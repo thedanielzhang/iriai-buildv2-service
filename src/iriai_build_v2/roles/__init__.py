@@ -56,6 +56,16 @@ plan_compiler = AgentActor(
     role=plan_compiler_role,
     context_keys=["plan", "prd", "design"],
 )
+plan_completeness_reviewer = AgentActor(
+    name="plan-completeness-reviewer",
+    role=plan_compiler_role,
+    context_keys=["plan", "prd", "design"],
+)
+plan_security_reviewer = AgentActor(
+    name="plan-security-reviewer",
+    role=plan_compiler_role,
+    context_keys=["plan", "prd", "design"],
+)
 planning_lead = AgentActor(
     name="planning-lead",
     role=planning_lead_role,

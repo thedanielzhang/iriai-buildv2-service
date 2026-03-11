@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 
-from iriai_compose import Ask, Feature, Gate, Phase, WorkflowRunner, to_str
+from iriai_compose import AgentActor, Ask, Feature, Gate, Phase, WorkflowRunner, to_str
 
 from ..models.outputs import ImplementationDAG, ImplementationResult, Verdict
 from ..models.state import BuildState
@@ -12,6 +12,16 @@ logger = logging.getLogger(__name__)
 
 VERIFY_RETRIES = 2
 WARN_AFTER_CYCLES = 3
+
+
+def _make_parallel_actor(base: AgentActor, suffix: str) -> AgentActor:
+    """Create a parallel-safe copy of an AgentActor with a unique name."""
+    return AgentActor(
+        name=f"{base.name}-{suffix}",
+        role=base.role,
+        context_keys=base.context_keys,
+        persistent=base.persistent,
+    )
 
 
 class ImplementationPhase(Phase):
@@ -140,14 +150,14 @@ async def _implement_dag(
         results = await runner.parallel(
             [
                 Ask(
-                    actor=implementer,
+                    actor=_make_parallel_actor(implementer, f"g{group_idx}-t{task_idx}"),
                     prompt=(
                         f"Implement task '{t.name}':\n{t.description}\n"
                         f"Files: {', '.join(t.files) if t.files else 'determine as needed'}"
                     ),
                     output_type=ImplementationResult,
                 )
-                for t in group_tasks
+                for task_idx, t in enumerate(group_tasks)
             ],
             feature,
         )

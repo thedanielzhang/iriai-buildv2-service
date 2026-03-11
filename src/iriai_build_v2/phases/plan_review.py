@@ -4,7 +4,7 @@ from iriai_compose import Ask, Feature, Gate, Phase, Respond, WorkflowRunner, to
 
 from ..models.outputs import Verdict
 from ..models.state import BuildState
-from ..roles import plan_compiler, user
+from ..roles import plan_completeness_reviewer, plan_security_reviewer, user
 
 
 class PlanReviewPhase(Phase):
@@ -13,12 +13,12 @@ class PlanReviewPhase(Phase):
     async def execute(
         self, runner: WorkflowRunner, feature: Feature, state: BuildState
     ) -> BuildState:
-        # Parallel: plan-compiler + security review run concurrently
-        # Using two Ask tasks with the same plan_compiler actor but different prompts
+        # Parallel: completeness + security review run concurrently
+        # Using distinct actors sharing plan_compiler_role to avoid parallel collision
         results = await runner.parallel(
             [
                 Ask(
-                    actor=plan_compiler,
+                    actor=plan_completeness_reviewer,
                     prompt=(
                         "Review the technical plan for completeness and correctness. "
                         "Verify all PRD requirements are addressed and implementation "
@@ -27,7 +27,7 @@ class PlanReviewPhase(Phase):
                     output_type=Verdict,
                 ),
                 Ask(
-                    actor=plan_compiler,
+                    actor=plan_security_reviewer,
                     prompt=(
                         "Review the technical plan for security concerns. Check for "
                         "potential vulnerabilities, insecure patterns, and missing "
