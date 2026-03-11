@@ -1,0 +1,25 @@
+[project]
+name = "iriai-build-v2"
+version = "0.1.0"
+description = "Agent orchestration build system powered by iriai-compose"
+requires-python = ">=3.11"
+dependencies = [
+    "iriai-compose[terminal]",
+    "iriai-preview",
+    "asyncpg>=0.29",
+    "pydantic>=2.0",
+    "click>=8.0",
+    "playwright>=1.40",
+    "pytest-playwright>=0.4",
+    "pytest-json-report>=1.5",
+]
+
+[project.scripts]
+iriai-build-v2 = "iriai_build_v2.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/iriai_build_v2"]

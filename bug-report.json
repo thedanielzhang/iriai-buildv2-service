@@ -1,0 +1,23 @@
+{
+  "title": "Phase 2 app service deployment fails: API service errors abort loop, frontend never created",
+  "description": "When deploying the 'survey-polling-mvp-test' app (imported from https://github.com/thedanielzhang/survey-polling-mvp-test) via the deploy console, the deployment consistently fails during Phase 2 (app service deployment). The Railway project is created successfully, infra services (DB/Redis) come up, but app services fail: the API service is created on Railway but always fails (likely during repo connection), and the frontend service is never even added to the project. Retries also fail.\n\nRoot cause identified in code: The Phase 2 service deployment loop in deployment_orchestrator.py (~line 1344) has no try/catch within the loop. Services are deployed in dependency order (API first, frontend second). When the API service deployment raises a RailwayDeploymentError (e.g., during connect_service_repo()), the exception propagates immediately, the loop exits, and remaining services (frontend) are never attempted. The entire deployment is marked 'failed'.\n\nAdditionally, the Railway API's 'Problem processing request' error pattern suggests a possible GitHub integration or repo accessibility issue on Railway's side when connecting the repo, but the deploy pipeline's lack of per-service error isolation makes this a cascading failure.",
+  "steps_to_reproduce": [
+    "Navigate to the deploy console UI",
+    "Create a new app by importing repo URL: https://github.com/thedanielzhang/survey-polling-mvp-test",
+    "Allow the system to auto-detect and create infra + app services from the repo",
+    "Click 'Deploy to Staging'",
+    "Observe: Phase 1 completes (Railway project created, infra services come up)",
+    "Observe: Phase 2 fails — API service created but fails, frontend service never added to Railway project",
+    "Check the Railway dashboard — confirm the deployed project exists but its services have failed to deploy",
+    "Attempt retry via the UI — same failure occurs"
+  ],
+  "expected_behavior": "All app services (API and frontend) should be created on Railway and connected to the GitHub repo. The deployment should complete successfully with all services running. If one service fails, the remaining services should still be attempted rather than aborting the entire deployment.",
+  "actual_behavior": "Phase 1 (infra) succeeds — Railway project created, DB and Redis services come up. Phase 2 fails — API service is created on Railway but fails (likely during repo connection step), which raises RailwayDeploymentError. The exception aborts the entire service deployment loop, so the frontend service is never even created. The deployment is marked as 'failed'. Retrying produces the same result. Checking the Railway dashboard confirms the project exists with failed/missing services.",
+  "severity": "blocker",
+  "affected_area": "deploy-console backend — deployment pipeline (Phase 2 app service deployment)",
+  "error_messages": [
+    "Phase 2 failed: deployment_env_id=<id> error=Failed to connect repository for <service_name>: <RailwayError details> (inferred from code analysis — exact log message to be captured during reproduction)",
+    "Possible underlying: 'Problem processing request' from Railway API — indicates GitHub integration or repo accessibility issue"
+  ],
+  "additional_context": "Critical code locations:\n- Phase 2 service loop (no per-service error handling): deployment_orchestrator.py ~line 1344-1385\n- Individual service deploy with repo connection: deployment_orchestrator.py ~lines 2036-2048 (_deploy_service)\n- Background continuation: background_deploy.py ~lines 360-443\n- Railway repo connection GraphQL: railway_client.py ~lines 584-642\n\nConstraint: The fix must be in the deployment pipeline code — no changes to the survey-polling-mvp-test repo.\n\nTwo likely fixes needed:\n1. Add per-service try/catch in the Phase 2 loop so one service failure doesn't abort deployment of remaining services\n2. Investigate why the Railway repo connection fails for this specific repo (possible Railway GitHub App permissions or branch mismatch issue)"
+}
