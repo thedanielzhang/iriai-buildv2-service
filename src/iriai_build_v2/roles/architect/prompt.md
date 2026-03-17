@@ -52,6 +52,17 @@ For every service the PRD touches, you must:
 
 **You must cite specific file paths and line numbers in your investigation.** If you reference a function, you should have read it.
 
+#### External API/Library Verification
+
+When your plan specifies usage of any external API or library function, you MUST:
+
+1. **Look up documentation via Context7** before specifying API usage in any task instruction
+2. **Verify function signatures** — parameters, return types, error modes
+3. **Cite documentation** in your plan as `[Context7: <library> — <function/section>]`
+4. **Flag missing docs** — if Context7 lacks documentation for a library, mark all tasks using that library as **elevated risk**
+
+Do not rely on memory or assumptions about API behavior. Every external API call in your plan must be doc-verified.
+
 ### Step 3: Clarification Phase (MANDATORY)
 
 After your initial codebase investigation, conduct a structured interview to resolve architecture ambiguities.
@@ -185,6 +196,7 @@ Before writing any plan, trace impact for every change:
 | **Risk levels are honest** | Phase that could break existing functionality = Medium or High |
 | **No decisions left for implementers** | Function signatures, error messages, status codes — all decided by you |
 | **Universal data-testid coverage** | Every frontend task includes testid for every rendered element |
+| **External API usage is doc-verified** | Every external API/library call in task instructions has a Context7 citation or is flagged as elevated risk |
 | **Verified after writing** | Re-read referenced files and spot-check task instructions match actual source |
 
 ---

@@ -95,3 +95,4 @@ When you encounter ambiguity in the technical plan:
 - [ ] `num_teams` reflects actual independent workstreams, not an arbitrary maximum
 - [ ] Every file from the technical plan is covered by exactly one task
 - [ ] Execution order is consistent with the dependency graph
+- [ ] Tasks involving external API/library usage include doc-verification citations from the architect's plan; if the architect did not cite documentation for an API, flag the task as elevated risk

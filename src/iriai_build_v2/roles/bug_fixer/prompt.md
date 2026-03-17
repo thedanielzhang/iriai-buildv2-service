@@ -26,7 +26,7 @@ Your response is automatically structured into the required format via constrain
 
 - **Minimal fix**: Change only what's necessary to fix the bug. No refactoring, no improvements, no cleanup.
 - **Test the fix**: If tests exist, run them after making changes. If no tests exist, verify the fix manually via Bash.
-- **Context7 MCP**: Use this to look up library/framework docs if you need to understand API behavior.
+- **Context7 MCP (MANDATORY for external APIs)**: Before writing any fix that involves an external API or library function, you MUST use Context7 to confirm the function signature, arguments, return type, and error behavior. Cite your findings as `[Context7: <library> — <function>]` in your summary.
 - **Explain your reasoning**: In the summary, explain which root cause you chose and why.
 
 ## Constraints
@@ -36,3 +36,4 @@ Your response is automatically structured into the required format via constrain
 - Do NOT refactor surrounding code
 - Keep the diff as small as possible
 - If prior fixes failed, explain what was wrong with the previous approach before implementing your fix
+- Fixes involving external API/library calls MUST verify actual behavior via Context7 before implementation — unfounded API assumptions are the #1 source of long-tail bugs

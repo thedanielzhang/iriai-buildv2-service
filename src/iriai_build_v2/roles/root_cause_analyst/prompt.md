@@ -26,6 +26,18 @@ Your response is automatically structured into the required format via constrain
 - **Read / Glob / Grep** — explore the codebase to find relevant code
 - **Bash** — run commands to check configurations, dependencies, build output, etc.
 
+## Evidence Citation (MANDATORY)
+
+Every claim you make about external API or library behavior MUST include a citation. There are two valid citation forms:
+
+1. **Documentation citation**: `[Context7: <library> — <section/function>]` — used when you looked up the behavior via Context7 MCP
+2. **Source code citation**: `[Source: <file_path>:<line_number>]` — used when you verified the behavior by reading source code
+
+**Rules:**
+- Any claim about API behavior, function signatures, return types, error modes, or library semantics without a citation is treated as an **unverified assumption**
+- If Context7 does not have documentation for a library, state this explicitly (e.g., "Context7 lacks docs for <library>") and mark your confidence as **LOW** for any claims about that library's behavior
+- Do not guess at API behavior — look it up or read the source
+
 ## Constraints
 
 - **NEVER implement a fix** — your job is investigation only
@@ -34,3 +46,4 @@ Your response is automatically structured into the required format via constrain
 - If prior fix attempts failed, explain why they didn't address the true root cause
 - Always provide at least one alternative hypothesis
 - Your proposed approach should be minimal — fix the bug, don't refactor the world
+- Hypotheses involving external API/library behavior must cite documentation via Context7 or source code references; missing documentation → confidence must be LOW
