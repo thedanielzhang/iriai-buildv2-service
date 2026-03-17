@@ -46,7 +46,7 @@ async def _run(
     from .tasks.feedback import FeedbackService
     from .tasks.playwright import PlaywrightService
     from .tasks.preview import PreviewService
-    from .workflows import BugFixWorkflow, FullBuildWorkflow, PlanningWorkflow, TrackedWorkflowRunner
+    from .workflows import BugFixWorkflow, FullDevelopWorkflow, PlanningWorkflow, TrackedWorkflowRunner
     from .models.state import BugFixState, BuildState
 
     # 1. Database
@@ -114,7 +114,7 @@ async def _run(
         elif workflow_name == "bugfix":
             workflow = BugFixWorkflow()
         else:
-            workflow = FullBuildWorkflow()
+            workflow = FullDevelopWorkflow()
 
         state: BuildState | BugFixState
         if workflow_name == "bugfix":
@@ -171,9 +171,9 @@ def plan(name: str, workspace: str, auto: bool) -> None:
 @click.option("--name", required=True, help="Feature name")
 @click.option("--workspace", default=".", help="Project workspace path")
 @click.option("--auto", is_flag=True, help="Auto-approve all gates")
-def build(name: str, workspace: str, auto: bool) -> None:
-    """Run the full build workflow (Planning + Implementation)."""
-    asyncio.run(_run("full-build", name, workspace, auto))
+def develop(name: str, workspace: str, auto: bool) -> None:
+    """Run the full develop workflow (Planning + Implementation)."""
+    asyncio.run(_run("full-develop", name, workspace, auto))
 
 
 @cli.command()

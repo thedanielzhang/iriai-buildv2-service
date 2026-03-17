@@ -1,11 +1,11 @@
 from .planning import PlanningWorkflow
-from .build import FullBuildWorkflow
+from .develop import FullDevelopWorkflow
 from .bugfix import BugFixWorkflow
 from ._runner import TrackedWorkflowRunner
 
 __all__ = [
     "PlanningWorkflow",
-    "FullBuildWorkflow",
+    "FullDevelopWorkflow",
     "BugFixWorkflow",
     "TrackedWorkflowRunner",
 ]

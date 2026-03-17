@@ -12,8 +12,8 @@ from ..planning.phases import (
 from .phases import ImplementationPhase
 
 
-class FullBuildWorkflow(Workflow):
-    name = "full-build"
+class FullDevelopWorkflow(Workflow):
+    name = "full-develop"
 
     def build_phases(self) -> list[type[Phase]]:
         return [PMPhase, DesignPhase, ArchitecturePhase, PlanReviewPhase, TaskPlanningPhase, ImplementationPhase]

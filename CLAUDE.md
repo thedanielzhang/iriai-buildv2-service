@@ -29,8 +29,8 @@ Agent orchestration build system using `iriai-compose` framework and Claude Agen
 # Planning workflow
 iriai-build plan --name "Feature name" --workspace /path/to/project
 
-# Full build workflow
-iriai-build build --name "Feature name" --workspace /path/to/project
+# Full develop workflow
+iriai-build develop --name "Feature name" --workspace /path/to/project
 
 # Bug fix workflow
 iriai-build bugfix --name "Bug description" --project myproject --workspace /path/to/project
