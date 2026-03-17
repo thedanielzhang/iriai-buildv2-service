@@ -4,8 +4,8 @@ import logging
 
 from iriai_compose import Feature, Phase, WorkflowRunner
 
-from ..models.state import BugFixState
-from ..tasks.preview import CleanupMode, CleanupPreviewTask
+from ....models.state import BugFixState
+from ....tasks.preview import CleanupMode, CleanupPreviewTask
 
 logger = logging.getLogger(__name__)
 

@@ -4,9 +4,9 @@ import logging
 
 from iriai_compose import Ask, Feature, Phase, WorkflowRunner, to_str
 
-from ..models.outputs import ReproductionResult
-from ..models.state import BugFixState
-from ..roles import bug_reproducer
+from ....models.outputs import ReproductionResult
+from ....models.state import BugFixState
+from ....roles import bug_reproducer
 
 logger = logging.getLogger(__name__)
 

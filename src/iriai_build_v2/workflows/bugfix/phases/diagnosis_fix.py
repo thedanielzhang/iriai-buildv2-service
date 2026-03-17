@@ -4,9 +4,9 @@ import logging
 
 from iriai_compose import Ask, Feature, Phase, WorkflowRunner, to_str
 
-from ..models.outputs import BugFixResult, ReproductionResult, RootCauseAnalysis
-from ..models.state import BugFixState
-from ..roles import bug_fixer, bug_reproducer, rca_architecture_analyst, rca_symptoms_analyst
+from ....models.outputs import BugFixResult, ReproductionResult, RootCauseAnalysis
+from ....models.state import BugFixState
+from ....roles import bug_fixer, bug_reproducer, rca_architecture_analyst, rca_symptoms_analyst
 
 logger = logging.getLogger(__name__)
 
@@ -120,7 +120,7 @@ class DiagnosisAndFixPhase(Phase):
             )
 
             # Re-deploy / wait for preview to rebuild
-            from ..tasks.preview import LaunchPreviewServerTask
+            from ....tasks.preview import LaunchPreviewServerTask
 
             try:
                 info = await runner.run(

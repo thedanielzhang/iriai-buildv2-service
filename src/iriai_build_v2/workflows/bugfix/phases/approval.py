@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from iriai_compose import Feature, Gate, Phase, WorkflowRunner
 
-from ..models.state import BugFixState
-from ..roles import user
+from ....models.state import BugFixState
+from ....roles import user
 
 
 class ApprovalPhase(Phase):

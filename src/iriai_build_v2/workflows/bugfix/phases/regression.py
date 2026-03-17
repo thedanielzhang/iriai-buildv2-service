@@ -4,10 +4,10 @@ import logging
 
 from iriai_compose import Ask, Feature, Phase, WorkflowRunner, to_str
 
-from ..models.outputs import Verdict
-from ..models.state import BugFixState
-from ..roles import smoke_tester
-from ..tasks.playwright import RunE2ETestTask
+from ....models.outputs import Verdict
+from ....models.state import BugFixState
+from ....roles import smoke_tester
+from ....tasks.playwright import RunE2ETestTask
 
 logger = logging.getLogger(__name__)
 

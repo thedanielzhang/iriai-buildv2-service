@@ -2,10 +2,10 @@ from __future__ import annotations
 
 from iriai_compose import Feature, Interview, Phase, WorkflowRunner
 
-from ..models.outputs import DesignDecisions, Envelope, envelope_done
-from ..models.state import BuildState
-from ..roles import designer, user
-from ._helpers import gate_and_revise
+from ....models.outputs import DesignDecisions, Envelope, envelope_done
+from ....models.state import BuildState
+from ....roles import designer, user
+from ..._common import gate_and_revise
 
 
 class DesignPhase(Phase):

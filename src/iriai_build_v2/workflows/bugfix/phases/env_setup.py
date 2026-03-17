@@ -7,8 +7,8 @@ from pathlib import Path
 
 from iriai_compose import Feature, Phase, WorkflowRunner
 
-from ..models.state import BugFixState
-from ..tasks.preview import LaunchPreviewServerTask
+from ....models.state import BugFixState
+from ....tasks.preview import LaunchPreviewServerTask
 
 logger = logging.getLogger(__name__)
 

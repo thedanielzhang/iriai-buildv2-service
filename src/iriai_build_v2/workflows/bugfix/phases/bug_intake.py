@@ -4,10 +4,10 @@ import logging
 
 from iriai_compose import Feature, Interview, Phase, WorkflowRunner
 
-from ..models.outputs import BugReport, Envelope, envelope_done
-from ..models.state import BugFixState
-from ..roles import bug_interviewer, user
-from ._helpers import gate_and_revise
+from ....models.outputs import BugReport, Envelope, envelope_done
+from ....models.state import BugFixState
+from ....roles import bug_interviewer, user
+from ..._common import gate_and_revise
 
 logger = logging.getLogger(__name__)
 

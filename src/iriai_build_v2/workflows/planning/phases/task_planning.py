@@ -2,10 +2,10 @@ from __future__ import annotations
 
 from iriai_compose import Feature, Interview, Phase, WorkflowRunner
 
-from ..models.outputs import Envelope, ImplementationDAG, envelope_done
-from ..models.state import BuildState
-from ..roles import task_planner, user
-from ._helpers import gate_and_revise
+from ....models.outputs import Envelope, ImplementationDAG, envelope_done
+from ....models.state import BuildState
+from ....roles import task_planner, user
+from ..._common import gate_and_revise
 
 
 class TaskPlanningPhase(Phase):
