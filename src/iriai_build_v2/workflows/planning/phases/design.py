@@ -135,7 +135,7 @@ class DesignPhase(Phase):
                 target.write_text(content, encoding="utf-8")
                 logger.info("Copied mockup from %s → %s", source, target)
 
-            url = await hosting.push(
+            url = await hosting.push_qa(
                 feature.id, "mockup", content,
                 f"Mockup — {feature.name}",
             )

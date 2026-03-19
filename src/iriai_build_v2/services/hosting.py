@@ -86,6 +86,40 @@ class DocHostingService:
         logger.info("Hosted %s at %s", key, url)
         return url
 
+    async def push_qa(self, feature_id: str, key: str, content: str, label: str) -> str:
+        """Write artifact to disk and start a QA feedback session (annotation overlay).
+
+        Unlike ``push()`` which uses doc-review (static rendering), this uses
+        the QA feedback tool which wraps the served page with an interactive
+        annotation overlay — ideal for visual artifacts like mockups.
+        """
+        path = self._mirror.write_artifact(feature_id, key, content)
+        base_path = f"/features/{feature_id}/{key}"
+
+        # First serve the file via doc-review to get an HTTP URL
+        doc_info = await self._feedback.start_doc_review(
+            str(path), title=label, base_path=base_path,
+        )
+        local_url = doc_info.url
+
+        # Wrap with QA feedback overlay
+        info = await self._feedback.start_qa(local_url)
+
+        url = info.url
+        if self._tunnel:
+            try:
+                public_base = await self._tunnel.tunnel(info.port)
+                url = public_base
+                logger.info("Tunneled QA %s: %s → %s", key, info.url, url)
+            except Exception:
+                logger.warning("Tunnel failed for QA %s, using local URL", key, exc_info=True)
+
+        self._sessions[key] = info
+        self._urls[key] = url
+        self._labels[key] = label
+        logger.info("QA hosted %s at %s", key, url)
+        return url
+
     async def update(self, feature_id: str, key: str, content: str) -> None:
         """Re-write artifact and restart its hosting session.
 
