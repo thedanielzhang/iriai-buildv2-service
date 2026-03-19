@@ -36,17 +36,25 @@ async def gate_and_revise(
     """
     artifact_text = to_str(artifact) if isinstance(artifact, BaseModel) else artifact
     artifact_name = label.split("\n", 1)[0]
-    base_label = label  # preserve caller's label (may include multiple URLs)
+
+    # Strip pre-embedded URLs so we can rebuild them fresh each iteration
+    clean_label = "\n".join(
+        line for line in label.splitlines()
+        if "Review in browser:" not in line
+    ).strip()
+
+    # Keys to look up URLs for (annotation_keys includes mockup, etc.)
+    url_keys = annotation_keys or ([artifact_key] if artifact_key else [])
 
     while True:
-        # Refresh review URL each iteration (port may change after hosting.update)
-        gate_label = base_label
-        if artifact_key and "Review in browser:" not in gate_label:
-            hosting = runner.services.get("hosting")
-            if hosting:
-                url = hosting.get_url(artifact_key)
-                if url:
-                    gate_label = f"{gate_label}\nReview in browser: {url}"
+        # Rebuild review URLs from hosting each iteration (ports may change after update)
+        gate_label = clean_label
+        hosting = runner.services.get("hosting")
+        if hosting and url_keys:
+            urls = [hosting.get_url(k) for k in url_keys]
+            urls = [u for u in urls if u]
+            if urls:
+                gate_label += "\nReview in browser: " + " | ".join(urls)
 
         approved = await runner.run(
             Gate(approver=approver, prompt=f"{gate_label}:\n\n{artifact_text}\n\nApprove?"),
