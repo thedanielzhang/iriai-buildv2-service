@@ -4,9 +4,10 @@ import logging
 
 from iriai_compose import Ask, Feature, Phase, WorkflowRunner, to_str
 
-from ....models.outputs import BugFixResult, ReproductionResult, RootCauseAnalysis
+from ....models.outputs import BugFixResult, HandoverDoc, ReproductionResult, RootCauseAnalysis, TaskOutcome
 from ....models.state import BugFixState
 from ....roles import bug_fixer, bug_reproducer, rca_architecture_analyst, rca_symptoms_analyst
+from ....services.markdown import to_markdown
 
 logger = logging.getLogger(__name__)
 
@@ -19,18 +20,19 @@ class DiagnosisAndFixPhase(Phase):
     async def execute(
         self, runner: WorkflowRunner, feature: Feature, state: BugFixState
     ) -> BugFixState:
-        prior_attempts: list[str] = []
+        handover = HandoverDoc()
 
         for iteration in range(MAX_ITERATIONS):
             logger.info("Diagnosis-fix iteration %d/%d", iteration + 1, MAX_ITERATIONS)
 
             # ── Step A: Root Cause Analysis (parallel) ────────────────────
-            prior_context = ""
-            if prior_attempts:
-                prior_context = (
-                    "\n\n## Prior Fix Attempts (FAILED)\n"
-                    + "\n\n---\n\n".join(prior_attempts)
-                    + "\n\nThe above fixes did NOT resolve the bug. "
+            handover_context = ""
+            if handover.failed_attempts:
+                handover.compress()
+                handover_context = (
+                    f"\n\n## Prior Fix Attempts (DO NOT REPEAT)\n\n"
+                    f"{to_markdown(handover)}\n\n"
+                    "The above fixes did NOT resolve the bug. "
                     "Consider what they missed."
                 )
 
@@ -45,7 +47,7 @@ class DiagnosisAndFixPhase(Phase):
                             "find where behavior diverges from expectation.\n\n"
                             f"## Bug Report\n{state.bug_report}\n\n"
                             f"## Reproduction Evidence\n{state.reproduction}"
-                            f"{prior_context}"
+                            f"{handover_context}"
                         ),
                         output_type=RootCauseAnalysis,
                     ),
@@ -59,7 +61,7 @@ class DiagnosisAndFixPhase(Phase):
                             "or config mismatches.\n\n"
                             f"## Bug Report\n{state.bug_report}\n\n"
                             f"## Reproduction Evidence\n{state.reproduction}"
-                            f"{prior_context}"
+                            f"{handover_context}"
                         ),
                         output_type=RootCauseAnalysis,
                     ),
@@ -84,11 +86,8 @@ class DiagnosisAndFixPhase(Phase):
                 f"## Analyst A — Trace from Symptoms\n{rca_a_text}\n\n"
                 f"## Analyst B — Trace from Architecture\n{rca_b_text}"
             )
-            if prior_attempts:
-                fix_prompt += (
-                    "\n\n## Prior Fix Attempts (FAILED)\n"
-                    + "\n\n---\n\n".join(prior_attempts)
-                )
+            if handover.failed_attempts:
+                fix_prompt += f"\n\n## Prior Fix Attempts (DO NOT REPEAT)\n\n{to_markdown(handover)}"
 
             fix_result: BugFixResult = await runner.run(
                 Ask(
@@ -105,7 +104,6 @@ class DiagnosisAndFixPhase(Phase):
             state.fix = fix_text
 
             # ── Step C: Push & Verify ─────────────────────────────────────
-            # Commit and push so Railway auto-syncs the preview
             await runner.run(
                 Ask(
                     actor=bug_fixer,
@@ -119,7 +117,6 @@ class DiagnosisAndFixPhase(Phase):
                 phase_name=self.name,
             )
 
-            # Re-deploy / wait for preview to rebuild
             from ....tasks.preview import LaunchPreviewServerTask
 
             try:
@@ -134,7 +131,6 @@ class DiagnosisAndFixPhase(Phase):
             except Exception as exc:
                 logger.warning("Preview redeploy failed, using existing URL: %s", exc)
 
-            # Verify: re-run reproduction to check if bug is fixed
             verification: ReproductionResult = await runner.run(
                 Ask(
                     actor=bug_reproducer,
@@ -159,15 +155,27 @@ class DiagnosisAndFixPhase(Phase):
             # ── Loop control ──────────────────────────────────────────────
             if not verification.reproduced:
                 logger.info("Bug verified as fixed on iteration %d", iteration + 1)
+                handover.completed.append(TaskOutcome(
+                    task_id=f"fix-iter-{iteration + 1}",
+                    status="completed",
+                    summary=fix_result.summary,
+                    files_changed=fix_result.files_created + fix_result.files_modified,
+                ))
+                state.handover = to_str(handover)
+                await runner.artifacts.put("handover", state.handover, feature=feature)
                 return state
 
-            # Bug still present — accumulate context and loop
-            prior_attempts.append(
-                f"### Iteration {iteration + 1}\n"
-                f"**Fix applied:**\n{fix_text}\n\n"
-                f"**Verification result:**\n{verification_text}\n\n"
-                "The bug was still reproducible after this fix."
+            # Bug still present — record failure in handover
+            handover.record_failure(
+                task_id=f"fix-iter-{iteration + 1}",
+                summary=fix_result.summary,
+                failure_reason=(
+                    f"Bug still reproducible. Verification: {verification_text[:500]}"
+                ),
             )
+            state.handover = to_str(handover)
+            await runner.artifacts.put("handover", state.handover, feature=feature)
+
             logger.warning(
                 "Bug still present after iteration %d, looping back",
                 iteration + 1,

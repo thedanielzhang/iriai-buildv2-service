@@ -27,6 +27,12 @@ class PostgresSessionStore(SessionStore):
             metadata=metadata,
         )
 
+    async def delete(self, session_key: str) -> None:
+        """Remove a session, forcing the next invoke to start fresh."""
+        await self._pool.execute(
+            "DELETE FROM sessions WHERE session_key = $1", session_key,
+        )
+
     async def save(self, session: AgentSession) -> None:
         metadata_json = json.dumps(session.metadata)
         await self._pool.execute(

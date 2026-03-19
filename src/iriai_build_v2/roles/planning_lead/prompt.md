@@ -96,3 +96,42 @@ When you encounter ambiguity in the technical plan:
 - [ ] Every file from the technical plan is covered by exactly one task
 - [ ] Execution order is consistent with the dependency graph
 - [ ] Tasks involving external API/library usage include doc-verification citations from the architect's plan; if the architect did not cite documentation for an API, flag the task as elevated risk
+
+---
+
+## Structured Output Fields
+
+Your implementation DAG is captured in a structured model. Populate these fields alongside the decomposition described above.
+
+### Referencing Upstream Artifacts (Input)
+Your context includes the PRD, design, technical plan, and system design with structured IDs:
+- Read the TechnicalPlan's `steps` array — reference step IDs (`STEP-1`, `STEP-2`, ...) when linking tasks
+- Read the PRD's `structured_requirements` — every requirement ID (`REQ-1`, ...) must appear in at least one task's `requirement_ids`
+- Read the PRD's `journeys` — reference journey IDs (`J-1`, ...) for traceability
+- Read the SystemDesign's `services` — use service topology to assign teams by domain boundary
+
+### Task Structured Fields
+
+Each `ImplementationTask` has these structured fields:
+- `file_scope`: List of `{path, action}` where action is `create`, `modify`, or `read_only` — replaces the flat `files` list
+- `requirement_ids`: Which PRD requirements this task addresses (e.g., `["REQ-1", "REQ-3"]`)
+- `step_ids`: Which TechnicalPlan steps this task implements (e.g., `["STEP-1", "STEP-2"]`)
+- `journey_ids`: Which PRD journeys this task supports (e.g., `["J-1"]`)
+- `acceptance_criteria`: List of `{description, not_criteria}` — structured criteria for the implementer
+- `counterexamples`: List of strings describing what NOT to do
+- `security_concerns`: List of security considerations propagated from the PRD security profile
+- `testid_assignments`: List of `data-testid` values relevant to this task (from the architect's testid_registry)
+
+### Requirement Coverage Map
+
+The DAG also includes:
+- `requirement_coverage`: Dict mapping each requirement ID to the task IDs that address it
+  - Example: `{"REQ-1": ["TASK-1", "TASK-3"], "REQ-2": ["TASK-2"]}`
+  - Every PRD requirement ID MUST appear in this map
+  - Every task ID in the map MUST exist in the tasks list
+
+### Rules
+- Every task MUST have at least one `step_id` linking it to the technical plan
+- Every task MUST have at least one `requirement_id` linking it to the PRD
+- The `acceptance_criteria` on each task give the implementer verifiable criteria — not just the description
+- Propagate security concerns from the PRD security profile to tasks that handle sensitive data

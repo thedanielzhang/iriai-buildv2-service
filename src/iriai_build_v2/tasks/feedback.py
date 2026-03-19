@@ -54,10 +54,11 @@ class FeedbackService:
         *,
         title: str | None = None,
         port: int = 9000,
+        base_path: str = "/doc-review",
     ) -> SessionInfo:
         """Start a doc review session. Returns session_id and review_url."""
         session = await self._manager.start_doc_review(
-            doc_path, title=title,
+            doc_path, title=title, base_path=base_path,
         )
         return SessionInfo(
             session_id=session.session_id,

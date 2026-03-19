@@ -4,13 +4,16 @@ from pydantic import BaseModel, Field
 
 
 class BuildState(BaseModel):
+    scope: str = ""
     prd: str = ""
     design: str = ""
     plan: str = ""
+    system_design: str = ""
     user_notes: str = ""
     dag: str = ""
     implementation: str = ""
-    phase: str = "pm"
+    handover: str = ""
+    phase: str = "scoping"
     metadata: dict[str, object] = Field(default_factory=dict)
 
 
@@ -23,6 +26,7 @@ class BugFixState(BaseModel):
     fix: str = ""
     verification: str = ""
     regression: str = ""
+    handover: str = ""
     preview_url: str = ""
     project: str = ""
     phase: str = "intake"

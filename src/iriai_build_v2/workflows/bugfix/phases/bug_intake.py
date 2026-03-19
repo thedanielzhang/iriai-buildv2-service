@@ -40,7 +40,6 @@ class BugIntakePhase(Phase):
         )
 
         bug_report = envelope.output
-        assert bug_report is not None
 
         bug_report, bug_report_text = await gate_and_revise(
             runner, feature, self.name,

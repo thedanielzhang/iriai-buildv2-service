@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from iriai_compose import Feature, Interview, Phase, WorkflowRunner
+from iriai_compose import Feature, Phase, WorkflowRunner
 
 from ....models.outputs import PRD, Envelope, envelope_done
 from ....models.state import BuildState
 from ....roles import pm, user
-from ..._common import gate_and_revise
+from ..._common import HostedInterview, gate_and_revise
 
 
 class PMPhase(Phase):
@@ -15,7 +15,7 @@ class PMPhase(Phase):
         self, runner: WorkflowRunner, feature: Feature, state: BuildState
     ) -> BuildState:
         envelope: Envelope[PRD] = await runner.run(
-            Interview(
+            HostedInterview(
                 questioner=pm,
                 responder=user,
                 initial_prompt=(
@@ -25,18 +25,20 @@ class PMPhase(Phase):
                 ),
                 output_type=Envelope[PRD],
                 done=envelope_done,
+                artifact_key="prd",
+                artifact_label="PRD",
             ),
             feature,
             phase_name=self.name,
         )
 
         prd = envelope.output
-        assert prd is not None
 
         prd, prd_text = await gate_and_revise(
             runner, feature, self.name,
             artifact=prd, actor=pm, output_type=PRD,
             approver=user, label="PRD",
+            artifact_key="prd",
         )
 
         await runner.artifacts.put("prd", prd_text, feature=feature)

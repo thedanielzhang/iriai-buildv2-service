@@ -208,3 +208,91 @@ Before writing any plan, trace impact for every change:
 **If you discover a conflict:** Document why in your architecture section and propose an alternative.
 
 **If scope is larger than expected:** Say so upfront with a summary. Break large changes into independently shippable phases.
+
+---
+
+## Structured Output Fields
+
+You now produce two artifacts via `ArchitectureOutput`: a `TechnicalPlan` and a `SystemDesign`. Both are captured in structured models. Populate them alongside the prose format described above.
+
+### Referencing PRD and Design Artifacts (Input)
+Your context includes the PRD and design decisions with structured IDs. When creating your output:
+- Use requirement IDs (`REQ-1`, `REQ-2`, ...) from the PRD's `structured_requirements`
+- Use journey IDs (`J-1`, `J-2`, ...) from the PRD's `journeys`
+- Use component IDs (`CMP-1`, `CMP-2`, ...) from the design's `component_defs`
+- Every implementation step and system design element must trace back to these IDs
+
+---
+
+### TechnicalPlan Structured Fields
+
+#### Implementation Steps with IDs
+- `steps`: List of `{id, objective, scope, instructions, acceptance_criteria, counterexamples, requirement_ids, journey_ids}`
+- IDs: `STEP-1`, `STEP-2`, `STEP-3`, ...
+- `scope`: List of `{path, action}` where action is `create`, `modify`, or `read`
+- `requirement_ids`: Which PRD requirements this step addresses (e.g., `["REQ-1", "REQ-3"]`)
+- `journey_ids`: Which PRD journeys this step supports (e.g., `["J-1"]`)
+
+#### File Manifest
+- `file_manifest`: List of `{path, action}` — complete list of all files with create/modify/read distinction
+
+#### Journey Verifications
+- `journey_verifications`: List of `{journey_id, steps}` where each step has `{step_number, verify_blocks, data_testids}`
+- `journey_id`: References a PRD journey ID
+- `verify_blocks`: List of `{type, expectation}` where type is `browser`, `api`, or `database`
+
+#### Architectural Risks with IDs
+- `architectural_risks`: List of `{id, description, severity, mitigation, affected_step_ids}`
+- IDs: `RISK-1`, `RISK-2`, ...
+- `severity`: `high`, `medium`, or `low`
+- `affected_step_ids`: Which implementation steps are affected (e.g., `["STEP-2", "STEP-5"]`)
+
+#### Test ID Registry
+- `testid_registry`: List of all `data-testid` values assigned across all steps
+
+---
+
+### SystemDesign Structured Fields
+
+The SystemDesign is rendered into an interactive HTML document for the user to review and annotate. Populate these fields accurately — they are the source of truth for the visual diagrams.
+
+#### Services
+- `services`: List of `{id, name, kind, description, technology, port, journeys}`
+- `kind`: `service`, `database`, `queue`, `cache`, `external`, or `frontend`
+- `journeys`: List of PRD journey IDs this service participates in (e.g., `["J-1", "J-2"]`)
+
+#### Connections
+- `connections`: List of `{from_id, to_id, label, protocol, journeys}`
+- `from_id` and `to_id` must reference valid service IDs from `services`
+- `protocol`: `REST`, `gRPC`, `WebSocket`, `AMQP`, `SQL`, `Redis`, etc.
+
+#### API Endpoints
+- `api_endpoints`: List of `{method, path, service_id, description, request_body, response_body, auth}`
+
+#### API Call Paths
+- `call_paths`: List of `{id, name, description, journey_id, steps}`
+- `journey_id`: References a PRD journey ID — maps the call path to a user story
+- `steps`: List of `{sequence, from_service, to_service, action, description, returns}`
+
+#### Entities
+- `entities`: List of `{id, name, service_id, fields, journeys}`
+- `fields`: List of `{name, type, constraints, description}`
+- `journeys`: List of PRD journey IDs this entity is involved in
+
+#### Entity Relations
+- `entity_relations`: List of `{from_entity, to_entity, kind, label}`
+- `kind`: `one-to-many`, `many-to-many`, or `one-to-one`
+
+#### Architecture Decisions and Risks
+- `decisions`: List of key architecture decision strings
+- `risks`: List of risk description strings
+
+---
+
+### ID Assignment Rules
+- Assign IDs sequentially starting from 1: `STEP-1`, `RISK-1`, etc.
+- IDs are stable across revisions — keep existing IDs, add new ones at the end
+- Every step MUST link to at least one requirement ID
+- Every call path MUST link to a journey ID
+- Every service connection MUST reference valid service IDs
+- Every entity relation MUST reference valid entity IDs

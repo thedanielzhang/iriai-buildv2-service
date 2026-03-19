@@ -47,8 +47,13 @@ def _inline_defs(schema: dict[str, Any]) -> dict[str, Any]:
 class ClaudeAgentRuntime(AgentRuntime):
     """Agent runtime using ClaudeSDKClient for reliable structured output.
 
-    Each invoke() creates an ephemeral ClaudeSDKClient. Session continuity
-    is maintained via options.resume with stored session_id.
+    Two modes controlled by ``interactive_roles`` constructor param:
+
+    - **Default** (no interactive_roles): Ephemeral client per invoke, uses
+      ``receive_response()``. Same as the original implementation.
+    - **Interactive** (role.name in interactive_roles): Persistent client during
+      invoke, uses ``receive_messages()`` to support mid-stream user message
+      injection via ``inject_user_message()``.
     """
 
     name = "claude"
@@ -57,6 +62,8 @@ class ClaudeAgentRuntime(AgentRuntime):
         self,
         session_store: SessionStore | None = None,
         on_message: Callable[[Any], None] | None = None,
+        *,
+        interactive_roles: set[str] | None = None,
     ) -> None:
         try:
             import claude_agent_sdk  # noqa: F401
@@ -67,6 +74,17 @@ class ClaudeAgentRuntime(AgentRuntime):
             )
         self.session_store = session_store
         self.on_message = on_message
+        self._interactive_roles = interactive_roles or set()
+
+        # Interactive mode state
+        self._active_clients: dict[str, Any] = {}  # session_key → ClaudeSDKClient
+        self._pending_counts: dict[str, int] = {}  # session_key → unresolved turns
+        self._feature_sessions: dict[str, str] = {}  # feature_id → active session_key
+
+        # Context management: message accumulation for session cycling
+        self._session_messages: dict[str, list[str]] = {}  # session_key → message texts
+        self._session_context: dict[str, str] = {}  # session_key → compressed context after cycle
+        self._retry_depth: int = 0  # prevent infinite retry loops
 
     async def invoke(
         self,
@@ -77,10 +95,32 @@ class ClaudeAgentRuntime(AgentRuntime):
         workspace: Workspace | None = None,
         session_key: str | None = None,
     ) -> str | BaseModel:
-        from claude_agent_sdk import ClaudeSDKClient
         from claude_agent_sdk.types import ResultMessage
 
+        # ── Context management: proactive session cycling ──
+        if session_key:
+            max_chars = role.metadata.get("max_session_chars", 0)
+            if max_chars:
+                chars = sum(len(m) for m in self._session_messages.get(session_key, []))
+                if chars >= max_chars:
+                    logger.info(
+                        "Session %s reached %d chars (limit %d) — cycling",
+                        session_key, chars, max_chars,
+                    )
+                    await self._cycle_session(session_key, role)
+
+            # Accumulate user prompt for size tracking
+            self._session_messages.setdefault(session_key, []).append(
+                f"User: {prompt[:2000]}"
+            )
+
+        # ── Build options + inject compressed context if session was cycled ──
         options = self._build_options(role, workspace, output_type)
+
+        effective_prompt = prompt
+        prior_context = self._session_context.pop(session_key, None) if session_key else None
+        if prior_context:
+            effective_prompt = f"{prior_context}\n\n## Current Task\n{prompt}"
 
         # Resume existing session if available
         if session_key and self.session_store:
@@ -88,18 +128,26 @@ class ClaudeAgentRuntime(AgentRuntime):
             if session and session.session_id:
                 options.resume = session.session_id
 
-        # Per-invoke client (output_format is fixed per CLI process)
-        async with ClaudeSDKClient(options=options) as client:
-            await client.query(prompt)
-            result_msg = None
-            async for msg in client.receive_response():
-                if self.on_message is not None:
-                    self.on_message(msg)
-                if isinstance(msg, ResultMessage):
-                    result_msg = msg
+        use_interactive = bool(
+            self._interactive_roles and role.name in self._interactive_roles
+        )
+
+        if use_interactive:
+            result_msg = await self._invoke_interactive(
+                options, effective_prompt, session_key, ResultMessage
+            )
+        else:
+            result_msg = await self._invoke_default(options, effective_prompt, ResultMessage)
 
         if result_msg is None:
             raise RuntimeError("Claude query completed without a result message")
+
+        # Accumulate assistant response for size tracking
+        if session_key:
+            result_text = getattr(result_msg, "result", "") or ""
+            self._session_messages.setdefault(session_key, []).append(
+                f"Assistant: {result_text[:2000]}"
+            )
 
         # Save session for future invocations
         session_id = getattr(result_msg, "session_id", None)
@@ -113,11 +161,169 @@ class ClaudeAgentRuntime(AgentRuntime):
 
         # SDK guarantees structured output when output_format is set
         if result_msg.subtype == "error_max_structured_output_retries":
+            logger.error(
+                "Structured output failed for %s. subtype=%s, result=%s, structured_output=%s",
+                output_type.__name__,
+                result_msg.subtype,
+                repr(result_msg.result)[:200] if result_msg.result else None,
+                repr(getattr(result_msg, "structured_output", None))[:200],
+            )
             raise RuntimeError(
                 f"Claude could not produce valid {output_type.__name__} "
                 f"after multiple attempts. Last result: {result_msg.result}"
             )
+
+        # ── Error fallback: structured_output is None (context overflow) ──
+        if result_msg.structured_output is None and session_key and self._retry_depth == 0:
+            logger.warning(
+                "structured_output is None for %s (session %s) — cycling and retrying",
+                output_type.__name__, session_key,
+            )
+            await self._cycle_session(session_key, role)
+            self._retry_depth += 1
+            try:
+                return await self.invoke(
+                    role, prompt,
+                    output_type=output_type, workspace=workspace, session_key=session_key,
+                )
+            finally:
+                self._retry_depth -= 1
+
         return output_type.model_validate(result_msg.structured_output)
+
+    async def _invoke_default(self, options: Any, prompt: str, ResultMessage: type) -> Any:
+        """Ephemeral client, receive_response(). Original code path."""
+        from claude_agent_sdk import ClaudeSDKClient
+
+        async with ClaudeSDKClient(options=options) as client:
+            await client.query(prompt)
+            result_msg = None
+            async for msg in client.receive_response():
+                if self.on_message is not None:
+                    self.on_message(msg)
+                if isinstance(msg, ResultMessage):
+                    result_msg = msg
+        return result_msg
+
+    async def _invoke_interactive(
+        self, options: Any, prompt: str, session_key: str | None, ResultMessage: type
+    ) -> Any:
+        """Like default path but registers client for mid-stream injection."""
+        from claude_agent_sdk import ClaudeSDKClient
+
+        feature_id = session_key.rsplit(":", 1)[-1] if session_key else None
+
+        async with ClaudeSDKClient(options=options) as client:
+            if session_key:
+                self._active_clients[session_key] = client
+                self._pending_counts[session_key] = 1
+            if feature_id:
+                self._feature_sessions[feature_id] = session_key
+
+            try:
+                await client.query(prompt)
+                result_msg = None
+                async for msg in client.receive_response():
+                    if self.on_message is not None:
+                        self.on_message(msg)
+                    if isinstance(msg, ResultMessage):
+                        result_msg = msg
+            finally:
+                if session_key:
+                    self._active_clients.pop(session_key, None)
+                    self._pending_counts.pop(session_key, None)
+                if feature_id:
+                    self._feature_sessions.pop(feature_id, None)
+
+        return result_msg
+
+    async def inject_user_message(self, feature_id: str, text: str) -> bool:
+        """Inject a user message into the active agent for a feature.
+
+        Returns True if injected, False if no active agent for this feature.
+        """
+        session_key = self._feature_sessions.get(feature_id)
+        if not session_key or session_key not in self._active_clients:
+            return False
+        self._pending_counts[session_key] = self._pending_counts.get(session_key, 0) + 1
+        await self._active_clients[session_key].query(f"[User message]: {text}")
+        return True
+
+    def has_active_agent(self, feature_id: str) -> bool:
+        """Check if there is an active agent invocation for a feature."""
+        session_key = self._feature_sessions.get(feature_id)
+        return session_key is not None and session_key in self._active_clients
+
+    # ── Session cycling ────────────────────────────────────────────────
+
+    async def _cycle_session(self, session_key: str, role: Role) -> None:
+        """Summarize old messages, keep recent ones, clear the session."""
+        messages = self._session_messages.get(session_key, [])
+        keep_recent = role.metadata.get("keep_recent_messages", 6)
+
+        if len(messages) <= keep_recent:
+            # Nothing old to summarize — just clear the session
+            if self.session_store:
+                await self.session_store.delete(session_key)
+            return
+
+        old = messages[:-keep_recent]
+        recent = messages[-keep_recent:]
+
+        # Summarize old messages via Haiku
+        summary = ""
+        try:
+            summary = await self._summarize(old)
+        except Exception:
+            logger.warning("Summarization failed — proceeding without summary", exc_info=True)
+
+        # Build compressed context
+        parts: list[str] = []
+        if summary:
+            parts.append(f"## Prior Conversation Summary\n\n{summary}")
+        if recent:
+            parts.append("## Recent Messages\n\n" + "\n\n".join(recent))
+        self._session_context[session_key] = "\n\n".join(parts)
+
+        # Reset message buffer to recent only
+        self._session_messages[session_key] = list(recent)
+
+        # Clear the SDK session so the next invoke starts fresh
+        if self.session_store:
+            await self.session_store.delete(session_key)
+
+        logger.info(
+            "Cycled session %s: summarized %d old messages, kept %d recent",
+            session_key, len(old), len(recent),
+        )
+
+    async def _summarize(self, messages: list[str]) -> str:
+        """Use Haiku to summarize conversation history."""
+        from claude_agent_sdk import ClaudeSDKClient, ClaudeAgentOptions
+        from claude_agent_sdk.types import ResultMessage
+
+        text = "\n\n---\n\n".join(messages)
+        prompt = (
+            "Summarize this conversation between an AI agent and a user. "
+            "Capture: key decisions made, user preferences expressed, "
+            "current state of the work, and any constraints established. "
+            "For any files or artifacts mentioned, preserve their file paths "
+            "so the agent can re-read them. "
+            "Do NOT reproduce artifact content — just reference the paths. "
+            "Be concise but preserve all decision-relevant information.\n\n"
+            f"{text}"
+        )
+        options = ClaudeAgentOptions(
+            model="claude-haiku-4-5-20251001",
+            system_prompt="You are a conversation summarizer. Output only the summary.",
+        )
+        async with ClaudeSDKClient(options=options) as client:
+            await client.query(prompt)
+            result = None
+            async for msg in client.receive_response():
+                if isinstance(msg, ResultMessage):
+                    result = msg
+            return result.result if result else ""
 
     def _build_options(
         self,

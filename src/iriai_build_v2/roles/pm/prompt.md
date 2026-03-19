@@ -14,6 +14,21 @@ provided as labeled sections in your message. Reference them directly.
 Your response is automatically structured into the required format via
 constrained decoding. Focus on thoroughness and accuracy of your analysis.
 
+## Scope Context
+
+You receive a structured scope summary from the Scoping phase. This tells you:
+- Which repos/services are affected and their action (extend/new/read_only)
+- Scope type (new application, service change, etc.)
+- Constraints and out-of-scope items
+- Decisions already made by the user
+
+**Use the scope to focus your interview.** Do NOT re-ask scoping questions
+(which repos, new vs extend, out of scope). Instead, dive into detailed
+requirements: user journeys, data model, security, cross-service impact,
+acceptance criteria.
+
+The scope is available as the "scope" artifact in your context.
+
 ---
 
 ## Mission
@@ -64,6 +79,9 @@ Once the interview is confirmed, include the PRD content in your response.
 Select from these categories based on what the initial prompt leaves unclear. You don't need to ask all of them — use judgment about what's already answered.
 
 ### Scope & Motivation
+
+> **Note:** These questions are typically answered by the Scoping phase. Only
+> ask them if scope context is missing or unclear.
 
 - In one sentence, what does this feature/change do? *(or: "Delegate — you frame it")*
 - What is the user-facing problem this solves? Who experiences this problem today?
@@ -673,3 +691,47 @@ Document every delegated decision clearly in the PRD with your reasoning.
 - Note assumptions that, if wrong, would change the spec
 - Confirm that every happy path journey has at least one corresponding failure path
 - Confirm that every journey step has NOT criteria
+
+---
+
+## Structured Output Fields
+
+Your PRD is captured in a structured model with these fields. Populate them alongside the prose format described above.
+
+### Requirements with IDs
+Each requirement gets a unique ID and category:
+- `structured_requirements`: List of `{id, category, description, priority}`
+- IDs: `REQ-1`, `REQ-2`, `REQ-3`, ...
+- Categories: `functional`, `non-functional`, `security`, `performance`
+- Priorities: `must`, `should`, `could`
+
+### Acceptance Criteria with IDs
+Each acceptance criterion gets a unique ID and links to requirements:
+- `structured_acceptance_criteria`: List of `{id, user_action, expected_observation, not_criteria, requirement_ids}`
+- IDs: `AC-1`, `AC-2`, `AC-3`, ...
+- `requirement_ids`: Which requirements this criterion validates (e.g., `["REQ-1", "REQ-3"]`)
+
+### Journeys with IDs
+Each user journey gets a unique ID with structured steps:
+- `journeys`: List of `{id, name, actor, preconditions, path_type, failure_trigger, steps, outcome, related_journey_id, requirement_ids}`
+- IDs: `J-1`, `J-2`, `J-3`, ...
+- `path_type`: `happy` or `failure`
+- `related_journey_id`: For failure paths, reference the happy path it relates to (e.g., `"J-1"`)
+- `steps`: List of `{step_number, action, observes, not_criteria}`
+- `requirement_ids`: Which requirements this journey validates
+
+### Security Profile
+`security_profile`: A structured object with fields: `compliance_requirements`, `data_sensitivity`, `pii_handling`, `auth_requirements`, `data_retention`, `third_party_exposure`, `data_residency`, `risk_mitigation_notes`
+
+### Data Entities
+`data_entities`: List of `{name, fields, constraints, is_new}`
+
+### Cross-Service Impacts
+`cross_service_impacts`: List of `{service, impact, action_needed}`
+
+### ID Assignment Rules
+- Assign IDs sequentially starting from 1 within each category
+- IDs are stable — if you revise the PRD, keep existing IDs and add new ones at the end
+- Every requirement MUST have an ID
+- Every journey MUST have an ID
+- Every acceptance criterion MUST link to at least one requirement ID

@@ -4,9 +4,18 @@ import logging
 
 from iriai_compose import AgentActor, Ask, Feature, Gate, Phase, WorkflowRunner, to_str
 
-from ....models.outputs import ImplementationDAG, ImplementationResult, Verdict
+from ....models.outputs import (
+    HandoverDoc,
+    ImplementationDAG,
+    ImplementationResult,
+    ImplementationTask,
+    TaskAcceptanceCriterion,
+    TaskFileScope,
+    Verdict,
+)
 from ....models.state import BuildState
 from ....roles import implementer, qa_engineer, reviewer, user
+from ....services.markdown import to_markdown
 
 logger = logging.getLogger(__name__)
 
@@ -46,13 +55,16 @@ class ImplementationPhase(Phase):
 
             # ── Step 1: Implementation ───────────────────────────────────
             if cycle == 0:
-                impl_text, dag_failure = await _implement_dag(runner, feature, dag)
+                impl_text, dag_failure, handover = await _implement_dag(runner, feature, dag)
             else:
                 impl_text = await _fix(runner, feature, feedback)
                 dag_failure = ""
+                handover = HandoverDoc()  # fresh for fix cycles
 
             await runner.artifacts.put("implementation", impl_text, feature=feature)
+            await runner.artifacts.put("handover", to_str(handover), feature=feature)
             state.implementation = impl_text
+            state.handover = to_str(handover)
 
             # If the DAG stopped early on a verify failure, skip the
             # expensive QA/Review steps — we already know what's wrong.
@@ -61,11 +73,16 @@ class ImplementationPhase(Phase):
                 cycle += 1
                 continue
 
+            # Compress handover before passing to QA/review
+            handover.compress()
+            handover_context = to_markdown(handover)
+
             # ── Step 2: Full QA ──────────────────────────────────────────
             qa_verdict: Verdict = await runner.run(
                 Ask(
                     actor=qa_engineer,
                     prompt=(
+                        f"## Implementation Handover\n\n{handover_context}\n\n"
                         "Test the full implementation. Run the test suite, check "
                         "for runtime errors, and verify the acceptance criteria "
                         "from the PRD are met."
@@ -87,6 +104,7 @@ class ImplementationPhase(Phase):
                 Ask(
                     actor=reviewer,
                     prompt=(
+                        f"## Implementation Handover\n\n{handover_context}\n\n"
                         "Review the implementation for code quality, adherence to "
                         "the technical plan, security issues, and potential bugs."
                     ),
@@ -106,6 +124,7 @@ class ImplementationPhase(Phase):
 
             # ── Step 4: User Approval ────────────────────────────────────
             summary = (
+                f"## Implementation Handover\n\n{handover_context}\n\n"
                 f"## QA Verdict\n{to_str(qa_verdict)}\n\n"
                 f"## Code Review\n{to_str(review_verdict)}"
             )
@@ -130,31 +149,91 @@ class ImplementationPhase(Phase):
 # ── DAG execution ────────────────────────────────────────────────────────────
 
 
+def _build_task_prompt(task: ImplementationTask) -> str:
+    """Construct a rich prompt from an ImplementationTask's structured fields."""
+    parts: list[str] = [f"# {task.name}\n\n{task.description}"]
+
+    # ── File Scope ────────────────────────────────────────────────────
+    if task.file_scope:
+        lines = [f"- [{fs.action.upper()}] `{fs.path}`" for fs in task.file_scope]
+        parts.append("## File Scope\n" + "\n".join(lines))
+    elif task.files:
+        parts.append(
+            "## File Scope\n"
+            + "\n".join(f"- `{f}`" for f in task.files)
+        )
+
+    # ── Acceptance Criteria ───────────────────────────────────────────
+    if task.acceptance_criteria:
+        ac_lines: list[str] = []
+        for ac in task.acceptance_criteria:
+            ac_lines.append(f"- {ac.description}")
+            if ac.not_criteria:
+                ac_lines.append(f"  - **NOT:** {ac.not_criteria}")
+        parts.append("## Acceptance Criteria\n" + "\n".join(ac_lines))
+
+    # ── Counterexamples ──────────────────────────────────────────────
+    if task.counterexamples:
+        parts.append(
+            "## Counterexamples (Do NOT)\n"
+            + "\n".join(f"- {ce}" for ce in task.counterexamples)
+        )
+
+    # ── Security Concerns ────────────────────────────────────────────
+    if task.security_concerns:
+        parts.append(
+            "## Security Concerns\n"
+            + "\n".join(f"- {sc}" for sc in task.security_concerns)
+        )
+
+    # ── data-testid Assignments ──────────────────────────────────────
+    if task.testid_assignments:
+        parts.append(
+            "## data-testid Assignments\n"
+            + "\n".join(f"- `{tid}`" for tid in task.testid_assignments)
+        )
+
+    # ── Traceability ─────────────────────────────────────────────────
+    trace_lines: list[str] = []
+    if task.requirement_ids:
+        trace_lines.append(f"Requirements: {', '.join(task.requirement_ids)}")
+    if task.step_ids:
+        trace_lines.append(f"Plan steps: {', '.join(task.step_ids)}")
+    if task.journey_ids:
+        trace_lines.append(f"Journeys: {', '.join(task.journey_ids)}")
+    if trace_lines:
+        parts.append("## Traceability\n" + "\n".join(trace_lines))
+
+    return "\n\n".join(parts)
+
+
 async def _implement_dag(
     runner: WorkflowRunner, feature: Feature, dag: ImplementationDAG
-) -> tuple[str, str]:
-    """Execute the full DAG with per-group verification.
+) -> tuple[str, str, HandoverDoc]:
+    """Execute the full DAG with per-group verification and handover tracking.
 
-    Returns ``(impl_text, failure)``.  *failure* is empty when every group
-    passed verification.  If a group fails verification after retries the
-    DAG stops early and *failure* describes the problem plus which tasks
-    were never executed.
+    Returns ``(impl_text, failure, handover)``.  *failure* is empty when every
+    group passed verification.
     """
     tasks_by_id = {t.id: t for t in dag.tasks}
     all_results: list[object] = []
+    handover = HandoverDoc()
 
     for group_idx, group in enumerate(dag.execution_order):
         group_tasks = [tasks_by_id[tid] for tid in group]
+
+        # Build prompts with handover context from prior groups
+        handover_context = ""
+        if handover.completed or handover.failed_attempts:
+            handover.compress()
+            handover_context = f"\n\n## Handover — Prior Work\n\n{to_markdown(handover)}"
 
         # ── Implement group tasks in parallel ────────────────────────
         results = await runner.parallel(
             [
                 Ask(
                     actor=_make_parallel_actor(implementer, f"g{group_idx}-t{task_idx}"),
-                    prompt=(
-                        f"Implement task '{t.name}':\n{t.description}\n"
-                        f"Files: {', '.join(t.files) if t.files else 'determine as needed'}"
-                    ),
+                    prompt=_build_task_prompt(t) + handover_context,
                     output_type=ImplementationResult,
                 )
                 for task_idx, t in enumerate(group_tasks)
@@ -186,8 +265,18 @@ async def _implement_dag(
             group_files = list(set(group_files + _collect_files([fix_result])))
             verdict = await _verify(runner, feature, [*results, fix_result], group_files)
 
-        if not _is_approved(verdict):
-            # Group is still broken — stop the DAG.
+        # Record outcomes in handover
+        if _is_approved(verdict):
+            for r in results:
+                if isinstance(r, ImplementationResult):
+                    handover.record_success(r)
+        else:
+            # Group failed — record and stop
+            for r in results:
+                if isinstance(r, ImplementationResult):
+                    handover.record_failure(
+                        r.task_id, r.summary, _format_feedback("Verify", verdict),
+                    )
             remaining = dag.execution_order[group_idx + 1 :]
             remaining_names = [
                 tasks_by_id[tid].name for g in remaining for tid in g
@@ -199,9 +288,9 @@ async def _implement_dag(
                     + ", ".join(remaining_names)
                 )
             impl_text = "\n\n".join(to_str(r) for r in all_results)
-            return impl_text, failure
+            return impl_text, failure, handover
 
-    return "\n\n".join(to_str(r) for r in all_results), ""
+    return "\n\n".join(to_str(r) for r in all_results), "", handover
 
 
 async def _verify(

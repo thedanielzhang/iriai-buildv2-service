@@ -1,6 +1,37 @@
 from __future__ import annotations
 
+from typing import Any, ClassVar
+
 from iriai_compose import AgentActor, InteractionActor
+
+_ENVELOPE_INSTRUCTIONS = """\
+
+## Structured Output Format
+
+Your responses use the Envelope format with these fields:
+- `question`: Your next question for the user (set this while interviewing)
+- `options`: Optional suggested answers for the user to choose from
+- `output`: The final artifact (set this ONLY when the interview is complete and confirmed)
+  - Must include `complete: true` when the artifact is finalized
+  - Leave as null while still gathering information
+
+**Rules:**
+- During the interview: set `question`, leave `output` as null
+- After user confirms your summary: set `output` with the full artifact and `complete: true`
+- NEVER set `output` while still asking questions — this terminates the interview immediately
+"""
+
+
+class InterviewActor(AgentActor):
+    """AgentActor for interview phases. Appends Envelope usage instructions to the role prompt."""
+
+    _envelope_instructions: ClassVar[str] = _ENVELOPE_INSTRUCTIONS
+
+    def model_post_init(self, __context: Any) -> None:
+        super().model_post_init(__context)
+        self.role = self.role.model_copy(update={
+            "prompt": self.role.prompt + self._envelope_instructions,
+        })
 
 # ── Role imports ────────────────────────────────────────────────────────────
 from .pm import role as pm_role
@@ -32,6 +63,7 @@ from .release_manager import role as release_manager_role
 from .documentation import role as documentation_role
 from .ui_designer import role as ui_designer_role
 from .ux_designer import role as ux_designer_role
+from .scoper import role as scoper_role
 from .bug_interviewer import role as bug_interviewer_role
 from .bug_reproducer import role as bug_reproducer_role
 from .root_cause_analyst import role as root_cause_analyst_role
@@ -43,9 +75,10 @@ qa_engineer_role = smoke_tester_role
 reviewer_role = code_reviewer_role
 
 # ── Actors ──────────────────────────────────────────────────────────────────
-pm = AgentActor(name="pm", role=pm_role, context_keys=["project"])
-designer = AgentActor(name="designer", role=designer_role, context_keys=["project", "prd"])
-architect = AgentActor(
+scoper = InterviewActor(name="scoper", role=scoper_role, context_keys=["project"])
+pm = InterviewActor(name="pm", role=pm_role, context_keys=["project", "scope"])
+designer = InterviewActor(name="designer", role=designer_role, context_keys=["project", "prd"])
+architect = InterviewActor(
     name="architect",
     role=architect_role,
     context_keys=["project", "prd", "design"],
@@ -59,22 +92,22 @@ plan_compiler = AgentActor(
 plan_completeness_reviewer = AgentActor(
     name="plan-completeness-reviewer",
     role=plan_compiler_role,
-    context_keys=["plan", "prd", "design"],
+    context_keys=["plan", "prd", "design", "system-design"],
 )
 plan_security_reviewer = AgentActor(
     name="plan-security-reviewer",
     role=plan_compiler_role,
-    context_keys=["plan", "prd", "design"],
+    context_keys=["plan", "prd", "design", "system-design"],
 )
-planning_lead = AgentActor(
+planning_lead = InterviewActor(
     name="planning-lead",
     role=planning_lead_role,
-    context_keys=["project", "plan", "prd", "design"],
+    context_keys=["project", "plan", "prd", "design", "system-design"],
 )
 feature_lead = AgentActor(
     name="feature-lead",
     role=feature_lead_role,
-    context_keys=["project", "plan", "prd", "design"],
+    context_keys=["project", "plan", "prd", "design", "system-design"],
 )
 orchestrator = AgentActor(
     name="orchestrator",

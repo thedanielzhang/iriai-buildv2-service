@@ -1,14 +1,15 @@
 from iriai_compose import Role
 
 from .._loader import load_prompt
-from ...config import BUDGET_TIERS, mcp_servers_for
+from ...config import BUDGET_TIERS
 
 role = Role(
     name="ux-designer",
     prompt=load_prompt(__file__),
-    tools=["Read", "Glob", "Grep"],
-    model=BUDGET_TIERS["opus"],
+    tools=["Read", "Write", "Edit", "Glob", "Grep"],
+    model=BUDGET_TIERS["opus_1m"],
     metadata={
-        "mcp_servers": mcp_servers_for("qa-feedback"),
+        "max_session_chars": 600_000,
+        "keep_recent_messages": 6,
     },
 )

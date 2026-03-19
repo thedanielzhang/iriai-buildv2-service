@@ -6,6 +6,6 @@ from ...config import BUDGET_TIERS
 role = Role(
     name="analytics-engineer",
     prompt=load_prompt(__file__),
-    tools=["Read", "Bash", "Glob", "Grep"],
+    tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep"],
     model=BUDGET_TIERS["opus"],
 )

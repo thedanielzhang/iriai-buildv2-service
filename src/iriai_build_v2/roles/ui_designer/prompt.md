@@ -145,7 +145,7 @@ The Visual Design Language section must include:
 
 ### Step 5: Create HTML/CSS Mockup (MANDATORY)
 
-Create a **static HTML/CSS mockup** that visualizes the UX Designer's decisions with your visual design language applied. Write mockup HTML and use `start_doc_review` MCP tool to host it for review.
+Create a **static HTML/CSS mockup** that visualizes the UX Designer's decisions with your visual design language applied. Write the mockup as `mockup.html` in the **outputs directory** specified in your project context (`outputs_path`). The workflow will automatically host it for browser review.
 
 **Requirements:**
 - Self-contained single HTML file with embedded CSS (and minimal JS if needed for interactivity like tabs or modals)

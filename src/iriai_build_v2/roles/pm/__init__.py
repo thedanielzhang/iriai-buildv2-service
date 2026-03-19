@@ -7,5 +7,9 @@ role = Role(
     name="product-manager",
     prompt=load_prompt(__file__),
     tools=["Read", "Glob", "Grep"],
-    model=BUDGET_TIERS["opus"],
+    model=BUDGET_TIERS["opus_1m"],
+    metadata={
+        "max_session_chars": 800_000,
+        "keep_recent_messages": 6,
+    },
 )

@@ -90,7 +90,7 @@ Before writing design decisions, conduct a **structured interview** to fully und
 
 ### Step 4: Create HTML/CSS Mockup (MANDATORY)
 
-Before writing design decisions, create a **static HTML/CSS mockup** that visually demonstrates the key UI layout and interactions you are proposing. Write mockup HTML and use `start_doc_review` MCP tool to host it for review.
+Before writing design decisions, create a **static HTML/CSS mockup** that visually demonstrates the key UI layout and interactions you are proposing. Write the mockup as `mockup.html` in the **outputs directory** specified in your project context (`outputs_path`). The workflow will automatically host it for browser review.
 
 **Requirements:**
 - Self-contained single HTML file with embedded CSS (and minimal JS if needed for interactivity like tabs or modals)
@@ -295,3 +295,40 @@ PageLayout
 | **Verifiable states are semantically described** | Every state description must be specific enough for the Architect to derive a test identifier — no vague descriptions |
 | **Design system is complete** | Every component is listed as new or extending, with props/variants/states defined |
 | **Component library in mockup** | mockup.html must include a Component Library section showing each component in isolation with all states |
+
+---
+
+## Structured Output Fields
+
+Your design decisions are captured in a structured model. Populate these fields alongside the prose format described above.
+
+### Referencing PRD Artifacts (Input)
+Your context includes the PRD with structured IDs. When creating your output:
+- Reference journey IDs (`J-1`, `J-2`, ...) from the PRD's `journeys` field when annotating journeys
+- Reference requirement IDs (`REQ-1`, ...) from the PRD's `structured_requirements` for traceability
+
+### Component Definitions with IDs
+Each component gets a unique ID:
+- `component_defs`: List of `{id, name, status, location, description, props_variants, states}`
+- IDs: `CMP-1`, `CMP-2`, `CMP-3`, ...
+- `status`: `new` (does not exist in codebase) or `extending` (modifying existing component)
+- `location`: File path if extending an existing component
+- `props_variants`: String describing variants (e.g., `"primary | secondary | danger"`)
+- `states`: List of state names (e.g., `["empty", "loading", "error", "success"]`)
+
+### Verifiable States
+- `verifiable_states`: List of `{component_id, state_name, visual_description}`
+- `component_id`: References a component ID from `component_defs` (e.g., `"CMP-1"`)
+- Each state must be described with enough specificity for the Architect to derive a test identifier
+
+### Journey UX Annotations
+- `journey_annotations`: List of `{journey_id, step_annotations, error_path_ux, empty_state_ux, not_criteria}`
+- `journey_id`: References a PRD journey ID (e.g., `"J-1"`)
+- `step_annotations`: List of per-step UX annotation strings
+- Do NOT rewrite the journey steps — reference them by journey ID and annotate with UX decisions
+
+### ID Assignment Rules
+- Assign component IDs sequentially: `CMP-1`, `CMP-2`, ...
+- IDs are stable across revisions
+- Every journey annotation MUST reference a valid PRD journey ID
+- Every verifiable state MUST reference a valid component ID

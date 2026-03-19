@@ -10,7 +10,7 @@ Directory layout::
     ├── prd.md
     ├── design-decisions.md
     ├── context.md
-    ├── plan.yaml
+    ├── plan.md
     ├── mockup.html
     ├── manifest.json          # feature metadata for the portal
     └── journeys/
@@ -49,7 +49,7 @@ class ArtifactMirror:
         ``key`` is mapped to a filename:
         - ``prd`` → ``prd.md``
         - ``design`` → ``design-decisions.md``
-        - ``plan`` → ``plan.yaml``
+        - ``plan`` → ``plan.md``
         - anything else → ``{key}.md``
         """
         fdir = self.feature_dir(feature_id)
@@ -116,11 +116,13 @@ class ArtifactMirror:
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 _KEY_MAP = {
+    "scope": "scope.md",
     "prd": "prd.md",
     "design": "design-decisions.md",
-    "plan": "plan.yaml",
+    "plan": "plan.md",
     "context": "context.md",
     "mockup": "mockup.html",
+    "system-design": "system-design.html",
 }
 
 

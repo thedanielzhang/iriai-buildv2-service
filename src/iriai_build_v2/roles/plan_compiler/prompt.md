@@ -228,3 +228,47 @@ gaps:
 
 - **If PASS or PASS_WITH_WARNINGS:** Set `approved: true` and include the full report.
 - **If FAIL:** Set `approved: false` and include the full report. The framework will present the failures to the user alongside the plan for their decision.
+
+---
+
+## ID-Based Coverage Validation
+
+With structured IDs, you can now validate coverage by comparing ID sets rather than parsing prose.
+
+### Requirement → Step Coverage
+```
+prd_requirement_ids = {r.id for r in prd.structured_requirements}
+step_covered_ids = union of step.requirement_ids across all plan.steps
+uncovered = prd_requirement_ids - step_covered_ids
+```
+If any requirement IDs are uncovered, this is a **blocker**.
+
+### Journey → Verification Coverage
+```
+prd_journey_ids = {j.id for j in prd.journeys}
+verified_ids = {jv.journey_id for jv in plan.journey_verifications}
+unverified = prd_journey_ids - verified_ids
+```
+If any journey IDs lack verification, this is a **warning** (failure paths may not need full verification).
+
+### Step → Task Coverage (when validating DAG)
+```
+all_step_ids = {s.id for s in plan.steps}
+task_covered_ids = union of task.step_ids across all dag.tasks
+uncovered_steps = all_step_ids - task_covered_ids
+```
+If any step IDs are uncovered by tasks, this is a **blocker**.
+
+### DAG Requirement Coverage
+```
+dag.requirement_coverage should contain every PRD requirement ID as a key
+Every value should contain at least one valid task ID
+```
+
+### SystemDesign Structural Validation
+- Every `service_id` in `connections`, `api_endpoints`, `call_paths`, and `entities` must resolve to a service in `services`
+- Every `from_entity` and `to_entity` in `entity_relations` must resolve to an entity in `entities`
+- Every `journey_id` in `call_paths`, `services`, and `entities` must reference a valid PRD journey ID
+- Every `from_service` and `to_service` in call path steps must reference valid service IDs
+
+Add these as structured checks in your validation report.

@@ -14,8 +14,11 @@ dependencies = [
     "pytest-json-report>=1.5",
 ]
 
+[project.optional-dependencies]
+slack = ["slack-sdk>=3.26", "aiohttp>=3.9"]
+
 [project.scripts]
-iriai-build-v2 = "iriai_build_v2.cli:main"
+iriai-build-v2 = "iriai_build_v2.interfaces.cli.app:main"
 
 [build-system]
 requires = ["hatchling"]

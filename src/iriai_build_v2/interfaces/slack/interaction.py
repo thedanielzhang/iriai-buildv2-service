@@ -1,0 +1,412 @@
+"""SlackInteractionRuntime: bridges iriai-compose interaction tasks to Slack.
+
+All user interactions are self-contained within Block Kit cards — buttons for
+choices, inline text inputs for quick answers, and an Expand button that opens
+a modal for longer responses. No "reply in channel" patterns.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+from typing import TYPE_CHECKING, Any
+
+from iriai_compose.runner import InteractionRuntime
+
+from .cards import ApproveCard, ChooseCard, RespondCard, build_modal_view
+from .helpers import build_resolved_blocks
+
+if TYPE_CHECKING:
+    from iriai_compose.pending import Pending
+
+    from .adapter import SlackAdapter
+
+logger = logging.getLogger(__name__)
+
+
+class SlackInteractionRuntime(InteractionRuntime):
+    """Resolves interaction requests via Slack Block Kit cards.
+
+    Card designs:
+    - Respond: question text + option buttons + inline text input + Expand
+    - Approve: context + Approve/Reject + inline feedback + Expand
+    - Choose: question + one button per option
+    """
+
+    name = "terminal"  # matches user actor's resolver="terminal"
+
+    def __init__(self, adapter: SlackAdapter) -> None:
+        self._adapter = adapter
+
+        # pending_id → Future
+        self._pending_futures: dict[str, asyncio.Future] = {}
+        # pending_id → options list (for mapping button index → text)
+        self._pending_options: dict[str, list[str]] = {}
+        # pending_id → (channel, message_ts) for updating card on resolution
+        self._pending_messages: dict[str, tuple[str, str]] = {}
+        # feature_id ↔ channel bidirectional mapping
+        self._feature_channels: dict[str, str] = {}
+        self._channel_features: dict[str, str] = {}
+
+    # ── Channel Registration ──────────────────────────────────────────────
+
+    def register_channel(self, feature_id: str, channel: str) -> None:
+        self._feature_channels[feature_id] = channel
+        self._channel_features[channel] = feature_id
+
+    def unregister_channel(self, feature_id: str) -> None:
+        channel = self._feature_channels.pop(feature_id, None)
+        if channel:
+            self._channel_features.pop(channel, None)
+
+    def has_pending(self, channel: str) -> bool:
+        """Check if any pending interaction exists for this channel's feature."""
+        feature_id = self._channel_features.get(channel)
+        if not feature_id:
+            return False
+        return any(
+            pid.endswith(f"_{feature_id}") or feature_id in pid
+            for pid in self._pending_futures
+        )
+
+    # ── InteractionRuntime.resolve() ──────────────────────────────────────
+
+    async def resolve(self, pending: Pending) -> str | bool:
+        channel = self._feature_channels.get(pending.feature_id)
+        if not channel:
+            raise RuntimeError(
+                f"No Slack channel registered for feature {pending.feature_id}"
+            )
+
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[str | bool] = loop.create_future()
+        self._pending_futures[pending.id] = future
+
+        if pending.kind == "approve":
+            await self._post_approve(pending, channel)
+        elif pending.kind == "choose":
+            await self._post_choose(pending, channel)
+        else:  # respond
+            await self._post_respond(pending, channel)
+
+        try:
+            result = await future
+        finally:
+            self._pending_futures.pop(pending.id, None)
+            self._pending_options.pop(pending.id, None)
+            self._pending_messages.pop(pending.id, None)
+
+        return result
+
+    # ── Inbound Event Handlers ────────────────────────────────────────────
+
+    async def handle_action(self, body: dict, action: dict) -> None:
+        """Route button clicks, inline text input, and dropdown selections."""
+        action_id = action.get("action_id", "")
+        trigger_id = body.get("trigger_id", "")
+        channel = body.get("channel", {}).get("id", "")
+        message_ts = body.get("message", {}).get("ts", "")
+        user_id = body.get("user", {}).get("id", "")
+
+        if action_id.startswith("respond_"):
+            await self._handle_respond_action(
+                action_id, action, trigger_id, channel, message_ts, user_id
+            )
+        elif action_id.startswith("gate_"):
+            await self._handle_gate_action(
+                action_id, action, trigger_id, channel, message_ts, user_id
+            )
+        elif action_id.startswith("choose_"):
+            await self._handle_choose_action(
+                action_id, action, channel, message_ts, user_id
+            )
+        elif action_id.startswith("decision_"):
+            # Backward compat: orchestrator mode selection uses decision_ prefix
+            await self._handle_legacy_decision(
+                action_id, action, trigger_id, channel, message_ts, user_id
+            )
+
+    async def handle_view_submission(self, payload: dict) -> None:
+        """Handle modal form submissions."""
+        view = payload.get("view", {})
+        pending_id = view.get("private_metadata", "")
+        user_id = payload.get("user", {}).get("id", "")
+
+        # Extract text from the modal input
+        values = view.get("state", {}).get("values", {})
+        reply_block = values.get("reply_block", {})
+        reply_input = reply_block.get("reply_input", {})
+        text = reply_input.get("value", "")
+
+        if pending_id and text:
+            self._resolve_pending(pending_id, text, label=text[:50], user_id=user_id)
+
+    async def handle_message(self, event: dict) -> None:
+        """No-op: all interactions must go through cards, not channel messages.
+
+        The orchestrator calls this when a pending card is active, but per
+        the self-contained card design, we do not resolve from channel messages.
+        """
+
+    # ── Respond Card Actions ─────────────────────────────────────────────
+
+    async def _handle_respond_action(
+        self,
+        action_id: str,
+        action: dict,
+        trigger_id: str,
+        channel: str,
+        message_ts: str,
+        user_id: str,
+    ) -> None:
+        # respond_{pid}_opt_{idx}
+        if "_opt_" in action_id:
+            parts = action_id.rsplit("_opt_", 1)
+            pending_id = parts[0][len("respond_"):]
+            try:
+                idx = int(parts[1])
+            except (ValueError, IndexError):
+                return
+            options = self._pending_options.get(pending_id, [])
+            if 0 <= idx < len(options):
+                self._resolve_pending(
+                    pending_id, options[idx], label=options[idx][:50], user_id=user_id
+                )
+            return
+
+        # respond_{pid}_reply — open modal for free-form text input
+        if action_id.endswith("_reply"):
+            pending_id = action_id[len("respond_"):-len("_reply")]
+            if trigger_id:
+                view = build_modal_view(pending_id, "Reply")
+                await self._adapter.open_modal(trigger_id, view)
+            return
+
+        # respond_{pid}_select — dropdown selection
+        if action_id.endswith("_select"):
+            pending_id = action_id[len("respond_"):-len("_select")]
+            selected = action.get("selected_option", {})
+            try:
+                idx = int(selected.get("value", ""))
+            except (ValueError, TypeError):
+                return
+            options = self._pending_options.get(pending_id, [])
+            if 0 <= idx < len(options):
+                self._resolve_pending(
+                    pending_id, options[idx], label=options[idx][:50], user_id=user_id
+                )
+
+    # ── Gate Card Actions ────────────────────────────────────────────────
+
+    async def _handle_gate_action(
+        self,
+        action_id: str,
+        action: dict,
+        trigger_id: str,
+        channel: str,
+        message_ts: str,
+        user_id: str,
+    ) -> None:
+        # gate_{pid}_approve
+        if action_id.endswith("_approve"):
+            pending_id = action_id[len("gate_"):-len("_approve")]
+            self._resolve_pending(pending_id, True, label="Approved", user_id=user_id)
+            return
+
+        # gate_{pid}_reject
+        if action_id.endswith("_reject"):
+            pending_id = action_id[len("gate_"):-len("_reject")]
+            self._resolve_pending(pending_id, False, label="Rejected", user_id=user_id)
+            return
+
+        # gate_{pid}_feedback — open feedback modal
+        if action_id.endswith("_feedback"):
+            pending_id = action_id[len("gate_"):-len("_feedback")]
+            if trigger_id:
+                view = build_modal_view(pending_id, "Feedback")
+                await self._adapter.open_modal(trigger_id, view)
+
+    # ── Choose Card Actions ──────────────────────────────────────────────
+
+    async def _handle_choose_action(
+        self,
+        action_id: str,
+        action: dict,
+        channel: str,
+        message_ts: str,
+        user_id: str,
+    ) -> None:
+        # choose_{pid}_opt_{idx}
+        if "_opt_" in action_id:
+            parts = action_id.rsplit("_opt_", 1)
+            pending_id = parts[0][len("choose_"):]
+            try:
+                idx = int(parts[1])
+            except (ValueError, IndexError):
+                return
+            options = self._pending_options.get(pending_id, [])
+            if 0 <= idx < len(options):
+                self._resolve_pending(
+                    pending_id, options[idx], label=options[idx][:50], user_id=user_id
+                )
+
+    # ── Legacy Decision Actions (backward compat) ────────────────────────
+
+    async def _handle_legacy_decision(
+        self,
+        action_id: str,
+        action: dict,
+        trigger_id: str,
+        channel: str,
+        message_ts: str,
+        user_id: str,
+    ) -> None:
+        """Handle decision_{id}_{option} format used by orchestrator mode selection."""
+        parts = action_id.split("_", 2)
+        if len(parts) < 3:
+            return
+        pending_id = parts[1]
+        option_id = parts[2]
+
+        if option_id == "approve":
+            self._resolve_pending(pending_id, True, label="Approved", user_id=user_id)
+        elif option_id == "reject":
+            self._resolve_pending(pending_id, False, label="Rejected", user_id=user_id)
+        elif option_id == "feedback":
+            if trigger_id:
+                view = build_modal_view(pending_id, "Feedback")
+                await self._adapter.open_modal(trigger_id, view)
+        else:
+            self._resolve_pending(pending_id, option_id, label=option_id, user_id=user_id)
+
+    # ── Post Helpers ──────────────────────────────────────────────────────
+
+    async def _post_respond(self, pending: Pending, channel: str) -> None:
+        """Post an Interview question card with options + inline text input + Expand."""
+        question, options = _extract_question(pending.prompt)
+        card = RespondCard(
+            pending_id=pending.id,
+            phase_name=pending.phase_name,
+            question=question,
+            options=options,
+        )
+        blocks = card.build_blocks()
+        ts = await self._adapter.post_blocks(channel, blocks, question[:100])
+        self._pending_messages[pending.id] = (channel, ts)
+        if options:
+            self._pending_options[pending.id] = options
+
+    async def _post_approve(self, pending: Pending, channel: str) -> None:
+        """Post a Gate approval card with buttons + feedback modal."""
+        prompt = pending.prompt
+        # Extract artifact name and review URL from the prompt
+        artifact_name, review_url = _extract_gate_info(prompt)
+        card = ApproveCard(
+            pending_id=pending.id,
+            title="Approval Required",
+            context=artifact_name,
+            review_url=review_url,
+        )
+        blocks = card.build_blocks()
+        ts = await self._adapter.post_blocks(channel, blocks, "Approval Required")
+        self._pending_messages[pending.id] = (channel, ts)
+
+    async def _post_choose(self, pending: Pending, channel: str) -> None:
+        """Post a Choose selection card with one button per option."""
+        question, _ = _extract_question(pending.prompt)
+        options_list = pending.options or []
+        card = ChooseCard(
+            pending_id=pending.id,
+            title="Selection Required",
+            question=question,
+            options=options_list,
+        )
+        blocks = card.build_blocks()
+        ts = await self._adapter.post_blocks(channel, blocks, question[:100])
+        self._pending_messages[pending.id] = (channel, ts)
+        if options_list:
+            self._pending_options[pending.id] = options_list
+
+    # ── Internal ──────────────────────────────────────────────────────────
+
+    def _resolve_pending(
+        self,
+        pending_id: str,
+        value: str | bool,
+        *,
+        label: str = "",
+        user_id: str = "",
+    ) -> None:
+        """Resolve a pending Future and update the card to resolved state."""
+        future = self._pending_futures.get(pending_id)
+        if future and not future.done():
+            future.set_result(value)
+
+        # Update card to resolved state
+        msg_info = self._pending_messages.get(pending_id)
+        if msg_info:
+            channel, ts = msg_info
+            display = label or (
+                str(value)
+                if isinstance(value, str)
+                else ("Approved" if value else "Rejected")
+            )
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(self._update_to_resolved(channel, ts, display, user_id))
+            except RuntimeError:
+                pass
+
+    async def _update_to_resolved(
+        self, channel: str, ts: str, display: str, user_id: str
+    ) -> None:
+        """Replace the card with a resolved-state block."""
+        try:
+            blocks = build_resolved_blocks("Response", display, user_id)
+            await self._adapter.update_message(channel, ts, blocks=blocks, text=f"Resolved: {display}")
+        except Exception:
+            logger.exception("Failed to update card to resolved state")
+
+
+def _extract_gate_info(prompt: str) -> tuple[str, str | None]:
+    """Extract artifact name and review URL from a Gate prompt.
+
+    Gate prompts look like: ``"PRD\\nReview in browser: https://...:\\n\\n{full text}\\n\\nApprove?"``
+    Returns ``(artifact_name, review_url_or_None)``.
+    """
+    import re
+
+    # Extract review URL if present
+    url_match = re.search(r"Review in browser:\s*(https?://\S+)", prompt)
+    review_url = url_match.group(1).rstrip(":") if url_match else None
+
+    # Extract artifact name from the first line (before any newline or colon)
+    first_line = prompt.split("\n", 1)[0].rstrip(":")
+    # Strip "Review in browser: ..." suffix if on the same line
+    if "Review in browser:" in first_line:
+        first_line = first_line.split("Review in browser:")[0].strip().rstrip(":")
+
+    return first_line or "Artifact", review_url
+
+
+def _extract_question(prompt: str) -> tuple[str, list[str]]:
+    """Parse prompt that may be JSON with question/options fields.
+
+    Mirrors iriai_compose/runtimes/terminal.py:_display_prompt.
+    Returns (question_text, options_list).
+    """
+    try:
+        data = json.loads(prompt)
+    except (json.JSONDecodeError, TypeError):
+        return prompt, []
+
+    if not isinstance(data, dict):
+        return prompt, []
+
+    question = data.get("question")
+    if not question:
+        return prompt, []
+
+    options = data.get("options", [])
+    return question, options if isinstance(options, list) else []

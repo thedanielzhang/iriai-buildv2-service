@@ -7,6 +7,10 @@ role = Role(
     name="software-architect",
     prompt=load_prompt(__file__),
     tools=["Read", "Glob", "Grep", "Bash"],
-    model=BUDGET_TIERS["opus"],
-    metadata={"mcp_servers": mcp_servers_for("context7")},
+    model=BUDGET_TIERS["opus_1m"],
+    metadata={
+        "mcp_servers": mcp_servers_for("context7"),
+        "max_session_chars": 800_000,
+        "keep_recent_messages": 6,
+    },
 )

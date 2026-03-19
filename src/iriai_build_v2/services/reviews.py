@@ -9,16 +9,27 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import re
 import signal
 import socket
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import shutil
+
+logger = logging.getLogger(__name__)
+
 from ..config import IRIAI_ROOT
 
-FEEDBACK_CLI = IRIAI_ROOT / "iriai-feedback" / "bin" / "iriai-feedback"
+_HARDCODED_CLI = IRIAI_ROOT / "iriai-feedback" / "bin" / "iriai-feedback"
+_RESOLVED_CLI = shutil.which("iriai-feedback")
+FEEDBACK_CLI = Path(_RESOLVED_CLI) if _RESOLVED_CLI else _HARDCODED_CLI
 PORT_RANGE = range(9001, 9021)
+_SESSIONS_DIR = Path.home() / ".qa-feedback" / "sessions"
+
+_FEEDBACK_SESSION_RE = re.compile(r"session (qs_[a-f0-9]{12})")
 
 
 @dataclass
@@ -27,6 +38,7 @@ class ReviewSession:
     url: str
     port: int
     kind: str  # "doc_review" | "qa_session" | "mockup_review"
+    feedback_session_id: str | None = None
     process: asyncio.subprocess.Process | None = field(
         default=None, repr=False
     )
@@ -55,11 +67,60 @@ class ReviewSessionManager:
         self._next_id += 1
         return sid
 
+    @staticmethod
+    async def _read_feedback_session_id(
+        process: asyncio.subprocess.Process,
+    ) -> str | None:
+        """Read up to 2 lines from subprocess stdout to extract the qs_ ID."""
+        if not process.stdout:
+            return None
+        try:
+            for _ in range(2):
+                line_bytes = await asyncio.wait_for(
+                    process.stdout.readline(), timeout=5.0
+                )
+                if not line_bytes:
+                    break
+                match = _FEEDBACK_SESSION_RE.search(line_bytes.decode())
+                if match:
+                    return match.group(1)
+        except (asyncio.TimeoutError, UnicodeDecodeError):
+            pass
+        return None
+
+    @staticmethod
+    def _list_session_ids() -> set[str]:
+        """Snapshot existing qs_* session directory names from disk."""
+        if not _SESSIONS_DIR.is_dir():
+            return set()
+        return {
+            e.name for e in _SESSIONS_DIR.iterdir()
+            if e.is_dir() and e.name.startswith("qs_")
+        }
+
+    @staticmethod
+    def _find_new_session_on_disk(port: int, known: set[str]) -> str | None:
+        """Find a new qs_* session on disk (not in *known*) matching *port*."""
+        if not _SESSIONS_DIR.is_dir():
+            return None
+        for entry in _SESSIONS_DIR.iterdir():
+            if not entry.is_dir() or entry.name in known or not entry.name.startswith("qs_"):
+                continue
+            session_file = entry / "session.json"
+            try:
+                data = json.loads(session_file.read_text())
+                if data.get("qa_port") == port:
+                    return entry.name
+            except (json.JSONDecodeError, OSError):
+                continue
+        return None
+
     async def start_doc_review(
         self,
         doc_path: str | Path,
         *,
         title: str | None = None,
+        base_path: str = "/doc-review",
     ) -> ReviewSession:
         """Start a document review session for a markdown/HTML file."""
         port = self._allocate_port()
@@ -71,9 +132,13 @@ class ReviewSessionManager:
             str(doc_path),
             "--port",
             str(port),
+            "--base-path",
+            base_path,
         ]
         if title:
             args.extend(["--title", title])
+
+        known_sessions = self._list_session_ids()
 
         process = await asyncio.create_subprocess_exec(
             *args,
@@ -81,17 +146,25 @@ class ReviewSessionManager:
             stderr=asyncio.subprocess.PIPE,
         )
 
+        feedback_id = await self._read_feedback_session_id(process)
+        if not feedback_id:
+            # Stdout timed out — session file should be on disk by now
+            feedback_id = self._find_new_session_on_disk(port, known_sessions)
+
+        if feedback_id:
+            logger.warning("[diag] session %s: feedback_session_id=%s", sid, feedback_id)
+        else:
+            logger.warning("[diag] session %s: FAILED to capture feedback_session_id", sid)
+
         session = ReviewSession(
             session_id=sid,
-            url=f"http://localhost:{port}",
+            url=f"http://localhost:{port}{base_path}",
             port=port,
             kind="doc_review",
+            feedback_session_id=feedback_id,
             process=process,
         )
         self._sessions[sid] = session
-
-        # Brief wait for server to bind
-        await asyncio.sleep(0.5)
         return session
 
     async def start_qa_session(
@@ -114,22 +187,32 @@ class ReviewSessionManager:
         if context:
             args.extend(["--context", context])
 
+        known_sessions = self._list_session_ids()
+
         process = await asyncio.create_subprocess_exec(
             *args,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
 
+        feedback_id = await self._read_feedback_session_id(process)
+        if not feedback_id:
+            feedback_id = self._find_new_session_on_disk(port, known_sessions)
+
+        if feedback_id:
+            logger.warning("[diag] session %s: feedback_session_id=%s", sid, feedback_id)
+        else:
+            logger.warning("[diag] session %s: FAILED to capture feedback_session_id", sid)
+
         session = ReviewSession(
             session_id=sid,
             url=f"http://localhost:{port}",
             port=port,
             kind="qa_session",
+            feedback_session_id=feedback_id,
             process=process,
         )
         self._sessions[sid] = session
-
-        await asyncio.sleep(0.5)
         return session
 
     async def start_mockup_review(
@@ -143,27 +226,37 @@ class ReviewSessionManager:
         return await self.start_doc_review(html_path, title=title)
 
     async def collect_feedback(self, session_id: str) -> list[dict[str, Any]]:
-        """Collect annotations from an active session via the MCP."""
+        """Collect annotations from an active session via the CLI."""
         session = self._sessions.get(session_id)
         if not session:
+            logger.warning("[diag] collect_feedback: no session for %r (known: %s)", session_id, list(self._sessions.keys()))
             raise KeyError(f"No session with id {session_id}")
 
-        # Use iriai-feedback's HTTP API to get annotations
+        feedback_id = session.feedback_session_id
+        if not feedback_id:
+            logger.warning("[diag] collect_feedback: feedback_session_id is None for %s", session_id)
+            return []
+
+        logger.warning("[diag] collect_feedback: calling CLI with %s", feedback_id)
         proc = await asyncio.create_subprocess_exec(
             str(FEEDBACK_CLI),
             "feedback",
-            session_id,
+            feedback_id,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, _ = await proc.communicate()
+        stdout, stderr = await proc.communicate()
 
         if proc.returncode != 0:
+            logger.warning("[diag] collect_feedback: CLI exit %d, stderr=%s", proc.returncode, stderr.decode()[:300])
             return []
 
         try:
-            return json.loads(stdout.decode())
+            result = json.loads(stdout.decode())
+            logger.warning("[diag] collect_feedback: got %d annotations", len(result))
+            return result
         except (json.JSONDecodeError, UnicodeDecodeError):
+            logger.warning("[diag] collect_feedback: JSON parse failed, stdout=%r", stdout[:200])
             return []
 
     async def stop_session(self, session_id: str) -> None:
