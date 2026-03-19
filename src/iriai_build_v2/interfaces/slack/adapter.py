@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any, Awaitable, Callable, Literal
 
@@ -20,8 +21,33 @@ from .helpers import (
 
 logger = logging.getLogger(__name__)
 
+_MAX_RETRIES = 3
+_DEFAULT_RETRY_DELAY = 1.0  # seconds
+
 AsyncEventCallback = Callable[[dict], Awaitable[None]]
 AsyncActionCallback = Callable[[dict, dict], Awaitable[None]]
+
+
+async def _call_with_retry(coro_factory: Callable[[], Any]) -> Any:
+    """Call a Slack API method with retry on rate limit (429).
+
+    ``coro_factory`` must be a zero-arg callable that returns a new awaitable
+    each invocation (we can't re-await the same coroutine on retry).
+    """
+    from slack_sdk.errors import SlackApiError
+
+    for attempt in range(_MAX_RETRIES + 1):
+        try:
+            return await coro_factory()
+        except SlackApiError as exc:
+            if exc.response.status_code != 429 or attempt == _MAX_RETRIES:
+                raise
+            retry_after = float(exc.response.headers.get("Retry-After", _DEFAULT_RETRY_DELAY))
+            logger.warning(
+                "Slack rate limit hit (attempt %d/%d) — retrying in %.1fs",
+                attempt + 1, _MAX_RETRIES + 1, retry_after,
+            )
+            await asyncio.sleep(retry_after)
 
 
 class SlackAdapter:
@@ -122,7 +148,7 @@ class SlackAdapter:
         }
         if thread_ts:
             kwargs["thread_ts"] = thread_ts
-        result = await self._web.chat_postMessage(**kwargs)
+        result = await _call_with_retry(lambda: self._web.chat_postMessage(**kwargs))
         return result["ts"]
 
     async def post_blocks(
@@ -141,7 +167,7 @@ class SlackAdapter:
         }
         if thread_ts:
             kwargs["thread_ts"] = thread_ts
-        result = await self._web.chat_postMessage(**kwargs)
+        result = await _call_with_retry(lambda: self._web.chat_postMessage(**kwargs))
         return result["ts"]
 
     async def update_message(
@@ -158,7 +184,7 @@ class SlackAdapter:
             kwargs["text"] = text
         if blocks is not None:
             kwargs["blocks"] = blocks
-        await self._web.chat_update(**kwargs)
+        await _call_with_retry(lambda: self._web.chat_update(**kwargs))
 
     async def post_decision(
         self,
@@ -204,7 +230,7 @@ class SlackAdapter:
 
     async def open_modal(self, trigger_id: str, view: dict[str, Any]) -> None:
         """Open a Slack modal via views.open."""
-        await self._web.views_open(trigger_id=trigger_id, view=view)
+        await _call_with_retry(lambda: self._web.views_open(trigger_id=trigger_id, view=view))
 
     async def add_reaction(self, channel: str, ts: str, reaction: str) -> None:
         """Add a reaction emoji to a message."""
@@ -230,7 +256,7 @@ class SlackAdapter:
         for attempt in range(3):
             try_name = name if attempt == 0 else f"{name}-{secrets.token_hex(2)}"
             try:
-                result = await self._web.conversations_create(name=try_name)
+                result = await _call_with_retry(lambda: self._web.conversations_create(name=try_name))
                 channel_id = result["channel"]["id"]
                 logger.info("Created channel %s (%s)", try_name, channel_id)
                 return channel_id

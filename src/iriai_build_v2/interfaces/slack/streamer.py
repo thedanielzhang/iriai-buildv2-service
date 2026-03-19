@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from typing import TYPE_CHECKING, Any, Callable
 
 from .helpers import markdown_to_mrkdwn
@@ -18,6 +19,9 @@ if TYPE_CHECKING:
     from .adapter import SlackAdapter
 
 logger = logging.getLogger(__name__)
+
+# Minimum seconds between Slack API updates (avoids 429 rate limits)
+_MIN_FLUSH_INTERVAL = 1.5
 
 # Max characters for thinking / text block preview
 _THINKING_TRUNCATE = 200
@@ -82,6 +86,7 @@ class SlackStreamer:
         self._flushing: bool = False
         self._pending: bool = False
         self._seen_ids: set[str] = set()
+        self._last_flush_time: float = 0.0
 
     def on_message(self, msg: Any) -> None:
         """Synchronous callback for ClaudeAgentRuntime. Schedules async updates."""
@@ -127,6 +132,7 @@ class SlackStreamer:
             self._message_ts = None
             self._seen_ids = set()
             self._pending = False
+            self._last_flush_time = 0.0
 
             # Schedule final flush with captured state
             self._schedule_final_flush(final_text, final_ts)
@@ -149,6 +155,11 @@ class SlackStreamer:
         """Post or update the Slack message with the current single status line."""
         self._flushing = True
         try:
+            # Throttle: wait if we flushed too recently
+            elapsed = time.monotonic() - self._last_flush_time
+            if elapsed < _MIN_FLUSH_INTERVAL:
+                await asyncio.sleep(_MIN_FLUSH_INTERVAL - elapsed)
+
             text = self._current_status
             if not text:
                 return
@@ -161,6 +172,7 @@ class SlackStreamer:
                 await self._adapter.update_message(
                     self._channel, self._message_ts, text=text
                 )
+            self._last_flush_time = time.monotonic()
         except Exception:
             logger.exception("Failed to flush streamer to Slack")
         finally:
