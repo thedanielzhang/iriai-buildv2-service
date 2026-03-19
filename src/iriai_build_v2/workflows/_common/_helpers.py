@@ -26,6 +26,7 @@ async def gate_and_revise(
     approver: Actor,
     label: str,
     artifact_key: str | None = None,
+    annotation_keys: list[str] | None = None,
 ) -> tuple[T | BaseModel | str, str]:
     """Approve/revise loop. Returns ``(artifact, artifact_text)``.
 
@@ -59,19 +60,22 @@ async def gate_and_revise(
 
         # Collect browser annotations AFTER rejection — the user annotates
         # while reviewing, then clicks reject.
-        if artifact_key:
+        collect_keys = annotation_keys or ([artifact_key] if artifact_key else [])
+        if collect_keys:
             hosting = runner.services.get("hosting")
             if hosting:
-                try:
-                    annotations = await hosting.try_collect(artifact_key)
-                    logger.warning("[diag] gate_and_revise: collected %d annotations for %r", len(annotations), artifact_key)
-                except Exception:
-                    logger.warning("[diag] gate_and_revise: try_collect raised", exc_info=True)
-                    annotations = []
-                if annotations:
+                all_annotations: list[dict] = []
+                for ck in collect_keys:
+                    try:
+                        anns = await hosting.try_collect(ck)
+                        logger.warning("[diag] gate_and_revise: collected %d annotations for %r", len(anns), ck)
+                        all_annotations.extend(anns)
+                    except Exception:
+                        logger.warning("[diag] gate_and_revise: try_collect(%r) raised", ck, exc_info=True)
+                if all_annotations:
                     ann_lines = [
                         f"- [{a['data'].get('selected_text', '')}] {a['comment']}"
-                        for a in annotations if a.get("comment")
+                        for a in all_annotations if a.get("comment")
                     ]
                     if ann_lines:
                         feedback += "\n\nReviewer annotations:\n" + "\n".join(ann_lines)

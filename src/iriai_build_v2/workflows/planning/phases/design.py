@@ -72,11 +72,17 @@ class DesignPhase(Phase):
         if review_links:
             label += "\nReview in browser: " + " | ".join(review_links)
 
+        # Collect annotations from both design decisions and mockup sessions
+        ann_keys = ["design"]
+        if mockup_url:
+            ann_keys.append("mockup")
+
         design, design_text = await gate_and_revise(
             runner, feature, self.name,
             artifact=design, actor=designer, output_type=DesignDecisions,
             approver=user, label=label,
             artifact_key="design",
+            annotation_keys=ann_keys,
         )
 
         await runner.artifacts.put("design", design_text, feature=feature)
