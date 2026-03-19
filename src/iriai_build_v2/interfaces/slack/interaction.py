@@ -300,13 +300,13 @@ class SlackInteractionRuntime(InteractionRuntime):
     async def _post_approve(self, pending: Pending, channel: str) -> None:
         """Post a Gate approval card with buttons + feedback modal."""
         prompt = pending.prompt
-        # Extract artifact name and review URL from the prompt
-        artifact_name, review_url = _extract_gate_info(prompt)
+        # Extract artifact name and review URLs from the prompt
+        artifact_name, review_urls = _extract_gate_info(prompt)
         card = ApproveCard(
             pending_id=pending.id,
             title="Approval Required",
             context=artifact_name,
-            review_url=review_url,
+            review_urls=review_urls or None,
         )
         blocks = card.build_blocks()
         ts = await self._adapter.post_blocks(channel, blocks, "Approval Required")
@@ -369,25 +369,40 @@ class SlackInteractionRuntime(InteractionRuntime):
             logger.exception("Failed to update card to resolved state")
 
 
-def _extract_gate_info(prompt: str) -> tuple[str, str | None]:
-    """Extract artifact name and review URL from a Gate prompt.
+def _extract_gate_info(prompt: str) -> tuple[str, list[str]]:
+    """Extract artifact name and review URLs from a Gate prompt.
 
-    Gate prompts look like: ``"PRD\\nReview in browser: https://...:\\n\\n{full text}\\n\\nApprove?"``
-    Returns ``(artifact_name, review_url_or_None)``.
+    Gate prompts look like::
+
+        PRD
+        Review in browser: https://...
+
+        {full text}
+
+        Approve?
+
+    Or with multiple URLs::
+
+        Design Decisions
+        Review in browser: Design decisions: https://url1 | Mockup: https://url2
+
+    Returns ``(artifact_name, list_of_review_urls)``.
     """
     import re
 
-    # Extract review URL if present
-    url_match = re.search(r"Review in browser:\s*(https?://\S+)", prompt)
-    review_url = url_match.group(1).rstrip(":") if url_match else None
+    # Split at double newline to get the label area (before the artifact text)
+    label_area = prompt.split("\n\n", 1)[0]
 
-    # Extract artifact name from the first line (before any newline or colon)
-    first_line = prompt.split("\n", 1)[0].rstrip(":")
-    # Strip "Review in browser: ..." suffix if on the same line
+    # Extract ALL URLs from the label area
+    urls = re.findall(r"https?://\S+", label_area)
+    urls = [u.rstrip(":|,") for u in urls]
+
+    # Extract artifact name from the first line
+    first_line = label_area.split("\n", 1)[0].rstrip(":")
     if "Review in browser:" in first_line:
         first_line = first_line.split("Review in browser:")[0].strip().rstrip(":")
 
-    return first_line or "Artifact", review_url
+    return first_line or "Artifact", urls
 
 
 def _extract_question(prompt: str) -> tuple[str, list[str]]:

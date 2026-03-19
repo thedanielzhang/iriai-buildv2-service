@@ -30,7 +30,7 @@ class ApproveCard:
     pending_id: str
     title: str
     context: str
-    review_url: str | None = None
+    review_urls: list[str] | None = None
 
     def build_blocks(self) -> list[dict[str, Any]]:
         return [
@@ -44,8 +44,10 @@ class ApproveCard:
         text = f"*{self.title}*"
         if self.context:
             text += f"\n{self.context}"
-        if self.review_url:
-            text += f"\n\nReview in browser: {self.review_url}"
+        if self.review_urls:
+            text += "\n"
+            for url in self.review_urls:
+                text += f"\n<{url}|Review in browser>"
         return {
             "type": "section",
             "text": {"type": "mrkdwn", "text": text},

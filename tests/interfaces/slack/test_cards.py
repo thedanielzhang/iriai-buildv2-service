@@ -127,7 +127,7 @@ class TestApproveCard:
     def test_review_url_shown(self):
         card = ApproveCard(
             pending_id="p2", title="T", context="C",
-            review_url="https://example.com/review",
+            review_urls=["https://example.com/review"],
         )
         blocks = card.build_blocks()
         text = blocks[0]["text"]["text"]
