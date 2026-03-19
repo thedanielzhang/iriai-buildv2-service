@@ -215,6 +215,50 @@ class ReviewSessionManager:
         self._sessions[sid] = session
         return session
 
+    async def start_qa_file(
+        self,
+        html_path: str | Path,
+    ) -> ReviewSession:
+        """Start a QA session serving a local file with the full QA overlay."""
+        port = self._allocate_port()
+        sid = self._make_id("qa")
+
+        args = [
+            str(FEEDBACK_CLI),
+            "start",
+            str(html_path),
+            "--port",
+            str(port),
+        ]
+
+        known_sessions = self._list_session_ids()
+
+        process = await asyncio.create_subprocess_exec(
+            *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+
+        feedback_id = await self._read_feedback_session_id(process)
+        if not feedback_id:
+            feedback_id = self._find_new_session_on_disk(port, known_sessions)
+
+        if feedback_id:
+            logger.warning("[diag] session %s: feedback_session_id=%s", sid, feedback_id)
+        else:
+            logger.warning("[diag] session %s: FAILED to capture feedback_session_id", sid)
+
+        session = ReviewSession(
+            session_id=sid,
+            url=f"http://localhost:{port}",
+            port=port,
+            kind="qa_session",
+            feedback_session_id=feedback_id,
+            process=process,
+        )
+        self._sessions[sid] = session
+        return session
+
     async def start_mockup_review(
         self,
         html_path: str | Path,

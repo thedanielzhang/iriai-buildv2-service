@@ -89,21 +89,12 @@ class DocHostingService:
     async def push_qa(self, feature_id: str, key: str, content: str, label: str) -> str:
         """Write artifact to disk and start a QA feedback session (annotation overlay).
 
-        Unlike ``push()`` which uses doc-review (static rendering), this uses
-        the QA feedback tool which wraps the served page with an interactive
-        annotation overlay — ideal for visual artifacts like mockups.
+        Unlike ``push()`` which uses doc-review (static rendering), this
+        serves the file with the full QA overlay (click-to-annotate, visual
+        regression) — ideal for visual artifacts like mockups.
         """
         path = self._mirror.write_artifact(feature_id, key, content)
-        base_path = f"/features/{feature_id}/{key}"
-
-        # First serve the file via doc-review to get an HTTP URL
-        doc_info = await self._feedback.start_doc_review(
-            str(path), title=label, base_path=base_path,
-        )
-        local_url = doc_info.url
-
-        # Wrap with QA feedback overlay
-        info = await self._feedback.start_qa(local_url)
+        info = await self._feedback.start_qa_file(str(path))
 
         url = info.url
         if self._tunnel:

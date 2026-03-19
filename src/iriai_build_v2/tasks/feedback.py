@@ -48,6 +48,18 @@ class FeedbackService:
             port=session.port,
         )
 
+    async def start_qa_file(
+        self,
+        html_path: str,
+    ) -> SessionInfo:
+        """Start a QA session serving a local HTML file with the full QA overlay."""
+        session = await self._manager.start_qa_file(html_path)
+        return SessionInfo(
+            session_id=session.session_id,
+            url=session.url,
+            port=session.port,
+        )
+
     async def start_doc_review(
         self,
         doc_path: str,
