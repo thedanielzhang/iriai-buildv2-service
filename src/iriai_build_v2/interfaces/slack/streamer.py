@@ -23,11 +23,40 @@ logger = logging.getLogger(__name__)
 # Minimum seconds between Slack API updates (avoids 429 rate limits)
 _MIN_FLUSH_INTERVAL = 1.5
 
+# Slack message text limit. chat.postMessage allows ~40K, but chat.update
+# can fail with msg_too_long on shorter payloads depending on formatting.
+# Use 30K as a safe maximum that works for both.
+_MAX_MSG_CHARS = 30_000
+
 # Max characters for thinking / text block preview
 _THINKING_TRUNCATE = 200
 
 # Max characters for tool result preview
 _RESULT_TRUNCATE = 150
+
+
+def _split_message(text: str, limit: int = _MAX_MSG_CHARS) -> list[str]:
+    """Split text into chunks that fit within Slack's message limit.
+
+    Splits at paragraph boundaries first, then line boundaries.
+    Never loses content.
+    """
+    if len(text) <= limit:
+        return [text]
+
+    chunks: list[str] = []
+    remaining = text
+    while len(remaining) > limit:
+        split_at = remaining.rfind("\n\n", 0, limit)
+        if split_at < limit // 2:
+            split_at = remaining.rfind("\n", 0, limit)
+        if split_at < limit // 2:
+            split_at = limit
+        chunks.append(remaining[:split_at])
+        remaining = remaining[split_at:].lstrip("\n")
+    if remaining:
+        chunks.append(remaining)
+    return chunks
 
 
 def _format_thinking(thinking: str) -> str:
@@ -197,28 +226,21 @@ class SlackStreamer:
             return
 
         display_text = markdown_to_mrkdwn(text)
-
-        # Slack message limit is ~40K chars. Split into chunks rather than truncate.
-        _MAX_MSG = 38_000
-        chunks = []
-        while len(display_text) > _MAX_MSG:
-            # Find a good split point (paragraph break)
-            split_at = display_text.rfind("\n\n", 0, _MAX_MSG)
-            if split_at < _MAX_MSG // 2:
-                split_at = display_text.rfind("\n", 0, _MAX_MSG)
-            if split_at < _MAX_MSG // 2:
-                split_at = _MAX_MSG
-            chunks.append(display_text[:split_at])
-            display_text = display_text[split_at:].lstrip("\n")
-        chunks.append(display_text)
+        chunks = _split_message(display_text)
 
         try:
-            # First chunk: update or post
+            # First chunk: update existing message or post new one
             first = chunks[0]
             if message_ts:
-                await self._adapter.update_message(
-                    self._channel, message_ts, text=first
-                )
+                try:
+                    await self._adapter.update_message(
+                        self._channel, message_ts, text=first
+                    )
+                except Exception:
+                    # update failed (msg_too_long) — post as new message instead
+                    await self._adapter.post_message(
+                        self._channel, first, thread_ts=self._thread_ts
+                    )
             else:
                 await self._adapter.post_message(
                     self._channel, first, thread_ts=self._thread_ts
