@@ -1,10 +1,12 @@
-"""Cloudflare Tunnel + iriai-feedback serve for artifact hosting.
+"""Artifact hosting server + optional Cloudflare tunnel.
 
 Manages two subprocesses:
-1. ``iriai-feedback serve <dir> --port 9000`` — multi-doc artifact server
-2. ``cloudflared tunnel --url http://localhost:9000`` — public tunnel
+1. ``iriai-feedback serve <dir> --port 9000`` — always started
+2. ``cloudflared tunnel --url http://localhost:9000`` — best-effort
 
-Started once at bridge boot, shared across all workflows.
+The serve process is essential (artifacts won't render without it).
+The tunnel is optional — if cloudflared fails, artifacts are served
+via local URLs only.
 """
 
 from __future__ import annotations
@@ -24,30 +26,29 @@ _SERVE_PORT = 9000
 
 
 class CloudflareTunnel:
-    """Manages a single iriai-feedback serve process + cloudflared tunnel."""
+    """Manages iriai-feedback serve (always) + cloudflared tunnel (best-effort)."""
 
     def __init__(self) -> None:
         self._serve_process: asyncio.subprocess.Process | None = None
         self._cf_process: asyncio.subprocess.Process | None = None
         self._public_url: str | None = None
 
-    async def start(self, artifact_dir: Path) -> str:
-        """Start iriai-feedback serve + cloudflared. Returns public base URL.
+    async def start(self, artifact_dir: Path) -> str | None:
+        """Start iriai-feedback serve + attempt cloudflared tunnel.
 
-        Raises RuntimeError if either process fails to start.
+        Always starts the serve process. Tunnel is best-effort — if
+        cloudflared fails, artifacts are served locally on port 9000.
+
+        Returns public tunnel URL if available, else None.
+        Raises RuntimeError only if the serve process fails to start.
         """
         if not _FEEDBACK_CLI:
             raise RuntimeError(
                 "iriai-feedback is not installed. "
                 "Install it with: npm install -g iriai-feedback"
             )
-        if not _CLOUDFLARED:
-            raise RuntimeError(
-                "cloudflared is not installed. "
-                "Install it with: brew install cloudflared"
-            )
 
-        # 1. Start iriai-feedback serve
+        # 1. Start iriai-feedback serve (essential)
         self._serve_process = await asyncio.create_subprocess_exec(
             _FEEDBACK_CLI,
             "serve",
@@ -57,7 +58,6 @@ class CloudflareTunnel:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        # Give the HTTP server a moment to bind
         await asyncio.sleep(1.0)
         if self._serve_process.returncode is not None:
             stderr = ""
@@ -73,18 +73,28 @@ class CloudflareTunnel:
             )
         logger.info("iriai-feedback serve started on port %d", _SERVE_PORT)
 
-        # 2. Start cloudflared tunnel
-        self._cf_process = await asyncio.create_subprocess_exec(
-            _CLOUDFLARED,
-            "tunnel",
-            "--url",
-            f"http://localhost:{_SERVE_PORT}",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
+        # 2. Attempt cloudflared tunnel (best-effort)
+        if not _CLOUDFLARED:
+            logger.warning("cloudflared not installed — serving artifacts locally only")
+            return None
 
-        url = await self._read_tunnel_url(self._cf_process)
-        if not url:
+        try:
+            self._cf_process = await asyncio.create_subprocess_exec(
+                _CLOUDFLARED,
+                "tunnel",
+                "--url",
+                f"http://localhost:{_SERVE_PORT}",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+
+            url = await self._read_tunnel_url(self._cf_process)
+            if url:
+                self._public_url = url
+                logger.info("Tunnel started: localhost:%d → %s", _SERVE_PORT, url)
+                return url
+
+            # Tunnel failed — log and continue with local URLs
             if self._cf_process.stderr:
                 try:
                     remaining = await asyncio.wait_for(self._cf_process.stderr.read(), timeout=2.0)
@@ -92,21 +102,18 @@ class CloudflareTunnel:
                         logger.warning("cloudflared stderr: %s", remaining.decode(errors="replace")[:500])
                 except (asyncio.TimeoutError, Exception):
                     pass
-            # Clean up serve process too
             await self._kill(self._cf_process)
-            await self._kill(self._serve_process)
-            raise RuntimeError(
-                "Failed to start cloudflared tunnel. "
-                "Check that cloudflared is working correctly."
-            )
+            self._cf_process = None
+            logger.warning("cloudflared tunnel failed — serving artifacts locally only")
+        except Exception:
+            logger.warning("cloudflared tunnel failed", exc_info=True)
+            self._cf_process = None
 
-        self._public_url = url
-        logger.info("Tunnel started: localhost:%d → %s", _SERVE_PORT, url)
-        return url
+        return None
 
     @property
     def public_url(self) -> str | None:
-        """The base tunnel URL, or None if not started."""
+        """The base tunnel URL, or None if tunnel isn't active."""
         return self._public_url
 
     def local_url(self, feature_id: str, key: str) -> str:

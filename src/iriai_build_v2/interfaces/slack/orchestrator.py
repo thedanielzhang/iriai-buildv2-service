@@ -69,16 +69,19 @@ class SlackWorkflowOrchestrator:
         self._adapter.on_action_callback = self._on_action
         self._adapter.on_view_submission_callback = self._on_view_submission
 
-        # Start shared tunnel (iriai-feedback serve + cloudflared)
+        # Start artifact server + optional tunnel
         from ...services.tunnel import CloudflareTunnel
 
         self._tunnel: CloudflareTunnel | None = None
         try:
             self._tunnel = CloudflareTunnel()
             tunnel_url = await self._tunnel.start(self._env.artifact_mirror._base)
-            logger.info("Tunnel started: %s", tunnel_url)
+            if tunnel_url:
+                logger.info("Tunnel started: %s", tunnel_url)
+            else:
+                logger.info("Artifact server started (local only, no tunnel)")
         except Exception:
-            logger.warning("Tunnel failed to start — artifacts will use local URLs", exc_info=True)
+            logger.warning("Artifact server failed to start", exc_info=True)
             self._tunnel = None
 
         await self._recover_active_features()
