@@ -122,11 +122,25 @@ class ClaudeAgentRuntime(AgentRuntime):
         if prior_context:
             effective_prompt = f"{prior_context}\n\n## Current Task\n{prompt}"
 
-        # Resume existing session if available
+        # Resume existing session only if we have local message history.
+        # On a fresh runtime (e.g. after bridge restart), _session_messages
+        # is empty — the old SDK session may have accumulated a conversation
+        # that exceeds the context window.  We can't summarize it (we don't
+        # have the messages locally), so we start a fresh session.  Context
+        # continuity is preserved via the artifact store + context provider
+        # which inject prior artifacts into each prompt.
         if session_key and self.session_store:
+            has_local_history = len(self._session_messages.get(session_key, [])) > 1
             session = await self.session_store.load(session_key)
             if session and session.session_id:
-                options.resume = session.session_id
+                if has_local_history:
+                    options.resume = session.session_id
+                else:
+                    logger.info(
+                        "Fresh runtime for %s — starting new session (prior context via artifacts)",
+                        session_key,
+                    )
+                    await self.session_store.delete(session_key)
 
         use_interactive = bool(
             self._interactive_roles and role.name in self._interactive_roles
