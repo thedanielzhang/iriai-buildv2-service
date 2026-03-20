@@ -112,17 +112,16 @@ class TestApproveCard:
         blocks = card.build_blocks()
         assert len(blocks) == 2  # Header + buttons
 
-    def test_approve_reject_feedback_buttons(self):
+    def test_approve_reject_buttons(self):
         card = ApproveCard(pending_id="p2", title="T", context="C")
         blocks = card.build_blocks()
         btn_block = blocks[1]
         elements = btn_block["elements"]
-        assert len(elements) == 3
+        assert len(elements) == 2
         assert elements[0]["action_id"] == "gate_p2_approve"
         assert elements[0]["style"] == "primary"
         assert elements[1]["action_id"] == "gate_p2_reject"
         assert elements[1]["style"] == "danger"
-        assert elements[2]["action_id"] == "gate_p2_feedback"
 
     def test_review_url_shown(self):
         card = ApproveCard(

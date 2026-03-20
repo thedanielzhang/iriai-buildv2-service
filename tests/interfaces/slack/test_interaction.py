@@ -266,37 +266,22 @@ class TestGateActions:
         assert future.result() is True
 
     @pytest.mark.asyncio
-    async def test_reject_resolves(self):
-        adapter = MockAdapter()
-        runtime = SlackInteractionRuntime(adapter)
-
-        loop = asyncio.get_running_loop()
-        future = loop.create_future()
-        runtime._pending_futures["abc"] = future
-        runtime._pending_messages["abc"] = ("C001", "123.456")
-
-        body = {"trigger_id": "t1", "channel": {"id": "C001"}, "message": {"ts": "123.456"}, "user": {"id": "U001"}}
-        action = {"action_id": "gate_abc_reject"}
-
-        await runtime.handle_action(body, action)
-
-        assert future.done()
-        assert future.result() is False
-
-    @pytest.mark.asyncio
-    async def test_feedback_opens_modal(self):
+    async def test_reject_opens_modal(self):
         adapter = MockAdapter()
         runtime = SlackInteractionRuntime(adapter)
 
         loop = asyncio.get_running_loop()
         runtime._pending_futures["abc"] = loop.create_future()
 
-        body = {"trigger_id": "t1", "channel": {"id": "C001"}, "message": {"ts": "1"}, "user": {"id": "U1"}}
-        action = {"action_id": "gate_abc_feedback"}
+        body = {"trigger_id": "t1", "channel": {"id": "C001"}, "message": {"ts": "123.456"}, "user": {"id": "U001"}}
+        action = {"action_id": "gate_abc_reject"}
 
         await runtime.handle_action(body, action)
 
         assert len(adapter.opened_modals) == 1
+        view = adapter.opened_modals[0]["view"]
+        assert view["private_metadata"] == "abc"
+        assert view["blocks"][0].get("optional") is True
 
 
 # ── Choose Action Handling ──────────────────────────────────────────────────
@@ -413,7 +398,8 @@ class TestHandleViewSubmission:
 
         await runtime.handle_view_submission(payload)
 
-        assert not future.done()
+        assert future.done()
+        assert future.result() == "Please revise."
 
 
 # ── Card Update on Resolution ───────────────────────────────────────────────

@@ -128,19 +128,30 @@ class SlackInteractionRuntime(InteractionRuntime):
             )
 
     async def handle_view_submission(self, payload: dict) -> None:
-        """Handle modal form submissions."""
+        """Handle modal form submissions.
+
+        For reject modals (optional feedback), empty text resolves as a
+        plain rejection (``"Please revise."``).  Non-empty text is passed
+        as the feedback string.
+        """
         view = payload.get("view", {})
         pending_id = view.get("private_metadata", "")
         user_id = payload.get("user", {}).get("id", "")
+
+        if not pending_id:
+            return
 
         # Extract text from the modal input
         values = view.get("state", {}).get("values", {})
         reply_block = values.get("reply_block", {})
         reply_input = reply_block.get("reply_input", {})
-        text = reply_input.get("value", "")
+        text = (reply_input.get("value") or "").strip()
 
-        if pending_id and text:
+        if text:
             self._resolve_pending(pending_id, text, label=text[:50], user_id=user_id)
+        else:
+            # Empty submission = reject without specific feedback
+            self._resolve_pending(pending_id, "Please revise.", label="Rejected", user_id=user_id)
 
     async def handle_message(self, event: dict) -> None:
         """No-op: all interactions must go through cards, not channel messages.
@@ -214,18 +225,18 @@ class SlackInteractionRuntime(InteractionRuntime):
             self._resolve_pending(pending_id, True, label="Approved", user_id=user_id)
             return
 
-        # gate_{pid}_reject
+        # gate_{pid}_reject — open modal for optional feedback, then reject
         if action_id.endswith("_reject"):
             pending_id = action_id[len("gate_"):-len("_reject")]
-            self._resolve_pending(pending_id, False, label="Rejected", user_id=user_id)
-            return
-
-        # gate_{pid}_feedback — open feedback modal
-        if action_id.endswith("_feedback"):
-            pending_id = action_id[len("gate_"):-len("_feedback")]
             if trigger_id:
-                view = build_modal_view(pending_id, "Feedback")
+                view = build_modal_view(
+                    pending_id, "Reject",
+                    label="Feedback (optional)",
+                    optional=True,
+                    placeholder="Add comments for the revision...",
+                )
                 await self._adapter.open_modal(trigger_id, view)
+            return
 
     # ── Choose Card Actions ──────────────────────────────────────────────
 

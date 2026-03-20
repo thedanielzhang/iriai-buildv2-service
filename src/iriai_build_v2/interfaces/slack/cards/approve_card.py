@@ -1,6 +1,7 @@
-"""ApproveCard: Gate approval card with approve/reject and feedback via modal.
+"""ApproveCard: Gate approval card with approve/reject.
 
 Used for ``kind="approve"`` interactions (Gate decisions in gate_and_revise loops).
+Reject opens a modal for optional feedback comments.
 """
 
 from __future__ import annotations
@@ -20,11 +21,10 @@ class ApproveCard:
         │ {context}                                  │
         │ Review in browser: {url}                   │
         ├────────────────────────────────────────────┤
-        │ [Approve]  [Reject]  [Feedback]            │
+        │ [Approve]  [Reject]                        │
         └────────────────────────────────────────────┘
 
-    Note: Slack Block Kit does not support ``plain_text_input`` in ``actions``
-    blocks, so feedback uses a modal opened by the Feedback button.
+    Reject opens a modal with an optional feedback text input.
     """
 
     pending_id: str
@@ -72,11 +72,6 @@ class ApproveCard:
                     "value": "reject",
                     "action_id": f"gate_{pid}_reject",
                     "style": "danger",
-                },
-                {
-                    "type": "button",
-                    "text": {"type": "plain_text", "text": "Feedback", "emoji": True},
-                    "action_id": f"gate_{pid}_feedback",
                 },
             ],
         }
