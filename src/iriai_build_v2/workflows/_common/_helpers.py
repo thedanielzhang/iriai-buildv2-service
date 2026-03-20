@@ -15,6 +15,42 @@ logger = logging.getLogger(__name__)
 T = TypeVar("T", bound=BaseModel)
 
 
+async def get_existing_artifact(
+    runner: WorkflowRunner,
+    feature: Feature,
+    artifact_key: str,
+) -> str | None:
+    """Check DB store first, then fall back to filesystem mirror.
+
+    Artifacts are written to disk by ``hosting.push()`` during interviews
+    but only saved to the DB after ``gate_and_revise`` completes.  If the
+    workflow was interrupted mid-gate, the artifact exists on disk but not
+    in the DB.
+    """
+    # 1. Try the DB artifact store
+    text = await runner.artifacts.get(artifact_key, feature=feature)
+    if text:
+        return text
+
+    # 2. Fall back to filesystem mirror
+    mirror = runner.services.get("artifact_mirror")
+    if not mirror:
+        return None
+
+    from ...services.artifacts import _KEY_MAP
+
+    filename = _KEY_MAP.get(artifact_key)
+    if not filename:
+        return None
+
+    path = mirror.feature_dir(feature.id) / filename
+    if not path.exists():
+        return None
+
+    content = path.read_text(encoding="utf-8").strip()
+    return content if content else None
+
+
 async def gate_and_revise(
     runner: WorkflowRunner,
     feature: Feature,

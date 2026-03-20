@@ -8,7 +8,7 @@ from iriai_compose import Feature, Phase, WorkflowRunner
 from ....models.outputs import DesignDecisions, Envelope, envelope_done
 from ....models.state import BuildState
 from ....roles import designer, user
-from ..._common import HostedInterview, gate_and_revise
+from ..._common import HostedInterview, gate_and_revise, get_existing_artifact
 
 logger = logging.getLogger(__name__)
 
@@ -19,8 +19,8 @@ class DesignPhase(Phase):
     async def execute(
         self, runner: WorkflowRunner, feature: Feature, state: BuildState
     ) -> BuildState:
-        # Check if design artifact already exists (e.g. resuming after restart)
-        existing_design_text = await runner.artifacts.get("design", feature=feature)
+        # Check if design artifact already exists (DB or filesystem — e.g. resuming after restart)
+        existing_design_text = await get_existing_artifact(runner, feature, "design")
 
         if existing_design_text:
             logger.info("Design artifact exists — skipping interview, resuming at gate")

@@ -14,7 +14,7 @@ from ....models.outputs import (
 from ....models.state import BuildState
 from ....roles import architect, user
 from ....services.system_design_html import render_system_design_html
-from ..._common import HostedInterview, gate_and_revise
+from ..._common import HostedInterview, gate_and_revise, get_existing_artifact
 
 logger = logging.getLogger(__name__)
 
@@ -25,9 +25,9 @@ class ArchitecturePhase(Phase):
     async def execute(
         self, runner: WorkflowRunner, feature: Feature, state: BuildState
     ) -> BuildState:
-        # Check if plan artifact already exists (resuming after restart)
-        existing_plan_text = await runner.artifacts.get("plan", feature=feature)
-        existing_sd_text = await runner.artifacts.get("system-design", feature=feature)
+        # Check if plan artifact already exists (DB or filesystem — resuming after restart)
+        existing_plan_text = await get_existing_artifact(runner, feature, "plan")
+        existing_sd_text = await get_existing_artifact(runner, feature, "system-design")
 
         if existing_plan_text:
             logger.info("Architecture artifacts exist — skipping interview, resuming at gate")

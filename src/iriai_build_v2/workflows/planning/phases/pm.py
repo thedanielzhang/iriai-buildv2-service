@@ -7,7 +7,7 @@ from iriai_compose import Feature, Phase, WorkflowRunner
 from ....models.outputs import PRD, Envelope, envelope_done
 from ....models.state import BuildState
 from ....roles import pm, user
-from ..._common import HostedInterview, gate_and_revise
+from ..._common import HostedInterview, gate_and_revise, get_existing_artifact
 
 logger = logging.getLogger(__name__)
 
@@ -18,8 +18,8 @@ class PMPhase(Phase):
     async def execute(
         self, runner: WorkflowRunner, feature: Feature, state: BuildState
     ) -> BuildState:
-        # Check if PRD already exists (resuming after restart)
-        existing_prd_text = await runner.artifacts.get("prd", feature=feature)
+        # Check if PRD already exists (DB or filesystem — resuming after restart)
+        existing_prd_text = await get_existing_artifact(runner, feature, "prd")
 
         if existing_prd_text:
             logger.info("PRD artifact exists — skipping interview, resuming at gate")
