@@ -68,13 +68,31 @@ class SlackWorkflowOrchestrator:
         self._adapter.on_message_callback = self._on_message
         self._adapter.on_action_callback = self._on_action
         self._adapter.on_view_submission_callback = self._on_view_submission
+
+        # Start shared tunnel (iriai-feedback serve + cloudflared)
+        from ...services.tunnel import CloudflareTunnel
+
+        self._tunnel: CloudflareTunnel | None = None
+        try:
+            self._tunnel = CloudflareTunnel()
+            tunnel_url = await self._tunnel.start(self._env.artifact_mirror._base)
+            logger.info("Tunnel started: %s", tunnel_url)
+        except Exception:
+            logger.warning("Tunnel failed to start — artifacts will use local URLs", exc_info=True)
+            self._tunnel = None
+
         await self._recover_active_features()
         logger.info("Orchestrator started, default_workspace=%s", self._default_workspace)
 
     async def shutdown(self) -> None:
-        """Cancel active workflows and teardown environment."""
+        """Cancel active workflows, stop tunnel, and teardown environment."""
         for feature_id, task in list(self._active_workflows.items()):
             task.cancel()
+        if self._tunnel:
+            try:
+                await self._tunnel.stop_all()
+            except Exception:
+                logger.warning("Failed to stop tunnel", exc_info=True)
         if self._env:
             await teardown(self._env)
 
@@ -203,10 +221,8 @@ class SlackWorkflowOrchestrator:
         from iriai_compose import Workspace
 
         from ...runtimes.claude import ClaudeAgentRuntime
-        from ...services.tunnel import CloudflareTunnel
         from ...workflows import TrackedWorkflowRunner
 
-        tunnel = CloudflareTunnel()
         agent_runtime = ClaudeAgentRuntime(
             session_store=self._env.sessions,
             on_message=streamer.on_message,
@@ -228,7 +244,7 @@ class SlackWorkflowOrchestrator:
                 "preview": self._env.preview_service,
                 "playwright": self._env.playwright_service,
                 "artifact_mirror": self._env.artifact_mirror,
-                "tunnel": tunnel,
+                "tunnel": self._tunnel,
             },
         )
 
@@ -252,7 +268,7 @@ class SlackWorkflowOrchestrator:
 
         # 12. Launch workflow as background task
         task = asyncio.create_task(
-            self._run_workflow(runner, workflow, feature, state, channel_id, tunnel)
+            self._run_workflow(runner, workflow, feature, state, channel_id)
         )
         self._active_workflows[feature.id] = task
 
@@ -263,7 +279,6 @@ class SlackWorkflowOrchestrator:
         feature: Any,
         state: Any,
         channel_id: str,
-        tunnel: Any,
     ) -> None:
         try:
             await runner.execute_workflow(workflow, feature, state)
@@ -281,10 +296,6 @@ class SlackWorkflowOrchestrator:
             self._active_runtimes.pop(feature.id, None)
             self._interaction.unregister_channel(feature.id)
             self._user_notes.pop(feature.id, None)
-            try:
-                await tunnel.stop_all()
-            except Exception:
-                logger.warning("Failed to stop tunnels", exc_info=True)
 
     # ── Mode Selection ────────────────────────────────────────────────────
 
@@ -523,10 +534,8 @@ class SlackWorkflowOrchestrator:
         from iriai_compose import Workspace
 
         from ...runtimes.claude import ClaudeAgentRuntime
-        from ...services.tunnel import CloudflareTunnel
         from ...workflows import TrackedWorkflowRunner
 
-        tunnel = CloudflareTunnel()
         agent_runtime = ClaudeAgentRuntime(
             session_store=self._env.sessions,
             on_message=streamer.on_message,
@@ -548,7 +557,7 @@ class SlackWorkflowOrchestrator:
                 "preview": self._env.preview_service,
                 "playwright": self._env.playwright_service,
                 "artifact_mirror": self._env.artifact_mirror,
-                "tunnel": tunnel,
+                "tunnel": self._tunnel,
             },
         )
 
@@ -560,7 +569,7 @@ class SlackWorkflowOrchestrator:
 
         task = asyncio.create_task(
             self._run_workflow_resumed(
-                runner, workflow, feature, state, channel_id, tunnel, resume_phase
+                runner, workflow, feature, state, channel_id, resume_phase
             )
         )
         self._active_workflows[feature_id] = task
@@ -572,7 +581,6 @@ class SlackWorkflowOrchestrator:
         feature: Any,
         state: Any,
         channel_id: str,
-        tunnel: Any,
         resume_phase: str,
     ) -> None:
         try:
@@ -590,10 +598,6 @@ class SlackWorkflowOrchestrator:
             self._active_runtimes.pop(feature.id, None)
             self._interaction.unregister_channel(feature.id)
             self._user_notes.pop(feature.id, None)
-            try:
-                await tunnel.stop_all()
-            except Exception:
-                logger.warning("Failed to stop tunnels", exc_info=True)
 
     # ── Helpers ───────────────────────────────────────────────────────────
 

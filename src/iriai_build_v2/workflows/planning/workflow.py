@@ -26,13 +26,13 @@ class PlanningWorkflow(Workflow):
 
     async def on_start(self, runner: WorkflowRunner, feature: Feature, state: BaseModel) -> None:
         mirror = runner.services.get("artifact_mirror")
-        feedback = runner.services.get("feedback")
-        if not mirror or not feedback:
+        if not mirror:
             raise RuntimeError(
-                "Planning workflow requires 'artifact_mirror' and 'feedback' services. "
-                "Ensure ArtifactMirror and FeedbackService are registered."
+                "Planning workflow requires 'artifact_mirror' service. "
+                "Ensure ArtifactMirror is registered."
             )
         tunnel = runner.services.get("tunnel")  # None for CLI, CloudflareTunnel for Slack
+        feedback = runner.services.get("feedback")  # kept for backward compat
         hosting = DocHostingService(mirror, feedback, tunnel=tunnel)
         runner.services["hosting"] = hosting
         mirror.write_manifest(feature.id, title=feature.name, phase="scoping")

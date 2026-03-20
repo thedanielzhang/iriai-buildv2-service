@@ -1,7 +1,10 @@
-"""Cloudflare Tunnel service for exposing local ports to the internet.
+"""Cloudflare Tunnel + iriai-feedback serve for artifact hosting.
 
-Uses ``cloudflared tunnel --url`` (quick tunnels, no account needed) to create
-ephemeral public URLs for local review sessions.
+Manages two subprocesses:
+1. ``iriai-feedback serve <dir> --port 9000`` — multi-doc artifact server
+2. ``cloudflared tunnel --url http://localhost:9000`` — public tunnel
+
+Started once at bridge boot, shared across all workflows.
 """
 
 from __future__ import annotations
@@ -10,86 +13,137 @@ import asyncio
 import logging
 import re
 import shutil
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
 _URL_RE = re.compile(r"(https://[a-z0-9-]+\.trycloudflare\.com)")
 _CLOUDFLARED = shutil.which("cloudflared")
+_FEEDBACK_CLI = shutil.which("iriai-feedback")
+_SERVE_PORT = 9000
 
 
 class CloudflareTunnel:
-    """Manages cloudflared quick tunnels for localhost ports."""
+    """Manages a single iriai-feedback serve process + cloudflared tunnel."""
 
     def __init__(self) -> None:
-        self._tunnels: dict[int, tuple[str, asyncio.subprocess.Process]] = {}
+        self._serve_process: asyncio.subprocess.Process | None = None
+        self._cf_process: asyncio.subprocess.Process | None = None
+        self._public_url: str | None = None
 
-    async def tunnel(self, port: int) -> str:
-        """Start a cloudflared tunnel for the given port. Returns public URL.
+    async def start(self, artifact_dir: Path) -> str:
+        """Start iriai-feedback serve + cloudflared. Returns public base URL.
 
-        Reuses existing tunnel if one is already running for this port.
-        Raises RuntimeError if cloudflared is not installed or tunnel fails.
+        Raises RuntimeError if either process fails to start.
         """
-        if port in self._tunnels:
-            return self._tunnels[port][0]
-
+        if not _FEEDBACK_CLI:
+            raise RuntimeError(
+                "iriai-feedback is not installed. "
+                "Install it with: npm install -g iriai-feedback"
+            )
         if not _CLOUDFLARED:
             raise RuntimeError(
                 "cloudflared is not installed. "
                 "Install it with: brew install cloudflared"
             )
 
-        process = await asyncio.create_subprocess_exec(
+        # 1. Start iriai-feedback serve
+        self._serve_process = await asyncio.create_subprocess_exec(
+            _FEEDBACK_CLI,
+            "serve",
+            str(artifact_dir),
+            "--port",
+            str(_SERVE_PORT),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        # Give the HTTP server a moment to bind
+        await asyncio.sleep(1.0)
+        if self._serve_process.returncode is not None:
+            stderr = ""
+            if self._serve_process.stderr:
+                try:
+                    raw = await asyncio.wait_for(self._serve_process.stderr.read(), timeout=2.0)
+                    stderr = raw.decode(errors="replace")[:500]
+                except (asyncio.TimeoutError, Exception):
+                    pass
+            raise RuntimeError(
+                f"iriai-feedback serve exited immediately (code {self._serve_process.returncode}). "
+                f"stderr: {stderr}"
+            )
+        logger.info("iriai-feedback serve started on port %d", _SERVE_PORT)
+
+        # 2. Start cloudflared tunnel
+        self._cf_process = await asyncio.create_subprocess_exec(
             _CLOUDFLARED,
             "tunnel",
             "--url",
-            f"http://localhost:{port}",
+            f"http://localhost:{_SERVE_PORT}",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
 
-        url = await self._read_tunnel_url(process)
+        url = await self._read_tunnel_url(self._cf_process)
         if not url:
-            # Log stderr for debugging
-            if process.stderr:
+            if self._cf_process.stderr:
                 try:
-                    remaining = await asyncio.wait_for(process.stderr.read(), timeout=2.0)
+                    remaining = await asyncio.wait_for(self._cf_process.stderr.read(), timeout=2.0)
                     if remaining:
                         logger.warning("cloudflared stderr: %s", remaining.decode(errors="replace")[:500])
                 except (asyncio.TimeoutError, Exception):
                     pass
-            try:
-                process.terminate()
-            except ProcessLookupError:
-                pass  # Already exited
+            # Clean up serve process too
+            await self._kill(self._cf_process)
+            await self._kill(self._serve_process)
             raise RuntimeError(
-                f"Failed to start cloudflared tunnel for port {port}. "
+                "Failed to start cloudflared tunnel. "
                 "Check that cloudflared is working correctly."
             )
 
-        self._tunnels[port] = (url, process)
-        logger.info("Tunnel started: localhost:%d → %s", port, url)
+        self._public_url = url
+        logger.info("Tunnel started: localhost:%d → %s", _SERVE_PORT, url)
         return url
 
+    @property
+    def public_url(self) -> str | None:
+        """The base tunnel URL, or None if not started."""
+        return self._public_url
+
+    def local_url(self, feature_id: str, key: str) -> str:
+        """Deterministic local URL for an artifact."""
+        return f"http://localhost:{_SERVE_PORT}/features/{feature_id}/{key}"
+
+    def artifact_url(self, feature_id: str, key: str) -> str:
+        """Public URL if tunnel is active, else local URL."""
+        base = self._public_url or f"http://localhost:{_SERVE_PORT}"
+        return f"{base}/features/{feature_id}/{key}"
+
     async def stop_all(self) -> None:
-        """Terminate all cloudflared processes."""
-        for port, (url, proc) in self._tunnels.items():
+        """Terminate both subprocesses."""
+        for label, proc in [("cloudflared", self._cf_process), ("iriai-feedback", self._serve_process)]:
+            if proc:
+                await self._kill(proc)
+                logger.info("%s stopped", label)
+        self._cf_process = None
+        self._serve_process = None
+        self._public_url = None
+
+    @staticmethod
+    async def _kill(proc: asyncio.subprocess.Process) -> None:
+        try:
+            proc.terminate()
+            await asyncio.wait_for(proc.wait(), timeout=5.0)
+        except (asyncio.TimeoutError, ProcessLookupError):
             try:
-                proc.terminate()
-                await asyncio.wait_for(proc.wait(), timeout=5.0)
-            except (asyncio.TimeoutError, ProcessLookupError):
                 proc.kill()
-            logger.info("Tunnel stopped: port %d (%s)", port, url)
-        self._tunnels.clear()
+            except ProcessLookupError:
+                pass
 
     @staticmethod
     async def _read_tunnel_url(
         process: asyncio.subprocess.Process,
     ) -> str | None:
-        """Read cloudflared output to extract the public tunnel URL.
-
-        cloudflared outputs the URL to stderr (or sometimes stdout) in a line
-        like: ``... | https://abc123.trycloudflare.com``
-        """
+        """Read cloudflared output to extract the public tunnel URL."""
 
         async def _scan_stream(
             stream: asyncio.StreamReader | None,
@@ -113,7 +167,6 @@ class CloudflareTunnel:
                 pass
             return None
 
-        # Try stderr first (most common), fall back to stdout
         url = await _scan_stream(process.stderr)
         if not url:
             url = await _scan_stream(process.stdout)

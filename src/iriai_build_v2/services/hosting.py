@@ -1,13 +1,16 @@
 """Document hosting service for artifact review sessions.
 
-Wraps ArtifactMirror + FeedbackService into a single service that manages
-hosted artifact sessions.  Created per-workflow, torn down on completion.
+With ``iriai-feedback serve``, the hosting service is a thin URL manager:
+write artifacts to disk, construct deterministic URLs, read co-located
+feedback.  The single ``iriai-feedback serve`` process handles rendering,
+overlay injection, and annotation storage.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
 from pydantic import BaseModel, ValidationError
@@ -26,14 +29,9 @@ from .system_design_html import render_system_design_html
 if TYPE_CHECKING:
     from .artifacts import ArtifactMirror
     from .tunnel import CloudflareTunnel
-    from ..tasks.feedback import FeedbackService, SessionInfo
 
 logger = logging.getLogger(__name__)
 
-# Explicit key → model mapping.  Most output models have all-default fields,
-# so *any* JSON dict validates against *any* of them.  Using the artifact key
-# to pick the correct model avoids cross-contamination (e.g. ScopeOutput JSON
-# being rendered as an empty PRD).
 _KEY_TO_MODEL: dict[str, type[BaseModel]] = {
     "prd": PRD,
     "design": DesignDecisions,
@@ -41,122 +39,111 @@ _KEY_TO_MODEL: dict[str, type[BaseModel]] = {
     "scope": ScopeOutput,
 }
 
-# Fallback list for unknown keys (order shouldn't matter when key is known).
 _ARTIFACT_MODELS: list[type[BaseModel]] = [PRD, DesignDecisions, TechnicalPlan, ImplementationDAG]
+
+_SERVE_PORT = 9000
 
 
 class DocHostingService:
-    """Manages artifact hosting sessions. Created per-workflow, torn down on completion."""
+    """Manages artifact hosting. Writes files; iriai-feedback serve handles the rest."""
 
     def __init__(
         self,
         mirror: ArtifactMirror,
-        feedback: FeedbackService,
+        feedback: Any = None,
         *,
         tunnel: CloudflareTunnel | None = None,
     ) -> None:
         self._mirror = mirror
-        self._feedback = feedback
+        self._feedback = feedback  # kept for backward compat, unused in serve mode
         self._tunnel = tunnel
-        self._sessions: dict[str, SessionInfo] = {}
-        self._urls: dict[str, str] = {}  # key → public URL (tunneled if available)
-        self._labels: dict[str, str] = {}  # key → label (for restarts)
+        self._urls: dict[str, str] = {}
+        self._labels: dict[str, str] = {}
+        self._current_feature_id: str | None = None
+
+    def _artifact_url(self, feature_id: str, key: str) -> str:
+        """Build the review URL for an artifact."""
+        if self._tunnel:
+            return self._tunnel.artifact_url(feature_id, key)
+        return f"http://localhost:{_SERVE_PORT}/features/{feature_id}/{key}"
 
     async def push(self, feature_id: str, key: str, content: str, label: str) -> str:
-        """Write artifact to disk and start hosting. Returns URL. Raises on failure."""
+        """Write artifact to disk and return its review URL."""
         display_content = self._to_display_content(content, key)
-        path = self._mirror.write_artifact(feature_id, key, display_content)
-        base_path = f"/features/{feature_id}/{key}"
-        info = await self._feedback.start_doc_review(
-            str(path), title=label, base_path=base_path,
-        )
+        self._mirror.write_artifact(feature_id, key, display_content)
+        self._current_feature_id = feature_id
 
-        url = info.url
-        if self._tunnel:
-            try:
-                public_base = await self._tunnel.tunnel(info.port)
-                url = f"{public_base}{base_path}"
-                logger.info("Tunneled %s: %s → %s", key, info.url, url)
-            except Exception:
-                logger.warning("Tunnel failed for %s, using local URL", key, exc_info=True)
-
-        self._sessions[key] = info
-        self._urls[key] = url  # Store the (possibly tunneled) URL
+        url = self._artifact_url(feature_id, key)
+        self._urls[key] = url
         self._labels[key] = label
         logger.info("Hosted %s at %s", key, url)
         return url
 
     async def push_qa(self, feature_id: str, key: str, content: str, label: str) -> str:
-        """Write artifact to disk and start a QA feedback session (annotation overlay).
+        """Write artifact to disk and return its review URL.
 
-        Unlike ``push()`` which uses doc-review (static rendering), this
-        serves the file with the full QA overlay (click-to-annotate, visual
-        regression) — ideal for visual artifacts like mockups.
+        With iriai-feedback serve, HTML artifacts get the same overlay treatment
+        as markdown — no separate QA session needed.
         """
-        path = self._mirror.write_artifact(feature_id, key, content)
-        info = await self._feedback.start_qa_file(str(path))
+        self._mirror.write_artifact(feature_id, key, content)
+        self._current_feature_id = feature_id
 
-        url = info.url
-        if self._tunnel:
-            try:
-                public_base = await self._tunnel.tunnel(info.port)
-                url = public_base
-                logger.info("Tunneled QA %s: %s → %s", key, info.url, url)
-            except Exception:
-                logger.warning("Tunnel failed for QA %s, using local URL", key, exc_info=True)
-
-        self._sessions[key] = info
+        url = self._artifact_url(feature_id, key)
         self._urls[key] = url
         self._labels[key] = label
         logger.info("QA hosted %s at %s", key, url)
         return url
 
     async def update(self, feature_id: str, key: str, content: str) -> None:
-        """Re-write artifact and restart its hosting session.
-
-        The iriai-feedback server reads the file once at startup, so a
-        disk-only write won't be picked up.  Stop the old session and
-        re-push to start a fresh server with the new content.
-        ``push()`` handles display-format conversion, so callers pass raw
-        content (JSON / text) — same as ``push()``.
-        """
-        old_info = self._sessions.get(key)
-        if old_info:
-            try:
-                await self._feedback.stop(old_info.session_id)
-            except Exception:
-                logger.warning("Failed to stop old session for %s", key, exc_info=True)
-
-        label = self._labels.get(key, key)
-        await self.push(feature_id, key, content, label)
+        """Re-write artifact file. iriai-feedback serve watches for changes and auto-refreshes."""
+        display_content = self._to_display_content(content, key)
+        self._mirror.write_artifact(feature_id, key, display_content)
+        logger.info("Updated %s (auto-refresh via SSE)", key)
 
     def get_url(self, key: str) -> str | None:
         return self._urls.get(key)
 
     async def try_collect(self, key: str) -> list[dict[str, Any]]:
-        """Non-blocking: return annotations if available, else []."""
-        info = self._sessions.get(key)
-        if not info:
-            logger.warning("[diag] try_collect: no session for key %r (known: %s)", key, list(self._sessions.keys()))
+        """Read annotations from co-located .feedback/ directory."""
+        if not self._current_feature_id:
             return []
-        logger.warning("[diag] try_collect(%r): session_id=%s", key, info.session_id)
-        annotations = await self._feedback.get_annotations(info.session_id)
-        logger.warning("[diag] try_collect(%r): got %d annotations", key, len(annotations))
+
+        feedback_dir = (
+            self._mirror.feature_dir(self._current_feature_id)
+            / ".feedback"
+            / key
+            / "annotations"
+        )
+
+        if not feedback_dir.is_dir():
+            return []
+
+        annotations: list[dict[str, Any]] = []
+        for f in sorted(feedback_dir.iterdir()):
+            if f.suffix != ".json":
+                continue
+            try:
+                data = json.loads(f.read_text(encoding="utf-8"))
+                if not data.get("deleted"):
+                    annotations.append(data)
+            except (json.JSONDecodeError, OSError):
+                continue
+
+        logger.info("try_collect(%r): %d annotations", key, len(annotations))
         return annotations
 
     async def rehost_existing(self, feature_id: str, label_prefix: str = "") -> int:
-        """Re-host all artifact files on disk for a feature. Returns count hosted.
+        """Register URLs for existing artifacts. No subprocess restart needed.
 
-        Scans the artifact mirror's feature directory for known artifact files
-        and pushes each one to start a fresh hosting session.  Used after a
-        bridge restart to restore browser review URLs.
+        iriai-feedback serve auto-discovers all artifacts in the directory.
+        This just populates the URL cache so get_url() works after recovery.
         """
         from .artifacts import _KEY_MAP
 
         fdir = self._mirror.feature_dir(feature_id)
+        self._current_feature_id = feature_id
         hosted = 0
 
-        # Reverse map: filename → artifact key
         filename_to_key = {v: k for k, v in _KEY_MAP.items()}
 
         for path in sorted(fdir.iterdir()):
@@ -166,45 +153,30 @@ class DocHostingService:
             if not key:
                 continue
 
-            content = path.read_text(encoding="utf-8")
-            if not content.strip():
+            if not path.read_text(encoding="utf-8").strip():
                 continue
 
             label = f"{label_prefix}{key}".strip() if label_prefix else key
-            try:
-                url = await self.push(feature_id, key, content, label)
-                logger.info("Re-hosted %s at %s", key, url)
-                hosted += 1
-            except Exception:
-                logger.warning("Failed to re-host %s for feature %s", key, feature_id, exc_info=True)
+            url = self._artifact_url(feature_id, key)
+            self._urls[key] = url
+            self._labels[key] = label
+            logger.info("Re-registered %s at %s", key, url)
+            hosted += 1
 
         return hosted
 
     async def stop_all(self) -> None:
-        """Best-effort cleanup — logs warnings but doesn't raise."""
-        for key, info in self._sessions.items():
-            try:
-                await self._feedback.stop(info.session_id)
-            except Exception:
-                logger.warning("Failed to stop session for %s", key, exc_info=True)
-        self._sessions.clear()
+        """No-op — the single iriai-feedback serve process is bridge-scoped."""
+        pass
 
     @staticmethod
     def _to_display_content(content: str, key: str = "") -> str:
-        """Convert JSON-serialized Pydantic models to display format.
-
-        Uses the artifact *key* to select the correct model, avoiding
-        false-positive validation (most models have all-default fields).
-        SystemDesign → HTML; everything else → markdown.
-        If *content* is not valid JSON or doesn't match a known model, it is
-        returned as-is (already markdown/HTML/text).
-        """
+        """Convert JSON-serialized Pydantic models to display format."""
         try:
             data = json.loads(content)
         except (json.JSONDecodeError, TypeError):
             return content
 
-        # SystemDesign renders to interactive HTML.
         if key == "system-design":
             try:
                 sd = SystemDesign.model_validate(data)
@@ -212,7 +184,6 @@ class DocHostingService:
             except ValidationError:
                 pass
 
-        # Try the model mapped to this specific key first.
         if key in _KEY_TO_MODEL:
             try:
                 model = _KEY_TO_MODEL[key].model_validate(data)
@@ -220,7 +191,6 @@ class DocHostingService:
             except ValidationError:
                 pass
 
-        # Fallback: try all known models for unknown keys.
         for model_cls in _ARTIFACT_MODELS:
             try:
                 model = model_cls.model_validate(data)
