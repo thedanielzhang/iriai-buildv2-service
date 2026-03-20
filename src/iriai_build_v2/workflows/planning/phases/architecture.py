@@ -95,7 +95,20 @@ class ArchitecturePhase(Phase):
                 )
                 print(f"\n📐 System Design hosted at: {sd_url}\n", flush=True)
 
-        # 3. Gate the text plan
+        # 3. Gate the text plan (include system design link for full picture)
+        hosting = runner.services.get("hosting") if not existing_plan_text else hosting
+        plan_url = hosting.get_url("plan") if hosting else None
+        sd_url_for_gate = hosting.get_url("system-design") if hosting else sd_url if 'sd_url' in dir() else None
+
+        plan_label = "Technical Plan"
+        review_links: list[str] = []
+        if plan_url:
+            review_links.append(f"Plan: {plan_url}")
+        if sd_url_for_gate:
+            review_links.append(f"System Design: {sd_url_for_gate}")
+        if review_links:
+            plan_label += "\nReview in browser: " + " | ".join(review_links)
+
         plan, plan_text = await gate_and_revise(
             runner,
             feature,
@@ -104,14 +117,15 @@ class ArchitecturePhase(Phase):
             actor=architect,
             output_type=TechnicalPlan,
             approver=user,
-            label="Technical plan",
+            label=plan_label,
             artifact_key="plan",
+            annotation_keys=["plan", "system-design"] if sd_url_for_gate else None,
         )
 
         # 4. Gate the system design
         sd_label = (
-            f"System Design\nReview in browser: {sd_url}"
-            if sd_url
+            f"System Design\nReview in browser: {sd_url_for_gate}"
+            if sd_url_for_gate
             else "System Design"
         )
         system_design, sd_text = await gate_and_revise(
