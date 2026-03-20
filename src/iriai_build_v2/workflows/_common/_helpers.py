@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar
 
 from pydantic import BaseModel
 
-from iriai_compose import Ask, Gate, to_str
+from iriai_compose import Ask, Gate, Interview, to_str
 from iriai_compose.actors import Actor
 
 if TYPE_CHECKING:
@@ -49,6 +49,29 @@ async def get_existing_artifact(
 
     content = path.read_text(encoding="utf-8").strip()
     return content if content else None
+
+
+def _revision_done(result: Any, output_type: type) -> bool:
+    """Check if a revision Interview produced a complete artifact.
+
+    Returns True if the result has the ``complete`` flag set, or if the
+    model has any substantive content (non-empty string/list fields).
+    This allows the agent to ask clarifying questions before producing
+    the final output.
+    """
+    if hasattr(result, "complete") and result.complete:
+        return True
+    # Check if the model has any actual content
+    if isinstance(result, BaseModel):
+        for name in result.model_fields:
+            if name == "complete":
+                continue
+            value = getattr(result, name)
+            if isinstance(value, str) and value:
+                return True
+            if isinstance(value, list) and value:
+                return True
+    return False
 
 
 async def gate_and_revise(
@@ -132,10 +155,12 @@ async def gate_and_revise(
                         logger.debug("Failed to clear feedback for %r", ck)
 
         artifact = await runner.run(
-            Ask(
-                actor=actor,
-                prompt=f"Revise the {artifact_name.lower()} based on this feedback:\n\n{feedback}",
+            Interview(
+                questioner=actor,
+                responder=approver,
+                initial_prompt=f"Revise the {artifact_name.lower()} based on this feedback:\n\n{feedback}",
                 output_type=output_type,
+                done=lambda result: _revision_done(result, output_type),
             ),
             feature,
             phase_name=phase_name,
