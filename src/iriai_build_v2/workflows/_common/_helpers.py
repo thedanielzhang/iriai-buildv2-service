@@ -154,11 +154,19 @@ async def gate_and_revise(
                     except Exception:
                         logger.debug("Failed to clear feedback for %r", ck)
 
+        revision_prompt = (
+            f"Here is the current {artifact_name.lower()}:\n\n"
+            f"{artifact_text}\n\n"
+            f"---\n\n"
+            f"Revise the COMPLETE {artifact_name.lower()} based on this feedback. "
+            f"Output the full document with all sections, not just the changes:\n\n"
+            f"{feedback}"
+        )
         artifact = await runner.run(
             Interview(
                 questioner=actor,
                 responder=approver,
-                initial_prompt=f"Revise the {artifact_name.lower()} based on this feedback:\n\n{feedback}",
+                initial_prompt=revision_prompt,
                 output_type=output_type,
                 done=lambda result: _revision_done(result, output_type),
             ),
