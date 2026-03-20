@@ -197,16 +197,36 @@ class SlackStreamer:
             return
 
         display_text = markdown_to_mrkdwn(text)
-        if len(display_text) > 39_000:
-            display_text = display_text[:39_000] + "\n\n_(truncated)_"
+
+        # Slack message limit is ~40K chars. Split into chunks rather than truncate.
+        _MAX_MSG = 38_000
+        chunks = []
+        while len(display_text) > _MAX_MSG:
+            # Find a good split point (paragraph break)
+            split_at = display_text.rfind("\n\n", 0, _MAX_MSG)
+            if split_at < _MAX_MSG // 2:
+                split_at = display_text.rfind("\n", 0, _MAX_MSG)
+            if split_at < _MAX_MSG // 2:
+                split_at = _MAX_MSG
+            chunks.append(display_text[:split_at])
+            display_text = display_text[split_at:].lstrip("\n")
+        chunks.append(display_text)
+
         try:
+            # First chunk: update or post
+            first = chunks[0]
             if message_ts:
                 await self._adapter.update_message(
-                    self._channel, message_ts, text=display_text
+                    self._channel, message_ts, text=first
                 )
             else:
                 await self._adapter.post_message(
-                    self._channel, display_text, thread_ts=self._thread_ts
+                    self._channel, first, thread_ts=self._thread_ts
+                )
+            # Remaining chunks: post as follow-up messages
+            for chunk in chunks[1:]:
+                await self._adapter.post_message(
+                    self._channel, chunk, thread_ts=self._thread_ts
                 )
         except Exception:
             logger.exception("Failed final flush to Slack")
