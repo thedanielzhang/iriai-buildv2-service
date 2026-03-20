@@ -88,6 +88,13 @@ async def gate_and_revise(
                     if ann_lines:
                         feedback += "\n\nReviewer annotations:\n" + "\n".join(ann_lines)
 
+                # Clear annotations so they don't carry over to the next iteration
+                for ck in collect_keys:
+                    try:
+                        await hosting.clear_feedback(ck)
+                    except Exception:
+                        logger.debug("Failed to clear feedback for %r", ck)
+
         artifact = await runner.run(
             Ask(
                 actor=actor,

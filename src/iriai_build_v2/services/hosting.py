@@ -138,6 +138,43 @@ class DocHostingService:
         logger.info("try_collect(%r): %d annotations", key, len(annotations))
         return annotations
 
+    async def clear_feedback(self, key: str) -> None:
+        """Delete all annotation files and reset the session for an artifact.
+
+        Called after collecting annotations so they don't carry over to the
+        next gate iteration.
+        """
+        if not self._current_feature_id:
+            return
+
+        fb_dir = (
+            self._mirror.feature_dir(self._current_feature_id)
+            / ".feedback"
+            / key
+        )
+        if not fb_dir.is_dir():
+            return
+
+        # Remove annotation files
+        ann_dir = fb_dir / "annotations"
+        if ann_dir.is_dir():
+            for f in ann_dir.iterdir():
+                if f.suffix == ".json":
+                    f.unlink(missing_ok=True)
+
+        # Reset session status so the overlay allows new annotations
+        session_file = fb_dir / "session.json"
+        if session_file.exists():
+            try:
+                data = json.loads(session_file.read_text(encoding="utf-8"))
+                data["status"] = "active"
+                data["submitted_at"] = None
+                session_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            except (json.JSONDecodeError, OSError):
+                pass
+
+        logger.info("Cleared feedback for %s", key)
+
     async def rehost_existing(self, feature_id: str, label_prefix: str = "") -> int:
         """Register URLs for existing artifacts. No subprocess restart needed.
 
