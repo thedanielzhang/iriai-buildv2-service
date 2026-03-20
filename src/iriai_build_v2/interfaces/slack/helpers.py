@@ -237,6 +237,57 @@ async def remove_reaction(
         pass
 
 
+# ── Long text splitting ────────────────────────────────────────────────
+
+_SECTION_TEXT_LIMIT = 2900  # Slack max is 3000, leave room for formatting
+
+
+def split_mrkdwn_blocks(text: str, limit: int = _SECTION_TEXT_LIMIT) -> list[dict[str, Any]]:
+    """Split long mrkdwn text into multiple section blocks.
+
+    Breaks at double-newline (paragraph) boundaries first, then single
+    newlines, to avoid mid-sentence cuts.  Returns a list of section
+    blocks, each within the char limit.
+    """
+    if len(text) <= limit:
+        return [{"type": "section", "text": {"type": "mrkdwn", "text": text}}]
+
+    chunks: list[str] = []
+    current = ""
+
+    for paragraph in text.split("\n\n"):
+        candidate = f"{current}\n\n{paragraph}" if current else paragraph
+        if len(candidate) <= limit:
+            current = candidate
+        else:
+            if current:
+                chunks.append(current)
+            # If single paragraph exceeds limit, split by lines
+            if len(paragraph) > limit:
+                for line in paragraph.split("\n"):
+                    line_candidate = f"{current}\n{line}" if current else line
+                    if len(line_candidate) <= limit:
+                        current = line_candidate
+                    else:
+                        if current:
+                            chunks.append(current)
+                        # Hard split if single line exceeds limit
+                        while len(line) > limit:
+                            chunks.append(line[:limit])
+                            line = line[limit:]
+                        current = line
+            else:
+                current = paragraph
+
+    if current:
+        chunks.append(current)
+
+    return [
+        {"type": "section", "text": {"type": "mrkdwn", "text": chunk}}
+        for chunk in chunks
+    ]
+
+
 # ── Backward-compat re-exports (moved to cards/) ─────────────────────────
 
 from .cards.modal import build_modal_view  # noqa: F401, E402

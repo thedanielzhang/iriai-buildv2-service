@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Any
 from iriai_compose.runner import InteractionRuntime
 
 from .cards import ApproveCard, ChooseCard, RespondCard, build_modal_view
-from .helpers import build_resolved_blocks
+from .helpers import build_resolved_blocks, split_mrkdwn_blocks
 
 if TYPE_CHECKING:
     from iriai_compose.pending import Pending
@@ -294,14 +294,36 @@ class SlackInteractionRuntime(InteractionRuntime):
     # ── Post Helpers ──────────────────────────────────────────────────────
 
     async def _post_respond(self, pending: Pending, channel: str) -> None:
-        """Post an Interview question card with options + inline text input + Expand."""
+        """Post an Interview question card with options + inline text input + Expand.
+
+        If the question exceeds Slack's 3000-char section limit, the full
+        text is posted as preceding context message(s), and the interactive
+        card gets a short summary.
+        """
         question, options = _extract_question(pending.prompt)
-        card = RespondCard(
-            pending_id=pending.id,
-            phase_name=pending.phase_name,
-            question=question,
-            options=options,
-        )
+
+        full_text = f"*{pending.phase_name}*\n{question}"
+        if len(full_text) > 2900:
+            # Post full content as context message(s) — no truncation
+            context_blocks = split_mrkdwn_blocks(full_text)
+            await self._adapter.post_blocks(channel, context_blocks, question[:100])
+
+            # Post compact interactive card with just the buttons
+            short_q = question[:200] + "..." if len(question) > 200 else question
+            card = RespondCard(
+                pending_id=pending.id,
+                phase_name=pending.phase_name,
+                question=short_q,
+                options=options,
+            )
+        else:
+            card = RespondCard(
+                pending_id=pending.id,
+                phase_name=pending.phase_name,
+                question=question,
+                options=options,
+            )
+
         blocks = card.build_blocks()
         ts = await self._adapter.post_blocks(channel, blocks, question[:100])
         self._pending_messages[pending.id] = (channel, ts)
@@ -309,16 +331,36 @@ class SlackInteractionRuntime(InteractionRuntime):
             self._pending_options[pending.id] = options
 
     async def _post_approve(self, pending: Pending, channel: str) -> None:
-        """Post a Gate approval card with buttons + feedback modal."""
+        """Post a Gate approval card with buttons + feedback modal.
+
+        If the context exceeds Slack's 3000-char section limit, the full
+        text is posted as preceding context message(s).
+        """
         prompt = pending.prompt
-        # Extract artifact name and review URLs from the prompt
         artifact_name, review_urls = _extract_gate_info(prompt)
-        card = ApproveCard(
-            pending_id=pending.id,
-            title="Approval Required",
-            context=artifact_name,
-            review_urls=review_urls or None,
-        )
+
+        full_text = f"*Approval Required*\n{artifact_name}"
+        if review_urls:
+            full_text += "\n" + "\n".join(f"<{u}|Review in browser>" for u in review_urls)
+
+        if len(full_text) > 2900:
+            context_blocks = split_mrkdwn_blocks(full_text)
+            await self._adapter.post_blocks(channel, context_blocks, "Approval Required")
+            # Compact card with just title + URLs + buttons
+            card = ApproveCard(
+                pending_id=pending.id,
+                title="Approval Required",
+                context=artifact_name[:200],
+                review_urls=review_urls or None,
+            )
+        else:
+            card = ApproveCard(
+                pending_id=pending.id,
+                title="Approval Required",
+                context=artifact_name,
+                review_urls=review_urls or None,
+            )
+
         blocks = card.build_blocks()
         ts = await self._adapter.post_blocks(channel, blocks, "Approval Required")
         self._pending_messages[pending.id] = (channel, ts)
