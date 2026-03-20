@@ -19,42 +19,62 @@ class DesignPhase(Phase):
     async def execute(
         self, runner: WorkflowRunner, feature: Feature, state: BuildState
     ) -> BuildState:
-        # Resolve the outputs path so we can tell the designer exactly where to write
-        outputs_path = ""
-        project_json = await runner.artifacts.get("project", feature=feature)
-        if project_json:
-            import json as _json
-            try:
-                outputs_path = _json.loads(project_json).get("outputs_path", "")
-            except (ValueError, TypeError):
-                pass
+        # Check if design artifact already exists (e.g. resuming after restart)
+        existing_design_text = await runner.artifacts.get("design", feature=feature)
 
-        initial_prompt = (
-            "Based on the PRD, I'll propose design decisions including component "
-            "structure, user flows, and interaction patterns. Let me ask a few "
-            "clarifying questions about your UX preferences first."
-        )
-        if outputs_path:
-            initial_prompt += (
-                f"\n\n**IMPORTANT: When you create the mockup HTML file, write it to "
-                f"exactly this path: `{outputs_path}/mockup.html`**"
+        if existing_design_text:
+            logger.info("Design artifact exists — skipping interview, resuming at gate")
+            try:
+                import json as _json
+                data = _json.loads(existing_design_text)
+                design = DesignDecisions.model_validate(data)
+            except Exception:
+                design = existing_design_text
+
+            # Re-host existing artifacts
+            hosting = runner.services.get("hosting")
+            if hosting:
+                await hosting.push(
+                    feature.id, "design", existing_design_text,
+                    f"Design Decisions — {feature.name}",
+                )
+        else:
+            # Resolve the outputs path so we can tell the designer exactly where to write
+            outputs_path = ""
+            project_json = await runner.artifacts.get("project", feature=feature)
+            if project_json:
+                import json as _json
+                try:
+                    outputs_path = _json.loads(project_json).get("outputs_path", "")
+                except (ValueError, TypeError):
+                    pass
+
+            initial_prompt = (
+                "Based on the PRD, I'll propose design decisions including component "
+                "structure, user flows, and interaction patterns. Let me ask a few "
+                "clarifying questions about your UX preferences first."
+            )
+            if outputs_path:
+                initial_prompt += (
+                    f"\n\n**IMPORTANT: When you create the mockup HTML file, write it to "
+                    f"exactly this path: `{outputs_path}/mockup.html`**"
+                )
+
+            envelope: Envelope[DesignDecisions] = await runner.run(
+                HostedInterview(
+                    questioner=designer,
+                    responder=user,
+                    initial_prompt=initial_prompt,
+                    output_type=Envelope[DesignDecisions],
+                    done=envelope_done,
+                    artifact_key="design",
+                    artifact_label="Design Decisions",
+                ),
+                feature,
+                phase_name=self.name,
             )
 
-        envelope: Envelope[DesignDecisions] = await runner.run(
-            HostedInterview(
-                questioner=designer,
-                responder=user,
-                initial_prompt=initial_prompt,
-                output_type=Envelope[DesignDecisions],
-                done=envelope_done,
-                artifact_key="design",
-                artifact_label="Design Decisions",
-            ),
-            feature,
-            phase_name=self.name,
-        )
-
-        design = envelope.output
+            design = envelope.output
 
         # Host mockup if the designer created one during the interview
         mockup_url = await self._host_mockup(runner, feature)

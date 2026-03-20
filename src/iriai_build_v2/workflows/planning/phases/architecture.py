@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+
 from iriai_compose import Feature, Phase, WorkflowRunner
 
 from ....models.outputs import (
@@ -14,6 +16,8 @@ from ....roles import architect, user
 from ....services.system_design_html import render_system_design_html
 from ..._common import HostedInterview, gate_and_revise
 
+logger = logging.getLogger(__name__)
+
 
 class ArchitecturePhase(Phase):
     name = "architecture"
@@ -21,41 +25,75 @@ class ArchitecturePhase(Phase):
     async def execute(
         self, runner: WorkflowRunner, feature: Feature, state: BuildState
     ) -> BuildState:
-        # 1. Interview produces both plan and system design
-        envelope: Envelope[ArchitectureOutput] = await runner.run(
-            HostedInterview(
-                questioner=architect,
-                responder=user,
-                initial_prompt=(
-                    "I'll explore the codebase and ask questions to build a technical plan. "
-                    "Let me start by understanding the project structure. "
-                    "What area of the codebase should I focus on?"
+        # Check if plan artifact already exists (resuming after restart)
+        existing_plan_text = await runner.artifacts.get("plan", feature=feature)
+        existing_sd_text = await runner.artifacts.get("system-design", feature=feature)
+
+        if existing_plan_text:
+            logger.info("Architecture artifacts exist — skipping interview, resuming at gate")
+            try:
+                import json as _json
+                data = _json.loads(existing_plan_text)
+                plan = TechnicalPlan.model_validate(data)
+            except Exception:
+                plan = existing_plan_text
+
+            try:
+                import json as _json
+                data = _json.loads(existing_sd_text or "{}")
+                system_design = SystemDesign.model_validate(data)
+            except Exception:
+                system_design = SystemDesign()
+
+            # Re-host existing artifacts
+            hosting = runner.services.get("hosting")
+            sd_url: str | None = None
+            if hosting:
+                await hosting.push(
+                    feature.id, "plan", existing_plan_text,
+                    f"Technical Plan — {feature.name}",
+                )
+                if existing_sd_text:
+                    sd_url = await hosting.push(
+                        feature.id, "system-design", existing_sd_text,
+                        f"System Design — {feature.name}",
+                    )
+        else:
+            # 1. Interview produces both plan and system design
+            envelope: Envelope[ArchitectureOutput] = await runner.run(
+                HostedInterview(
+                    questioner=architect,
+                    responder=user,
+                    initial_prompt=(
+                        "I'll explore the codebase and ask questions to build a technical plan. "
+                        "Let me start by understanding the project structure. "
+                        "What area of the codebase should I focus on?"
+                    ),
+                    output_type=Envelope[ArchitectureOutput],
+                    done=envelope_done,
+                    artifact_key="plan",
+                    artifact_label="Technical Plan",
                 ),
-                output_type=Envelope[ArchitectureOutput],
-                done=envelope_done,
-                artifact_key="plan",
-                artifact_label="Technical Plan",
-            ),
-            feature,
-            phase_name=self.name,
-        )
-
-        arch_output = envelope.output
-        plan = arch_output.plan
-        system_design = arch_output.system_design
-
-        # 2. Render and host system design HTML
-        hosting = runner.services.get("hosting")
-        sd_url: str | None = None
-        if hosting:
-            html = render_system_design_html(system_design)
-            sd_url = await hosting.push(
-                feature.id,
-                "system-design",
-                html,
-                f"System Design — {feature.name}",
+                feature,
+                phase_name=self.name,
             )
-            print(f"\n📐 System Design hosted at: {sd_url}\n", flush=True)
+
+            arch_output = envelope.output
+            plan = arch_output.plan
+            system_design = arch_output.system_design
+
+            # 2. Render and host system design HTML
+            hosting = runner.services.get("hosting")
+            sd_url: str | None = None
+            if hosting:
+                html = render_system_design_html(system_design)
+                sd_url = await hosting.push(
+                    feature.id,
+                    "system-design",
+                    html,
+                    f"System Design — {feature.name}",
+                )
+                print(f"\n📐 System Design hosted at: {sd_url}\n", flush=True)
 
         # 3. Gate the text plan
         plan, plan_text = await gate_and_revise(
