@@ -1,16 +1,51 @@
 from __future__ import annotations
 
+import json as _json
 import logging
 from pathlib import Path
 
-from iriai_compose import Feature, Phase, WorkflowRunner
+from iriai_compose import Feature, Phase, WorkflowRunner, to_str
 
-from ....models.outputs import DesignDecisions, Envelope, envelope_done
+from ....models.outputs import (
+    DesignDecisions,
+    RevisionPlan,
+    RevisionRequest,
+    SubfeatureDecomposition,
+)
 from ....models.state import BuildState
-from ....roles import designer, user
-from ..._common import HostedInterview, gate_and_revise, get_existing_artifact
+from ....roles import (
+    design_compiler,
+    designer_role,
+    lead_designer,
+    lead_designer_gate_reviewer,
+    lead_designer_reviewer,
+    user,
+)
+from ..._common import (
+    broad_interview,
+    compile_artifacts,
+    get_existing_artifact,
+    integration_review,
+    interview_gate_review,
+    per_subfeature_loop,
+)
+from ..._common._helpers import targeted_revision
 
 logger = logging.getLogger(__name__)
+
+
+def _make_sf_prompt(sf, context: str) -> str:
+    """Build the initial interview prompt for a per-subfeature designer agent."""
+    return (
+        f"You are the designer for the **{sf.name}** subfeature (ID: {sf.id}, slug: {sf.slug}).\n\n"
+        f"**Description:** {sf.description}\n\n"
+        "The broad design system has been established (see context below). "
+        "Create detailed component definitions, journey UX annotations, "
+        "interaction patterns, and responsive behavior for this subfeature.\n\n"
+        "Search the codebase for existing UI patterns to reuse. "
+        "Document all interfaces and edges to other subfeatures explicitly.\n\n"
+        f"## Context from prior work\n\n{context}"
+    )
 
 
 class DesignPhase(Phase):
@@ -19,112 +54,123 @@ class DesignPhase(Phase):
     async def execute(
         self, runner: WorkflowRunner, feature: Feature, state: BuildState
     ) -> BuildState:
-        # Check if design artifact already exists (DB or filesystem — e.g. resuming after restart)
-        existing_design_text = await get_existing_artifact(runner, feature, "design")
+        # ── Step 1: Resume check ──
+        existing_design = await get_existing_artifact(runner, feature, "design")
+        if existing_design:
+            logger.info("Compiled design exists — skipping to end")
+            state.design = existing_design
+            return state
 
-        if existing_design_text:
-            logger.info("Design artifact exists — skipping interview, resuming at gate")
-            try:
-                import json as _json
-                data = _json.loads(existing_design_text)
-                design = DesignDecisions.model_validate(data)
-            except Exception:
-                design = existing_design_text
+        # Load decomposition from state or artifact store
+        decomposition = await self._load_decomposition(runner, feature, state)
 
-            # Re-host existing artifacts
-            hosting = runner.services.get("hosting")
-            if hosting:
-                await hosting.push(
-                    feature.id, "design", existing_design_text,
-                    f"Design Decisions — {feature.name}",
-                )
-        else:
-            # Resolve the outputs path so we can tell the designer exactly where to write
-            outputs_path = ""
-            project_json = await runner.artifacts.get("project", feature=feature)
-            if project_json:
-                import json as _json
-                try:
-                    outputs_path = _json.loads(project_json).get("outputs_path", "")
-                except (ValueError, TypeError):
-                    pass
-
-            initial_prompt = (
-                "Based on the PRD, I'll propose design decisions including component "
-                "structure, user flows, and interaction patterns. Let me ask a few "
-                "clarifying questions about your UX preferences first."
-            )
-            if outputs_path:
-                initial_prompt += (
-                    f"\n\n**IMPORTANT: When you create the mockup HTML file, write it to "
-                    f"exactly this path: `{outputs_path}/mockup.html`**"
-                )
-
-            envelope: Envelope[DesignDecisions] = await runner.run(
-                HostedInterview(
-                    questioner=designer,
-                    responder=user,
-                    initial_prompt=initial_prompt,
-                    output_type=Envelope[DesignDecisions],
-                    done=envelope_done,
-                    artifact_key="design",
-                    artifact_label="Design Decisions",
-                ),
-                feature,
-                phase_name=self.name,
-            )
-
-            design = envelope.output
-
-        # Host mockup if the designer created one during the interview
-        mockup_url = await self._host_mockup(runner, feature)
-
-        # Build gate label with both review URLs
-        hosting = runner.services.get("hosting")
-        design_url = hosting.get_url("design") if hosting else None
-
-        label = "Design Decisions"
-        review_links: list[str] = []
-        if design_url:
-            review_links.append(f"Design decisions: {design_url}")
-        if mockup_url:
-            review_links.append(f"Mockup: {mockup_url}")
-        if review_links:
-            label += "\nReview in browser: " + " | ".join(review_links)
-
-        # Collect annotations from both design decisions and mockup sessions
-        ann_keys = ["design"]
-        if mockup_url:
-            ann_keys.append("mockup")
-
-        design, design_text = await gate_and_revise(
+        # ── Step 2: Broad Design Interview ──
+        # Anti-pattern: do NOT create BroadDesignSystem — reuse DesignDecisions
+        _, broad_text = await broad_interview(
             runner, feature, self.name,
-            artifact=design, actor=designer, output_type=DesignDecisions,
-            approver=user, label=label,
-            artifact_key="design",
-            annotation_keys=ann_keys,
+            lead_actor=lead_designer,
+            output_type=DesignDecisions,
+            artifact_key="design:broad",
+            artifact_label="Broad Design System",
+            initial_prompt=(
+                f"I'm going to establish the design foundation for: {feature.name}\n\n"
+                "We'll define the visual language, color palette, typography, spacing, "
+                "and shared component patterns that ALL subfeature designers will build on. "
+                "This is about the design system, not individual components.\n\n"
+                "What aesthetic direction are you looking for?"
+            ),
         )
 
-        await runner.artifacts.put("design", design_text, feature=feature)
-        state.design = design_text
+        # ── Step 3: Per-Subfeature Design Loop (sequential) ──
+        sf_artifacts = await per_subfeature_loop(
+            runner, feature, self.name,
+            decomposition=decomposition,
+            base_role=designer_role,
+            output_type=DesignDecisions,
+            artifact_prefix="design",
+            broad_key="design:broad",
+            make_prompt=_make_sf_prompt,
+        )
+
+        # Host per-subfeature mockups
+        for sf in decomposition.subfeatures:
+            await self._host_sf_mockup(runner, feature, sf.slug)
+
+        # ── Step 4: Integration Review ──
+        review = await integration_review(
+            runner, feature, self.name,
+            lead_actor=lead_designer_reviewer,
+            decomposition=decomposition,
+            artifact_prefix="design",
+            broad_key="design:broad",
+        )
+
+        if review.verdict == "needs_revision" and review.revision_instructions:
+            logger.info("Design integration review needs revision")
+            plan = RevisionPlan(requests=[
+                RevisionRequest(
+                    description=instruction,
+                    reasoning="Design integration review finding",
+                    affected_subfeatures=[sf_slug],
+                )
+                for sf_slug, instruction in review.revision_instructions.items()
+            ])
+            await targeted_revision(
+                runner, feature, self.name,
+                revision_plan=plan,
+                decomposition=decomposition,
+                base_role=designer_role,
+                output_type=DesignDecisions,
+                artifact_prefix="design",
+            )
+
+        # ── Step 5: Compilation ──
+        compiled_design, compiled_text = await compile_artifacts(
+            runner, feature, self.name,
+            compiler_actor=design_compiler,
+            decomposition=decomposition,
+            artifact_prefix="design",
+            broad_key="design:broad",
+            output_type=DesignDecisions,
+            final_key="design",
+        )
+
+        # ── Step 6: Interview-Based Gate Review ──
+        final_text = await interview_gate_review(
+            runner, feature, self.name,
+            lead_actor=lead_designer_gate_reviewer,
+            decomposition=decomposition,
+            artifact_prefix="design",
+            compiled_key="design",
+            base_role=designer_role,
+            output_type=DesignDecisions,
+            compiler_actor=design_compiler,
+            broad_key="design:broad",
+        )
+
+        state.design = final_text
         return state
 
     @staticmethod
-    async def _host_mockup(
-        runner: WorkflowRunner, feature: Feature
+    async def _load_decomposition(
+        runner: WorkflowRunner, feature: Feature, state: BuildState
+    ) -> SubfeatureDecomposition:
+        """Load decomposition from state or artifact store."""
+        decomp_text = state.decomposition
+        if not decomp_text:
+            decomp_text = await runner.artifacts.get("decomposition", feature=feature) or ""
+        if decomp_text:
+            try:
+                return SubfeatureDecomposition.model_validate(_json.loads(decomp_text))
+            except Exception:
+                pass
+        return SubfeatureDecomposition()
+
+    @staticmethod
+    async def _host_sf_mockup(
+        runner: WorkflowRunner, feature: Feature, sf_slug: str
     ) -> str | None:
-        """Find and host the mockup HTML if the designer wrote one.
-
-        Globs for ``mockup*.html`` in multiple locations (the designer
-        may name the file unpredictably).  Search order:
-
-        1. Feature outputs dir (``.iriai/features/{slug}/outputs/``)
-        2. Workspace root (fallback for misbehaved writes)
-        3. Artifact mirror dir (already hosted from a prior session)
-
-        When found outside the artifact mirror, the file is copied there
-        so ``rehost_existing`` can find it after a restart.
-        """
+        """Find and host a mockup HTML for a specific subfeature."""
         hosting = runner.services.get("hosting")
         mirror = runner.services.get("artifact_mirror")
         if not hosting or not mirror:
@@ -132,19 +178,18 @@ class DesignPhase(Phase):
 
         artifact_dir = mirror.feature_dir(feature.id)
 
-        # Directories to glob, in priority order
+        # Search in outputs dir and workspace root
         search_dirs: list[Path] = []
         for ws in runner._workspaces.values():
             outputs = ws.path / ".iriai" / "features" / feature.slug / "outputs"
             if outputs.is_dir():
                 search_dirs.append(outputs)
-            search_dirs.append(ws.path)  # workspace root fallback
+            search_dirs.append(ws.path)
         search_dirs.append(artifact_dir)
 
-        # Find the first mockup*.html match
         source: Path | None = None
         for d in search_dirs:
-            matches = sorted(d.glob("mockup*.html"))
+            matches = sorted(d.glob(f"mockup*{sf_slug}*.html"))
             if matches:
                 source = matches[0]
                 break
@@ -154,19 +199,13 @@ class DesignPhase(Phase):
 
         try:
             content = source.read_text(encoding="utf-8")
-
-            # Copy to artifact mirror so rehost_existing picks it up
-            target = artifact_dir / "mockup.html"
-            if source != target:
-                target.write_text(content, encoding="utf-8")
-                logger.info("Copied mockup from %s → %s", source, target)
-
+            mockup_key = f"mockup:{sf_slug}"
             url = await hosting.push_qa(
-                feature.id, "mockup", content,
-                f"Mockup — {feature.name}",
+                feature.id, mockup_key, content,
+                f"Mockup — {sf_slug}",
             )
-            logger.info("Mockup hosted at %s (found at %s)", url, source)
+            logger.info("Subfeature mockup hosted at %s (found at %s)", url, source)
             return url
         except Exception:
-            logger.warning("Failed to host mockup", exc_info=True)
+            logger.warning("Failed to host subfeature mockup for %s", sf_slug, exc_info=True)
             return None

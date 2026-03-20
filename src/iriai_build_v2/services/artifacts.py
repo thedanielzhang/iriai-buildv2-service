@@ -46,16 +46,17 @@ class ArtifactMirror:
     ) -> Path:
         """Write an artifact to the filesystem mirror.
 
-        ``key`` is mapped to a filename:
+        ``key`` is mapped to a relative path via ``_key_to_path()``:
         - ``prd`` → ``prd.md``
-        - ``design`` → ``design-decisions.md``
-        - ``plan`` → ``plan.md``
-        - anything else → ``{key}.md``
+        - ``prd:broad`` → ``broad/prd.md``
+        - ``prd:visual-workflow-canvas`` → ``subfeatures/visual-workflow-canvas/prd.md``
+        - ``integration-review:pm`` → ``reviews/pm.md``
         """
         fdir = self.feature_dir(feature_id)
 
-        filename = _key_to_filename(key)
-        path = fdir / filename
+        rel_path = _key_to_path(key)
+        path = fdir / rel_path
+        path.parent.mkdir(parents=True, exist_ok=True)
 
         if isinstance(content, BaseModel):
             text = content.model_dump_json(indent=2)
@@ -126,5 +127,51 @@ _KEY_MAP = {
 }
 
 
-def _key_to_filename(key: str) -> str:
-    return _KEY_MAP.get(key, f"{key}.md")
+def _key_to_path(key: str) -> str:
+    """Map an artifact key to a relative file path within the feature directory.
+
+    Standard keys (prd, design, plan, etc.) map to root-level files.
+    Namespaced keys map to subdirectories:
+      prd:visual-workflow-canvas  → subfeatures/visual-workflow-canvas/prd.md
+      prd-summary:visual-workflow  → subfeatures/visual-workflow/prd-summary.md
+      design:broad                → broad/design-system.md
+      plan:broad                  → broad/architecture.md
+      dag:strategy                → broad/strategy.md
+      integration-review:pm       → reviews/pm.md
+      mockup:visual-workflow      → subfeatures/visual-workflow/mockup.html
+    """
+    # 1. Exact matches for standard compiled artifacts
+    if key in _KEY_MAP:
+        return _KEY_MAP[key]
+
+    # 2. Parse namespaced key
+    if ":" not in key:
+        return f"{key}.md"
+
+    prefix, slug = key.split(":", 1)
+
+    # 3. Broad-phase artifacts
+    _BROAD_MAP = {
+        "prd:broad": "broad/prd.md",
+        "design:broad": "broad/design-system.md",
+        "plan:broad": "broad/architecture.md",
+        "dag:strategy": "broad/strategy.md",
+        "design:decomp-alignment": "broad/design-decomp-alignment.md",
+        "plan:decomp-alignment": "broad/plan-decomp-alignment.md",
+    }
+    if key in _BROAD_MAP:
+        return _BROAD_MAP[key]
+
+    # 4. Integration reviews
+    if prefix == "integration-review":
+        return f"reviews/{slug}.md"
+
+    # 5. Subfeature artifacts
+    base_key = prefix.replace("-summary", "")  # prd-summary → prd
+    is_summary = prefix.endswith("-summary")
+    filename = _KEY_MAP.get(base_key, f"{base_key}.md")
+    if is_summary:
+        name, ext = filename.rsplit(".", 1)
+        filename = f"{name}-summary.{ext}"
+
+    return f"subfeatures/{slug}/{filename}"

@@ -68,6 +68,13 @@ from .bug_interviewer import role as bug_interviewer_role
 from .bug_reproducer import role as bug_reproducer_role
 from .root_cause_analyst import role as root_cause_analyst_role
 from .bug_fixer import role as bug_fixer_role
+from .lead_pm import role as lead_pm_role
+from .lead_designer import role as lead_designer_role
+from .lead_architect import role as lead_architect_role
+from .lead_task_planner import role as lead_task_planner_role
+from .compiler import role as compiler_role
+from .summarizer import role as summarizer_role
+from .citation_reviewer import role as citation_reviewer_role
 
 # Backward compat aliases
 task_planner_role = planning_lead_role
@@ -229,6 +236,75 @@ ux_designer = AgentActor(
 task_planner = planning_lead
 qa_engineer = smoke_tester
 reviewer = code_reviewer
+
+# ── Subfeature decomposition actors ────────────────────────────────────────
+lead_pm = InterviewActor(
+    name="lead-pm", role=lead_pm_role, context_keys=["project", "scope"],
+)
+lead_pm_decomposer = InterviewActor(
+    name="lead-pm-decomposer", role=lead_pm_role, context_keys=["project", "scope", "prd:broad"],
+)
+lead_pm_reviewer = InterviewActor(
+    name="lead-pm-reviewer", role=lead_pm_role, context_keys=["project", "scope"],
+)
+lead_pm_gate_reviewer = InterviewActor(
+    name="lead-pm-gate-reviewer", role=lead_pm_role, context_keys=["project", "scope"],
+)
+pm_compiler = AgentActor(
+    name="pm-compiler", role=compiler_role, context_keys=[],
+)
+artifact_summarizer = AgentActor(
+    name="summarizer", role=summarizer_role, context_keys=[],
+)
+citation_reviewer = AgentActor(
+    name="citation-reviewer", role=citation_reviewer_role, context_keys=[],
+)
+
+# Lead designer actors
+lead_designer = InterviewActor(
+    name="lead-designer", role=lead_designer_role, context_keys=["project", "scope", "prd", "decomposition"],
+)
+lead_designer_reviewer = InterviewActor(
+    name="lead-designer-reviewer", role=lead_designer_role, context_keys=["project", "scope"],
+)
+lead_designer_gate_reviewer = InterviewActor(
+    name="lead-designer-gate-reviewer", role=lead_designer_role, context_keys=["project", "scope"],
+)
+design_compiler = AgentActor(
+    name="design-compiler", role=compiler_role, context_keys=[],
+)
+
+# Lead architect actors
+lead_architect = InterviewActor(
+    name="lead-architect", role=lead_architect_role, context_keys=["project", "scope", "prd", "design", "decomposition"],
+)
+lead_architect_reviewer = InterviewActor(
+    name="lead-architect-reviewer", role=lead_architect_role, context_keys=["project", "scope"],
+)
+lead_architect_gate_reviewer = InterviewActor(
+    name="lead-architect-gate-reviewer", role=lead_architect_role, context_keys=["project", "scope"],
+)
+plan_arch_compiler = AgentActor(
+    name="plan-arch-compiler", role=compiler_role, context_keys=[],
+)
+sysdesign_compiler = AgentActor(
+    name="sysdesign-compiler", role=compiler_role, context_keys=[],
+)
+
+# Lead task planner actors
+lead_task_planner = InterviewActor(
+    name="lead-task-planner", role=lead_task_planner_role,
+    context_keys=["project", "scope", "prd", "design", "plan", "system-design", "decomposition"],
+)
+lead_task_planner_reviewer = InterviewActor(
+    name="lead-task-planner-reviewer", role=lead_task_planner_role, context_keys=["project", "scope"],
+)
+lead_task_planner_gate_reviewer = InterviewActor(
+    name="lead-task-planner-gate-reviewer", role=lead_task_planner_role, context_keys=["project", "scope"],
+)
+dag_compiler = AgentActor(
+    name="dag-compiler", role=compiler_role, context_keys=[],
+)
 
 bug_interviewer = AgentActor(name="bug-interviewer", role=bug_interviewer_role, context_keys=["project"])
 bug_reproducer = AgentActor(name="bug-reproducer", role=bug_reproducer_role, context_keys=["project"])

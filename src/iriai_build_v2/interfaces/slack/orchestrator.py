@@ -233,6 +233,10 @@ class SlackWorkflowOrchestrator:
         )
         self._active_runtimes[feature.id] = agent_runtime
 
+        # Wire turn persistence for mid-interview resume
+        self._interaction._session_store = self._env.sessions
+        self._interaction._agent_runtime = agent_runtime
+
         ws = Workspace(id="main", path=workspace_path)
         runner = TrackedWorkflowRunner(
             feature_store=self._env.feature_store,
@@ -545,6 +549,10 @@ class SlackWorkflowOrchestrator:
             interactive_roles=_INTERACTIVE_ROLES,
         )
         self._active_runtimes[feature_id] = agent_runtime
+
+        # Wire turn persistence for mid-interview resume
+        self._interaction._session_store = self._env.sessions
+        self._interaction._agent_runtime = agent_runtime
 
         ws = Workspace(id="main", path=workspace_path)
         runner = TrackedWorkflowRunner(

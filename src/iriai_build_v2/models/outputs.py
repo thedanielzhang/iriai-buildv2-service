@@ -7,6 +7,18 @@ from pydantic import BaseModel, Field
 T = TypeVar("T", bound=BaseModel)
 
 
+# ── Citation model ───────────────────────────────────────────────────────────
+
+
+class Citation(BaseModel):
+    """A justification for a decision in a planning artifact."""
+
+    type: str  # code | decision | research
+    reference: str  # file path, decision ID (D-*), or URL/description
+    excerpt: str = ""
+    reasoning: str = ""
+
+
 # ── Shared sub-models ────────────────────────────────────────────────────────
 
 
@@ -91,6 +103,7 @@ class Requirement(BaseModel):
     category: str  # functional | non-functional | security | performance
     description: str
     priority: str = "must"  # must | should | could
+    citations: list[Citation] = Field(default_factory=list)
 
 
 class AcceptanceCriterion(BaseModel):
@@ -101,6 +114,7 @@ class AcceptanceCriterion(BaseModel):
     expected_observation: str
     not_criteria: str = ""
     requirement_ids: list[str] = Field(default_factory=list)
+    citations: list[Citation] = Field(default_factory=list)
 
 
 class JourneyStep(BaseModel):
@@ -110,6 +124,7 @@ class JourneyStep(BaseModel):
     action: str
     observes: str
     not_criteria: str = ""
+    citations: list[Citation] = Field(default_factory=list)
 
 
 class Journey(BaseModel):
@@ -208,6 +223,7 @@ class ComponentDef(BaseModel):
     description: str = ""
     props_variants: str = ""
     states: list[str] = Field(default_factory=list)
+    citations: list[Citation] = Field(default_factory=list)
 
 
 class VerifiableState(BaseModel):
@@ -249,6 +265,7 @@ class ImplementationStep(BaseModel):
     counterexamples: list[str] = Field(default_factory=list)
     requirement_ids: list[str] = Field(default_factory=list)
     journey_ids: list[str] = Field(default_factory=list)
+    citations: list[Citation] = Field(default_factory=list)
 
 
 class VerifyBlock(BaseModel):
@@ -298,6 +315,105 @@ class TaskFileScope(BaseModel):
 
     path: str
     action: str  # create | modify | read_only
+
+
+# ── Subfeature decomposition models ──────────────────────────────────────────
+
+
+class SubfeatureEdge(BaseModel):
+    """A directed interface between two subfeatures."""
+
+    from_subfeature: str  # slug of the producing subfeature
+    to_subfeature: str  # slug of the consuming subfeature
+    interface_type: str  # data_flow | event | shared_state | api_call | ui_navigation
+    description: str  # what crosses the boundary
+    data_contract: str = ""  # shape/schema of what's exchanged
+    owner: str = ""  # which subfeature owns the contract
+    citations: list[Citation] = Field(default_factory=list)
+
+
+class Subfeature(BaseModel):
+    """A decomposed unit of work identified by the Lead."""
+
+    id: str  # SF-1, SF-2, ...
+    slug: str  # e.g., "visual-workflow-canvas"
+    name: str
+    description: str
+    rationale: str = ""
+    requirement_ids: list[str] = Field(default_factory=list)
+    journey_ids: list[str] = Field(default_factory=list)
+
+
+class SubfeatureDecomposition(BaseModel):
+    """Output of the Lead's decomposition step."""
+
+    subfeatures: list[Subfeature] = Field(default_factory=list)
+    edges: list[SubfeatureEdge] = Field(default_factory=list)
+    decomposition_rationale: str = ""
+    complete: bool = False
+
+
+class EdgeCheck(BaseModel):
+    """Lead's assessment of one edge between subfeatures."""
+
+    edge_from: str
+    edge_to: str
+    interface_type: str
+    status: str = ""  # consistent | contradiction | missing | underspecified
+    detail: str = ""
+
+
+class IntegrationReview(BaseModel):
+    """Output of the Lead's integration review of per-subfeature artifacts."""
+
+    verdict: str = ""  # approved | needs_revision
+    edge_consistency: list[EdgeCheck] = Field(default_factory=list)
+    gaps: list[str] = Field(default_factory=list)
+    contradictions: list[str] = Field(default_factory=list)
+    revision_instructions: dict[str, str] = Field(
+        default_factory=dict
+    )  # sf_slug -> what to fix
+    complete: bool = False
+
+
+class RevisionRequest(BaseModel):
+    """A single change requested during gate review."""
+
+    description: str  # what the user wants changed
+    reasoning: str  # why (new decision)
+    affected_subfeatures: list[str] = Field(
+        default_factory=list
+    )  # slugs of subfeatures that need to change
+    affected_requirement_ids: list[str] = Field(default_factory=list)
+    cross_subfeature: bool = False  # true if the change spans multiple subfeatures
+
+
+class RevisionPlan(BaseModel):
+    """Lead agent's plan for routing revisions to subfeature agents."""
+
+    requests: list[RevisionRequest] = Field(default_factory=list)
+    new_decisions: list[str] = Field(default_factory=list)  # decisions captured during review
+    complete: bool = False
+
+
+class ReviewOutcome(BaseModel):
+    """Output of the interview-based gate review."""
+
+    approved: bool = False
+    revision_plan: RevisionPlan = Field(default_factory=RevisionPlan)
+    complete: bool = False
+
+
+class GlobalImplementationStrategy(BaseModel):
+    """Global implementation strategy established before per-subfeature task planning."""
+
+    subfeature_execution_order: list[str] = Field(default_factory=list)  # sf slugs in order
+    shared_infrastructure_tasks: list[str] = Field(default_factory=list)
+    cross_subfeature_dependencies: list[str] = Field(default_factory=list)
+    parallel_opportunities: list[str] = Field(default_factory=list)
+    execution_constraints: list[str] = Field(default_factory=list)
+    citations: list[Citation] = Field(default_factory=list)
+    complete: bool = False
 
 
 # ── System Design sub-models (for interactive HTML artifact) ─────────────────
@@ -527,6 +643,7 @@ class ImplementationTask(BaseModel):
     counterexamples: list[str] = Field(default_factory=list)
     security_concerns: list[str] = Field(default_factory=list)
     testid_assignments: list[str] = Field(default_factory=list)
+    subfeature_id: str = ""  # SF-1, SF-2, ... for traceability
     # Legacy / DAG metadata
     files: list[str] = Field(default_factory=list)
     dependencies: list[str] = Field(default_factory=list)

@@ -157,18 +157,30 @@ class ClaudeAgentRuntime(AgentRuntime):
             raise RuntimeError("Claude query completed without a result message")
 
         # Accumulate assistant response for size tracking
+        result_text = getattr(result_msg, "result", "") or ""
         if session_key:
-            result_text = getattr(result_msg, "result", "") or ""
             self._session_messages.setdefault(session_key, []).append(
                 f"Assistant: {result_text[:2000]}"
             )
 
-        # Save session for future invocations
+        # Save session for future invocations + persist assistant turn
         session_id = getattr(result_msg, "session_id", None)
         if session_key and self.session_store and session_id:
-            await self.session_store.save(
-                AgentSession(session_key=session_key, session_id=session_id)
-            )
+            session = await self.session_store.load(session_key)
+            if session:
+                session.session_id = session_id
+            else:
+                session = AgentSession(
+                    session_key=session_key, session_id=session_id
+                )
+            turns = session.metadata.get("turns", [])
+            turns.append({
+                "role": "assistant",
+                "text": result_text[:5000],
+                "turn": len(turns) + 1,
+            })
+            session.metadata["turns"] = turns
+            await self.session_store.save(session)
 
         if not output_type:
             return result_msg.result
@@ -267,6 +279,10 @@ class ClaudeAgentRuntime(AgentRuntime):
         """Check if there is an active agent invocation for a feature."""
         session_key = self._feature_sessions.get(feature_id)
         return session_key is not None and session_key in self._active_clients
+
+    def get_active_session_key(self, feature_id: str) -> str | None:
+        """Return the active session key for a feature, if any."""
+        return self._feature_sessions.get(feature_id)
 
     # ── Session cycling ────────────────────────────────────────────────
 

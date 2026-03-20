@@ -45,9 +45,15 @@ class SlackInteractionRuntime(InteractionRuntime):
         self._pending_options: dict[str, list[str]] = {}
         # pending_id → (channel, message_ts) for updating card on resolution
         self._pending_messages: dict[str, tuple[str, str]] = {}
+        # pending_id → feature_id for turn persistence
+        self._pending_features: dict[str, str] = {}
         # feature_id ↔ channel bidirectional mapping
         self._feature_channels: dict[str, str] = {}
         self._channel_features: dict[str, str] = {}
+
+        # Turn persistence: set by orchestrator when a runtime is available
+        self._session_store: Any = None
+        self._agent_runtime: Any = None  # ClaudeAgentRuntime with get_active_session_key()
 
     # ── Channel Registration ──────────────────────────────────────────────
 
@@ -82,6 +88,7 @@ class SlackInteractionRuntime(InteractionRuntime):
         loop = asyncio.get_running_loop()
         future: asyncio.Future[str | bool] = loop.create_future()
         self._pending_futures[pending.id] = future
+        self._pending_features[pending.id] = pending.feature_id
 
         if pending.kind == "approve":
             await self._post_approve(pending, channel)
@@ -96,6 +103,7 @@ class SlackInteractionRuntime(InteractionRuntime):
             self._pending_futures.pop(pending.id, None)
             self._pending_options.pop(pending.id, None)
             self._pending_messages.pop(pending.id, None)
+            self._pending_features.pop(pending.id, None)
 
         return result
 
@@ -391,10 +399,24 @@ class SlackInteractionRuntime(InteractionRuntime):
         label: str = "",
         user_id: str = "",
     ) -> None:
-        """Resolve a pending Future and update the card to resolved state."""
+        """Resolve a pending Future and update the card to resolved state.
+
+        Also persists the user's turn to ``session.metadata["turns"]`` for
+        mid-interview resume support.
+        """
         future = self._pending_futures.get(pending_id)
         if future and not future.done():
             future.set_result(value)
+
+        # Persist user turn for mid-interview resume
+        if isinstance(value, str) and self._session_store and self._agent_runtime:
+            feature_id = self._pending_features.get(pending_id)
+            if feature_id:
+                try:
+                    loop = asyncio.get_running_loop()
+                    loop.create_task(self._persist_user_turn(feature_id, value))
+                except RuntimeError:
+                    pass
 
         # Update card to resolved state
         msg_info = self._pending_messages.get(pending_id)
@@ -410,6 +432,22 @@ class SlackInteractionRuntime(InteractionRuntime):
                 loop.create_task(self._update_to_resolved(channel, ts, display, user_id))
             except RuntimeError:
                 pass
+
+    async def _persist_user_turn(self, feature_id: str, text: str) -> None:
+        """Persist a user turn to session metadata for mid-interview resume."""
+        try:
+            session_key = self._agent_runtime.get_active_session_key(feature_id)
+            if not session_key:
+                return
+            session = await self._session_store.load(session_key)
+            if not session:
+                return
+            turns = session.metadata.get("turns", [])
+            turns.append({"role": "user", "text": text[:5000], "turn": len(turns) + 1})
+            session.metadata["turns"] = turns
+            await self._session_store.save(session)
+        except Exception:
+            logger.debug("Failed to persist user turn for %s", feature_id, exc_info=True)
 
     async def _update_to_resolved(
         self, channel: str, ts: str, display: str, user_id: str

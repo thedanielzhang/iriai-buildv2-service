@@ -9,6 +9,7 @@ class BuildState(BaseModel):
     design: str = ""
     plan: str = ""
     system_design: str = ""
+    decomposition: str = ""
     user_notes: str = ""
     dag: str = ""
     implementation: str = ""

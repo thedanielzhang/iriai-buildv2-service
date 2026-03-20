@@ -116,6 +116,15 @@ class SlackStreamer:
         self._pending: bool = False
         self._seen_ids: set[str] = set()
         self._last_flush_time: float = 0.0
+        self._actor_name: str = ""
+
+    @property
+    def actor_name(self) -> str:
+        return self._actor_name
+
+    @actor_name.setter
+    def actor_name(self, value: str) -> None:
+        self._actor_name = value
 
     def on_message(self, msg: Any) -> None:
         """Synchronous callback for ClaudeAgentRuntime. Schedules async updates."""
@@ -147,6 +156,9 @@ class SlackStreamer:
                         status = preview
 
             if status:
+                # Prefix with actor name for subfeature agents
+                if self._actor_name and "sf-" in self._actor_name:
+                    status = f"*{self._actor_name}* {status}"
                 self._current_status = status
                 self._schedule_flush()
 

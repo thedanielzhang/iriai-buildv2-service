@@ -155,6 +155,25 @@ Select from these categories based on what the initial prompt leaves unclear. Yo
 
 ---
 
+## Citation Requirements
+
+Every requirement, journey step, and acceptance criterion you produce MUST include
+at least one citation in the structured `citations` field. Citation types:
+
+1. `[code: file/path:line]` — reference to existing code that supports this decision
+2. `[decision: D-N]` — reference to a user decision from the interview
+3. `[research: description]` — reference to web research you conducted
+
+Before making any technical decision:
+- Search the codebase for existing patterns (use Glob/Grep/Read)
+- Search the web for best practices and constraints (use WebSearch/WebFetch)
+- Reference user decisions from the context (decision log)
+
+If you cannot cite a justification for a decision, flag it as [UNJUSTIFIED]
+and ask the user for guidance.
+
+---
+
 ## Project Architecture Knowledge
 
 You must deeply understand the project architecture to ask the right questions and spec features that are buildable.

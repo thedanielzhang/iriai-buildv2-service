@@ -26,6 +26,7 @@ from ..models.outputs import (
     SystemDesign,
     TechnicalPlan,
 )
+from .artifacts import _key_to_path
 from .markdown import to_markdown
 from .system_design_html import render_system_design_html
 
@@ -110,16 +111,20 @@ class DocHostingService:
         return self._urls.get(key)
 
     async def try_collect(self, key: str) -> list[dict[str, Any]]:
-        """Read annotations from co-located .feedback/ directory."""
+        """Read annotations from co-located .feedback/ directory.
+
+        For namespaced keys (e.g. ``prd:canvas``), the feedback directory
+        lives relative to the artifact's parent directory:
+        ``subfeatures/canvas/.feedback/prd/annotations/``.
+        """
         if not self._current_feature_id:
             return []
 
-        feedback_dir = (
-            self._mirror.feature_dir(self._current_feature_id)
-            / ".feedback"
-            / key
-            / "annotations"
-        )
+        rel_path = Path(_key_to_path(key))
+        artifact_dir = self._mirror.feature_dir(self._current_feature_id) / rel_path.parent
+        feedback_key = rel_path.stem
+
+        feedback_dir = artifact_dir / ".feedback" / feedback_key / "annotations"
 
         if not feedback_dir.is_dir():
             return []
@@ -142,16 +147,17 @@ class DocHostingService:
         """Delete all annotation files and reset the session for an artifact.
 
         Called after collecting annotations so they don't carry over to the
-        next gate iteration.
+        next gate iteration.  Uses ``_key_to_path`` so namespaced keys resolve
+        to the correct nested ``.feedback/`` directory.
         """
         if not self._current_feature_id:
             return
 
-        fb_dir = (
-            self._mirror.feature_dir(self._current_feature_id)
-            / ".feedback"
-            / key
-        )
+        rel_path = Path(_key_to_path(key))
+        artifact_dir = self._mirror.feature_dir(self._current_feature_id) / rel_path.parent
+        feedback_key = rel_path.stem
+
+        fb_dir = artifact_dir / ".feedback" / feedback_key
         if not fb_dir.is_dir():
             return
 
@@ -241,13 +247,19 @@ class DocHostingService:
 
         Only converts if the model has actual content — models with all-default
         fields are rejected to avoid replacing rich content with empty headings.
+
+        Namespaced keys (e.g. ``prd:broad``, ``design:canvas``) are resolved
+        to their base key for model matching.
         """
         try:
             data = json.loads(content)
         except (json.JSONDecodeError, TypeError):
             return content
 
-        if key == "system-design":
+        # Resolve namespaced key to base key for model matching
+        base_key = key.split(":")[0] if ":" in key else key
+
+        if base_key == "system-design":
             try:
                 sd = SystemDesign.model_validate(data)
                 if DocHostingService._has_content(sd):
@@ -255,9 +267,9 @@ class DocHostingService:
             except ValidationError:
                 pass
 
-        if key in _KEY_TO_MODEL:
+        if base_key in _KEY_TO_MODEL:
             try:
-                model = _KEY_TO_MODEL[key].model_validate(data)
+                model = _KEY_TO_MODEL[base_key].model_validate(data)
                 if DocHostingService._has_content(model):
                     return to_markdown(model)
             except ValidationError:
