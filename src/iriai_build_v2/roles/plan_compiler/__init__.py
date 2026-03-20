@@ -6,6 +6,6 @@ from ...config import BUDGET_TIERS
 role = Role(
     name="plan-validator",
     prompt=load_prompt(__file__),
-    tools=["Read", "Write", "Edit", "Glob", "Grep"],
+    tools=["Read", "Write", "Edit", "Glob", "Grep", "WebSearch", "WebFetch"],
     model=BUDGET_TIERS["opus"],
 )

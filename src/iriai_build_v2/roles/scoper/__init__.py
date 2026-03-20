@@ -6,7 +6,7 @@ from ...config import BUDGET_TIERS
 role = Role(
     name="scoper",
     prompt=load_prompt(__file__),
-    tools=["Read", "Glob", "Grep", "Bash", "Write"],
+    tools=["Read", "Glob", "Grep", "Bash", "Write", "WebSearch", "WebFetch"],
     model=BUDGET_TIERS["opus_1m"],
     metadata={
         "max_session_chars": 800_000,

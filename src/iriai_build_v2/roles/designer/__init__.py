@@ -6,7 +6,7 @@ from ...config import BUDGET_TIERS
 role = Role(
     name="ux-designer",
     prompt=load_prompt(__file__),
-    tools=["Read", "Write", "Edit", "Glob", "Grep"],
+    tools=["Read", "Write", "Edit", "Glob", "Grep", "WebSearch", "WebFetch"],
     model=BUDGET_TIERS["opus_1m"],
     metadata={
         "max_session_chars": 600_000,
