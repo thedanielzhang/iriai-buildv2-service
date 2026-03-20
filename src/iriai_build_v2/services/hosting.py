@@ -186,8 +186,25 @@ class DocHostingService:
             logger.debug("Refresh notification failed for %s/%s", feature_id, key)
 
     @staticmethod
+    def _has_content(model: BaseModel) -> bool:
+        """Check if a model has any non-default content worth rendering."""
+        for name, field_info in model.model_fields.items():
+            if name == "complete":
+                continue
+            value = getattr(model, name)
+            if isinstance(value, str) and value:
+                return True
+            if isinstance(value, list) and value:
+                return True
+        return False
+
+    @staticmethod
     def _to_display_content(content: str, key: str = "") -> str:
-        """Convert JSON-serialized Pydantic models to display format."""
+        """Convert JSON-serialized Pydantic models to display format.
+
+        Only converts if the model has actual content — models with all-default
+        fields are rejected to avoid replacing rich content with empty headings.
+        """
         try:
             data = json.loads(content)
         except (json.JSONDecodeError, TypeError):
@@ -196,22 +213,26 @@ class DocHostingService:
         if key == "system-design":
             try:
                 sd = SystemDesign.model_validate(data)
-                return render_system_design_html(sd)
+                if DocHostingService._has_content(sd):
+                    return render_system_design_html(sd)
             except ValidationError:
                 pass
 
         if key in _KEY_TO_MODEL:
             try:
                 model = _KEY_TO_MODEL[key].model_validate(data)
-                return to_markdown(model)
+                if DocHostingService._has_content(model):
+                    return to_markdown(model)
             except ValidationError:
                 pass
 
         for model_cls in _ARTIFACT_MODELS:
             try:
                 model = model_cls.model_validate(data)
-                return to_markdown(model)
+                if DocHostingService._has_content(model):
+                    return to_markdown(model)
             except ValidationError:
                 continue
 
-        return content
+        # JSON that didn't match any model with content — render as formatted JSON
+        return f"```json\n{json.dumps(data, indent=2)}\n```\n"
