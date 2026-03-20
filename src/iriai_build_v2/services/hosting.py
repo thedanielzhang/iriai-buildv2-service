@@ -100,32 +100,11 @@ class DocHostingService:
         return url
 
     async def update(self, feature_id: str, key: str, content: str) -> None:
-        """Re-write artifact file and notify the serve process to refresh browsers.
-
-        Skips the write if the new content is empty/skeleton — avoids
-        overwriting a content-rich file with an empty structured output.
-        """
+        """Re-write artifact file and notify the serve process to refresh browsers."""
         display_content = self._to_display_content(content, key)
-
-        # Don't overwrite a rich file with empty content
-        from .artifacts import _KEY_MAP
-        filename = _KEY_MAP.get(key)
-        if filename:
-            existing_path = self._mirror.feature_dir(feature_id) / filename
-            if existing_path.exists():
-                existing_size = existing_path.stat().st_size
-                new_size = len(display_content.encode("utf-8"))
-                if new_size < 100 and existing_size > new_size:
-                    logger.warning(
-                        "Skipping update for %s: new content (%d bytes) is likely empty "
-                        "(existing: %d bytes)",
-                        key, new_size, existing_size,
-                    )
-                    return
-
         self._mirror.write_artifact(feature_id, key, display_content)
         await self._notify_refresh(feature_id, key)
-        logger.info("Updated %s (refresh notified)", key)
+        logger.info("Updated %s (%d bytes)", key, len(display_content))
 
     def get_url(self, key: str) -> str | None:
         return self._urls.get(key)
