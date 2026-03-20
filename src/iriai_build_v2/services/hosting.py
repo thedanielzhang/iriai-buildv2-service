@@ -8,8 +8,11 @@ overlay injection, and annotation storage.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import urllib.request
+import urllib.error
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
@@ -76,6 +79,7 @@ class DocHostingService:
         url = self._artifact_url(feature_id, key)
         self._urls[key] = url
         self._labels[key] = label
+        await self._notify_refresh(feature_id, key)
         logger.info("Hosted %s at %s", key, url)
         return url
 
@@ -91,14 +95,16 @@ class DocHostingService:
         url = self._artifact_url(feature_id, key)
         self._urls[key] = url
         self._labels[key] = label
+        await self._notify_refresh(feature_id, key)
         logger.info("QA hosted %s at %s", key, url)
         return url
 
     async def update(self, feature_id: str, key: str, content: str) -> None:
-        """Re-write artifact file. iriai-feedback serve watches for changes and auto-refreshes."""
+        """Re-write artifact file and notify the serve process to refresh browsers."""
         display_content = self._to_display_content(content, key)
         self._mirror.write_artifact(feature_id, key, display_content)
-        logger.info("Updated %s (auto-refresh via SSE)", key)
+        await self._notify_refresh(feature_id, key)
+        logger.info("Updated %s (refresh notified)", key)
 
     def get_url(self, key: str) -> str | None:
         return self._urls.get(key)
@@ -168,6 +174,16 @@ class DocHostingService:
     async def stop_all(self) -> None:
         """No-op — the single iriai-feedback serve process is bridge-scoped."""
         pass
+
+    async def _notify_refresh(self, feature_id: str, key: str) -> None:
+        """Tell iriai-feedback serve to send SSE refresh to connected browsers."""
+        url = f"http://localhost:{_SERVE_PORT}/__qa__/api/{feature_id}/{key}/refresh"
+        loop = asyncio.get_running_loop()
+        try:
+            req = urllib.request.Request(url, method="POST", data=b"")
+            await loop.run_in_executor(None, urllib.request.urlopen, req)
+        except Exception:
+            logger.debug("Refresh notification failed for %s/%s", feature_id, key)
 
     @staticmethod
     def _to_display_content(content: str, key: str = "") -> str:
