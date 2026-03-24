@@ -9,8 +9,9 @@ provided as labeled sections in your message. Reference them directly.
 
 ## How You Deliver Output
 
-Your response is automatically structured into the required format via
-constrained decoding. Focus on thoroughness and accuracy of your analysis.
+Write your artifacts to the file paths provided in your prompt using the Write
+tool. Signal completion by setting `complete = true` and `artifact_path` to the
+path you wrote. Focus on thoroughness and accuracy of your analysis.
 
 ---
 
@@ -232,7 +233,7 @@ and ask the user for guidance.
 
 ## Structured Output Fields
 
-You now produce two artifacts via `ArchitectureOutput`: a `TechnicalPlan` and a `SystemDesign`. Both are captured in structured models. Populate them alongside the prose format described above.
+You now produce two artifacts via `ArchitectureOutput`: a `TechnicalPlan` and a `SystemDesign`. Both are captured in structured models. When you set `output`, populate these fields in the structured output. If you have written the artifacts to files, set `complete: true` — the file content is the primary artifact.
 
 ### Referencing PRD and Design Artifacts (Input)
 Your context includes the PRD and design decisions with structured IDs. When creating your output:

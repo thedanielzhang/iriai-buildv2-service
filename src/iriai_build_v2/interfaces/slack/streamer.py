@@ -1,8 +1,9 @@
 """SlackStreamer: live-update a Slack message with Claude SDK output.
 
-Creates a message on first content, then updates it in-place with the latest
-activity line. Shows a single status (thinking, tool use, etc.) at a time.
-On completion, the final update contains only the actual text response.
+Creates a progress message on first content, then updates it in-place with
+the latest activity line (thinking, tool use, etc.). On completion, the
+progress message is updated to a compact "done" marker and the agent's text
+response is posted as a separate new message.
 """
 
 from __future__ import annotations
@@ -149,11 +150,6 @@ class SlackStreamer:
                     status = _format_tool_result(block.content, block.is_error)
                 elif block_type == "TextBlock":
                     self._final_text += block.text
-                    if not _is_structured_output(block.text):
-                        preview = block.text.strip().replace("\n", " ")
-                        if len(preview) > _THINKING_TRUNCATE:
-                            preview = preview[:_THINKING_TRUNCATE] + "..."
-                        status = preview
 
             if status:
                 # Prefix with actor name for subfeature agents
@@ -166,6 +162,7 @@ class SlackStreamer:
             # Capture state before reset (flush is async — avoids race condition)
             final_text = self._final_text
             final_ts = self._message_ts
+            has_structured = getattr(msg, "structured_output", None) is not None
 
             # Reset state immediately so the next invocation creates a fresh message
             self._current_status = ""
@@ -175,8 +172,7 @@ class SlackStreamer:
             self._pending = False
             self._last_flush_time = 0.0
 
-            # Schedule final flush with captured state
-            self._schedule_final_flush(final_text, final_ts)
+            self._schedule_completion(final_text, final_ts, has_structured)
 
     def _schedule_flush(self) -> None:
         """Schedule an immediate flush, serialised by the _flushing flag."""
@@ -222,48 +218,48 @@ class SlackStreamer:
                 self._pending = False
                 self._schedule_flush()
 
-    def _schedule_final_flush(self, text: str, message_ts: str | None) -> None:
-        """Schedule the final text update with captured state."""
+    def _schedule_completion(
+        self, text: str, progress_ts: str | None, has_structured: bool
+    ) -> None:
+        """Schedule progress cleanup and optional text posting."""
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             return
 
-        loop.create_task(self._do_final_flush(text, message_ts))
+        loop.create_task(self._do_completion(text, progress_ts, has_structured))
 
-    async def _do_final_flush(self, text: str, message_ts: str | None) -> None:
-        """Final update with captured state — immune to reset race."""
-        # Don't replace verbose output with raw structured output JSON or empty text
-        if not text or _is_structured_output(text):
-            return
-
-        display_text = markdown_to_mrkdwn(text)
-        chunks = _split_message(display_text)
-
+    async def _do_completion(
+        self, text: str, progress_ts: str | None, has_structured: bool
+    ) -> None:
+        """Clean up progress message and optionally post final text as new message."""
         try:
-            # First chunk: update existing message or post new one
-            first = chunks[0]
-            if message_ts:
+            # Step 1: Update progress message to compact "done" summary
+            if progress_ts:
                 try:
                     await self._adapter.update_message(
-                        self._channel, message_ts, text=first
+                        self._channel, progress_ts, text="\u2713 Done"
                     )
                 except Exception:
-                    # update failed (msg_too_long) — post as new message instead
-                    await self._adapter.post_message(
-                        self._channel, first, thread_ts=self._thread_ts
+                    logger.debug(
+                        "Failed to update progress message to done", exc_info=True
                     )
-            else:
-                await self._adapter.post_message(
-                    self._channel, first, thread_ts=self._thread_ts
-                )
-            # Remaining chunks: post as follow-up messages
-            for chunk in chunks[1:]:
+
+            # Step 2: For non-structured turns, post final text as a NEW message
+            if has_structured:
+                return  # Interview card handles presentation
+
+            if not text or _is_structured_output(text):
+                return
+
+            display_text = markdown_to_mrkdwn(text)
+            chunks = _split_message(display_text)
+            for chunk in chunks:
                 await self._adapter.post_message(
                     self._channel, chunk, thread_ts=self._thread_ts
                 )
         except Exception:
-            logger.exception("Failed final flush to Slack")
+            logger.exception("Failed completion flush to Slack")
 
 
 def _is_structured_output(text: str) -> bool:

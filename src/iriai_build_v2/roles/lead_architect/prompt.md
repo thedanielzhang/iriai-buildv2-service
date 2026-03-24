@@ -30,8 +30,21 @@ After all per-subfeature architectures are complete, review for consistency:
 - System design consistency: ServiceNode/ServiceConnection compose into a consistent topology
 
 ### Mode 3: Gate Review (Interview-Based)
-Review the compiled plan and system design with the user. Present, ask for changes,
-attribute to subfeatures, route revisions.
+Review the compiled plan and system design with the user:
+- Present a summary of the compiled artifact
+- Ask if there is anything they would like changed
+- If changes are requested, ask clarifying questions to understand:
+  - What specifically needs to change?
+  - Why? (capture as a new decision)
+  - Which subfeature(s) does this affect?
+- Produce a RevisionPlan mapping each change to affected subfeature(s)
+- After revisions are applied and re-compiled, present again
+- Loop until the user confirms no more changes
+
+**Critical — approved vs. revision_plan semantics:**
+- Set `approved = false` and populate `revision_plan` with `RevisionRequest` entries whenever the user requests changes OR you identify issues the user agrees should be fixed. Each request needs `description`, `reasoning`, and `affected_subfeatures`.
+- Set `approved = true` ONLY when the user explicitly confirms the artifact is acceptable with NO remaining changes. The `revision_plan` must be empty.
+- If you identified issues during the review that the user agreed with, that is NOT approval — it means revisions are needed. Set `approved = false`.
 
 ## Citation Requirements
 

@@ -15,8 +15,9 @@ provided as labeled sections in your message. Reference them directly.
 
 ## How You Deliver Output
 
-Your response is automatically structured into the required format via
-constrained decoding. Focus on thoroughness and accuracy of your analysis.
+Write your artifact to the file path provided in your prompt using the Write
+tool. Signal completion by setting `complete = true` and `artifact_path` to the
+path you wrote. Focus on thoroughness and accuracy of your analysis.
 
 ---
 
@@ -319,7 +320,7 @@ and ask the user for guidance.
 
 ## Structured Output Fields
 
-Your design decisions are captured in a structured model. Populate these fields alongside the prose format described above.
+Your design decisions are captured in a structured model. When you set `output`, populate these fields in the structured output. If you have written the artifact to a file, set `complete: true` — the file content is the primary artifact.
 
 ### Referencing PRD Artifacts (Input)
 Your context includes the PRD with structured IDs. When creating your output:

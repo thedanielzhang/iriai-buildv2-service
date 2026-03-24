@@ -11,14 +11,18 @@ _ENVELOPE_INSTRUCTIONS = """\
 Your responses use the Envelope format with these fields:
 - `question`: Your next question for the user (set this while interviewing)
 - `options`: Optional suggested answers for the user to choose from
-- `output`: The final artifact (set this ONLY when the interview is complete and confirmed)
-  - Must include `complete: true` when the artifact is finalized
-  - Leave as null while still gathering information
+- `complete`: Set to `true` when the interview is finished and the artifact is ready
+- `artifact_path`: The file path where you wrote the artifact (set alongside `complete`)
+- `output`: Optional — leave as null when writing file-based artifacts
 
 **Rules:**
-- During the interview: set `question`, leave `output` as null
-- After user confirms your summary: set `output` with the full artifact and `complete: true`
-- NEVER set `output` while still asking questions — this terminates the interview immediately
+- During the interview: set `question`, leave `complete` as false
+- When done: write artifact to the file path specified in your prompt, then set `complete = true` and `artifact_path` to the path you wrote
+- NEVER set `complete` while still asking questions — this terminates the interview immediately
+
+**Critical — text vs structured output:**
+- Your text response is internal reasoning. The user NEVER sees it — only the `question` field is displayed.
+- Do NOT describe, summarize, or present the artifact in your text response.
 """
 
 
@@ -265,10 +269,10 @@ lead_designer = InterviewActor(
     name="lead-designer", role=lead_designer_role, context_keys=["project", "scope", "prd", "decomposition"],
 )
 lead_designer_reviewer = InterviewActor(
-    name="lead-designer-reviewer", role=lead_designer_role, context_keys=["project", "scope"],
+    name="lead-designer-reviewer", role=lead_designer_role, context_keys=["project", "scope", "prd", "decomposition"],
 )
 lead_designer_gate_reviewer = InterviewActor(
-    name="lead-designer-gate-reviewer", role=lead_designer_role, context_keys=["project", "scope"],
+    name="lead-designer-gate-reviewer", role=lead_designer_role, context_keys=["project", "scope", "prd", "decomposition"],
 )
 design_compiler = AgentActor(
     name="design-compiler", role=compiler_role, context_keys=[],
@@ -279,10 +283,10 @@ lead_architect = InterviewActor(
     name="lead-architect", role=lead_architect_role, context_keys=["project", "scope", "prd", "design", "decomposition"],
 )
 lead_architect_reviewer = InterviewActor(
-    name="lead-architect-reviewer", role=lead_architect_role, context_keys=["project", "scope"],
+    name="lead-architect-reviewer", role=lead_architect_role, context_keys=["project", "scope", "prd", "design", "decomposition"],
 )
 lead_architect_gate_reviewer = InterviewActor(
-    name="lead-architect-gate-reviewer", role=lead_architect_role, context_keys=["project", "scope"],
+    name="lead-architect-gate-reviewer", role=lead_architect_role, context_keys=["project", "scope", "prd", "design", "decomposition"],
 )
 plan_arch_compiler = AgentActor(
     name="plan-arch-compiler", role=compiler_role, context_keys=[],
@@ -297,10 +301,12 @@ lead_task_planner = InterviewActor(
     context_keys=["project", "scope", "prd", "design", "plan", "system-design", "decomposition"],
 )
 lead_task_planner_reviewer = InterviewActor(
-    name="lead-task-planner-reviewer", role=lead_task_planner_role, context_keys=["project", "scope"],
+    name="lead-task-planner-reviewer", role=lead_task_planner_role,
+    context_keys=["project", "scope", "prd", "design", "plan", "system-design", "decomposition"],
 )
 lead_task_planner_gate_reviewer = InterviewActor(
-    name="lead-task-planner-gate-reviewer", role=lead_task_planner_role, context_keys=["project", "scope"],
+    name="lead-task-planner-gate-reviewer", role=lead_task_planner_role,
+    context_keys=["project", "scope", "prd", "design", "plan", "system-design", "decomposition"],
 )
 dag_compiler = AgentActor(
     name="dag-compiler", role=compiler_role, context_keys=[],

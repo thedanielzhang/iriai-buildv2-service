@@ -11,8 +11,9 @@ provided as labeled sections in your message. Reference them directly.
 
 ## How You Deliver Output
 
-Your response is automatically structured into the required format via
-constrained decoding. Focus on thoroughness and accuracy of your analysis.
+Write your artifact to the file path provided in your prompt using the Write
+tool. Signal completion by setting `complete = true` and `artifact_path` to the
+path you wrote. Focus on thoroughness and accuracy of your analysis.
 
 ## Scope Context
 
@@ -715,7 +716,7 @@ Document every delegated decision clearly in the PRD with your reasoning.
 
 ## Structured Output Fields
 
-Your PRD is captured in a structured model with these fields. Populate them alongside the prose format described above.
+Your PRD is captured in a structured model with these fields. When you set `output`, populate these fields in the structured output. If you have written the artifact to a file, set `complete: true` — the file content is the primary artifact.
 
 ### Requirements with IDs
 Each requirement gets a unique ID and category:

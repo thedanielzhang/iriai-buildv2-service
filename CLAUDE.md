@@ -22,6 +22,7 @@ Agent orchestration build system using `iriai-compose` framework and Claude Agen
 - `_inline_defs()` resolves `$ref` in Pydantic schemas (Claude API doesn't support `$ref`)
 - SDK guarantees structured output; error subtype: `error_max_structured_output_retries`
 - Runtime lives in `src/iriai_build_v2/runtimes/claude.py` (not in iriai-compose)
+- **Flat structured output rule**: `Envelope` control fields must be flat primitives (`str`, `bool`, `list[str]`). Never add nested `BaseModel` fields that agents must populate for signaling. Complex artifacts are written to files via `HostedInterview`; the structured output only carries `question`, `options`, `complete`, and `artifact_path`. The `output: T | None` field is optional — agents can leave it null when writing file-based artifacts.
 
 ## Running
 

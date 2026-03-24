@@ -6,6 +6,6 @@ from ...config import BUDGET_TIERS
 role = Role(
     name="compiler",
     prompt=load_prompt(__file__),
-    tools=["Read", "Glob", "Grep"],
-    model=BUDGET_TIERS["opus"],
+    tools=["Read", "Glob", "Grep", "Write"],
+    model=BUDGET_TIERS["opus_1m"],
 )

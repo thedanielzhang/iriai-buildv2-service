@@ -369,6 +369,7 @@ class ClaudeAgentRuntime(AgentRuntime):
             allowed_tools=role.tools,
             model=role.model or "claude-sonnet-4-6",
             cwd=str(workspace.path) if workspace else None,
+            permission_mode="bypassPermissions",
         )
 
         if "setting_sources" in role.metadata:

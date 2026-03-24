@@ -6,7 +6,7 @@ from ...config import BUDGET_TIERS
 role = Role(
     name="product-manager",
     prompt=load_prompt(__file__),
-    tools=["Read", "Glob", "Grep", "WebSearch", "WebFetch"],
+    tools=["Read", "Write", "Glob", "Grep", "WebSearch", "WebFetch"],
     model=BUDGET_TIERS["opus_1m"],
     metadata={
         "max_session_chars": 800_000,

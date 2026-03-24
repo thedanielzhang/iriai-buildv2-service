@@ -85,6 +85,11 @@ class SlackInteractionRuntime(InteractionRuntime):
                 f"No Slack channel registered for feature {pending.feature_id}"
             )
 
+        # Don't block on empty-question Envelopes — let the Interview
+        # continue without user input so the agent gets another turn.
+        if pending.kind == "respond" and not _has_question(pending.prompt):
+            return "Continue"
+
         loop = asyncio.get_running_loop()
         future: asyncio.Future[str | bool] = loop.create_future()
         self._pending_futures[pending.id] = future
@@ -496,6 +501,22 @@ def _extract_gate_info(prompt: str) -> tuple[str, list[str]]:
     return first_line or "Artifact", urls
 
 
+def _has_question(prompt: str) -> bool:
+    """Check if the prompt contains a real question for the user.
+
+    Returns False for JSON Envelopes with empty ``question`` — these are
+    intermediate agent turns (tool use, investigation) that should not
+    block on user input.
+    """
+    try:
+        data = json.loads(prompt)
+    except (json.JSONDecodeError, TypeError):
+        return True  # Plain text — always show
+    if not isinstance(data, dict):
+        return True
+    return bool(data.get("question"))
+
+
 def _extract_question(prompt: str) -> tuple[str, list[str]]:
     """Parse prompt that may be JSON with question/options fields.
 
@@ -511,8 +532,14 @@ def _extract_question(prompt: str) -> tuple[str, list[str]]:
         return prompt, []
 
     question = data.get("question")
-    if not question:
-        return prompt, []
+    if question:
+        options = data.get("options", [])
+        return question, options if isinstance(options, list) else []
 
-    options = data.get("options", [])
-    return question, options if isinstance(options, list) else []
+    # Any JSON object without a question is structured model data —
+    # don't dump raw JSON on the user (catches Envelopes with empty
+    # question AND raw model JSON like PRD, TechnicalPlan, etc.)
+    return (
+        "The agent is processing. Reply with feedback or guidance.",
+        [],
+    )

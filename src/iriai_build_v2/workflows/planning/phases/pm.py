@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import json as _json
 import logging
 
 from iriai_compose import Feature, Phase, WorkflowRunner, to_str
 
-from ....models.outputs import PRD
+from ....models.outputs import PRD, SubfeatureDecomposition
 from ....models.state import BuildState
 from ....roles import (
     lead_pm,
@@ -53,11 +54,31 @@ class PMPhase(Phase):
         self, runner: WorkflowRunner, feature: Feature, state: BuildState
     ) -> BuildState:
         # ── Step 1: Resume check ──
-        # If compiled PRD already exists, skip to gate review
-        existing_prd = await get_existing_artifact(runner, feature, "prd")
-        if existing_prd:
-            logger.info("Compiled PRD exists — skipping to gate review")
-            state.prd = existing_prd
+        # DB = gate-approved → skip entirely
+        approved_prd = await runner.artifacts.get("prd", feature=feature)
+        if approved_prd:
+            logger.info("Gate-approved PRD exists — skipping")
+            state.prd = approved_prd
+            return state
+
+        # Filesystem-only = compiled but not gate-reviewed → jump to gate review
+        compiled_prd = await get_existing_artifact(runner, feature, "prd")
+        if compiled_prd:
+            logger.info("Compiled PRD exists but not gate-reviewed — running gate review")
+            decomposition = await self._load_decomposition(runner, feature, state)
+            final_text = await interview_gate_review(
+                runner, feature, self.name,
+                lead_actor=lead_pm_gate_reviewer,
+                decomposition=decomposition,
+                artifact_prefix="prd",
+                compiled_key="prd",
+                base_role=pm_role,
+                output_type=PRD,
+                compiler_actor=pm_compiler,
+                broad_key="prd:broad",
+            )
+            await runner.artifacts.put("prd", final_text, feature=feature)
+            state.prd = final_text
             return state
 
         # ── Step 2: Broad Requirements Interview ──
@@ -103,36 +124,43 @@ class PMPhase(Phase):
             broad_key="prd:broad",
         )
 
-        if review.verdict == "needs_revision" and review.revision_instructions:
-            logger.info("Integration review needs revision — re-running affected subfeatures")
-            # Re-run affected subfeatures with revision instructions
-            from ..._common._helpers import targeted_revision
-            from ....models.outputs import RevisionPlan, RevisionRequest
-            plan = RevisionPlan(requests=[
-                RevisionRequest(
-                    description=instruction,
-                    reasoning="Integration review finding",
-                    affected_subfeatures=[sf_slug],
+        if review.needs_revision:
+            if not review.revision_instructions:
+                logger.error(
+                    "PMPhase: integration review needs_revision=True but "
+                    "revision_instructions is empty — skipping revision"
                 )
-                for sf_slug, instruction in review.revision_instructions.items()
-            ])
-            await targeted_revision(
-                runner, feature, self.name,
-                revision_plan=plan,
-                decomposition=decomposition,
-                base_role=pm_role,
-                output_type=PRD,
-                artifact_prefix="prd",
-            )
+            else:
+                logger.info(
+                    "Integration review needs revision — re-running %d subfeatures",
+                    len(review.revision_instructions),
+                )
+                from ..._common._helpers import targeted_revision
+                from ....models.outputs import RevisionPlan, RevisionRequest
+                plan = RevisionPlan(requests=[
+                    RevisionRequest(
+                        description=instruction,
+                        reasoning="Integration review finding",
+                        affected_subfeatures=[sf_slug],
+                    )
+                    for sf_slug, instruction in review.revision_instructions.items()
+                ])
+                await targeted_revision(
+                    runner, feature, self.name,
+                    revision_plan=plan,
+                    decomposition=decomposition,
+                    base_role=pm_role,
+                    output_type=PRD,
+                    artifact_prefix="prd",
+                )
 
         # ── Step 6: Compilation ──
-        compiled_prd, compiled_text = await compile_artifacts(
+        compiled_text = await compile_artifacts(
             runner, feature, self.name,
             compiler_actor=pm_compiler,
             decomposition=decomposition,
             artifact_prefix="prd",
             broad_key="prd:broad",
-            output_type=PRD,
             final_key="prd",
         )
 
@@ -149,5 +177,21 @@ class PMPhase(Phase):
             broad_key="prd:broad",
         )
 
+        await runner.artifacts.put("prd", final_text, feature=feature)
         state.prd = final_text
         return state
+
+    @staticmethod
+    async def _load_decomposition(
+        runner: WorkflowRunner, feature: Feature, state: BuildState
+    ) -> SubfeatureDecomposition:
+        """Load decomposition from state or artifact store."""
+        decomp_text = state.decomposition
+        if not decomp_text:
+            decomp_text = await runner.artifacts.get("decomposition", feature=feature) or ""
+        if decomp_text:
+            try:
+                return SubfeatureDecomposition.model_validate(_json.loads(decomp_text))
+            except Exception:
+                pass
+        return SubfeatureDecomposition()

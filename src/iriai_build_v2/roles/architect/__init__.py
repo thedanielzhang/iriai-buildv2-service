@@ -6,7 +6,7 @@ from ...config import BUDGET_TIERS, mcp_servers_for
 role = Role(
     name="software-architect",
     prompt=load_prompt(__file__),
-    tools=["Read", "Glob", "Grep", "Bash", "WebSearch", "WebFetch"],
+    tools=["Read", "Write", "Glob", "Grep", "Bash", "WebSearch", "WebFetch"],
     model=BUDGET_TIERS["opus_1m"],
     metadata={
         "mcp_servers": mcp_servers_for("context7"),

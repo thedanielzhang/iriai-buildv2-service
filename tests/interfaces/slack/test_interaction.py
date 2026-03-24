@@ -468,7 +468,8 @@ class TestExtractQuestion:
 
         prompt = json.dumps({"message": "hello"})
         question, options = _extract_question(prompt)
-        assert question == prompt  # falls back to raw prompt
+        # JSON objects without "question" key show fallback, not raw JSON
+        assert "processing" in question.lower() or "feedback" in question.lower()
         assert options == []
 
     def test_non_dict_json(self):

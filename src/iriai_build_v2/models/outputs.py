@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Generic, TypeVar
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -366,13 +366,18 @@ class EdgeCheck(BaseModel):
 class IntegrationReview(BaseModel):
     """Output of the Lead's integration review of per-subfeature artifacts."""
 
-    verdict: str = ""  # approved | needs_revision
+    needs_revision: bool = Field(
+        default=False,
+        description="Set to true if ANY subfeature artifact needs changes. When true, revision_instructions MUST be non-empty.",
+    )
+    summary: str = ""
     edge_consistency: list[EdgeCheck] = Field(default_factory=list)
     gaps: list[str] = Field(default_factory=list)
     contradictions: list[str] = Field(default_factory=list)
     revision_instructions: dict[str, str] = Field(
-        default_factory=dict
-    )  # sf_slug -> what to fix
+        default_factory=dict,
+        description="Map of subfeature slug to revision instruction. Keys must be exact subfeature slugs from the decomposition. Required when needs_revision is true.",
+    )
     complete: bool = False
 
 
@@ -399,9 +404,27 @@ class RevisionPlan(BaseModel):
 class ReviewOutcome(BaseModel):
     """Output of the interview-based gate review."""
 
-    approved: bool = False
-    revision_plan: RevisionPlan = Field(default_factory=RevisionPlan)
+    approved: bool = Field(
+        default=False,
+        description="Set to true when the user explicitly approves. Do NOT set true if the user requested changes.",
+    )
+    revision_plan: RevisionPlan = Field(
+        default_factory=RevisionPlan,
+        description="Required when approved is false. Contains the specific revision requests from the user.",
+    )
     complete: bool = False
+
+    @model_validator(mode="after")
+    def _revisions_override_approval(self) -> ReviewOutcome:
+        """If revision_plan has requests, approved must be False.
+
+        Agents sometimes set approved=True after discussing changes with the
+        user, conflating 'user agreed changes are needed' with 'user approves
+        the artifact as-is'.  Revisions always take priority.
+        """
+        if self.approved and self.revision_plan.requests:
+            self.approved = False
+        return self
 
 
 class GlobalImplementationStrategy(BaseModel):
@@ -587,7 +610,9 @@ class ArchitectureOutput(BaseModel):
 class Verdict(BaseModel):
     """Review verdict used by QA roles, reviewers, and the plan compiler."""
 
-    approved: bool
+    approved: bool = Field(
+        description="True if the artifact passes review. False if concerns or gaps are blocking.",
+    )
     summary: str
     concerns: list[Issue] = Field(default_factory=list)
     suggestions: list[str] = Field(default_factory=list)
@@ -601,8 +626,10 @@ class Verdict(BaseModel):
 class Envelope(BaseModel, Generic[T]):
     """Structured output for every interview turn.
 
-    Populate ``question``/``options`` while gathering info.
-    Populate ``output`` with the final artifact when done.
+    Control fields (``question``, ``options``, ``complete``, ``artifact_path``)
+    are flat primitives — agents never need to construct nested objects to
+    signal completion.  Complex artifacts are written to files; the ``output``
+    field is optional when file-based artifacts are used.
 
     ``output`` stays nullable so the agent can write ``"output": null``
     during the interview.  All inner ``anyOf`` patterns (e.g.
@@ -611,18 +638,39 @@ class Envelope(BaseModel, Generic[T]):
     this top-level ``T | null``.
     """
 
-    question: str = ""
-    options: list[str] = Field(default_factory=list)
+    question: str = Field(
+        default="",
+        description="Your question for the user. MUST be non-empty when you want user input. Leave empty only when working silently (tool use, investigation).",
+    )
+    options: list[str] = Field(
+        default_factory=list,
+        description="Response options for the user to choose from. Include a 'Delegate to you' option when appropriate.",
+    )
     output: T | None = None
+    complete: bool = Field(
+        default=False,
+        description="Set to true ONLY when the artifact is fully written to a file and ready for review.",
+    )
+    artifact_path: str = Field(
+        default="",
+        description="Absolute path to the artifact file you wrote. Set together with complete=true.",
+    )
 
 
 def envelope_done(response: object) -> bool:
-    """Interview done-predicate: true when the envelope's output is populated and complete."""
-    if not isinstance(response, Envelope) or response.output is None:
+    """Interview done-predicate: true when the envelope signals completion.
+
+    Checks flat ``complete`` first (preferred), falls back to nested
+    ``output.complete`` for backward compatibility.
+    """
+    if not isinstance(response, Envelope):
         return False
-    if hasattr(response.output, "complete"):
+    if response.complete:
+        return True
+    # Backward compat: nested output.complete
+    if response.output is not None and hasattr(response.output, "complete"):
         return response.output.complete
-    return True
+    return False
 
 
 # ── Implementation DAG models ────────────────────────────────────────────────

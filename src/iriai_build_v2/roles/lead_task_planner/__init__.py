@@ -6,6 +6,6 @@ from ...config import BUDGET_TIERS
 role = Role(
     name="lead-task-planner",
     prompt=load_prompt(__file__),
-    tools=["Read", "Glob", "Grep", "WebSearch", "WebFetch"],
+    tools=["Read", "Write", "Glob", "Grep", "WebSearch", "WebFetch"],
     model=BUDGET_TIERS["opus"],
 )

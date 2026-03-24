@@ -54,10 +54,32 @@ class TaskPlanningPhase(Phase):
         self, runner: WorkflowRunner, feature: Feature, state: BuildState
     ) -> BuildState:
         # ── Step 1: Resume check ──
-        existing_dag = await get_existing_artifact(runner, feature, "dag")
-        if existing_dag:
-            logger.info("Compiled DAG exists — skipping to end")
-            state.dag = existing_dag
+        # DB = gate-approved → skip entirely
+        approved_dag = await runner.artifacts.get("dag", feature=feature)
+        if approved_dag:
+            logger.info("Gate-approved DAG exists — skipping")
+            state.dag = approved_dag
+            return state
+
+        # Filesystem-only = compiled but not gate-reviewed → jump to gate review
+        compiled_dag = await get_existing_artifact(runner, feature, "dag")
+        if compiled_dag:
+            logger.info("Compiled DAG exists but not gate-reviewed — running gate review")
+            decomposition = await self._load_decomposition(runner, feature, state)
+            final_text = await interview_gate_review(
+                runner, feature, self.name,
+                lead_actor=lead_task_planner_gate_reviewer,
+                decomposition=decomposition,
+                artifact_prefix="dag",
+                compiled_key="dag",
+                base_role=planning_lead_role,
+                output_type=ImplementationDAG,
+                compiler_actor=dag_compiler,
+                broad_key="dag:strategy",
+                context_keys=["project", "scope", "prd", "design", "plan", "system-design"],
+            )
+            await runner.artifacts.put("dag", final_text, feature=feature)
+            state.dag = final_text
             return state
 
         decomposition = await self._load_decomposition(runner, feature, state)
@@ -101,6 +123,7 @@ class TaskPlanningPhase(Phase):
             artifact_prefix="dag",
             broad_key="dag:strategy",
             make_prompt=_make_sf_prompt,
+            context_keys=["project", "scope", "prd", "design", "plan", "system-design"],
         )
 
         # ── Step 4: DAG Integration Review ──
@@ -112,33 +135,42 @@ class TaskPlanningPhase(Phase):
             broad_key="dag:strategy",
         )
 
-        if review.verdict == "needs_revision" and review.revision_instructions:
-            logger.info("DAG integration review needs revision")
-            plan = RevisionPlan(requests=[
-                RevisionRequest(
-                    description=instruction,
-                    reasoning="DAG integration review finding",
-                    affected_subfeatures=[sf_slug],
+        if review.needs_revision:
+            if not review.revision_instructions:
+                logger.error(
+                    "TaskPlanningPhase: integration review needs_revision=True but "
+                    "revision_instructions is empty — skipping revision"
                 )
-                for sf_slug, instruction in review.revision_instructions.items()
-            ])
-            await targeted_revision(
-                runner, feature, self.name,
-                revision_plan=plan,
-                decomposition=ordered_decomp,
-                base_role=planning_lead_role,
-                output_type=ImplementationDAG,
-                artifact_prefix="dag",
-            )
+            else:
+                logger.info(
+                    "DAG integration review needs revision — re-running %d subfeatures",
+                    len(review.revision_instructions),
+                )
+                plan = RevisionPlan(requests=[
+                    RevisionRequest(
+                        description=instruction,
+                        reasoning="DAG integration review finding",
+                        affected_subfeatures=[sf_slug],
+                    )
+                    for sf_slug, instruction in review.revision_instructions.items()
+                ])
+                await targeted_revision(
+                    runner, feature, self.name,
+                    revision_plan=plan,
+                    decomposition=ordered_decomp,
+                    base_role=planning_lead_role,
+                    output_type=ImplementationDAG,
+                    artifact_prefix="dag",
+                    context_keys=["project", "scope", "prd", "design", "plan", "system-design"],
+                )
 
         # ── Step 5: DAG Compilation ──
-        _, dag_text = await compile_artifacts(
+        dag_text = await compile_artifacts(
             runner, feature, self.name,
             compiler_actor=dag_compiler,
             decomposition=ordered_decomp,
             artifact_prefix="dag",
             broad_key="dag:strategy",
-            output_type=ImplementationDAG,
             final_key="dag",
         )
 
@@ -153,8 +185,10 @@ class TaskPlanningPhase(Phase):
             output_type=ImplementationDAG,
             compiler_actor=dag_compiler,
             broad_key="dag:strategy",
+            context_keys=["project", "scope", "prd", "design", "plan", "system-design"],
         )
 
+        await runner.artifacts.put("dag", final_text, feature=feature)
         state.dag = final_text
         return state
 

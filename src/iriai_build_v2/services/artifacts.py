@@ -162,9 +162,11 @@ def _key_to_path(key: str) -> str:
     if key in _BROAD_MAP:
         return _BROAD_MAP[key]
 
-    # 4. Integration reviews
+    # 4. Integration reviews and gate reviews
     if prefix == "integration-review":
         return f"reviews/{slug}.md"
+    if prefix == "gate-review":
+        return f"reviews/{slug}-gate-review.md"
 
     # 5. Subfeature artifacts
     base_key = prefix.replace("-summary", "")  # prd-summary → prd

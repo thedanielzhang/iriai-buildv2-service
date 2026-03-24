@@ -32,6 +32,10 @@ You receive:
 - The decomposition (subfeature list and edges)
 - All per-subfeature artifacts (full detail)
 
+**When a source file path is provided in the prompt**, use the Read tool to load all source artifacts from that file before compiling.
+
 ## Output
 
 A single compiled artifact of the same type (PRD, DesignDecisions, TechnicalPlan, etc.) that is a complete union of all inputs.
+
+**When a file path is provided in the prompt**, use the Write tool to save the complete compiled document to that path. Write the full document as markdown — do NOT return the compiled content in your response text. Your response should only confirm the file was written.

@@ -62,12 +62,25 @@ class ArchitecturePhase(Phase):
         self, runner: WorkflowRunner, feature: Feature, state: BuildState
     ) -> BuildState:
         # ── Step 1: Resume check ──
-        existing_plan = await get_existing_artifact(runner, feature, "plan")
-        if existing_plan:
-            logger.info("Compiled plan exists — skipping to end")
-            state.plan = existing_plan
-            existing_sd = await get_existing_artifact(runner, feature, "system-design") or ""
-            state.system_design = existing_sd
+        # DB = gate-approved → skip entirely
+        approved_plan = await runner.artifacts.get("plan", feature=feature)
+        if approved_plan:
+            logger.info("Gate-approved plan exists — skipping")
+            state.plan = approved_plan
+            state.system_design = await runner.artifacts.get("system-design", feature=feature) or ""
+            return state
+
+        # Filesystem-only = compiled but not gate-reviewed → jump to gate review
+        compiled_plan = await get_existing_artifact(runner, feature, "plan")
+        if compiled_plan:
+            logger.info("Compiled plan exists but not gate-reviewed — running gate review")
+            decomposition = await self._load_decomposition(runner, feature, state)
+            plan_text = await self._plan_gate_review(runner, feature, decomposition)
+            await runner.artifacts.put("plan", plan_text, feature=feature)
+            sd_text = await self._system_design_gate_review(runner, feature, decomposition)
+            await runner.artifacts.put("system-design", sd_text, feature=feature)
+            state.plan = plan_text
+            state.system_design = sd_text
             return state
 
         decomposition = await self._load_decomposition(runner, feature, state)
@@ -104,34 +117,43 @@ class ArchitecturePhase(Phase):
             broad_key="plan:broad",
         )
 
-        if review.verdict == "needs_revision" and review.revision_instructions:
-            logger.info("Architecture integration review needs revision")
-            plan = RevisionPlan(requests=[
-                RevisionRequest(
-                    description=instruction,
-                    reasoning="Architecture integration review finding",
-                    affected_subfeatures=[sf_slug],
+        if review.needs_revision:
+            if not review.revision_instructions:
+                logger.error(
+                    "ArchitecturePhase: integration review needs_revision=True but "
+                    "revision_instructions is empty — skipping revision"
                 )
-                for sf_slug, instruction in review.revision_instructions.items()
-            ])
-            await targeted_revision(
-                runner, feature, self.name,
-                revision_plan=plan,
-                decomposition=decomposition,
-                base_role=architect_role,
-                output_type=TechnicalPlan,
-                artifact_prefix="plan",
-            )
+            else:
+                logger.info(
+                    "Architecture integration review needs revision — re-running %d subfeatures",
+                    len(review.revision_instructions),
+                )
+                plan = RevisionPlan(requests=[
+                    RevisionRequest(
+                        description=instruction,
+                        reasoning="Architecture integration review finding",
+                        affected_subfeatures=[sf_slug],
+                    )
+                    for sf_slug, instruction in review.revision_instructions.items()
+                ])
+                await targeted_revision(
+                    runner, feature, self.name,
+                    revision_plan=plan,
+                    decomposition=decomposition,
+                    base_role=architect_role,
+                    output_type=TechnicalPlan,
+                    artifact_prefix="plan",
+                    context_keys=["project", "scope", "prd", "design"],
+                )
 
         # ── Step 5: Dual Compilation ──
         # 5a: Technical Plan compilation
-        _, plan_text = await compile_artifacts(
+        plan_text = await compile_artifacts(
             runner, feature, self.name,
             compiler_actor=plan_arch_compiler,
             decomposition=decomposition,
             artifact_prefix="plan",
             broad_key="plan:broad",
-            output_type=TechnicalPlan,
             final_key="plan",
         )
 
@@ -145,6 +167,8 @@ class ArchitecturePhase(Phase):
         # 6b: System Design gate review
         sd_text = await self._system_design_gate_review(runner, feature, decomposition)
 
+        await runner.artifacts.put("plan", plan_text, feature=feature)
+        await runner.artifacts.put("system-design", sd_text, feature=feature)
         state.plan = plan_text
         state.system_design = sd_text
         return state
@@ -170,12 +194,59 @@ class ArchitecturePhase(Phase):
             plan_key = f"plan:{sf.slug}"
             sd_key = f"system-design:{sf.slug}"
 
-            # Resume check
-            existing = await get_existing_artifact(runner, feature, plan_key)
-            if existing:
-                logger.info("Subfeature arch %s exists — skipping", plan_key)
-                completed_plans[sf.slug] = existing
+            # Resume check: DB = approved (artifacts.put only happens after gate)
+            approved_text = await runner.artifacts.get(plan_key, feature=feature)
+            if approved_text:
+                logger.info("Subfeature arch %s approved — skipping", plan_key)
+                completed_plans[sf.slug] = approved_text
                 summary = await runner.artifacts.get(f"plan-summary:{sf.slug}", feature=feature)
+                if summary:
+                    completed_summaries[sf.slug] = summary
+                continue
+
+            # Draft check: file exists but not approved — run gate only
+            draft_text = await get_existing_artifact(runner, feature, plan_key)
+            if draft_text:
+                logger.info("Subfeature arch %s exists as draft — running gate", plan_key)
+                sf_actor = InterviewActor(
+                    name=f"architect-sf-{sf.slug}",
+                    role=architect_role,
+                    context_keys=["project", "scope", "prd", "design"],
+                )
+                # Read system design draft too if available
+                sd_draft = await get_existing_artifact(runner, feature, sd_key)
+                # Host drafts so gate cards have review URLs
+                hosting = runner.services.get("hosting")
+                if hosting:
+                    await hosting.push(feature.id, plan_key, draft_text, f"Technical Plan — {sf.name}")
+                    if sd_draft:
+                        await self._convert_and_host_sd(runner, feature, sd_key, sd_draft, sf.name)
+
+                async def _sd_post_update_draft(key: str, text: str) -> None:
+                    if key.startswith("system-design"):
+                        await self._convert_and_host_sd(runner, feature, key, text, sf.name)
+
+                # Gate the plan
+                plan_obj, plan_text = await gate_and_revise(
+                    runner, feature, self.name,
+                    artifact=draft_text, actor=sf_actor, output_type=TechnicalPlan,
+                    approver=approver, label=f"Technical Plan — {sf.name}",
+                    artifact_key=plan_key, annotation_keys=[plan_key, sd_key],
+                )
+                plan_text = to_str(plan_obj) if isinstance(plan_obj, BaseModel) else plan_text
+                # Gate the system design if it exists
+                if sd_draft:
+                    sd_obj, sd_text = await gate_and_revise(
+                        runner, feature, self.name,
+                        artifact=sd_draft, actor=sf_actor, output_type=SystemDesign,
+                        approver=approver, label=f"System Design — {sf.name}",
+                        artifact_key=sd_key, post_update=_sd_post_update_draft,
+                    )
+                    sd_text = to_str(sd_obj) if isinstance(sd_obj, BaseModel) else sd_text
+                    await runner.artifacts.put(sd_key, sd_text, feature=feature)
+                await runner.artifacts.put(plan_key, plan_text, feature=feature)
+                completed_plans[sf.slug] = plan_text
+                summary = await generate_summary(runner, feature, "plan", sf.slug)
                 if summary:
                     completed_summaries[sf.slug] = summary
                 continue
@@ -203,25 +274,47 @@ class ArchitecturePhase(Phase):
                     done=envelope_done,
                     artifact_key=plan_key,
                     artifact_label=f"Architecture — {sf.name}",
+                    additional_artifact_keys=[sd_key],
                 ),
                 feature,
                 phase_name=self.name,
             )
 
-            arch_output = envelope.output
-            plan_text = to_str(arch_output.plan)
-            sd_text = to_str(arch_output.system_design)
+            # Read artifacts from files (preferred) or Envelope output
+            from ....services.artifacts import _key_to_path
 
-            # Host system design HTML per subfeature
-            hosting = runner.services.get("hosting")
-            if hosting and arch_output.system_design:
-                html = render_system_design_html(arch_output.system_design)
-                await hosting.push(feature.id, sd_key, html, f"System Design — {sf.name}")
+            plan_text = None
+            sd_text = None
+            mirror = runner.services.get("artifact_mirror")
+            if mirror:
+                for key, attr in [(plan_key, "plan"), (sd_key, "system_design")]:
+                    path = mirror.feature_dir(feature.id) / _key_to_path(key)
+                    if path.exists():
+                        text = path.read_text(encoding="utf-8").strip()
+                        if text:
+                            if attr == "plan":
+                                plan_text = text
+                            else:
+                                sd_text = text
+
+            arch_output = envelope.output
+            if not plan_text:
+                plan_text = to_str(arch_output.plan) if arch_output else ""
+            if not sd_text:
+                sd_text = to_str(arch_output.system_design) if arch_output else ""
+
+            # Convert system design markdown to HTML for hosting
+            await self._convert_and_host_sd(runner, feature, sd_key, sd_text, sf.name)
+
+            # Post-update callback: re-convert system design after revisions
+            async def _sd_post_update(key: str, text: str) -> None:
+                if key.startswith("system-design"):
+                    await self._convert_and_host_sd(runner, feature, key, text, sf.name)
 
             # Gate the plan (with system design link)
             plan_obj, plan_text = await gate_and_revise(
                 runner, feature, self.name,
-                artifact=arch_output.plan, actor=sf_actor, output_type=TechnicalPlan,
+                artifact=plan_text, actor=sf_actor, output_type=TechnicalPlan,
                 approver=approver, label=f"Technical Plan — {sf.name}",
                 artifact_key=plan_key,
                 annotation_keys=[plan_key, sd_key],
@@ -231,9 +324,10 @@ class ArchitecturePhase(Phase):
             # Gate the system design
             sd_obj, sd_text = await gate_and_revise(
                 runner, feature, self.name,
-                artifact=arch_output.system_design, actor=sf_actor, output_type=SystemDesign,
+                artifact=sd_text, actor=sf_actor, output_type=SystemDesign,
                 approver=approver, label=f"System Design — {sf.name}",
                 artifact_key=sd_key,
+                post_update=_sd_post_update,
             )
             sd_text = to_str(sd_obj) if not isinstance(sd_text, str) else sd_text
 
@@ -248,9 +342,17 @@ class ArchitecturePhase(Phase):
 
     async def _compile_system_design(
         self, runner: WorkflowRunner, feature: Feature, decomposition: SubfeatureDecomposition
-    ) -> tuple[SystemDesign, str]:
-        """Compile per-subfeature system designs into a single SystemDesign."""
+    ) -> str:
+        """Compile per-subfeature system designs into a single document.
+
+        Uses file-based output to avoid structured output token limits.
+        HTML rendering is handled by ``_convert_and_host_sd`` (text→SystemDesign→HTML).
+        """
+        from pathlib import Path
+
         from iriai_compose import Ask
+
+        from ....services.artifacts import _key_to_path
 
         parts = []
         decomp_text = await runner.artifacts.get("decomposition", feature=feature)
@@ -263,7 +365,24 @@ class ArchitecturePhase(Phase):
 
         source_text = "\n\n---\n\n".join(parts)
 
-        compiled = await runner.run(
+        # Resolve output file path
+        mirror = runner.services.get("artifact_mirror")
+        if mirror:
+            feature_dir = Path(mirror.feature_dir(feature.id))
+            file_path = feature_dir / _key_to_path("system-design")
+            file_path.parent.mkdir(parents=True, exist_ok=True)
+        else:
+            import tempfile
+            feature_dir = Path(tempfile.mkdtemp())
+            file_path = feature_dir / "system-design.md"
+            file_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Write source artifacts to file so the compiler can read them
+        sources_path = feature_dir / "compile-sources-system-design.md"
+        sources_path.parent.mkdir(parents=True, exist_ok=True)
+        sources_path.write_text(source_text, encoding="utf-8")
+
+        await runner.run(
             Ask(
                 actor=sysdesign_compiler,
                 prompt=(
@@ -275,24 +394,26 @@ class ArchitecturePhase(Phase):
                     "- Union all API endpoints, group by service\n"
                     "- Union all entities, deduplicate by (name, service_id)\n"
                     "- Union all call paths, decisions, risks\n\n"
-                    f"{source_text}"
+                    f"**Read the source artifacts from:** `{sources_path}`\n"
+                    f"**Write the complete compiled system design to:** `{file_path}`\n"
                 ),
-                output_type=SystemDesign,
             ),
             feature,
             phase_name=self.name,
         )
 
-        sd_text = to_str(compiled)
-        await runner.artifacts.put("system-design", sd_text, feature=feature)
+        if not file_path.exists():
+            raise RuntimeError(f"System design compiler did not write output to {file_path}")
+        sd_text = file_path.read_text(encoding="utf-8").strip()
+        if not sd_text:
+            raise RuntimeError(f"System design compiler wrote empty file at {file_path}")
 
-        # Host the compiled system design HTML
-        hosting = runner.services.get("hosting")
-        if hosting:
-            html = render_system_design_html(compiled)
-            await hosting.push(feature.id, "system-design", html, f"System Design — {feature.name}")
+        # NOTE: do NOT store to DB here — wait until gate review approves.
 
-        return compiled, sd_text
+        # Convert to HTML via the two-pass approach (text→SystemDesign→render)
+        await self._convert_and_host_sd(runner, feature, "system-design", sd_text, feature.name)
+
+        return sd_text
 
     async def _plan_gate_review(
         self, runner: WorkflowRunner, feature: Feature, decomposition: SubfeatureDecomposition
@@ -309,6 +430,7 @@ class ArchitecturePhase(Phase):
             output_type=TechnicalPlan,
             compiler_actor=plan_arch_compiler,
             broad_key="plan:broad",
+            context_keys=["project", "scope", "prd", "design"],
         )
 
     async def _system_design_gate_review(
@@ -316,6 +438,19 @@ class ArchitecturePhase(Phase):
     ) -> str:
         """Interview-based gate review for the compiled system design."""
         from ..._common import interview_gate_review
+
+        async def _sd_gate_post_update(key: str, text: str) -> None:
+            if key.startswith("system-design"):
+                await self._convert_and_host_sd(runner, feature, key, text, feature.name)
+
+        async def _sd_post_compile() -> None:
+            """Re-convert the recompiled system design to HTML."""
+            sd_text = await get_existing_artifact(runner, feature, "system-design")
+            if sd_text:
+                await self._convert_and_host_sd(
+                    runner, feature, "system-design", sd_text, feature.name,
+                )
+
         return await interview_gate_review(
             runner, feature, self.name,
             lead_actor=lead_architect_gate_reviewer,
@@ -326,7 +461,67 @@ class ArchitecturePhase(Phase):
             output_type=SystemDesign,
             compiler_actor=sysdesign_compiler,
             broad_key="plan:broad",
+            post_update=_sd_gate_post_update,
+            post_compile=_sd_post_compile,
+            context_keys=["project", "scope", "prd", "design"],
         )
+
+    async def _convert_and_host_sd(
+        self,
+        runner: WorkflowRunner,
+        feature: Feature,
+        sd_key: str,
+        sd_text: str,
+        sf_name: str,
+    ) -> None:
+        """Convert system design text to structured model and host as interactive HTML.
+
+        Two-pass approach: agent writes markdown/text → converter produces
+        SystemDesign model via constrained decoding → render_system_design_html
+        produces the interactive D3.js visualization.
+        """
+        if not sd_text:
+            return
+
+        hosting = runner.services.get("hosting")
+        if not hosting:
+            return
+
+        # Try to parse as existing SystemDesign JSON first
+        try:
+            data = _json.loads(sd_text)
+            sd_model = SystemDesign.model_validate(data)
+            if any(getattr(sd_model, f) for f in ("services", "connections", "api_endpoints", "entities")):
+                html = render_system_design_html(sd_model)
+                await hosting.push(feature.id, sd_key, html, f"System Design — {sf_name}")
+                return
+        except Exception:
+            pass
+
+        # Convert markdown/text to SystemDesign model via Ask
+        from iriai_compose import Ask
+
+        try:
+            sd_model = await runner.run(
+                Ask(
+                    actor=AgentActor(name=f"sd-converter-{sd_key}", role=compiler_role),
+                    prompt=(
+                        "Convert this system design description to a structured SystemDesign object.\n\n"
+                        "Extract: services (nodes), connections between them, API endpoints, "
+                        "call paths (sequence diagrams), entities, entity relations, decisions, and risks.\n\n"
+                        f"{sd_text}"
+                    ),
+                    output_type=SystemDesign,
+                ),
+                feature,
+                phase_name=self.name,
+            )
+            html = render_system_design_html(sd_model)
+            await hosting.push(feature.id, sd_key, html, f"System Design — {sf_name}")
+        except Exception:
+            logger.warning("Failed to convert system design %s to HTML", sd_key, exc_info=True)
+            # Fall back to hosting the raw text
+            await hosting.push(feature.id, sd_key, sd_text, f"System Design — {sf_name}")
 
     @staticmethod
     async def _load_decomposition(

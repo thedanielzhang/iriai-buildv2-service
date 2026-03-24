@@ -173,6 +173,7 @@ class PlanReviewPhase(Phase):
             output_type=DesignDecisions,
             compiler_actor=design_compiler,
             broad_key="design:broad",
+            context_keys=["project", "scope", "prd"],
         )
         state.design = design_text
 
@@ -187,6 +188,7 @@ class PlanReviewPhase(Phase):
             output_type=TechnicalPlan,
             compiler_actor=plan_arch_compiler,
             broad_key="plan:broad",
+            context_keys=["project", "scope", "prd", "design"],
         )
         state.plan = plan_text
 
@@ -202,6 +204,7 @@ class PlanReviewPhase(Phase):
                 output_type=SystemDesign,
                 compiler_actor=sysdesign_compiler,
                 broad_key="plan:broad",
+                context_keys=["project", "scope", "prd", "design"],
             )
             state.system_design = sd_text
 

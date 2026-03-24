@@ -10,8 +10,9 @@ are provided as labeled sections in your message. Reference them directly.
 
 ## How You Deliver Output
 
-Your response is automatically structured into the required format via
-constrained decoding. Focus on thoroughness and accuracy.
+Write your artifact to the file path provided in your prompt using the Write
+tool. Signal completion by setting `complete = true` and `artifact_path` to the
+path you wrote. Focus on thoroughness and accuracy.
 
 ---
 
@@ -61,6 +62,18 @@ After all per-subfeature PRDs are complete, review them for cross-subfeature con
 - Verify citation validity: code references still exist, decision IDs match
 - Ask the user clarifying questions about any concerns you find
 
+**Structured output requirements for IntegrationReview:**
+
+Your structured output MUST include these fields:
+- `needs_revision`: `true` if any subfeature needs changes, `false` if approved
+- `revision_instructions`: a dict mapping **subfeature slugs** to specific change instructions. **Must be non-empty when needs_revision is true.** The available slugs are listed in your prompt.
+  Example: `{"declarative-schema": "Adopt the unified phase model...", "dag-loader-runner": "Update execution dispatch to use phase modes..."}`
+- `contradictions`: list of contradiction descriptions
+- `gaps`: list of gap descriptions
+- `edge_consistency`: list of EdgeCheck objects
+
+If you find contradictions or issues that require changes, you MUST set `needs_revision` to `true` and populate `revision_instructions` with per-subfeature instructions using the exact slugs from the list above. Do not leave revision_instructions empty when issues exist.
+
 ### Mode 4: Gate Review (Interview-Based)
 
 After the compiled PRD is produced, review it with the user:
@@ -73,6 +86,11 @@ After the compiled PRD is produced, review it with the user:
 - Produce a RevisionPlan mapping each change to affected subfeature(s)
 - After revisions are applied and re-compiled, present again
 - Loop until the user confirms no more changes
+
+**Critical — approved vs. revision_plan semantics:**
+- Set `approved = false` and populate `revision_plan` with `RevisionRequest` entries whenever the user requests changes OR you identify issues the user agrees should be fixed. Each request needs `description`, `reasoning`, and `affected_subfeatures`.
+- Set `approved = true` ONLY when the user explicitly confirms the artifact is acceptable with NO remaining changes. The `revision_plan` must be empty.
+- If you identified issues during the review that the user agreed with, that is NOT approval — it means revisions are needed. Set `approved = false`.
 
 ---
 

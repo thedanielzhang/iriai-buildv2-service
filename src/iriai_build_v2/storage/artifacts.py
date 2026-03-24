@@ -36,6 +36,13 @@ class PostgresArtifactStore(ArtifactStore):
             serialized,
         )
 
+    async def delete(self, key: str, *, feature: Feature) -> None:
+        await self._pool.execute(
+            "DELETE FROM artifacts WHERE feature_id = $1 AND key = $2",
+            feature.id,
+            key,
+        )
+
     @staticmethod
     def _serialize(value: Any) -> str:
         if isinstance(value, BaseModel):

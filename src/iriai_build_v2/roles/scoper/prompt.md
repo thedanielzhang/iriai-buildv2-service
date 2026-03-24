@@ -12,8 +12,9 @@ discovered repos (built automatically before you run).
 
 ## How You Deliver Output
 
-Your response is automatically structured into the required format via
-constrained decoding. Focus on accuracy of repo identification and scope boundaries.
+Write your artifact to the file path provided in your prompt using the Write
+tool. Signal completion by setting `complete = true` and `artifact_path` to the
+path you wrote. Focus on accuracy of repo identification and scope boundaries.
 
 ---
 
