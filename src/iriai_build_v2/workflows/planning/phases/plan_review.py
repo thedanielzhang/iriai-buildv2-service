@@ -4,13 +4,14 @@ import json as _json
 import logging
 from typing import Any
 
-from iriai_compose import AgentActor, Ask, Feature, Phase, Respond, WorkflowRunner, to_str
+from iriai_compose import AgentActor, Ask, Feature, Phase, Respond, WorkflowRunner
 
 from ....models.outputs import (
     PRD,
     DesignDecisions,
     Envelope,
     ReviewOutcome,
+    RevisionPlan,
     SubfeatureDecomposition,
     SubfeatureEdge,
     SystemDesign,
@@ -114,6 +115,7 @@ _ARTIFACT_CONFIGS = [
     ("prd", pm_role, PRD, pm_compiler, "prd:broad"),
     ("design", designer_role, DesignDecisions, design_compiler, "design:broad"),
     ("plan", architect_role, TechnicalPlan, plan_arch_compiler, "plan:broad"),
+    ("system-design", architect_role, SystemDesign, sysdesign_compiler, "plan:broad"),
 ]
 
 
@@ -491,8 +493,7 @@ class PlanReviewPhase(Phase):
                     if not affected_requests:
                         continue
 
-                    from ....models.outputs import RevisionPlan as RP
-                    filtered_plan = RP(requests=affected_requests)
+                    filtered_plan = RevisionPlan(requests=affected_requests)
 
                     old_text = await runner.artifacts.get(prefix, feature=feature) or ""
                     old_size = len(old_text)
