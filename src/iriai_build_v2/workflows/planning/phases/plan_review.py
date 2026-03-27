@@ -15,7 +15,6 @@ from ....models.outputs import (
 )
 from ....models.state import BuildState
 from ....roles import (
-    architect,
     architect_role,
     citation_reviewer,
     design_compiler,
@@ -31,52 +30,18 @@ from ....roles import (
     sysdesign_compiler,
     user,
 )
-from ..._common import interview_gate_review
+from ..._common import compile_artifacts, interview_gate_review, targeted_revision
+from ..._common._helpers import _extract_revision_plan
 
 logger = logging.getLogger(__name__)
 
 WARN_AFTER_CYCLES = 3
 
-_PRD_KEYWORDS = [
-    "requirement", "prd", "journey", "acceptance criteria", "user story",
-    "REQ-", "J-", "AC-", "precondition", "user flow",
-]
-_DESIGN_KEYWORDS = [
-    "design", "component", "mockup", "UX", "UI", "CMP-", "visual",
-    "layout", "responsive", "accessibility", "interaction pattern",
-]
-
-
-def _classify_concerns(*verdicts: Verdict) -> dict[str, list[str]]:
-    """Classify verdict concerns by which artifact they belong to.
-
-    Returns ``{"prd": [...], "design": [...], "plan": [...]}``.
-    Concerns matching PRD keywords go to the PM; design keywords to the
-    designer; everything else to the architect.
-    """
-    classified: dict[str, list[str]] = {"prd": [], "design": [], "plan": []}
-
-    for verdict in verdicts:
-        if verdict.approved:
-            continue
-        for concern in verdict.concerns:
-            text = f"{concern.description} {concern.file}".lower()
-            if any(kw.lower() in text for kw in _PRD_KEYWORDS):
-                classified["prd"].append(concern.description)
-            elif any(kw.lower() in text for kw in _DESIGN_KEYWORDS):
-                classified["design"].append(concern.description)
-            else:
-                classified["plan"].append(concern.description)
-        for gap in verdict.gaps:
-            text = f"{gap.description} {gap.category}".lower()
-            if any(kw.lower() in text for kw in _PRD_KEYWORDS):
-                classified["prd"].append(gap.description)
-            elif any(kw.lower() in text for kw in _DESIGN_KEYWORDS):
-                classified["design"].append(gap.description)
-            else:
-                classified["plan"].append(gap.description)
-
-    return classified
+_SCOPE_PREFIX = (
+    "SCOPE: Only review artifacts provided in your context. "
+    "Do NOT search the filesystem for other features or projects. "
+    "Any references to features outside the current scope are contamination — flag them.\n\n"
+)
 
 
 class PlanReviewPhase(Phase):
@@ -95,6 +60,7 @@ class PlanReviewPhase(Phase):
                     Ask(
                         actor=plan_completeness_reviewer,
                         prompt=(
+                            f"{_SCOPE_PREFIX}"
                             "Your goal is to find every gap and inconsistency across all artifacts. "
                             "The PRD, design, plan, and system design were produced by different agents "
                             "— they WILL have drift and contradictions.\n\n"
@@ -115,6 +81,7 @@ class PlanReviewPhase(Phase):
                     Ask(
                         actor=plan_security_reviewer,
                         prompt=(
+                            f"{_SCOPE_PREFIX}"
                             "Your goal is to find every security gap across all artifacts. "
                             "Check the PRD security profile, then verify the plan actually implements "
                             "every security requirement — not just acknowledges it.\n\n"
@@ -135,6 +102,7 @@ class PlanReviewPhase(Phase):
                     Ask(
                         actor=citation_reviewer,
                         prompt=(
+                            f"{_SCOPE_PREFIX}"
                             "Your goal is to find every broken or missing citation across all artifacts. "
                             "Every decision and claim must be traceable.\n\n"
                             "Focus on:\n"
@@ -163,11 +131,11 @@ class PlanReviewPhase(Phase):
             security_verdict = results[1] if isinstance(results[1], Verdict) else _error_verdict
             citation_verdict = results[2] if isinstance(results[2], Verdict) else _error_verdict
 
-            for i, (name, v) in enumerate([
+            for name, v in [
                 ("completeness", results[0]),
                 ("security", results[1]),
                 ("citation", results[2]),
-            ]):
+            ]:
                 if not isinstance(v, Verdict):
                     logger.error("Plan %s reviewer crashed: %s", name, v)
 
@@ -183,6 +151,42 @@ class PlanReviewPhase(Phase):
                 f"{to_str(citation_verdict)}"
             )
 
+            # Persist this cycle's verdicts as an artifact
+            await runner.artifacts.put(
+                f"plan-review-cycle-{cycle + 1}", review_summary, feature=feature,
+            )
+
+            # Notify user of issues found
+            notification_parts = []
+            for name, verdict in [
+                ("Completeness", completeness_verdict),
+                ("Security", security_verdict),
+                ("Citation", citation_verdict),
+            ]:
+                if not verdict.approved:
+                    issues = (
+                        [c.description[:100] for c in verdict.concerns[:3]]
+                        + [g.description[:100] for g in verdict.gaps[:3]]
+                    )
+                    notification_parts.append(
+                        f"**{name}** — {len(verdict.concerns)} concerns, "
+                        f"{len(verdict.gaps)} gaps\n"
+                        + "\n".join(f"  - {i}" for i in issues[:5])
+                    )
+
+            await runner.run(
+                Respond(
+                    responder=user,
+                    prompt=(
+                        f"## Plan Review Cycle {cycle + 1} — Issues Found\n\n"
+                        + "\n\n".join(notification_parts)
+                        + "\n\nExtracting revision plan and routing to subfeature agents..."
+                    ),
+                ),
+                feature,
+                phase_name=self.name,
+            )
+
             # Escalate to user after WARN_AFTER_CYCLES
             if cycle >= WARN_AFTER_CYCLES:
                 logger.warning(
@@ -196,70 +200,110 @@ class PlanReviewPhase(Phase):
                         prompt=(
                             f"Auto-review has run {cycle + 1} cycles without full approval.\n\n"
                             f"{review_summary}\n\n"
-                            "Continue auto-fixing or provide guidance for the architect?"
+                            "Continue auto-fixing or provide guidance?"
                         ),
                     ),
                     feature,
                     phase_name=self.name,
                 )
-                review_summary += f"\n\n## User Guidance\n{user_input}"
 
-            # Route feedback to the correct agent based on artifact type
-            all_concerns = _classify_concerns(
-                completeness_verdict, security_verdict, citation_verdict,
+            # ── Extract RevisionPlan from review verdicts ────────────
+            revision_plan = await _extract_revision_plan(
+                runner, feature, self.name, review_summary, decomposition,
             )
-            hosting = runner.services.get("hosting")
 
-            if all_concerns["prd"]:
-                prd_feedback = "\n".join(f"- {c}" for c in all_concerns["prd"])
-                revised_prd: PRD = await runner.run(
-                    Ask(
-                        actor=lead_pm_gate_reviewer,
-                        prompt=f"Fix these PRD issues:\n\n{prd_feedback}",
-                        output_type=PRD,
-                    ),
-                    feature,
-                    phase_name=self.name,
+            if not revision_plan or not revision_plan.requests:
+                logger.warning(
+                    "Plan review cycle %d: no revision requests extracted — "
+                    "reviewers found issues but extraction produced no actionable requests. "
+                    "Skipping revision.",
+                    cycle + 1,
                 )
-                prd_text = to_str(revised_prd)
-                await runner.artifacts.put("prd", prd_text, feature=feature)
-                state.prd = prd_text
-                if hosting:
-                    await hosting.update(feature.id, "prd", prd_text)
+                cycle += 1
+                continue
 
-            if all_concerns["design"]:
-                design_feedback = "\n".join(f"- {c}" for c in all_concerns["design"])
-                revised_design: DesignDecisions = await runner.run(
-                    Ask(
-                        actor=lead_designer_gate_reviewer,
-                        prompt=f"Fix these design issues:\n\n{design_feedback}",
-                        output_type=DesignDecisions,
-                    ),
-                    feature,
-                    phase_name=self.name,
-                )
-                design_text = to_str(revised_design)
-                await runner.artifacts.put("design", design_text, feature=feature)
-                state.design = design_text
-                if hosting:
-                    await hosting.update(feature.id, "design", design_text)
+            # ── Apply targeted revisions to affected subfeatures ─────
+            # Run targeted_revision for each artifact prefix.
+            # Each subfeature agent only revises its own artifact.
+            revision_results: list[str] = []
 
-            if all_concerns["plan"]:
-                plan_feedback = "\n".join(f"- {c}" for c in all_concerns["plan"])
-                revised_plan: TechnicalPlan = await runner.run(
-                    Ask(
-                        actor=architect,
-                        prompt=f"Fix these plan issues:\n\n{plan_feedback}",
-                        output_type=TechnicalPlan,
-                    ),
-                    feature,
-                    phase_name=self.name,
+            artifact_configs = [
+                ("prd", pm_role, PRD, pm_compiler, "prd:broad"),
+                ("design", designer_role, DesignDecisions, design_compiler, "design:broad"),
+                ("plan", architect_role, TechnicalPlan, plan_arch_compiler, "plan:broad"),
+            ]
+
+            for prefix, base_role, output_type, compiler_actor, broad_key in artifact_configs:
+                # Check if any revision request affects subfeatures with this prefix
+                has_artifacts = any(
+                    await runner.artifacts.get(f"{prefix}:{sf.slug}", feature=feature)
+                    for sf in decomposition.subfeatures
                 )
-                plan_text = to_str(revised_plan)
-                await runner.artifacts.put("plan", plan_text, feature=feature)
-                state.plan = plan_text
-                if hosting:
-                    await hosting.update(feature.id, "plan", plan_text)
+                if not has_artifacts:
+                    continue
+
+                # Get current compiled artifact size for size guard
+                old_text = await runner.artifacts.get(prefix, feature=feature) or ""
+                old_size = len(old_text)
+
+                try:
+                    await targeted_revision(
+                        runner, feature, self.name,
+                        revision_plan=revision_plan,
+                        decomposition=decomposition,
+                        base_role=base_role,
+                        output_type=output_type,
+                        artifact_prefix=prefix,
+                        context_keys=["project", "scope"],
+                    )
+
+                    # Recompile the unified artifact from revised subfeatures
+                    new_text = await compile_artifacts(
+                        runner, feature, self.name,
+                        compiler_actor=compiler_actor,
+                        decomposition=decomposition,
+                        artifact_prefix=prefix,
+                        broad_key=broad_key,
+                        final_key=prefix,
+                    )
+
+                    # Size guard: reject if recompiled artifact lost >50% content
+                    new_size = len(new_text) if new_text else 0
+                    if old_size > 0 and new_size < old_size * 0.5:
+                        logger.error(
+                            "Rejecting %s recompilation: %d → %d bytes (%.0f%% reduction)",
+                            prefix, old_size, new_size, (1 - new_size / old_size) * 100,
+                        )
+                        # Restore the original
+                        await runner.artifacts.put(prefix, old_text, feature=feature)
+                        revision_results.append(f"{prefix}: REJECTED (size guard: {old_size} → {new_size} bytes)")
+                    else:
+                        await runner.artifacts.put(prefix, new_text, feature=feature)
+                        setattr(state, prefix.replace("-", "_"), new_text)
+
+                        hosting = runner.services.get("hosting")
+                        if hosting:
+                            await hosting.update(feature.id, prefix, new_text)
+
+                        revision_results.append(f"{prefix}: revised and recompiled ({old_size} → {new_size} bytes)")
+
+                except Exception as exc:
+                    logger.error("Failed to revise %s: %s", prefix, exc, exc_info=True)
+                    revision_results.append(f"{prefix}: FAILED ({exc})")
+
+            # Notify user of revision results
+            await runner.run(
+                Respond(
+                    responder=user,
+                    prompt=(
+                        f"## Plan Review Cycle {cycle + 1} — Revisions Applied\n\n"
+                        + "\n".join(f"- {r}" for r in revision_results)
+                        + "\n\nRe-running reviewers..."
+                    ),
+                ),
+                feature,
+                phase_name=self.name,
+            )
 
             cycle += 1
 
