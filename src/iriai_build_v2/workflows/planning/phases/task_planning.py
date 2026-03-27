@@ -3,7 +3,7 @@ from __future__ import annotations
 import json as _json
 import logging
 
-from iriai_compose import AgentActor, Feature, Phase, WorkflowRunner, to_str
+from iriai_compose import Feature, Phase, WorkflowRunner
 
 from ....models.outputs import (
     GlobalImplementationStrategy,
@@ -16,11 +16,7 @@ from ....models.state import BuildState
 from ....roles import (
     InterviewActor,
     dag_compiler,
-    lead_task_planner,
-    lead_task_planner_gate_reviewer,
-    lead_task_planner_reviewer,
     planning_lead_role,
-    user,
 )
 from ..._common import (
     broad_interview,
