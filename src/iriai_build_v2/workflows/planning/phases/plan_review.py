@@ -37,6 +37,47 @@ logger = logging.getLogger(__name__)
 
 WARN_AFTER_CYCLES = 3
 
+_PRD_KEYWORDS = [
+    "requirement", "prd", "journey", "acceptance criteria", "user story",
+    "REQ-", "J-", "AC-", "precondition", "user flow",
+]
+_DESIGN_KEYWORDS = [
+    "design", "component", "mockup", "UX", "UI", "CMP-", "visual",
+    "layout", "responsive", "accessibility", "interaction pattern",
+]
+
+
+def _classify_concerns(*verdicts: Verdict) -> dict[str, list[str]]:
+    """Classify verdict concerns by which artifact they belong to.
+
+    Returns ``{"prd": [...], "design": [...], "plan": [...]}``.
+    Concerns matching PRD keywords go to the PM; design keywords to the
+    designer; everything else to the architect.
+    """
+    classified: dict[str, list[str]] = {"prd": [], "design": [], "plan": []}
+
+    for verdict in verdicts:
+        if verdict.approved:
+            continue
+        for concern in verdict.concerns:
+            text = f"{concern.description} {concern.file}".lower()
+            if any(kw.lower() in text for kw in _PRD_KEYWORDS):
+                classified["prd"].append(concern.description)
+            elif any(kw.lower() in text for kw in _DESIGN_KEYWORDS):
+                classified["design"].append(concern.description)
+            else:
+                classified["plan"].append(concern.description)
+        for gap in verdict.gaps:
+            text = f"{gap.description} {gap.category}".lower()
+            if any(kw.lower() in text for kw in _PRD_KEYWORDS):
+                classified["prd"].append(gap.description)
+            elif any(kw.lower() in text for kw in _DESIGN_KEYWORDS):
+                classified["design"].append(gap.description)
+            else:
+                classified["plan"].append(gap.description)
+
+    return classified
+
 
 class PlanReviewPhase(Phase):
     name = "plan-review"
@@ -147,32 +188,62 @@ class PlanReviewPhase(Phase):
                 )
                 review_summary += f"\n\n## User Guidance\n{user_input}"
 
-            # Route feedback to architect for revision
-            feedback_parts = []
-            if not completeness_verdict.approved:
-                feedback_parts.append(f"Completeness issues:\n{to_str(completeness_verdict)}")
-            if not security_verdict.approved:
-                feedback_parts.append(f"Security issues:\n{to_str(security_verdict)}")
-            if not citation_verdict.approved:
-                feedback_parts.append(f"Citation issues:\n{to_str(citation_verdict)}")
-            feedback = "\n\n".join(feedback_parts)
-
-            revised_plan: TechnicalPlan = await runner.run(
-                Ask(
-                    actor=architect,
-                    prompt=f"Fix these review issues in the technical plan:\n\n{feedback}",
-                    output_type=TechnicalPlan,
-                ),
-                feature,
-                phase_name=self.name,
+            # Route feedback to the correct agent based on artifact type
+            all_concerns = _classify_concerns(
+                completeness_verdict, security_verdict, citation_verdict,
             )
-            plan_text = to_str(revised_plan)
-            await runner.artifacts.put("plan", plan_text, feature=feature)
-            state.plan = plan_text
-
             hosting = runner.services.get("hosting")
-            if hosting:
-                await hosting.update(feature.id, "plan", plan_text)
+
+            if all_concerns["prd"]:
+                prd_feedback = "\n".join(f"- {c}" for c in all_concerns["prd"])
+                revised_prd: PRD = await runner.run(
+                    Ask(
+                        actor=lead_pm_gate_reviewer,
+                        prompt=f"Fix these PRD issues:\n\n{prd_feedback}",
+                        output_type=PRD,
+                    ),
+                    feature,
+                    phase_name=self.name,
+                )
+                prd_text = to_str(revised_prd)
+                await runner.artifacts.put("prd", prd_text, feature=feature)
+                state.prd = prd_text
+                if hosting:
+                    await hosting.update(feature.id, "prd", prd_text)
+
+            if all_concerns["design"]:
+                design_feedback = "\n".join(f"- {c}" for c in all_concerns["design"])
+                revised_design: DesignDecisions = await runner.run(
+                    Ask(
+                        actor=lead_designer_gate_reviewer,
+                        prompt=f"Fix these design issues:\n\n{design_feedback}",
+                        output_type=DesignDecisions,
+                    ),
+                    feature,
+                    phase_name=self.name,
+                )
+                design_text = to_str(revised_design)
+                await runner.artifacts.put("design", design_text, feature=feature)
+                state.design = design_text
+                if hosting:
+                    await hosting.update(feature.id, "design", design_text)
+
+            if all_concerns["plan"]:
+                plan_feedback = "\n".join(f"- {c}" for c in all_concerns["plan"])
+                revised_plan: TechnicalPlan = await runner.run(
+                    Ask(
+                        actor=architect,
+                        prompt=f"Fix these plan issues:\n\n{plan_feedback}",
+                        output_type=TechnicalPlan,
+                    ),
+                    feature,
+                    phase_name=self.name,
+                )
+                plan_text = to_str(revised_plan)
+                await runner.artifacts.put("plan", plan_text, feature=feature)
+                state.plan = plan_text
+                if hosting:
+                    await hosting.update(feature.id, "plan", plan_text)
 
             cycle += 1
 

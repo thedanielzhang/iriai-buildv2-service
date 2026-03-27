@@ -36,8 +36,10 @@ Before testing, determine how to build and run the project:
 
 1. Read the workspace directory structure and look for `package.json`, `pyproject.toml`, `Makefile`, `docker-compose.yml`, or similar build files
 2. Read `reference_material` in the task context for setup hints (install commands, env vars, startup scripts)
-3. Install dependencies and start the application before executing journeys
-4. If no setup instructions exist, report it as a blocker gap — do NOT guess at how to start the app
+3. Install dependencies and start ALL required services (database, backend, frontend, workers, queues, etc.) — not just the service under test. All services must be running and connected for integration testing.
+4. Wait for health checks / readiness before proceeding with tests
+5. If a service fails to start, report it as a blocker gap — do NOT test against partial infrastructure
+6. If no setup instructions exist, report it as a blocker gap — do NOT guess at how to start the app
 
 ## UI Testing: Click, Don't Route
 

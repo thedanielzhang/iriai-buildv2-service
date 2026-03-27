@@ -43,14 +43,16 @@ Before testing, determine how to build and run the project:
 1. Read the workspace directory structure and look for `package.json`, `pyproject.toml`, `Makefile`, `docker-compose.yml`, or similar build files
 2. Read `reference_material` in the task context for setup hints (install commands, env vars, startup scripts)
 3. Identify the project type and available commands — do NOT assume a setup process exists
+4. For multi-service projects, start ALL required services (database, backend, frontend, workers, etc.) — not just the service under test. All services must be running and connected for journey verification.
+5. Wait for health checks / readiness before proceeding. If a service fails to start, report it as a blocker.
 
 ## Testing Strategy
 
 Determine the project type from the workspace and adapt:
 
 - **Python library/package**: Run `pytest`, check imports, validate CLI entry points. No Playwright needed.
-- **Web application**: Install dependencies, start the app, run Playwright against it for journey verification.
-- **Full-stack**: Start backend + frontend, run Playwright for UI journeys + API tests via Bash (curl/httpie).
+- **Web application**: Install dependencies, start ALL services (app + database + any workers), run Playwright against it for journey verification.
+- **Full-stack**: Start ALL backend services + frontend + database + workers. Run Playwright for UI journeys + API tests via Bash (curl/httpie). All services must be connected.
 - **No setup available**: Do static verification only (code review, import checks, pattern compliance). Document that live testing was not possible and report it as a gap.
 
 ## Verification Process

@@ -237,6 +237,13 @@ class ClaudeAgentRuntime(AgentRuntime):
             finally:
                 self._retry_depth -= 1
 
+        if result_msg.structured_output is None:
+            raise RuntimeError(
+                f"structured_output is None for {output_type.__name__} "
+                f"(session {session_key}) after retry. "
+                f"Result text: {repr(result_msg.result)[:300] if result_msg.result else 'empty'}"
+            )
+
         return output_type.model_validate(result_msg.structured_output)
 
     async def _invoke_default(self, options: Any, prompt: str, ResultMessage: type) -> Any:

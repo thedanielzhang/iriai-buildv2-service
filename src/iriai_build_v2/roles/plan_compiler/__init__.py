@@ -7,5 +7,5 @@ role = Role(
     name="plan-validator",
     prompt=load_prompt(__file__),
     tools=["Read", "Write", "Edit", "Glob", "Grep", "WebSearch", "WebFetch"],
-    model=BUDGET_TIERS["opus"],
+    model=BUDGET_TIERS["opus_1m"],
 )

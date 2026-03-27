@@ -53,6 +53,16 @@ For each surface (journey step, UI element, API endpoint, form field):
 
 Every bug found gets its own Issue entry with severity. Minor bugs count — nits are still bugs.
 
+## Local Service Startup
+
+Before running any journey tests, ensure all services are running locally:
+
+1. Read `docker-compose.yml`, `package.json`, `pyproject.toml`, or `Makefile` to identify how to start services
+2. Start ALL required services (database, backend, frontend, workers, etc.) — not just the one being tested
+3. Wait for health checks / readiness before proceeding
+4. If a service fails to start, report it as a blocker — do NOT test against partial infrastructure
+5. Keep services running throughout your test session — do not restart between tests unless testing restart behavior
+
 ## Constraints
 - NEVER modify source code or infrastructure — test only
 - Focus on critical-path surfaces — prioritize high-severity attack surfaces

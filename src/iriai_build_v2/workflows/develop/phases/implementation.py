@@ -3,7 +3,7 @@ from __future__ import annotations
 import itertools
 import logging
 
-from iriai_compose import AgentActor, Ask, Feature, Gate, Phase, WorkflowRunner, to_str
+from iriai_compose import AgentActor, Ask, Feature, Gate, Phase, Respond, WorkflowRunner, to_str
 from iriai_compose.actors import Role
 
 from ....config import BUDGET_TIERS
@@ -22,9 +22,11 @@ from ....roles import (
     implementer,
     integration_tester,
     qa_engineer,
+    regression_tester,
     reviewer,
     root_cause_analyst,
     security_auditor,
+    test_author,
     user,
     verifier,
 )
@@ -255,7 +257,29 @@ class ImplementationPhase(Phase):
                 cycle += 1
                 continue
 
-            # ── Step 6: Verifier — confirm all journeys work ────────────
+            # ── Step 6: Test Authoring ────────────────────────────────
+            test_result: ImplementationResult = await runner.run(
+                Ask(
+                    actor=test_author,
+                    prompt=(
+                        f"## Implementation Handover\n\n{handover_context}\n\n"
+                        "Write tests for this implementation. For each acceptance "
+                        "criterion in the PRD, write at least one test. For each "
+                        "counterexample, write a test that verifies the wrong thing "
+                        "does NOT happen. Use the project's existing test framework "
+                        "and patterns. Write both unit tests and integration/E2E tests "
+                        "where appropriate.\n\n"
+                        "For web/full-stack projects, write Playwright E2E tests that "
+                        "test user journeys via real UI interactions."
+                    ),
+                    output_type=ImplementationResult,
+                ),
+                feature,
+                phase_name=self.name,
+            )
+            await runner.artifacts.put("test-authoring", to_str(test_result), feature=feature)
+
+            # ── Step 7: Verifier — confirm all journeys work ────────────
             verifier_verdict: Verdict = await runner.run(
                 Ask(
                     actor=verifier,
@@ -291,49 +315,79 @@ class ImplementationPhase(Phase):
                 cycle += 1
                 continue
 
-            # ── Step 7: User Approval ────────────────────────────────────
-            attempts_summary = ""
-            if prior_attempts:
-                fixed = [a for a in prior_attempts if a.re_verify_result == "PASS"]
-                failed_all = [a for a in prior_attempts if a.re_verify_result != "PASS"]
-                attempts_summary = (
-                    f"\n\n## Bug Fix Attempts ({len(fixed)} fixed, {len(failed_all)} failed)\n\n"
-                    + "\n".join(
-                        f"- **{a.bug_id}** ({a.source_verdict}, group {a.group_id or 'single'}): "
-                        f"{a.description[:80]} → {a.re_verify_result}"
-                        for a in prior_attempts
-                    )
+            # ── Step 8: Implementation Report ────────────────────────────
+            from ....services.implementation_report import (
+                render_implementation_report,
+                validate_report,
+            )
+
+            # Collect artifact URLs from hosting service
+            artifact_urls = _collect_artifact_urls(runner)
+
+            # Collect any Playwright screenshots from the workspace
+            screenshot_paths = _collect_screenshots(feature)
+
+            all_verdicts = {
+                "qa": qa_verdict,
+                "integration": integration_verdict,
+                "code_review": review_verdict,
+                "security": security_verdict,
+                "verifier": verifier_verdict,
+            }
+
+            report_html = render_implementation_report(
+                feature_name=feature.name,
+                handover=handover,
+                verdicts=all_verdicts,
+                bug_fix_attempts=prior_attempts,
+                test_result=test_result,
+                artifact_urls=artifact_urls,
+                screenshot_paths=screenshot_paths,
+            )
+
+            # Validate the report
+            validation_errors = validate_report(report_html, handover, all_verdicts)
+            if validation_errors:
+                logger.warning(
+                    "Report validation: %d issues: %s",
+                    len(validation_errors),
+                    "; ".join(validation_errors[:5]),
                 )
 
-            summary = (
-                f"## Implementation Handover\n\n{handover_context}\n\n"
-                f"## QA Verdict\n{to_str(qa_verdict)}\n\n"
-                f"## Integration Test\n{to_str(integration_verdict)}\n\n"
-                f"## Code Review\n{to_str(review_verdict)}\n\n"
-                f"## Security Audit\n{to_str(security_verdict)}\n\n"
-                f"## Verifier\n{to_str(verifier_verdict)}"
-                f"{attempts_summary}"
+            # Host the report
+            report_url = ""
+            hosting = runner.services.get("hosting")
+            if hosting:
+                report_url = await hosting.push_qa(
+                    feature.id, "implementation-report",
+                    report_html, "Implementation Report",
+                )
+                logger.info("Implementation report hosted at %s", report_url)
+
+            # Store as artifact
+            await runner.artifacts.put(
+                "implementation-report", report_html, feature=feature
             )
-            approved = await runner.run(
-                Gate(
-                    approver=user,
-                    prompt=f"Implementation complete.\n\n{summary}\n\nApprove?",
+
+            # Notify user via Slack with report link
+            notification = "All quality gates passed. Implementation complete."
+            if report_url:
+                notification = (
+                    f"All quality gates passed. Implementation complete.\n\n"
+                    f"**[View Implementation Report]({report_url})**\n\n"
+                    f"The report contains journey evidence, gate verdicts, "
+                    f"bug fix history, and artifact references."
+                )
+            await runner.run(
+                Respond(
+                    responder=user,
+                    prompt=notification,
                 ),
                 feature,
                 phase_name=self.name,
             )
-            if approved is True:
-                return state
 
-            # User rejection — go through RCA with user feedback
-            user_feedback = str(approved) if isinstance(approved, str) else "Please revise."
-            attempts = await _diagnose_and_fix(
-                runner, feature, user_feedback, "user",
-                qa_engineer, implementer, prior_attempts, bug_counter,
-            )
-            prior_attempts.extend(attempts)
-            await _store_attempts(runner, feature, prior_attempts)
-            cycle += 1
+            return state
 
 
 # ── DAG execution ────────────────────────────────────────────────────────────
@@ -806,12 +860,30 @@ async def _diagnose_and_fix(
     else:
         verify_results = await runner.parallel(verify_tasks, feature)
 
-    # 6. Collect BugFixAttempt records
+    # 6. Regression test on all modified files from passed groups
+    passed_gids = [
+        gid for gid, rv in zip(fix_results.keys(), verify_results) if _is_approved(rv)
+    ]
+    regression_failed_gids: set[str] = set()
+    if passed_gids:
+        all_modified = []
+        for gid in passed_gids:
+            fix = fix_results[gid]
+            all_modified.extend(fix.files_created + fix.files_modified)
+        all_modified = sorted(set(all_modified))
+        if all_modified:
+            regression_verdict = await _run_regression(runner, feature, all_modified)
+            if regression_verdict is not None and not _is_approved(regression_verdict):
+                logger.warning("Regression found after multi-group fixes")
+                # Mark all passed groups as failed due to regression
+                regression_failed_gids = set(passed_gids)
+
+    # 7. Collect BugFixAttempt records
     attempts: list[BugFixAttempt] = []
     for gid, re_verdict in zip(fix_results.keys(), verify_results):
         group = group_by_id[gid]
         fix = fix_results[gid]
-        passed = _is_approved(re_verdict)
+        passed = _is_approved(re_verdict) and gid not in regression_failed_gids
 
         description = group.likely_root_cause
         if passed:
@@ -910,6 +982,15 @@ async def _single_rca_fix_verify(
         phase_name="implementation",
     )
 
+    # 4. Regression test on modified files
+    passed = _is_approved(re_verdict)
+    if passed:
+        modified = fix_result.files_created + fix_result.files_modified
+        regression_verdict = await _run_regression(runner, feature, modified)
+        if regression_verdict is not None and not _is_approved(regression_verdict):
+            logger.warning("Regression found after fix %s", bug_id)
+            passed = False
+
     return BugFixAttempt(
         bug_id=bug_id,
         source_verdict=source,
@@ -917,7 +998,7 @@ async def _single_rca_fix_verify(
         root_cause=rca.hypothesis,
         fix_applied=fix_result.summary,
         files_modified=fix_result.files_created + fix_result.files_modified,
-        re_verify_result="PASS" if _is_approved(re_verdict) else "FAIL",
+        re_verify_result="PASS" if passed else "FAIL",
         attempt_number=attempt_number,
     )
 
@@ -977,6 +1058,37 @@ async def _store_attempts(
     await runner.artifacts.put("bug-fix-attempts", text, feature=feature)
 
 
+async def _run_regression(
+    runner: WorkflowRunner,
+    feature: Feature,
+    modified_files: list[str],
+) -> Verdict | None:
+    """Run regression tests on files modified by bug fixes.
+
+    Returns None if no files to test, otherwise a Verdict.
+    """
+    if not modified_files:
+        return None
+
+    file_list = "\n".join(f"- `{f}`" for f in sorted(set(modified_files)))
+    return await runner.run(
+        Ask(
+            actor=regression_tester,
+            prompt=(
+                f"## Regression Check After Bug Fixes\n\n"
+                f"The following files were modified during bug fix cycles:\n"
+                f"{file_list}\n\n"
+                "Run existing tests covering these files. Then probe the "
+                "changed surfaces for regressions the test suite doesn't cover. "
+                "Focus on downstream consumers and integration points."
+            ),
+            output_type=Verdict,
+        ),
+        feature,
+        phase_name="implementation",
+    )
+
+
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 
@@ -1001,3 +1113,39 @@ def _is_approved(verdict: object) -> bool:
 
 def _format_feedback(source: str, verdict: object) -> str:
     return f"## {source} Feedback\n\n{to_str(verdict)}"
+
+
+def _collect_artifact_urls(runner: WorkflowRunner) -> dict[str, str]:
+    """Collect hosted artifact URLs from the hosting service."""
+    hosting = runner.services.get("hosting")
+    if not hosting:
+        return {}
+    urls: dict[str, str] = {}
+    for key in ("prd", "design", "plan", "system-design", "mockup"):
+        url = hosting.get_url(key)
+        if url:
+            urls[key] = url
+    return urls
+
+
+def _collect_screenshots(feature: Feature) -> list[str]:
+    """Collect Playwright screenshot paths from the workspace.
+
+    Searches common Playwright output locations for .png/.jpg files.
+    """
+    import glob
+
+    workspace = getattr(feature, "workspace_path", "") or ""
+    if not workspace:
+        return []
+
+    patterns = [
+        f"{workspace}/**/screenshots/*.png",
+        f"{workspace}/**/test-results/**/*.png",
+        f"{workspace}/**/playwright-report/**/*.png",
+        f"{workspace}/**/*.screenshot.png",
+    ]
+    paths: list[str] = []
+    for pattern in patterns:
+        paths.extend(glob.glob(pattern, recursive=True))
+    return sorted(set(paths))
