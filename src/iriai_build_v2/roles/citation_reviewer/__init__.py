@@ -7,5 +7,5 @@ role = Role(
     name="citation-reviewer",
     prompt=load_prompt(__file__),
     tools=["Read", "Glob", "Grep"],
-    model=BUDGET_TIERS["opus"],
+    model=BUDGET_TIERS["opus_1m"],
 )

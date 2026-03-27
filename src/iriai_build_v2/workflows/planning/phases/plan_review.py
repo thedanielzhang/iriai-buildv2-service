@@ -151,9 +151,25 @@ class PlanReviewPhase(Phase):
                     ),
                 ],
                 feature,
+                fail_fast=False,
             )
 
-            completeness_verdict, security_verdict, citation_verdict = results
+            # Handle crashed reviewers: treat errors as FAIL verdicts
+            _error_verdict = Verdict(
+                approved=False,
+                summary="Reviewer crashed — treating as FAIL",
+            )
+            completeness_verdict = results[0] if isinstance(results[0], Verdict) else _error_verdict
+            security_verdict = results[1] if isinstance(results[1], Verdict) else _error_verdict
+            citation_verdict = results[2] if isinstance(results[2], Verdict) else _error_verdict
+
+            for i, (name, v) in enumerate([
+                ("completeness", results[0]),
+                ("security", results[1]),
+                ("citation", results[2]),
+            ]):
+                if not isinstance(v, Verdict):
+                    logger.error("Plan %s reviewer crashed: %s", name, v)
 
             if completeness_verdict.approved and security_verdict.approved and citation_verdict.approved:
                 break
