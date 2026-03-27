@@ -55,29 +55,6 @@ async def get_existing_artifact(
     return content if content else None
 
 
-def _revision_done(result: Any, output_type: type) -> bool:
-    """Check if a revision Interview produced a complete artifact.
-
-    Returns True if the result has the ``complete`` flag set, or if the
-    model has any substantive content (non-empty string/list fields).
-    This allows the agent to ask clarifying questions before producing
-    the final output.
-    """
-    if hasattr(result, "complete") and result.complete:
-        return True
-    # Check if the model has any actual content
-    if isinstance(result, BaseModel):
-        for name in result.model_fields:
-            if name == "complete":
-                continue
-            value = getattr(result, name)
-            if isinstance(value, str) and value:
-                return True
-            if isinstance(value, list) and value:
-                return True
-    return False
-
-
 async def gate_and_revise(
     runner: WorkflowRunner,
     feature: Feature,
@@ -167,11 +144,14 @@ async def gate_and_revise(
                 from ...services.artifacts import _key_to_path
                 artifact_path = mirror.feature_dir(feature.id) / _key_to_path(artifact_key)
 
+        from ...models.outputs import Envelope, envelope_done
+
         revision_prompt = (
             f"Here is the current {artifact_name.lower()}:\n\n"
             f"{artifact_text}\n\n"
             f"---\n\n"
-            f"Revise the COMPLETE {artifact_name.lower()} based on this feedback. "
+            f"Revise the {artifact_name.lower()} based on this feedback. "
+            f"Ask clarifying questions if the feedback is ambiguous. "
             f"Output the full document with all sections, not just the changes:\n\n"
             f"{feedback}"
         )
@@ -181,17 +161,19 @@ async def gate_and_revise(
                 f"Then set `complete = true` in the structured output."
             )
 
-        artifact = await runner.run(
+        envelope = await runner.run(
             Interview(
                 questioner=actor,
                 responder=approver,
                 initial_prompt=revision_prompt,
-                output_type=output_type,
-                done=lambda result: _revision_done(result, output_type),
+                output_type=Envelope[output_type],
+                done=envelope_done,
             ),
             feature,
             phase_name=phase_name,
         )
+
+        artifact = envelope.output if isinstance(envelope, Envelope) and envelope.output else envelope
 
         # Prefer file content over to_str(BaseModel) JSON
         artifact_text = to_str(artifact)
@@ -844,6 +826,7 @@ async def _extract_review_fields(
         ),
         tools=[],
         model="claude-haiku-4-5-20251001",
+        effort="high",
     )
 
     result = await runner.run(
@@ -898,6 +881,7 @@ async def _extract_revision_plan(
         ),
         tools=[],
         model="claude-haiku-4-5-20251001",
+        effort="high",
     )
 
     result = await runner.run(

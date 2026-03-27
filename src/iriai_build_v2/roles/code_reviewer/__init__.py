@@ -7,7 +7,7 @@ role = Role(
     name="code-reviewer",
     prompt=load_prompt(__file__),
     tools=["Read", "Glob", "Grep"],
-    model=BUDGET_TIERS["opus"],
+    model=BUDGET_TIERS["opus_1m"],
     metadata={
         "mcp_servers": mcp_servers_for("qa-feedback"),
     },

@@ -94,6 +94,12 @@ class DesignPhase(Phase):
                     if url:
                         mockup_urls[f"Mockup: {sf.name}"] = url
 
+            # Callback to re-compile mockup after each revision cycle
+            async def _refresh_mockup_resume() -> None:
+                url = await self._compile_mockup(runner, feature, decomposition)
+                if url:
+                    mockup_urls["Unified Mockup"] = url
+
             final_text = await interview_gate_review(
                 runner, feature, self.name,
                 lead_actor=lead_designer_gate_reviewer,
@@ -106,6 +112,7 @@ class DesignPhase(Phase):
                 broad_key="design:broad",
                 context_keys=["project", "scope", "prd"],
                 additional_urls=mockup_urls or None,
+                post_compile=_refresh_mockup_resume,
             )
             await runner.artifacts.put("design", final_text, feature=feature)
             state.design = final_text

@@ -6,9 +6,9 @@ from ...config import BUDGET_TIERS, mcp_servers_for
 role = Role(
     name="verifier",
     prompt=load_prompt(__file__),
-    tools=["Read", "Glob", "Grep"],
-    model=BUDGET_TIERS["opus"],
+    tools=["Read", "Bash", "Glob", "Grep"],
+    model=BUDGET_TIERS["opus_1m"],
     metadata={
-        "mcp_servers": mcp_servers_for("qa-feedback"),
+        "mcp_servers": mcp_servers_for("playwright", "qa-feedback"),
     },
 )

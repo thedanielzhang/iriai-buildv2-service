@@ -8,4 +8,5 @@ role = Role(
     prompt=load_prompt(__file__),
     tools=[],
     model=BUDGET_TIERS["haiku"],
+    effort="high",
 )

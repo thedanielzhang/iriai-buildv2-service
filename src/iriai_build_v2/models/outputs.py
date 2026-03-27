@@ -676,6 +676,13 @@ def envelope_done(response: object) -> bool:
 # ── Implementation DAG models ────────────────────────────────────────────────
 
 
+class TaskReference(BaseModel):
+    """An excerpt from an upstream artifact embedded in a task for implementer context."""
+
+    source: str  # e.g., "PRD REQ-3", "Design CMP-2", "Plan D-SF1-10", "SystemDesign entity:NodeBase"
+    content: str  # the actual text/spec the implementer needs
+
+
 class ImplementationTask(BaseModel):
     """A single unit of work in the implementation DAG."""
 
@@ -691,6 +698,15 @@ class ImplementationTask(BaseModel):
     counterexamples: list[str] = Field(default_factory=list)
     security_concerns: list[str] = Field(default_factory=list)
     testid_assignments: list[str] = Field(default_factory=list)
+    reference_material: list[TaskReference] = Field(
+        default_factory=list,
+        description=(
+            "Excerpts from upstream artifacts (PRD requirements, design component "
+            "specs, plan decisions, system design entities, mockup component specs) "
+            "that the implementer needs. Each entry is self-contained — the "
+            "implementer should not need to consult the full artifact."
+        ),
+    )
     subfeature_id: str = ""  # SF-1, SF-2, ... for traceability
     # Legacy / DAG metadata
     files: list[str] = Field(default_factory=list)
@@ -718,6 +734,38 @@ class ImplementationResult(BaseModel):
     notes: str = ""
     deviations: list[Deviation] = Field(default_factory=list)
     self_reported_risks: list[Risk] = Field(default_factory=list)
+
+
+class BugFixAttempt(BaseModel):
+    """Record of a single bug fix attempt during implementation."""
+
+    bug_id: str  # e.g., "QA-FAIL-1", "REVIEW-FAIL-3"
+    group_id: str = ""  # triage group ID (e.g., "BG-1"), empty for single-bug path
+    source_verdict: str  # which reviewer found it (qa_engineer, code_reviewer, etc.)
+    description: str  # what the bug is
+    root_cause: str  # RCA finding
+    fix_applied: str  # what the implementer did
+    files_modified: list[str] = Field(default_factory=list)
+    re_verify_result: str  # PASS or FAIL
+    attempt_number: int = 1
+
+
+class BugGroup(BaseModel):
+    """A group of related issues sharing a likely root cause."""
+
+    group_id: str  # e.g., "BG-1"
+    likely_root_cause: str  # one-sentence hypothesis
+    issue_indices: list[int] = Field(default_factory=list)  # into Verdict.concerns
+    gap_indices: list[int] = Field(default_factory=list)  # into Verdict.gaps
+    severity: str  # blocker | major | minor (worst in group)
+    affected_files_hint: list[str] = Field(default_factory=list)
+
+
+class BugTriage(BaseModel):
+    """Triage output: ALL issues grouped by likely root cause. No deferrals."""
+
+    groups: list[BugGroup] = Field(default_factory=list)
+    rationale: str = ""
 
 
 class BugFixResult(BaseModel):

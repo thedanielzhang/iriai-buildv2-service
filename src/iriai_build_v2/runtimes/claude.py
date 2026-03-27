@@ -82,7 +82,8 @@ class ClaudeAgentRuntime(AgentRuntime):
         self._feature_sessions: dict[str, str] = {}  # feature_id → active session_key
 
         # Context management: message accumulation for session cycling
-        self._session_messages: dict[str, list[str]] = {}  # session_key → message texts
+        self._session_messages: dict[str, list[str]] = {}  # session_key → message texts (truncated for summarization)
+        self._session_sizes: dict[str, int] = {}  # session_key → actual byte count of full prompts/responses
         self._session_context: dict[str, str] = {}  # session_key → compressed context after cycle
         self._retry_depth: int = 0  # prevent infinite retry loops
 
@@ -97,21 +98,39 @@ class ClaudeAgentRuntime(AgentRuntime):
     ) -> str | BaseModel:
         from claude_agent_sdk.types import ResultMessage
 
-        # ── Context management: proactive session cycling ──
-        if session_key:
-            max_chars = role.metadata.get("max_session_chars", 0)
-            if max_chars:
-                chars = sum(len(m) for m in self._session_messages.get(session_key, []))
-                if chars >= max_chars:
-                    logger.info(
-                        "Session %s reached %d chars (limit %d) — cycling",
-                        session_key, chars, max_chars,
-                    )
-                    await self._cycle_session(session_key, role)
+        # ── Determine session mode ──
+        # Roles with max_session_chars are multi-turn (interviews) and
+        # accumulate sessions.  Roles without it are one-shot (Ask tasks)
+        # and get a fresh session every invocation.
+        max_chars = role.metadata.get("max_session_chars", 0)
+        ephemeral = not max_chars
 
-            # Accumulate user prompt for size tracking
+        # ── One-shot tasks: clear prior session state ──
+        if session_key and ephemeral:
+            self._session_messages.pop(session_key, None)
+            self._session_sizes.pop(session_key, 0)
+            self._session_context.pop(session_key, None)
+            if self.session_store:
+                await self.session_store.delete(session_key)
+
+        # ── Context management: proactive session cycling ──
+        if session_key and max_chars:
+            actual_size = self._session_sizes.get(session_key, 0)
+            if actual_size >= max_chars:
+                logger.info(
+                    "Session %s reached %d chars (limit %d) — cycling",
+                    session_key, actual_size, max_chars,
+                )
+                await self._cycle_session(session_key, role)
+
+        if session_key:
+            # Track truncated copy for summarization
             self._session_messages.setdefault(session_key, []).append(
                 f"User: {prompt[:2000]}"
+            )
+            # Track actual size for threshold checks
+            self._session_sizes[session_key] = (
+                self._session_sizes.get(session_key, 0) + len(prompt)
             )
 
         # ── Build options + inject compressed context if session was cycled ──
@@ -161,6 +180,9 @@ class ClaudeAgentRuntime(AgentRuntime):
         if session_key:
             self._session_messages.setdefault(session_key, []).append(
                 f"Assistant: {result_text[:2000]}"
+            )
+            self._session_sizes[session_key] = (
+                self._session_sizes.get(session_key, 0) + len(result_text)
             )
 
         # Save session for future invocations + persist assistant turn
@@ -315,8 +337,9 @@ class ClaudeAgentRuntime(AgentRuntime):
             parts.append("## Recent Messages\n\n" + "\n\n".join(recent))
         self._session_context[session_key] = "\n\n".join(parts)
 
-        # Reset message buffer to recent only
+        # Reset message buffer and size counter to recent only
         self._session_messages[session_key] = list(recent)
+        self._session_sizes[session_key] = sum(len(m) for m in recent)
 
         # Clear the SDK session so the next invoke starts fresh
         if self.session_store:
@@ -370,6 +393,7 @@ class ClaudeAgentRuntime(AgentRuntime):
             model=role.model or "claude-sonnet-4-6",
             cwd=str(workspace.path) if workspace else None,
             permission_mode="bypassPermissions",
+            effort=role.effort if role.effort is not None else "high",
         )
 
         if "setting_sources" in role.metadata:

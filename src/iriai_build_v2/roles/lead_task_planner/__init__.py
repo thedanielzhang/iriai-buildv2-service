@@ -7,5 +7,9 @@ role = Role(
     name="lead-task-planner",
     prompt=load_prompt(__file__),
     tools=["Read", "Write", "Glob", "Grep", "WebSearch", "WebFetch"],
-    model=BUDGET_TIERS["opus"],
+    model=BUDGET_TIERS["opus_1m"],
+    metadata={
+        "max_session_chars": 800_000,
+        "keep_recent_messages": 6,
+    },
 )

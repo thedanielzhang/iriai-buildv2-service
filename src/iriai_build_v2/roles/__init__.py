@@ -98,22 +98,22 @@ architect = InterviewActor(
 plan_compiler = AgentActor(
     name="plan-compiler",
     role=plan_compiler_role,
-    context_keys=["plan", "prd", "design"],
+    context_keys=["plan", "prd", "design", "system-design", "mockup", "scope"],
 )
 plan_completeness_reviewer = AgentActor(
     name="plan-completeness-reviewer",
     role=plan_compiler_role,
-    context_keys=["plan", "prd", "design", "system-design"],
+    context_keys=["plan", "prd", "design", "system-design", "mockup", "scope"],
 )
 plan_security_reviewer = AgentActor(
     name="plan-security-reviewer",
     role=plan_compiler_role,
-    context_keys=["plan", "prd", "design", "system-design"],
+    context_keys=["plan", "prd", "design", "system-design", "mockup", "scope"],
 )
 planning_lead = InterviewActor(
     name="planning-lead",
     role=planning_lead_role,
-    context_keys=["project", "plan", "prd", "design", "system-design"],
+    context_keys=["project", "plan", "prd", "design", "system-design", "mockup"],
 )
 feature_lead = AgentActor(
     name="feature-lead",
@@ -163,42 +163,42 @@ test_author = AgentActor(
 integration_tester = AgentActor(
     name="integration-tester",
     role=integration_tester_role,
-    context_keys=["project", "plan", "prd"],
+    context_keys=["project", "plan", "prd", "design", "system-design", "mockup"],
 )
 regression_tester = AgentActor(
     name="regression-tester",
     role=regression_tester_role,
-    context_keys=["project", "plan"],
+    context_keys=["project", "plan", "prd"],
 )
 smoke_tester = AgentActor(
     name="smoke-tester",
     role=smoke_tester_role,
-    context_keys=["project", "plan", "prd"],
+    context_keys=["project", "plan", "prd", "design", "system-design"],
 )
 code_reviewer = AgentActor(
     name="code-reviewer",
     role=code_reviewer_role,
-    context_keys=["project", "plan"],
+    context_keys=["project", "plan", "prd", "design", "system-design"],
 )
 security_auditor = AgentActor(
     name="security-auditor",
     role=security_auditor_role,
-    context_keys=["project", "plan"],
+    context_keys=["project", "plan", "prd", "design", "system-design"],
 )
 accessibility_auditor = AgentActor(
     name="accessibility-auditor",
     role=accessibility_auditor_role,
-    context_keys=["project", "plan"],
+    context_keys=["project", "plan", "design", "mockup"],
 )
 performance_analyst = AgentActor(
     name="performance-analyst",
     role=performance_analyst_role,
-    context_keys=["project", "plan"],
+    context_keys=["project", "plan", "system-design"],
 )
 verifier = AgentActor(
     name="verifier",
     role=verifier_role,
-    context_keys=["project", "plan", "prd"],
+    context_keys=["project", "plan", "prd", "design", "system-design", "mockup"],
 )
 analytics_engineer = AgentActor(
     name="analytics-engineer",
@@ -298,15 +298,15 @@ sysdesign_compiler = AgentActor(
 # Lead task planner actors
 lead_task_planner = InterviewActor(
     name="lead-task-planner", role=lead_task_planner_role,
-    context_keys=["project", "scope", "prd", "design", "plan", "system-design", "decomposition"],
+    context_keys=["project", "scope", "prd", "design", "plan", "system-design", "mockup", "decomposition"],
 )
 lead_task_planner_reviewer = InterviewActor(
     name="lead-task-planner-reviewer", role=lead_task_planner_role,
-    context_keys=["project", "scope", "prd", "design", "plan", "system-design", "decomposition"],
+    context_keys=["project", "scope", "prd", "design", "plan", "system-design", "mockup", "decomposition"],
 )
 lead_task_planner_gate_reviewer = InterviewActor(
     name="lead-task-planner-gate-reviewer", role=lead_task_planner_role,
-    context_keys=["project", "scope", "prd", "design", "plan", "system-design", "decomposition"],
+    context_keys=["project", "scope", "prd", "design", "plan", "system-design", "mockup", "decomposition"],
 )
 dag_compiler = AgentActor(
     name="dag-compiler", role=compiler_role, context_keys=[],

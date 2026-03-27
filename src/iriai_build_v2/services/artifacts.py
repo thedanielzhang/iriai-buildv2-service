@@ -127,6 +127,19 @@ _KEY_MAP = {
 }
 
 
+def _sd_source_path(key: str) -> str | None:
+    """Return the source markdown path for a system-design key, or None.
+
+    ``hosting.push`` writes rendered HTML to ``system-design.html``,
+    overwriting the raw prose the architect originally wrote.  This
+    companion path stores the raw source so it survives the overwrite.
+    """
+    html_path = _key_to_path(key)
+    if not html_path.endswith("system-design.html"):
+        return None
+    return html_path.replace("system-design.html", "system-design-source.md")
+
+
 def _key_to_path(key: str) -> str:
     """Map an artifact key to a relative file path within the feature directory.
 

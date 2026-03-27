@@ -54,27 +54,57 @@ class PlanReviewPhase(Phase):
                     Ask(
                         actor=plan_completeness_reviewer,
                         prompt=(
-                            "Review the technical plan for completeness and correctness. "
-                            "Verify all PRD requirements are addressed and implementation "
-                            "steps are actionable."
+                            "Your goal is to find every gap and inconsistency across all artifacts. "
+                            "The PRD, design, plan, and system design were produced by different agents "
+                            "— they WILL have drift and contradictions.\n\n"
+                            "Focus on:\n"
+                            "1. PRD requirements with no corresponding plan step (uncovered requirements)\n"
+                            "2. Plan steps that implement something not in the PRD (scope creep)\n"
+                            "3. PRD journeys with no verification blocks in the plan\n"
+                            "4. Design components with no implementation task\n"
+                            "5. PRD ↔ Design contradictions (requirement vs component mismatch)\n"
+                            "6. PRD ↔ Plan contradictions (requirement vs implementation mismatch)\n"
+                            "7. Design ↔ Plan contradictions (component vs task mismatch)\n"
+                            "8. Missing cross-service tasks (shared package changes without consumer updates)\n"
+                            "9. Acceptance criteria that are unverifiable given the plan's file scope\n\n"
+                            "Every gap gets its own concern entry. A clean PASS means you missed something."
                         ),
                         output_type=Verdict,
                     ),
                     Ask(
                         actor=plan_security_reviewer,
                         prompt=(
-                            "Review the technical plan for security concerns. Check for "
-                            "potential vulnerabilities, insecure patterns, and missing "
-                            "security considerations."
+                            "Your goal is to find every security gap across all artifacts. "
+                            "Check the PRD security profile, then verify the plan actually implements "
+                            "every security requirement — not just acknowledges it.\n\n"
+                            "Focus on:\n"
+                            "1. PRD security profile requirements with no implementation task\n"
+                            "2. Endpoints without auth decorators in the plan\n"
+                            "3. Data flows handling PII without encryption/masking tasks\n"
+                            "4. Missing input validation on user-facing endpoints\n"
+                            "5. Missing rate limiting on public endpoints\n"
+                            "6. Secrets/credentials hardcoded in task instructions\n"
+                            "7. CORS/CSRF gaps in the API design\n"
+                            "8. Database migrations without rollback steps\n"
+                            "9. Third-party integrations without error handling tasks\n\n"
+                            "Every gap gets its own concern entry. A clean PASS means you missed something."
                         ),
                         output_type=Verdict,
                     ),
                     Ask(
                         actor=citation_reviewer,
                         prompt=(
-                            "Verify all citations in the compiled artifacts are valid. "
-                            "Check code references exist (use Read/Glob), verify decision "
-                            "IDs match the decision log, and validate research references."
+                            "Your goal is to find every broken or missing citation across all artifacts. "
+                            "Every decision and claim must be traceable.\n\n"
+                            "Focus on:\n"
+                            "1. Decision IDs (D-*) referenced in citations that don't exist in the decision log\n"
+                            "2. Scope decision references (scope-*) that don't match scope.user_decisions\n"
+                            "3. Code references ([Source: path:line]) where the file/function doesn't exist\n"
+                            "4. Requirements referenced in plan steps that don't exist in the PRD\n"
+                            "5. Journey IDs referenced in verification blocks that don't exist in the PRD\n"
+                            "6. Component IDs referenced in tasks that don't exist in the design\n"
+                            "7. Claims about library/API behavior without documentation citation\n\n"
+                            "Every broken reference gets its own concern entry. A clean PASS means you missed something."
                         ),
                         output_type=Verdict,
                     ),

@@ -7,7 +7,7 @@ role = Role(
     name="integration-tester",
     prompt=load_prompt(__file__),
     tools=["Read", "Bash", "Glob", "Grep"],
-    model=BUDGET_TIERS["opus"],
+    model=BUDGET_TIERS["opus_1m"],
     metadata={
         "mcp_servers": mcp_servers_for(
             "playwright", "context7", "postgres", "qa-feedback", "preview",

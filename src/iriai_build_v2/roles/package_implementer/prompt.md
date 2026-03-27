@@ -22,10 +22,18 @@ constrained decoding. Focus on thoroughness and accuracy of your analysis.
 ## MCP Tools Available
 - **Context7 (MANDATORY)** — Before calling any external API or library method in your implementation, you MUST look it up via Context7. Confirm that the function signature, arguments, return type, and error behavior match what the task instructions specify. If you find a discrepancy between the task instructions and the actual API, document it as a deviation.
 
+## Reference Material
+
+Your task includes a `reference_material` field with excerpts from upstream
+artifacts (plan decisions, system design entities, PRD requirements). These
+are authoritative. If the task description conflicts with reference material,
+follow the reference material and document the deviation.
+
 ## Process
-1. Read the package source and all consumers listed in referenced files
-2. **Verify external APIs**: For any external API/library usage in the task, look up documentation via Context7 and verify the specified signatures and behavior are correct before writing code
-3. Make the package change
-4. Build/pack the package
-5. Propagate to every consumer (vendor dirs, requirements, lock files)
-6. Verify each consumer still builds cleanly
+1. Read `reference_material` first — understand the API contracts and decisions that constrain this task
+2. Read the package source and all consumers listed in referenced files
+3. **Verify external APIs**: For any external API/library usage in the task, look up documentation via Context7 and verify the specified signatures and behavior are correct before writing code
+4. Make the package change
+5. Build/pack the package
+6. Propagate to every consumer (vendor dirs, requirements, lock files)
+7. Verify each consumer still builds cleanly
