@@ -1125,10 +1125,14 @@ async def interview_gate_review(
                 questioner=lead_actor,
                 responder=_get_user(),
                 initial_prompt=(
+                    f"**[MODE: Gate Review]** You are in Gate Review mode. "
+                    f"Review the compiled **{artifact_prefix}** artifact below and discuss "
+                    f"with the user. Do NOT start a Broad Architecture, Requirements, "
+                    f"or Design interview.\n\n"
                     f"I've compiled the {artifact_prefix} from all subfeatures. "
                     f"Please review it and let me know if there is anything you'd like changed.{url_note}"
                     f"{extra_links}\n\n"
-                    f"Summary of compiled artifact:\n{compiled_text[:3000]}"
+                    f"Compiled artifact for review:\n{compiled_text}"
                 ),
                 output_type=Envelope[ReviewOutcome],
                 done=envelope_done,

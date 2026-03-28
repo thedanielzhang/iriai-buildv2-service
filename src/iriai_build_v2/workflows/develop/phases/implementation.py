@@ -110,11 +110,106 @@ class ImplementationPhase(Phase):
                 cycle += 1
                 continue
 
-            # Compress handover before passing to QA/review
+            # Compress handover before passing to review/QA gates
             handover.compress()
             handover_context = to_markdown(handover)
 
-            # ── Step 2: Full QA ──────────────────────────────────────────
+            # ── Step 2: Code Review (static) ─────────────────────────────
+            review_verdict: Verdict = await runner.run(
+                Ask(
+                    actor=reviewer,
+                    prompt=(
+                        f"## Implementation Handover\n\n{handover_context}\n\n"
+                        "Review the implementation for code quality, adherence to "
+                        "the technical plan, design decisions, and system design. "
+                        "Cross-check against the full upstream artifacts in your context."
+                    ),
+                    output_type=Verdict,
+                ),
+                feature,
+                phase_name=self.name,
+            )
+            await runner.artifacts.put(
+                "review-verdict", to_str(review_verdict), feature=feature
+            )
+
+            if not _is_approved(review_verdict):
+                attempts = await _diagnose_and_fix(
+                    runner, feature, review_verdict, "code_reviewer",
+                    reviewer, implementer, prior_attempts, bug_counter,
+                    handover_context=handover_context,
+                )
+                prior_attempts.extend(attempts)
+                await _store_attempts(runner, feature, prior_attempts)
+                failed = [a for a in attempts if a.re_verify_result != "PASS"]
+                if failed and _count_source_attempts(prior_attempts, "code_reviewer") >= MAX_FIX_ATTEMPTS:
+                    await _escalate_to_user(
+                        runner, feature, self.name,
+                        "Code Review", failed[0], prior_attempts,
+                    )
+                cycle += 1
+                continue
+
+            # ── Step 3: Security Audit (static) ──────────────────────────
+            security_verdict: Verdict = await runner.run(
+                Ask(
+                    actor=security_auditor,
+                    prompt=(
+                        f"## Implementation Handover\n\n{handover_context}\n\n"
+                        "Audit the implementation for security vulnerabilities. "
+                        "Check OWASP Top 10, auth on every endpoint, secrets in "
+                        "code, input validation, and data exposure. Cross-check "
+                        "against the security profile in the PRD."
+                    ),
+                    output_type=Verdict,
+                ),
+                feature,
+                phase_name=self.name,
+            )
+            await runner.artifacts.put(
+                "security-verdict", to_str(security_verdict), feature=feature
+            )
+
+            if not _is_approved(security_verdict):
+                attempts = await _diagnose_and_fix(
+                    runner, feature, security_verdict, "security_auditor",
+                    security_auditor, implementer, prior_attempts, bug_counter,
+                    handover_context=handover_context,
+                )
+                prior_attempts.extend(attempts)
+                await _store_attempts(runner, feature, prior_attempts)
+                failed = [a for a in attempts if a.re_verify_result != "PASS"]
+                if failed and _count_source_attempts(prior_attempts, "security_auditor") >= MAX_FIX_ATTEMPTS:
+                    await _escalate_to_user(
+                        runner, feature, self.name,
+                        "Security Audit", failed[0], prior_attempts,
+                    )
+                cycle += 1
+                continue
+
+            # ── Step 4: Test Authoring ────────────────────────────────────
+            test_result: ImplementationResult = await runner.run(
+                Ask(
+                    actor=test_author,
+                    prompt=(
+                        f"## Implementation Handover\n\n{handover_context}\n\n"
+                        "Write tests for this implementation. For each acceptance "
+                        "criterion in the PRD, write at least one test. For each "
+                        "counterexample, write a test that verifies the wrong thing "
+                        "does NOT happen. Use the project's existing test framework "
+                        "and patterns. Write both unit tests and integration/E2E tests "
+                        "where appropriate.\n\n"
+                        "For web/full-stack projects, write Playwright E2E tests that "
+                        "test user journeys via real UI interactions."
+                    ),
+                    output_type=ImplementationResult,
+                ),
+                feature,
+                phase_name=self.name,
+            )
+            await runner.artifacts.put("test-authoring", to_str(test_result), feature=feature)
+
+            # ── Step 5: Full QA (dynamic) ─────────────────────────────────
             qa_verdict: Verdict = await runner.run(
                 Ask(
                     actor=qa_engineer,
@@ -137,6 +232,7 @@ class ImplementationPhase(Phase):
                 attempts = await _diagnose_and_fix(
                     runner, feature, qa_verdict, "qa_engineer",
                     qa_engineer, implementer, prior_attempts, bug_counter,
+                    handover_context=handover_context,
                 )
                 prior_attempts.extend(attempts)
                 await _store_attempts(runner, feature, prior_attempts)
@@ -149,7 +245,7 @@ class ImplementationPhase(Phase):
                 cycle += 1
                 continue
 
-            # ── Step 3: Integration Test ─────────────────────────────────
+            # ── Step 6: Integration Test (dynamic) ────────────────────────
             integration_verdict: Verdict = await runner.run(
                 Ask(
                     actor=integration_tester,
@@ -174,6 +270,7 @@ class ImplementationPhase(Phase):
                 attempts = await _diagnose_and_fix(
                     runner, feature, integration_verdict, "integration_tester",
                     integration_tester, implementer, prior_attempts, bug_counter,
+                    handover_context=handover_context,
                 )
                 prior_attempts.extend(attempts)
                 await _store_attempts(runner, feature, prior_attempts)
@@ -186,100 +283,7 @@ class ImplementationPhase(Phase):
                 cycle += 1
                 continue
 
-            # ── Step 4: Code Review ──────────────────────────────────────
-            review_verdict: Verdict = await runner.run(
-                Ask(
-                    actor=reviewer,
-                    prompt=(
-                        f"## Implementation Handover\n\n{handover_context}\n\n"
-                        "Review the implementation for code quality, adherence to "
-                        "the technical plan, design decisions, and system design. "
-                        "Cross-check against the full upstream artifacts in your context."
-                    ),
-                    output_type=Verdict,
-                ),
-                feature,
-                phase_name=self.name,
-            )
-            await runner.artifacts.put(
-                "review-verdict", to_str(review_verdict), feature=feature
-            )
-
-            if not _is_approved(review_verdict):
-                attempts = await _diagnose_and_fix(
-                    runner, feature, review_verdict, "code_reviewer",
-                    reviewer, implementer, prior_attempts, bug_counter,
-                )
-                prior_attempts.extend(attempts)
-                await _store_attempts(runner, feature, prior_attempts)
-                failed = [a for a in attempts if a.re_verify_result != "PASS"]
-                if failed and _count_source_attempts(prior_attempts, "code_reviewer") >= MAX_FIX_ATTEMPTS:
-                    await _escalate_to_user(
-                        runner, feature, self.name,
-                        "Code Review", failed[0], prior_attempts,
-                    )
-                cycle += 1
-                continue
-
-            # ── Step 5: Security Audit ───────────────────────────────────
-            security_verdict: Verdict = await runner.run(
-                Ask(
-                    actor=security_auditor,
-                    prompt=(
-                        f"## Implementation Handover\n\n{handover_context}\n\n"
-                        "Audit the implementation for security vulnerabilities. "
-                        "Check OWASP Top 10, auth on every endpoint, secrets in "
-                        "code, input validation, and data exposure. Cross-check "
-                        "against the security profile in the PRD."
-                    ),
-                    output_type=Verdict,
-                ),
-                feature,
-                phase_name=self.name,
-            )
-            await runner.artifacts.put(
-                "security-verdict", to_str(security_verdict), feature=feature
-            )
-
-            if not _is_approved(security_verdict):
-                attempts = await _diagnose_and_fix(
-                    runner, feature, security_verdict, "security_auditor",
-                    security_auditor, implementer, prior_attempts, bug_counter,
-                )
-                prior_attempts.extend(attempts)
-                await _store_attempts(runner, feature, prior_attempts)
-                failed = [a for a in attempts if a.re_verify_result != "PASS"]
-                if failed and _count_source_attempts(prior_attempts, "security_auditor") >= MAX_FIX_ATTEMPTS:
-                    await _escalate_to_user(
-                        runner, feature, self.name,
-                        "Security Audit", failed[0], prior_attempts,
-                    )
-                cycle += 1
-                continue
-
-            # ── Step 6: Test Authoring ────────────────────────────────
-            test_result: ImplementationResult = await runner.run(
-                Ask(
-                    actor=test_author,
-                    prompt=(
-                        f"## Implementation Handover\n\n{handover_context}\n\n"
-                        "Write tests for this implementation. For each acceptance "
-                        "criterion in the PRD, write at least one test. For each "
-                        "counterexample, write a test that verifies the wrong thing "
-                        "does NOT happen. Use the project's existing test framework "
-                        "and patterns. Write both unit tests and integration/E2E tests "
-                        "where appropriate.\n\n"
-                        "For web/full-stack projects, write Playwright E2E tests that "
-                        "test user journeys via real UI interactions."
-                    ),
-                    output_type=ImplementationResult,
-                ),
-                feature,
-                phase_name=self.name,
-            )
-            await runner.artifacts.put("test-authoring", to_str(test_result), feature=feature)
-
-            # ── Step 7: Verifier — confirm all journeys work ────────────
+            # ── Step 7: Verifier — confirm all journeys work ─────────────
             verifier_verdict: Verdict = await runner.run(
                 Ask(
                     actor=verifier,
@@ -303,6 +307,7 @@ class ImplementationPhase(Phase):
                 attempts = await _diagnose_and_fix(
                     runner, feature, verifier_verdict, "verifier",
                     verifier, implementer, prior_attempts, bug_counter,
+                    handover_context=handover_context,
                 )
                 prior_attempts.extend(attempts)
                 await _store_attempts(runner, feature, prior_attempts)
@@ -679,6 +684,7 @@ async def _diagnose_and_fix(
     fixer: AgentActor,
     prior_attempts: list[BugFixAttempt],
     bug_counter: itertools.count,  # type: ignore[type-arg]
+    handover_context: str = "",
 ) -> list[BugFixAttempt]:
     """Structured failure handling: triage → parallel RCA → fix → re-verify.
 
@@ -705,6 +711,7 @@ async def _diagnose_and_fix(
             original_reviewer, fixer, prior_context,
             bug_id=f"{source.upper().replace(' ', '-')}-FAIL-{next(bug_counter)}",
             attempt_number=attempt_number,
+            handover_context=handover_context,
         )
         return [attempt]
 
@@ -737,6 +744,7 @@ async def _diagnose_and_fix(
             original_reviewer, fixer, prior_context,
             bug_id=f"{source.upper().replace(' ', '-')}-FAIL-{next(bug_counter)}",
             attempt_number=attempt_number,
+            handover_context=handover_context,
         )
         return [attempt]
 
@@ -783,6 +791,7 @@ async def _diagnose_and_fix(
             original_reviewer, fixer, prior_context,
             bug_id=f"{source.upper().replace(' ', '-')}-FAIL-{next(bug_counter)}",
             attempt_number=attempt_number,
+            handover_context=handover_context,
         )
         return [attempt]
 
@@ -872,7 +881,9 @@ async def _diagnose_and_fix(
             all_modified.extend(fix.files_created + fix.files_modified)
         all_modified = sorted(set(all_modified))
         if all_modified:
-            regression_verdict = await _run_regression(runner, feature, all_modified)
+            regression_verdict = await _run_regression(
+                runner, feature, all_modified, handover_context=handover_context,
+            )
             if regression_verdict is not None and not _is_approved(regression_verdict):
                 logger.warning("Regression found after multi-group fixes")
                 # Mark all passed groups as failed due to regression
@@ -916,6 +927,7 @@ async def _single_rca_fix_verify(
     prior_context: str,
     bug_id: str,
     attempt_number: int,
+    handover_context: str = "",
 ) -> BugFixAttempt:
     """Single-bug RCA → fix → re-verify (no triage needed)."""
     # 1. Root Cause Analysis
@@ -986,7 +998,9 @@ async def _single_rca_fix_verify(
     passed = _is_approved(re_verdict)
     if passed:
         modified = fix_result.files_created + fix_result.files_modified
-        regression_verdict = await _run_regression(runner, feature, modified)
+        regression_verdict = await _run_regression(
+            runner, feature, modified, handover_context=handover_context,
+        )
         if regression_verdict is not None and not _is_approved(regression_verdict):
             logger.warning("Regression found after fix %s", bug_id)
             passed = False
@@ -1062,16 +1076,19 @@ async def _run_regression(
     runner: WorkflowRunner,
     feature: Feature,
     modified_files: list[str],
+    handover_context: str = "",
 ) -> Verdict | None:
     """Run regression tests on files modified by bug fixes.
 
     Returns None if no files to test, otherwise a Verdict.
+    When *handover_context* is provided, also runs an integration-style
+    regression on user journeys touching the modified files.
     """
     if not modified_files:
         return None
 
     file_list = "\n".join(f"- `{f}`" for f in sorted(set(modified_files)))
-    return await runner.run(
+    regression_verdict: Verdict = await runner.run(
         Ask(
             actor=regression_tester,
             prompt=(
@@ -1087,6 +1104,35 @@ async def _run_regression(
         feature,
         phase_name="implementation",
     )
+
+    if not _is_approved(regression_verdict):
+        return regression_verdict
+
+    # ── Integration regression: re-run affected user journeys ─────────
+    if handover_context:
+        integration_verdict: Verdict = await runner.run(
+            Ask(
+                actor=integration_tester,
+                prompt=(
+                    f"## Integration Regression Check\n\n"
+                    f"The following files were modified during bug fix cycles:\n"
+                    f"{file_list}\n\n"
+                    f"## Implementation Handover\n\n{handover_context}\n\n"
+                    "Re-execute ONLY the user journeys from the PRD that touch "
+                    "the modified files listed above. Use Playwright for UI "
+                    "journeys, Bash for API/CLI journeys. This is a targeted "
+                    "regression check — verify that existing journeys still "
+                    "work correctly after the bug fix changes."
+                ),
+                output_type=Verdict,
+            ),
+            feature,
+            phase_name="implementation",
+        )
+        if not _is_approved(integration_verdict):
+            return integration_verdict
+
+    return regression_verdict
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────

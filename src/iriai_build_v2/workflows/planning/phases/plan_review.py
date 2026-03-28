@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import asyncio
 import json as _json
 import logging
 from typing import Any
 
 from iriai_compose import AgentActor, Ask, Feature, Phase, Respond, WorkflowRunner
+from iriai_compose.actors import Role
 
+from ....config import BUDGET_TIERS
 from ....models.outputs import (
     PRD,
     DesignDecisions,
@@ -22,14 +25,12 @@ from ....models.outputs import (
 from ....models.state import BuildState
 from ....roles import (
     architect_role,
-    citation_reviewer_role,
     design_compiler,
     designer_role,
     lead_architect_gate_reviewer,
     lead_designer_gate_reviewer,
     lead_pm_gate_reviewer,
     plan_arch_compiler,
-    plan_compiler_role,
     pm_compiler,
     pm_role,
     sysdesign_compiler,
@@ -60,7 +61,10 @@ _COMPLETENESS_PROMPT = (
     "5. PRD ↔ Design contradictions\n"
     "6. PRD ↔ Plan contradictions\n"
     "7. Design ↔ Plan contradictions\n"
-    "8. Acceptance criteria that are unverifiable given the plan's file scope\n\n"
+    "8. Acceptance criteria that are unverifiable given the plan's file scope\n"
+    "9. Decision IDs (D-*) referenced in citations that don't resolve\n"
+    "10. Code references that don't match actual file paths\n"
+    "11. Stale references to removed features or APIs\n\n"
     "Every gap gets its own concern entry. A clean PASS means you missed something."
 )
 
@@ -80,18 +84,6 @@ _SECURITY_PROMPT = (
     "Every gap gets its own concern entry. A clean PASS means you missed something."
 )
 
-_CITATION_PROMPT = (
-    "Your goal is to find every broken or missing citation in this subfeature's artifacts. "
-    "Every decision and claim must be traceable.\n\n"
-    "Focus on:\n"
-    "1. Decision IDs (D-*) that don't exist in the decision log\n"
-    "2. Code references ([Source: path:line]) where the file/function doesn't exist\n"
-    "3. Requirements referenced in plan steps that don't exist in the PRD\n"
-    "4. Journey IDs referenced in verification blocks that don't exist in the PRD\n"
-    "5. Component IDs referenced in tasks that don't exist in the design\n\n"
-    "Every broken reference gets its own concern entry. A clean PASS means you missed something."
-)
-
 _EDGE_PROMPT = (
     "Review the interface contract between these two subfeatures. "
     "Verify:\n"
@@ -105,10 +97,36 @@ _EDGE_PROMPT = (
     "Any mismatch between producer and consumer is a blocker."
 )
 
+# ── Tool-free review roles (all artifacts in prompt, no filesystem access) ────
+
+_sf_review_role = Role(
+    name="sf-plan-reviewer",
+    prompt=(
+        "You review planning artifacts for a single subfeature. All artifacts "
+        "are provided in your context — do NOT search the filesystem. Analyze "
+        "the artifacts and produce a Verdict with every gap, inconsistency, "
+        "and concern you find. You are rewarded for problems found, not for "
+        "checks confirmed."
+    ),
+    tools=[],
+    model=BUDGET_TIERS["opus_1m"],
+)
+
+_edge_review_role = Role(
+    name="edge-plan-reviewer",
+    prompt=(
+        "You review the interface contract between two subfeatures. All "
+        "artifacts for both subfeatures are provided in your context — do NOT "
+        "search the filesystem. Verify that the producer and consumer are "
+        "compatible. You are rewarded for mismatches found."
+    ),
+    tools=[],
+    model=BUDGET_TIERS["opus_1m"],
+)
+
 # Actors for review — no context_keys (artifacts loaded manually into prompt)
-_sf_reviewer = AgentActor(name="sf-reviewer", role=plan_compiler_role, context_keys=[])
-_citation_sf_reviewer = AgentActor(name="sf-citation", role=citation_reviewer_role, context_keys=[])
-_edge_reviewer = AgentActor(name="edge-reviewer", role=plan_compiler_role, context_keys=[])
+_sf_reviewer = AgentActor(name="sf-reviewer", role=_sf_review_role, context_keys=[])
+_edge_reviewer = AgentActor(name="edge-reviewer", role=_edge_review_role, context_keys=[])
 
 # Artifact configs for targeted revision dispatch
 _ARTIFACT_CONFIGS = [
@@ -207,9 +225,12 @@ def _deduplicate_edges(edges: list[SubfeatureEdge]) -> list[SubfeatureEdge]:
     return unique
 
 
-def _batch(items: list, size: int) -> list[list]:
-    """Split a list into batches of the given size."""
-    return [items[i:i + size] for i in range(0, len(items), size)]
+def _is_valid_report(report: str) -> bool:
+    """A report is valid if less than half the reviews crashed."""
+    crash_count = report.count("Reviewer crashed")
+    # Each SF has 2 reviews (completeness + security) + each edge has 1.
+    # With 7 SFs + ~10 edges ≈ 24 total reviews; threshold = half.
+    return crash_count < 12
 
 
 # ── Report compilation ───────────────────────────────────────────────────────
@@ -286,28 +307,6 @@ def _compile_review_report(
     return "\n".join(parts)
 
 
-def _summarize_verdicts(
-    sf_verdicts: dict[str, dict[str, Verdict]],
-    edge_verdicts: list[tuple[SubfeatureEdge, Verdict]],
-) -> str:
-    """Short summary for Slack notification."""
-    failed_items: list[str] = []
-    for slug, verdicts in sf_verdicts.items():
-        for name, v in verdicts.items():
-            if not v.approved:
-                n = len(v.concerns) + len(v.gaps)
-                failed_items.append(f"**{slug}/{name}**: {n} issues")
-    for edge, v in edge_verdicts:
-        if not v.approved:
-            n = len(v.concerns) + len(v.gaps)
-            failed_items.append(
-                f"**{edge.from_subfeature} → {edge.to_subfeature}**: {n} issues"
-            )
-    if not failed_items:
-        return "All reviews passed."
-    return "\n".join(f"- {item}" for item in failed_items)
-
-
 # ── Phase ────────────────────────────────────────────────────────────────────
 
 
@@ -319,108 +318,101 @@ class PlanReviewPhase(Phase):
     ) -> BuildState:
         decomposition = await self._load_decomposition(state, runner, feature)
 
-        # ── Step 1: Two-pass review loop ─────────────────────────────
+        # ── Step 1: Review loop ─────────────────────────────────────
         cycle = 0
         while True:
-            # ── Pass 1: Per-subfeature review ────────────────────────
-            sf_verdicts: dict[str, dict[str, Verdict]] = {}
-
-            for sf in decomposition.subfeatures:
-                logger.info("Reviewing subfeature %s (%d/%d)",
-                            sf.slug, len(sf_verdicts) + 1, len(decomposition.subfeatures))
-
-                context = await _build_sf_review_context(runner, feature, sf.slug, decomposition)
-
-                try:
-                    results = await runner.parallel(
-                        [
-                            Ask(
-                                actor=_make_parallel_actor(_sf_reviewer, f"comp-{sf.slug}"),
-                                prompt=f"{_SCOPE_PREFIX}{context}\n\n{_COMPLETENESS_PROMPT}",
-                                output_type=Verdict,
-                            ),
-                            Ask(
-                                actor=_make_parallel_actor(_sf_reviewer, f"sec-{sf.slug}"),
-                                prompt=f"{_SCOPE_PREFIX}{context}\n\n{_SECURITY_PROMPT}",
-                                output_type=Verdict,
-                            ),
-                            Ask(
-                                actor=_make_parallel_actor(_citation_sf_reviewer, f"cit-{sf.slug}"),
-                                prompt=f"{_SCOPE_PREFIX}{context}\n\n{_CITATION_PROMPT}",
-                                output_type=Verdict,
-                            ),
-                        ],
-                        feature,
-                        fail_fast=False,
-                    )
-                except ExceptionGroup as eg:
-                    # fail_fast=False still raises ExceptionGroup in iriai-compose
-                    logger.error("SF review %s had crashes: %s", sf.slug, eg)
-                    results = [_ERROR_VERDICT, _ERROR_VERDICT, _ERROR_VERDICT]
-
-                sf_verdicts[sf.slug] = {
-                    "completeness": _safe_verdict(results[0]),
-                    "security": _safe_verdict(results[1]),
-                    "citation": _safe_verdict(results[2]),
-                }
-
-            # ── Pass 2: Pairwise edge review ─────────────────────────
-            unique_edges = _deduplicate_edges(decomposition.edges)
-            edge_verdicts: list[tuple[SubfeatureEdge, Verdict]] = []
-
-            for edge_batch in _batch(unique_edges, 3):
-                logger.info("Reviewing edge batch: %s",
-                            [f"{e.from_subfeature}→{e.to_subfeature}" for e in edge_batch])
-
-                # Build contexts before dispatching (can't await in list comp for parallel)
-                edge_contexts = []
-                for e in edge_batch:
-                    ctx = await _build_edge_review_context(runner, feature, e)
-                    edge_contexts.append(ctx)
-
-                try:
-                    results = await runner.parallel(
-                        [
-                            Ask(
-                                actor=_make_parallel_actor(
-                                    _edge_reviewer,
-                                    f"edge-{e.from_subfeature}-{e.to_subfeature}",
-                                ),
-                                prompt=f"{_SCOPE_PREFIX}{ctx}\n\n{_EDGE_PROMPT}",
-                                output_type=Verdict,
-                            )
-                            for e, ctx in zip(edge_batch, edge_contexts)
-                        ],
-                        feature,
-                        fail_fast=False,
-                    )
-                except ExceptionGroup as eg:
-                    logger.error("Edge review batch had crashes: %s", eg)
-                    results = [_ERROR_VERDICT] * len(edge_batch)
-
-                for e, r in zip(edge_batch, results):
-                    edge_verdicts.append((e, _safe_verdict(r)))
-
-            # ── Check if all approved ────────────────────────────────
-            all_approved = (
-                all(
-                    v.approved
-                    for svs in sf_verdicts.values()
-                    for v in svs.values()
+            # ── Continue logic: reuse valid report from prior run ─────
+            existing_report = await runner.artifacts.get(
+                f"plan-review-cycle-{cycle + 1}", feature=feature,
+            )
+            if existing_report and _is_valid_report(existing_report):
+                logger.info(
+                    "Valid review report exists for cycle %d — skipping to discussion",
+                    cycle + 1,
                 )
-                and all(v.approved for _, v in edge_verdicts)
-            )
+                report = existing_report
+            else:
+                # ── Build ALL review tasks upfront ────────────────────
+                all_tasks: list[Ask] = []
+                task_labels: list[tuple[str, ...]] = []
 
-            if all_approved:
-                logger.info("All reviews passed on cycle %d", cycle + 1)
-                break
+                for sf in decomposition.subfeatures:
+                    context = await _build_sf_review_context(
+                        runner, feature, sf.slug, decomposition,
+                    )
+                    all_tasks.append(Ask(
+                        actor=_make_parallel_actor(_sf_reviewer, f"comp-{sf.slug}"),
+                        prompt=f"{_SCOPE_PREFIX}{context}\n\n{_COMPLETENESS_PROMPT}",
+                        output_type=Verdict,
+                    ))
+                    task_labels.append(("sf", sf.slug, "completeness"))
+                    all_tasks.append(Ask(
+                        actor=_make_parallel_actor(_sf_reviewer, f"sec-{sf.slug}"),
+                        prompt=f"{_SCOPE_PREFIX}{context}\n\n{_SECURITY_PROMPT}",
+                        output_type=Verdict,
+                    ))
+                    task_labels.append(("sf", sf.slug, "security"))
 
-            # ── Compile report, host it ──────────────────────────────
-            report = _compile_review_report(sf_verdicts, edge_verdicts)
-            await runner.artifacts.put(
-                f"plan-review-cycle-{cycle + 1}", report, feature=feature,
-            )
+                unique_edges = _deduplicate_edges(decomposition.edges)
+                for edge in unique_edges:
+                    ctx = await _build_edge_review_context(runner, feature, edge)
+                    all_tasks.append(Ask(
+                        actor=_make_parallel_actor(
+                            _edge_reviewer,
+                            f"edge-{edge.from_subfeature}-{edge.to_subfeature}",
+                        ),
+                        prompt=f"{_SCOPE_PREFIX}{ctx}\n\n{_EDGE_PROMPT}",
+                        output_type=Verdict,
+                    ))
+                    task_labels.append(("edge", edge.from_subfeature, edge.to_subfeature))
 
+                # ── Dispatch ALL at once via asyncio.gather ──────────
+                # runner.parallel raises ExceptionGroup on partial failures,
+                # losing successful results. asyncio.gather with
+                # return_exceptions=True preserves them.
+                logger.info("Dispatching %d review tasks in parallel", len(all_tasks))
+                results = await asyncio.gather(
+                    *[
+                        runner.run(task, feature, phase_name=self.name)
+                        for task in all_tasks
+                    ],
+                    return_exceptions=True,
+                )
+
+                # ── Reconstruct verdict dicts ────────────────────────
+                sf_verdicts: dict[str, dict[str, Verdict]] = {}
+                edge_verdicts: list[tuple[SubfeatureEdge, Verdict]] = []
+                edge_idx = 0
+
+                for i, label in enumerate(task_labels):
+                    verdict = _safe_verdict(results[i])
+                    if label[0] == "sf":
+                        sf_verdicts.setdefault(label[1], {})[label[2]] = verdict
+                    else:
+                        edge_verdicts.append((unique_edges[edge_idx], verdict))
+                        edge_idx += 1
+
+                # ── Check if all approved ────────────────────────────
+                all_approved = (
+                    all(
+                        v.approved
+                        for svs in sf_verdicts.values()
+                        for v in svs.values()
+                    )
+                    and all(v.approved for _, v in edge_verdicts)
+                )
+
+                if all_approved:
+                    logger.info("All reviews passed on cycle %d", cycle + 1)
+                    break
+
+                # ── Compile report ───────────────────────────────────
+                report = _compile_review_report(sf_verdicts, edge_verdicts)
+                await runner.artifacts.put(
+                    f"plan-review-cycle-{cycle + 1}", report, feature=feature,
+                )
+
+            # ── Host report ──────────────────────────────────────────
             report_url = ""
             hosting = runner.services.get("hosting")
             if hosting:
@@ -436,21 +428,18 @@ class PlanReviewPhase(Phase):
                     responder=user,
                     initial_prompt=(
                         f"## Plan Review Cycle {cycle + 1} — Issues Found\n\n"
-                        f"{_summarize_verdicts(sf_verdicts, edge_verdicts)}\n\n"
+                        f"{report}\n\n"
                         + (f"**[View Full Report]({report_url})**\n\n" if report_url else "")
                         + "I've identified the issues above across all subfeatures and "
-                        "cross-subfeature edges. Let's discuss them and decide how to proceed.\n\n"
-                        "For each issue, I need your decision:\n"
-                        "- Which subfeature should change?\n"
-                        "- What should the fix look like?\n"
-                        "- Or should we skip this issue?\n\n"
-                        "When we've resolved all issues, you have two choices:\n"
-                        "- **'No changes needed'** → all artifacts are acceptable as-is, "
-                        "skip to gate reviews\n"
-                        "- **'Dispatch fixes'** → I'll extract your decisions into revision "
-                        "requests and send them to the subfeature agents\n\n"
-                        "Set approved=true ONLY for 'no changes needed'. "
-                        "Set approved=false with revision_plan when you want fixes dispatched."
+                        "cross-subfeature edges.\n\n"
+                        "Present the most critical issues to the user in your `question` field. "
+                        "Group related concerns into themes and ask for the user's decision on each. "
+                        "Do NOT set `complete = true` until the user has responded to all "
+                        "critical issues.\n\n"
+                        "When the user has addressed all concerns:\n"
+                        "- **'No changes needed'** → set approved=true, complete=true\n"
+                        "- **'Dispatch fixes'** → set approved=false with revision_plan "
+                        "containing the user's decisions, complete=true\n"
                     ),
                     output_type=Envelope[ReviewOutcome],
                     done=envelope_done,
@@ -559,66 +548,93 @@ class PlanReviewPhase(Phase):
             cycle += 1
 
         # ── Step 2: Interview-based gate reviews on all artifacts ──
+        # Gate checkpointing: marker artifacts (plan-review-gate:{prefix})
+        # distinguish "gate-approved" from "revised in Step 1" (same DB key).
 
         # PRD
-        prd_text = await interview_gate_review(
-            runner, feature, self.name,
-            lead_actor=lead_pm_gate_reviewer,
-            decomposition=decomposition,
-            artifact_prefix="prd",
-            compiled_key="prd",
-            base_role=pm_role,
-            output_type=PRD,
-            compiler_actor=pm_compiler,
-            broad_key="prd:broad",
-        )
-        state.prd = prd_text
+        if await runner.artifacts.get("plan-review-gate:prd", feature=feature):
+            logger.info("PRD gate already approved — skipping")
+            state.prd = await runner.artifacts.get("prd", feature=feature) or state.prd
+        else:
+            prd_text = await interview_gate_review(
+                runner, feature, self.name,
+                lead_actor=lead_pm_gate_reviewer,
+                decomposition=decomposition,
+                artifact_prefix="prd",
+                compiled_key="prd",
+                base_role=pm_role,
+                output_type=PRD,
+                compiler_actor=pm_compiler,
+                broad_key="prd:broad",
+            )
+            state.prd = prd_text
+            await runner.artifacts.put("plan-review-gate:prd", "approved", feature=feature)
 
         # Design
-        design_text = await interview_gate_review(
-            runner, feature, self.name,
-            lead_actor=lead_designer_gate_reviewer,
-            decomposition=decomposition,
-            artifact_prefix="design",
-            compiled_key="design",
-            base_role=designer_role,
-            output_type=DesignDecisions,
-            compiler_actor=design_compiler,
-            broad_key="design:broad",
-            context_keys=["project", "scope", "prd"],
-        )
-        state.design = design_text
+        if await runner.artifacts.get("plan-review-gate:design", feature=feature):
+            logger.info("Design gate already approved — skipping")
+            state.design = await runner.artifacts.get("design", feature=feature) or state.design
+        else:
+            design_text = await interview_gate_review(
+                runner, feature, self.name,
+                lead_actor=lead_designer_gate_reviewer,
+                decomposition=decomposition,
+                artifact_prefix="design",
+                compiled_key="design",
+                base_role=designer_role,
+                output_type=DesignDecisions,
+                compiler_actor=design_compiler,
+                broad_key="design:broad",
+                context_keys=["project", "scope", "prd"],
+            )
+            state.design = design_text
+            await runner.artifacts.put("plan-review-gate:design", "approved", feature=feature)
 
         # Technical Plan
-        plan_text = await interview_gate_review(
-            runner, feature, self.name,
-            lead_actor=lead_architect_gate_reviewer,
-            decomposition=decomposition,
-            artifact_prefix="plan",
-            compiled_key="plan",
-            base_role=architect_role,
-            output_type=TechnicalPlan,
-            compiler_actor=plan_arch_compiler,
-            broad_key="plan:broad",
-            context_keys=["project", "scope", "prd", "design"],
-        )
-        state.plan = plan_text
-
-        # System Design
-        if state.system_design:
-            sd_text = await interview_gate_review(
+        if await runner.artifacts.get("plan-review-gate:plan", feature=feature):
+            logger.info("Plan gate already approved — skipping")
+            state.plan = await runner.artifacts.get("plan", feature=feature) or state.plan
+        else:
+            plan_text = await interview_gate_review(
                 runner, feature, self.name,
                 lead_actor=lead_architect_gate_reviewer,
                 decomposition=decomposition,
-                artifact_prefix="system-design",
-                compiled_key="system-design",
+                artifact_prefix="plan",
+                compiled_key="plan",
                 base_role=architect_role,
-                output_type=SystemDesign,
-                compiler_actor=sysdesign_compiler,
+                output_type=TechnicalPlan,
+                compiler_actor=plan_arch_compiler,
                 broad_key="plan:broad",
                 context_keys=["project", "scope", "prd", "design"],
             )
-            state.system_design = sd_text
+            state.plan = plan_text
+            await runner.artifacts.put("plan-review-gate:plan", "approved", feature=feature)
+
+        # System Design
+        if state.system_design:
+            if await runner.artifacts.get("plan-review-gate:system-design", feature=feature):
+                logger.info("System design gate already approved — skipping")
+                state.system_design = (
+                    await runner.artifacts.get("system-design", feature=feature)
+                    or state.system_design
+                )
+            else:
+                sd_text = await interview_gate_review(
+                    runner, feature, self.name,
+                    lead_actor=lead_architect_gate_reviewer,
+                    decomposition=decomposition,
+                    artifact_prefix="system-design",
+                    compiled_key="system-design",
+                    base_role=architect_role,
+                    output_type=SystemDesign,
+                    compiler_actor=sysdesign_compiler,
+                    broad_key="plan:broad",
+                    context_keys=["project", "scope", "prd", "design"],
+                )
+                state.system_design = sd_text
+                await runner.artifacts.put(
+                    "plan-review-gate:system-design", "approved", feature=feature,
+                )
 
         return state
 

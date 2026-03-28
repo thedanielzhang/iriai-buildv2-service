@@ -59,13 +59,17 @@ class HostedInterview(Interview):
 
         self.initial_prompt += (
             f"\n\n## Artifact Output\n"
-            f"When your artifacts are complete, write them to these paths:\n"
+            f"When the discussion is complete and you have gathered all user input, "
+            f"write the final artifacts to these paths:\n"
             + "\n".join(paths)
             + "\n\n"
             "Use the Write tool. Write markdown for document artifacts, "
             "JSON for data artifacts (like system design).\n"
             "Then set `complete = true` and `artifact_path` to the path you wrote. "
             "The `output` field can be left null — the file is the real artifact.\n"
+            "**IMPORTANT:** Always present your analysis and questions in the "
+            "`question` field first. Do NOT write artifacts or set `complete = true` "
+            "until the user has responded and all concerns are resolved.\n"
         )
 
         # Wrap done predicate to detect file-based completion.
@@ -77,6 +81,11 @@ class HostedInterview(Interview):
             original_done = self.done
 
             def file_aware_done(response: Any) -> bool:
+                # Envelope question field is authoritative — never exit
+                # while the agent has a pending question for the user
+                question = getattr(response, "question", "")
+                if question:
+                    return False
                 if original_done and original_done(response):
                     return True
                 # Agent reported artifact_path — verify file exists
@@ -85,15 +94,13 @@ class HostedInterview(Interview):
                     p = Path(reported)
                     if p.exists() and p.stat().st_size > 100:
                         return True
-                # Fallback: detect new file at expected path (no question pending)
+                # Fallback: detect new file at expected path
                 if (
                     not file_existed_before
                     and artifact_file_path.exists()
                     and artifact_file_path.stat().st_size > 100
                 ):
-                    question = getattr(response, "question", "")
-                    if not question:
-                        return True
+                    return True
                 return False
 
             self.done = file_aware_done

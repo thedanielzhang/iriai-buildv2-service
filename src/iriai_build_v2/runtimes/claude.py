@@ -82,7 +82,7 @@ class ClaudeAgentRuntime(AgentRuntime):
         self._feature_sessions: dict[str, str] = {}  # feature_id → active session_key
 
         # Context management: message accumulation for session cycling
-        self._session_messages: dict[str, list[str]] = {}  # session_key → message texts (truncated for summarization)
+        self._session_messages: dict[str, list[str]] = {}  # session_key → full message texts (summarized only on cycle)
         self._session_sizes: dict[str, int] = {}  # session_key → actual byte count of full prompts/responses
         self._session_context: dict[str, str] = {}  # session_key → compressed context after cycle
         self._retry_depth: int = 0  # prevent infinite retry loops
@@ -124,9 +124,8 @@ class ClaudeAgentRuntime(AgentRuntime):
                 await self._cycle_session(session_key, role)
 
         if session_key:
-            # Track truncated copy for summarization
             self._session_messages.setdefault(session_key, []).append(
-                f"User: {prompt[:2000]}"
+                f"User: {prompt}"
             )
             # Track actual size for threshold checks
             self._session_sizes[session_key] = (
@@ -175,11 +174,10 @@ class ClaudeAgentRuntime(AgentRuntime):
         if result_msg is None:
             raise RuntimeError("Claude query completed without a result message")
 
-        # Accumulate assistant response for size tracking
         result_text = getattr(result_msg, "result", "") or ""
         if session_key:
             self._session_messages.setdefault(session_key, []).append(
-                f"Assistant: {result_text[:2000]}"
+                f"Assistant: {result_text}"
             )
             self._session_sizes[session_key] = (
                 self._session_sizes.get(session_key, 0) + len(result_text)

@@ -660,10 +660,17 @@ class Envelope(BaseModel, Generic[T]):
 def envelope_done(response: object) -> bool:
     """Interview done-predicate: true when the envelope signals completion.
 
+    The ``question`` field is authoritative — if the agent has a question
+    for the user, the interview continues regardless of the ``complete``
+    flag.  This prevents interviews from exiting before the responder has
+    had a chance to participate.
+
     Checks flat ``complete`` first (preferred), falls back to nested
     ``output.complete`` for backward compatibility.
     """
     if not isinstance(response, Envelope):
+        return False
+    if response.question:
         return False
     if response.complete:
         return True
