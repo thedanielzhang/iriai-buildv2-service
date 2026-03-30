@@ -173,9 +173,26 @@ def bugfix(
     default="multiplayer",
     help="multiplayer: bot responds only to @mentions. singleplayer: bot responds to all messages.",
 )
-def slack_cmd(channel: str, workspace: str | None, mode: str) -> None:
+@click.option(
+    "--agent-runtime",
+    default=None,
+    help="Agent runtime to use for workflow agents (claude or codex).",
+)
+def slack_cmd(
+    channel: str,
+    workspace: str | None,
+    mode: str,
+    agent_runtime: str | None,
+) -> None:
     """Start the Slack bridge (long-lived process)."""
     import logging as _logging
+
+    from ...runtimes import normalize_agent_runtime
+
+    try:
+        resolved_runtime = normalize_agent_runtime(agent_runtime)
+    except ValueError as exc:
+        raise click.BadParameter(str(exc), param_hint="--agent-runtime") from exc
 
     _logging.basicConfig(
         level=_logging.INFO,
@@ -190,6 +207,7 @@ def slack_cmd(channel: str, workspace: str | None, mode: str) -> None:
             planning_channel=channel,
             workspace=workspace,
             mode=mode,
+            agent_runtime=resolved_runtime,
         )
     )
 

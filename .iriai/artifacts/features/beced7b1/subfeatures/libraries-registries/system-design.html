@@ -1,0 +1,2048 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SF-7 Libraries &amp; Registries - System Design - System Design</title>
+<style>
+  /* ── Reset & Base ─────────────────────────────────────────────────── */
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  @font-face {
+    font-family: 'Charter';
+    src: local('Charter'), local('Georgia');
+    font-display: swap;
+  }
+
+  :root {
+    --text-primary: #1a1a2e;
+    --text-secondary: #555;
+    --text-muted: #888;
+    --bg-page: #faf9f7;
+    --bg-card: #fff;
+    --border-subtle: rgba(0, 0, 0, 0.06);
+    --border-medium: rgba(0, 0, 0, 0.1);
+    --accent: #2d5be3;
+    --accent-faint: rgba(45, 91, 227, 0.06);
+    --accent-light: rgba(45, 91, 227, 0.12);
+    --content-width: 960px;
+    --gutter: clamp(20px, 5vw, 48px);
+    --radius: 10px;
+    --radius-sm: 6px;
+  }
+
+  html {
+    font-size: 17px;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
+    scroll-behavior: smooth;
+  }
+
+  body {
+    font-family: Charter, Georgia, 'Times New Roman', serif;
+    color: var(--text-primary);
+    background: var(--bg-page);
+    line-height: 1.72;
+    min-height: 100vh;
+  }
+
+  ::selection {
+    background: rgba(45, 91, 227, 0.18);
+    color: inherit;
+  }
+
+  /* ── Header ──────────────────────────────────────────────────────── */
+  .sd-header {
+    position: sticky;
+    top: 0;
+    z-index: 100;
+    background: rgba(250, 249, 247, 0.92);
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
+    border-bottom: 1px solid var(--border-subtle);
+    padding: 0 var(--gutter);
+  }
+
+  .sd-header-inner {
+    max-width: var(--content-width);
+    margin: 0 auto;
+    padding: 20px 0 16px;
+  }
+
+  .sd-title {
+    font-size: clamp(1.8rem, 4vw, 2.6rem);
+    font-weight: 700;
+    line-height: 1.15;
+    letter-spacing: -0.025em;
+    color: var(--text-primary);
+    margin-bottom: 12px;
+  }
+
+  .sd-nav {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-bottom: 12px;
+  }
+
+  .sd-nav-link {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--text-muted);
+    text-decoration: none;
+    padding: 4px 10px;
+    border-radius: var(--radius-sm);
+    transition: color 0.15s, background 0.15s;
+  }
+
+  .sd-nav-link:hover {
+    color: var(--accent);
+    background: var(--accent-faint);
+  }
+
+  /* ── Filter pills ────────────────────────────────────────────────── */
+  .sd-filters {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+    padding-top: 4px;
+  }
+
+  .sd-filter-label {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    margin-right: 4px;
+  }
+
+  .sd-pill {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 12px;
+    font-weight: 500;
+    padding: 3px 12px;
+    border: 1px solid var(--border-medium);
+    border-radius: 100px;
+    background: var(--bg-card);
+    color: var(--text-secondary);
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+
+  .sd-pill:hover {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+
+  .sd-pill-active {
+    background: var(--accent);
+    color: #fff;
+    border-color: var(--accent);
+  }
+
+  .sd-pill-active:hover {
+    background: #1a3fa0;
+    border-color: #1a3fa0;
+    color: #fff;
+  }
+
+  /* ── Main content ────────────────────────────────────────────────── */
+  .sd-main {
+    max-width: var(--content-width);
+    margin: 0 auto;
+    padding: 32px var(--gutter) 80px;
+  }
+
+  .sd-section {
+    margin-bottom: 48px;
+  }
+
+  .sd-section-title {
+    font-size: 1.5rem;
+    font-weight: 700;
+    line-height: 1.3;
+    letter-spacing: -0.01em;
+    margin-bottom: 20px;
+    padding-bottom: 10px;
+    border-bottom: 1px solid var(--border-subtle);
+    color: var(--text-primary);
+  }
+
+  .sd-subsection-title {
+    font-size: 1.1rem;
+    font-weight: 700;
+    margin: 28px 0 14px;
+    color: var(--text-primary);
+  }
+
+  .sd-overview-text {
+    font-size: 1.05rem;
+    line-height: 1.75;
+    color: var(--text-secondary);
+    margin-bottom: 1.4em;
+  }
+
+  .sd-empty {
+    font-style: italic;
+    color: var(--text-muted);
+    padding: 16px 0;
+  }
+
+  /* ── Decisions list ──────────────────────────────────────────────── */
+  .sd-decisions-list {
+    padding-left: 1.6em;
+    color: var(--text-secondary);
+  }
+
+  .sd-decisions-list li {
+    margin-bottom: 0.5em;
+    line-height: 1.6;
+  }
+
+  /* ── Tier labels ─────────────────────────────────────────────────── */
+  .sd-tier-label {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 0.72rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--text-muted);
+    margin: 20px 0 10px;
+  }
+
+  /* ── Service grid ────────────────────────────────────────────────── */
+  .sd-service-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+    gap: 14px;
+    margin-bottom: 8px;
+  }
+
+  .sd-service-card {
+    background: var(--bg-card);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius);
+    padding: 18px;
+    transition: opacity 0.3s, border-color 0.2s, box-shadow 0.2s;
+    cursor: default;
+  }
+
+  .sd-service-card:hover {
+    border-color: var(--accent);
+    box-shadow: 0 2px 12px rgba(45, 91, 227, 0.08);
+  }
+
+  .sd-service-card.sd-highlight {
+    border-color: var(--accent);
+    box-shadow: 0 2px 16px rgba(45, 91, 227, 0.14);
+  }
+
+  .sd-service-icon {
+    font-size: 1.5rem;
+    margin-bottom: 8px;
+  }
+
+  .sd-service-name {
+    font-weight: 700;
+    font-size: 1rem;
+    color: var(--text-primary);
+    margin-bottom: 2px;
+  }
+
+  .sd-service-kind {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 0.72rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-muted);
+    margin-bottom: 6px;
+  }
+
+  .sd-service-tech {
+    font-family: 'SF Mono', 'Fira Code', Menlo, Consolas, monospace;
+    font-size: 0.78rem;
+    color: #1a3fa0;
+    background: var(--accent-faint);
+    display: inline-block;
+    padding: 1px 8px;
+    border-radius: 4px;
+    margin-bottom: 4px;
+  }
+
+  .sd-service-port {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 0.75rem;
+    color: var(--text-muted);
+    margin-bottom: 6px;
+  }
+
+  .sd-service-desc {
+    font-size: 0.88rem;
+    color: var(--text-secondary);
+    line-height: 1.55;
+    margin-top: 6px;
+  }
+
+  /* ── Connections list ────────────────────────────────────────────── */
+  .sd-connections-list {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .sd-connection-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 16px;
+    background: var(--bg-card);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-sm);
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 0.88rem;
+    transition: opacity 0.3s;
+    flex-wrap: wrap;
+  }
+
+  .sd-conn-from, .sd-conn-to {
+    font-weight: 600;
+    color: var(--text-primary);
+  }
+
+  .sd-conn-arrow {
+    color: var(--accent);
+    font-weight: 700;
+  }
+
+  .sd-conn-proto {
+    font-size: 0.78rem;
+    color: var(--text-muted);
+  }
+
+  .sd-conn-label {
+    color: var(--text-secondary);
+    font-weight: 400;
+    margin-left: auto;
+  }
+
+  /* ── Call paths (details/summary) ────────────────────────────────── */
+  .sd-call-path {
+    background: var(--bg-card);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius);
+    margin-bottom: 10px;
+    transition: opacity 0.3s;
+    overflow: hidden;
+  }
+
+  .sd-call-path summary {
+    padding: 14px 18px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-weight: 600;
+    font-size: 0.95rem;
+    color: var(--text-primary);
+    list-style: none;
+  }
+
+  .sd-call-path summary::-webkit-details-marker { display: none; }
+
+  .sd-call-path summary::before {
+    content: '\25B6';
+    font-size: 0.65rem;
+    color: var(--text-muted);
+    transition: transform 0.2s;
+    flex-shrink: 0;
+  }
+
+  .sd-call-path[open] summary::before {
+    transform: rotate(90deg);
+  }
+
+  .sd-cp-name { flex: 1; }
+
+  .sd-cp-journey {
+    font-size: 0.72rem;
+    font-weight: 500;
+    color: var(--accent);
+    background: var(--accent-faint);
+    padding: 2px 8px;
+    border-radius: 100px;
+  }
+
+  .sd-cp-desc {
+    padding: 0 18px 12px;
+    font-size: 0.9rem;
+    color: var(--text-secondary);
+    line-height: 1.6;
+  }
+
+  /* ── Sequence diagram rows ───────────────────────────────────────── */
+  .sd-sequence {
+    margin: 0 18px 18px;
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-sm);
+    overflow-x: auto;
+  }
+
+  .sd-seq-header, .sd-seq-row {
+    display: grid;
+    grid-template-columns: 40px 1fr 32px 1fr 2fr 1.5fr;
+    gap: 8px;
+    padding: 8px 14px;
+    align-items: start;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 0.82rem;
+  }
+
+  .sd-seq-header {
+    background: rgba(0, 0, 0, 0.02);
+    font-weight: 700;
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--text-muted);
+    border-bottom: 1px solid var(--border-subtle);
+  }
+
+  .sd-seq-row {
+    border-bottom: 1px solid var(--border-subtle);
+    color: var(--text-secondary);
+  }
+
+  .sd-seq-row:last-child { border-bottom: none; }
+
+  .sd-seq-row:hover { background: rgba(45, 91, 227, 0.02); }
+
+  .sd-seq-num {
+    font-weight: 700;
+    color: var(--accent);
+    text-align: center;
+  }
+
+  .sd-seq-from, .sd-seq-to { font-weight: 600; color: var(--text-primary); }
+
+  .sd-seq-arrow { color: var(--accent); text-align: center; font-weight: 700; }
+
+  .sd-seq-action { color: var(--text-primary); }
+
+  .sd-seq-detail {
+    font-size: 0.78rem;
+    color: var(--text-muted);
+    margin-top: 2px;
+  }
+
+  .sd-seq-returns {
+    font-family: 'SF Mono', 'Fira Code', Menlo, Consolas, monospace;
+    font-size: 0.78rem;
+    color: var(--text-muted);
+  }
+
+  /* ── Expand/collapse button ──────────────────────────────────────── */
+  .sd-expand-btn {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 12px;
+    font-weight: 500;
+    padding: 4px 14px;
+    border: 1px solid var(--border-medium);
+    border-radius: var(--radius-sm);
+    background: var(--bg-card);
+    color: var(--text-secondary);
+    cursor: pointer;
+    margin-bottom: 14px;
+    transition: all 0.15s;
+  }
+
+  .sd-expand-btn:hover {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+
+  /* ── Tables ──────────────────────────────────────────────────────── */
+  .sd-table-wrap {
+    overflow-x: auto;
+  }
+
+  .sd-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.88rem;
+    border-radius: var(--radius);
+    overflow: hidden;
+    border: 1px solid var(--border-subtle);
+  }
+
+  .sd-table th, .sd-table td {
+    padding: 10px 14px;
+    text-align: left;
+    border-bottom: 1px solid var(--border-subtle);
+  }
+
+  .sd-table th {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-weight: 600;
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--text-muted);
+    background: rgba(0, 0, 0, 0.02);
+  }
+
+  .sd-table tr:last-child td { border-bottom: none; }
+  .sd-table tr:hover td { background: rgba(45, 91, 227, 0.02); }
+
+  .sd-table code {
+    font-family: 'SF Mono', 'Fira Code', Menlo, Consolas, monospace;
+    font-size: 0.82em;
+    background: var(--accent-faint);
+    padding: 2px 6px;
+    border-radius: 4px;
+    color: #1a3fa0;
+    word-break: break-all;
+  }
+
+  .sd-svc-ref {
+    cursor: pointer;
+    font-weight: 500;
+    color: var(--accent);
+    transition: color 0.15s;
+  }
+
+  .sd-svc-ref:hover { color: #1a3fa0; }
+
+  .sd-rel-kind {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 0.78rem;
+    font-weight: 500;
+    color: var(--text-muted);
+    background: rgba(0,0,0,0.03);
+    padding: 2px 8px;
+    border-radius: 4px;
+  }
+
+  /* ── Entity grid ─────────────────────────────────────────────────── */
+  .sd-entity-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+    gap: 14px;
+  }
+
+  .sd-entity-card {
+    background: var(--bg-card);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius);
+    overflow: hidden;
+    transition: opacity 0.3s, border-color 0.2s, box-shadow 0.2s;
+  }
+
+  .sd-entity-card:hover {
+    border-color: var(--accent);
+    box-shadow: 0 2px 12px rgba(45, 91, 227, 0.08);
+  }
+
+  .sd-entity-card.sd-highlight {
+    border-color: var(--accent);
+    box-shadow: 0 2px 16px rgba(45, 91, 227, 0.14);
+  }
+
+  .sd-entity-header {
+    padding: 14px 16px 10px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    border-bottom: 1px solid var(--border-subtle);
+  }
+
+  .sd-entity-name {
+    font-size: 1rem;
+    font-weight: 700;
+    color: var(--text-primary);
+  }
+
+  .sd-entity-svc {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 0.72rem;
+    font-weight: 500;
+    color: var(--accent);
+    background: var(--accent-faint);
+    padding: 2px 8px;
+    border-radius: 100px;
+    cursor: pointer;
+  }
+
+  .sd-field-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.82rem;
+  }
+
+  .sd-field-table th, .sd-field-table td {
+    padding: 7px 16px;
+    text-align: left;
+    border-bottom: 1px solid var(--border-subtle);
+  }
+
+  .sd-field-table th {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-weight: 600;
+    font-size: 0.68rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--text-muted);
+    background: rgba(0, 0, 0, 0.015);
+  }
+
+  .sd-field-table tr:last-child td { border-bottom: none; }
+  .sd-field-table tr:hover td { background: rgba(45, 91, 227, 0.02); }
+
+  .sd-field-table code {
+    font-family: 'SF Mono', 'Fira Code', Menlo, Consolas, monospace;
+    font-size: 0.85em;
+    background: var(--accent-faint);
+    padding: 1px 5px;
+    border-radius: 3px;
+    color: #1a3fa0;
+  }
+
+  /* ── Risks ───────────────────────────────────────────────────────── */
+  .sd-risks-list {
+    list-style: none;
+    padding: 0;
+  }
+
+  .sd-risks-list li {
+    padding: 10px 16px;
+    margin-bottom: 6px;
+    background: #fef3f2;
+    border: 1px solid rgba(239, 68, 68, 0.12);
+    border-left: 3px solid #ef4444;
+    border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+    font-size: 0.92rem;
+    color: var(--text-secondary);
+    line-height: 1.6;
+  }
+
+  /* ── Footer ──────────────────────────────────────────────────────── */
+  .sd-footer {
+    max-width: var(--content-width);
+    margin: 0 auto;
+    padding: 24px var(--gutter) 48px;
+    text-align: center;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 0.75rem;
+    color: var(--text-muted);
+    border-top: 1px solid var(--border-subtle);
+  }
+
+  /* ── Dimmed state for journey filtering ──────────────────────────── */
+  .sd-dimmed {
+    opacity: 0.15 !important;
+    pointer-events: none;
+  }
+
+  /* ── Entrance animation ──────────────────────────────────────────── */
+  @keyframes sd-fade-up {
+    from { opacity: 0; transform: translateY(12px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+
+  .sd-header, .sd-main {
+    animation: sd-fade-up 0.45s ease both;
+  }
+
+  .sd-main { animation-delay: 0.08s; }
+
+  /* ── Responsive ──────────────────────────────────────────────────── */
+  @media (max-width: 700px) {
+    html { font-size: 15px; }
+    .sd-service-grid { grid-template-columns: 1fr; }
+    .sd-entity-grid { grid-template-columns: 1fr; }
+    .sd-seq-header, .sd-seq-row {
+      grid-template-columns: 32px 1fr 24px 1fr 1.5fr 1fr;
+      font-size: 0.75rem;
+    }
+  }
+
+  @media (max-width: 480px) {
+    .sd-header-inner { padding: 16px 0 12px; }
+    .sd-nav { gap: 4px; }
+    .sd-nav-link { font-size: 12px; padding: 3px 8px; }
+    .sd-filters { gap: 4px; }
+  }
+</style>
+</head>
+<body>
+<header class="sd-header">
+<div class="sd-header-inner">
+<h1 class="sd-title">SF-7 Libraries &amp; Registries - System Design</h1>
+<nav class="sd-nav" id="sd-nav">
+<a href="#overview" class="sd-nav-link">Overview</a>
+<a href="#topology" class="sd-nav-link">Topology</a>
+<a href="#call-paths" class="sd-nav-link">Call Paths</a>
+<a href="#endpoints" class="sd-nav-link">Endpoints</a>
+<a href="#entities" class="sd-nav-link">Entities</a>
+<a href="#relations" class="sd-nav-link">Relations</a>
+<a href="#risks" class="sd-nav-link">Risks</a>
+</nav>
+<div class="sd-filters" id="sd-filters">
+<span class="sd-filter-label">Filter by journey:</span>
+<button class="sd-pill sd-pill-active" data-journey="__all__" onclick="window.__sd_filter('__all__')">All</button>
+<button class="sd-pill" data-journey="J-16" onclick="window.__sd_filter('J-16')">J-16</button>
+<button class="sd-pill" data-journey="J-18" onclick="window.__sd_filter('J-18')">J-18</button>
+<button class="sd-pill" data-journey="J-20" onclick="window.__sd_filter('J-20')">J-20</button>
+<button class="sd-pill" data-journey="J-23" onclick="window.__sd_filter('J-23')">J-23</button>
+<button class="sd-pill" data-journey="J-24" onclick="window.__sd_filter('J-24')">J-24</button>
+<button class="sd-pill" data-journey="J-25" onclick="window.__sd_filter('J-25')">J-25</button>
+<button class="sd-pill" data-journey="J-27" onclick="window.__sd_filter('J-27')">J-27</button>
+<button class="sd-pill" data-journey="J-28" onclick="window.__sd_filter('J-28')">J-28</button>
+<button class="sd-pill" data-journey="J-29" onclick="window.__sd_filter('J-29')">J-29</button>
+<button class="sd-pill" data-journey="J-5" onclick="window.__sd_filter('J-5')">J-5</button>
+</div>
+</div>
+</header>
+<main class="sd-main">
+<section class="sd-section" id="overview">
+<h2 class="sd-section-title">Overview</h2>
+<p class="sd-overview-text">SF-7 adds four library pages (Roles, Output Schemas, Task Templates, Tools) and three picker components that integrate with the SF-6 workflow editor across a React 19 frontend and FastAPI backend. The sidebar contains exactly 5 entity-type folders: Workflows, Roles, Schemas, Templates, Tools per PRD REQ-2.
+
+SF-7 is the exclusive owner of three follow-on Alembic migrations that extend SF-5's 5-table foundation: `workflow_entity_refs` (reference index), `tools` (custom tool registry), and `actor_slots` (task-template actor-slot definitions). SF-5's five foundation tables — `workflows`, `workflow_versions`, `roles`, `output_schemas`, `custom_task_templates` — are not modified by SF-7. SF-5 exposes a post-commit mutation hook interface (REQ-18) that fires typed events (`created`, `updated`, `soft_deleted`, `restored`) on all four foundation entity types after each successful database commit. SF-7 subscribes to the `Workflow` hook slot at application startup (FastAPI lifespan event), registering `refresh_entity_refs(workflow_id, user_id)` for `updated` events and `purge_entity_refs(workflow_id)` for `soft_deleted` events. The callbacks maintain the `workflow_entity_refs` materialized index in a separate SF-7-owned database transaction, enabling O(1) delete preflight checks — a single indexed lookup per entity ID regardless of workflow count.
+
+`GET /api/{entity}/references/{id}` reads from `workflow_entity_refs`, and library delete dialogs plus DELETE guards use those indexed rows instead of delete-time YAML scans. To guard against stale-index drift when a post-commit callback fails (SF-5 has already committed; the SF-7 transaction fails independently), an APScheduler reconciliation job runs periodically within compose-backend and can also be triggered manually via `POST /api/admin/reconcile-entity-refs`. The reconciliation job performs a full resync of `workflow_entity_refs` against actual workflow `yaml_content`, providing a deterministic recovery path for any missed hook events. The Tool Library (REQ-4) combines hardcoded built-in Claude tools with user-registered custom tools from the `tools` table, while tool delete protection remains a Role `tools` array check because tools are referenced by roles rather than by workflows. `actor_slots` rows extend `custom_task_templates` with named slot definitions so that actor-slot assignments survive reloads and remain reusable across workflows.</p>
+<h3 class="sd-subsection-title">Architecture Decisions</h3>
+<ol class="sd-decisions-list">
+<li>D-SF7-1: TaskTemplateEditorView reuses SF-6 editor components (EditorCanvas, AskNode, BranchNode, inspectors) directly with no shared canvas abstraction layer. Each editor creates its own editorStore instance via factory function. Phase creation tools are disabled via a noPhaseTools prop.</li>
+<li>D-SF7-2 [REQ-18, D-GR-37]: Reference checking for role, schema, and template deletes subscribes to SF-5's REQ-18 post-commit mutation hook interface and maintains the SF-7-owned materialized workflow_entity_refs index to provide O(1) delete preflight checks (single indexed lookup by entity_id, regardless of workflow count). The prior approach of parsing all workflow YAML at delete time (O(n×parse) per entity delete) is explicitly rejected. SF-7 registers refresh_entity_refs(workflow_id, user_id) against the Workflow `updated` hook slot and purge_entity_refs(workflow_id) against the Workflow `soft_deleted` slot at FastAPI lifespan startup. Both GET /api/{entity}/references/{id} and DELETE handler re-checks read the same workflow_entity_refs index — no YAML parsing occurs at delete time. Recovery from stale-index drift is handled by the periodic reconciliation job per D-SF7-8.</li>
+<li>D-SF7-3: SF-7 is the EXCLUSIVE owner of the workflow_entity_refs table and its Alembic migration. SF-5's five-table foundation (workflows, workflow_versions, roles, output_schemas, custom_task_templates) does NOT include workflow_entity_refs. SF-5's REQ-18 post-commit mutation hook interface fires typed events (created, updated, soft_deleted, restored) on all four foundation entity types after each successful database commit. SF-7 registers refresh_entity_refs(workflow_id, user_id) and purge_entity_refs(workflow_id) callbacks against the Workflow hook slot at application startup (FastAPI lifespan event). Those callbacks run in a separate SF-7-owned database transaction and do not re-enter SF-5's transaction. SF-5 never creates or updates workflow_entity_refs rows — all library-facing backend flows (duplicate name validation, JSON Schema server-side validation, inline-to-library promotion, pre-delete reference dialogs, delete guard responses) remain SF-7 scope.</li>
+<li>D-SF7-4 [REQ-2]: Sidebar contains exactly 5 entity-type folders: Workflows, Roles, Schemas, Templates, Tools. Phases and Plugins are NOT sidebar folders.</li>
+<li>D-SF7-5 [REQ-4, D-GR-7]: Tool Library uses a two-tier data strategy: built-in Claude tools are hardcoded in the backend and always included in GET /api/tools responses (no DB rows), while user-registered custom tools are stored in the SF-7-owned tools table. Tool deletion intentionally remains a Role.tools array check and does not use workflow_entity_refs because tools are not referenced directly by workflows.</li>
+<li>D-GR-26: workflow_entity_refs is the canonical reference-tracking model behind GET /api/{entity}/references/{id}. Pre-delete dialogs use that endpoint, and DELETE handlers re-check the same SF-7-owned table to guard against stale clients or concurrent workflow edits.</li>
+<li>D-SF7-6: SF-5's REQ-18 post-commit hook interface exposes two relevant slot types for SF-7: Workflow updated (covers create, import, duplicate, save-version) and Workflow soft_deleted. Both pass the workflow_id and user_id. SF-7's refresh_entity_refs callback handles the updated event by opening a new AsyncSession, re-fetching the workflow's yaml_content, parsing all library UUID references (roles, schemas, templates), and atomically replacing the workflow's workflow_entity_refs rows (DELETE WHERE workflow_id=:wid + bulk INSERT). SF-7's purge_entity_refs callback handles the soft_deleted event by deleting all workflow_entity_refs rows for that workflow_id. Both callbacks are registered synchronously during the FastAPI lifespan startup event by calling SF-5's hook registration API, with SF-5 never importing SF-7 modules. The callbacks execute synchronously in-process but in separate database transactions from SF-5's commit — if a callback fails, SF-5's transaction is already committed and the workflow save is not rolled back. Stale-index recovery is owned by the reconciliation job (D-SF7-8).</li>
+<li>D-SF7-7: actor_slots persistence is SF-7-owned. SF-7's Alembic migration creates the actor_slots table as an extension to SF-5's custom_task_templates (FK: actor_slots.template_id -&gt; custom_task_templates.id ON DELETE CASCADE). Each row stores a named slot_key unique per template, an optional default_role_id pointing to the SF-5-owned roles table, and a description. The API surface is /api/templates/{id}/actor-slots with GET (list), PUT /{slot_key} (upsert), and DELETE /{slot_key} (remove). Actor slot definitions are not reference-tracked in workflow_entity_refs.</li>
+<li>D-SF7-8 [D-GR-37, RISK-1]: A periodic reconciliation job runs within compose-backend (APScheduler BackgroundScheduler, default interval: 15 minutes, configurable via RECONCILE_JOB_INTERVAL_MINUTES env var, disableable via RECONCILE_JOB_ENABLED=false) to resync workflow_entity_refs from workflow yaml_content in scenarios where SF-7's post-commit hook callbacks fail (the SF-5 commit succeeds but the SF-7 separate transaction does not). The reconciliation function reconcile_entity_refs_all(): (1) queries all non-deleted workflows in a single SELECT, (2) batch-fetches current workflow_entity_refs rows for those workflow IDs, (3) for each workflow, parses yaml_content using the same entity-ref extractor as refresh_entity_refs, (4) computes the diff (missing inserts, stale deletes), and (5) for each workflow with a non-empty diff, opens an atomic transaction: DELETE stale rows + INSERT missing rows. Workflows already in sync incur no write. The job is idempotent — running it multiple times produces the same result. A manual trigger endpoint POST /api/admin/reconcile-entity-refs invokes the same reconcile_entity_refs_all() function and returns { workflows_scanned, rows_added, rows_removed, duration_ms }. The job is registered via FastAPI lifespan startup using the same startup hook that registers the mutation callbacks.</li>
+</ol>
+</section>
+<section class="sd-section" id="topology">
+<h2 class="sd-section-title">Service Topology</h2>
+<h4 class="sd-tier-label">Frontend</h4>
+<div class="sd-service-grid">
+<div class="sd-service-card" data-service-id="compose-frontend" data-journeys="J-5 J-23 J-24 J-25 J-27 J-28 J-29">
+<div class="sd-service-icon">&#x1F310;</div>
+<div class="sd-service-name">compose-frontend</div>
+<div class="sd-service-kind">frontend</div>
+<div class="sd-service-tech">React 19, Vite, React Router, Zustand, React Flow, CodeMirror 6</div>
+<p class="sd-service-desc">React SPA hosted at tools/compose/frontend that contains the SF-7 library pages and picker components alongside the SF-6 workflow editor. SF-7 additions live under features/libraries/ and include 4 library pages (Roles, Schemas, Templates, Tools), 3 pickers, a promotion dialog, shared hooks, and delete dialogs that preflight GET /api/{entity}/references/{id} before destructive actions.</p>
+</div>
+<div class="sd-service-card" data-service-id="libraries-feature" data-journeys="J-5 J-23 J-24 J-25 J-27 J-28 J-29">
+<div class="sd-service-icon">&#x1F310;</div>
+<div class="sd-service-name">Libraries Feature (SF-7)</div>
+<div class="sd-service-kind">frontend</div>
+<div class="sd-service-tech">React 19, Zustand, TanStack Query</div>
+<p class="sd-service-desc">Sub-module of compose-frontend providing the 4 library pages (RolesLibraryPage, SchemasLibraryPage, TemplatesLibraryPage, ToolsLibraryPage), 3 picker components (RolePicker, SchemaPicker, TemplatePicker), ToolChecklistGrid (consumed by Role editor), PromotionDialog, EntityDeleteDialog, and shared hooks. Delete flows call the dedicated references endpoint and render a blocking dialog before DELETE when workflows still reference the selected role, schema, or template.</p>
+</div>
+<div class="sd-service-card" data-service-id="editor-feature" data-journeys="J-5 J-16 J-18 J-20 J-27 J-29">
+<div class="sd-service-icon">&#x1F310;</div>
+<div class="sd-service-name">Editor Feature (SF-6)</div>
+<div class="sd-service-kind">frontend</div>
+<div class="sd-service-tech">React Flow, editorStore (Zustand factory)</div>
+<p class="sd-service-desc">SF-6 workflow editor sub-module containing EditorCanvas, AskNode, BranchNode, inspectors, and palette. Hosts pickers from libraries-feature inside inspectors and emits promotion callbacks (onPromoteRole, onPromoteSchema, onSaveTemplate). When a library role, schema, or template is attached to workflow content, the editor persists the library UUID in workflow data so that SF-5's workflow save fires the post-commit hook that SF-7 uses to refresh workflow_entity_refs.</p>
+</div>
+</div>
+<h4 class="sd-tier-label">Services &amp; External</h4>
+<div class="sd-service-grid">
+<div class="sd-service-card" data-service-id="compose-backend" data-journeys="J-5 J-23 J-24 J-27 J-28 J-29">
+<div class="sd-service-icon">&#x2699;&#xFE0F;</div>
+<div class="sd-service-name">compose-backend</div>
+<div class="sd-service-kind">service</div>
+<div class="sd-service-tech">FastAPI, SQLAlchemy async, asyncpg, Alembic, APScheduler, homelocal-auth, jsonschema</div>
+<p class="sd-service-desc">FastAPI backend at tools/compose/backend. SF-7 adds library entity CRUD extensions (Roles, Schemas, Templates, Tools, ActorSlots), duplicate name validation, JSON Schema server-side validation (Draft 2020-12), idempotent inline-to-library promotion, and reference-checking for delete dialogs and DELETE guards. SF-7's Alembic migrations create `workflow_entity_refs`, `tools`, and `actor_slots` as downstream extensions after SF-5's five-table foundation; those migrations run in SF-7's own revision chain within the shared alembic_version_compose history. At application startup (FastAPI lifespan event), SF-7 subscribes to SF-5's REQ-18 post-commit mutation hook interface by registering `refresh_entity_refs(workflow_id, user_id)` against the Workflow `updated` slot and `purge_entity_refs(workflow_id)` against the Workflow `soft_deleted` slot. The callbacks execute synchronously in-process but in separate database transactions from SF-5's commit; if a callback fails, SF-5's transaction is already committed and the workflow save is not rolled back. To recover from stale-index drift caused by callback failures, an APScheduler BackgroundScheduler job (`reconcile_entity_refs_all`) runs on a configurable interval (default: 15 minutes) and can be triggered on-demand via POST /api/admin/reconcile-entity-refs. GET /api/{entity}/references/{id} and role/schema/template DELETE endpoints query workflow_entity_refs. Tool delete protection remains a role scan because custom tools are referenced from Role.tools arrays, not directly from workflows.</p>
+</div>
+</div>
+<h4 class="sd-tier-label">Databases</h4>
+<div class="sd-service-grid">
+<div class="sd-service-card" data-service-id="compose-db" data-journeys="J-5 J-23 J-24 J-27 J-28 J-29">
+<div class="sd-service-icon">&#x1F5C3;&#xFE0F;</div>
+<div class="sd-service-name">compose-db</div>
+<div class="sd-service-kind">database</div>
+<div class="sd-service-tech">PostgreSQL 15+, Alembic migrations</div>
+<p class="sd-service-desc">PostgreSQL 15+ database managed by Alembic (alembic_version_compose table). SF-5 owns exactly five foundation tables: `workflows`, `workflow_versions`, `roles`, `output_schemas`, and `custom_task_templates`. SF-7 extends the schema with three additional tables via SF-7-owned Alembic migrations: `workflow_entity_refs` (materialized reference index for O(1) delete preflight; maintained by SF-5 post-commit mutation hook callbacks registered by SF-7), `tools` (user-registered custom tools; built-in tools remain backend constants and are never stored), and `actor_slots` (named actor-slot definitions per custom_task_templates row, enabling reusable slot assignments across workflows). SF-7 migrations depend on SF-5's initial migration revision and must run after it.</p>
+</div>
+</div>
+<h3 class="sd-subsection-title">Connections</h3>
+<div class="sd-connections-list">
+<div class="sd-connection-row" data-journeys="J-5 J-23 J-24 J-25 J-27 J-28 J-29"><span class="sd-conn-from">compose-frontend</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">compose-backend</span><span class="sd-conn-proto"> (REST/HTTPS - JWT Bearer)</span><span class="sd-conn-label">Library CRUD + reference lookups + validation + tool registry</span></div>
+<div class="sd-connection-row" data-journeys="J-5 J-23 J-24 J-27 J-28 J-29"><span class="sd-conn-from">compose-backend</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">compose-db</span><span class="sd-conn-proto"> (SQL / asyncpg)</span><span class="sd-conn-label">Entity queries + workflow_entity_refs refresh (post-commit hook) + reconciliation resync + tools table + actor_slots table</span></div>
+<div class="sd-connection-row" data-journeys="J-16 J-18 J-27"><span class="sd-conn-from">Libraries Feature (SF-7)</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">Editor Feature (SF-6)</span><span class="sd-conn-proto"> (React import)</span><span class="sd-conn-label">Picker integration into inspectors + palette + library ID handoff</span></div>
+<div class="sd-connection-row" data-journeys="J-20 J-27"><span class="sd-conn-from">Editor Feature (SF-6)</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">Libraries Feature (SF-7)</span><span class="sd-conn-proto"> (Callback / React prop)</span><span class="sd-conn-label">onPromoteRole, onPromoteSchema, onSaveTemplate callbacks + picker refresh</span></div>
+<div class="sd-connection-row" data-journeys="J-5"><span class="sd-conn-from">Editor Feature (SF-6)</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">compose-backend</span><span class="sd-conn-proto"> (REST/HTTPS - JWT Bearer)</span><span class="sd-conn-label">Role editor ToolChecklistGrid fetches GET /api/tools directly (REQ-4)</span></div>
+<div class="sd-connection-row" data-journeys="J-23 J-24 J-25 J-27 J-29"><span class="sd-conn-from">Editor Feature (SF-6)</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">compose-backend</span><span class="sd-conn-proto"> (REST/HTTPS - JWT Bearer)</span><span class="sd-conn-label">Workflow saves hit SF-5 workflow endpoints; after SF-5 commits, SF-7 post-commit hook refreshes workflow_entity_refs in a separate transaction</span></div>
+</div>
+</section>
+<section class="sd-section" id="call-paths">
+<h2 class="sd-section-title">API Call Paths</h2>
+<button class="sd-expand-btn" id="sd-toggle-details" onclick="window.__sd_toggle_details()">Expand All</button>
+<details class="sd-call-path" data-journey-id="J-23">
+<summary>
+<span class="sd-cp-name">Create and Use a Role</span>
+<span class="sd-cp-journey">J-23</span>
+</summary>
+<p class="sd-cp-desc">User creates a new library role, immediately uses it in the workflow editor, and saves the workflow. The workflow save triggers SF-5's post-commit Workflow updated event; SF-7's registered refresh_entity_refs callback rebuilds the materialized workflow_entity_refs rows so later delete checks are O(1) table lookups rather than YAML scans.</p>
+<div class="sd-sequence">
+<div class="sd-seq-header">
+<div class="sd-seq-col sd-seq-num">#</div>
+<div class="sd-seq-col sd-seq-from">From</div>
+<div class="sd-seq-col sd-seq-arrow"></div>
+<div class="sd-seq-col sd-seq-to">To</div>
+<div class="sd-seq-col sd-seq-action">Action</div>
+<div class="sd-seq-col sd-seq-returns">Returns</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">1</div>
+<div class="sd-seq-col sd-seq-from">Browser</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">compose-frontend</div>
+<div class="sd-seq-col sd-seq-action"><div>Navigate to /roles, click '+ New Role'</div><div class="sd-seq-detail">User opens the Roles library page and triggers the RoleEditorView render.</div></div>
+<div class="sd-seq-col sd-seq-returns">RoleEditorView renders</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">2</div>
+<div class="sd-seq-col sd-seq-from">compose-frontend</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">compose-backend</div>
+<div class="sd-seq-col sd-seq-action"><div>GET /api/roles/check-name?name=test-pm</div><div class="sd-seq-detail">Frontend validates role name uniqueness before allowing save.</div></div>
+<div class="sd-seq-col sd-seq-returns">{ available: true }</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">3</div>
+<div class="sd-seq-col sd-seq-from">compose-frontend</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">compose-backend</div>
+<div class="sd-seq-col sd-seq-action"><div>POST /api/roles { name, model, system_prompt, tools, metadata }</div><div class="sd-seq-detail">Create the new role record in the SF-5-owned roles table.</div></div>
+<div class="sd-seq-col sd-seq-returns">201 { id, name, ... }</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">4</div>
+<div class="sd-seq-col sd-seq-from">compose-frontend</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">compose-frontend</div>
+<div class="sd-seq-col sd-seq-action"><div>Invalidate library list and picker caches</div><div class="sd-seq-detail">Role appears in both the library grid and RolePicker with its canonical UUID and display name.</div></div>
+<div class="sd-seq-col sd-seq-returns">UI updated with new role option</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">5</div>
+<div class="sd-seq-col sd-seq-from">Browser</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">editor-feature</div>
+<div class="sd-seq-col sd-seq-action"><div>Select the new role from RolePicker in AskInspector</div><div class="sd-seq-detail">The editor stores the role UUID on the Ask node while showing the role name in the UI.</div></div>
+<div class="sd-seq-col sd-seq-returns">Node now references the library role</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">6</div>
+<div class="sd-seq-col sd-seq-from">editor-feature</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">compose-backend</div>
+<div class="sd-seq-col sd-seq-action"><div>PUT /api/workflows/{id} { yaml_content: ...roleId... }</div><div class="sd-seq-detail">SF-5 workflow save endpoint persists the role UUID inside the serialized workflow definition and commits the transaction.</div></div>
+<div class="sd-seq-col sd-seq-returns">200 { id, updated_at }</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">7</div>
+<div class="sd-seq-col sd-seq-from">compose-backend</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">compose-db</div>
+<div class="sd-seq-col sd-seq-action"><div>SF-5 post-commit hook fires Workflow updated event; SF-7 refresh_entity_refs callback re-fetches yaml_content and executes: DELETE FROM workflow_entity_refs WHERE workflow_id=:wid; INSERT INTO workflow_entity_refs (role/schema/template refs parsed from yaml)</div><div class="sd-seq-detail">SF-7's registered refresh_entity_refs callback runs in its own database transaction after SF-5's commit. It re-fetches the workflow's yaml_content, parses entity UUID references, and atomically replaces the materialized reference rows. Result is immediately available for O(1) delete preflight lookups.</div></div>
+<div class="sd-seq-col sd-seq-returns">Updated workflow_entity_refs rows (separate transaction)</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">8</div>
+<div class="sd-seq-col sd-seq-from">compose-backend</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">editor-feature</div>
+<div class="sd-seq-col sd-seq-action"><div>Return workflow save success (step 6 already returned 200; ref refresh is post-commit)</div><div class="sd-seq-detail">Editor save completes with 200 from SF-5. The workflow_entity_refs rows are refreshed asynchronously in SF-7's post-commit callback.</div></div>
+<div class="sd-seq-col sd-seq-returns">200 workflow saved</div>
+</div>
+</div>
+</details>
+<details class="sd-call-path" data-journey-id="J-27">
+<summary>
+<span class="sd-cp-name">Promote Inline Role to Library</span>
+<span class="sd-cp-journey">J-27</span>
+</summary>
+<p class="sd-cp-desc">User promotes an inline role defined within a workflow node to the shared Roles library. The node switches from inline role data to the canonical library role UUID, and the next workflow save triggers SF-5's Workflow updated post-commit event for SF-7 to refresh workflow_entity_refs.</p>
+<div class="sd-sequence">
+<div class="sd-seq-header">
+<div class="sd-seq-col sd-seq-num">#</div>
+<div class="sd-seq-col sd-seq-from">From</div>
+<div class="sd-seq-col sd-seq-arrow"></div>
+<div class="sd-seq-col sd-seq-to">To</div>
+<div class="sd-seq-col sd-seq-action">Action</div>
+<div class="sd-seq-col sd-seq-returns">Returns</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">1</div>
+<div class="sd-seq-col sd-seq-from">editor-feature</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">libraries-feature</div>
+<div class="sd-seq-col sd-seq-action"><div>Open PromotionDialog with inline role data</div><div class="sd-seq-detail">Workflow editor emits onPromoteRole callback; PromotionDialog renders with pre-filled inline role fields.</div></div>
+<div class="sd-seq-col sd-seq-returns">PromotionDialog renders</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">2</div>
+<div class="sd-seq-col sd-seq-from">compose-frontend</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">compose-backend</div>
+<div class="sd-seq-col sd-seq-action"><div>GET /api/roles/check-name?name=promoted-pm</div><div class="sd-seq-detail">Validate proposed library name is not already taken.</div></div>
+<div class="sd-seq-col sd-seq-returns">{ available: true }</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">3</div>
+<div class="sd-seq-col sd-seq-from">compose-frontend</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">compose-backend</div>
+<div class="sd-seq-col sd-seq-action"><div>POST /api/roles { ...inlineRole, promote: true }</div><div class="sd-seq-detail">Idempotent promotion. Backend returns the existing record if the same role name was already promoted. Writes to SF-5-owned roles table.</div></div>
+<div class="sd-seq-col sd-seq-returns">201 { id, name, ... } or 200 existing record</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">4</div>
+<div class="sd-seq-col sd-seq-from">libraries-feature</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">editor-feature</div>
+<div class="sd-seq-col sd-seq-action"><div>onSave callback -&gt; updateNodeData(nodeId, { actor: role.id, actorLabel: role.name, inline_role: undefined })</div><div class="sd-seq-detail">Node in the workflow editor switches from inline role content to the canonical library role UUID while keeping the display label.</div></div>
+<div class="sd-seq-col sd-seq-returns">Node reference updated in workflow graph</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">5</div>
+<div class="sd-seq-col sd-seq-from">editor-feature</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">compose-backend</div>
+<div class="sd-seq-col sd-seq-action"><div>PUT /api/workflows/{id} { yaml_content: ...roleId... }</div><div class="sd-seq-detail">SF-5 workflow save endpoint persists the promoted role UUID in the serialized workflow definition and commits.</div></div>
+<div class="sd-seq-col sd-seq-returns">200 { id, updated_at }</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">6</div>
+<div class="sd-seq-col sd-seq-from">compose-backend</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">compose-db</div>
+<div class="sd-seq-col sd-seq-action"><div>SF-5 post-commit hook fires Workflow updated event; SF-7 refresh_entity_refs callback re-fetches yaml_content and atomically replaces workflow_entity_refs rows in a separate transaction</div><div class="sd-seq-detail">SF-7's refresh_entity_refs callback runs after SF-5's commit. It re-fetches the workflow YAML, parses entity refs including the newly promoted role UUID, and rebuilds the workflow's materialized reference rows.</div></div>
+<div class="sd-seq-col sd-seq-returns">Updated workflow_entity_refs rows (separate transaction)</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">7</div>
+<div class="sd-seq-col sd-seq-from">compose-backend</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">editor-feature</div>
+<div class="sd-seq-col sd-seq-action"><div>Return workflow save success (step 5 already returned 200; ref refresh is post-commit)</div><div class="sd-seq-detail">The node now references the reusable library role. Future delete checks resolve from workflow_entity_refs via O(1) indexed lookup.</div></div>
+<div class="sd-seq-col sd-seq-returns">200 workflow saved</div>
+</div>
+</div>
+</details>
+<details class="sd-call-path" data-journey-id="J-29">
+<summary>
+<span class="sd-cp-name">Pre-delete Reference Check and Blocked Delete</span>
+<span class="sd-cp-journey">J-29</span>
+</summary>
+<p class="sd-cp-desc">User attempts to delete a role that is still referenced by at least one workflow. The frontend first calls the dedicated references endpoint, and both the pre-delete dialog and the DELETE guard read the SF-7-owned workflow_entity_refs table with a single O(1) indexed lookup instead of parsing workflow YAML.</p>
+<div class="sd-sequence">
+<div class="sd-seq-header">
+<div class="sd-seq-col sd-seq-num">#</div>
+<div class="sd-seq-col sd-seq-from">From</div>
+<div class="sd-seq-col sd-seq-arrow"></div>
+<div class="sd-seq-col sd-seq-to">To</div>
+<div class="sd-seq-col sd-seq-action">Action</div>
+<div class="sd-seq-col sd-seq-returns">Returns</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">1</div>
+<div class="sd-seq-col sd-seq-from">Browser</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">compose-frontend</div>
+<div class="sd-seq-col sd-seq-action"><div>Click delete on a role card</div><div class="sd-seq-detail">User initiates deletion for a library role.</div></div>
+<div class="sd-seq-col sd-seq-returns">Delete flow starts</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">2</div>
+<div class="sd-seq-col sd-seq-from">compose-frontend</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">compose-backend</div>
+<div class="sd-seq-col sd-seq-action"><div>GET /api/roles/references/{id}</div><div class="sd-seq-detail">Frontend preflights the dedicated reference endpoint before showing a destructive confirmation.</div></div>
+<div class="sd-seq-col sd-seq-returns">Pending reference lookup</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">3</div>
+<div class="sd-seq-col sd-seq-from">compose-backend</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">compose-db</div>
+<div class="sd-seq-col sd-seq-action"><div>SELECT DISTINCT workflows.id, workflows.name FROM workflow_entity_refs JOIN workflows ON workflows.id = workflow_entity_refs.workflow_id WHERE workflow_entity_refs.entity_type='role' AND workflow_entity_refs.entity_id=:role_id AND workflow_entity_refs.user_id=:uid AND workflows.deleted_at IS NULL</div><div class="sd-seq-detail">Backend resolves referencing workflows from the SF-7-owned workflow_entity_refs junction table joined to SF-5's active workflow rows. Single indexed lookup — O(1) per entity ID.</div></div>
+<div class="sd-seq-col sd-seq-returns">Referencing workflow rows</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">4</div>
+<div class="sd-seq-col sd-seq-from">compose-backend</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">compose-frontend</div>
+<div class="sd-seq-col sd-seq-action"><div>200 { total: 1, referenced_by: [{ workflow_id, workflow_name: 'Planning Workflow' }] }</div><div class="sd-seq-detail">Reference endpoint returns the blocked-delete details needed by the dialog.</div></div>
+<div class="sd-seq-col sd-seq-returns">Reference payload</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">5</div>
+<div class="sd-seq-col sd-seq-from">compose-frontend</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">Browser</div>
+<div class="sd-seq-col sd-seq-action"><div>EntityDeleteDialog shows 'Cannot delete - referenced by 1 workflow'</div><div class="sd-seq-detail">Frontend renders the blocked-delete state with workflow names and no destructive confirm action.</div></div>
+<div class="sd-seq-col sd-seq-returns">User sees blocked state</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">6</div>
+<div class="sd-seq-col sd-seq-from">compose-frontend</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">compose-backend</div>
+<div class="sd-seq-col sd-seq-action"><div>DELETE /api/roles/{id}</div><div class="sd-seq-detail">If a stale client or manual request still submits DELETE, the backend re-checks workflow_entity_refs before mutating data.</div></div>
+<div class="sd-seq-col sd-seq-returns">Pending server-side delete guard</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">7</div>
+<div class="sd-seq-col sd-seq-from">compose-backend</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">compose-db</div>
+<div class="sd-seq-col sd-seq-action"><div>SELECT 1 FROM workflow_entity_refs WHERE entity_type='role' AND entity_id=:role_id AND user_id=:uid LIMIT 1</div><div class="sd-seq-detail">DELETE re-check uses the same SF-7-owned workflow_entity_refs index (O(1) lookup) to prevent races between preflight and mutation. No YAML parsing occurs.</div></div>
+<div class="sd-seq-col sd-seq-returns">Matching ref row still exists</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">8</div>
+<div class="sd-seq-col sd-seq-from">compose-backend</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">compose-frontend</div>
+<div class="sd-seq-col sd-seq-action"><div>409 { error: 'reference_conflict', total: 1, referenced_by: [{ workflow_id, workflow_name: 'Planning Workflow' }] }</div><div class="sd-seq-detail">Backend blocks the delete without any workflow YAML parsing.</div></div>
+<div class="sd-seq-col sd-seq-returns">Blocked delete response</div>
+</div>
+</div>
+</details>
+<details class="sd-call-path" data-journey-id="J-5">
+<summary>
+<span class="sd-cp-name">Register a Custom MCP Tool and Use It in a Role</span>
+<span class="sd-cp-journey">J-5</span>
+</summary>
+<p class="sd-cp-desc">User registers a custom MCP tool in the SF-7-owned tools table, then opens a Role editor where the tool appears in the ToolChecklistGrid. The user selects the tool and saves the role with the custom tool in its tools array.</p>
+<div class="sd-sequence">
+<div class="sd-seq-header">
+<div class="sd-seq-col sd-seq-num">#</div>
+<div class="sd-seq-col sd-seq-from">From</div>
+<div class="sd-seq-col sd-seq-arrow"></div>
+<div class="sd-seq-col sd-seq-to">To</div>
+<div class="sd-seq-col sd-seq-action">Action</div>
+<div class="sd-seq-col sd-seq-returns">Returns</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">1</div>
+<div class="sd-seq-col sd-seq-from">Browser</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">compose-frontend</div>
+<div class="sd-seq-col sd-seq-action"><div>Navigate to /tools, click 'New Tool'</div><div class="sd-seq-detail">User opens the Tools Library page. Two sections are visible: 'Built-in Tools' (read-only cards, no DB rows) and 'My Tools' (user-registered, from SF-7-owned tools table).</div></div>
+<div class="sd-seq-col sd-seq-returns">ToolEditorView renders (create mode)</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">2</div>
+<div class="sd-seq-col sd-seq-from">compose-frontend</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">compose-backend</div>
+<div class="sd-seq-col sd-seq-action"><div>GET /api/tools/check-name?name=mcp__github__create_issue</div><div class="sd-seq-detail">Frontend validates tool name uniqueness before allowing save.</div></div>
+<div class="sd-seq-col sd-seq-returns">{ available: true }</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">3</div>
+<div class="sd-seq-col sd-seq-from">compose-frontend</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">compose-backend</div>
+<div class="sd-seq-col sd-seq-action"><div>POST /api/tools { name, description, source: 'mcp', input_schema }</div><div class="sd-seq-detail">Create the new tool record in the SF-7-owned tools table.</div></div>
+<div class="sd-seq-col sd-seq-returns">201 { id, name, source, ... }</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">4</div>
+<div class="sd-seq-col sd-seq-from">compose-frontend</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">compose-frontend</div>
+<div class="sd-seq-col sd-seq-action"><div>Success toast + navigate to /tools list view</div><div class="sd-seq-detail">Cache invalidation triggers a refetch; the tool appears in the 'My Tools' section with an 'MCP' badge.</div></div>
+<div class="sd-seq-col sd-seq-returns">UI updated with new tool in list</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">5</div>
+<div class="sd-seq-col sd-seq-from">Browser</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">compose-frontend</div>
+<div class="sd-seq-col sd-seq-action"><div>Navigate to /roles, open 'code-reviewer' role editor, scroll to Tools section</div><div class="sd-seq-detail">User opens the Role editor; the Tools section renders ToolChecklistGrid.</div></div>
+<div class="sd-seq-col sd-seq-returns">RoleEditorView renders with Tools section</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">6</div>
+<div class="sd-seq-col sd-seq-from">compose-frontend</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">compose-backend</div>
+<div class="sd-seq-col sd-seq-action"><div>GET /api/tools</div><div class="sd-seq-detail">ToolChecklistGrid fetches all tools. Response merges hardcoded built-in tools (backend constants) with user-registered tools from the SF-7-owned tools table.</div></div>
+<div class="sd-seq-col sd-seq-returns">{ tools: [ ...built-in, { id, name: 'mcp__github__create_issue', source: 'mcp', ... } ] }</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">7</div>
+<div class="sd-seq-col sd-seq-from">Browser</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">compose-frontend</div>
+<div class="sd-seq-col sd-seq-action"><div>Check Read, Grep, Glob, and mcp__github__create_issue, then save role</div><div class="sd-seq-detail">ToolChecklistGrid shows 'Built-in' and 'Registered' groups. User selects tools from both groups.</div></div>
+<div class="sd-seq-col sd-seq-returns">Role saved with tools: ['Read', 'Grep', 'Glob', 'mcp__github__create_issue']</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">8</div>
+<div class="sd-seq-col sd-seq-from">compose-frontend</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">compose-backend</div>
+<div class="sd-seq-col sd-seq-action"><div>PUT /api/roles/{id} { tools: ['Read', 'Grep', 'Glob', 'mcp__github__create_issue'] }</div><div class="sd-seq-detail">Role entity is updated in the SF-5-owned roles table with the new tools array. Tool references remain role-local and do not participate in workflow_entity_refs.</div></div>
+<div class="sd-seq-col sd-seq-returns">200 { id, name, tools: [...], ... }</div>
+</div>
+</div>
+</details>
+<details class="sd-call-path" data-journey-id="J-5">
+<summary>
+<span class="sd-cp-name">Delete a Custom Tool (Blocked by Role Reference)</span>
+<span class="sd-cp-journey">J-5</span>
+</summary>
+<p class="sd-cp-desc">User attempts to delete a custom tool from the SF-7-owned tools table that is referenced by at least one Role's tools array. Tool delete protection intentionally remains a Role scan and does not use workflow_entity_refs, because tools are not referenced directly by workflows.</p>
+<div class="sd-sequence">
+<div class="sd-seq-header">
+<div class="sd-seq-col sd-seq-num">#</div>
+<div class="sd-seq-col sd-seq-from">From</div>
+<div class="sd-seq-col sd-seq-arrow"></div>
+<div class="sd-seq-col sd-seq-to">To</div>
+<div class="sd-seq-col sd-seq-action">Action</div>
+<div class="sd-seq-col sd-seq-returns">Returns</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">1</div>
+<div class="sd-seq-col sd-seq-from">compose-frontend</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">compose-backend</div>
+<div class="sd-seq-col sd-seq-action"><div>DELETE /api/tools/{id}</div><div class="sd-seq-detail">User clicks delete on a custom tool card in the 'My Tools' section; frontend sends the delete request.</div></div>
+<div class="sd-seq-col sd-seq-returns">&mdash;</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">2</div>
+<div class="sd-seq-col sd-seq-from">compose-backend</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">compose-db</div>
+<div class="sd-seq-col sd-seq-action"><div>SELECT name FROM tools WHERE id=:tool_id AND deleted_at IS NULL</div><div class="sd-seq-detail">Fetch the tool's name from the SF-7-owned tools table so the backend can check Role tools arrays for that exact identifier.</div></div>
+<div class="sd-seq-col sd-seq-returns">{ name: 'mcp__github__create_issue' }</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">3</div>
+<div class="sd-seq-col sd-seq-from">compose-backend</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">compose-db</div>
+<div class="sd-seq-col sd-seq-action"><div>SELECT id, name, tools FROM roles WHERE user_id=:uid AND deleted_at IS NULL</div><div class="sd-seq-detail">Backend fetches all non-deleted roles from the SF-5-owned roles table to scan their tools JSON arrays.</div></div>
+<div class="sd-seq-col sd-seq-returns">Role rows with tools JSON arrays</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">4</div>
+<div class="sd-seq-col sd-seq-from">compose-backend</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">compose-backend</div>
+<div class="sd-seq-col sd-seq-action"><div>Scan each role's tools array for tool name match</div><div class="sd-seq-detail">In-memory role scan identifies referencing role names. This flow is separate from the workflow reference endpoint.</div></div>
+<div class="sd-seq-col sd-seq-returns">List of referencing role names</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">5</div>
+<div class="sd-seq-col sd-seq-from">compose-backend</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">compose-frontend</div>
+<div class="sd-seq-col sd-seq-action"><div>409 { error: 'reference_conflict', details: [{ role_id, role_name }] }</div><div class="sd-seq-detail">Backend returns blocked-delete response listing referencing roles.</div></div>
+<div class="sd-seq-col sd-seq-returns">&mdash;</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">6</div>
+<div class="sd-seq-col sd-seq-from">compose-frontend</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">Browser</div>
+<div class="sd-seq-col sd-seq-action"><div>EntityDeleteDialog shows 'Cannot delete - referenced by 2 roles'</div><div class="sd-seq-detail">Frontend renders the blocked-delete state with role names so the user understands the dependency.</div></div>
+<div class="sd-seq-col sd-seq-returns">User sees blocked state</div>
+</div>
+</div>
+</details>
+<details class="sd-call-path" data-journey-id="J-25">
+<summary>
+<span class="sd-cp-name">Define Actor Slots for a Task Template</span>
+<span class="sd-cp-journey">J-25</span>
+</summary>
+<p class="sd-cp-desc">User opens a task template in the library and defines named actor slots (e.g., 'pm', 'reviewer') with optional default role assignments. SF-7's actor_slots table persists these definitions so they survive reloads and are reusable across workflow instances.</p>
+<div class="sd-sequence">
+<div class="sd-seq-header">
+<div class="sd-seq-col sd-seq-num">#</div>
+<div class="sd-seq-col sd-seq-from">From</div>
+<div class="sd-seq-col sd-seq-arrow"></div>
+<div class="sd-seq-col sd-seq-to">To</div>
+<div class="sd-seq-col sd-seq-action">Action</div>
+<div class="sd-seq-col sd-seq-returns">Returns</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">1</div>
+<div class="sd-seq-col sd-seq-from">Browser</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">compose-frontend</div>
+<div class="sd-seq-col sd-seq-action"><div>Navigate to /templates, open a template, click 'Edit Actor Slots'</div><div class="sd-seq-detail">User opens the ActorSlotsEditor panel within the TemplatesLibraryPage.</div></div>
+<div class="sd-seq-col sd-seq-returns">ActorSlotsEditor renders</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">2</div>
+<div class="sd-seq-col sd-seq-from">compose-frontend</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">compose-backend</div>
+<div class="sd-seq-col sd-seq-action"><div>GET /api/templates/{id}/actor-slots</div><div class="sd-seq-detail">Load existing slot definitions from the SF-7-owned actor_slots table for this template.</div></div>
+<div class="sd-seq-col sd-seq-returns">{ slots: [{ slot_key, default_role_id?, role_name? }] }</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">3</div>
+<div class="sd-seq-col sd-seq-from">Browser</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">compose-frontend</div>
+<div class="sd-seq-col sd-seq-action"><div>Add new slot 'pm', select a default role from RolePicker, click Save</div><div class="sd-seq-detail">User defines a new named actor slot with an optional default role assignment.</div></div>
+<div class="sd-seq-col sd-seq-returns">Pending slot upsert</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">4</div>
+<div class="sd-seq-col sd-seq-from">compose-frontend</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">compose-backend</div>
+<div class="sd-seq-col sd-seq-action"><div>PUT /api/templates/{id}/actor-slots/pm { default_role_id: roleUUID }</div><div class="sd-seq-detail">Upsert the slot definition in the SF-7-owned actor_slots table. slot_key 'pm' is unique per template.</div></div>
+<div class="sd-seq-col sd-seq-returns">{ slot_key: 'pm', default_role_id: roleUUID, role_name: 'Product Manager', updated_at }</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">5</div>
+<div class="sd-seq-col sd-seq-from">compose-frontend</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">Browser</div>
+<div class="sd-seq-col sd-seq-action"><div>ActorSlotsEditor shows 'pm → Product Manager' in the slot list</div><div class="sd-seq-detail">Slot definition is persisted and displayed. Future workflow instances referencing this template can resolve the 'pm' slot to the assigned role.</div></div>
+<div class="sd-seq-col sd-seq-returns">Slot persisted and visible</div>
+</div>
+</div>
+</details>
+<details class="sd-call-path" data-journey-id="">
+<summary>
+<span class="sd-cp-name">Reconciliation Job — Resync workflow_entity_refs Index</span>
+</summary>
+<p class="sd-cp-desc">The APScheduler reconciliation job (or manual operator trigger via POST /api/admin/reconcile-entity-refs) resyncs the materialized workflow_entity_refs index against actual workflow yaml_content. Handles stale-index recovery for scenarios where SF-7's post-commit hook callbacks failed after a SF-5 commit. The job is idempotent and produces the same result regardless of how many times it runs.</p>
+<div class="sd-sequence">
+<div class="sd-seq-header">
+<div class="sd-seq-col sd-seq-num">#</div>
+<div class="sd-seq-col sd-seq-from">From</div>
+<div class="sd-seq-col sd-seq-arrow"></div>
+<div class="sd-seq-col sd-seq-to">To</div>
+<div class="sd-seq-col sd-seq-action">Action</div>
+<div class="sd-seq-col sd-seq-returns">Returns</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">1</div>
+<div class="sd-seq-col sd-seq-from">APScheduler</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">compose-backend</div>
+<div class="sd-seq-col sd-seq-action"><div>Fire reconcile_entity_refs_all() on configured interval (default: 15 minutes) or via POST /api/admin/reconcile-entity-refs</div><div class="sd-seq-detail">Scheduler triggers the reconciliation function. Manual trigger path calls the same reconcile_entity_refs_all() function.</div></div>
+<div class="sd-seq-col sd-seq-returns">Reconciliation started</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">2</div>
+<div class="sd-seq-col sd-seq-from">compose-backend</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">compose-db</div>
+<div class="sd-seq-col sd-seq-action"><div>SELECT id, user_id, yaml_content FROM workflows WHERE deleted_at IS NULL</div><div class="sd-seq-detail">Fetch all non-deleted workflows to inspect their current yaml_content. No lock held — reads are snapshot-consistent.</div></div>
+<div class="sd-seq-col sd-seq-returns">List of active workflow rows</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">3</div>
+<div class="sd-seq-col sd-seq-from">compose-backend</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">compose-backend</div>
+<div class="sd-seq-col sd-seq-action"><div>For each workflow: parse yaml_content to extract all library UUID refs (roles, schemas, templates)</div><div class="sd-seq-detail">In-process YAML parse extracts all entity_type / entity_id pairs from the workflow definition. Same parser used by refresh_entity_refs callback.</div></div>
+<div class="sd-seq-col sd-seq-returns">Expected set of (entity_type, entity_id) pairs per workflow_id</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">4</div>
+<div class="sd-seq-col sd-seq-from">compose-backend</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">compose-db</div>
+<div class="sd-seq-col sd-seq-action"><div>SELECT workflow_id, entity_type, entity_id FROM workflow_entity_refs WHERE workflow_id = ANY(:workflow_ids)</div><div class="sd-seq-detail">Batch-fetch the current materialized rows for all active workflows in a single query.</div></div>
+<div class="sd-seq-col sd-seq-returns">Current set of indexed (workflow_id, entity_type, entity_id) rows</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">5</div>
+<div class="sd-seq-col sd-seq-from">compose-backend</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">compose-backend</div>
+<div class="sd-seq-col sd-seq-action"><div>Compute diff per workflow: missing_rows = expected − current; stale_rows = current − expected</div><div class="sd-seq-detail">Set arithmetic identifies which rows need to be inserted (missed by failed hooks) and which rows are stale (orphaned by failed purge hooks).</div></div>
+<div class="sd-seq-col sd-seq-returns">Per-workflow diff maps</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">6</div>
+<div class="sd-seq-col sd-seq-from">compose-backend</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">compose-db</div>
+<div class="sd-seq-col sd-seq-action"><div>For each workflow with non-empty diff: BEGIN; DELETE stale rows; INSERT missing rows; COMMIT</div><div class="sd-seq-detail">Atomic reconcile transaction per workflow. Only workflows with diffs are touched. Workflows already in sync incur no write.</div></div>
+<div class="sd-seq-col sd-seq-returns">Updated workflow_entity_refs rows; rows_added and rows_removed counters accumulated</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">7</div>
+<div class="sd-seq-col sd-seq-from">compose-backend</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">compose-backend</div>
+<div class="sd-seq-col sd-seq-action"><div>Return { workflows_scanned, rows_added, rows_removed, duration_ms }</div><div class="sd-seq-detail">Summary returned to the manual trigger caller (POST /api/admin/reconcile-entity-refs response body) or logged by the scheduler job.</div></div>
+<div class="sd-seq-col sd-seq-returns">Reconciliation summary</div>
+</div>
+</div>
+</details>
+</section>
+<section class="sd-section" id="endpoints">
+<h2 class="sd-section-title">API Endpoints</h2>
+<div class="sd-table-wrap">
+<table class="sd-table">
+<thead><tr>
+<th>Method</th><th>Path</th><th>Service</th><th>Auth</th><th>Description</th>
+</tr></thead>
+<tbody>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#22c55e;letter-spacing:0.04em;line-height:1.6;">GET</span></td>
+<td><code>/api/roles/check-name</code></td>
+<td><span class="sd-svc-ref" data-ref-service="compose-backend">compose-backend</span></td>
+<td>JWT Bearer</td>
+<td>Check role name uniqueness for the authenticated user.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#22c55e;letter-spacing:0.04em;line-height:1.6;">GET</span></td>
+<td><code>/api/schemas/check-name</code></td>
+<td><span class="sd-svc-ref" data-ref-service="compose-backend">compose-backend</span></td>
+<td>JWT Bearer</td>
+<td>Check output schema name uniqueness for the authenticated user.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#22c55e;letter-spacing:0.04em;line-height:1.6;">GET</span></td>
+<td><code>/api/templates/check-name</code></td>
+<td><span class="sd-svc-ref" data-ref-service="compose-backend">compose-backend</span></td>
+<td>JWT Bearer</td>
+<td>Check task template name uniqueness for the authenticated user.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#22c55e;letter-spacing:0.04em;line-height:1.6;">GET</span></td>
+<td><code>/api/tools/check-name</code></td>
+<td><span class="sd-svc-ref" data-ref-service="compose-backend">compose-backend</span></td>
+<td>JWT Bearer</td>
+<td>Check tool name uniqueness for the authenticated user. Query param: ?name=mcp__github__create_issue.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#22c55e;letter-spacing:0.04em;line-height:1.6;">GET</span></td>
+<td><code>/api/tools</code></td>
+<td><span class="sd-svc-ref" data-ref-service="compose-backend">compose-backend</span></td>
+<td>JWT Bearer</td>
+<td>List all tools: hardcoded built-in tools (source=built_in, no id) merged with user-registered custom tools from the SF-7-owned tools table (source=mcp or custom_function, with id). Used by both ToolsLibraryPage and the Role editor's ToolChecklistGrid (REQ-4).</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#22c55e;letter-spacing:0.04em;line-height:1.6;">GET</span></td>
+<td><code>/api/tools/{id}</code></td>
+<td><span class="sd-svc-ref" data-ref-service="compose-backend">compose-backend</span></td>
+<td>JWT Bearer</td>
+<td>Get a single custom tool by UUID. Returns 404 for non-existent or deleted tools.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#22c55e;letter-spacing:0.04em;line-height:1.6;">GET</span></td>
+<td><code>/api/{entity}/references/{id}</code></td>
+<td><span class="sd-svc-ref" data-ref-service="compose-backend">compose-backend</span></td>
+<td>JWT Bearer</td>
+<td>Return total and referenced_by[] for a role, schema, or template by querying the SF-7-owned workflow_entity_refs table joined to active SF-5 workflow rows. Single indexed lookup — O(1) per entity ID. Used by EntityDeleteDialog before delete and by DELETE handlers for re-checks. Entity must be one of: roles, schemas, templates.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#f59e0b;letter-spacing:0.04em;line-height:1.6;">PUT</span></td>
+<td><code>/api/workflows/{id}</code></td>
+<td><span class="sd-svc-ref" data-ref-service="compose-backend">compose-backend</span></td>
+<td>JWT Bearer</td>
+<td>SF-5-owned endpoint. Persists workflow YAML containing library role/schema/template UUIDs. After SF-5 commits the workflow update, SF-5's Workflow post-commit hook fires the `updated` event; SF-7's registered refresh_entity_refs callback re-fetches the workflow's yaml_content and replaces that workflow's workflow_entity_refs rows in a separate SF-7 transaction.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#ef4444;letter-spacing:0.04em;line-height:1.6;">DELETE</span></td>
+<td><code>/api/workflows/{id}</code></td>
+<td><span class="sd-svc-ref" data-ref-service="compose-backend">compose-backend</span></td>
+<td>JWT Bearer</td>
+<td>SF-5-owned endpoint. Soft-deletes a workflow. After SF-5 commits the soft-delete, SF-5's Workflow post-commit hook fires the `soft_deleted` event; SF-7's registered purge_entity_refs callback removes that workflow's workflow_entity_refs rows in a separate SF-7 transaction.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#ef4444;letter-spacing:0.04em;line-height:1.6;">DELETE</span></td>
+<td><code>/api/roles/{id}</code></td>
+<td><span class="sd-svc-ref" data-ref-service="compose-backend">compose-backend</span></td>
+<td>JWT Bearer</td>
+<td>Soft-delete a role with a workflow_entity_refs re-check. Returns 409 with referencing workflow names if any active workflow still references the role UUID in the SF-7-owned workflow_entity_refs table (O(1) indexed lookup).</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#ef4444;letter-spacing:0.04em;line-height:1.6;">DELETE</span></td>
+<td><code>/api/schemas/{id}</code></td>
+<td><span class="sd-svc-ref" data-ref-service="compose-backend">compose-backend</span></td>
+<td>JWT Bearer</td>
+<td>Soft-delete an output schema with a workflow_entity_refs re-check. Blocked if referenced by any active workflow.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#ef4444;letter-spacing:0.04em;line-height:1.6;">DELETE</span></td>
+<td><code>/api/templates/{id}</code></td>
+<td><span class="sd-svc-ref" data-ref-service="compose-backend">compose-backend</span></td>
+<td>JWT Bearer</td>
+<td>Soft-delete a task template with a workflow_entity_refs re-check. Blocked if referenced by any active workflow.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#ef4444;letter-spacing:0.04em;line-height:1.6;">DELETE</span></td>
+<td><code>/api/tools/{id}</code></td>
+<td><span class="sd-svc-ref" data-ref-service="compose-backend">compose-backend</span></td>
+<td>JWT Bearer</td>
+<td>Soft-delete a custom tool from the SF-7-owned tools table with role-reference checking. Scans non-deleted Roles' tools JSON arrays for the tool's name and returns 409 with referencing role names if found. Built-in tools cannot be deleted because they have no id.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#3b82f6;letter-spacing:0.04em;line-height:1.6;">POST</span></td>
+<td><code>/api/roles</code></td>
+<td><span class="sd-svc-ref" data-ref-service="compose-backend">compose-backend</span></td>
+<td>JWT Bearer</td>
+<td>Create a new role with optional idempotent promotion flag. Returns the existing record on duplicate name when promote=true. Writes to SF-5-owned roles table.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#f59e0b;letter-spacing:0.04em;line-height:1.6;">PUT</span></td>
+<td><code>/api/roles/{id}</code></td>
+<td><span class="sd-svc-ref" data-ref-service="compose-backend">compose-backend</span></td>
+<td>JWT Bearer</td>
+<td>Update an existing role in the SF-5-owned roles table, including tool selections sourced from GET /api/tools.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#3b82f6;letter-spacing:0.04em;line-height:1.6;">POST</span></td>
+<td><code>/api/schemas</code></td>
+<td><span class="sd-svc-ref" data-ref-service="compose-backend">compose-backend</span></td>
+<td>JWT Bearer</td>
+<td>Create a new output schema in the SF-5-owned output_schemas table. Validates json_schema against JSON Schema Draft 2020-12 before persisting.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#3b82f6;letter-spacing:0.04em;line-height:1.6;">POST</span></td>
+<td><code>/api/tools</code></td>
+<td><span class="sd-svc-ref" data-ref-service="compose-backend">compose-backend</span></td>
+<td>JWT Bearer</td>
+<td>Register a new custom tool in the SF-7-owned tools table. Returns 409 on duplicate name. Name max 200 chars, description max 500 chars, input_schema max 256KB (REQ-8).</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#f59e0b;letter-spacing:0.04em;line-height:1.6;">PUT</span></td>
+<td><code>/api/tools/{id}</code></td>
+<td><span class="sd-svc-ref" data-ref-service="compose-backend">compose-backend</span></td>
+<td>JWT Bearer</td>
+<td>Update a custom tool in the SF-7-owned tools table. Same body fields as POST. Returns 404 for non-existent or deleted tools. If the name changes, the UI warns that roles using the old string must be updated manually.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#22c55e;letter-spacing:0.04em;line-height:1.6;">GET</span></td>
+<td><code>/api/templates/{id}/actor-slots</code></td>
+<td><span class="sd-svc-ref" data-ref-service="compose-backend">compose-backend</span></td>
+<td>JWT Bearer</td>
+<td>List all actor slot definitions for a task template, reading from the SF-7-owned actor_slots table. Returns each slot_key with its current default_role_id and role display name.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#f59e0b;letter-spacing:0.04em;line-height:1.6;">PUT</span></td>
+<td><code>/api/templates/{id}/actor-slots/{slot_key}</code></td>
+<td><span class="sd-svc-ref" data-ref-service="compose-backend">compose-backend</span></td>
+<td>JWT Bearer</td>
+<td>Upsert a named actor slot definition for a task template in the SF-7-owned actor_slots table. slot_key must be unique per template. default_role_id null defines an unassigned slot. Used to persist actor-slot definitions so they survive reloads and remain reusable across workflow instances.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#ef4444;letter-spacing:0.04em;line-height:1.6;">DELETE</span></td>
+<td><code>/api/templates/{id}/actor-slots/{slot_key}</code></td>
+<td><span class="sd-svc-ref" data-ref-service="compose-backend">compose-backend</span></td>
+<td>JWT Bearer</td>
+<td>Remove a named actor slot definition from the SF-7-owned actor_slots table. Returns 204. Does not block on role references because slot definitions are template-level metadata, not reference-tracked entities.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#3b82f6;letter-spacing:0.04em;line-height:1.6;">POST</span></td>
+<td><code>/api/admin/reconcile-entity-refs</code></td>
+<td><span class="sd-svc-ref" data-ref-service="compose-backend">compose-backend</span></td>
+<td>JWT Bearer</td>
+<td>Manually trigger a full reconciliation of the workflow_entity_refs materialized index against actual workflow yaml_content. Invokes the same reconcile_entity_refs_all() function used by the APScheduler periodic job. For each non-deleted workflow, re-parses yaml_content, computes the diff against current workflow_entity_refs rows, and atomically reconciles mismatches (DELETE stale rows + INSERT missing rows in a single transaction per workflow). Idempotent — safe to run at any time. Returns a summary of rows added, rows removed, and workflows scanned. Intended for operator use when post-commit hook failures are suspected.</td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section class="sd-section" id="entities">
+<h2 class="sd-section-title">Entity Model</h2>
+<div class="sd-entity-grid">
+<div class="sd-entity-card" data-service-id="compose-db" data-journeys="J-23 J-24 J-25 J-27 J-29">
+<div class="sd-entity-header">
+<h4 class="sd-entity-name">Workflow</h4>
+<span class="sd-entity-svc" data-ref-service="compose-db">compose-db</span>
+</div>
+<table class="sd-field-table">
+<thead><tr><th>Field</th><th>Type</th><th>Constraints</th></tr></thead>
+<tbody>
+<tr>
+<td>id</td>
+<td><code>UUID</code></td>
+<td>PK, auto-generated</td>
+</tr>
+<tr>
+<td>name</td>
+<td><code>VARCHAR</code></td>
+<td>NOT NULL</td>
+</tr>
+<tr>
+<td>yaml_content</td>
+<td><code>TEXT</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>user_id</td>
+<td><code>VARCHAR</code></td>
+<td>NOT NULL</td>
+</tr>
+<tr>
+<td>deleted_at</td>
+<td><code>TIMESTAMP</code></td>
+<td>nullable</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div class="sd-entity-card" data-service-id="compose-db" data-journeys="J-23 J-27 J-29">
+<div class="sd-entity-header">
+<h4 class="sd-entity-name">Role</h4>
+<span class="sd-entity-svc" data-ref-service="compose-db">compose-db</span>
+</div>
+<table class="sd-field-table">
+<thead><tr><th>Field</th><th>Type</th><th>Constraints</th></tr></thead>
+<tbody>
+<tr>
+<td>id</td>
+<td><code>UUID</code></td>
+<td>PK, auto-generated</td>
+</tr>
+<tr>
+<td>name</td>
+<td><code>VARCHAR</code></td>
+<td>NOT NULL</td>
+</tr>
+<tr>
+<td>model</td>
+<td><code>VARCHAR</code></td>
+<td>NOT NULL</td>
+</tr>
+<tr>
+<td>system_prompt</td>
+<td><code>TEXT</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>tools</td>
+<td><code>JSON</code></td>
+<td>Array of tool name strings (built-in + registered)</td>
+</tr>
+<tr>
+<td>metadata</td>
+<td><code>JSON</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>is_example</td>
+<td><code>BOOLEAN</code></td>
+<td>DEFAULT false</td>
+</tr>
+<tr>
+<td>user_id</td>
+<td><code>VARCHAR</code></td>
+<td>NOT NULL</td>
+</tr>
+<tr>
+<td>created_at</td>
+<td><code>TIMESTAMP</code></td>
+<td>auto</td>
+</tr>
+<tr>
+<td>updated_at</td>
+<td><code>TIMESTAMP</code></td>
+<td>auto</td>
+</tr>
+<tr>
+<td>deleted_at</td>
+<td><code>TIMESTAMP</code></td>
+<td>nullable</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div class="sd-entity-card" data-service-id="compose-db" data-journeys="J-24 J-27 J-29">
+<div class="sd-entity-header">
+<h4 class="sd-entity-name">OutputSchema</h4>
+<span class="sd-entity-svc" data-ref-service="compose-db">compose-db</span>
+</div>
+<table class="sd-field-table">
+<thead><tr><th>Field</th><th>Type</th><th>Constraints</th></tr></thead>
+<tbody>
+<tr>
+<td>id</td>
+<td><code>UUID</code></td>
+<td>PK, auto-generated</td>
+</tr>
+<tr>
+<td>name</td>
+<td><code>VARCHAR</code></td>
+<td>NOT NULL</td>
+</tr>
+<tr>
+<td>description</td>
+<td><code>TEXT</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>json_schema</td>
+<td><code>JSON</code></td>
+<td>NOT NULL, validated Draft 2020-12</td>
+</tr>
+<tr>
+<td>is_example</td>
+<td><code>BOOLEAN</code></td>
+<td>DEFAULT false</td>
+</tr>
+<tr>
+<td>user_id</td>
+<td><code>VARCHAR</code></td>
+<td>NOT NULL</td>
+</tr>
+<tr>
+<td>created_at</td>
+<td><code>TIMESTAMP</code></td>
+<td>auto</td>
+</tr>
+<tr>
+<td>updated_at</td>
+<td><code>TIMESTAMP</code></td>
+<td>auto</td>
+</tr>
+<tr>
+<td>deleted_at</td>
+<td><code>TIMESTAMP</code></td>
+<td>nullable</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div class="sd-entity-card" data-service-id="compose-db" data-journeys="J-25 J-27 J-29">
+<div class="sd-entity-header">
+<h4 class="sd-entity-name">TaskTemplate</h4>
+<span class="sd-entity-svc" data-ref-service="compose-db">compose-db</span>
+</div>
+<table class="sd-field-table">
+<thead><tr><th>Field</th><th>Type</th><th>Constraints</th></tr></thead>
+<tbody>
+<tr>
+<td>id</td>
+<td><code>UUID</code></td>
+<td>PK, auto-generated</td>
+</tr>
+<tr>
+<td>name</td>
+<td><code>VARCHAR</code></td>
+<td>NOT NULL</td>
+</tr>
+<tr>
+<td>description</td>
+<td><code>TEXT</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>subgraph_yaml</td>
+<td><code>TEXT</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>input_interface</td>
+<td><code>JSON</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>output_interface</td>
+<td><code>JSON</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>is_example</td>
+<td><code>BOOLEAN</code></td>
+<td>DEFAULT false</td>
+</tr>
+<tr>
+<td>user_id</td>
+<td><code>VARCHAR</code></td>
+<td>NOT NULL</td>
+</tr>
+<tr>
+<td>created_at</td>
+<td><code>TIMESTAMP</code></td>
+<td>auto</td>
+</tr>
+<tr>
+<td>updated_at</td>
+<td><code>TIMESTAMP</code></td>
+<td>auto</td>
+</tr>
+<tr>
+<td>deleted_at</td>
+<td><code>TIMESTAMP</code></td>
+<td>nullable</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div class="sd-entity-card" data-service-id="compose-db" data-journeys="J-5">
+<div class="sd-entity-header">
+<h4 class="sd-entity-name">Tool</h4>
+<span class="sd-entity-svc" data-ref-service="compose-db">compose-db</span>
+</div>
+<table class="sd-field-table">
+<thead><tr><th>Field</th><th>Type</th><th>Constraints</th></tr></thead>
+<tbody>
+<tr>
+<td>id</td>
+<td><code>UUID</code></td>
+<td>PK, auto-generated</td>
+</tr>
+<tr>
+<td>user_id</td>
+<td><code>VARCHAR</code></td>
+<td>NOT NULL</td>
+</tr>
+<tr>
+<td>name</td>
+<td><code>VARCHAR(200)</code></td>
+<td>NOT NULL, unique per user (partial index on deleted_at IS NULL)</td>
+</tr>
+<tr>
+<td>description</td>
+<td><code>VARCHAR(500)</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>source</td>
+<td><code>VARCHAR</code></td>
+<td>NOT NULL, CHECK IN ('mcp', 'custom_function')</td>
+</tr>
+<tr>
+<td>input_schema</td>
+<td><code>JSON</code></td>
+<td>nullable, max 256KB (REQ-8)</td>
+</tr>
+<tr>
+<td>created_at</td>
+<td><code>TIMESTAMP</code></td>
+<td>auto</td>
+</tr>
+<tr>
+<td>updated_at</td>
+<td><code>TIMESTAMP</code></td>
+<td>auto</td>
+</tr>
+<tr>
+<td>deleted_at</td>
+<td><code>TIMESTAMP</code></td>
+<td>nullable</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div class="sd-entity-card" data-service-id="compose-db" data-journeys="J-23 J-24 J-25 J-27 J-29">
+<div class="sd-entity-header">
+<h4 class="sd-entity-name">WorkflowEntityRef</h4>
+<span class="sd-entity-svc" data-ref-service="compose-db">compose-db</span>
+</div>
+<table class="sd-field-table">
+<thead><tr><th>Field</th><th>Type</th><th>Constraints</th></tr></thead>
+<tbody>
+<tr>
+<td>id</td>
+<td><code>UUID</code></td>
+<td>PK, auto-generated</td>
+</tr>
+<tr>
+<td>workflow_id</td>
+<td><code>UUID</code></td>
+<td>NOT NULL, indexed, FK -&gt; workflows.id ON DELETE CASCADE</td>
+</tr>
+<tr>
+<td>entity_type</td>
+<td><code>VARCHAR</code></td>
+<td>NOT NULL, CHECK IN ('role', 'schema', 'template')</td>
+</tr>
+<tr>
+<td>entity_id</td>
+<td><code>UUID</code></td>
+<td>NOT NULL, indexed</td>
+</tr>
+<tr>
+<td>user_id</td>
+<td><code>VARCHAR</code></td>
+<td>NOT NULL, indexed</td>
+</tr>
+<tr>
+<td>created_at</td>
+<td><code>TIMESTAMP</code></td>
+<td>auto</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div class="sd-entity-card" data-service-id="compose-db" data-journeys="J-25">
+<div class="sd-entity-header">
+<h4 class="sd-entity-name">ActorSlot</h4>
+<span class="sd-entity-svc" data-ref-service="compose-db">compose-db</span>
+</div>
+<table class="sd-field-table">
+<thead><tr><th>Field</th><th>Type</th><th>Constraints</th></tr></thead>
+<tbody>
+<tr>
+<td>id</td>
+<td><code>UUID</code></td>
+<td>PK, auto-generated</td>
+</tr>
+<tr>
+<td>template_id</td>
+<td><code>UUID</code></td>
+<td>NOT NULL, FK -&gt; custom_task_templates.id ON DELETE CASCADE, indexed</td>
+</tr>
+<tr>
+<td>slot_key</td>
+<td><code>VARCHAR(100)</code></td>
+<td>NOT NULL, UNIQUE (template_id, slot_key)</td>
+</tr>
+<tr>
+<td>default_role_id</td>
+<td><code>UUID</code></td>
+<td>nullable, FK -&gt; roles.id</td>
+</tr>
+<tr>
+<td>description</td>
+<td><code>VARCHAR(500)</code></td>
+<td>nullable</td>
+</tr>
+<tr>
+<td>user_id</td>
+<td><code>VARCHAR</code></td>
+<td>NOT NULL, indexed</td>
+</tr>
+<tr>
+<td>created_at</td>
+<td><code>TIMESTAMP</code></td>
+<td>auto</td>
+</tr>
+<tr>
+<td>updated_at</td>
+<td><code>TIMESTAMP</code></td>
+<td>auto</td>
+</tr>
+</tbody>
+</table>
+</div>
+</div>
+</section>
+<section class="sd-section" id="relations">
+<h2 class="sd-section-title">Entity Relationships</h2>
+<div class="sd-table-wrap">
+<table class="sd-table">
+<thead><tr>
+<th>From</th><th>Relationship</th><th>To</th><th>Label</th>
+</tr></thead>
+<tbody>
+<tr>
+<td>workflow</td>
+<td><span class="sd-rel-kind">one-to-many</span></td>
+<td>workflow-entity-ref</td>
+<td>SF-7's refresh_entity_refs post-commit callback (on Workflow updated event) atomically replaces a workflow's materialized library reference rows. SF-7's purge_entity_refs callback (on Workflow soft_deleted event) removes all rows for the workflow. The reconciliation job resyncs rows that were missed due to callback failure.</td>
+</tr>
+<tr>
+<td>workflow</td>
+<td><span class="sd-rel-kind">many-to-many</span></td>
+<td>role</td>
+<td>Materialized via SF-7-owned workflow_entity_refs rows where entity_type='role' and entity_id=roles.id.</td>
+</tr>
+<tr>
+<td>workflow</td>
+<td><span class="sd-rel-kind">many-to-many</span></td>
+<td>output-schema</td>
+<td>Materialized via SF-7-owned workflow_entity_refs rows where entity_type='schema' and entity_id=output_schemas.id.</td>
+</tr>
+<tr>
+<td>workflow</td>
+<td><span class="sd-rel-kind">many-to-many</span></td>
+<td>task-template</td>
+<td>Materialized via SF-7-owned workflow_entity_refs rows where entity_type='template' and entity_id=custom_task_templates.id.</td>
+</tr>
+<tr>
+<td>role</td>
+<td><span class="sd-rel-kind">many-to-many</span></td>
+<td>tool</td>
+<td>Role.tools JSON array stores tool name strings referencing both built-in constants and SF-7-owned tools table entries. Tool DELETE scans roles directly; tools do not participate in workflow_entity_refs.</td>
+</tr>
+<tr>
+<td>task-template</td>
+<td><span class="sd-rel-kind">one-to-many</span></td>
+<td>actor-slot</td>
+<td>SF-5-owned custom_task_templates extended by SF-7-owned actor_slots rows. One template has zero or more named actor slot definitions; CASCADE delete removes slots when a template is hard-deleted.</td>
+</tr>
+<tr>
+<td>actor-slot</td>
+<td><span class="sd-rel-kind">many-to-many</span></td>
+<td>role</td>
+<td>ActorSlot.default_role_id references a library Role UUID in the SF-5-owned roles table. Multiple slots across different templates can reference the same role.</td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section class="sd-section" id="risks">
+<h2 class="sd-section-title">Risks</h2>
+<ul class="sd-risks-list">
+<li>RISK-1 (Medium): workflow_entity_refs can drift from the true set of workflow entity references if SF-7's post-commit callback fails (e.g., database error in the separate SF-7 transaction after SF-5 has already committed). Because SF-5 has already committed, the workflow save succeeds but the reference index is stale until the next workflow save or reconciliation run. Mitigation: (a) D-SF7-8 reconciliation job (APScheduler, 15-minute interval) deterministically resyncs the index from yaml_content, providing a bounded-time recovery path with no operator intervention; (b) a manual trigger endpoint (POST /api/admin/reconcile-entity-refs) allows on-demand resync when drift is suspected; (c) SF-7's DELETE re-checks on role/schema/template delete provide a second safety net; (d) the ON DELETE CASCADE FK on workflow_entity_refs.workflow_id ensures rows are always cleaned up on hard-delete even if the callback was missed.</li>
+<li>RISK-2 (Medium): Sharing SF-6 editor components in TaskTemplateEditorView may cause state leaks between the workflow editor and the template editor. Mitigation: create isolated editorStore instances via a factory function per editor mount.</li>
+<li>RISK-3 (Low): Picker data freshness - a role or schema created in the library page may not appear in editor pickers until the next fetch cycle. Mitigation: TanStack Query cache invalidation on successful mutations.</li>
+<li>RISK-4 (Low): Inline-to-library promotion race condition if a user has two windows open simultaneously creating the same role name. Mitigation: backend idempotent promotion path returns the existing record on duplicate name when promote=true.</li>
+<li>RISK-5 (Medium): Tool name-based references in Role.tools JSON arrays are fragile - renaming a custom tool via PUT /api/tools/{id} does not automatically update roles that reference the old name. Mitigation: UI warning banner on rename and Role editor refetch from GET /api/tools so stale names become visible when edited.</li>
+<li>RISK-6 (Low): Tool deletion reference checking still scans all user roles in memory. Complexity is O(N*M), where N=roles and M=average tools per role. Mitigation: typical user counts are small, and the query stays scoped to the current user's non-deleted roles.</li>
+<li>RISK-7 (Low): SF-7's Alembic migration must declare its dependency on SF-5's initial migration revision. If SF-5's revision ID changes (e.g., squashed migration), SF-7's down_revision reference breaks. Mitigation: treat SF-5's initial revision ID as a stable anchor; document the dependency explicitly in SF-7's migration file header.</li>
+<li>RISK-8 (Low): The reconciliation job (D-SF7-8) scans all non-deleted workflows on every run. At high workflow counts this may cause a momentary read spike. Mitigation: the batch SELECT reads yaml_content once; writes only touch workflows with diffs; the job interval (default 15 min) is tunable via RECONCILE_JOB_INTERVAL_MINUTES; the job can be disabled entirely via RECONCILE_JOB_ENABLED=false if the hook failure rate is negligible in production.</li>
+</ul>
+</section>
+</main>
+<footer class="sd-footer">
+<p>System Design Document</p>
+</footer>
+<script>
+(function () {
+  'use strict';
+
+  // ── Journey filtering ──────────────────────────────────────────────
+  var activeJourney = '__all__';
+
+  window.__sd_filter = function (journeyId) {
+    activeJourney = journeyId;
+
+    // Update pill states
+    var pills = document.querySelectorAll('.sd-pill');
+    for (var i = 0; i < pills.length; i++) {
+      var p = pills[i];
+      if (p.getAttribute('data-journey') === journeyId) {
+        p.classList.add('sd-pill-active');
+      } else {
+        p.classList.remove('sd-pill-active');
+      }
+    }
+
+    // Filter elements with data-journeys
+    var tagged = document.querySelectorAll('[data-journeys]');
+    for (var j = 0; j < tagged.length; j++) {
+      var el = tagged[j];
+      if (journeyId === '__all__') {
+        el.classList.remove('sd-dimmed');
+      } else {
+        var jList = (el.getAttribute('data-journeys') || '').split(/\s+/);
+        var match = false;
+        for (var k = 0; k < jList.length; k++) {
+          if (jList[k] === journeyId) { match = true; break; }
+        }
+        el.classList.toggle('sd-dimmed', !match);
+      }
+    }
+
+    // Filter elements with data-journey-id (call paths)
+    var cpTagged = document.querySelectorAll('[data-journey-id]');
+    for (var m = 0; m < cpTagged.length; m++) {
+      var cpEl = cpTagged[m];
+      if (journeyId === '__all__') {
+        cpEl.classList.remove('sd-dimmed');
+      } else {
+        var cpJourney = cpEl.getAttribute('data-journey-id') || '';
+        cpEl.classList.toggle('sd-dimmed', cpJourney !== '' && cpJourney !== journeyId);
+      }
+    }
+  };
+
+  // ── Expand / collapse all details ──────────────────────────────────
+  var detailsExpanded = false;
+
+  window.__sd_toggle_details = function () {
+    detailsExpanded = !detailsExpanded;
+    var details = document.querySelectorAll('.sd-call-path');
+    for (var i = 0; i < details.length; i++) {
+      details[i].open = detailsExpanded;
+    }
+    var btn = document.getElementById('sd-toggle-details');
+    if (btn) {
+      btn.textContent = detailsExpanded ? 'Collapse All' : 'Expand All';
+    }
+  };
+
+  // ── Service hover cross-highlighting ───────────────────────────────
+  function highlightService(serviceId, on) {
+    // Highlight service cards
+    var cards = document.querySelectorAll('.sd-service-card[data-service-id="' + serviceId + '"]');
+    for (var i = 0; i < cards.length; i++) {
+      cards[i].classList.toggle('sd-highlight', on);
+    }
+
+    // Highlight entity cards belonging to this service
+    var entities = document.querySelectorAll('.sd-entity-card[data-service-id="' + serviceId + '"]');
+    for (var j = 0; j < entities.length; j++) {
+      entities[j].classList.toggle('sd-highlight', on);
+    }
+
+    // Highlight service references in tables
+    var refs = document.querySelectorAll('.sd-svc-ref[data-ref-service="' + serviceId + '"]');
+    for (var k = 0; k < refs.length; k++) {
+      refs[k].style.fontWeight = on ? '700' : '';
+      refs[k].style.textDecoration = on ? 'underline' : '';
+    }
+  }
+
+  // Attach hover listeners to service cards
+  document.addEventListener('DOMContentLoaded', function () {
+    var svcCards = document.querySelectorAll('.sd-service-card[data-service-id]');
+    for (var i = 0; i < svcCards.length; i++) {
+      (function (card) {
+        var sid = card.getAttribute('data-service-id');
+        card.addEventListener('mouseenter', function () { highlightService(sid, true); });
+        card.addEventListener('mouseleave', function () { highlightService(sid, false); });
+      })(svcCards[i]);
+    }
+
+    // Attach hover listeners to service refs (entity badges, table refs)
+    var svcRefs = document.querySelectorAll('[data-ref-service]');
+    for (var j = 0; j < svcRefs.length; j++) {
+      (function (ref) {
+        var sid = ref.getAttribute('data-ref-service');
+        ref.addEventListener('mouseenter', function () { highlightService(sid, true); });
+        ref.addEventListener('mouseleave', function () { highlightService(sid, false); });
+      })(svcRefs[j]);
+    }
+  });
+
+  // ── Smooth scroll via nav links ────────────────────────────────────
+  var navLinks = document.querySelectorAll('.sd-nav-link');
+  for (var i = 0; i < navLinks.length; i++) {
+    navLinks[i].addEventListener('click', function (e) {
+      var href = this.getAttribute('href');
+      if (href && href.charAt(0) === '#') {
+        var target = document.getElementById(href.substring(1));
+        if (target) {
+          e.preventDefault();
+          var headerHeight = document.querySelector('.sd-header')
+            ? document.querySelector('.sd-header').offsetHeight
+            : 0;
+          var top = target.getBoundingClientRect().top + window.pageYOffset - headerHeight - 16;
+          window.scrollTo({ top: top, behavior: 'smooth' });
+        }
+      }
+    });
+  }
+})();
+</script>
+</body>
+</html>

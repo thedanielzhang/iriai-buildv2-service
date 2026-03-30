@@ -1,0 +1,836 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Charmander ASCII Art Page - System Design</title>
+<style>
+  /* ── Reset & Base ─────────────────────────────────────────────────── */
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  @font-face {
+    font-family: 'Charter';
+    src: local('Charter'), local('Georgia');
+    font-display: swap;
+  }
+
+  :root {
+    --text-primary: #1a1a2e;
+    --text-secondary: #555;
+    --text-muted: #888;
+    --bg-page: #faf9f7;
+    --bg-card: #fff;
+    --border-subtle: rgba(0, 0, 0, 0.06);
+    --border-medium: rgba(0, 0, 0, 0.1);
+    --accent: #2d5be3;
+    --accent-faint: rgba(45, 91, 227, 0.06);
+    --accent-light: rgba(45, 91, 227, 0.12);
+    --content-width: 960px;
+    --gutter: clamp(20px, 5vw, 48px);
+    --radius: 10px;
+    --radius-sm: 6px;
+  }
+
+  html {
+    font-size: 17px;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
+    scroll-behavior: smooth;
+  }
+
+  body {
+    font-family: Charter, Georgia, 'Times New Roman', serif;
+    color: var(--text-primary);
+    background: var(--bg-page);
+    line-height: 1.72;
+    min-height: 100vh;
+  }
+
+  ::selection {
+    background: rgba(45, 91, 227, 0.18);
+    color: inherit;
+  }
+
+  /* ── Header ──────────────────────────────────────────────────────── */
+  .sd-header {
+    position: sticky;
+    top: 0;
+    z-index: 100;
+    background: rgba(250, 249, 247, 0.92);
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
+    border-bottom: 1px solid var(--border-subtle);
+    padding: 0 var(--gutter);
+  }
+
+  .sd-header-inner {
+    max-width: var(--content-width);
+    margin: 0 auto;
+    padding: 20px 0 16px;
+  }
+
+  .sd-title {
+    font-size: clamp(1.8rem, 4vw, 2.6rem);
+    font-weight: 700;
+    line-height: 1.15;
+    letter-spacing: -0.025em;
+    color: var(--text-primary);
+    margin-bottom: 12px;
+  }
+
+  .sd-nav {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-bottom: 12px;
+  }
+
+  .sd-nav-link {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--text-muted);
+    text-decoration: none;
+    padding: 4px 10px;
+    border-radius: var(--radius-sm);
+    transition: color 0.15s, background 0.15s;
+  }
+
+  .sd-nav-link:hover {
+    color: var(--accent);
+    background: var(--accent-faint);
+  }
+
+  /* ── Filter pills ────────────────────────────────────────────────── */
+  .sd-filters {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+    padding-top: 4px;
+  }
+
+  .sd-filter-label {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    margin-right: 4px;
+  }
+
+  .sd-pill {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 12px;
+    font-weight: 500;
+    padding: 3px 12px;
+    border: 1px solid var(--border-medium);
+    border-radius: 100px;
+    background: var(--bg-card);
+    color: var(--text-secondary);
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+
+  .sd-pill:hover {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+
+  .sd-pill-active {
+    background: var(--accent);
+    color: #fff;
+    border-color: var(--accent);
+  }
+
+  .sd-pill-active:hover {
+    background: #1a3fa0;
+    border-color: #1a3fa0;
+    color: #fff;
+  }
+
+  /* ── Main content ────────────────────────────────────────────────── */
+  .sd-main {
+    max-width: var(--content-width);
+    margin: 0 auto;
+    padding: 32px var(--gutter) 80px;
+  }
+
+  .sd-section {
+    margin-bottom: 48px;
+  }
+
+  .sd-section-title {
+    font-size: 1.5rem;
+    font-weight: 700;
+    line-height: 1.3;
+    letter-spacing: -0.01em;
+    margin-bottom: 20px;
+    padding-bottom: 10px;
+    border-bottom: 1px solid var(--border-subtle);
+    color: var(--text-primary);
+  }
+
+  .sd-subsection-title {
+    font-size: 1.1rem;
+    font-weight: 700;
+    margin: 28px 0 14px;
+    color: var(--text-primary);
+  }
+
+  .sd-overview-text {
+    font-size: 1.05rem;
+    line-height: 1.75;
+    color: var(--text-secondary);
+    margin-bottom: 1.4em;
+  }
+
+  .sd-empty {
+    font-style: italic;
+    color: var(--text-muted);
+    padding: 16px 0;
+  }
+
+  /* ── Decisions list ──────────────────────────────────────────────── */
+  .sd-decisions-list {
+    padding-left: 1.6em;
+    color: var(--text-secondary);
+  }
+
+  .sd-decisions-list li {
+    margin-bottom: 0.5em;
+    line-height: 1.6;
+  }
+
+  /* ── Tier labels ─────────────────────────────────────────────────── */
+  .sd-tier-label {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 0.72rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--text-muted);
+    margin: 20px 0 10px;
+  }
+
+  /* ── Service grid ────────────────────────────────────────────────── */
+  .sd-service-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+    gap: 14px;
+    margin-bottom: 8px;
+  }
+
+  .sd-service-card {
+    background: var(--bg-card);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius);
+    padding: 18px;
+    transition: opacity 0.3s, border-color 0.2s, box-shadow 0.2s;
+    cursor: default;
+  }
+
+  .sd-service-card:hover {
+    border-color: var(--accent);
+    box-shadow: 0 2px 12px rgba(45, 91, 227, 0.08);
+  }
+
+  .sd-service-card.sd-highlight {
+    border-color: var(--accent);
+    box-shadow: 0 2px 16px rgba(45, 91, 227, 0.14);
+  }
+
+  .sd-service-icon {
+    font-size: 1.5rem;
+    margin-bottom: 8px;
+  }
+
+  .sd-service-name {
+    font-weight: 700;
+    font-size: 1rem;
+    color: var(--text-primary);
+    margin-bottom: 2px;
+  }
+
+  .sd-service-kind {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 0.72rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-muted);
+    margin-bottom: 6px;
+  }
+
+  .sd-service-tech {
+    font-family: 'SF Mono', 'Fira Code', Menlo, Consolas, monospace;
+    font-size: 0.78rem;
+    color: #1a3fa0;
+    background: var(--accent-faint);
+    display: inline-block;
+    padding: 1px 8px;
+    border-radius: 4px;
+    margin-bottom: 4px;
+  }
+
+  .sd-service-port {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 0.75rem;
+    color: var(--text-muted);
+    margin-bottom: 6px;
+  }
+
+  .sd-service-desc {
+    font-size: 0.88rem;
+    color: var(--text-secondary);
+    line-height: 1.55;
+    margin-top: 6px;
+  }
+
+  /* ── Connections list ────────────────────────────────────────────── */
+  .sd-connections-list {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .sd-connection-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 16px;
+    background: var(--bg-card);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-sm);
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 0.88rem;
+    transition: opacity 0.3s;
+    flex-wrap: wrap;
+  }
+
+  .sd-conn-from, .sd-conn-to {
+    font-weight: 600;
+    color: var(--text-primary);
+  }
+
+  .sd-conn-arrow {
+    color: var(--accent);
+    font-weight: 700;
+  }
+
+  .sd-conn-proto {
+    font-size: 0.78rem;
+    color: var(--text-muted);
+  }
+
+  .sd-conn-label {
+    color: var(--text-secondary);
+    font-weight: 400;
+    margin-left: auto;
+  }
+
+  /* ── Call paths (details/summary) ────────────────────────────────── */
+  .sd-call-path {
+    background: var(--bg-card);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius);
+    margin-bottom: 10px;
+    transition: opacity 0.3s;
+    overflow: hidden;
+  }
+
+  .sd-call-path summary {
+    padding: 14px 18px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-weight: 600;
+    font-size: 0.95rem;
+    color: var(--text-primary);
+    list-style: none;
+  }
+
+  .sd-call-path summary::-webkit-details-marker { display: none; }
+
+  .sd-call-path summary::before {
+    content: '\25B6';
+    font-size: 0.65rem;
+    color: var(--text-muted);
+    transition: transform 0.2s;
+    flex-shrink: 0;
+  }
+
+  .sd-call-path[open] summary::before {
+    transform: rotate(90deg);
+  }
+
+  .sd-cp-name { flex: 1; }
+
+  .sd-cp-journey {
+    font-size: 0.72rem;
+    font-weight: 500;
+    color: var(--accent);
+    background: var(--accent-faint);
+    padding: 2px 8px;
+    border-radius: 100px;
+  }
+
+  .sd-cp-desc {
+    padding: 0 18px 12px;
+    font-size: 0.9rem;
+    color: var(--text-secondary);
+    line-height: 1.6;
+  }
+
+  /* ── Sequence diagram rows ───────────────────────────────────────── */
+  .sd-sequence {
+    margin: 0 18px 18px;
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-sm);
+    overflow-x: auto;
+  }
+
+  .sd-seq-header, .sd-seq-row {
+    display: grid;
+    grid-template-columns: 40px 1fr 32px 1fr 2fr 1.5fr;
+    gap: 8px;
+    padding: 8px 14px;
+    align-items: start;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 0.82rem;
+  }
+
+  .sd-seq-header {
+    background: rgba(0, 0, 0, 0.02);
+    font-weight: 700;
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--text-muted);
+    border-bottom: 1px solid var(--border-subtle);
+  }
+
+  .sd-seq-row {
+    border-bottom: 1px solid var(--border-subtle);
+    color: var(--text-secondary);
+  }
+
+  .sd-seq-row:last-child { border-bottom: none; }
+
+  .sd-seq-row:hover { background: rgba(45, 91, 227, 0.02); }
+
+  .sd-seq-num {
+    font-weight: 700;
+    color: var(--accent);
+    text-align: center;
+  }
+
+  .sd-seq-from, .sd-seq-to { font-weight: 600; color: var(--text-primary); }
+
+  .sd-seq-arrow { color: var(--accent); text-align: center; font-weight: 700; }
+
+  .sd-seq-action { color: var(--text-primary); }
+
+  .sd-seq-detail {
+    font-size: 0.78rem;
+    color: var(--text-muted);
+    margin-top: 2px;
+  }
+
+  .sd-seq-returns {
+    font-family: 'SF Mono', 'Fira Code', Menlo, Consolas, monospace;
+    font-size: 0.78rem;
+    color: var(--text-muted);
+  }
+
+  /* ── Expand/collapse button ──────────────────────────────────────── */
+  .sd-expand-btn {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 12px;
+    font-weight: 500;
+    padding: 4px 14px;
+    border: 1px solid var(--border-medium);
+    border-radius: var(--radius-sm);
+    background: var(--bg-card);
+    color: var(--text-secondary);
+    cursor: pointer;
+    margin-bottom: 14px;
+    transition: all 0.15s;
+  }
+
+  .sd-expand-btn:hover {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+
+  /* ── Tables ──────────────────────────────────────────────────────── */
+  .sd-table-wrap {
+    overflow-x: auto;
+  }
+
+  .sd-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.88rem;
+    border-radius: var(--radius);
+    overflow: hidden;
+    border: 1px solid var(--border-subtle);
+  }
+
+  .sd-table th, .sd-table td {
+    padding: 10px 14px;
+    text-align: left;
+    border-bottom: 1px solid var(--border-subtle);
+  }
+
+  .sd-table th {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-weight: 600;
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--text-muted);
+    background: rgba(0, 0, 0, 0.02);
+  }
+
+  .sd-table tr:last-child td { border-bottom: none; }
+  .sd-table tr:hover td { background: rgba(45, 91, 227, 0.02); }
+
+  .sd-table code {
+    font-family: 'SF Mono', 'Fira Code', Menlo, Consolas, monospace;
+    font-size: 0.82em;
+    background: var(--accent-faint);
+    padding: 2px 6px;
+    border-radius: 4px;
+    color: #1a3fa0;
+    word-break: break-all;
+  }
+
+  .sd-svc-ref {
+    cursor: pointer;
+    font-weight: 500;
+    color: var(--accent);
+    transition: color 0.15s;
+  }
+
+  .sd-svc-ref:hover { color: #1a3fa0; }
+
+  .sd-rel-kind {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 0.78rem;
+    font-weight: 500;
+    color: var(--text-muted);
+    background: rgba(0,0,0,0.03);
+    padding: 2px 8px;
+    border-radius: 4px;
+  }
+
+  /* ── Entity grid ─────────────────────────────────────────────────── */
+  .sd-entity-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+    gap: 14px;
+  }
+
+  .sd-entity-card {
+    background: var(--bg-card);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius);
+    overflow: hidden;
+    transition: opacity 0.3s, border-color 0.2s, box-shadow 0.2s;
+  }
+
+  .sd-entity-card:hover {
+    border-color: var(--accent);
+    box-shadow: 0 2px 12px rgba(45, 91, 227, 0.08);
+  }
+
+  .sd-entity-card.sd-highlight {
+    border-color: var(--accent);
+    box-shadow: 0 2px 16px rgba(45, 91, 227, 0.14);
+  }
+
+  .sd-entity-header {
+    padding: 14px 16px 10px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    border-bottom: 1px solid var(--border-subtle);
+  }
+
+  .sd-entity-name {
+    font-size: 1rem;
+    font-weight: 700;
+    color: var(--text-primary);
+  }
+
+  .sd-entity-svc {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 0.72rem;
+    font-weight: 500;
+    color: var(--accent);
+    background: var(--accent-faint);
+    padding: 2px 8px;
+    border-radius: 100px;
+    cursor: pointer;
+  }
+
+  .sd-field-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.82rem;
+  }
+
+  .sd-field-table th, .sd-field-table td {
+    padding: 7px 16px;
+    text-align: left;
+    border-bottom: 1px solid var(--border-subtle);
+  }
+
+  .sd-field-table th {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-weight: 600;
+    font-size: 0.68rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--text-muted);
+    background: rgba(0, 0, 0, 0.015);
+  }
+
+  .sd-field-table tr:last-child td { border-bottom: none; }
+  .sd-field-table tr:hover td { background: rgba(45, 91, 227, 0.02); }
+
+  .sd-field-table code {
+    font-family: 'SF Mono', 'Fira Code', Menlo, Consolas, monospace;
+    font-size: 0.85em;
+    background: var(--accent-faint);
+    padding: 1px 5px;
+    border-radius: 3px;
+    color: #1a3fa0;
+  }
+
+  /* ── Risks ───────────────────────────────────────────────────────── */
+  .sd-risks-list {
+    list-style: none;
+    padding: 0;
+  }
+
+  .sd-risks-list li {
+    padding: 10px 16px;
+    margin-bottom: 6px;
+    background: #fef3f2;
+    border: 1px solid rgba(239, 68, 68, 0.12);
+    border-left: 3px solid #ef4444;
+    border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+    font-size: 0.92rem;
+    color: var(--text-secondary);
+    line-height: 1.6;
+  }
+
+  /* ── Footer ──────────────────────────────────────────────────────── */
+  .sd-footer {
+    max-width: var(--content-width);
+    margin: 0 auto;
+    padding: 24px var(--gutter) 48px;
+    text-align: center;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 0.75rem;
+    color: var(--text-muted);
+    border-top: 1px solid var(--border-subtle);
+  }
+
+  /* ── Dimmed state for journey filtering ──────────────────────────── */
+  .sd-dimmed {
+    opacity: 0.15 !important;
+    pointer-events: none;
+  }
+
+  /* ── Entrance animation ──────────────────────────────────────────── */
+  @keyframes sd-fade-up {
+    from { opacity: 0; transform: translateY(12px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+
+  .sd-header, .sd-main {
+    animation: sd-fade-up 0.45s ease both;
+  }
+
+  .sd-main { animation-delay: 0.08s; }
+
+  /* ── Responsive ──────────────────────────────────────────────────── */
+  @media (max-width: 700px) {
+    html { font-size: 15px; }
+    .sd-service-grid { grid-template-columns: 1fr; }
+    .sd-entity-grid { grid-template-columns: 1fr; }
+    .sd-seq-header, .sd-seq-row {
+      grid-template-columns: 32px 1fr 24px 1fr 1.5fr 1fr;
+      font-size: 0.75rem;
+    }
+  }
+
+  @media (max-width: 480px) {
+    .sd-header-inner { padding: 16px 0 12px; }
+    .sd-nav { gap: 4px; }
+    .sd-nav-link { font-size: 12px; padding: 3px 8px; }
+    .sd-filters { gap: 4px; }
+  }
+</style>
+</head>
+<body>
+<header class="sd-header">
+<div class="sd-header-inner">
+<h1 class="sd-title">Charmander ASCII Art Page</h1>
+<nav class="sd-nav" id="sd-nav">
+<a href="#overview" class="sd-nav-link">Overview</a>
+</nav>
+</div>
+</header>
+<main class="sd-main">
+<section class="sd-section" id="overview">
+<h2 class="sd-section-title">Overview</h2>
+<p class="sd-overview-text">A new standalone static HTML page (charmander.html) that displays a Charmander ASCII art rendering, following the same design pattern as the existing Pikachu page. The page uses a warm orange-cream background (#fff3e0) to reflect Charmander's fire-type identity, centered flexbox layout, Courier New 14px monospace font, and inline CSS with no JavaScript or external dependencies.</p>
+</section>
+<section class="sd-section" id="topology">
+<h2 class="sd-section-title">Service Topology</h2>
+<p class="sd-empty">No services defined.</p>
+</section>
+</main>
+<footer class="sd-footer">
+<p>System Design Document</p>
+</footer>
+<script>
+(function () {
+  'use strict';
+
+  // ── Journey filtering ──────────────────────────────────────────────
+  var activeJourney = '__all__';
+
+  window.__sd_filter = function (journeyId) {
+    activeJourney = journeyId;
+
+    // Update pill states
+    var pills = document.querySelectorAll('.sd-pill');
+    for (var i = 0; i < pills.length; i++) {
+      var p = pills[i];
+      if (p.getAttribute('data-journey') === journeyId) {
+        p.classList.add('sd-pill-active');
+      } else {
+        p.classList.remove('sd-pill-active');
+      }
+    }
+
+    // Filter elements with data-journeys
+    var tagged = document.querySelectorAll('[data-journeys]');
+    for (var j = 0; j < tagged.length; j++) {
+      var el = tagged[j];
+      if (journeyId === '__all__') {
+        el.classList.remove('sd-dimmed');
+      } else {
+        var jList = (el.getAttribute('data-journeys') || '').split(/\s+/);
+        var match = false;
+        for (var k = 0; k < jList.length; k++) {
+          if (jList[k] === journeyId) { match = true; break; }
+        }
+        el.classList.toggle('sd-dimmed', !match);
+      }
+    }
+
+    // Filter elements with data-journey-id (call paths)
+    var cpTagged = document.querySelectorAll('[data-journey-id]');
+    for (var m = 0; m < cpTagged.length; m++) {
+      var cpEl = cpTagged[m];
+      if (journeyId === '__all__') {
+        cpEl.classList.remove('sd-dimmed');
+      } else {
+        var cpJourney = cpEl.getAttribute('data-journey-id') || '';
+        cpEl.classList.toggle('sd-dimmed', cpJourney !== '' && cpJourney !== journeyId);
+      }
+    }
+  };
+
+  // ── Expand / collapse all details ──────────────────────────────────
+  var detailsExpanded = false;
+
+  window.__sd_toggle_details = function () {
+    detailsExpanded = !detailsExpanded;
+    var details = document.querySelectorAll('.sd-call-path');
+    for (var i = 0; i < details.length; i++) {
+      details[i].open = detailsExpanded;
+    }
+    var btn = document.getElementById('sd-toggle-details');
+    if (btn) {
+      btn.textContent = detailsExpanded ? 'Collapse All' : 'Expand All';
+    }
+  };
+
+  // ── Service hover cross-highlighting ───────────────────────────────
+  function highlightService(serviceId, on) {
+    // Highlight service cards
+    var cards = document.querySelectorAll('.sd-service-card[data-service-id="' + serviceId + '"]');
+    for (var i = 0; i < cards.length; i++) {
+      cards[i].classList.toggle('sd-highlight', on);
+    }
+
+    // Highlight entity cards belonging to this service
+    var entities = document.querySelectorAll('.sd-entity-card[data-service-id="' + serviceId + '"]');
+    for (var j = 0; j < entities.length; j++) {
+      entities[j].classList.toggle('sd-highlight', on);
+    }
+
+    // Highlight service references in tables
+    var refs = document.querySelectorAll('.sd-svc-ref[data-ref-service="' + serviceId + '"]');
+    for (var k = 0; k < refs.length; k++) {
+      refs[k].style.fontWeight = on ? '700' : '';
+      refs[k].style.textDecoration = on ? 'underline' : '';
+    }
+  }
+
+  // Attach hover listeners to service cards
+  document.addEventListener('DOMContentLoaded', function () {
+    var svcCards = document.querySelectorAll('.sd-service-card[data-service-id]');
+    for (var i = 0; i < svcCards.length; i++) {
+      (function (card) {
+        var sid = card.getAttribute('data-service-id');
+        card.addEventListener('mouseenter', function () { highlightService(sid, true); });
+        card.addEventListener('mouseleave', function () { highlightService(sid, false); });
+      })(svcCards[i]);
+    }
+
+    // Attach hover listeners to service refs (entity badges, table refs)
+    var svcRefs = document.querySelectorAll('[data-ref-service]');
+    for (var j = 0; j < svcRefs.length; j++) {
+      (function (ref) {
+        var sid = ref.getAttribute('data-ref-service');
+        ref.addEventListener('mouseenter', function () { highlightService(sid, true); });
+        ref.addEventListener('mouseleave', function () { highlightService(sid, false); });
+      })(svcRefs[j]);
+    }
+  });
+
+  // ── Smooth scroll via nav links ────────────────────────────────────
+  var navLinks = document.querySelectorAll('.sd-nav-link');
+  for (var i = 0; i < navLinks.length; i++) {
+    navLinks[i].addEventListener('click', function (e) {
+      var href = this.getAttribute('href');
+      if (href && href.charAt(0) === '#') {
+        var target = document.getElementById(href.substring(1));
+        if (target) {
+          e.preventDefault();
+          var headerHeight = document.querySelector('.sd-header')
+            ? document.querySelector('.sd-header').offsetHeight
+            : 0;
+          var top = target.getBoundingClientRect().top + window.pageYOffset - headerHeight - 16;
+          window.scrollTo({ top: top, behavior: 'smooth' });
+        }
+      }
+    });
+  }
+})();
+</script>
+</body>
+</html>

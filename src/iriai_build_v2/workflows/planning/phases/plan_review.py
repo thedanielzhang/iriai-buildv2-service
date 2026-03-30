@@ -37,12 +37,49 @@ from ....roles import (
     user,
 )
 from ..._common import compile_artifacts, interview_gate_review, targeted_revision
-from ..._common._helpers import _extract_revision_plan
 from ..._common._tasks import HostedInterview
 
 logger = logging.getLogger(__name__)
 
 WARN_AFTER_CYCLES = 3
+
+
+def _parse_revision_plan_from_discussion(discussion_text: str) -> RevisionPlan | None:
+    """Extract RevisionPlan from a discussion file that contains JSON output.
+
+    The discussion file is typically the structured JSON output from the
+    HostedInterview, wrapped in markdown code fences.
+    """
+    import json
+    import re
+
+    # Strip markdown code fences if present
+    text = discussion_text.strip()
+    match = re.search(r"```(?:json)?\s*\n(.*?)\n```", text, re.DOTALL)
+    raw = match.group(1) if match else text
+
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        logger.warning("Could not parse discussion JSON for revision plan")
+        return None
+
+    # The JSON may be the full Envelope (with revision_plan nested)
+    # or just the ReviewOutcome directly
+    rp_data = None
+    if "revision_plan" in data:
+        rp_data = data["revision_plan"]
+    elif "output" in data and isinstance(data["output"], dict):
+        rp_data = data["output"].get("revision_plan")
+
+    if not rp_data:
+        return None
+
+    try:
+        return RevisionPlan.model_validate(rp_data)
+    except Exception:
+        logger.warning("Could not validate revision plan from discussion JSON")
+        return None
 
 _SCOPE_PREFIX = (
     "SCOPE: Only review artifacts provided in your context. "
@@ -65,7 +102,9 @@ _COMPLETENESS_PROMPT = (
     "9. Decision IDs (D-*) referenced in citations that don't resolve\n"
     "10. Code references that don't match actual file paths\n"
     "11. Stale references to removed features or APIs\n\n"
-    "Every gap gets its own concern entry. A clean PASS means you missed something."
+    "Every genuine gap gets its own concern entry. Only flag issues that would cause "
+    "implementation failures or specification contradictions. If the artifacts are "
+    "sound, report approved=true with an empty concerns list."
 )
 
 _SECURITY_PROMPT = (
@@ -81,7 +120,9 @@ _SECURITY_PROMPT = (
     "6. Secrets/credentials hardcoded in task instructions\n"
     "7. CORS/CSRF gaps in the API design\n"
     "8. Database migrations without rollback steps\n\n"
-    "Every gap gets its own concern entry. A clean PASS means you missed something."
+    "Every genuine gap gets its own concern entry. Only flag issues that would cause "
+    "implementation failures or specification contradictions. If the artifacts are "
+    "sound, report approved=true with an empty concerns list."
 )
 
 _EDGE_PROMPT = (
@@ -181,15 +222,24 @@ async def _build_edge_review_context(
     runner: WorkflowRunner,
     feature: Feature,
     edge: SubfeatureEdge,
+    decomposition: SubfeatureDecomposition | None = None,
 ) -> str:
     """Build review context for one cross-SF edge: full artifacts of both SFs."""
+    # Build ID→slug map (edges use SF-1, artifacts use declarative-schema)
+    id_to_slug: dict[str, str] = {}
+    if decomposition:
+        for sf in decomposition.subfeatures:
+            id_to_slug[sf.id] = sf.slug
+            id_to_slug[sf.slug] = sf.slug  # passthrough if already a slug
+
     parts: list[str] = [
         f"## Edge: {edge.from_subfeature} → {edge.to_subfeature}\n"
         f"**Interface type:** {edge.interface_type}\n"
         f"**Description:** {edge.description}\n"
         f"**Data contract:** {edge.data_contract}\n"
     ]
-    for slug in (edge.from_subfeature, edge.to_subfeature):
+    for sf_ref in (edge.from_subfeature, edge.to_subfeature):
+        slug = id_to_slug.get(sf_ref, sf_ref)
         for prefix in ("prd", "design", "plan", "system-design"):
             text = await runner.artifacts.get(f"{prefix}:{slug}", feature=feature)
             if text:
@@ -223,6 +273,43 @@ def _deduplicate_edges(edges: list[SubfeatureEdge]) -> list[SubfeatureEdge]:
             seen.add(pair)
             unique.append(edge)
     return unique
+
+
+async def _load_review_discussion(
+    runner: WorkflowRunner,
+    feature: Feature,
+    key: str,
+) -> str:
+    """Load a discussion artifact from DB, or recover it from the mirror file."""
+    discussion_text = await runner.artifacts.get(key, feature=feature) or ""
+    if discussion_text:
+        return discussion_text
+
+    mirror = runner.services.get("artifact_mirror")
+    if not mirror:
+        return ""
+
+    from ....services.artifacts import _key_to_path
+
+    path = mirror.feature_dir(feature.id) / _key_to_path(key)
+    if not path.exists():
+        return ""
+
+    discussion_text = path.read_text(encoding="utf-8").strip()
+    if not discussion_text:
+        return ""
+
+    await runner.artifacts.put(key, discussion_text, feature=feature)
+    logger.info("Recovered %s from mirror file %s", key, path)
+    return discussion_text
+
+
+def _discussion_approved_as_is(discussion_text: str) -> bool:
+    for line in discussion_text.splitlines():
+        normalized = line.strip().lower()
+        if normalized.startswith("**outcome:**"):
+            return "no changes needed" in normalized or "accepted artifacts as-is" in normalized
+    return False
 
 
 def _is_valid_report(report: str) -> bool:
@@ -318,6 +405,30 @@ class PlanReviewPhase(Phase):
     ) -> BuildState:
         decomposition = await self._load_decomposition(state, runner, feature)
 
+        # ── Skip check: manual bypass via plan-review-complete marker ──
+        complete_marker = await runner.artifacts.get(
+            "plan-review-complete", feature=feature,
+        )
+        if not complete_marker:
+            # Fallback: check filesystem via artifact mirror
+            mirror = runner.services.get("artifact_mirror")
+            if mirror:
+                from pathlib import Path
+                marker_path = Path(mirror.feature_dir(feature.id)) / "plan-review-complete.md"
+                if marker_path.exists():
+                    complete_marker = marker_path.read_text(encoding="utf-8").strip()
+        if complete_marker:
+            logger.info("plan-review-complete marker found — skipping plan review entirely")
+            # Load per-SF artifacts into state so downstream phases have them
+            state.prd = await runner.artifacts.get("prd", feature=feature) or state.prd
+            state.design = await runner.artifacts.get("design", feature=feature) or state.design
+            state.plan = await runner.artifacts.get("plan", feature=feature) or state.plan
+            state.system_design = (
+                await runner.artifacts.get("system-design", feature=feature)
+                or state.system_design
+            )
+            return state
+
         # ── Step 1: Review loop ─────────────────────────────────────
         cycle = 0
         while True:
@@ -325,7 +436,18 @@ class PlanReviewPhase(Phase):
             existing_report = await runner.artifacts.get(
                 f"plan-review-cycle-{cycle + 1}", feature=feature,
             )
-            if existing_report and _is_valid_report(existing_report):
+            already_revised = await runner.artifacts.get(
+                f"plan-review-cycle-{cycle + 1}-revised", feature=feature,
+            )
+            if existing_report and already_revised:
+                # Report exists AND revisions already applied — advance
+                logger.info(
+                    "Cycle %d already revised — advancing to next cycle",
+                    cycle + 1,
+                )
+                cycle += 1
+                continue
+            elif existing_report and _is_valid_report(existing_report):
                 logger.info(
                     "Valid review report exists for cycle %d — skipping to discussion",
                     cycle + 1,
@@ -355,7 +477,7 @@ class PlanReviewPhase(Phase):
 
                 unique_edges = _deduplicate_edges(decomposition.edges)
                 for edge in unique_edges:
-                    ctx = await _build_edge_review_context(runner, feature, edge)
+                    ctx = await _build_edge_review_context(runner, feature, edge, decomposition)
                     all_tasks.append(Ask(
                         actor=_make_parallel_actor(
                             _edge_reviewer,
@@ -422,60 +544,137 @@ class PlanReviewPhase(Phase):
                 )
 
             # ── Interactive discussion with user ─────────────────────
-            review_envelope: Envelope[ReviewOutcome] = await runner.run(
-                HostedInterview(
-                    questioner=lead_architect_gate_reviewer,
-                    responder=user,
-                    initial_prompt=(
-                        f"## Plan Review Cycle {cycle + 1} — Issues Found\n\n"
-                        f"{report}\n\n"
-                        + (f"**[View Full Report]({report_url})**\n\n" if report_url else "")
-                        + "I've identified the issues above across all subfeatures and "
-                        "cross-subfeature edges.\n\n"
-                        "Present the most critical issues to the user in your `question` field. "
-                        "Group related concerns into themes and ask for the user's decision on each. "
-                        "Do NOT set `complete = true` until the user has responded to all "
-                        "critical issues.\n\n"
-                        "When the user has addressed all concerns:\n"
-                        "- **'No changes needed'** → set approved=true, complete=true\n"
-                        "- **'Dispatch fixes'** → set approved=false with revision_plan "
-                        "containing the user's decisions, complete=true\n"
+            discussion_key = f"plan-review-discussion-{cycle + 1}"
+            discussion_text = await _load_review_discussion(runner, feature, discussion_key)
+
+            revision_plan = None
+
+            if discussion_text:
+                logger.info(
+                    "Recovered existing discussion for cycle %d — skipping interview rerun",
+                    cycle + 1,
+                )
+                if _discussion_approved_as_is(discussion_text):
+                    logger.info("Recovered discussion accepts artifacts as-is — skipping revisions")
+                    break
+                # Extract revision plan from the discussion JSON
+                revision_plan = _parse_revision_plan_from_discussion(discussion_text)
+            else:
+                # Collect prior decisions for discussion context
+                prior_context = ""
+                for prior_cycle in range(cycle):
+                    prior_disc = await _load_review_discussion(
+                        runner, feature,
+                        f"plan-review-discussion-{prior_cycle + 1}",
+                    )
+                    if prior_disc:
+                        prior_context += (
+                            f"\n\n### Prior Cycle {prior_cycle + 1} Decisions\n"
+                            f"{prior_disc}\n"
+                        )
+
+                review_envelope: Envelope[ReviewOutcome] = await runner.run(
+                    HostedInterview(
+                        questioner=lead_architect_gate_reviewer,
+                        responder=user,
+                        initial_prompt=(
+                            f"## Plan Review Cycle {cycle + 1} — Issues Found\n\n"
+                            f"{report}\n\n"
+                            + (f"**[View Full Report]({report_url})**\n\n" if report_url else "")
+                            + (
+                                f"## Prior Decisions (MANDATORY)\n"
+                                f"The following decisions from prior cycles are already approved "
+                                f"and MUST be enforced. Do NOT re-negotiate them. Only raise "
+                                f"issues that are NEW or that prior decisions failed to address.\n"
+                                f"{prior_context}\n\n"
+                                if prior_context else ""
+                            )
+                            + "IMPORTANT: Your revision_plan MUST include ALL findings, not "
+                            "just new issues. For findings covered by prior D-GR decisions, "
+                            "include them as revision requests that reference the applicable "
+                            "decision — these need to be dispatched to revision agents who "
+                            "will apply the fix. Only present NEW issues to the user for "
+                            "discussion in your `question` field.\n\n"
+                            "Do NOT set `complete = true` until the user has responded to all "
+                            "new issues.\n\n"
+                            "When the user has addressed all new concerns:\n"
+                            "- **'No changes needed'** → set approved=true, complete=true\n"
+                            "- **'Dispatch fixes'** → set approved=false with revision_plan "
+                            "containing BOTH prior-decision enforcement AND new user decisions, "
+                            "complete=true\n"
+                        ),
+                        output_type=Envelope[ReviewOutcome],
+                        done=envelope_done,
+                        artifact_key=discussion_key,
+                        artifact_label=f"Plan Review Discussion — Cycle {cycle + 1}",
                     ),
-                    output_type=Envelope[ReviewOutcome],
-                    done=envelope_done,
-                    artifact_key=f"plan-review-discussion-{cycle + 1}",
-                    artifact_label=f"Plan Review Discussion — Cycle {cycle + 1}",
-                ),
-                feature,
-                phase_name=self.name,
-            )
+                    feature,
+                    phase_name=self.name,
+                )
 
-            # Check if user said "no changes needed"
-            outcome = review_envelope.output if review_envelope else None
-            if outcome and outcome.approved:
-                logger.info("User accepted artifacts as-is — skipping revisions")
-                break
+                outcome = review_envelope.output if review_envelope else None
+                if outcome and outcome.approved:
+                    logger.info("User accepted artifacts as-is — skipping revisions")
+                    break
 
-            # ── Extract revision plan from discussion ────────────────
-            discussion_text = await runner.artifacts.get(
-                f"plan-review-discussion-{cycle + 1}", feature=feature,
-            ) or ""
-
-            revision_plan = await _extract_revision_plan(
-                runner, feature, self.name,
-                f"{report}\n\n## User Discussion\n\n{discussion_text}",
-                decomposition,
-            )
+                # Use revision plan directly from discussion output (opus)
+                if outcome and outcome.revision_plan and outcome.revision_plan.requests:
+                    revision_plan = outcome.revision_plan
+                else:
+                    # Fallback: parse from the written discussion file
+                    discussion_text = await _load_review_discussion(
+                        runner, feature, discussion_key,
+                    )
+                    if discussion_text:
+                        revision_plan = _parse_revision_plan_from_discussion(
+                            discussion_text,
+                        )
 
             if revision_plan and revision_plan.requests:
-                revision_results: list[str] = []
+                # ── Collect all prior decisions for revision context ──
+                prior_decisions_parts: list[str] = []
+                for prior_cycle in range(cycle + 1):
+                    prior_disc = await runner.artifacts.get(
+                        f"plan-review-discussion-{prior_cycle + 1}",
+                        feature=feature,
+                    )
+                    if not prior_disc:
+                        # Try loading from disk via artifact mirror
+                        mirror = runner.services.get("artifact_mirror")
+                        if mirror:
+                            from pathlib import Path
+                            disc_path = (
+                                Path(mirror.feature_dir(feature.id))
+                                / f"plan-review-discussion-{prior_cycle + 1}.md"
+                            )
+                            if disc_path.exists():
+                                prior_disc = disc_path.read_text(encoding="utf-8")
+                    if prior_disc:
+                        prior_decisions_parts.append(
+                            f"### Cycle {prior_cycle + 1} Decisions\n{prior_disc}"
+                        )
+                # Also include current cycle's new_decisions
+                if revision_plan.new_decisions:
+                    prior_decisions_parts.append(
+                        f"### Cycle {cycle + 1} New Decisions\n"
+                        + "\n".join(f"- {d}" for d in revision_plan.new_decisions)
+                    )
+                prior_decisions = "\n\n".join(prior_decisions_parts)
+
+                # ── Phase 1: Dispatch all revisions in parallel ──────
+                revision_coros = []
+                revision_meta: list[tuple[str, Any, str, str]] = []
 
                 for prefix, base_role, output_type, compiler_actor, broad_key in _ARTIFACT_CONFIGS:
-                    # Check if any request affects SFs that have this artifact type
                     affected_requests = []
                     for req in revision_plan.requests:
+                        # Skip if request specifies artifact types and this one isn't listed
+                        if req.affected_artifact_types and prefix not in req.affected_artifact_types:
+                            continue
                         for slug in req.affected_subfeatures:
-                            has = await runner.artifacts.get(f"{prefix}:{slug}", feature=feature)
+                            has = await runner.artifacts.get(
+                                f"{prefix}:{slug}", feature=feature,
+                            )
                             if has:
                                 affected_requests.append(req)
                                 break
@@ -483,12 +682,8 @@ class PlanReviewPhase(Phase):
                         continue
 
                     filtered_plan = RevisionPlan(requests=affected_requests)
-
-                    old_text = await runner.artifacts.get(prefix, feature=feature) or ""
-                    old_size = len(old_text)
-
-                    try:
-                        await targeted_revision(
+                    revision_coros.append(
+                        targeted_revision(
                             runner, feature, self.name,
                             revision_plan=filtered_plan,
                             decomposition=decomposition,
@@ -496,38 +691,91 @@ class PlanReviewPhase(Phase):
                             output_type=output_type,
                             artifact_prefix=prefix,
                             context_keys=["project", "scope"],
+                            checkpoint_prefix=f"cycle-{cycle + 1}",
+                            prior_decisions=prior_decisions,
                         )
-                        new_text = await compile_artifacts(
+                    )
+                    revision_meta.append((prefix, compiler_actor, broad_key, prefix))
+
+                logger.info(
+                    "Dispatching revisions for %d artifact types in parallel",
+                    len(revision_coros),
+                )
+                rev_results = await asyncio.gather(
+                    *revision_coros, return_exceptions=True,
+                )
+                for i, res in enumerate(rev_results):
+                    if isinstance(res, BaseException):
+                        logger.error(
+                            "Revision for %s crashed: %s",
+                            revision_meta[i][0], res,
+                        )
+
+                # ── Phase 2: Recompile all affected types in parallel ─
+                old_texts: dict[str, str] = {}
+                for prefix, _ca, _bk, _fk in revision_meta:
+                    old_texts[prefix] = (
+                        await runner.artifacts.get(prefix, feature=feature) or ""
+                    )
+
+                compile_results = await asyncio.gather(
+                    *[
+                        compile_artifacts(
                             runner, feature, self.name,
-                            compiler_actor=compiler_actor,
+                            compiler_actor=ca,
                             decomposition=decomposition,
                             artifact_prefix=prefix,
-                            broad_key=broad_key,
-                            final_key=prefix,
+                            broad_key=bk,
+                            final_key=fk,
                         )
-                        new_size = len(new_text) if new_text else 0
+                        for prefix, ca, bk, fk in revision_meta
+                    ],
+                    return_exceptions=True,
+                )
 
-                        # Size guard
-                        if old_size > 0 and new_size < old_size * 0.5:
-                            logger.error(
-                                "Rejecting %s recompilation: %d → %d bytes",
-                                prefix, old_size, new_size,
-                            )
-                            await runner.artifacts.put(prefix, old_text, feature=feature)
-                            revision_results.append(
-                                f"{prefix}: REJECTED (size guard: {old_size} → {new_size})"
-                            )
-                        else:
-                            await runner.artifacts.put(prefix, new_text, feature=feature)
-                            setattr(state, prefix.replace("-", "_"), new_text)
-                            if hosting:
-                                await hosting.update(feature.id, prefix, new_text)
-                            revision_results.append(
-                                f"{prefix}: revised ({old_size} → {new_size} bytes)"
-                            )
-                    except Exception as exc:
-                        logger.error("Failed to revise %s: %s", prefix, exc, exc_info=True)
-                        revision_results.append(f"{prefix}: FAILED ({exc})")
+                # ── Phase 3: Size guard + store ───────────────────────
+                revision_results: list[str] = []
+                for i, (prefix, _ca, _bk, _fk) in enumerate(revision_meta):
+                    if isinstance(rev_results[i], BaseException):
+                        revision_results.append(f"{prefix}: FAILED (revision crashed)")
+                        continue
+                    if isinstance(compile_results[i], BaseException):
+                        revision_results.append(f"{prefix}: FAILED (compile crashed)")
+                        continue
+
+                    new_text = compile_results[i]
+                    old_text = old_texts[prefix]
+                    old_size = len(old_text)
+                    new_size = len(new_text) if new_text else 0
+
+                    if old_size > 0 and new_size < old_size * 0.5:
+                        logger.error(
+                            "Rejecting %s recompilation: %d → %d bytes",
+                            prefix, old_size, new_size,
+                        )
+                        await runner.artifacts.put(prefix, old_text, feature=feature)
+                        revision_results.append(
+                            f"{prefix}: REJECTED (size guard: {old_size} → {new_size})"
+                        )
+                    else:
+                        await runner.artifacts.put(prefix, new_text, feature=feature)
+                        setattr(state, prefix.replace("-", "_"), new_text)
+                        if hosting:
+                            await hosting.update(feature.id, prefix, new_text)
+                        revision_results.append(
+                            f"{prefix}: revised ({old_size} → {new_size} bytes)"
+                        )
+
+                # ── Save revision summary so continue logic can advance ─
+                revision_summary = (
+                    f"# Revisions Applied — Cycle {cycle + 1}\n\n"
+                    + "\n".join(f"- {r}" for r in revision_results)
+                )
+                await runner.artifacts.put(
+                    f"plan-review-cycle-{cycle + 1}-revised",
+                    revision_summary,
+                    feature=feature,
+                )
 
                 # Notify user of revision results
                 await runner.run(
@@ -547,7 +795,40 @@ class PlanReviewPhase(Phase):
 
             cycle += 1
 
-        # ── Step 2: Interview-based gate reviews on all artifacts ──
+        return await self._run_gates(runner, feature, state, decomposition)
+
+    async def _run_gates(
+        self,
+        runner: WorkflowRunner,
+        feature: Feature,
+        state: BuildState,
+        decomposition: SubfeatureDecomposition,
+    ) -> BuildState:
+        """Interview-based gate reviews on all compiled artifacts."""
+        # ── Recompile from per-SF sources before gate review ──
+        # When entering gates via plan-review-complete skip, the compiled
+        # artifacts may be stale. Recompile each type so gate reviewers
+        # see the latest per-SF content.
+        for prefix, _base_role, _output_type, compiler_actor, broad_key in _ARTIFACT_CONFIGS:
+            gate_marker = await runner.artifacts.get(
+                f"plan-review-gate:{prefix}", feature=feature,
+            )
+            if gate_marker:
+                continue  # Already gate-approved — don't recompile
+            logger.info("Recompiling %s from per-SF sources before gate review", prefix)
+            compiled = await compile_artifacts(
+                runner, feature, self.name,
+                compiler_actor=compiler_actor,
+                decomposition=decomposition,
+                artifact_prefix=prefix,
+                broad_key=broad_key,
+                final_key=prefix,
+            )
+            if compiled:
+                hosting = runner.services.get("hosting")
+                if hosting:
+                    await hosting.update(feature.id, prefix, compiled)
+
         # Gate checkpointing: marker artifacts (plan-review-gate:{prefix})
         # distinguish "gate-approved" from "revised in Step 1" (same DB key).
 

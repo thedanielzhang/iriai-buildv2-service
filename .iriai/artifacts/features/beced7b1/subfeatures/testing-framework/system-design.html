@@ -1,0 +1,1528 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SF-3 Testing Framework — System Design - System Design</title>
+<style>
+  /* ── Reset & Base ─────────────────────────────────────────────────── */
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  @font-face {
+    font-family: 'Charter';
+    src: local('Charter'), local('Georgia');
+    font-display: swap;
+  }
+
+  :root {
+    --text-primary: #1a1a2e;
+    --text-secondary: #555;
+    --text-muted: #888;
+    --bg-page: #faf9f7;
+    --bg-card: #fff;
+    --border-subtle: rgba(0, 0, 0, 0.06);
+    --border-medium: rgba(0, 0, 0, 0.1);
+    --accent: #2d5be3;
+    --accent-faint: rgba(45, 91, 227, 0.06);
+    --accent-light: rgba(45, 91, 227, 0.12);
+    --content-width: 960px;
+    --gutter: clamp(20px, 5vw, 48px);
+    --radius: 10px;
+    --radius-sm: 6px;
+  }
+
+  html {
+    font-size: 17px;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
+    scroll-behavior: smooth;
+  }
+
+  body {
+    font-family: Charter, Georgia, 'Times New Roman', serif;
+    color: var(--text-primary);
+    background: var(--bg-page);
+    line-height: 1.72;
+    min-height: 100vh;
+  }
+
+  ::selection {
+    background: rgba(45, 91, 227, 0.18);
+    color: inherit;
+  }
+
+  /* ── Header ──────────────────────────────────────────────────────── */
+  .sd-header {
+    position: sticky;
+    top: 0;
+    z-index: 100;
+    background: rgba(250, 249, 247, 0.92);
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
+    border-bottom: 1px solid var(--border-subtle);
+    padding: 0 var(--gutter);
+  }
+
+  .sd-header-inner {
+    max-width: var(--content-width);
+    margin: 0 auto;
+    padding: 20px 0 16px;
+  }
+
+  .sd-title {
+    font-size: clamp(1.8rem, 4vw, 2.6rem);
+    font-weight: 700;
+    line-height: 1.15;
+    letter-spacing: -0.025em;
+    color: var(--text-primary);
+    margin-bottom: 12px;
+  }
+
+  .sd-nav {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-bottom: 12px;
+  }
+
+  .sd-nav-link {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--text-muted);
+    text-decoration: none;
+    padding: 4px 10px;
+    border-radius: var(--radius-sm);
+    transition: color 0.15s, background 0.15s;
+  }
+
+  .sd-nav-link:hover {
+    color: var(--accent);
+    background: var(--accent-faint);
+  }
+
+  /* ── Filter pills ────────────────────────────────────────────────── */
+  .sd-filters {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+    padding-top: 4px;
+  }
+
+  .sd-filter-label {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    margin-right: 4px;
+  }
+
+  .sd-pill {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 12px;
+    font-weight: 500;
+    padding: 3px 12px;
+    border: 1px solid var(--border-medium);
+    border-radius: 100px;
+    background: var(--bg-card);
+    color: var(--text-secondary);
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+
+  .sd-pill:hover {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+
+  .sd-pill-active {
+    background: var(--accent);
+    color: #fff;
+    border-color: var(--accent);
+  }
+
+  .sd-pill-active:hover {
+    background: #1a3fa0;
+    border-color: #1a3fa0;
+    color: #fff;
+  }
+
+  /* ── Main content ────────────────────────────────────────────────── */
+  .sd-main {
+    max-width: var(--content-width);
+    margin: 0 auto;
+    padding: 32px var(--gutter) 80px;
+  }
+
+  .sd-section {
+    margin-bottom: 48px;
+  }
+
+  .sd-section-title {
+    font-size: 1.5rem;
+    font-weight: 700;
+    line-height: 1.3;
+    letter-spacing: -0.01em;
+    margin-bottom: 20px;
+    padding-bottom: 10px;
+    border-bottom: 1px solid var(--border-subtle);
+    color: var(--text-primary);
+  }
+
+  .sd-subsection-title {
+    font-size: 1.1rem;
+    font-weight: 700;
+    margin: 28px 0 14px;
+    color: var(--text-primary);
+  }
+
+  .sd-overview-text {
+    font-size: 1.05rem;
+    line-height: 1.75;
+    color: var(--text-secondary);
+    margin-bottom: 1.4em;
+  }
+
+  .sd-empty {
+    font-style: italic;
+    color: var(--text-muted);
+    padding: 16px 0;
+  }
+
+  /* ── Decisions list ──────────────────────────────────────────────── */
+  .sd-decisions-list {
+    padding-left: 1.6em;
+    color: var(--text-secondary);
+  }
+
+  .sd-decisions-list li {
+    margin-bottom: 0.5em;
+    line-height: 1.6;
+  }
+
+  /* ── Tier labels ─────────────────────────────────────────────────── */
+  .sd-tier-label {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 0.72rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--text-muted);
+    margin: 20px 0 10px;
+  }
+
+  /* ── Service grid ────────────────────────────────────────────────── */
+  .sd-service-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+    gap: 14px;
+    margin-bottom: 8px;
+  }
+
+  .sd-service-card {
+    background: var(--bg-card);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius);
+    padding: 18px;
+    transition: opacity 0.3s, border-color 0.2s, box-shadow 0.2s;
+    cursor: default;
+  }
+
+  .sd-service-card:hover {
+    border-color: var(--accent);
+    box-shadow: 0 2px 12px rgba(45, 91, 227, 0.08);
+  }
+
+  .sd-service-card.sd-highlight {
+    border-color: var(--accent);
+    box-shadow: 0 2px 16px rgba(45, 91, 227, 0.14);
+  }
+
+  .sd-service-icon {
+    font-size: 1.5rem;
+    margin-bottom: 8px;
+  }
+
+  .sd-service-name {
+    font-weight: 700;
+    font-size: 1rem;
+    color: var(--text-primary);
+    margin-bottom: 2px;
+  }
+
+  .sd-service-kind {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 0.72rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-muted);
+    margin-bottom: 6px;
+  }
+
+  .sd-service-tech {
+    font-family: 'SF Mono', 'Fira Code', Menlo, Consolas, monospace;
+    font-size: 0.78rem;
+    color: #1a3fa0;
+    background: var(--accent-faint);
+    display: inline-block;
+    padding: 1px 8px;
+    border-radius: 4px;
+    margin-bottom: 4px;
+  }
+
+  .sd-service-port {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 0.75rem;
+    color: var(--text-muted);
+    margin-bottom: 6px;
+  }
+
+  .sd-service-desc {
+    font-size: 0.88rem;
+    color: var(--text-secondary);
+    line-height: 1.55;
+    margin-top: 6px;
+  }
+
+  /* ── Connections list ────────────────────────────────────────────── */
+  .sd-connections-list {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .sd-connection-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 16px;
+    background: var(--bg-card);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-sm);
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 0.88rem;
+    transition: opacity 0.3s;
+    flex-wrap: wrap;
+  }
+
+  .sd-conn-from, .sd-conn-to {
+    font-weight: 600;
+    color: var(--text-primary);
+  }
+
+  .sd-conn-arrow {
+    color: var(--accent);
+    font-weight: 700;
+  }
+
+  .sd-conn-proto {
+    font-size: 0.78rem;
+    color: var(--text-muted);
+  }
+
+  .sd-conn-label {
+    color: var(--text-secondary);
+    font-weight: 400;
+    margin-left: auto;
+  }
+
+  /* ── Call paths (details/summary) ────────────────────────────────── */
+  .sd-call-path {
+    background: var(--bg-card);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius);
+    margin-bottom: 10px;
+    transition: opacity 0.3s;
+    overflow: hidden;
+  }
+
+  .sd-call-path summary {
+    padding: 14px 18px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-weight: 600;
+    font-size: 0.95rem;
+    color: var(--text-primary);
+    list-style: none;
+  }
+
+  .sd-call-path summary::-webkit-details-marker { display: none; }
+
+  .sd-call-path summary::before {
+    content: '\25B6';
+    font-size: 0.65rem;
+    color: var(--text-muted);
+    transition: transform 0.2s;
+    flex-shrink: 0;
+  }
+
+  .sd-call-path[open] summary::before {
+    transform: rotate(90deg);
+  }
+
+  .sd-cp-name { flex: 1; }
+
+  .sd-cp-journey {
+    font-size: 0.72rem;
+    font-weight: 500;
+    color: var(--accent);
+    background: var(--accent-faint);
+    padding: 2px 8px;
+    border-radius: 100px;
+  }
+
+  .sd-cp-desc {
+    padding: 0 18px 12px;
+    font-size: 0.9rem;
+    color: var(--text-secondary);
+    line-height: 1.6;
+  }
+
+  /* ── Sequence diagram rows ───────────────────────────────────────── */
+  .sd-sequence {
+    margin: 0 18px 18px;
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-sm);
+    overflow-x: auto;
+  }
+
+  .sd-seq-header, .sd-seq-row {
+    display: grid;
+    grid-template-columns: 40px 1fr 32px 1fr 2fr 1.5fr;
+    gap: 8px;
+    padding: 8px 14px;
+    align-items: start;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 0.82rem;
+  }
+
+  .sd-seq-header {
+    background: rgba(0, 0, 0, 0.02);
+    font-weight: 700;
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--text-muted);
+    border-bottom: 1px solid var(--border-subtle);
+  }
+
+  .sd-seq-row {
+    border-bottom: 1px solid var(--border-subtle);
+    color: var(--text-secondary);
+  }
+
+  .sd-seq-row:last-child { border-bottom: none; }
+
+  .sd-seq-row:hover { background: rgba(45, 91, 227, 0.02); }
+
+  .sd-seq-num {
+    font-weight: 700;
+    color: var(--accent);
+    text-align: center;
+  }
+
+  .sd-seq-from, .sd-seq-to { font-weight: 600; color: var(--text-primary); }
+
+  .sd-seq-arrow { color: var(--accent); text-align: center; font-weight: 700; }
+
+  .sd-seq-action { color: var(--text-primary); }
+
+  .sd-seq-detail {
+    font-size: 0.78rem;
+    color: var(--text-muted);
+    margin-top: 2px;
+  }
+
+  .sd-seq-returns {
+    font-family: 'SF Mono', 'Fira Code', Menlo, Consolas, monospace;
+    font-size: 0.78rem;
+    color: var(--text-muted);
+  }
+
+  /* ── Expand/collapse button ──────────────────────────────────────── */
+  .sd-expand-btn {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 12px;
+    font-weight: 500;
+    padding: 4px 14px;
+    border: 1px solid var(--border-medium);
+    border-radius: var(--radius-sm);
+    background: var(--bg-card);
+    color: var(--text-secondary);
+    cursor: pointer;
+    margin-bottom: 14px;
+    transition: all 0.15s;
+  }
+
+  .sd-expand-btn:hover {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+
+  /* ── Tables ──────────────────────────────────────────────────────── */
+  .sd-table-wrap {
+    overflow-x: auto;
+  }
+
+  .sd-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.88rem;
+    border-radius: var(--radius);
+    overflow: hidden;
+    border: 1px solid var(--border-subtle);
+  }
+
+  .sd-table th, .sd-table td {
+    padding: 10px 14px;
+    text-align: left;
+    border-bottom: 1px solid var(--border-subtle);
+  }
+
+  .sd-table th {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-weight: 600;
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--text-muted);
+    background: rgba(0, 0, 0, 0.02);
+  }
+
+  .sd-table tr:last-child td { border-bottom: none; }
+  .sd-table tr:hover td { background: rgba(45, 91, 227, 0.02); }
+
+  .sd-table code {
+    font-family: 'SF Mono', 'Fira Code', Menlo, Consolas, monospace;
+    font-size: 0.82em;
+    background: var(--accent-faint);
+    padding: 2px 6px;
+    border-radius: 4px;
+    color: #1a3fa0;
+    word-break: break-all;
+  }
+
+  .sd-svc-ref {
+    cursor: pointer;
+    font-weight: 500;
+    color: var(--accent);
+    transition: color 0.15s;
+  }
+
+  .sd-svc-ref:hover { color: #1a3fa0; }
+
+  .sd-rel-kind {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 0.78rem;
+    font-weight: 500;
+    color: var(--text-muted);
+    background: rgba(0,0,0,0.03);
+    padding: 2px 8px;
+    border-radius: 4px;
+  }
+
+  /* ── Entity grid ─────────────────────────────────────────────────── */
+  .sd-entity-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+    gap: 14px;
+  }
+
+  .sd-entity-card {
+    background: var(--bg-card);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius);
+    overflow: hidden;
+    transition: opacity 0.3s, border-color 0.2s, box-shadow 0.2s;
+  }
+
+  .sd-entity-card:hover {
+    border-color: var(--accent);
+    box-shadow: 0 2px 12px rgba(45, 91, 227, 0.08);
+  }
+
+  .sd-entity-card.sd-highlight {
+    border-color: var(--accent);
+    box-shadow: 0 2px 16px rgba(45, 91, 227, 0.14);
+  }
+
+  .sd-entity-header {
+    padding: 14px 16px 10px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    border-bottom: 1px solid var(--border-subtle);
+  }
+
+  .sd-entity-name {
+    font-size: 1rem;
+    font-weight: 700;
+    color: var(--text-primary);
+  }
+
+  .sd-entity-svc {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 0.72rem;
+    font-weight: 500;
+    color: var(--accent);
+    background: var(--accent-faint);
+    padding: 2px 8px;
+    border-radius: 100px;
+    cursor: pointer;
+  }
+
+  .sd-field-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.82rem;
+  }
+
+  .sd-field-table th, .sd-field-table td {
+    padding: 7px 16px;
+    text-align: left;
+    border-bottom: 1px solid var(--border-subtle);
+  }
+
+  .sd-field-table th {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-weight: 600;
+    font-size: 0.68rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--text-muted);
+    background: rgba(0, 0, 0, 0.015);
+  }
+
+  .sd-field-table tr:last-child td { border-bottom: none; }
+  .sd-field-table tr:hover td { background: rgba(45, 91, 227, 0.02); }
+
+  .sd-field-table code {
+    font-family: 'SF Mono', 'Fira Code', Menlo, Consolas, monospace;
+    font-size: 0.85em;
+    background: var(--accent-faint);
+    padding: 1px 5px;
+    border-radius: 3px;
+    color: #1a3fa0;
+  }
+
+  /* ── Risks ───────────────────────────────────────────────────────── */
+  .sd-risks-list {
+    list-style: none;
+    padding: 0;
+  }
+
+  .sd-risks-list li {
+    padding: 10px 16px;
+    margin-bottom: 6px;
+    background: #fef3f2;
+    border: 1px solid rgba(239, 68, 68, 0.12);
+    border-left: 3px solid #ef4444;
+    border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+    font-size: 0.92rem;
+    color: var(--text-secondary);
+    line-height: 1.6;
+  }
+
+  /* ── Footer ──────────────────────────────────────────────────────── */
+  .sd-footer {
+    max-width: var(--content-width);
+    margin: 0 auto;
+    padding: 24px var(--gutter) 48px;
+    text-align: center;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 0.75rem;
+    color: var(--text-muted);
+    border-top: 1px solid var(--border-subtle);
+  }
+
+  /* ── Dimmed state for journey filtering ──────────────────────────── */
+  .sd-dimmed {
+    opacity: 0.15 !important;
+    pointer-events: none;
+  }
+
+  /* ── Entrance animation ──────────────────────────────────────────── */
+  @keyframes sd-fade-up {
+    from { opacity: 0; transform: translateY(12px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+
+  .sd-header, .sd-main {
+    animation: sd-fade-up 0.45s ease both;
+  }
+
+  .sd-main { animation-delay: 0.08s; }
+
+  /* ── Responsive ──────────────────────────────────────────────────── */
+  @media (max-width: 700px) {
+    html { font-size: 15px; }
+    .sd-service-grid { grid-template-columns: 1fr; }
+    .sd-entity-grid { grid-template-columns: 1fr; }
+    .sd-seq-header, .sd-seq-row {
+      grid-template-columns: 32px 1fr 24px 1fr 1.5fr 1fr;
+      font-size: 0.75rem;
+    }
+  }
+
+  @media (max-width: 480px) {
+    .sd-header-inner { padding: 16px 0 12px; }
+    .sd-nav { gap: 4px; }
+    .sd-nav-link { font-size: 12px; padding: 3px 8px; }
+    .sd-filters { gap: 4px; }
+  }
+</style>
+</head>
+<body>
+<header class="sd-header">
+<div class="sd-header-inner">
+<h1 class="sd-title">SF-3 Testing Framework — System Design</h1>
+<nav class="sd-nav" id="sd-nav">
+<a href="#overview" class="sd-nav-link">Overview</a>
+<a href="#topology" class="sd-nav-link">Topology</a>
+<a href="#call-paths" class="sd-nav-link">Call Paths</a>
+<a href="#endpoints" class="sd-nav-link">Endpoints</a>
+<a href="#entities" class="sd-nav-link">Entities</a>
+<a href="#relations" class="sd-nav-link">Relations</a>
+<a href="#risks" class="sd-nav-link">Risks</a>
+</nav>
+<div class="sd-filters" id="sd-filters">
+<span class="sd-filter-label">Filter by journey:</span>
+<button class="sd-pill sd-pill-active" data-journey="__all__" onclick="window.__sd_filter('__all__')">All</button>
+<button class="sd-pill" data-journey="J-10" onclick="window.__sd_filter('J-10')">J-10</button>
+<button class="sd-pill" data-journey="J-7" onclick="window.__sd_filter('J-7')">J-7</button>
+<button class="sd-pill" data-journey="J-8" onclick="window.__sd_filter('J-8')">J-8</button>
+<button class="sd-pill" data-journey="J-9" onclick="window.__sd_filter('J-9')">J-9</button>
+</div>
+</div>
+</header>
+<main class="sd-main">
+<section class="sd-section" id="overview">
+<h2 class="sd-section-title">Overview</h2>
+<p class="sd-overview-text">`iriai_compose.testing` is a purpose-built Python testing subpackage within `iriai-compose` for validating declarative workflow definitions. It provides fluent mock runtimes, fixture builders, execution assertions, validation re-exports, and YAML snapshot helpers.
+
+**Edge contracts established per D-GR-41:**
+
+**SF-1→SF-3:** SF-3 imports from `iriai_compose.schema`: `WorkflowConfig`, `PhaseDefinition`, `AskNode`, `BranchNode`, `PluginNode`, `ActorDefinition`, `AgentActorDef`, `HumanActorDef`, `Edge`, `PortDefinition`, `ValidationError`, `load_workflow()`, `dump_workflow()`, `validate_workflow()`, `validate_type_flow()`, `detect_cycles()`. Entity names are `PhaseDefinition` (not `Phase`) and `Edge` (not `EdgeDefinition`). Phantom exports `MapNode`, `FoldNode`, `LoopNode`, `TransformRef`, `HookRef` do not exist.
+
+**SF-2→SF-3:** SF-3 imports from `iriai_compose.declarative`: `run()` with canonical signature `async def run(workflow: WorkflowConfig | str | Path, config: RuntimeConfig, *, inputs: dict[str, Any] | None = None) -&gt; ExecutionResult` — the stale `(yaml_path, runtime, workspace, transform_registry, hook_registry)` is permanently rejected. `ExecutionResult.nodes_executed` ordering is `(node_id, phase_id)`. `ExecutionResult.hook_warnings: list[str]` is a confirmed SF-2 field. `ExecutionHistory` is a confirmed SF-2 export (per D-GR-34). Additional imports: `RuntimeConfig`, `ExecutionHistory`, `ExecutionError`, `PluginRegistry`, `required_plugins()`, `load_runtime_config()`, `_current_node` ContextVar.
+
+**ABI invariants:** `AgentRuntime.invoke(role, prompt, *, output_type, workspace, session_key)` is permanently frozen — no `node_id` parameter. Node identity propagates via `_current_node: ContextVar[str | None]` managed by the SF-2 runner. Hierarchical context merge order is `workflow → phase → actor → node`. All port containers are `dict[str, PortDefinition]` keyed by port name. Checkpoint/resume is excluded from SF-2's published ABI.</p>
+<h3 class="sd-subsection-title">Architecture Decisions</h3>
+<ol class="sd-decisions-list">
+<li>D-SF3-1: Assertion helpers remain standalone functions rather than fluent assertion objects so they compose naturally with pytest and operate directly on `ExecutionResult`.</li>
+<li>D-SF3-2: All mock runtimes use a fluent configuration API with no-argument constructors. Dict-based constructors are prohibited because they cannot express priority matching, response sequences, per-matcher exception injection, or per-matcher cost metadata.</li>
+<li>D-SF3-3: YAML workflow fixtures live under `tests/fixtures/workflows/` and serialize every port container as a YAML map matching the dict-based schema model.</li>
+<li>D-SF3-4: The testing module lives at `iriai_compose/testing/` and ships behind the `[testing]` extra rather than as a separate package.</li>
+<li>D-SF3-5: `AgentRuntime.invoke()` remains unchanged per SF-2 published ABI. SF-2 propagates current node identity through a runner-managed `_current_node: ContextVar[str | None]`, and `MockAgentRuntime.when_node()` resolves against that ContextVar during `invoke()`. Adding `node_id` to `invoke()` is permanently prohibited.</li>
+<li>D-SF3-5a: Any invocation context exposed to `respond_with()` handlers is assembled by SF-2 in the canonical order `workflow -&gt; phase -&gt; actor -&gt; node`, with deduplication in that order, matching D-GR-23. SF-3 handlers consume this context; they must never reassemble it.</li>
+<li>D-SF3-6: `run_test()` is a thin delegation wrapper around SF-2 `run()` and must not swallow exceptions, rewrite `ExecutionResult`, synthesize a parallel runtime contract, or add checkpoint/resume behavior.</li>
+<li>D-SF3-7: SF-1 owns validation logic; SF-3 only re-exports validation functions and adds assertion helpers on top.</li>
+<li>D-SF3-8: Sequential build order is assumed. SF-3 implementation depends on SF-1 schema types and SF-2 runtime types being available first.</li>
+<li>D-SF3-9: Snapshot comparison uses `pyyaml` plus `difflib` only; no `deepdiff` dependency is introduced.</li>
+<li>D-SF3-10: `respond_sequence()` never wraps around. Exhaustion raises `MockExhaustedError` so loop-count bugs fail loudly.</li>
+<li>D-SF3-11: Anti-patterns are prohibited: `MockAgentRuntime.__init__` must not accept configuration parameters; `when_node()` and `when_role()` must return dedicated matcher objects; terminal matcher methods must return the parent runtime; matcher resolution must not depend on dict ordering; `MockAgentRuntime.invoke()` must not grow a `node_id` parameter; handler context assembly must not use any merge order other than `workflow -&gt; phase -&gt; actor -&gt; node`.</li>
+<li>D-SF3-12: All port containers throughout SF-3 use `dict[str, PortDefinition]` keyed by port name. This applies to builder internals, fixture factories, YAML fixtures, and edge resolution.</li>
+<li>D-SF3-13: Stale list-based port patterns are prohibited. Port names must not be stored redundantly inside `PortDefinition`, and `add_edge()` must not search port lists by name.</li>
+<li>D-SF3-14: No core checkpoint/resume contract is part of the SF-2 ABI consumed by SF-3. Testing helpers may assert execution history already returned by SF-2, but they must not require `checkpoint`, `resume`, or equivalent runner entry points to exist in the core declarative surface.</li>
+<li>D-SF3-16: SF-1→SF-3 import boundary established per D-GR-41. Canonical imports from `iriai_compose.schema`: `WorkflowConfig`, `PhaseDefinition`, `AskNode`, `BranchNode`, `PluginNode`, `ActorDefinition`, `AgentActorDef`, `HumanActorDef`, `Edge`, `PortDefinition`, `ValidationError`, `load_workflow()`, `dump_workflow()`, `validate_workflow()`, `validate_type_flow()`, `detect_cycles()`. Phantom exports `MapNode`, `FoldNode`, `LoopNode`, `TransformRef`, `HookRef` do not exist and are permanently prohibited. Entity names `PhaseDefinition` (not `Phase`) and `Edge` (not `EdgeDefinition`) are canonical. Phase execution modes (`MapConfig`, `FoldConfig`, `LoopConfig`, `SequentialConfig`) are config types on `PhaseDefinition.mode`, not node types.</li>
+<li>D-SF3-17: SF-2→SF-3 ABI edge established per D-GR-41. Canonical run() signature: `async def run(workflow: WorkflowConfig | str | Path, config: RuntimeConfig, *, inputs: dict[str, Any] | None = None) -&gt; ExecutionResult`. The stale `(yaml_path, runtime, workspace, transform_registry, hook_registry)` signature is permanently rejected. `ExecutionResult.nodes_executed` ordering is `(node_id, phase_id)` — node first, containing phase second. `ExecutionResult.hook_warnings: list[str]` is a confirmed SF-2 field SF-3 may assert against. `ExecutionHistory` is a confirmed SF-2 export (added per D-GR-34) and the type of `ExecutionResult.history`. `RuntimeConfig` fields: `agent_runtime: AgentRuntime`, `interaction_runtimes: dict[str, InteractionRuntime]`, `artifacts: ArtifactStore | None`, `sessions: SessionStore | None`, `context_provider: ContextProvider | None`, `plugin_registry: PluginRegistry | None`, `workspace: Workspace | None`, `feature: Feature | None`. `run_test()` wraps these fields into RuntimeConfig — `interaction` parameter maps to `interaction_runtimes={'default': interaction}`.</li>
+</ol>
+</section>
+<section class="sd-section" id="topology">
+<h2 class="sd-section-title">Service Topology</h2>
+<h4 class="sd-tier-label">Services &amp; External</h4>
+<div class="sd-service-grid">
+<div class="sd-service-card" data-service-id="SVC-SF3-1" data-journeys="J-7 J-8 J-9 J-10">
+<div class="sd-service-icon">&#x2699;&#xFE0F;</div>
+<div class="sd-service-name">iriai_compose.testing</div>
+<div class="sd-service-kind">service</div>
+<div class="sd-service-tech">Python 3.11+, pytest</div>
+<p class="sd-service-desc">Testing subpackage installed via `pip install iriai-compose[testing]`. Provides `MockAgentRuntime`, `MockInteractionRuntime`, `MockPluginRuntime`, fixture builders, standalone assertions, YAML snapshot helpers, validation re-exports, and a thin `run_test()` wrapper. `MockAgentRuntime.when_node()` resolves against the SF-2 current-node `ContextVar` instead of requiring an `invoke(..., node_id=...)` signature change, and `run_test()` mirrors the SF-2-published ABI without inventing any checkpoint/resume surface.</p>
+</div>
+<div class="sd-service-card" data-service-id="SVC-SF3-2" data-journeys="J-7 J-9">
+<div class="sd-service-icon">&#x2699;&#xFE0F;</div>
+<div class="sd-service-name">iriai_compose.schema</div>
+<div class="sd-service-kind">service</div>
+<div class="sd-service-tech">Python 3.11+, Pydantic v2</div>
+<p class="sd-service-desc">SF-1 schema models and validation logic consumed by SF-3 builders, snapshot helpers, and validation re-exports. Canonical public exports from `iriai_compose.schema` (per D-GR-34/D-GR-41): `WorkflowConfig`, `PhaseDefinition`, `AskNode`, `BranchNode`, `PluginNode`, `ActorDefinition`, `AgentActorDef`, `HumanActorDef`, `Edge`, `PortDefinition`, `ValidationError`, `load_workflow()`, `dump_workflow()`, `validate_workflow()`, `validate_type_flow()`, `detect_cycles()`. Phase execution modes (`MapConfig`, `FoldConfig`, `LoopConfig`, `SequentialConfig`) are separate config types attached to `PhaseDefinition.mode` — they are not node types. Phantom exports `MapNode`, `FoldNode`, `LoopNode`, `TransformRef`, and `HookRef` do not exist in `iriai_compose.schema` and must never be imported. Entity name is `PhaseDefinition` (not `Phase`), `Edge` (not `EdgeDefinition`). All port containers are `dict[str, PortDefinition]` keyed by port name.</p>
+</div>
+<div class="sd-service-card" data-service-id="SVC-SF3-3" data-journeys="J-8 J-10">
+<div class="sd-service-icon">&#x2699;&#xFE0F;</div>
+<div class="sd-service-name">iriai_compose.declarative</div>
+<div class="sd-service-kind">service</div>
+<div class="sd-service-tech">Python 3.11+, pyyaml</div>
+<p class="sd-service-desc">ABI Owner. SF-2 DAG loader and runner consumed by SF-3 as a downstream consumer. Canonical public exports from `iriai_compose.declarative` (per D-GR-34/D-GR-41): `run()`, `load_workflow()`, `load_runtime_config()`, `RuntimeConfig`, `ExecutionResult`, `ExecutionHistory`, `ExecutionError`, `PluginRegistry`, `required_plugins()`, plus error types `DeclarativeExecutionError`, `WorkflowLoadError`, `WorkflowInputError`, `ExpressionEvalError`, `PluginNotFoundError`. Runner-managed `_current_node: ContextVar[str | None]` is part of the published ABI. Published non-breaking contract: (1) `AgentRuntime.invoke(role, prompt, *, output_type, workspace, session_key)` — unchanged ABC, no `node_id` parameter ever; (2) `_current_node: ContextVar[str | None]` — set immediately before each Ask-node dispatch, reset to `None` after; (3) invocation context assembled in `workflow → phase → actor → node` merge order, deduplicated; (4) canonical run() signature: `async def run(workflow: WorkflowConfig | str | Path, config: RuntimeConfig, *, inputs: dict[str, Any] | None = None) -&gt; ExecutionResult` — the stale `(yaml_path, runtime, workspace, transform_registry, hook_registry)` signature is rejected; (5) `ExecutionResult.nodes_executed` is `list[tuple[str, str]]` ordered as `(node_id, phase_id)` (node first, containing phase second); `ExecutionResult.hook_warnings: list[str]` collects non-fatal hook warnings. Checkpoint/resume is excluded from the published ABI.</p>
+</div>
+<div class="sd-service-card" data-service-id="SVC-SF3-4" data-journeys="J-7 J-9">
+<div class="sd-service-icon">&#x1F517;</div>
+<div class="sd-service-name">Test Fixtures (filesystem)</div>
+<div class="sd-service-kind">external</div>
+<div class="sd-service-tech">YAML files</div>
+<p class="sd-service-desc">`tests/fixtures/workflows/` directory containing valid and invalid YAML workflow files. All fixture files serialize port containers as YAML maps (`inputs: {default: {type_ref: any}}`) to match the dict-based schema model.</p>
+</div>
+<div class="sd-service-card" data-service-id="SVC-SF3-5" data-journeys="J-8 J-10">
+<div class="sd-service-icon">&#x1F517;</div>
+<div class="sd-service-name">SF-4 Workflow Migration Consumers</div>
+<div class="sd-service-kind">external</div>
+<div class="sd-service-tech">Python 3.11+, pytest</div>
+<p class="sd-service-desc">SF-4 migration parity suites and litmus workflows consume `iriai_compose.testing` and `iriai_compose.declarative` against the SF-2-published runtime ABI. They must use the unchanged `AgentRuntime.invoke()`, current-node `ContextVar`, canonical `workflow -&gt; phase -&gt; actor -&gt; node` merge order, and must not assume any core checkpoint/resume API in SF-2.</p>
+</div>
+<div class="sd-service-card" data-service-id="SVC-SF3-0" data-journeys="J-8 J-10">
+<div class="sd-service-icon">&#x2699;&#xFE0F;</div>
+<div class="sd-service-name">iriai_compose (core)</div>
+<div class="sd-service-kind">service</div>
+<div class="sd-service-tech">Python 3.11+</div>
+<p class="sd-service-desc">Core iriai-compose library providing the unchanged `AgentRuntime` ABC (`invoke(role, prompt, *, output_type, workspace, session_key)`), `InteractionRuntime`, `PluginRuntime`, `InMemoryArtifactStore`, `InMemorySessionStore`, `DefaultContextProvider`, and the existing `ContextVar`-based runner pattern used today for phase state. SF-2 extends that pattern with a sibling current-node `ContextVar` without breaking the ABC surface.</p>
+</div>
+</div>
+<h3 class="sd-subsection-title">Connections</h3>
+<div class="sd-connections-list">
+<div class="sd-connection-row" data-journeys="J-7 J-9"><span class="sd-conn-from">iriai_compose.testing</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">iriai_compose.schema</span><span class="sd-conn-proto"> (Python import)</span><span class="sd-conn-label">imports from `iriai_compose.schema` (D-GR-41 canonical edge contract): `WorkflowConfig`, `PhaseDefinition`, `AskNode`, `BranchNode`, `PluginNode`, `ActorDefinition`, `AgentActorDef`, `HumanActorDef`, `Edge`, `PortDefinition`, `ValidationError`, `load_workflow()`, `dump_workflow()`, `validate_workflow()`, `validate_type_flow()`, `detect_cycles()` — for builders, snapshot helpers, and validation re-exports. Entity names are canonical: `PhaseDefinition` (not `Phase`), `Edge` (not `EdgeDefinition`). Phantom imports `MapNode`, `FoldNode`, `LoopNode`, `TransformRef`, `HookRef` do not exist and are prohibited.</span></div>
+<div class="sd-connection-row" data-journeys="J-8 J-10"><span class="sd-conn-from">iriai_compose.testing</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">iriai_compose.declarative</span><span class="sd-conn-proto"> (Python import)</span><span class="sd-conn-label">imports from `iriai_compose.declarative` (D-GR-41 canonical edge contract): `run()` (canonical signature `async def run(workflow: WorkflowConfig | str | Path, config: RuntimeConfig, *, inputs: dict[str, Any] | None = None) -&gt; ExecutionResult` — the stale `(yaml_path, runtime, workspace, transform_registry, hook_registry)` is rejected), `load_workflow()`, `load_runtime_config()`, `RuntimeConfig`, `ExecutionResult`, `ExecutionHistory`, `ExecutionError`, `PluginRegistry`, `required_plugins()`, `_current_node` ContextVar. `run_test()` wraps `run()` directly without rewriting contracts or adding checkpoint/resume. `MockAgentRuntime.when_node()` reads `_current_node` ContextVar during `invoke()` — never injects `node_id` as a parameter. Context in `respond_with()` handlers is assembled by SF-2 in canonical `workflow → phase → actor → node` order.</span></div>
+<div class="sd-connection-row" data-journeys="J-7 J-9"><span class="sd-conn-from">iriai_compose.testing</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">Test Fixtures (filesystem)</span><span class="sd-conn-proto"> (filesystem read)</span><span class="sd-conn-label">reads YAML fixture files for schema validation and round-trip snapshot testing; fixtures use YAML map format for dict-keyed ports</span></div>
+<div class="sd-connection-row" data-journeys="J-8 J-10"><span class="sd-conn-from">iriai_compose.testing</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">iriai_compose (core)</span><span class="sd-conn-proto"> (Python import)</span><span class="sd-conn-label">extends `AgentRuntime`, `InteractionRuntime`, and `PluginRuntime`; uses in-memory artifact/session stores and shared runtime context helpers while preserving the unchanged `AgentRuntime.invoke()` signature</span></div>
+<div class="sd-connection-row" data-journeys="J-8 J-10"><span class="sd-conn-from">SF-4 Workflow Migration Consumers</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">iriai_compose.testing</span><span class="sd-conn-proto"> (Python import)</span><span class="sd-conn-label">consumes SF-3 mocks, assertions, and `run_test()` under the SF-2-published ABI; migration suites must not reintroduce `invoke(..., node_id=...)` or core checkpoint/resume assumptions</span></div>
+<div class="sd-connection-row" data-journeys="J-8 J-10"><span class="sd-conn-from">SF-4 Workflow Migration Consumers</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">iriai_compose.declarative</span><span class="sd-conn-proto"> (Python import)</span><span class="sd-conn-label">executes migrated workflows through the canonical `run(workflow, config, *, inputs=None)` contract with ContextVar-based node identity and no SF-2 checkpoint/resume surface</span></div>
+</div>
+</section>
+<section class="sd-section" id="call-paths">
+<h2 class="sd-section-title">API Call Paths</h2>
+<button class="sd-expand-btn" id="sd-toggle-details" onclick="window.__sd_toggle_details()">Expand All</button>
+<details class="sd-call-path" data-journey-id="J-7">
+<summary>
+<span class="sd-cp-name">Schema Validation Test</span>
+<span class="sd-cp-journey">J-7</span>
+</summary>
+<p class="sd-cp-desc">Developer writes a test that intentionally constructs an invalid workflow and asserts the correct `ValidationError` is returned through SF-3 re-exports.</p>
+<div class="sd-sequence">
+<div class="sd-seq-header">
+<div class="sd-seq-col sd-seq-num">#</div>
+<div class="sd-seq-col sd-seq-from">From</div>
+<div class="sd-seq-col sd-seq-arrow"></div>
+<div class="sd-seq-col sd-seq-to">To</div>
+<div class="sd-seq-col sd-seq-action">Action</div>
+<div class="sd-seq-col sd-seq-returns">Returns</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">1</div>
+<div class="sd-seq-col sd-seq-from">test_file</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">SVC-SF3-1</div>
+<div class="sd-seq-col sd-seq-action"><div>WorkflowBuilder().add_ask_node(...).add_edge('n1', 'missing').build()</div><div class="sd-seq-detail">Build a workflow with a dangling edge. Builder stores node/phase ports as dicts keyed by port name.</div></div>
+<div class="sd-seq-col sd-seq-returns">WorkflowConfig</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">2</div>
+<div class="sd-seq-col sd-seq-from">test_file</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">SVC-SF3-1</div>
+<div class="sd-seq-col sd-seq-action"><div>validate_workflow(config)</div><div class="sd-seq-detail">Call the SF-1 validation function via the SF-3 re-export.</div></div>
+<div class="sd-seq-col sd-seq-returns">list[ValidationError]</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">3</div>
+<div class="sd-seq-col sd-seq-from">test_file</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">SVC-SF3-1</div>
+<div class="sd-seq-col sd-seq-action"><div>assert_validation_error(errors, code='dangling_edge')</div><div class="sd-seq-detail">Assert the expected validation error is present.</div></div>
+<div class="sd-seq-col sd-seq-returns">None</div>
+</div>
+</div>
+</details>
+<details class="sd-call-path" data-journey-id="J-8">
+<summary>
+<span class="sd-cp-name">Execution Path Test (Fluent MockAgentRuntime)</span>
+<span class="sd-cp-journey">J-8</span>
+</summary>
+<p class="sd-cp-desc">Developer writes an end-to-end execution test using a fixture workflow, a fluent `MockAgentRuntime` configured via `when_node()`, and `run_test()`; SF-2 sets current node state through `_current_node` ContextVar before `invoke()`.</p>
+<div class="sd-sequence">
+<div class="sd-seq-header">
+<div class="sd-seq-col sd-seq-num">#</div>
+<div class="sd-seq-col sd-seq-from">From</div>
+<div class="sd-seq-col sd-seq-arrow"></div>
+<div class="sd-seq-col sd-seq-to">To</div>
+<div class="sd-seq-col sd-seq-action">Action</div>
+<div class="sd-seq-col sd-seq-returns">Returns</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">1</div>
+<div class="sd-seq-col sd-seq-from">test_file</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">SVC-SF3-1</div>
+<div class="sd-seq-col sd-seq-action"><div>minimal_ask_workflow(actor='pm')</div><div class="sd-seq-detail">Create a minimal single-Ask-node `WorkflowConfig` with dict-based ports.</div></div>
+<div class="sd-seq-col sd-seq-returns">WorkflowConfig</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">2</div>
+<div class="sd-seq-col sd-seq-from">test_file</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">SVC-SF3-1</div>
+<div class="sd-seq-col sd-seq-action"><div>mock = MockAgentRuntime()</div><div class="sd-seq-detail">Instantiate with no arguments.</div></div>
+<div class="sd-seq-col sd-seq-returns">MockAgentRuntime</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">3</div>
+<div class="sd-seq-col sd-seq-from">test_file</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">SVC-SF3-1</div>
+<div class="sd-seq-col sd-seq-action"><div>mock.when_node('ask_1').respond('done')</div><div class="sd-seq-detail">Configure Strategy 1 matcher keyed by node ID.</div></div>
+<div class="sd-seq-col sd-seq-returns">MockAgentRuntime</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">4</div>
+<div class="sd-seq-col sd-seq-from">test_file</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">SVC-SF3-1</div>
+<div class="sd-seq-col sd-seq-action"><div>await run_test(wf, runtime=mock)</div><div class="sd-seq-detail">Invoke `run_test()` which builds `RuntimeConfig` and delegates directly to SF-2 `run()`.</div></div>
+<div class="sd-seq-col sd-seq-returns">ExecutionResult</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">5</div>
+<div class="sd-seq-col sd-seq-from">SVC-SF3-1</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">SVC-SF3-3</div>
+<div class="sd-seq-col sd-seq-action"><div>run(workflow, config)</div><div class="sd-seq-detail">SF-2 executes the DAG, sets `_current_node` ContextVar to `ask_1` before Ask-node dispatch, assembles invocation context in `workflow -&gt; phase -&gt; actor -&gt; node` order.</div></div>
+<div class="sd-seq-col sd-seq-returns">ExecutionResult</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">6</div>
+<div class="sd-seq-col sd-seq-from">SVC-SF3-3</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">SVC-SF3-1</div>
+<div class="sd-seq-col sd-seq-action"><div>MockAgentRuntime.invoke(role=Role('pm', ...), prompt='...')</div><div class="sd-seq-detail">Unchanged `invoke()` signature per SF-2 published ABI. `MockAgentRuntime` reads `_current_node` ContextVar (value: `ask_1`), resolves Strategy 1, records call, returns `'done'`.</div></div>
+<div class="sd-seq-col sd-seq-returns">'done'</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">7</div>
+<div class="sd-seq-col sd-seq-from">test_file</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">SVC-SF3-1</div>
+<div class="sd-seq-col sd-seq-action"><div>assert_node_reached(result, 'ask_1')</div><div class="sd-seq-detail">Assert that `ask_1` appears in `result.nodes_executed` (tuple order: `(node_id, phase_id)`).</div></div>
+<div class="sd-seq-col sd-seq-returns">None</div>
+</div>
+</div>
+</details>
+<details class="sd-call-path" data-journey-id="J-8">
+<summary>
+<span class="sd-cp-name">Gate-and-Revise Loop Test (Response Sequences)</span>
+<span class="sd-cp-journey">J-8</span>
+</summary>
+<p class="sd-cp-desc">Developer tests a loop-mode phase using `respond_sequence()` on `MockAgentRuntime` and `approve_sequence()` on `MockInteractionRuntime` to simulate draft -&gt; reject -&gt; revise -&gt; approve behavior.</p>
+<div class="sd-sequence">
+<div class="sd-seq-header">
+<div class="sd-seq-col sd-seq-num">#</div>
+<div class="sd-seq-col sd-seq-from">From</div>
+<div class="sd-seq-col sd-seq-arrow"></div>
+<div class="sd-seq-col sd-seq-to">To</div>
+<div class="sd-seq-col sd-seq-action">Action</div>
+<div class="sd-seq-col sd-seq-returns">Returns</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">1</div>
+<div class="sd-seq-col sd-seq-from">test_file</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">SVC-SF3-1</div>
+<div class="sd-seq-col sd-seq-action"><div>mock.when_node('pm-draft').respond_sequence([draft_v1, draft_v2])</div><div class="sd-seq-detail">Configure sequential responses. Exhaustion raises `MockExhaustedError`.</div></div>
+<div class="sd-seq-col sd-seq-returns">MockAgentRuntime</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">2</div>
+<div class="sd-seq-col sd-seq-from">test_file</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">SVC-SF3-1</div>
+<div class="sd-seq-col sd-seq-action"><div>interaction.when_node('user-gate').approve_sequence([False, True])</div><div class="sd-seq-detail">First iteration rejects, second approves.</div></div>
+<div class="sd-seq-col sd-seq-returns">MockInteractionRuntime</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">3</div>
+<div class="sd-seq-col sd-seq-from">test_file</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">SVC-SF3-1</div>
+<div class="sd-seq-col sd-seq-action"><div>await run_test(wf, runtime=mock, interaction=interaction)</div><div class="sd-seq-detail">Execute loop-mode workflow. SF-2 assembles context in `workflow -&gt; phase -&gt; actor -&gt; node` order and sets `_current_node` ContextVar on each draft-node invocation.</div></div>
+<div class="sd-seq-col sd-seq-returns">ExecutionResult</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">4</div>
+<div class="sd-seq-col sd-seq-from">SVC-SF3-3</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">SVC-SF3-1</div>
+<div class="sd-seq-col sd-seq-action"><div>MockAgentRuntime.invoke(...) x 2</div><div class="sd-seq-detail">Invocation 1 reads `_current_node` = `pm-draft`, returns `draft_v1`. Invocation 2 reads same node ID on second iteration, returns `draft_v2`. No `node_id` parameter passed.</div></div>
+<div class="sd-seq-col sd-seq-returns">draft_v1, then draft_v2</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">5</div>
+<div class="sd-seq-col sd-seq-from">test_file</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">SVC-SF3-1</div>
+<div class="sd-seq-col sd-seq-action"><div>assert_loop_iterations(result, 'review-phase', 2)</div><div class="sd-seq-detail">Verify loop ran exactly two iterations through `result.history.loop_progress`.</div></div>
+<div class="sd-seq-col sd-seq-returns">None</div>
+</div>
+</div>
+</details>
+<details class="sd-call-path" data-journey-id="J-9">
+<summary>
+<span class="sd-cp-name">YAML Round-Trip Snapshot Test</span>
+<span class="sd-cp-journey">J-9</span>
+</summary>
+<p class="sd-cp-desc">Developer asserts loading a YAML workflow fixture and re-serializing it produces an identical structure.</p>
+<div class="sd-sequence">
+<div class="sd-seq-header">
+<div class="sd-seq-col sd-seq-num">#</div>
+<div class="sd-seq-col sd-seq-from">From</div>
+<div class="sd-seq-col sd-seq-arrow"></div>
+<div class="sd-seq-col sd-seq-to">To</div>
+<div class="sd-seq-col sd-seq-action">Action</div>
+<div class="sd-seq-col sd-seq-returns">Returns</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">1</div>
+<div class="sd-seq-col sd-seq-from">test_file</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">SVC-SF3-1</div>
+<div class="sd-seq-col sd-seq-action"><div>assert_yaml_round_trip('tests/fixtures/workflows/minimal_ask.yaml')</div><div class="sd-seq-detail">Entry point for round-trip testing.</div></div>
+<div class="sd-seq-col sd-seq-returns">None</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">2</div>
+<div class="sd-seq-col sd-seq-from">SVC-SF3-1</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">SVC-SF3-2</div>
+<div class="sd-seq-col sd-seq-action"><div>load_workflow(path)</div><div class="sd-seq-detail">SF-1 schema I/O parses YAML into a validated `WorkflowConfig` with dict-keyed port containers.</div></div>
+<div class="sd-seq-col sd-seq-returns">WorkflowConfig</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">3</div>
+<div class="sd-seq-col sd-seq-from">SVC-SF3-1</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">SVC-SF3-2</div>
+<div class="sd-seq-col sd-seq-action"><div>dump_workflow(config)</div><div class="sd-seq-detail">Serialize back to YAML using map format for ports.</div></div>
+<div class="sd-seq-col sd-seq-returns">str</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">4</div>
+<div class="sd-seq-col sd-seq-from">SVC-SF3-1</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">SVC-SF3-1</div>
+<div class="sd-seq-col sd-seq-action"><div>yaml.safe_load(original) == yaml.safe_load(serialized)</div><div class="sd-seq-detail">Compare plain YAML structures for equality, show unified diff on failure.</div></div>
+<div class="sd-seq-col sd-seq-returns">None</div>
+</div>
+</div>
+</details>
+<details class="sd-call-path" data-journey-id="J-10">
+<summary>
+<span class="sd-cp-name">Multi-Strategy Priority Resolution Test</span>
+<span class="sd-cp-journey">J-10</span>
+</summary>
+<p class="sd-cp-desc">Developer configures `MockAgentRuntime` with node, role+prompt, role-only, and default matchers, then verifies the fixed resolution priority `node_id &gt; role+prompt &gt; role-only &gt; default` under the SF-2 ContextVar contract.</p>
+<div class="sd-sequence">
+<div class="sd-seq-header">
+<div class="sd-seq-col sd-seq-num">#</div>
+<div class="sd-seq-col sd-seq-from">From</div>
+<div class="sd-seq-col sd-seq-arrow"></div>
+<div class="sd-seq-col sd-seq-to">To</div>
+<div class="sd-seq-col sd-seq-action">Action</div>
+<div class="sd-seq-col sd-seq-returns">Returns</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">1</div>
+<div class="sd-seq-col sd-seq-from">test_file</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">SVC-SF3-1</div>
+<div class="sd-seq-col sd-seq-action"><div>mock.default_response('fallback').when_role('pm').respond('role-match').when_role('pm', prompt=r'review.*').respond('role-prompt-match').when_node('ask_1').respond('node-match')</div><div class="sd-seq-detail">Register all four strategies in one fluent chain.</div></div>
+<div class="sd-seq-col sd-seq-returns">MockAgentRuntime</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">2</div>
+<div class="sd-seq-col sd-seq-from">test_file</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">SVC-SF3-1</div>
+<div class="sd-seq-col sd-seq-action"><div>await run_test(wf, runtime=mock)</div><div class="sd-seq-detail">Execute a workflow that exercises all four strategy levels.</div></div>
+<div class="sd-seq-col sd-seq-returns">ExecutionResult</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">3</div>
+<div class="sd-seq-col sd-seq-from">SVC-SF3-3</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">SVC-SF3-1</div>
+<div class="sd-seq-col sd-seq-action"><div>invoke(role=Role('pm',...), prompt='review the PRD') with _current_node='ask_1'</div><div class="sd-seq-detail">Strategy 1 (`node_id`) wins — `MockAgentRuntime` reads `ask_1` from the SF-2-managed ContextVar before checking role strategies.</div></div>
+<div class="sd-seq-col sd-seq-returns">'node-match'</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">4</div>
+<div class="sd-seq-col sd-seq-from">SVC-SF3-3</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">SVC-SF3-1</div>
+<div class="sd-seq-col sd-seq-action"><div>invoke(role=Role('pm',...), prompt='review the code') with _current_node='ask_2'</div><div class="sd-seq-detail">No node matcher for `ask_2`; Strategy 2 (`role+prompt`) wins.</div></div>
+<div class="sd-seq-col sd-seq-returns">'role-prompt-match'</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">5</div>
+<div class="sd-seq-col sd-seq-from">SVC-SF3-3</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">SVC-SF3-1</div>
+<div class="sd-seq-col sd-seq-action"><div>invoke(role=Role('pm',...), prompt='write docs') with _current_node='ask_3'</div><div class="sd-seq-detail">No node match and no prompt-pattern match; Strategy 3 (`role-only`) wins.</div></div>
+<div class="sd-seq-col sd-seq-returns">'role-match'</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">6</div>
+<div class="sd-seq-col sd-seq-from">SVC-SF3-3</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">SVC-SF3-1</div>
+<div class="sd-seq-col sd-seq-action"><div>invoke(role=Role('designer',...), prompt='create mockup') with _current_node='ask_4'</div><div class="sd-seq-detail">No specific matcher applies; default matcher resolves.</div></div>
+<div class="sd-seq-col sd-seq-returns">'fallback'</div>
+</div>
+</div>
+</details>
+</section>
+<section class="sd-section" id="endpoints">
+<h2 class="sd-section-title">API Endpoints</h2>
+<div class="sd-table-wrap">
+<table class="sd-table">
+<thead><tr>
+<th>Method</th><th>Path</th><th>Service</th><th>Auth</th><th>Description</th>
+</tr></thead>
+<tbody>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#6b7280;letter-spacing:0.04em;line-height:1.6;">CALL</span></td>
+<td><code>iriai_compose.runner.AgentRuntime.invoke(role, prompt, *, output_type=None, workspace=None, session_key=None)</code></td>
+<td><span class="sd-svc-ref" data-ref-service="SVC-SF3-0">iriai_compose (core)</span></td>
+<td>&mdash;</td>
+<td>Unchanged abstract runtime contract. Declarative execution must not add `node_id` here; it propagates current node identity through a `ContextVar` instead.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#6b7280;letter-spacing:0.04em;line-height:1.6;">CALL</span></td>
+<td><code>iriai_compose.declarative.run(workflow, config, *, inputs=None)</code></td>
+<td><span class="sd-svc-ref" data-ref-service="SVC-SF3-3">iriai_compose.declarative</span></td>
+<td>&mdash;</td>
+<td>Canonical SF-2 runtime ABI for SF-3 and SF-4 consumers. Canonical signature: `async def run(workflow: WorkflowConfig | str | Path, config: RuntimeConfig, *, inputs: dict[str, Any] | None = None) -&gt; ExecutionResult`. The stale `(yaml_path, runtime, workspace, transform_registry, hook_registry)` form is permanently rejected. `RuntimeConfig` carries runtime dependencies; node identity is conveyed through the runner-managed `_current_node` ContextVar; hierarchical context merge order is `workflow -&gt; phase -&gt; actor -&gt; node`; `ExecutionResult.nodes_executed` ordering is `(node_id, phase_id)` (node first).</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#6b7280;letter-spacing:0.04em;line-height:1.6;">CALL</span></td>
+<td><code>iriai_compose.testing.runner.run_test(workflow, *, runtime=None, interaction=None, plugin_registry=None, artifacts=None, inputs=None, feature_id='test')</code></td>
+<td><span class="sd-svc-ref" data-ref-service="SVC-SF3-1">iriai_compose.testing</span></td>
+<td>&mdash;</td>
+<td>Thin async wrapper around the canonical SF-2 `run()` ABI. Assembles a `RuntimeConfig` from provided mocks: `runtime` → `config.agent_runtime`, `interaction` → `config.interaction_runtimes={'default': interaction}`, `plugin_registry` → `config.plugin_registry`, `artifacts` → `config.artifacts`. Delegates directly through `run(workflow, config, inputs=inputs)` and returns `ExecutionResult` unchanged. Must not inject a `node_id` kwarg into `AgentRuntime.invoke()`, synthesize checkpoint/resume behavior, swallow exceptions, or rewrite `ExecutionResult` fields.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#6b7280;letter-spacing:0.04em;line-height:1.6;">CALL</span></td>
+<td><code>iriai_compose.testing.validation.validate_workflow(config)</code></td>
+<td><span class="sd-svc-ref" data-ref-service="SVC-SF3-1">iriai_compose.testing</span></td>
+<td>&mdash;</td>
+<td>Re-export of SF-1 `validate_workflow()`. Validates full workflow config for structural errors.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#6b7280;letter-spacing:0.04em;line-height:1.6;">CALL</span></td>
+<td><code>iriai_compose.testing.validation.validate_type_flow(config)</code></td>
+<td><span class="sd-svc-ref" data-ref-service="SVC-SF3-1">iriai_compose.testing</span></td>
+<td>&mdash;</td>
+<td>Re-export of SF-1 `validate_type_flow()`. Checks output type compatibility across edges.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#6b7280;letter-spacing:0.04em;line-height:1.6;">CALL</span></td>
+<td><code>iriai_compose.testing.validation.detect_cycles(config)</code></td>
+<td><span class="sd-svc-ref" data-ref-service="SVC-SF3-1">iriai_compose.testing</span></td>
+<td>&mdash;</td>
+<td>Re-export of SF-1 `detect_cycles()`. Detects cyclic dependencies in the workflow DAG.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#6b7280;letter-spacing:0.04em;line-height:1.6;">CALL</span></td>
+<td><code>iriai_compose.testing.assertions.assert_node_reached(result, node_id, *, before=None, after=None)</code></td>
+<td><span class="sd-svc-ref" data-ref-service="SVC-SF3-1">iriai_compose.testing</span></td>
+<td>&mdash;</td>
+<td>Assert that a node was executed, with optional ordering constraints. Reads node IDs from `result.nodes_executed` tuples in canonical `(node_id, phase_id)` order — node first, containing phase second, per SF-2 published ABI (D-GR-41). Unpack as `nid, pid = entry` and check `nid == node_id`.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#6b7280;letter-spacing:0.04em;line-height:1.6;">CALL</span></td>
+<td><code>iriai_compose.testing.assertions.assert_branch_taken(result, branch_node_id, expected_port)</code></td>
+<td><span class="sd-svc-ref" data-ref-service="SVC-SF3-1">iriai_compose.testing</span></td>
+<td>&mdash;</td>
+<td>Assert that a specific Branch node recorded the expected output path in `result.branch_paths`.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#6b7280;letter-spacing:0.04em;line-height:1.6;">CALL</span></td>
+<td><code>iriai_compose.testing.assertions.assert_loop_iterations(result, phase_id, expected_count)</code></td>
+<td><span class="sd-svc-ref" data-ref-service="SVC-SF3-1">iriai_compose.testing</span></td>
+<td>&mdash;</td>
+<td>Assert loop iterations through `result.history.loop_progress[phase_id].completed_iterations`; phase-mode metrics live on `ExecutionHistory` (added to `ExecutionResult.history` per D-GR-34), not as top-level `ExecutionResult` fields.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#6b7280;letter-spacing:0.04em;line-height:1.6;">CALL</span></td>
+<td><code>iriai_compose.testing.snapshot.assert_yaml_round_trip(path)</code></td>
+<td><span class="sd-svc-ref" data-ref-service="SVC-SF3-1">iriai_compose.testing</span></td>
+<td>&mdash;</td>
+<td>Load a YAML workflow file, serialize back to YAML, reload, and assert structural equality. Port dicts must round-trip as dicts, not lists.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#6b7280;letter-spacing:0.04em;line-height:1.6;">CALL</span></td>
+<td><code>iriai_compose.testing.fixtures.minimal_ask_workflow(*, actor, prompt, **kwargs)</code></td>
+<td><span class="sd-svc-ref" data-ref-service="SVC-SF3-1">iriai_compose.testing</span></td>
+<td>&mdash;</td>
+<td>Factory function returning a minimal single-Ask-node `WorkflowConfig`. Ports are dict-based: `inputs`, `outputs`, and `hooks` are all `dict[str, PortDefinition]` keyed by port name.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#6b7280;letter-spacing:0.04em;line-height:1.6;">CALL</span></td>
+<td><code>MockAgentRuntime().when_node(node_id)</code></td>
+<td><span class="sd-svc-ref" data-ref-service="SVC-SF3-1">iriai_compose.testing</span></td>
+<td>&mdash;</td>
+<td>Fluent entry point for Strategy 1 matcher creation. The configured `node_id` is compared against the current-node `ContextVar` read inside `MockAgentRuntime.invoke()`, not against an `invoke(..., node_id=...)` parameter.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#6b7280;letter-spacing:0.04em;line-height:1.6;">CALL</span></td>
+<td><code>MockAgentRuntime().when_role(name, *, prompt=None)</code></td>
+<td><span class="sd-svc-ref" data-ref-service="SVC-SF3-1">iriai_compose.testing</span></td>
+<td>&mdash;</td>
+<td>Fluent entry point for role-based matching. With `prompt` set, creates Strategy 2 (`role+prompt`); otherwise Strategy 3 (`role-only`).</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#6b7280;letter-spacing:0.04em;line-height:1.6;">CALL</span></td>
+<td><code>NodeMatcher.respond_with(handler)</code></td>
+<td><span class="sd-svc-ref" data-ref-service="SVC-SF3-1">iriai_compose.testing</span></td>
+<td>&mdash;</td>
+<td>Terminal configuration for dynamic responses. The handler is called with `(prompt, context)` where `context` reflects the canonical hierarchical merge order `workflow -&gt; phase -&gt; actor -&gt; node`.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#6b7280;letter-spacing:0.04em;line-height:1.6;">CALL</span></td>
+<td><code>MockInteractionRuntime().when_node(node_id)</code></td>
+<td><span class="sd-svc-ref" data-ref-service="SVC-SF3-1">iriai_compose.testing</span></td>
+<td>&mdash;</td>
+<td>Fluent entry point for interaction mock configuration keyed by the `Pending.node_id` value.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#6b7280;letter-spacing:0.04em;line-height:1.6;">CALL</span></td>
+<td><code>MockPluginRuntime().when_ref(plugin_ref)</code></td>
+<td><span class="sd-svc-ref" data-ref-service="SVC-SF3-1">iriai_compose.testing</span></td>
+<td>&mdash;</td>
+<td>Fluent entry point for plugin mock configuration keyed by `plugin_ref`.</td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section class="sd-section" id="entities">
+<h2 class="sd-section-title">Entity Model</h2>
+<div class="sd-entity-grid">
+<div class="sd-entity-card" data-service-id="SVC-SF3-3" data-journeys="J-8 J-10">
+<div class="sd-entity-header">
+<h4 class="sd-entity-name">CurrentNodeContextVar</h4>
+<span class="sd-entity-svc" data-ref-service="SVC-SF3-3">iriai_compose.declarative</span>
+</div>
+<table class="sd-field-table">
+<thead><tr><th>Field</th><th>Type</th><th>Constraints</th></tr></thead>
+<tbody>
+<tr>
+<td>value</td>
+<td><code>ContextVar[str | None]</code></td>
+<td>SF-2 published ABI element. Runner-managed. Set immediately before each Ask-node agent dispatch and reset to `None` after. SF-3 mocks read this value inside `invoke()` — they must never set it themselves.</td>
+</tr>
+<tr>
+<td>default</td>
+<td><code>None</code></td>
+<td>Must default to `None` outside active Ask-node dispatch per SF-2 published ABI.</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div class="sd-entity-card" data-service-id="SVC-SF3-3" data-journeys="J-8">
+<div class="sd-entity-header">
+<h4 class="sd-entity-name">ExecutionResult</h4>
+<span class="sd-entity-svc" data-ref-service="SVC-SF3-3">iriai_compose.declarative</span>
+</div>
+<table class="sd-field-table">
+<thead><tr><th>Field</th><th>Type</th><th>Constraints</th></tr></thead>
+<tbody>
+<tr>
+<td>success</td>
+<td><code>bool</code></td>
+<td>SF-2 published ABI field.</td>
+</tr>
+<tr>
+<td>error</td>
+<td><code>ExecutionError | None</code></td>
+<td>SF-2 published ABI field. `ExecutionError` is the base class; `DeclarativeExecutionError` is the concrete runtime subclass exported from `iriai_compose.declarative`.</td>
+</tr>
+<tr>
+<td>nodes_executed</td>
+<td><code>list[tuple[str, str]]</code></td>
+<td>SF-2 published ABI field. Each tuple is `(node_id, phase_id)` — node first, containing phase second. Canonical ordering per D-GR-41. SF-3 `assert_node_reached()` must unpack as `nid, _ = entry` when searching by node ID.</td>
+</tr>
+<tr>
+<td>artifacts</td>
+<td><code>dict[str, Any]</code></td>
+<td>SF-2 published ABI field.</td>
+</tr>
+<tr>
+<td>branch_paths</td>
+<td><code>dict[str, str]</code></td>
+<td>SF-2 published ABI field. Keyed by branch node ID.</td>
+</tr>
+<tr>
+<td>cost_summary</td>
+<td><code>dict[str, Any]</code></td>
+<td>SF-2 published ABI field.</td>
+</tr>
+<tr>
+<td>duration_ms</td>
+<td><code>float</code></td>
+<td>SF-2 published ABI field.</td>
+</tr>
+<tr>
+<td>workflow_output</td>
+<td><code>dict[str, Any] | Any | None</code></td>
+<td>SF-2 published ABI field.</td>
+</tr>
+<tr>
+<td>hook_warnings</td>
+<td><code>list[str]</code></td>
+<td>SF-2 published ABI field. Empty list when no hook warnings occurred.</td>
+</tr>
+<tr>
+<td>history</td>
+<td><code>ExecutionHistory | None</code></td>
+<td>SF-2 published ABI field per D-GR-34. Phase-mode metrics (including `loop_progress` keyed by phase ID) live here. SF-3 `assert_loop_iterations()` accesses `result.history.loop_progress[phase_id].completed_iterations`.</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div class="sd-entity-card" data-service-id="SVC-SF3-1" data-journeys="J-8 J-10">
+<div class="sd-entity-header">
+<h4 class="sd-entity-name">MockAgentRuntime</h4>
+<span class="sd-entity-svc" data-ref-service="SVC-SF3-1">iriai_compose.testing</span>
+</div>
+<table class="sd-field-table">
+<thead><tr><th>Field</th><th>Type</th><th>Constraints</th></tr></thead>
+<tbody>
+<tr>
+<td>matchers</td>
+<td><code>list[ResponseMatcher]</code></td>
+<td>Internal. Resolved in fixed priority order: `node &gt; role_prompt &gt; role &gt; default`.</td>
+</tr>
+<tr>
+<td>calls</td>
+<td><code>list[dict[str, Any]]</code></td>
+<td>Each record includes `{node_id, role, prompt, output_type, workspace, session_key, matched}`. `node_id` is read from the SF-2-managed `_current_node` ContextVar, not from an `invoke()` parameter.</td>
+</tr>
+<tr>
+<td>invoke(role, prompt, *, output_type, workspace, session_key)</td>
+<td><code>async method -&gt; str | BaseModel</code></td>
+<td>Overrides the unchanged `AgentRuntime` ABC. Must read current node ID from `_current_node` ContextVar. Adding `node_id` to this signature is permanently prohibited.</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div class="sd-entity-card" data-service-id="SVC-SF3-2" data-journeys="J-7">
+<div class="sd-entity-header">
+<h4 class="sd-entity-name">ValidationError</h4>
+<span class="sd-entity-svc" data-ref-service="SVC-SF3-2">iriai_compose.schema</span>
+</div>
+<table class="sd-field-table">
+<thead><tr><th>Field</th><th>Type</th><th>Constraints</th></tr></thead>
+<tbody>
+<tr>
+<td>code</td>
+<td><code>str</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>path</td>
+<td><code>str</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>message</td>
+<td><code>str</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>context</td>
+<td><code>dict[str, Any]</code></td>
+<td>&mdash;</td>
+</tr>
+</tbody>
+</table>
+</div>
+</div>
+</section>
+<section class="sd-section" id="relations">
+<h2 class="sd-section-title">Entity Relationships</h2>
+<div class="sd-table-wrap">
+<table class="sd-table">
+<thead><tr>
+<th>From</th><th>Relationship</th><th>To</th><th>Label</th>
+</tr></thead>
+<tbody>
+<tr>
+<td>ENT-MockAgentRuntime</td>
+<td><span class="sd-rel-kind">one-to-one</span></td>
+<td>ENT-CurrentNodeContextVar</td>
+<td>reads the SF-2-managed current node ID during `invoke()` — consuming the published ABI without changing the ABC signature</td>
+</tr>
+<tr>
+<td>ENT-MockAgentRuntime</td>
+<td><span class="sd-rel-kind">one-to-one</span></td>
+<td>ENT-ExecutionResult</td>
+<td>produces execution traces through `run_test()` delegation to SF-2 `run()`, consuming the published ABI result type</td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section class="sd-section" id="risks">
+<h2 class="sd-section-title">Risks</h2>
+<ul class="sd-risks-list">
+<li>RISK-1 (HIGH): SF-1 schema models are unavailable or diverge from the dict-based port contract. This blocks `WorkflowBuilder`, fixture factories, snapshots, and validation re-exports.</li>
+<li>RISK-2 (HIGH): SF-2 exports `run()`, `RuntimeConfig`, `ExecutionResult`, `ExecutionHistory`, `ExecutionError`, or `PluginRegistry` are unavailable at build time or diverge from the canonical signatures documented in D-GR-41. This blocks `run_test()`, end-to-end execution assertions, and migration-consumer parity. Mitigation: D-SF3-17 locks the canonical SF-2 export list; SF-3 implementers should treat any missing export as a blocking gap to raise with SF-2.</li>
+<li>RISK-3 (MEDIUM): SF-2 forgets to set or reset the current-node `ContextVar` around Ask-node dispatch. `when_node()` matchers become ineffective or leak stale node IDs.</li>
+<li>RISK-4 (MEDIUM): SF-2 or downstream consumers assemble handler context in a different order than `workflow -&gt; phase -&gt; actor -&gt; node`. Mitigation: D-SF3-5a standardizes merge order across SF-2, SF-3, and SF-4.</li>
+<li>RISK-5 (MEDIUM): Implementers invert the fluent chain and return the wrong object, breaking API ergonomics.</li>
+<li>RISK-6 (MEDIUM): WorkflowBuilder edge assignment heuristics may be insufficient for nested phases or plugin-heavy flows.</li>
+<li>RISK-7 (LOW): YAML fixtures written with list-based ports instead of YAML maps will fail snapshot round-trip tests immediately.</li>
+<li>RISK-8 (MEDIUM): Downstream migration consumers drift back to stale `invoke(..., node_id=...)` or core checkpoint/resume assumptions despite the published SF-2 ABI.</li>
+<li>RISK-9 (HIGH): SF-3 assertion code written against the wrong `nodes_executed` tuple order `(phase_id, node_id)` instead of the canonical `(node_id, phase_id)`. Tests would silently pass when they should fail. Mitigation: D-GR-41 fixes the ordering contract explicitly; implementers must use `nid, pid = entry` and search by the first element.</li>
+<li>RISK-10 (MEDIUM): SF-2 does not export `ExecutionHistory` from `iriai_compose.declarative.__init__` after D-GR-34 rewrite, leaving SF-3 unable to type-annotate `result.history`. Mitigation: D-GR-41 explicitly lists `ExecutionHistory` as a required SF-2 export; SF-2 implementers must add it to `__init__.py`.</li>
+<li>RISK-11 (MEDIUM): `run_test()` builds `RuntimeConfig` with `interaction_runtimes={'default': interaction}` but the workflow expects a different key. Mitigation: document that the default key is `'default'`; SF-3 test fixtures should use `default` as the interaction runtime key.</li>
+</ul>
+</section>
+</main>
+<footer class="sd-footer">
+<p>System Design Document</p>
+</footer>
+<script>
+(function () {
+  'use strict';
+
+  // ── Journey filtering ──────────────────────────────────────────────
+  var activeJourney = '__all__';
+
+  window.__sd_filter = function (journeyId) {
+    activeJourney = journeyId;
+
+    // Update pill states
+    var pills = document.querySelectorAll('.sd-pill');
+    for (var i = 0; i < pills.length; i++) {
+      var p = pills[i];
+      if (p.getAttribute('data-journey') === journeyId) {
+        p.classList.add('sd-pill-active');
+      } else {
+        p.classList.remove('sd-pill-active');
+      }
+    }
+
+    // Filter elements with data-journeys
+    var tagged = document.querySelectorAll('[data-journeys]');
+    for (var j = 0; j < tagged.length; j++) {
+      var el = tagged[j];
+      if (journeyId === '__all__') {
+        el.classList.remove('sd-dimmed');
+      } else {
+        var jList = (el.getAttribute('data-journeys') || '').split(/\s+/);
+        var match = false;
+        for (var k = 0; k < jList.length; k++) {
+          if (jList[k] === journeyId) { match = true; break; }
+        }
+        el.classList.toggle('sd-dimmed', !match);
+      }
+    }
+
+    // Filter elements with data-journey-id (call paths)
+    var cpTagged = document.querySelectorAll('[data-journey-id]');
+    for (var m = 0; m < cpTagged.length; m++) {
+      var cpEl = cpTagged[m];
+      if (journeyId === '__all__') {
+        cpEl.classList.remove('sd-dimmed');
+      } else {
+        var cpJourney = cpEl.getAttribute('data-journey-id') || '';
+        cpEl.classList.toggle('sd-dimmed', cpJourney !== '' && cpJourney !== journeyId);
+      }
+    }
+  };
+
+  // ── Expand / collapse all details ──────────────────────────────────
+  var detailsExpanded = false;
+
+  window.__sd_toggle_details = function () {
+    detailsExpanded = !detailsExpanded;
+    var details = document.querySelectorAll('.sd-call-path');
+    for (var i = 0; i < details.length; i++) {
+      details[i].open = detailsExpanded;
+    }
+    var btn = document.getElementById('sd-toggle-details');
+    if (btn) {
+      btn.textContent = detailsExpanded ? 'Collapse All' : 'Expand All';
+    }
+  };
+
+  // ── Service hover cross-highlighting ───────────────────────────────
+  function highlightService(serviceId, on) {
+    // Highlight service cards
+    var cards = document.querySelectorAll('.sd-service-card[data-service-id="' + serviceId + '"]');
+    for (var i = 0; i < cards.length; i++) {
+      cards[i].classList.toggle('sd-highlight', on);
+    }
+
+    // Highlight entity cards belonging to this service
+    var entities = document.querySelectorAll('.sd-entity-card[data-service-id="' + serviceId + '"]');
+    for (var j = 0; j < entities.length; j++) {
+      entities[j].classList.toggle('sd-highlight', on);
+    }
+
+    // Highlight service references in tables
+    var refs = document.querySelectorAll('.sd-svc-ref[data-ref-service="' + serviceId + '"]');
+    for (var k = 0; k < refs.length; k++) {
+      refs[k].style.fontWeight = on ? '700' : '';
+      refs[k].style.textDecoration = on ? 'underline' : '';
+    }
+  }
+
+  // Attach hover listeners to service cards
+  document.addEventListener('DOMContentLoaded', function () {
+    var svcCards = document.querySelectorAll('.sd-service-card[data-service-id]');
+    for (var i = 0; i < svcCards.length; i++) {
+      (function (card) {
+        var sid = card.getAttribute('data-service-id');
+        card.addEventListener('mouseenter', function () { highlightService(sid, true); });
+        card.addEventListener('mouseleave', function () { highlightService(sid, false); });
+      })(svcCards[i]);
+    }
+
+    // Attach hover listeners to service refs (entity badges, table refs)
+    var svcRefs = document.querySelectorAll('[data-ref-service]');
+    for (var j = 0; j < svcRefs.length; j++) {
+      (function (ref) {
+        var sid = ref.getAttribute('data-ref-service');
+        ref.addEventListener('mouseenter', function () { highlightService(sid, true); });
+        ref.addEventListener('mouseleave', function () { highlightService(sid, false); });
+      })(svcRefs[j]);
+    }
+  });
+
+  // ── Smooth scroll via nav links ────────────────────────────────────
+  var navLinks = document.querySelectorAll('.sd-nav-link');
+  for (var i = 0; i < navLinks.length; i++) {
+    navLinks[i].addEventListener('click', function (e) {
+      var href = this.getAttribute('href');
+      if (href && href.charAt(0) === '#') {
+        var target = document.getElementById(href.substring(1));
+        if (target) {
+          e.preventDefault();
+          var headerHeight = document.querySelector('.sd-header')
+            ? document.querySelector('.sd-header').offsetHeight
+            : 0;
+          var top = target.getBoundingClientRect().top + window.pageYOffset - headerHeight - 16;
+          window.scrollTo({ top: top, behavior: 'smooth' });
+        }
+      }
+    });
+  }
+})();
+</script>
+</body>
+</html>

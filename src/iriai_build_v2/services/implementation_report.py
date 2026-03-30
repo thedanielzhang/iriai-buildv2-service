@@ -172,8 +172,10 @@ def render_implementation_report(
                 evidence_section += f"<p>Screenshot not found: <code>{_esc(path)}</code></p>"
     else:
         evidence_section += (
-            "<p><em>No screenshots captured. The verifier may not have "
-            "generated Playwright evidence for this project type.</em></p>"
+            '<p style="color:#dc2626;font-weight:bold;">'
+            "⚠ NO SCREENSHOT EVIDENCE — The verifier did not capture any "
+            "Playwright screenshots. This report cannot be approved without "
+            "visual evidence of user journeys working end-to-end.</p>"
         )
     evidence_section += "</section>"
     sections.append(evidence_section)
@@ -347,5 +349,18 @@ def validate_report(
     for outcome in handover.completed:
         if outcome.task_id and outcome.task_id not in html:
             errors.append(f"Missing task reference: {outcome.task_id}")
+
+    # Screenshot evidence is mandatory for projects with a frontend/UI.
+    # Pure backend/library projects get a pass.
+    has_frontend = any(
+        kw in html.lower()
+        for kw in ("frontend", "react", "composer", "editor", "canvas", "ui ")
+    )
+    if has_frontend and ("<img" not in html or "screenshot" not in html.lower()):
+        errors.append(
+            "Missing screenshot evidence: this project has frontend components but "
+            "no Playwright screenshots were found in the Journey Evidence section. "
+            "The verifier must capture screenshots for every UI journey step."
+        )
 
     return errors

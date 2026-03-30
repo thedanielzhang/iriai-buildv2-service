@@ -15,7 +15,8 @@ class PostgresArtifactStore(ArtifactStore):
 
     async def get(self, key: str, *, feature: Feature) -> Any | None:
         row = await self._pool.fetchrow(
-            "SELECT value FROM artifacts WHERE feature_id = $1 AND key = $2",
+            "SELECT value FROM artifacts WHERE feature_id = $1 AND key = $2 "
+            "ORDER BY id DESC LIMIT 1",
             feature.id,
             key,
         )
@@ -26,11 +27,7 @@ class PostgresArtifactStore(ArtifactStore):
     async def put(self, key: str, value: Any, *, feature: Feature) -> None:
         serialized = self._serialize(value)
         await self._pool.execute(
-            """
-            INSERT INTO artifacts (feature_id, key, value)
-            VALUES ($1, $2, $3)
-            ON CONFLICT (feature_id, key) DO UPDATE SET value = EXCLUDED.value
-            """,
+            "INSERT INTO artifacts (feature_id, key, value) VALUES ($1, $2, $3)",
             feature.id,
             key,
             serialized,

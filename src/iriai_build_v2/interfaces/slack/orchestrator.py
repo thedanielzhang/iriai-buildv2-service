@@ -20,6 +20,7 @@ from .._bootstrap import (
     slugify,
     teardown,
 )
+from ...runtimes import create_agent_runtime
 from .parser import parse_workflow_request
 from .streamer import SlackStreamer
 
@@ -43,15 +44,17 @@ class SlackWorkflowOrchestrator:
         adapter: SlackAdapter,
         interaction_runtime: SlackInteractionRuntime,
         workspace_path: Path | None = None,
+        agent_runtime_name: str = "claude",
     ) -> None:
         self._adapter = adapter
         self._interaction = interaction_runtime
         self._default_workspace = workspace_path  # suggestion, not binding
+        self._agent_runtime_name = agent_runtime_name
         self._env: BootstrappedEnv | None = None
 
         # Workflow tracking
         self._active_workflows: dict[str, asyncio.Task] = {}  # feature_id → task
-        self._active_runtimes: dict[str, Any] = {}  # feature_id → ClaudeAgentRuntime
+        self._active_runtimes: dict[str, Any] = {}  # feature_id → runtime instance
         self._channel_features: dict[str, str] = {}  # channel → feature_id
         self._user_notes: dict[str, list[str]] = {}  # feature_id → queued notes
 
@@ -85,7 +88,11 @@ class SlackWorkflowOrchestrator:
             self._tunnel = None
 
         await self._recover_active_features()
-        logger.info("Orchestrator started, default_workspace=%s", self._default_workspace)
+        logger.info(
+            "Orchestrator started, default_workspace=%s, agent_runtime=%s",
+            self._default_workspace,
+            self._agent_runtime_name,
+        )
 
     async def shutdown(self) -> None:
         """Cancel active workflows, stop tunnel, and teardown environment."""
@@ -123,12 +130,18 @@ class SlackWorkflowOrchestrator:
         elif self._has_active_agent(feature_id):
             # Mode 2: agent working → inject mid-stream
             runtime = self._active_runtimes.get(feature_id)
+            injected = False
             if runtime:
                 injected = await runtime.inject_user_message(feature_id, text)
-                if injected:
-                    await self._adapter.add_reaction(
-                        channel, event.get("ts", ""), "eyes"
-                    )
+            if injected:
+                await self._adapter.add_reaction(
+                    channel, event.get("ts", ""), "eyes"
+                )
+            else:
+                self._queue_user_note(feature_id, text)
+                await self._adapter.add_reaction(
+                    channel, event.get("ts", ""), "memo"
+                )
         elif feature_id in self._recoverable_features and feature_id not in self._active_workflows:
             # Mode 3a: recovered feature, no active workflow → resume
             await self._adapter.add_reaction(
@@ -213,47 +226,19 @@ class SlackWorkflowOrchestrator:
             "channel_id": channel_id,
             "workspace_path": str(workspace_path),
             "mode": mode,
+            "agent_runtime": self._agent_runtime_name,
         })
 
         # 7. Register channel with interaction runtime
         self._interaction.register_channel(feature.id, channel_id)
 
         # 8. Create streamer + runner with per-feature workspace
-        streamer = SlackStreamer(self._adapter, channel_id)
-
-        from iriai_compose import Workspace
-
-        from ...runtimes.claude import ClaudeAgentRuntime
-        from ...workflows import TrackedWorkflowRunner
-
-        agent_runtime = ClaudeAgentRuntime(
-            session_store=self._env.sessions,
-            on_message=streamer.on_message,
-            interactive_roles=_INTERACTIVE_ROLES,
+        agent_runtime, runner = self._create_runtime_and_runner(
+            workspace_path=workspace_path,
+            channel_id=channel_id,
+            runtime_name=self._agent_runtime_name,
         )
         self._active_runtimes[feature.id] = agent_runtime
-
-        # Wire turn persistence for mid-interview resume
-        self._interaction._session_store = self._env.sessions
-        self._interaction._agent_runtime = agent_runtime
-
-        ws = Workspace(id="main", path=workspace_path)
-        runner = TrackedWorkflowRunner(
-            feature_store=self._env.feature_store,
-            agent_runtime=agent_runtime,
-            interaction_runtimes={"terminal": self._interaction},
-            artifacts=self._env.artifacts,
-            sessions=self._env.sessions,
-            context_provider=self._env.context_provider,
-            workspaces={"main": ws},
-            services={
-                "feedback": self._env.feedback_service,
-                "preview": self._env.preview_service,
-                "playwright": self._env.playwright_service,
-                "artifact_mirror": self._env.artifact_mirror,
-                "tunnel": self._tunnel,
-            },
-        )
 
         # 9. Select workflow + build state
         workflow = select_workflow(parsed.workflow_name)
@@ -270,7 +255,7 @@ class SlackWorkflowOrchestrator:
         await self._adapter.post_message(
             channel_id,
             f"Starting *{parsed.workflow_name}* workflow for: *{parsed.feature_name}*\n"
-            f"Workspace: `{workspace_path}`\nMode: _{mode}_",
+            f"Workspace: `{workspace_path}`\nMode: _{mode}_\nRuntime: _{self._agent_runtime_name}_",
         )
 
         # 12. Launch workflow as background task
@@ -465,6 +450,7 @@ class SlackWorkflowOrchestrator:
             channel_id = meta.get("channel_id")
             workspace_path = meta.get("workspace_path")
             mode = meta.get("mode", "singleplayer")
+            agent_runtime = meta.get("agent_runtime", self._agent_runtime_name)
 
             if not channel_id or not workspace_path:
                 logger.warning(
@@ -484,13 +470,14 @@ class SlackWorkflowOrchestrator:
                 "workspace_path": workspace_path,
                 "mode": mode,
                 "phase": phase,
+                "agent_runtime": agent_runtime,
             }
 
             try:
                 await self._adapter.post_message(
                     channel_id,
                     f"Bridge restarted. Feature is in phase `{phase}`. "
-                    "Send any message to resume.",
+                    f"Runtime: `{agent_runtime}`. Send any message to resume.",
                 )
             except Exception:
                 logger.warning("Failed to post recovery message in %s", channel_id, exc_info=True)
@@ -510,6 +497,7 @@ class SlackWorkflowOrchestrator:
         workspace_path = Path(recovery_info["workspace_path"])
         mode = recovery_info["mode"]
         resume_phase = recovery_info["phase"]
+        agent_runtime_name = recovery_info["agent_runtime"]
 
         # Fail fast: workspace must still exist
         if not workspace_path.is_dir():
@@ -536,46 +524,17 @@ class SlackWorkflowOrchestrator:
         )
 
         # Create streamer, runtime, runner (same as _start_workflow steps 8-9)
-        streamer = SlackStreamer(self._adapter, channel_id)
-
-        from iriai_compose import Workspace
-
-        from ...runtimes.claude import ClaudeAgentRuntime
-        from ...workflows import TrackedWorkflowRunner
-
-        agent_runtime = ClaudeAgentRuntime(
-            session_store=self._env.sessions,
-            on_message=streamer.on_message,
-            interactive_roles=_INTERACTIVE_ROLES,
+        agent_runtime, runner = self._create_runtime_and_runner(
+            workspace_path=workspace_path,
+            channel_id=channel_id,
+            runtime_name=agent_runtime_name,
         )
         self._active_runtimes[feature_id] = agent_runtime
-
-        # Wire turn persistence for mid-interview resume
-        self._interaction._session_store = self._env.sessions
-        self._interaction._agent_runtime = agent_runtime
-
-        ws = Workspace(id="main", path=workspace_path)
-        runner = TrackedWorkflowRunner(
-            feature_store=self._env.feature_store,
-            agent_runtime=agent_runtime,
-            interaction_runtimes={"terminal": self._interaction},
-            artifacts=self._env.artifacts,
-            sessions=self._env.sessions,
-            context_provider=self._env.context_provider,
-            workspaces={"main": ws},
-            services={
-                "feedback": self._env.feedback_service,
-                "preview": self._env.preview_service,
-                "playwright": self._env.playwright_service,
-                "artifact_mirror": self._env.artifact_mirror,
-                "tunnel": self._tunnel,
-            },
-        )
 
         await self._adapter.post_message(
             channel_id,
             f"Resuming *{feature.workflow_name}* workflow from phase: *{resume_phase}*\n"
-            f"Workspace: `{workspace_path}`\nMode: _{mode}_",
+            f"Workspace: `{workspace_path}`\nMode: _{mode}_\nRuntime: _{agent_runtime_name}_",
         )
 
         task = asyncio.create_task(
@@ -616,7 +575,69 @@ class SlackWorkflowOrchestrator:
         runtime = self._active_runtimes.get(feature_id)
         if not runtime:
             return False
-        return runtime.has_active_agent(feature_id)
+        return bool(getattr(runtime, "has_active_agent", lambda _feature_id: False)(feature_id))
 
     def _queue_user_note(self, feature_id: str, text: str) -> None:
         self._user_notes.setdefault(feature_id, []).append(text)
+        runtime = self._active_runtimes.get(feature_id)
+        if runtime and hasattr(runtime, "queue_user_note"):
+            runtime.queue_user_note(feature_id, text)
+
+    def _create_runtime_and_runner(
+        self,
+        *,
+        workspace_path: Path,
+        channel_id: str,
+        runtime_name: str,
+    ) -> tuple[Any, Any]:
+        assert self._env is not None
+
+        streamer = SlackStreamer(self._adapter, channel_id)
+
+        from iriai_compose import Workspace
+
+        from ...workflows import TrackedWorkflowRunner
+
+        agent_runtime = create_agent_runtime(
+            runtime_name,
+            session_store=self._env.sessions,
+            on_message=streamer.on_message,
+            interactive_roles=_INTERACTIVE_ROLES,
+        )
+
+        # Secondary runtime for adversarial multi-model execution
+        secondary_name = "codex" if runtime_name != "codex" else "claude"
+        secondary_runtime = create_agent_runtime(
+            secondary_name,
+            session_store=self._env.sessions,
+            on_message=streamer.on_message,
+        )
+
+        self._interaction._session_store = self._env.sessions
+        self._interaction._agent_runtime = agent_runtime
+
+        # Workspace manager for worktree creation
+        from ...services.workspace import WorkspaceManager
+
+        workspace_manager = WorkspaceManager(base_path=workspace_path)
+
+        ws = Workspace(id="main", path=workspace_path)
+        runner = TrackedWorkflowRunner(
+            feature_store=self._env.feature_store,
+            agent_runtime=agent_runtime,
+            secondary_runtime=secondary_runtime,
+            interaction_runtimes={"terminal": self._interaction},
+            artifacts=self._env.artifacts,
+            sessions=self._env.sessions,
+            context_provider=self._env.context_provider,
+            workspaces={"main": ws},
+            services={
+                "feedback": self._env.feedback_service,
+                "preview": self._env.preview_service,
+                "playwright": self._env.playwright_service,
+                "artifact_mirror": self._env.artifact_mirror,
+                "workspace_manager": workspace_manager,
+                "tunnel": self._tunnel,
+            },
+        )
+        return agent_runtime, runner

@@ -10,12 +10,7 @@ _seen_ids: set[str] = set()
 
 def print_stream(msg: Any) -> None:
     """Print agent messages to the terminal as they stream in."""
-    try:
-        from claude_agent_sdk.types import AssistantMessage
-    except ImportError:
-        return
-
-    if not isinstance(msg, AssistantMessage):
+    if type(msg).__name__ != "AssistantMessage":
         return
 
     # Deduplicate by message ID if available
@@ -29,6 +24,8 @@ def print_stream(msg: Any) -> None:
         typ = type(block).__name__
         if typ == "TextBlock":
             print(block.text, end="", flush=True)
+        elif typ == "ThinkingBlock":
+            print(f"\n[thinking] {block.thinking}", flush=True)
         elif typ == "ToolUseBlock":
             name = block.name
             inp = block.input
@@ -36,3 +33,7 @@ def print_stream(msg: Any) -> None:
             if isinstance(inp, dict):
                 target = inp.get("file_path") or inp.get("command") or inp.get("pattern") or ""
             print(f"\n[tool] {name} {target}", flush=True)
+        elif typ == "ToolResultBlock":
+            marker = "error" if getattr(block, "is_error", False) else "ok"
+            content = getattr(block, "content", "")
+            print(f"\n[result:{marker}] {content}", flush=True)

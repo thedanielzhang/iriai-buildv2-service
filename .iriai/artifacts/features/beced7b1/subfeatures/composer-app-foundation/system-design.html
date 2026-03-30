@@ -1,0 +1,2174 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SF-5 Composer App Foundation &amp; Tools Hub - System Design</title>
+<style>
+  /* ── Reset & Base ─────────────────────────────────────────────────── */
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  @font-face {
+    font-family: 'Charter';
+    src: local('Charter'), local('Georgia');
+    font-display: swap;
+  }
+
+  :root {
+    --text-primary: #1a1a2e;
+    --text-secondary: #555;
+    --text-muted: #888;
+    --bg-page: #faf9f7;
+    --bg-card: #fff;
+    --border-subtle: rgba(0, 0, 0, 0.06);
+    --border-medium: rgba(0, 0, 0, 0.1);
+    --accent: #2d5be3;
+    --accent-faint: rgba(45, 91, 227, 0.06);
+    --accent-light: rgba(45, 91, 227, 0.12);
+    --content-width: 960px;
+    --gutter: clamp(20px, 5vw, 48px);
+    --radius: 10px;
+    --radius-sm: 6px;
+  }
+
+  html {
+    font-size: 17px;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
+    scroll-behavior: smooth;
+  }
+
+  body {
+    font-family: Charter, Georgia, 'Times New Roman', serif;
+    color: var(--text-primary);
+    background: var(--bg-page);
+    line-height: 1.72;
+    min-height: 100vh;
+  }
+
+  ::selection {
+    background: rgba(45, 91, 227, 0.18);
+    color: inherit;
+  }
+
+  /* ── Header ──────────────────────────────────────────────────────── */
+  .sd-header {
+    position: sticky;
+    top: 0;
+    z-index: 100;
+    background: rgba(250, 249, 247, 0.92);
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
+    border-bottom: 1px solid var(--border-subtle);
+    padding: 0 var(--gutter);
+  }
+
+  .sd-header-inner {
+    max-width: var(--content-width);
+    margin: 0 auto;
+    padding: 20px 0 16px;
+  }
+
+  .sd-title {
+    font-size: clamp(1.8rem, 4vw, 2.6rem);
+    font-weight: 700;
+    line-height: 1.15;
+    letter-spacing: -0.025em;
+    color: var(--text-primary);
+    margin-bottom: 12px;
+  }
+
+  .sd-nav {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-bottom: 12px;
+  }
+
+  .sd-nav-link {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--text-muted);
+    text-decoration: none;
+    padding: 4px 10px;
+    border-radius: var(--radius-sm);
+    transition: color 0.15s, background 0.15s;
+  }
+
+  .sd-nav-link:hover {
+    color: var(--accent);
+    background: var(--accent-faint);
+  }
+
+  /* ── Filter pills ────────────────────────────────────────────────── */
+  .sd-filters {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+    padding-top: 4px;
+  }
+
+  .sd-filter-label {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    margin-right: 4px;
+  }
+
+  .sd-pill {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 12px;
+    font-weight: 500;
+    padding: 3px 12px;
+    border: 1px solid var(--border-medium);
+    border-radius: 100px;
+    background: var(--bg-card);
+    color: var(--text-secondary);
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+
+  .sd-pill:hover {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+
+  .sd-pill-active {
+    background: var(--accent);
+    color: #fff;
+    border-color: var(--accent);
+  }
+
+  .sd-pill-active:hover {
+    background: #1a3fa0;
+    border-color: #1a3fa0;
+    color: #fff;
+  }
+
+  /* ── Main content ────────────────────────────────────────────────── */
+  .sd-main {
+    max-width: var(--content-width);
+    margin: 0 auto;
+    padding: 32px var(--gutter) 80px;
+  }
+
+  .sd-section {
+    margin-bottom: 48px;
+  }
+
+  .sd-section-title {
+    font-size: 1.5rem;
+    font-weight: 700;
+    line-height: 1.3;
+    letter-spacing: -0.01em;
+    margin-bottom: 20px;
+    padding-bottom: 10px;
+    border-bottom: 1px solid var(--border-subtle);
+    color: var(--text-primary);
+  }
+
+  .sd-subsection-title {
+    font-size: 1.1rem;
+    font-weight: 700;
+    margin: 28px 0 14px;
+    color: var(--text-primary);
+  }
+
+  .sd-overview-text {
+    font-size: 1.05rem;
+    line-height: 1.75;
+    color: var(--text-secondary);
+    margin-bottom: 1.4em;
+  }
+
+  .sd-empty {
+    font-style: italic;
+    color: var(--text-muted);
+    padding: 16px 0;
+  }
+
+  /* ── Decisions list ──────────────────────────────────────────────── */
+  .sd-decisions-list {
+    padding-left: 1.6em;
+    color: var(--text-secondary);
+  }
+
+  .sd-decisions-list li {
+    margin-bottom: 0.5em;
+    line-height: 1.6;
+  }
+
+  /* ── Tier labels ─────────────────────────────────────────────────── */
+  .sd-tier-label {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 0.72rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--text-muted);
+    margin: 20px 0 10px;
+  }
+
+  /* ── Service grid ────────────────────────────────────────────────── */
+  .sd-service-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+    gap: 14px;
+    margin-bottom: 8px;
+  }
+
+  .sd-service-card {
+    background: var(--bg-card);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius);
+    padding: 18px;
+    transition: opacity 0.3s, border-color 0.2s, box-shadow 0.2s;
+    cursor: default;
+  }
+
+  .sd-service-card:hover {
+    border-color: var(--accent);
+    box-shadow: 0 2px 12px rgba(45, 91, 227, 0.08);
+  }
+
+  .sd-service-card.sd-highlight {
+    border-color: var(--accent);
+    box-shadow: 0 2px 16px rgba(45, 91, 227, 0.14);
+  }
+
+  .sd-service-icon {
+    font-size: 1.5rem;
+    margin-bottom: 8px;
+  }
+
+  .sd-service-name {
+    font-weight: 700;
+    font-size: 1rem;
+    color: var(--text-primary);
+    margin-bottom: 2px;
+  }
+
+  .sd-service-kind {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 0.72rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-muted);
+    margin-bottom: 6px;
+  }
+
+  .sd-service-tech {
+    font-family: 'SF Mono', 'Fira Code', Menlo, Consolas, monospace;
+    font-size: 0.78rem;
+    color: #1a3fa0;
+    background: var(--accent-faint);
+    display: inline-block;
+    padding: 1px 8px;
+    border-radius: 4px;
+    margin-bottom: 4px;
+  }
+
+  .sd-service-port {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 0.75rem;
+    color: var(--text-muted);
+    margin-bottom: 6px;
+  }
+
+  .sd-service-desc {
+    font-size: 0.88rem;
+    color: var(--text-secondary);
+    line-height: 1.55;
+    margin-top: 6px;
+  }
+
+  /* ── Connections list ────────────────────────────────────────────── */
+  .sd-connections-list {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .sd-connection-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 16px;
+    background: var(--bg-card);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-sm);
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 0.88rem;
+    transition: opacity 0.3s;
+    flex-wrap: wrap;
+  }
+
+  .sd-conn-from, .sd-conn-to {
+    font-weight: 600;
+    color: var(--text-primary);
+  }
+
+  .sd-conn-arrow {
+    color: var(--accent);
+    font-weight: 700;
+  }
+
+  .sd-conn-proto {
+    font-size: 0.78rem;
+    color: var(--text-muted);
+  }
+
+  .sd-conn-label {
+    color: var(--text-secondary);
+    font-weight: 400;
+    margin-left: auto;
+  }
+
+  /* ── Call paths (details/summary) ────────────────────────────────── */
+  .sd-call-path {
+    background: var(--bg-card);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius);
+    margin-bottom: 10px;
+    transition: opacity 0.3s;
+    overflow: hidden;
+  }
+
+  .sd-call-path summary {
+    padding: 14px 18px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-weight: 600;
+    font-size: 0.95rem;
+    color: var(--text-primary);
+    list-style: none;
+  }
+
+  .sd-call-path summary::-webkit-details-marker { display: none; }
+
+  .sd-call-path summary::before {
+    content: '\25B6';
+    font-size: 0.65rem;
+    color: var(--text-muted);
+    transition: transform 0.2s;
+    flex-shrink: 0;
+  }
+
+  .sd-call-path[open] summary::before {
+    transform: rotate(90deg);
+  }
+
+  .sd-cp-name { flex: 1; }
+
+  .sd-cp-journey {
+    font-size: 0.72rem;
+    font-weight: 500;
+    color: var(--accent);
+    background: var(--accent-faint);
+    padding: 2px 8px;
+    border-radius: 100px;
+  }
+
+  .sd-cp-desc {
+    padding: 0 18px 12px;
+    font-size: 0.9rem;
+    color: var(--text-secondary);
+    line-height: 1.6;
+  }
+
+  /* ── Sequence diagram rows ───────────────────────────────────────── */
+  .sd-sequence {
+    margin: 0 18px 18px;
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-sm);
+    overflow-x: auto;
+  }
+
+  .sd-seq-header, .sd-seq-row {
+    display: grid;
+    grid-template-columns: 40px 1fr 32px 1fr 2fr 1.5fr;
+    gap: 8px;
+    padding: 8px 14px;
+    align-items: start;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 0.82rem;
+  }
+
+  .sd-seq-header {
+    background: rgba(0, 0, 0, 0.02);
+    font-weight: 700;
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--text-muted);
+    border-bottom: 1px solid var(--border-subtle);
+  }
+
+  .sd-seq-row {
+    border-bottom: 1px solid var(--border-subtle);
+    color: var(--text-secondary);
+  }
+
+  .sd-seq-row:last-child { border-bottom: none; }
+
+  .sd-seq-row:hover { background: rgba(45, 91, 227, 0.02); }
+
+  .sd-seq-num {
+    font-weight: 700;
+    color: var(--accent);
+    text-align: center;
+  }
+
+  .sd-seq-from, .sd-seq-to { font-weight: 600; color: var(--text-primary); }
+
+  .sd-seq-arrow { color: var(--accent); text-align: center; font-weight: 700; }
+
+  .sd-seq-action { color: var(--text-primary); }
+
+  .sd-seq-detail {
+    font-size: 0.78rem;
+    color: var(--text-muted);
+    margin-top: 2px;
+  }
+
+  .sd-seq-returns {
+    font-family: 'SF Mono', 'Fira Code', Menlo, Consolas, monospace;
+    font-size: 0.78rem;
+    color: var(--text-muted);
+  }
+
+  /* ── Expand/collapse button ──────────────────────────────────────── */
+  .sd-expand-btn {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 12px;
+    font-weight: 500;
+    padding: 4px 14px;
+    border: 1px solid var(--border-medium);
+    border-radius: var(--radius-sm);
+    background: var(--bg-card);
+    color: var(--text-secondary);
+    cursor: pointer;
+    margin-bottom: 14px;
+    transition: all 0.15s;
+  }
+
+  .sd-expand-btn:hover {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+
+  /* ── Tables ──────────────────────────────────────────────────────── */
+  .sd-table-wrap {
+    overflow-x: auto;
+  }
+
+  .sd-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.88rem;
+    border-radius: var(--radius);
+    overflow: hidden;
+    border: 1px solid var(--border-subtle);
+  }
+
+  .sd-table th, .sd-table td {
+    padding: 10px 14px;
+    text-align: left;
+    border-bottom: 1px solid var(--border-subtle);
+  }
+
+  .sd-table th {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-weight: 600;
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--text-muted);
+    background: rgba(0, 0, 0, 0.02);
+  }
+
+  .sd-table tr:last-child td { border-bottom: none; }
+  .sd-table tr:hover td { background: rgba(45, 91, 227, 0.02); }
+
+  .sd-table code {
+    font-family: 'SF Mono', 'Fira Code', Menlo, Consolas, monospace;
+    font-size: 0.82em;
+    background: var(--accent-faint);
+    padding: 2px 6px;
+    border-radius: 4px;
+    color: #1a3fa0;
+    word-break: break-all;
+  }
+
+  .sd-svc-ref {
+    cursor: pointer;
+    font-weight: 500;
+    color: var(--accent);
+    transition: color 0.15s;
+  }
+
+  .sd-svc-ref:hover { color: #1a3fa0; }
+
+  .sd-rel-kind {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 0.78rem;
+    font-weight: 500;
+    color: var(--text-muted);
+    background: rgba(0,0,0,0.03);
+    padding: 2px 8px;
+    border-radius: 4px;
+  }
+
+  /* ── Entity grid ─────────────────────────────────────────────────── */
+  .sd-entity-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+    gap: 14px;
+  }
+
+  .sd-entity-card {
+    background: var(--bg-card);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius);
+    overflow: hidden;
+    transition: opacity 0.3s, border-color 0.2s, box-shadow 0.2s;
+  }
+
+  .sd-entity-card:hover {
+    border-color: var(--accent);
+    box-shadow: 0 2px 12px rgba(45, 91, 227, 0.08);
+  }
+
+  .sd-entity-card.sd-highlight {
+    border-color: var(--accent);
+    box-shadow: 0 2px 16px rgba(45, 91, 227, 0.14);
+  }
+
+  .sd-entity-header {
+    padding: 14px 16px 10px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    border-bottom: 1px solid var(--border-subtle);
+  }
+
+  .sd-entity-name {
+    font-size: 1rem;
+    font-weight: 700;
+    color: var(--text-primary);
+  }
+
+  .sd-entity-svc {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 0.72rem;
+    font-weight: 500;
+    color: var(--accent);
+    background: var(--accent-faint);
+    padding: 2px 8px;
+    border-radius: 100px;
+    cursor: pointer;
+  }
+
+  .sd-field-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.82rem;
+  }
+
+  .sd-field-table th, .sd-field-table td {
+    padding: 7px 16px;
+    text-align: left;
+    border-bottom: 1px solid var(--border-subtle);
+  }
+
+  .sd-field-table th {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-weight: 600;
+    font-size: 0.68rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--text-muted);
+    background: rgba(0, 0, 0, 0.015);
+  }
+
+  .sd-field-table tr:last-child td { border-bottom: none; }
+  .sd-field-table tr:hover td { background: rgba(45, 91, 227, 0.02); }
+
+  .sd-field-table code {
+    font-family: 'SF Mono', 'Fira Code', Menlo, Consolas, monospace;
+    font-size: 0.85em;
+    background: var(--accent-faint);
+    padding: 1px 5px;
+    border-radius: 3px;
+    color: #1a3fa0;
+  }
+
+  /* ── Risks ───────────────────────────────────────────────────────── */
+  .sd-risks-list {
+    list-style: none;
+    padding: 0;
+  }
+
+  .sd-risks-list li {
+    padding: 10px 16px;
+    margin-bottom: 6px;
+    background: #fef3f2;
+    border: 1px solid rgba(239, 68, 68, 0.12);
+    border-left: 3px solid #ef4444;
+    border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+    font-size: 0.92rem;
+    color: var(--text-secondary);
+    line-height: 1.6;
+  }
+
+  /* ── Footer ──────────────────────────────────────────────────────── */
+  .sd-footer {
+    max-width: var(--content-width);
+    margin: 0 auto;
+    padding: 24px var(--gutter) 48px;
+    text-align: center;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 0.75rem;
+    color: var(--text-muted);
+    border-top: 1px solid var(--border-subtle);
+  }
+
+  /* ── Dimmed state for journey filtering ──────────────────────────── */
+  .sd-dimmed {
+    opacity: 0.15 !important;
+    pointer-events: none;
+  }
+
+  /* ── Entrance animation ──────────────────────────────────────────── */
+  @keyframes sd-fade-up {
+    from { opacity: 0; transform: translateY(12px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+
+  .sd-header, .sd-main {
+    animation: sd-fade-up 0.45s ease both;
+  }
+
+  .sd-main { animation-delay: 0.08s; }
+
+  /* ── Responsive ──────────────────────────────────────────────────── */
+  @media (max-width: 700px) {
+    html { font-size: 15px; }
+    .sd-service-grid { grid-template-columns: 1fr; }
+    .sd-entity-grid { grid-template-columns: 1fr; }
+    .sd-seq-header, .sd-seq-row {
+      grid-template-columns: 32px 1fr 24px 1fr 1.5fr 1fr;
+      font-size: 0.75rem;
+    }
+  }
+
+  @media (max-width: 480px) {
+    .sd-header-inner { padding: 16px 0 12px; }
+    .sd-nav { gap: 4px; }
+    .sd-nav-link { font-size: 12px; padding: 3px 8px; }
+    .sd-filters { gap: 4px; }
+  }
+</style>
+</head>
+<body>
+<header class="sd-header">
+<div class="sd-header-inner">
+<h1 class="sd-title">SF-5 Composer App Foundation &amp; Tools Hub</h1>
+<nav class="sd-nav" id="sd-nav">
+<a href="#overview" class="sd-nav-link">Overview</a>
+<a href="#topology" class="sd-nav-link">Topology</a>
+<a href="#call-paths" class="sd-nav-link">Call Paths</a>
+<a href="#endpoints" class="sd-nav-link">Endpoints</a>
+<a href="#entities" class="sd-nav-link">Entities</a>
+<a href="#relations" class="sd-nav-link">Relations</a>
+<a href="#risks" class="sd-nav-link">Risks</a>
+</nav>
+<div class="sd-filters" id="sd-filters">
+<span class="sd-filter-label">Filter by journey:</span>
+<button class="sd-pill sd-pill-active" data-journey="__all__" onclick="window.__sd_filter('__all__')">All</button>
+<button class="sd-pill" data-journey="J-1" onclick="window.__sd_filter('J-1')">J-1</button>
+<button class="sd-pill" data-journey="J-2" onclick="window.__sd_filter('J-2')">J-2</button>
+<button class="sd-pill" data-journey="J-3" onclick="window.__sd_filter('J-3')">J-3</button>
+<button class="sd-pill" data-journey="J-4" onclick="window.__sd_filter('J-4')">J-4</button>
+<button class="sd-pill" data-journey="J-5" onclick="window.__sd_filter('J-5')">J-5</button>
+<button class="sd-pill" data-journey="J-6" onclick="window.__sd_filter('J-6')">J-6</button>
+</div>
+</div>
+</header>
+<main class="sd-main">
+<section class="sd-section" id="overview">
+<h2 class="sd-section-title">Overview</h2>
+<p class="sd-overview-text">SF-5 establishes the canonical compose foundation: `tools/compose/backend` for the FastAPI + PostgreSQL service, `tools/compose/frontend` for the authenticated compose SPA, and `platform/toolshub/frontend` for the static tools hub. The backend persists workflow definitions as canonical nested YAML where phases contain `nodes` and `children`, hook wiring is serialized only as ordinary edges (`source`, `target`, `transform_fn`) with no persisted `port_type`, and `GET /api/schema/workflow` is the only runtime schema contract the composer consumes. SF-5 owns exactly five foundation tables: `workflows`, `workflow_versions`, `roles`, `output_schemas`, and `custom_task_templates`. After every workflow write (create, import, version_saved, deleted) the backend fires a `WorkflowMutationHook(workflow_id, operation)` event so downstream SF-7 can own the `workflow_entity_refs` reference-index extension without coupling SF-5 to that table. The frontend may keep a flat React Flow store internally, but every load, import, validate, save, and export boundary converts through the same iriai-compose declarative models that execution uses. This system design also fully specifies all four cross-subfeature edge data contracts per D-GR-41: (1) SF-5→SF-6: complete TypeScript type interfaces exported from `tools/compose/frontend/src/types/index.ts` and the authoritative JSON Schema field contract including `context_keys` and AskNode `task`/`context_text`; (2) SF-5→SF-7: `WorkflowMutationHookRegistry` Python interface and SQLAlchemy ORM model export contract; (3) SF-7→SF-6: reference endpoint paths, TypeScript response shapes, and delete preflight 409 contract; (4) SF-6→SF-7: exclusive hook-driven index rebuild path and component prop interfaces for usage panels.</p>
+<h3 class="sd-subsection-title">Architecture Decisions</h3>
+<ol class="sd-decisions-list">
+<li>D-GR-22: `GET /api/schema/workflow` is the canonical composer schema source. Bundled `workflow-schema.json` is build/test-only and must never drive runtime editor behavior.</li>
+<li>D-SF5-1: Workflow persistence is canonical nested YAML. Phases store local `nodes` plus nested `children`; the frontend may flatten to React Flow state internally but never writes that shape to storage or over the API.</li>
+<li>D-SF5-2: Hook wiring is serialized only through `edges[]` rows using `source`, `target`, and optional `transform_fn`. No separate serialized hooks section and no persisted `port_type` field exist in backend contracts.</li>
+<li>D-SF5-3: The accepted repo topology is `tools/compose/backend` for the FastAPI service, `tools/compose/frontend` for the compose SPA, and `platform/toolshub/frontend` for the static tools hub. The `tools/iriai-workflows` path is not part of the approved implementation contract and must not appear in SF-5 artifacts.</li>
+<li>D-SF5-4: The backend derives schema export and YAML validation from the same iriai-compose declarative models (`iriai_compose.schema`, created by SF-1) to avoid contract drift between authoring and execution.</li>
+<li>D-SF5-5: PostgreSQL is the foundation database for SF-5, managed through SQLAlchemy 2.x (async) and Alembic. The migration chain is isolated to the `alembic_version_compose` version table and must not share a version table with deploy-console or any other platform service. SQLite is out of scope.</li>
+<li>D-SF5-6: WorkflowVersion is append-only and is created on workflow create, starter-template use, import, and duplicate (v1) and on explicit save-version (vN). Every workflow mutation has an auditable snapshot. Version-history UI is deferred to a later subfeature.</li>
+<li>D-SF5-7: SF-5 exposes a `WorkflowMutationHook(workflow_id: str, operation: Literal['created','imported','version_saved','deleted'])` callable registry. After each workflow write transaction commits, SF-5 fires all registered handlers. SF-7 registers its reference-index refresh handler at application startup. SF-5 must never directly write or read `workflow_entity_refs` rows.</li>
+<li>D-SF5-8: Plugins remain runtime and YAML concerns owned by iriai-compose and consuming projects; SF-5 does not create plugin tables, plugin-management surfaces, or `/api/plugins` endpoints.</li>
+<li>D-SF5-9: SF-5 owns exactly five foundation tables (`workflows`, `workflow_versions`, `roles`, `output_schemas`, `custom_task_templates`). `workflow_entity_refs` is a SF-7-owned extension table. SF-5 migrations must not reference or create it. The five-table boundary is a hard constraint enforced at the Alembic level.</li>
+<li>D-EDGE-1 (SF-5→SF-6 TypeScript type contract): All SF-5→SF-6 type boundaries flow through a single barrel export at `tools/compose/frontend/src/types/index.ts`. SF-6 imports exclusively from this path — no direct imports from deeper module paths. Complete interface set: `interface Workflow { id: string; name: string; description: string | null; yaml_content: string; current_version: number; is_valid: boolean; user_id: string; created_at: string; updated_at: string | null; deleted_at: string | null }` — `interface WorkflowVersion { id: string; workflow_id: string; version_number: number; yaml_content: string; change_description: string | null; user_id: string; created_at: string }` — `interface Role { id: string; name: string; prompt: string; model: string | null; effort: string | null; tools: string[]; metadata: Record&lt;string,unknown&gt;; user_id: string; created_at: string; updated_at: string | null; deleted_at: string | null }` — `interface OutputSchema { id: string; name: string; description: string | null; json_schema: Record&lt;string,unknown&gt;; user_id: string; created_at: string; updated_at: string | null; deleted_at: string | null }` — `interface CustomTaskTemplate { id: string; name: string; description: string | null; subgraph_yaml: string; input_interface: Record&lt;string,unknown&gt;; output_interface: Record&lt;string,unknown&gt;; user_id: string; created_at: string; updated_at: string | null; deleted_at: string | null }` — `interface StarterTemplate { id: string; name: string; description: string; yaml_content: string; category: 'starter' }` — `interface PaginatedList&lt;T&gt; { items: T[]; next_cursor: string | null; has_more: boolean }` — `interface ValidationIssue { path: string; message: string; severity: 'error' | 'warning' }` — `interface ValidationResult { valid: boolean; errors: ValidationIssue[] }` — `interface ImportResult { workflow: Workflow; validation_warnings?: ValidationIssue[] }`</li>
+<li>D-EDGE-2 (SF-5→SF-6 schema field contract): `GET /api/schema/workflow` derives from `WorkflowConfig.model_json_schema()` in `iriai_compose.schema` (SF-1's new subpackage — not `iriai_compose.declarative` which does not exist). Authoritative field constraints for SF-6 node palette construction: (1) WorkflowConfig root includes optional `context_keys: string[]` per D-GR-39/SF-1→SF-4 contract — SF-6 must expose a workflow-level context_keys editor; (2) AskNode has required field `task: string` and optional field `context_text: string` — the field name `prompt` is not valid for AskNode and must not appear in SF-6 AskNode form fields; (3) BranchNode uses per-port condition expressions per D-GR-35 — no `switch_function` or `output_field` fields; (4) WorkflowConfig root has no `stores`, `plugin_instances`, `inputs`, or `outputs` fields; (5) existing iriai-compose exports `Phase` (ABC) and `Role` (dataclass) — these are runtime primitives distinct from the declarative `PhaseDefinition` and `WorkflowConfig` Pydantic models that SF-5 imports; (6) phantom exports MapNode, FoldNode, LoopNode, TransformRef, HookRef do not exist and must not appear in any SF-5 or SF-6 import statement.</li>
+<li>D-EDGE-3 (SF-5→SF-7 Python hook interface): SF-5 creates and exports a `WorkflowMutationHookRegistry` singleton at `tools/compose/backend/app/state.py::mutation_hook_registry`. Complete Python contract: `WorkflowMutationOperation = Literal['created', 'imported', 'version_saved', 'deleted']`; `MutationHandler = Callable[[str, WorkflowMutationOperation], Awaitable[None]]`; `class WorkflowMutationHookRegistry: def register(self, handler: MutationHandler) -&gt; None: ...; async def fire(self, workflow_id: str, operation: WorkflowMutationOperation) -&gt; None: ...`. `fire()` catches per-handler exceptions, logs via structlog, never propagates. `fire()` is called only after the primary workflow transaction has committed. SF-7 calls `mutation_hook_registry.register(refresh_entity_refs)` in a FastAPI `@asynccontextmanager` lifespan function. Handler signature: `async def refresh_entity_refs(workflow_id: str, operation: WorkflowMutationOperation) -&gt; None`. On `'deleted'` the handler purges all `workflow_entity_refs` rows for `workflow_id`. On `'created'`, `'imported'`, `'version_saved'` it scans `yaml_content` and upserts rows. Operation is idempotent.</li>
+<li>D-EDGE-4 (SF-5→SF-7 ORM model contract): SF-5 exposes the following SQLAlchemy 2.x async ORM models from `tools/compose/backend/app/models.py`: `WorkflowORM` (table: `workflows`), `WorkflowVersionORM` (table: `workflow_versions`), `RoleORM` (table: `roles`), `OutputSchemaORM` (table: `output_schemas`), `CustomTaskTemplateORM` (table: `custom_task_templates`). SF-7 imports these models and the `get_db` AsyncSession factory from `tools/compose/backend/app/database.py`. SF-7 must not redefine session management, re-declare table DDL, or modify the five foundation tables in its own migrations. SF-7's only DDL rights are: (1) CREATE TABLE `workflow_entity_refs`, (2) ALTER TABLE `custom_task_templates` ADD COLUMN `actor_slots` — both via separate SF-7 Alembic revision files chained after the SF-5 initial revision in the `alembic_version_compose` chain.</li>
+<li>D-EDGE-5 (SF-7→SF-6 reference endpoint contract): SF-7 adds four read-only endpoints to the compose backend router at `app/routers/entity_refs.py`. All four require JWT Bearer auth and are called by SF-6 via the shared Axios client at `tools/compose/frontend/src/api/client.ts` — no separate HTTP client setup. TypeScript response shapes exported from `tools/compose/frontend/src/types/index.ts`: `interface WorkflowEntityRefsResponse { workflow_id: string; refs: Array&lt;{ entity_type: 'role' | 'output_schema' | 'custom_task_template'; entity_id: string; node_id: string; node_type: string; context: string }&gt;; last_indexed_at: string }` — `interface EntityUsageReport { entity_id: string; entity_type: 'role' | 'output_schema' | 'custom_task_template'; referenced_by: Array&lt;{ workflow_id: string; workflow_name: string; node_ids: string[] }&gt;; total_references: number }`. Endpoint paths: `GET /api/workflows/{id}/entity-refs → WorkflowEntityRefsResponse`; `GET /api/roles/{id}/usage → EntityUsageReport`; `GET /api/schemas/{id}/usage → EntityUsageReport`; `GET /api/templates/{id}/usage → EntityUsageReport`.</li>
+<li>D-EDGE-6 (SF-7→SF-6 delete preflight guard contract): SF-7 injects a FastAPI dependency `require_no_entity_refs(entity_id, entity_type)` into SF-5's `DELETE /api/roles/{id}`, `DELETE /api/schemas/{id}`, `DELETE /api/templates/{id}` handlers. On reference conflict (`total_references &gt;0`), returns HTTP 409 with: `interface DeletePreflightConflict { detail: string; blocking_workflows: Array&lt;{ id: string; name: string }&gt; }`. The `detail` string format is: `&quot;&lt;EntityType&gt; '&lt;name&gt;' is referenced by &lt;N&gt; workflow(s). Remove all references before deleting.&quot;` SF-6 component `DeleteEntityDialog` prop interface: `interface DeleteEntityDialogProps { entityId: string; entityType: 'role' | 'output_schema' | 'custom_task_template'; entityName: string; usage: EntityUsageReport; onConfirm: () =&gt; void; onCancel: () =&gt; void }`. Dialog must: render a blocking error state (not a dismissible warning) when `usage.total_references &gt; 0`; display `referenced_by` list with links to each workflow; disable the confirm button when blocking references exist. The 409 guard is the authoritative server-side enforcement layer; the pre-dialog usage fetch is a UX convenience only.</li>
+<li>D-EDGE-7 (SF-6→SF-7 index rebuild path): SF-6 never calls a dedicated SF-7 index-rebuild endpoint. Reference index rebuilds are triggered exclusively by SF-6's save operations flowing through SF-5's WorkflowMutationHook chain: `POST /api/workflows` fires `'created'`; `POST /api/workflows/import` fires `'imported'`; `POST /api/workflows/{id}/versions` fires `'version_saved'`; `DELETE /api/workflows/{id}` fires `'deleted'`. SF-7's `refresh_entity_refs` handler: on `'deleted'` executes `DELETE FROM workflow_entity_refs WHERE workflow_id = ?`; on `'created'`/`'imported'`/`'version_saved'` loads `workflows.yaml_content`, parses via PyYAML `safe_load`, walks all `phases[].nodes` extracting `role_id`, `output_schema_id`, and `template_id` fields, deletes all prior `workflow_entity_refs` rows for this `workflow_id`, and bulk-inserts fresh rows. The rebuild is idempotent and safe to re-invoke on duplicate hook fires. SF-6 calls SF-7 endpoints only for user-facing reference display (`GET /api/roles/{id}/usage` etc.) — never to trigger index mutations.</li>
+</ol>
+</section>
+<section class="sd-section" id="topology">
+<h2 class="sd-section-title">Service Topology</h2>
+<h4 class="sd-tier-label">Frontend</h4>
+<div class="sd-service-grid">
+<div class="sd-service-card" data-service-id="SVC-SF5-2" data-journeys="J-1">
+<div class="sd-service-icon">&#x1F310;</div>
+<div class="sd-service-name">Tools Hub Frontend</div>
+<div class="sd-service-kind">frontend</div>
+<div class="sd-service-tech">React 18, Vite, TypeScript, @homelocal/auth</div>
+<p class="sd-service-desc">Static React/Vite app at `platform/toolshub/frontend/`. Reads `dev_tier` from JWT, renders a hardcoded developer-tools card catalog, and same-tab navigates to `compose.iriai.app` when the Workflow Composer card is clicked. No backend of its own.</p>
+</div>
+<div class="sd-service-card" data-service-id="SVC-SF5-3" data-journeys="J-1 J-2 J-3 J-4 J-5 J-6">
+<div class="sd-service-icon">&#x1F310;</div>
+<div class="sd-service-name">Compose Frontend</div>
+<div class="sd-service-kind">frontend</div>
+<div class="sd-service-tech">React 18, Vite, TypeScript, React Query, Zustand, @homelocal/auth, Axios</div>
+<p class="sd-service-desc">Authenticated React/Vite SPA at `tools/compose/frontend/` with the Explorer-style sidebar (four folders: Workflows, Roles, Output Schemas, Task Templates), workflows landing page with starter template cards, and the schema-driven editor shell consumed by SF-6. Exports all TypeScript type interfaces for API responses through `tools/compose/frontend/src/types/index.ts` (the canonical barrel export that SF-6 imports exclusively from). Configures the shared Axios API client at `tools/compose/frontend/src/api/client.ts` that both SF-5 routes and SF-7 extension routes use. No plugin, tool-library, or reference-check surfaces in SF-5.</p>
+</div>
+<div class="sd-service-card" data-service-id="SVC-SF5-9" data-journeys="J-2 J-3 J-4 J-5 J-6">
+<div class="sd-service-icon">&#x1F310;</div>
+<div class="sd-service-name">SF-6 Workflow Editor Canvas</div>
+<div class="sd-service-kind">frontend</div>
+<div class="sd-service-tech">React 18, React Flow, Zustand, TypeScript, Axios (shared SF-5 client)</div>
+<p class="sd-service-desc">Workflow canvas module owned by SF-6, co-located in `tools/compose/frontend/src/editor/`. Imports all TypeScript types exclusively from `tools/compose/frontend/src/types/index.ts` (the SF-5 barrel export): Workflow, WorkflowVersion, Role, OutputSchema, CustomTaskTemplate, StarterTemplate, PaginatedList&lt;T&gt;, ValidationIssue, ValidationResult, ImportResult, WorkflowEntityRefsResponse, EntityUsageReport, DeletePreflightConflict. Uses the shared Axios client from SF-5 (`src/api/client.ts`) to call both SF-5 workflow CRUD endpoints and SF-7 extension endpoints. Calls GET /api/schema/workflow at mount to drive the node palette. Calls GET /api/roles/{id}/usage, GET /api/schemas/{id}/usage, GET /api/templates/{id}/usage before rendering delete confirmation dialogs. Calls GET /api/workflows/{id}/entity-refs for the editor reference panel. Does NOT call any dedicated SF-7 index-rebuild endpoint — reference index rebuilds happen exclusively through SF-5 save hooks.</p>
+</div>
+</div>
+<h4 class="sd-tier-label">Services &amp; External</h4>
+<div class="sd-service-grid">
+<div class="sd-service-card" data-service-id="SVC-SF5-1" data-journeys="J-1 J-2 J-3 J-4 J-5 J-6">
+<div class="sd-service-icon">&#x1F517;</div>
+<div class="sd-service-name">User / Browser</div>
+<div class="sd-service-kind">external</div>
+<div class="sd-service-tech">Browser</div>
+<p class="sd-service-desc">Developer using the tools hub and composer in a browser.</p>
+</div>
+<div class="sd-service-card" data-service-id="SVC-SF5-4" data-journeys="J-1 J-2 J-3 J-4 J-5 J-6">
+<div class="sd-service-icon">&#x2699;&#xFE0F;</div>
+<div class="sd-service-name">Compose Backend</div>
+<div class="sd-service-kind">service</div>
+<div class="sd-service-tech">Python 3.11, FastAPI, SQLAlchemy 2.x (async), Alembic, homelocal-auth, structlog</div>
+<div class="sd-service-port">Port 8000</div>
+<p class="sd-service-desc">FastAPI service at `tools/compose/backend/` exposing workflow CRUD, versioning, validation, starter templates, schema export, and baseline library entity CRUD. Stores raw nested YAML and never invents a second schema contract. Exports `WorkflowMutationHookRegistry` singleton at `app/state.py::mutation_hook_registry` and SQLAlchemy ORM models at `app/models.py` for SF-7 to consume. After every workflow write commits, fires `WorkflowMutationHook(workflow_id, operation)` so SF-7 can register its reference-index refresh handler. Also hosts SF-7-owned router at `app/routers/entity_refs.py` and SF-7-owned delete preflight dependencies — these routes are physically served by this process but logically owned by SF-7.</p>
+</div>
+<div class="sd-service-card" data-service-id="SVC-SF5-5" data-journeys="J-2 J-3 J-5 J-6">
+<div class="sd-service-icon">&#x2699;&#xFE0F;</div>
+<div class="sd-service-name">iriai-compose Declarative Schema Subpackage</div>
+<div class="sd-service-kind">service</div>
+<div class="sd-service-tech">Python 3.11, Pydantic v2, PyYAML</div>
+<p class="sd-service-desc">New schema subpackage at `iriai-compose/iriai_compose/schema/` to be created by SF-1 (declarative-schema subfeature). Imported by SF-5's compose backend via `from iriai_compose.schema import WorkflowConfig`. Exposes: `WorkflowConfig`, `PhaseDefinition`, `AgentNode`, `AskNode`, `BranchNode`, `CustomNode`, `EvalNode`, `EdgeDefinition`, `PortDefinition`, `WorkflowCostConfig`, `PhaseCostConfig`, `NodeCostConfig`, `load_workflow()`, `validate_workflow()`. Does NOT export: MapNode, FoldNode, LoopNode, TransformRef, HookRef (these are phantom exports — they do not exist). The existing `iriai_compose` package independently exports `Phase` (ABC), `Workflow`, `Role`, and runtime primitives — these are distinct from the new declarative Pydantic models. Key field contracts: AskNode has fields `task` (required string) and `context_text` (optional string) — the field name `prompt` is not a valid AskNode field. WorkflowConfig has an optional `context_keys: list[str]` field at the workflow root. BranchNode uses per-port condition expressions per D-GR-35.</p>
+</div>
+<div class="sd-service-card" data-service-id="SVC-SF5-6" data-journeys="J-1 J-2 J-3 J-4 J-5 J-6">
+<div class="sd-service-icon">&#x1F517;</div>
+<div class="sd-service-name">Auth Service</div>
+<div class="sd-service-kind">external</div>
+<div class="sd-service-tech">OAuth 2.0, RS256 JWT, JWKS</div>
+<p class="sd-service-desc">Homelocal auth service issuing JWTs and serving JWKS for the FastAPI backend and OAuth flows for both SPAs. JWT `sub` becomes `user_id`; `dev_tier` claim gates tools-hub card visibility.</p>
+</div>
+<div class="sd-service-card" data-service-id="SVC-SF5-10" data-journeys="J-2 J-4">
+<div class="sd-service-icon">&#x2699;&#xFE0F;</div>
+<div class="sd-service-name">SF-7 Libraries &amp; Registries Extension</div>
+<div class="sd-service-kind">service</div>
+<div class="sd-service-tech">Python 3.11, FastAPI, SQLAlchemy 2.x (async), PyYAML (yaml_content scanning), React 18, TypeScript</div>
+<p class="sd-service-desc">Backend and frontend extension module owned by SF-7. Backend: adds router at `tools/compose/backend/app/routers/entity_refs.py` with four read-only endpoints; injects `require_no_entity_refs` FastAPI dependency into SF-5's delete endpoints for 409 preflight; registers `refresh_entity_refs` async handler into SF-5's `WorkflowMutationHookRegistry` singleton during FastAPI lifespan startup; owns `workflow_entity_refs` DDL via separate SF-7 Alembic revision; optionally adds `actor_slots` column to `custom_task_templates` via additive migration. Imports `WorkflowORM`, `WorkflowVersionORM`, `RoleORM`, `OutputSchemaORM`, `CustomTaskTemplateORM` from `app/models.py` and `get_db` from `app/database.py` — never redefines session management. Frontend: adds `EntityUsagePanel` and `DeleteEntityDialog` React components consumed by SF-6 canvas.</p>
+</div>
+</div>
+<h4 class="sd-tier-label">Databases</h4>
+<div class="sd-service-grid">
+<div class="sd-service-card" data-service-id="SVC-SF5-7" data-journeys="J-2 J-3 J-4 J-5 J-6">
+<div class="sd-service-icon">&#x1F5C3;&#xFE0F;</div>
+<div class="sd-service-name">PostgreSQL Database</div>
+<div class="sd-service-kind">database</div>
+<div class="sd-service-tech">PostgreSQL, SQLAlchemy 2.x, Alembic, psycopg (asyncpg driver)</div>
+<p class="sd-service-desc">Dedicated PostgreSQL instance managed by SQLAlchemy 2.x and Alembic. Migration chain tracked by `alembic_version_compose` table (isolated from all other platform services). Stores exactly five SF-5 foundation tables: `workflows`, `workflow_versions`, `roles`, `output_schemas`, and `custom_task_templates`. The `workflow_entity_refs` table is not created by SF-5 migrations — it is added by a separate SF-7 Alembic revision chained after the SF-5 initial revision.</p>
+</div>
+<div class="sd-service-card" data-service-id="SVC-SF5-8" data-journeys="J-3">
+<div class="sd-service-icon">&#x1F5C3;&#xFE0F;</div>
+<div class="sd-service-name">Starter Template Bundle</div>
+<div class="sd-service-kind">database</div>
+<div class="sd-service-tech">JSON, YAML files</div>
+<p class="sd-service-desc">Bundled JSON/YAML assets checked into `tools/compose/backend/app/data/` containing translated starter workflows derived from the iriai-build-v2 planning/develop/bugfix reference flows.</p>
+</div>
+</div>
+<h3 class="sd-subsection-title">Connections</h3>
+<div class="sd-connections-list">
+<div class="sd-connection-row" data-journeys="J-1"><span class="sd-conn-from">User / Browser</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">Tools Hub Frontend</span><span class="sd-conn-proto"> (HTTPS)</span><span class="sd-conn-label">Loads tools hub and starts sign-in flow</span></div>
+<div class="sd-connection-row" data-journeys="J-1 J-2 J-3 J-4 J-5 J-6"><span class="sd-conn-from">User / Browser</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">Compose Frontend</span><span class="sd-conn-proto"> (HTTPS)</span><span class="sd-conn-label">Loads composer routes and editor shell</span></div>
+<div class="sd-connection-row" data-journeys="J-1"><span class="sd-conn-from">Tools Hub Frontend</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">Auth Service</span><span class="sd-conn-proto"> (HTTPS/OAuth)</span><span class="sd-conn-label">OAuth login/logout and token acquisition</span></div>
+<div class="sd-connection-row" data-journeys="J-1"><span class="sd-conn-from">Tools Hub Frontend</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">Compose Frontend</span><span class="sd-conn-proto"> (Browser navigation)</span><span class="sd-conn-label">Same-tab navigation to compose.iriai.app</span></div>
+<div class="sd-connection-row" data-journeys="J-1 J-2 J-3 J-4 J-5 J-6"><span class="sd-conn-from">Compose Frontend</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">Auth Service</span><span class="sd-conn-proto"> (HTTPS/OAuth)</span><span class="sd-conn-label">OAuth callback handling and token refresh</span></div>
+<div class="sd-connection-row" data-journeys="J-2 J-3 J-4 J-5 J-6"><span class="sd-conn-from">Compose Frontend</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">Compose Backend</span><span class="sd-conn-proto"> (HTTP/REST)</span><span class="sd-conn-label">Workflow CRUD, schema fetch, validation, import/export, and library entity CRUD</span></div>
+<div class="sd-connection-row" data-journeys="J-2 J-3 J-4 J-5 J-6"><span class="sd-conn-from">Compose Backend</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">Auth Service</span><span class="sd-conn-proto"> (HTTPS/JWKS)</span><span class="sd-conn-label">JWKS-backed JWT validation and issuer checks</span></div>
+<div class="sd-connection-row" data-journeys="J-2 J-3 J-4 J-5 J-6"><span class="sd-conn-from">Compose Backend</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">PostgreSQL Database</span><span class="sd-conn-proto"> (SQL)</span><span class="sd-conn-label">Transactional reads and writes for five foundation tables: workflows, workflow_versions, roles, output_schemas, custom_task_templates</span></div>
+<div class="sd-connection-row" data-journeys="J-2 J-3 J-5 J-6"><span class="sd-conn-from">Compose Backend</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">iriai-compose Declarative Schema Subpackage</span><span class="sd-conn-proto"> (Python import)</span><span class="sd-conn-label">Imports WorkflowConfig for JSON Schema export plus YAML parse/validate on create, import, validate, and save</span></div>
+<div class="sd-connection-row" data-journeys="J-3"><span class="sd-conn-from">Compose Backend</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">Starter Template Bundle</span><span class="sd-conn-proto"> (Filesystem read)</span><span class="sd-conn-label">Reads starter template payloads for the landing page</span></div>
+<div class="sd-connection-row" data-journeys="J-2 J-3 J-4 J-5 J-6"><span class="sd-conn-from">Compose Frontend</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">SF-6 Workflow Editor Canvas</span><span class="sd-conn-proto"> (TypeScript import)</span><span class="sd-conn-label">SF-5 compose frontend foundation provides TypeScript barrel export (tools/compose/frontend/src/types/index.ts) and shared Axios client (src/api/client.ts) to SF-6 canvas module at compile time</span></div>
+<div class="sd-connection-row" data-journeys="J-2 J-4"><span class="sd-conn-from">Compose Backend</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">SF-7 Libraries &amp; Registries Extension</span><span class="sd-conn-proto"> (Python import)</span><span class="sd-conn-label">SF-5 compose backend exports WorkflowMutationHookRegistry singleton (app/state.py::mutation_hook_registry), ORM models WorkflowORM/WorkflowVersionORM/RoleORM/OutputSchemaORM/CustomTaskTemplateORM (app/models.py), and AsyncSession factory get_db (app/database.py) for SF-7 to import</span></div>
+<div class="sd-connection-row" data-journeys="J-4"><span class="sd-conn-from">SF-7 Libraries &amp; Registries Extension</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">SF-6 Workflow Editor Canvas</span><span class="sd-conn-proto"> (HTTP/REST)</span><span class="sd-conn-label">SF-7 extension endpoints consumed by SF-6 canvas: GET /api/workflows/{id}/entity-refs, GET /api/roles/{id}/usage, GET /api/schemas/{id}/usage, GET /api/templates/{id}/usage; plus delete preflight 409 on DELETE /api/roles|schemas|templates/{id}</span></div>
+<div class="sd-connection-row" data-journeys="J-2 J-4"><span class="sd-conn-from">SF-6 Workflow Editor Canvas</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">SF-7 Libraries &amp; Registries Extension</span><span class="sd-conn-proto"> (HTTP/REST)</span><span class="sd-conn-label">SF-6 canvas triggers SF-7 reference index rebuilds exclusively via SF-5 workflow save/delete operations (WorkflowMutationHook chain); also calls SF-7 usage endpoints directly for entity panels and delete preflights</span></div>
+</div>
+</section>
+<section class="sd-section" id="call-paths">
+<h2 class="sd-section-title">API Call Paths</h2>
+<button class="sd-expand-btn" id="sd-toggle-details" onclick="window.__sd_toggle_details()">Expand All</button>
+<details class="sd-call-path" data-journey-id="J-1">
+<summary>
+<span class="sd-cp-name">Tools Hub Opens Composer</span>
+<span class="sd-cp-journey">J-1</span>
+</summary>
+<p class="sd-cp-desc">First-time user authenticates in the tools hub and navigates into the composer without introducing a second launcher contract.</p>
+<div class="sd-sequence">
+<div class="sd-seq-header">
+<div class="sd-seq-col sd-seq-num">#</div>
+<div class="sd-seq-col sd-seq-from">From</div>
+<div class="sd-seq-col sd-seq-arrow"></div>
+<div class="sd-seq-col sd-seq-to">To</div>
+<div class="sd-seq-col sd-seq-action">Action</div>
+<div class="sd-seq-col sd-seq-returns">Returns</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">1</div>
+<div class="sd-seq-col sd-seq-from">SVC-SF5-1</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">SVC-SF5-2</div>
+<div class="sd-seq-col sd-seq-action"><div>Open tools.iriai.app</div><div class="sd-seq-detail">The browser loads the tools hub from `platform/toolshub/frontend/` with a developer-tools card catalog.</div></div>
+<div class="sd-seq-col sd-seq-returns">Tools hub shell</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">2</div>
+<div class="sd-seq-col sd-seq-from">SVC-SF5-2</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">SVC-SF5-6</div>
+<div class="sd-seq-col sd-seq-action"><div>Start OAuth flow</div><div class="sd-seq-detail">The tools hub redirects to auth-service and receives a JWT after login; `dev_tier` claim is extracted for card gating.</div></div>
+<div class="sd-seq-col sd-seq-returns">Access token</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">3</div>
+<div class="sd-seq-col sd-seq-from">SVC-SF5-2</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">SVC-SF5-3</div>
+<div class="sd-seq-col sd-seq-action"><div>Same-tab navigation to compose.iriai.app</div><div class="sd-seq-detail">Clicking the Workflow Composer card routes the browser to the compose frontend in the same tab.</div></div>
+<div class="sd-seq-col sd-seq-returns">Composer URL loaded</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">4</div>
+<div class="sd-seq-col sd-seq-from">SVC-SF5-3</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">SVC-SF5-6</div>
+<div class="sd-seq-col sd-seq-action"><div>Ensure authenticated compose session</div><div class="sd-seq-detail">The compose frontend completes its own OAuth callback or validates the existing token for the compose domain.</div></div>
+<div class="sd-seq-col sd-seq-returns">Authenticated compose session</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">5</div>
+<div class="sd-seq-col sd-seq-from">SVC-SF5-3</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">SVC-SF5-1</div>
+<div class="sd-seq-col sd-seq-action"><div>Render Workflows landing page</div><div class="sd-seq-detail">The authenticated browser sees the workflows list shell with the four SF-5 Explorer folders (Workflows, Roles, Output Schemas, Task Templates) and starter template cards.</div></div>
+<div class="sd-seq-col sd-seq-returns">Composer home page</div>
+</div>
+</div>
+</details>
+<details class="sd-call-path" data-journey-id="J-2">
+<summary>
+<span class="sd-cp-name">Bootstrap Editor From Canonical Schema</span>
+<span class="sd-cp-journey">J-2</span>
+</summary>
+<p class="sd-cp-desc">The frontend loads both the workflow record and the authoritative composer schema before handing control to the canvas editor.</p>
+<div class="sd-sequence">
+<div class="sd-seq-header">
+<div class="sd-seq-col sd-seq-num">#</div>
+<div class="sd-seq-col sd-seq-from">From</div>
+<div class="sd-seq-col sd-seq-arrow"></div>
+<div class="sd-seq-col sd-seq-to">To</div>
+<div class="sd-seq-col sd-seq-action">Action</div>
+<div class="sd-seq-col sd-seq-returns">Returns</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">1</div>
+<div class="sd-seq-col sd-seq-from">SVC-SF5-1</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">SVC-SF5-3</div>
+<div class="sd-seq-col sd-seq-action"><div>Open /workflows/{id}/edit</div><div class="sd-seq-detail">The browser enters the editor route after creating or selecting a workflow.</div></div>
+<div class="sd-seq-col sd-seq-returns">Editor shell loading state</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">2</div>
+<div class="sd-seq-col sd-seq-from">SVC-SF5-3</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">SVC-SF5-4</div>
+<div class="sd-seq-col sd-seq-action"><div>GET /api/schema/workflow</div><div class="sd-seq-detail">The frontend fetches the only runtime schema contract it is allowed to use.</div></div>
+<div class="sd-seq-col sd-seq-returns">WorkflowConfig JSON Schema</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">3</div>
+<div class="sd-seq-col sd-seq-from">SVC-SF5-4</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">SVC-SF5-5</div>
+<div class="sd-seq-col sd-seq-action"><div>WorkflowConfig.model_json_schema()</div><div class="sd-seq-detail">The backend derives the schema directly from iriai-compose declarative models and caches the result.</div></div>
+<div class="sd-seq-col sd-seq-returns">Canonical schema dict</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">4</div>
+<div class="sd-seq-col sd-seq-from">SVC-SF5-3</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">SVC-SF5-4</div>
+<div class="sd-seq-col sd-seq-action"><div>GET /api/workflows/{id}</div><div class="sd-seq-detail">The frontend fetches the stored YAML snapshot for the workflow.</div></div>
+<div class="sd-seq-col sd-seq-returns">Workflow record</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">5</div>
+<div class="sd-seq-col sd-seq-from">SVC-SF5-4</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">SVC-SF5-7</div>
+<div class="sd-seq-col sd-seq-action"><div>SELECT workflow row</div><div class="sd-seq-detail">The backend reads the workflow record and current YAML snapshot from PostgreSQL.</div></div>
+<div class="sd-seq-col sd-seq-returns">Workflow row</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">6</div>
+<div class="sd-seq-col sd-seq-from">SVC-SF5-3</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">SVC-SF5-3</div>
+<div class="sd-seq-col sd-seq-action"><div>Flatten nested YAML to editor state</div><div class="sd-seq-detail">The frontend converts canonical `phases[].nodes` and `phases[].children` into its flat React Flow store without mutating the stored contract.</div></div>
+<div class="sd-seq-col sd-seq-returns">Canvas-ready node and edge arrays</div>
+</div>
+</div>
+</details>
+<details class="sd-call-path" data-journey-id="J-2">
+<summary>
+<span class="sd-cp-name">Create Workflow With Version V1</span>
+<span class="sd-cp-journey">J-2</span>
+</summary>
+<p class="sd-cp-desc">Creating a workflow from scratch inserts the workflow row and immutable version row in one transaction, then fires the mutation hook so SF-7 can refresh its reference index.</p>
+<div class="sd-sequence">
+<div class="sd-seq-header">
+<div class="sd-seq-col sd-seq-num">#</div>
+<div class="sd-seq-col sd-seq-from">From</div>
+<div class="sd-seq-col sd-seq-arrow"></div>
+<div class="sd-seq-col sd-seq-to">To</div>
+<div class="sd-seq-col sd-seq-action">Action</div>
+<div class="sd-seq-col sd-seq-returns">Returns</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">1</div>
+<div class="sd-seq-col sd-seq-from">SVC-SF5-3</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">SVC-SF5-4</div>
+<div class="sd-seq-col sd-seq-action"><div>POST /api/workflows</div><div class="sd-seq-detail">The frontend submits the workflow name and either a user-authored nested YAML snapshot or a minimal skeleton.</div></div>
+<div class="sd-seq-col sd-seq-returns">Create request</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">2</div>
+<div class="sd-seq-col sd-seq-from">SVC-SF5-4</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">SVC-SF5-6</div>
+<div class="sd-seq-col sd-seq-action"><div>Validate JWT</div><div class="sd-seq-detail">The backend verifies the bearer token and extracts the user ID from `sub`.</div></div>
+<div class="sd-seq-col sd-seq-returns">Authenticated user</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">3</div>
+<div class="sd-seq-col sd-seq-from">SVC-SF5-4</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">SVC-SF5-5</div>
+<div class="sd-seq-col sd-seq-action"><div>Parse and validate YAML contract</div><div class="sd-seq-detail">The backend validates the document against the same nested schema returned by `/api/schema/workflow`.</div></div>
+<div class="sd-seq-col sd-seq-returns">Validated WorkflowConfig</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">4</div>
+<div class="sd-seq-col sd-seq-from">SVC-SF5-4</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">SVC-SF5-7</div>
+<div class="sd-seq-col sd-seq-action"><div>INSERT Workflow + WorkflowVersion v1</div><div class="sd-seq-detail">The backend writes the workflow record and immutable version 1 snapshot in a single transaction. No `workflow_entity_refs` rows are written by SF-5.</div></div>
+<div class="sd-seq-col sd-seq-returns">Persisted workflow ID</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">5</div>
+<div class="sd-seq-col sd-seq-from">SVC-SF5-4</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">SVC-SF5-4</div>
+<div class="sd-seq-col sd-seq-action"><div>Fire WorkflowMutationHook(workflow_id, 'created')</div><div class="sd-seq-detail">After the transaction commits, the backend fires the mutation hook. SF-7 registers its reference-index refresh handler here at application startup; SF-5 catches and logs any handler exceptions without rolling back.</div></div>
+<div class="sd-seq-col sd-seq-returns">Hook handlers invoked</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">6</div>
+<div class="sd-seq-col sd-seq-from">SVC-SF5-4</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">SVC-SF5-3</div>
+<div class="sd-seq-col sd-seq-action"><div>201 Created</div><div class="sd-seq-detail">The backend returns the created workflow with `current_version = 1`.</div></div>
+<div class="sd-seq-col sd-seq-returns">Workflow</div>
+</div>
+</div>
+</details>
+<details class="sd-call-path" data-journey-id="J-3">
+<summary>
+<span class="sd-cp-name">Use Starter Template</span>
+<span class="sd-cp-journey">J-3</span>
+</summary>
+<p class="sd-cp-desc">The landing page fetches starter templates from the bundled asset set and creates a user-owned workflow copy on demand.</p>
+<div class="sd-sequence">
+<div class="sd-seq-header">
+<div class="sd-seq-col sd-seq-num">#</div>
+<div class="sd-seq-col sd-seq-from">From</div>
+<div class="sd-seq-col sd-seq-arrow"></div>
+<div class="sd-seq-col sd-seq-to">To</div>
+<div class="sd-seq-col sd-seq-action">Action</div>
+<div class="sd-seq-col sd-seq-returns">Returns</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">1</div>
+<div class="sd-seq-col sd-seq-from">SVC-SF5-3</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">SVC-SF5-4</div>
+<div class="sd-seq-col sd-seq-action"><div>GET /api/templates/starters</div><div class="sd-seq-detail">The frontend loads the built-in starter cards for the landing page.</div></div>
+<div class="sd-seq-col sd-seq-returns">StarterTemplate[]</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">2</div>
+<div class="sd-seq-col sd-seq-from">SVC-SF5-4</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">SVC-SF5-8</div>
+<div class="sd-seq-col sd-seq-action"><div>Read starter bundle</div><div class="sd-seq-detail">The backend reads the translated starter templates from checked-in assets at `tools/compose/backend/app/data/`.</div></div>
+<div class="sd-seq-col sd-seq-returns">Starter template payloads</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">3</div>
+<div class="sd-seq-col sd-seq-from">SVC-SF5-3</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">SVC-SF5-4</div>
+<div class="sd-seq-col sd-seq-action"><div>POST /api/workflows</div><div class="sd-seq-detail">When the user clicks Use Template, the frontend creates a new workflow using the selected starter template's canonical YAML.</div></div>
+<div class="sd-seq-col sd-seq-returns">Create request</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">4</div>
+<div class="sd-seq-col sd-seq-from">SVC-SF5-4</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">SVC-SF5-5</div>
+<div class="sd-seq-col sd-seq-action"><div>Validate starter YAML</div><div class="sd-seq-detail">The backend validates the starter payload before persistence so the starter bundle cannot drift from the runtime contract.</div></div>
+<div class="sd-seq-col sd-seq-returns">Validated WorkflowConfig</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">5</div>
+<div class="sd-seq-col sd-seq-from">SVC-SF5-4</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">SVC-SF5-7</div>
+<div class="sd-seq-col sd-seq-action"><div>Insert workflow copy and version 1</div><div class="sd-seq-detail">The backend persists the user-owned workflow and its first immutable version row. WorkflowMutationHook fires post-commit.</div></div>
+<div class="sd-seq-col sd-seq-returns">Workflow copy</div>
+</div>
+</div>
+</details>
+<details class="sd-call-path" data-journey-id="J-5">
+<summary>
+<span class="sd-cp-name">Import YAML And Surface Errors</span>
+<span class="sd-cp-journey">J-5</span>
+</summary>
+<p class="sd-cp-desc">Import uses the canonical nested contract and cleanly separates malformed YAML failures from schema-level warnings.</p>
+<div class="sd-sequence">
+<div class="sd-seq-header">
+<div class="sd-seq-col sd-seq-num">#</div>
+<div class="sd-seq-col sd-seq-from">From</div>
+<div class="sd-seq-col sd-seq-arrow"></div>
+<div class="sd-seq-col sd-seq-to">To</div>
+<div class="sd-seq-col sd-seq-action">Action</div>
+<div class="sd-seq-col sd-seq-returns">Returns</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">1</div>
+<div class="sd-seq-col sd-seq-from">SVC-SF5-1</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">SVC-SF5-3</div>
+<div class="sd-seq-col sd-seq-action"><div>Choose YAML file</div><div class="sd-seq-detail">The user selects a `.yaml` or `.yml` file from the import button.</div></div>
+<div class="sd-seq-col sd-seq-returns">File payload</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">2</div>
+<div class="sd-seq-col sd-seq-from">SVC-SF5-3</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">SVC-SF5-4</div>
+<div class="sd-seq-col sd-seq-action"><div>POST /api/workflows/import</div><div class="sd-seq-detail">The frontend uploads the file or raw YAML body.</div></div>
+<div class="sd-seq-col sd-seq-returns">Import request</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">3</div>
+<div class="sd-seq-col sd-seq-from">SVC-SF5-4</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">SVC-SF5-5</div>
+<div class="sd-seq-col sd-seq-action"><div>safe_load + model validation</div><div class="sd-seq-detail">The backend first parses YAML, then validates the nested contract and edge-only hook wiring against iriai-compose models.</div></div>
+<div class="sd-seq-col sd-seq-returns">Validated WorkflowConfig or parse/validation errors</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">4</div>
+<div class="sd-seq-col sd-seq-from">SVC-SF5-4</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">SVC-SF5-7</div>
+<div class="sd-seq-col sd-seq-action"><div>INSERT Workflow + WorkflowVersion v1 on success</div><div class="sd-seq-detail">Successful imports persist the workflow snapshot and version 1 in one transaction. No `workflow_entity_refs` rows are written by SF-5.</div></div>
+<div class="sd-seq-col sd-seq-returns">Persisted workflow</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">5</div>
+<div class="sd-seq-col sd-seq-from">SVC-SF5-4</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">SVC-SF5-4</div>
+<div class="sd-seq-col sd-seq-action"><div>Fire WorkflowMutationHook(workflow_id, 'imported') on success</div><div class="sd-seq-detail">After transaction commit, the backend fires the mutation hook for SF-7 handler invocation. Skipped entirely on validation failure.</div></div>
+<div class="sd-seq-col sd-seq-returns">Hook handlers invoked</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">6</div>
+<div class="sd-seq-col sd-seq-from">SVC-SF5-4</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">SVC-SF5-3</div>
+<div class="sd-seq-col sd-seq-action"><div>Return 201 or 400</div><div class="sd-seq-detail">Malformed YAML returns 400 with parser details; schema-valid imports return 201 and may include warning rows without blocking persistence.</div></div>
+<div class="sd-seq-col sd-seq-returns">ImportResult or import error payload</div>
+</div>
+</div>
+</details>
+<details class="sd-call-path" data-journey-id="J-4">
+<summary>
+<span class="sd-cp-name">Validate And Save Nested Workflow Version</span>
+<span class="sd-cp-journey">J-4</span>
+</summary>
+<p class="sd-cp-desc">The editor serializes its flat state back to canonical nested YAML, validates it, stores an immutable version snapshot, and fires the mutation hook.</p>
+<div class="sd-sequence">
+<div class="sd-seq-header">
+<div class="sd-seq-col sd-seq-num">#</div>
+<div class="sd-seq-col sd-seq-from">From</div>
+<div class="sd-seq-col sd-seq-arrow"></div>
+<div class="sd-seq-col sd-seq-to">To</div>
+<div class="sd-seq-col sd-seq-action">Action</div>
+<div class="sd-seq-col sd-seq-returns">Returns</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">1</div>
+<div class="sd-seq-col sd-seq-from">SVC-SF5-3</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">SVC-SF5-3</div>
+<div class="sd-seq-col sd-seq-action"><div>Serialize flat canvas state</div><div class="sd-seq-detail">The frontend groups nodes by phase and emits canonical `phases[].nodes`, `phases[].children`, and `edges[]` with no persisted `port_type`.</div></div>
+<div class="sd-seq-col sd-seq-returns">yaml_content</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">2</div>
+<div class="sd-seq-col sd-seq-from">SVC-SF5-3</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">SVC-SF5-4</div>
+<div class="sd-seq-col sd-seq-action"><div>POST /api/workflows/{id}/validate</div><div class="sd-seq-detail">The frontend asks the backend to validate the serialized YAML before committing a version snapshot.</div></div>
+<div class="sd-seq-col sd-seq-returns">ValidationResult: { valid, errors[] }</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">3</div>
+<div class="sd-seq-col sd-seq-from">SVC-SF5-4</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">SVC-SF5-5</div>
+<div class="sd-seq-col sd-seq-action"><div>Validate via declarative models</div><div class="sd-seq-detail">The backend uses the same iriai-compose models and helpers that drive `/api/schema/workflow` and import.</div></div>
+<div class="sd-seq-col sd-seq-returns">Validation result</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">4</div>
+<div class="sd-seq-col sd-seq-from">SVC-SF5-3</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">SVC-SF5-4</div>
+<div class="sd-seq-col sd-seq-action"><div>POST /api/workflows/{id}/versions</div><div class="sd-seq-detail">After a valid response, the frontend submits the same YAML snapshot as a new immutable version.</div></div>
+<div class="sd-seq-col sd-seq-returns">Version create request</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">5</div>
+<div class="sd-seq-col sd-seq-from">SVC-SF5-4</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">SVC-SF5-7</div>
+<div class="sd-seq-col sd-seq-action"><div>INSERT WorkflowVersion and update workflow current snapshot</div><div class="sd-seq-detail">The backend appends a version row and updates the workflow's `yaml_content` and `current_version` in one transaction. No `workflow_entity_refs` rows are written by SF-5.</div></div>
+<div class="sd-seq-col sd-seq-returns">WorkflowVersion</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">6</div>
+<div class="sd-seq-col sd-seq-from">SVC-SF5-4</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">SVC-SF5-4</div>
+<div class="sd-seq-col sd-seq-action"><div>Fire WorkflowMutationHook(workflow_id, 'version_saved')</div><div class="sd-seq-detail">After the transaction commits, the backend fires the mutation hook. SF-7's registered handler rebuilds the reference index for this workflow_id.</div></div>
+<div class="sd-seq-col sd-seq-returns">Hook handlers invoked</div>
+</div>
+</div>
+</details>
+<details class="sd-call-path" data-journey-id="J-2">
+<summary>
+<span class="sd-cp-name">SF-5→SF-6 Type and Schema Contract Bootstrap</span>
+<span class="sd-cp-journey">J-2</span>
+</summary>
+<p class="sd-cp-desc">Documents the complete SF-5→SF-6 edge: SF-5's TypeScript barrel export provides all compile-time types; the runtime schema endpoint provides the authoritative JSON Schema with context_keys and correct AskNode fields.</p>
+<div class="sd-sequence">
+<div class="sd-seq-header">
+<div class="sd-seq-col sd-seq-num">#</div>
+<div class="sd-seq-col sd-seq-from">From</div>
+<div class="sd-seq-col sd-seq-arrow"></div>
+<div class="sd-seq-col sd-seq-to">To</div>
+<div class="sd-seq-col sd-seq-action">Action</div>
+<div class="sd-seq-col sd-seq-returns">Returns</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">1</div>
+<div class="sd-seq-col sd-seq-from">SVC-SF5-3</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">SVC-SF5-9</div>
+<div class="sd-seq-col sd-seq-action"><div>Compile-time TypeScript barrel export</div><div class="sd-seq-detail">SF-5 exports from `tools/compose/frontend/src/types/index.ts`: Workflow, WorkflowVersion, Role, OutputSchema, CustomTaskTemplate, StarterTemplate, PaginatedList&lt;T&gt;, ValidationIssue, ValidationResult, ImportResult, WorkflowEntityRefsResponse, EntityUsageReport, DeletePreflightConflict. SF-6 imports exclusively from this path — no imports from deeper module paths.</div></div>
+<div class="sd-seq-col sd-seq-returns">TypeScript interface types bound at compile time</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">2</div>
+<div class="sd-seq-col sd-seq-from">SVC-SF5-9</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">SVC-SF5-4</div>
+<div class="sd-seq-col sd-seq-action"><div>GET /api/schema/workflow (editor mount)</div><div class="sd-seq-detail">SF-6 canvas fetches the authoritative WorkflowConfig JSON Schema using the shared Axios client from `src/api/client.ts`. This is the only schema source SF-6 may use — a bundled static schema is not permitted for runtime node palette construction.</div></div>
+<div class="sd-seq-col sd-seq-returns">WorkflowConfig JSON Schema document</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">3</div>
+<div class="sd-seq-col sd-seq-from">SVC-SF5-4</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">SVC-SF5-5</div>
+<div class="sd-seq-col sd-seq-action"><div>WorkflowConfig.model_json_schema() from iriai_compose.schema</div><div class="sd-seq-detail">Backend derives schema from the `iriai_compose.schema` subpackage (SF-1). Schema includes: optional `context_keys: string[]` at WorkflowConfig root; AskNode with required `task: string` and optional `context_text: string` (not `prompt`); BranchNode with per-port condition expressions; no `stores`, `plugin_instances`, `inputs`, `outputs` at root.</div></div>
+<div class="sd-seq-col sd-seq-returns">Schema dict cached in application state</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">4</div>
+<div class="sd-seq-col sd-seq-from">SVC-SF5-4</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">SVC-SF5-9</div>
+<div class="sd-seq-col sd-seq-action"><div>Return WorkflowConfig JSON Schema</div><div class="sd-seq-detail">Backend returns the full JSON Schema. SF-6 must validate that the schema contains context_keys and AskNode.task before marking the editor as ready.</div></div>
+<div class="sd-seq-col sd-seq-returns">WorkflowConfig JSON Schema (200)</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">5</div>
+<div class="sd-seq-col sd-seq-from">SVC-SF5-9</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">SVC-SF5-9</div>
+<div class="sd-seq-col sd-seq-action"><div>Map schema to node palette</div><div class="sd-seq-detail">SF-6 canvas maps the JSON Schema discriminated union to the editor node palette: AgentNode, AskNode (task+context_text fields), BranchNode (per-port conditions), CustomNode, EvalNode. Caches schema; subscribes to version stamp for invalidation on backend redeploy.</div></div>
+<div class="sd-seq-col sd-seq-returns">Node palette ready; editor unlocked for workflow load</div>
+</div>
+</div>
+</details>
+<details class="sd-call-path" data-journey-id="J-2">
+<summary>
+<span class="sd-cp-name">SF-5→SF-7 Hook Registration and Index Rebuild Chain</span>
+<span class="sd-cp-journey">J-2</span>
+</summary>
+<p class="sd-cp-desc">Documents the complete SF-5→SF-7 edge: SF-7 registers its reference-index handler into SF-5's WorkflowMutationHookRegistry at app startup, then the chain fires on every workflow write to rebuild workflow_entity_refs.</p>
+<div class="sd-sequence">
+<div class="sd-seq-header">
+<div class="sd-seq-col sd-seq-num">#</div>
+<div class="sd-seq-col sd-seq-from">From</div>
+<div class="sd-seq-col sd-seq-arrow"></div>
+<div class="sd-seq-col sd-seq-to">To</div>
+<div class="sd-seq-col sd-seq-action">Action</div>
+<div class="sd-seq-col sd-seq-returns">Returns</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">1</div>
+<div class="sd-seq-col sd-seq-from">SVC-SF5-10</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">SVC-SF5-4</div>
+<div class="sd-seq-col sd-seq-action"><div>Register refresh_entity_refs handler at FastAPI lifespan startup</div><div class="sd-seq-detail">SF-7 calls `mutation_hook_registry.register(refresh_entity_refs)` during the FastAPI @asynccontextmanager lifespan startup block. The handler signature is `async def refresh_entity_refs(workflow_id: str, operation: WorkflowMutationOperation) -&gt; None`. SF-7 imports `mutation_hook_registry` from `app/state.py` and ORM models from `app/models.py`.</div></div>
+<div class="sd-seq-col sd-seq-returns">Handler stored in registry</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">2</div>
+<div class="sd-seq-col sd-seq-from">SVC-SF5-9</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">SVC-SF5-4</div>
+<div class="sd-seq-col sd-seq-action"><div>POST /api/workflows/{id}/versions { yaml_content, change_description }</div><div class="sd-seq-detail">SF-6 canvas submits a validated YAML snapshot as a new immutable version.</div></div>
+<div class="sd-seq-col sd-seq-returns">Version create request</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">3</div>
+<div class="sd-seq-col sd-seq-from">SVC-SF5-4</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">SVC-SF5-7</div>
+<div class="sd-seq-col sd-seq-action"><div>INSERT workflow_versions; UPDATE workflows.yaml_content in one transaction</div><div class="sd-seq-detail">SF-5 appends the version row and updates the workflow snapshot atomically.</div></div>
+<div class="sd-seq-col sd-seq-returns">Committed transaction</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">4</div>
+<div class="sd-seq-col sd-seq-from">SVC-SF5-4</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">SVC-SF5-10</div>
+<div class="sd-seq-col sd-seq-action"><div>mutation_hook_registry.fire(workflow_id, 'version_saved') post-commit</div><div class="sd-seq-detail">SF-5 invokes all registered handlers after the transaction commits. Handler exceptions are caught per-handler, logged via structlog, and never propagated to the HTTP response.</div></div>
+<div class="sd-seq-col sd-seq-returns">Handler invocations dispatched (exceptions swallowed)</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">5</div>
+<div class="sd-seq-col sd-seq-from">SVC-SF5-10</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">SVC-SF5-7</div>
+<div class="sd-seq-col sd-seq-action"><div>Parse yaml_content; DELETE prior refs; bulk INSERT workflow_entity_refs rows</div><div class="sd-seq-detail">SF-7 handler loads yaml_content via PyYAML, walks all PhaseDefinition.nodes extracting role_id, output_schema_id, and template_id references, deletes all existing workflow_entity_refs rows for this workflow_id, then inserts fresh rows. Operation is idempotent — safe to re-invoke.</div></div>
+<div class="sd-seq-col sd-seq-returns">Reference index rebuilt; workflow_entity_refs current</div>
+</div>
+</div>
+</details>
+<details class="sd-call-path" data-journey-id="J-4">
+<summary>
+<span class="sd-cp-name">SF-7→SF-6 Reference Check and Delete Preflight</span>
+<span class="sd-cp-journey">J-4</span>
+</summary>
+<p class="sd-cp-desc">Documents the SF-7→SF-6 edge: SF-7 extension endpoints consumed by SF-6 for usage display and blocking delete preflights. Covers both the pre-dialog usage fetch and the 409 guard on the delete endpoint itself.</p>
+<div class="sd-sequence">
+<div class="sd-seq-header">
+<div class="sd-seq-col sd-seq-num">#</div>
+<div class="sd-seq-col sd-seq-from">From</div>
+<div class="sd-seq-col sd-seq-arrow"></div>
+<div class="sd-seq-col sd-seq-to">To</div>
+<div class="sd-seq-col sd-seq-action">Action</div>
+<div class="sd-seq-col sd-seq-returns">Returns</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">1</div>
+<div class="sd-seq-col sd-seq-from">SVC-SF5-1</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">SVC-SF5-9</div>
+<div class="sd-seq-col sd-seq-action"><div>Click Delete Role (or schema / template)</div><div class="sd-seq-detail">User initiates delete from the library entity list. SF-6 intercepts the action before calling DELETE to fetch usage count.</div></div>
+<div class="sd-seq-col sd-seq-returns">Delete intent</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">2</div>
+<div class="sd-seq-col sd-seq-from">SVC-SF5-9</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">SVC-SF5-4</div>
+<div class="sd-seq-col sd-seq-action"><div>GET /api/roles/{id}/usage</div><div class="sd-seq-detail">SF-6 calls the SF-7-owned usage endpoint via the shared Axios client. No separate HTTP client is configured for SF-7 routes.</div></div>
+<div class="sd-seq-col sd-seq-returns">GET usage request</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">3</div>
+<div class="sd-seq-col sd-seq-from">SVC-SF5-4</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">SVC-SF5-7</div>
+<div class="sd-seq-col sd-seq-action"><div>SELECT workflow_entity_refs WHERE entity_type='role' AND entity_id=?</div><div class="sd-seq-detail">SF-7 router handler queries the materialized reference index.</div></div>
+<div class="sd-seq-col sd-seq-returns">Ref rows</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">4</div>
+<div class="sd-seq-col sd-seq-from">SVC-SF5-4</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">SVC-SF5-9</div>
+<div class="sd-seq-col sd-seq-action"><div>Return EntityUsageReport</div><div class="sd-seq-detail">Backend returns: `{ entity_id, entity_type: 'role', referenced_by: [{ workflow_id, workflow_name, node_ids[] }], total_references: number }`.</div></div>
+<div class="sd-seq-col sd-seq-returns">EntityUsageReport (200)</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">5</div>
+<div class="sd-seq-col sd-seq-from">SVC-SF5-9</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">SVC-SF5-9</div>
+<div class="sd-seq-col sd-seq-action"><div>Render DeleteEntityDialog with usage</div><div class="sd-seq-detail">SF-6 renders DeleteEntityDialog (SF-7 component). If total_references &gt; 0, the dialog shows a blocking warning listing referenced workflows with links. The confirm button is disabled when blocking references exist — this is a blocking error state, not a dismissible warning.</div></div>
+<div class="sd-seq-col sd-seq-returns">Dialog displayed; user decides</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">6</div>
+<div class="sd-seq-col sd-seq-from">SVC-SF5-9</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">SVC-SF5-4</div>
+<div class="sd-seq-col sd-seq-action"><div>DELETE /api/roles/{id} (if user confirms with zero references)</div><div class="sd-seq-detail">SF-6 calls the delete endpoint. SF-7's `require_no_entity_refs` dependency runs first as a second line of enforcement — returns 409 if refs exist at delete time (race-condition guard). SF-6 handles 409 by re-rendering the blocking dialog.</div></div>
+<div class="sd-seq-col sd-seq-returns">204 No Content; or 409 DeletePreflightConflict: { detail: string, blocking_workflows: [{ id, name }] }</div>
+</div>
+</div>
+</details>
+<details class="sd-call-path" data-journey-id="J-4">
+<summary>
+<span class="sd-cp-name">SF-6→SF-7 Editor Reference Panel Load</span>
+<span class="sd-cp-journey">J-4</span>
+</summary>
+<p class="sd-cp-desc">Documents the SF-6→SF-7 edge for the editor reference panel: SF-6 fetches the workflow entity-refs index to display what library entities are used by the current workflow's nodes. Index is already current because the hook chain (CP-SF5-8) ran on the last save.</p>
+<div class="sd-sequence">
+<div class="sd-seq-header">
+<div class="sd-seq-col sd-seq-num">#</div>
+<div class="sd-seq-col sd-seq-from">From</div>
+<div class="sd-seq-col sd-seq-arrow"></div>
+<div class="sd-seq-col sd-seq-to">To</div>
+<div class="sd-seq-col sd-seq-action">Action</div>
+<div class="sd-seq-col sd-seq-returns">Returns</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">1</div>
+<div class="sd-seq-col sd-seq-from">SVC-SF5-9</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">SVC-SF5-4</div>
+<div class="sd-seq-col sd-seq-action"><div>GET /api/workflows/{id}/entity-refs</div><div class="sd-seq-detail">SF-6 canvas calls the SF-7-owned entity-refs endpoint when the editor reference panel is opened. Uses the shared Axios client — no separate client for SF-7 routes.</div></div>
+<div class="sd-seq-col sd-seq-returns">GET entity-refs request</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">2</div>
+<div class="sd-seq-col sd-seq-from">SVC-SF5-4</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">SVC-SF5-7</div>
+<div class="sd-seq-col sd-seq-action"><div>SELECT workflow_entity_refs WHERE workflow_id=?</div><div class="sd-seq-detail">SF-7 router handler reads the materialized index for this workflow.</div></div>
+<div class="sd-seq-col sd-seq-returns">Ref rows with entity_type, entity_id, node_id, node_type, context</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">3</div>
+<div class="sd-seq-col sd-seq-from">SVC-SF5-4</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">SVC-SF5-9</div>
+<div class="sd-seq-col sd-seq-action"><div>Return WorkflowEntityRefsResponse</div><div class="sd-seq-detail">Backend returns `{ workflow_id, refs: [{ entity_type, entity_id, node_id, node_type, context }], last_indexed_at }`.</div></div>
+<div class="sd-seq-col sd-seq-returns">WorkflowEntityRefsResponse (200)</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">4</div>
+<div class="sd-seq-col sd-seq-from">SVC-SF5-9</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">SVC-SF5-9</div>
+<div class="sd-seq-col sd-seq-action"><div>Render reference panel grouped by entity_type</div><div class="sd-seq-detail">SF-6 displays the refs grouped by entity_type (Roles, Output Schemas, Task Templates). Each entry links to the library entity detail. `last_indexed_at` is shown to indicate when the index was last rebuilt. If the workflow has unsaved changes, SF-6 shows a stale-index notice prompting the user to save first.</div></div>
+<div class="sd-seq-col sd-seq-returns">Reference panel rendered</div>
+</div>
+</div>
+</details>
+</section>
+<section class="sd-section" id="endpoints">
+<h2 class="sd-section-title">API Endpoints</h2>
+<div class="sd-table-wrap">
+<table class="sd-table">
+<thead><tr>
+<th>Method</th><th>Path</th><th>Service</th><th>Auth</th><th>Description</th>
+</tr></thead>
+<tbody>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#22c55e;letter-spacing:0.04em;line-height:1.6;">GET</span></td>
+<td><code>/api/schema/workflow</code></td>
+<td><span class="sd-svc-ref" data-ref-service="SVC-SF5-4">Compose Backend</span></td>
+<td>JWT Bearer</td>
+<td>Returns the canonical WorkflowConfig JSON Schema used by the composer at runtime. Derived from `WorkflowConfig.model_json_schema()` in `iriai_compose.schema`. The schema exposes nested `phases[].nodes` and `phases[].children` plus edge-only hook wiring (`source`, `target`, `transform_fn`) and never ships a serialized `port_type` field. Key field constraints: WorkflowConfig root includes optional `context_keys: string[]` per D-GR-39; AskNode has required `task: string` and optional `context_text: string` (not `prompt`); BranchNode uses per-port condition expressions per D-GR-35; no `stores`, `plugin_instances`, `inputs`, or `outputs` at root. SF-6 must fetch this endpoint at editor mount and must not use a static bundled schema for runtime behavior.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#22c55e;letter-spacing:0.04em;line-height:1.6;">GET</span></td>
+<td><code>/api/workflows</code></td>
+<td><span class="sd-svc-ref" data-ref-service="SVC-SF5-4">Compose Backend</span></td>
+<td>JWT Bearer</td>
+<td>Lists the caller's workflows with cursor pagination and search.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#3b82f6;letter-spacing:0.04em;line-height:1.6;">POST</span></td>
+<td><code>/api/workflows</code></td>
+<td><span class="sd-svc-ref" data-ref-service="SVC-SF5-4">Compose Backend</span></td>
+<td>JWT Bearer</td>
+<td>Creates a workflow from nested YAML or a minimal skeleton, atomically writes WorkflowVersion v1, then fires WorkflowMutationHook(workflow_id, 'created').</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#22c55e;letter-spacing:0.04em;line-height:1.6;">GET</span></td>
+<td><code>/api/workflows/{id}</code></td>
+<td><span class="sd-svc-ref" data-ref-service="SVC-SF5-4">Compose Backend</span></td>
+<td>JWT Bearer</td>
+<td>Returns one workflow, including its canonical nested YAML document and current version number.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#f59e0b;letter-spacing:0.04em;line-height:1.6;">PUT</span></td>
+<td><code>/api/workflows/{id}</code></td>
+<td><span class="sd-svc-ref" data-ref-service="SVC-SF5-4">Compose Backend</span></td>
+<td>JWT Bearer</td>
+<td>Updates workflow metadata and current YAML snapshot without creating a new version row.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#ef4444;letter-spacing:0.04em;line-height:1.6;">DELETE</span></td>
+<td><code>/api/workflows/{id}</code></td>
+<td><span class="sd-svc-ref" data-ref-service="SVC-SF5-4">Compose Backend</span></td>
+<td>JWT Bearer</td>
+<td>Soft-deletes a workflow by setting `deleted_at`, then fires WorkflowMutationHook(workflow_id, 'deleted') so SF-7 can purge its reference-index rows.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#3b82f6;letter-spacing:0.04em;line-height:1.6;">POST</span></td>
+<td><code>/api/workflows/{id}/duplicate</code></td>
+<td><span class="sd-svc-ref" data-ref-service="SVC-SF5-4">Compose Backend</span></td>
+<td>JWT Bearer</td>
+<td>Duplicates an existing workflow, seeds a fresh WorkflowVersion v1 for the copy, and fires WorkflowMutationHook(new_workflow_id, 'created').</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#3b82f6;letter-spacing:0.04em;line-height:1.6;">POST</span></td>
+<td><code>/api/workflows/import</code></td>
+<td><span class="sd-svc-ref" data-ref-service="SVC-SF5-4">Compose Backend</span></td>
+<td>JWT Bearer</td>
+<td>Imports a YAML file or raw YAML body, validates it against the canonical schema contract, creates WorkflowVersion v1 on success, and fires WorkflowMutationHook(workflow_id, 'imported').</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#3b82f6;letter-spacing:0.04em;line-height:1.6;">POST</span></td>
+<td><code>/api/workflows/{id}/versions</code></td>
+<td><span class="sd-svc-ref" data-ref-service="SVC-SF5-4">Compose Backend</span></td>
+<td>JWT Bearer</td>
+<td>Validates and stores a new immutable WorkflowVersion snapshot, updates the workflow's current YAML, then fires WorkflowMutationHook(workflow_id, 'version_saved').</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#3b82f6;letter-spacing:0.04em;line-height:1.6;">POST</span></td>
+<td><code>/api/workflows/{id}/validate</code></td>
+<td><span class="sd-svc-ref" data-ref-service="SVC-SF5-4">Compose Backend</span></td>
+<td>JWT Bearer</td>
+<td>Runs server-side validation against the same iriai-compose declarative models used for schema export and import. Returns path/message error details.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#22c55e;letter-spacing:0.04em;line-height:1.6;">GET</span></td>
+<td><code>/api/workflows/{id}/export</code></td>
+<td><span class="sd-svc-ref" data-ref-service="SVC-SF5-4">Compose Backend</span></td>
+<td>JWT Bearer</td>
+<td>Downloads the stored canonical YAML document for a workflow.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#22c55e;letter-spacing:0.04em;line-height:1.6;">GET</span></td>
+<td><code>/api/templates/starters</code></td>
+<td><span class="sd-svc-ref" data-ref-service="SVC-SF5-4">Compose Backend</span></td>
+<td>JWT Bearer</td>
+<td>Returns the bundled starter templates used on the Workflows landing page.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#22c55e;letter-spacing:0.04em;line-height:1.6;">GET</span></td>
+<td><code>/api/roles</code></td>
+<td><span class="sd-svc-ref" data-ref-service="SVC-SF5-4">Compose Backend</span></td>
+<td>JWT Bearer</td>
+<td>Lists saved role definitions for the authenticated user.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#3b82f6;letter-spacing:0.04em;line-height:1.6;">POST</span></td>
+<td><code>/api/roles</code></td>
+<td><span class="sd-svc-ref" data-ref-service="SVC-SF5-4">Compose Backend</span></td>
+<td>JWT Bearer</td>
+<td>Creates a reusable role definition. Fields align with the iriai-compose Role contract: `prompt` (not `system_prompt`), `tools`, `model`, `effort`, and `metadata`.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#22c55e;letter-spacing:0.04em;line-height:1.6;">GET</span></td>
+<td><code>/api/roles/{id}</code></td>
+<td><span class="sd-svc-ref" data-ref-service="SVC-SF5-4">Compose Backend</span></td>
+<td>JWT Bearer</td>
+<td>Returns one role definition owned by the caller.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#f59e0b;letter-spacing:0.04em;line-height:1.6;">PUT</span></td>
+<td><code>/api/roles/{id}</code></td>
+<td><span class="sd-svc-ref" data-ref-service="SVC-SF5-4">Compose Backend</span></td>
+<td>JWT Bearer</td>
+<td>Updates an existing role definition.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#ef4444;letter-spacing:0.04em;line-height:1.6;">DELETE</span></td>
+<td><code>/api/roles/{id}</code></td>
+<td><span class="sd-svc-ref" data-ref-service="SVC-SF5-4">Compose Backend</span></td>
+<td>JWT Bearer</td>
+<td>Soft-deletes a role. In SF-5 the base handler performs the soft-delete; SF-7 injects a `require_no_entity_refs` FastAPI dependency that runs first and returns HTTP 409 if references exist. SF-6 must handle both 204 (success) and 409 (reference conflict).</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#22c55e;letter-spacing:0.04em;line-height:1.6;">GET</span></td>
+<td><code>/api/schemas</code></td>
+<td><span class="sd-svc-ref" data-ref-service="SVC-SF5-4">Compose Backend</span></td>
+<td>JWT Bearer</td>
+<td>Lists saved output schemas for the authenticated user.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#3b82f6;letter-spacing:0.04em;line-height:1.6;">POST</span></td>
+<td><code>/api/schemas</code></td>
+<td><span class="sd-svc-ref" data-ref-service="SVC-SF5-4">Compose Backend</span></td>
+<td>JWT Bearer</td>
+<td>Creates a reusable JSON Schema document for node and workflow outputs.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#22c55e;letter-spacing:0.04em;line-height:1.6;">GET</span></td>
+<td><code>/api/schemas/{id}</code></td>
+<td><span class="sd-svc-ref" data-ref-service="SVC-SF5-4">Compose Backend</span></td>
+<td>JWT Bearer</td>
+<td>Returns one output schema owned by the caller.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#f59e0b;letter-spacing:0.04em;line-height:1.6;">PUT</span></td>
+<td><code>/api/schemas/{id}</code></td>
+<td><span class="sd-svc-ref" data-ref-service="SVC-SF5-4">Compose Backend</span></td>
+<td>JWT Bearer</td>
+<td>Updates an output schema definition.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#ef4444;letter-spacing:0.04em;line-height:1.6;">DELETE</span></td>
+<td><code>/api/schemas/{id}</code></td>
+<td><span class="sd-svc-ref" data-ref-service="SVC-SF5-4">Compose Backend</span></td>
+<td>JWT Bearer</td>
+<td>Soft-deletes an output schema. SF-7 injects `require_no_entity_refs` dependency for 409 preflight; SF-6 handles both 204 and 409.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#22c55e;letter-spacing:0.04em;line-height:1.6;">GET</span></td>
+<td><code>/api/templates</code></td>
+<td><span class="sd-svc-ref" data-ref-service="SVC-SF5-4">Compose Backend</span></td>
+<td>JWT Bearer</td>
+<td>Lists saved task templates for the authenticated user.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#3b82f6;letter-spacing:0.04em;line-height:1.6;">POST</span></td>
+<td><code>/api/templates</code></td>
+<td><span class="sd-svc-ref" data-ref-service="SVC-SF5-4">Compose Backend</span></td>
+<td>JWT Bearer</td>
+<td>Creates a reusable task template whose `subgraph_yaml` follows the same canonical nested contract as full workflows.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#22c55e;letter-spacing:0.04em;line-height:1.6;">GET</span></td>
+<td><code>/api/templates/{id}</code></td>
+<td><span class="sd-svc-ref" data-ref-service="SVC-SF5-4">Compose Backend</span></td>
+<td>JWT Bearer</td>
+<td>Returns one task template owned by the caller.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#f59e0b;letter-spacing:0.04em;line-height:1.6;">PUT</span></td>
+<td><code>/api/templates/{id}</code></td>
+<td><span class="sd-svc-ref" data-ref-service="SVC-SF5-4">Compose Backend</span></td>
+<td>JWT Bearer</td>
+<td>Updates a task template definition.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#ef4444;letter-spacing:0.04em;line-height:1.6;">DELETE</span></td>
+<td><code>/api/templates/{id}</code></td>
+<td><span class="sd-svc-ref" data-ref-service="SVC-SF5-4">Compose Backend</span></td>
+<td>JWT Bearer</td>
+<td>Soft-deletes a task template. SF-7 injects `require_no_entity_refs` dependency for 409 preflight; SF-6 handles both 204 and 409.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#22c55e;letter-spacing:0.04em;line-height:1.6;">GET</span></td>
+<td><code>/health</code></td>
+<td><span class="sd-svc-ref" data-ref-service="SVC-SF5-4">Compose Backend</span></td>
+<td>&mdash;</td>
+<td>Liveness probe for process-level availability.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#22c55e;letter-spacing:0.04em;line-height:1.6;">GET</span></td>
+<td><code>/ready</code></td>
+<td><span class="sd-svc-ref" data-ref-service="SVC-SF5-4">Compose Backend</span></td>
+<td>&mdash;</td>
+<td>Readiness probe that confirms the PostgreSQL database is reachable and Alembic migration is current against `alembic_version_compose`.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#22c55e;letter-spacing:0.04em;line-height:1.6;">GET</span></td>
+<td><code>/api/workflows/{id}/entity-refs</code></td>
+<td><span class="sd-svc-ref" data-ref-service="SVC-SF5-4">Compose Backend</span></td>
+<td>JWT Bearer</td>
+<td>SF-7-owned route served from the compose backend (app/routers/entity_refs.py). Returns the materialized reference index for a workflow — all library entities referenced by nodes in that workflow's current yaml_content. SF-6 calls this for the editor reference panel. Index is rebuilt by SF-7's WorkflowMutationHook handler on every save/import/create; last_indexed_at shows when the last rebuild completed.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#22c55e;letter-spacing:0.04em;line-height:1.6;">GET</span></td>
+<td><code>/api/roles/{id}/usage</code></td>
+<td><span class="sd-svc-ref" data-ref-service="SVC-SF5-4">Compose Backend</span></td>
+<td>JWT Bearer</td>
+<td>SF-7-owned route served from the compose backend. Returns all workflows that reference this role. SF-6 calls this before rendering the DeleteEntityDialog for a role — if total_references &gt; 0, the dialog shows a blocking warning with workflow links. Reads from the `workflow_entity_refs` materialized index.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#22c55e;letter-spacing:0.04em;line-height:1.6;">GET</span></td>
+<td><code>/api/schemas/{id}/usage</code></td>
+<td><span class="sd-svc-ref" data-ref-service="SVC-SF5-4">Compose Backend</span></td>
+<td>JWT Bearer</td>
+<td>SF-7-owned route served from the compose backend. Returns all workflows that reference this output schema. SF-6 calls this before rendering the DeleteEntityDialog for a schema.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#22c55e;letter-spacing:0.04em;line-height:1.6;">GET</span></td>
+<td><code>/api/templates/{id}/usage</code></td>
+<td><span class="sd-svc-ref" data-ref-service="SVC-SF5-4">Compose Backend</span></td>
+<td>JWT Bearer</td>
+<td>SF-7-owned route served from the compose backend. Returns all workflows that reference this custom task template. SF-6 calls this before rendering the DeleteEntityDialog for a template.</td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section class="sd-section" id="entities">
+<h2 class="sd-section-title">Entity Model</h2>
+<div class="sd-entity-grid">
+<div class="sd-entity-card" data-service-id="SVC-SF5-4" data-journeys="J-2 J-3 J-4 J-5 J-6">
+<div class="sd-entity-header">
+<h4 class="sd-entity-name">Workflow</h4>
+<span class="sd-entity-svc" data-ref-service="SVC-SF5-4">Compose Backend</span>
+</div>
+<table class="sd-field-table">
+<thead><tr><th>Field</th><th>Type</th><th>Constraints</th></tr></thead>
+<tbody>
+<tr>
+<td>id</td>
+<td><code>UUID</code></td>
+<td>PK</td>
+</tr>
+<tr>
+<td>name</td>
+<td><code>string</code></td>
+<td>NOT NULL, unique per user among non-deleted rows</td>
+</tr>
+<tr>
+<td>description</td>
+<td><code>string | null</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>yaml_content</td>
+<td><code>text</code></td>
+<td>NOT NULL</td>
+</tr>
+<tr>
+<td>current_version</td>
+<td><code>integer</code></td>
+<td>NOT NULL</td>
+</tr>
+<tr>
+<td>is_valid</td>
+<td><code>boolean</code></td>
+<td>NOT NULL</td>
+</tr>
+<tr>
+<td>user_id</td>
+<td><code>string</code></td>
+<td>NOT NULL, indexed</td>
+</tr>
+<tr>
+<td>created_at</td>
+<td><code>datetime</code></td>
+<td>NOT NULL</td>
+</tr>
+<tr>
+<td>updated_at</td>
+<td><code>datetime | null</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>deleted_at</td>
+<td><code>datetime | null</code></td>
+<td>&mdash;</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div class="sd-entity-card" data-service-id="SVC-SF5-4" data-journeys="J-2 J-3 J-4 J-5">
+<div class="sd-entity-header">
+<h4 class="sd-entity-name">WorkflowVersion</h4>
+<span class="sd-entity-svc" data-ref-service="SVC-SF5-4">Compose Backend</span>
+</div>
+<table class="sd-field-table">
+<thead><tr><th>Field</th><th>Type</th><th>Constraints</th></tr></thead>
+<tbody>
+<tr>
+<td>id</td>
+<td><code>UUID</code></td>
+<td>PK</td>
+</tr>
+<tr>
+<td>workflow_id</td>
+<td><code>UUID</code></td>
+<td>FK -&gt; workflows.id, NOT NULL</td>
+</tr>
+<tr>
+<td>version_number</td>
+<td><code>integer</code></td>
+<td>NOT NULL, unique per workflow</td>
+</tr>
+<tr>
+<td>yaml_content</td>
+<td><code>text</code></td>
+<td>NOT NULL, immutable after insert</td>
+</tr>
+<tr>
+<td>change_description</td>
+<td><code>string | null</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>user_id</td>
+<td><code>string</code></td>
+<td>NOT NULL</td>
+</tr>
+<tr>
+<td>created_at</td>
+<td><code>datetime</code></td>
+<td>NOT NULL</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div class="sd-entity-card" data-service-id="SVC-SF5-4" data-journeys="J-4">
+<div class="sd-entity-header">
+<h4 class="sd-entity-name">Role</h4>
+<span class="sd-entity-svc" data-ref-service="SVC-SF5-4">Compose Backend</span>
+</div>
+<table class="sd-field-table">
+<thead><tr><th>Field</th><th>Type</th><th>Constraints</th></tr></thead>
+<tbody>
+<tr>
+<td>id</td>
+<td><code>UUID</code></td>
+<td>PK</td>
+</tr>
+<tr>
+<td>name</td>
+<td><code>string</code></td>
+<td>NOT NULL, unique per user among non-deleted rows</td>
+</tr>
+<tr>
+<td>prompt</td>
+<td><code>text</code></td>
+<td>NOT NULL</td>
+</tr>
+<tr>
+<td>model</td>
+<td><code>string | null</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>effort</td>
+<td><code>string | null</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>tools</td>
+<td><code>json</code></td>
+<td>NOT NULL, default []</td>
+</tr>
+<tr>
+<td>metadata</td>
+<td><code>json</code></td>
+<td>NOT NULL, default {}</td>
+</tr>
+<tr>
+<td>user_id</td>
+<td><code>string</code></td>
+<td>NOT NULL, indexed</td>
+</tr>
+<tr>
+<td>created_at</td>
+<td><code>datetime</code></td>
+<td>NOT NULL</td>
+</tr>
+<tr>
+<td>updated_at</td>
+<td><code>datetime | null</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>deleted_at</td>
+<td><code>datetime | null</code></td>
+<td>&mdash;</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div class="sd-entity-card" data-service-id="SVC-SF5-4" data-journeys="J-4">
+<div class="sd-entity-header">
+<h4 class="sd-entity-name">OutputSchema</h4>
+<span class="sd-entity-svc" data-ref-service="SVC-SF5-4">Compose Backend</span>
+</div>
+<table class="sd-field-table">
+<thead><tr><th>Field</th><th>Type</th><th>Constraints</th></tr></thead>
+<tbody>
+<tr>
+<td>id</td>
+<td><code>UUID</code></td>
+<td>PK</td>
+</tr>
+<tr>
+<td>name</td>
+<td><code>string</code></td>
+<td>NOT NULL, unique per user among non-deleted rows</td>
+</tr>
+<tr>
+<td>description</td>
+<td><code>string | null</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>json_schema</td>
+<td><code>json</code></td>
+<td>NOT NULL</td>
+</tr>
+<tr>
+<td>user_id</td>
+<td><code>string</code></td>
+<td>NOT NULL, indexed</td>
+</tr>
+<tr>
+<td>created_at</td>
+<td><code>datetime</code></td>
+<td>NOT NULL</td>
+</tr>
+<tr>
+<td>updated_at</td>
+<td><code>datetime | null</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>deleted_at</td>
+<td><code>datetime | null</code></td>
+<td>&mdash;</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div class="sd-entity-card" data-service-id="SVC-SF5-4" data-journeys="J-4">
+<div class="sd-entity-header">
+<h4 class="sd-entity-name">CustomTaskTemplate</h4>
+<span class="sd-entity-svc" data-ref-service="SVC-SF5-4">Compose Backend</span>
+</div>
+<table class="sd-field-table">
+<thead><tr><th>Field</th><th>Type</th><th>Constraints</th></tr></thead>
+<tbody>
+<tr>
+<td>id</td>
+<td><code>UUID</code></td>
+<td>PK</td>
+</tr>
+<tr>
+<td>name</td>
+<td><code>string</code></td>
+<td>NOT NULL, unique per user among non-deleted rows</td>
+</tr>
+<tr>
+<td>description</td>
+<td><code>string | null</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>subgraph_yaml</td>
+<td><code>text</code></td>
+<td>NOT NULL</td>
+</tr>
+<tr>
+<td>input_interface</td>
+<td><code>json</code></td>
+<td>NOT NULL</td>
+</tr>
+<tr>
+<td>output_interface</td>
+<td><code>json</code></td>
+<td>NOT NULL</td>
+</tr>
+<tr>
+<td>user_id</td>
+<td><code>string</code></td>
+<td>NOT NULL, indexed</td>
+</tr>
+<tr>
+<td>created_at</td>
+<td><code>datetime</code></td>
+<td>NOT NULL</td>
+</tr>
+<tr>
+<td>updated_at</td>
+<td><code>datetime | null</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>deleted_at</td>
+<td><code>datetime | null</code></td>
+<td>&mdash;</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div class="sd-entity-card" data-service-id="SVC-SF5-8" data-journeys="J-3">
+<div class="sd-entity-header">
+<h4 class="sd-entity-name">StarterTemplate</h4>
+<span class="sd-entity-svc" data-ref-service="SVC-SF5-8">Starter Template Bundle</span>
+</div>
+<table class="sd-field-table">
+<thead><tr><th>Field</th><th>Type</th><th>Constraints</th></tr></thead>
+<tbody>
+<tr>
+<td>id</td>
+<td><code>string</code></td>
+<td>required</td>
+</tr>
+<tr>
+<td>name</td>
+<td><code>string</code></td>
+<td>required</td>
+</tr>
+<tr>
+<td>description</td>
+<td><code>string</code></td>
+<td>required</td>
+</tr>
+<tr>
+<td>yaml_content</td>
+<td><code>text</code></td>
+<td>required</td>
+</tr>
+<tr>
+<td>category</td>
+<td><code>string</code></td>
+<td>required, constant 'starter'</td>
+</tr>
+</tbody>
+</table>
+</div>
+</div>
+</section>
+<section class="sd-section" id="relations">
+<h2 class="sd-section-title">Entity Relationships</h2>
+<div class="sd-table-wrap">
+<table class="sd-table">
+<thead><tr>
+<th>From</th><th>Relationship</th><th>To</th><th>Label</th>
+</tr></thead>
+<tbody>
+<tr>
+<td>ENT-SF5-1</td>
+<td><span class="sd-rel-kind">one-to-many</span></td>
+<td>ENT-SF5-2</td>
+<td>has immutable versions</td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section class="sd-section" id="risks">
+<h2 class="sd-section-title">Risks</h2>
+<ul class="sd-risks-list">
+<li>RISK-1 (high): Flat React Flow state may serialize back to nested YAML incorrectly, especially for deeply nested phases or hook edges. Mitigation: make import/export round-trip tests mandatory and validate every save against the same iriai-compose models used by import.</li>
+<li>RISK-2 (medium): Frontend schema caching can drift after backend deploys if `/api/schema/workflow` changes and stale local data survives. Mitigation: refetch schema on app boot, attach an ETag or version stamp, and invalidate cached editor metadata whenever the schema changes.</li>
+<li>RISK-3 (medium): PostgreSQL connection pool exhaustion under bursty concurrent write patterns (repeated explicit saves, parallel imports). Mitigation: configure SQLAlchemy async pool with `pool_size=5, max_overflow=10`; keep transactions short; avoid holding connections across validation calls; use asyncpg driver for efficient connection reuse.</li>
+<li>RISK-4 (medium): WorkflowMutationHook handlers registered by SF-7 could raise exceptions, causing silent reference-index staleness. Mitigation: SF-5 hook dispatcher must catch and log all handler exceptions without rolling back the primary workflow transaction; SF-7 handlers must be idempotent and safe to re-invoke; add observability metrics for hook invocation failures.</li>
+<li>RISK-5 (low): Starter template assets can drift from iriai-build-v2 translations or the canonical schema. Mitigation: validate the bundled starter payloads against iriai-compose `WorkflowConfig` during CI and on backend startup.</li>
+<li>RISK-6 (medium): SF-7's `refresh_entity_refs` handler scans `yaml_content` via PyYAML on every workflow save. For large workflows with many nodes, this adds latency to the post-commit hook path. Mitigation: handler runs post-commit and asynchronously (exception-swallowed), so it does not block the HTTP response. Add a timeout guard to the handler so a slow YAML scan does not hold the database connection indefinitely.</li>
+<li>RISK-7 (low): The SF-7 delete preflight 409 guard and the pre-dialog usage fetch can race if another user saves a workflow that adds a reference between the usage fetch and the delete call. Mitigation: the server-side 409 guard is the authoritative enforcement; SF-6's pre-dialog fetch is UX-only. The race window results in a 409 error after the user confirmed — SF-6 must handle this gracefully by re-rendering the blocking dialog with fresh usage data.</li>
+<li>RISK-8 (low): `iriai_compose.schema` module (SF-1) does not exist yet — SF-5's backend has a hard dependency on SF-1 completing first. Mitigation: SF-5 backend implementation is blocked until SF-1 exports `WorkflowConfig` from `iriai_compose.schema`. This dependency must be reflected in the implementation task DAG.</li>
+</ul>
+</section>
+</main>
+<footer class="sd-footer">
+<p>System Design Document</p>
+</footer>
+<script>
+(function () {
+  'use strict';
+
+  // ── Journey filtering ──────────────────────────────────────────────
+  var activeJourney = '__all__';
+
+  window.__sd_filter = function (journeyId) {
+    activeJourney = journeyId;
+
+    // Update pill states
+    var pills = document.querySelectorAll('.sd-pill');
+    for (var i = 0; i < pills.length; i++) {
+      var p = pills[i];
+      if (p.getAttribute('data-journey') === journeyId) {
+        p.classList.add('sd-pill-active');
+      } else {
+        p.classList.remove('sd-pill-active');
+      }
+    }
+
+    // Filter elements with data-journeys
+    var tagged = document.querySelectorAll('[data-journeys]');
+    for (var j = 0; j < tagged.length; j++) {
+      var el = tagged[j];
+      if (journeyId === '__all__') {
+        el.classList.remove('sd-dimmed');
+      } else {
+        var jList = (el.getAttribute('data-journeys') || '').split(/\s+/);
+        var match = false;
+        for (var k = 0; k < jList.length; k++) {
+          if (jList[k] === journeyId) { match = true; break; }
+        }
+        el.classList.toggle('sd-dimmed', !match);
+      }
+    }
+
+    // Filter elements with data-journey-id (call paths)
+    var cpTagged = document.querySelectorAll('[data-journey-id]');
+    for (var m = 0; m < cpTagged.length; m++) {
+      var cpEl = cpTagged[m];
+      if (journeyId === '__all__') {
+        cpEl.classList.remove('sd-dimmed');
+      } else {
+        var cpJourney = cpEl.getAttribute('data-journey-id') || '';
+        cpEl.classList.toggle('sd-dimmed', cpJourney !== '' && cpJourney !== journeyId);
+      }
+    }
+  };
+
+  // ── Expand / collapse all details ──────────────────────────────────
+  var detailsExpanded = false;
+
+  window.__sd_toggle_details = function () {
+    detailsExpanded = !detailsExpanded;
+    var details = document.querySelectorAll('.sd-call-path');
+    for (var i = 0; i < details.length; i++) {
+      details[i].open = detailsExpanded;
+    }
+    var btn = document.getElementById('sd-toggle-details');
+    if (btn) {
+      btn.textContent = detailsExpanded ? 'Collapse All' : 'Expand All';
+    }
+  };
+
+  // ── Service hover cross-highlighting ───────────────────────────────
+  function highlightService(serviceId, on) {
+    // Highlight service cards
+    var cards = document.querySelectorAll('.sd-service-card[data-service-id="' + serviceId + '"]');
+    for (var i = 0; i < cards.length; i++) {
+      cards[i].classList.toggle('sd-highlight', on);
+    }
+
+    // Highlight entity cards belonging to this service
+    var entities = document.querySelectorAll('.sd-entity-card[data-service-id="' + serviceId + '"]');
+    for (var j = 0; j < entities.length; j++) {
+      entities[j].classList.toggle('sd-highlight', on);
+    }
+
+    // Highlight service references in tables
+    var refs = document.querySelectorAll('.sd-svc-ref[data-ref-service="' + serviceId + '"]');
+    for (var k = 0; k < refs.length; k++) {
+      refs[k].style.fontWeight = on ? '700' : '';
+      refs[k].style.textDecoration = on ? 'underline' : '';
+    }
+  }
+
+  // Attach hover listeners to service cards
+  document.addEventListener('DOMContentLoaded', function () {
+    var svcCards = document.querySelectorAll('.sd-service-card[data-service-id]');
+    for (var i = 0; i < svcCards.length; i++) {
+      (function (card) {
+        var sid = card.getAttribute('data-service-id');
+        card.addEventListener('mouseenter', function () { highlightService(sid, true); });
+        card.addEventListener('mouseleave', function () { highlightService(sid, false); });
+      })(svcCards[i]);
+    }
+
+    // Attach hover listeners to service refs (entity badges, table refs)
+    var svcRefs = document.querySelectorAll('[data-ref-service]');
+    for (var j = 0; j < svcRefs.length; j++) {
+      (function (ref) {
+        var sid = ref.getAttribute('data-ref-service');
+        ref.addEventListener('mouseenter', function () { highlightService(sid, true); });
+        ref.addEventListener('mouseleave', function () { highlightService(sid, false); });
+      })(svcRefs[j]);
+    }
+  });
+
+  // ── Smooth scroll via nav links ────────────────────────────────────
+  var navLinks = document.querySelectorAll('.sd-nav-link');
+  for (var i = 0; i < navLinks.length; i++) {
+    navLinks[i].addEventListener('click', function (e) {
+      var href = this.getAttribute('href');
+      if (href && href.charAt(0) === '#') {
+        var target = document.getElementById(href.substring(1));
+        if (target) {
+          e.preventDefault();
+          var headerHeight = document.querySelector('.sd-header')
+            ? document.querySelector('.sd-header').offsetHeight
+            : 0;
+          var top = target.getBoundingClientRect().top + window.pageYOffset - headerHeight - 16;
+          window.scrollTo({ top: top, behavior: 'smooth' });
+        }
+      }
+    });
+  }
+})();
+</script>
+</body>
+</html>

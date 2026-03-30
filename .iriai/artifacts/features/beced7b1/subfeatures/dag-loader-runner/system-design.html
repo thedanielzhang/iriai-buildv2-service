@@ -1,0 +1,2164 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SF-2: DAG Loader &amp; Runner — D-GR-41 Canonical Cross-SF Edge Contracts - System Design</title>
+<style>
+  /* ── Reset & Base ─────────────────────────────────────────────────── */
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  @font-face {
+    font-family: 'Charter';
+    src: local('Charter'), local('Georgia');
+    font-display: swap;
+  }
+
+  :root {
+    --text-primary: #1a1a2e;
+    --text-secondary: #555;
+    --text-muted: #888;
+    --bg-page: #faf9f7;
+    --bg-card: #fff;
+    --border-subtle: rgba(0, 0, 0, 0.06);
+    --border-medium: rgba(0, 0, 0, 0.1);
+    --accent: #2d5be3;
+    --accent-faint: rgba(45, 91, 227, 0.06);
+    --accent-light: rgba(45, 91, 227, 0.12);
+    --content-width: 960px;
+    --gutter: clamp(20px, 5vw, 48px);
+    --radius: 10px;
+    --radius-sm: 6px;
+  }
+
+  html {
+    font-size: 17px;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
+    scroll-behavior: smooth;
+  }
+
+  body {
+    font-family: Charter, Georgia, 'Times New Roman', serif;
+    color: var(--text-primary);
+    background: var(--bg-page);
+    line-height: 1.72;
+    min-height: 100vh;
+  }
+
+  ::selection {
+    background: rgba(45, 91, 227, 0.18);
+    color: inherit;
+  }
+
+  /* ── Header ──────────────────────────────────────────────────────── */
+  .sd-header {
+    position: sticky;
+    top: 0;
+    z-index: 100;
+    background: rgba(250, 249, 247, 0.92);
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
+    border-bottom: 1px solid var(--border-subtle);
+    padding: 0 var(--gutter);
+  }
+
+  .sd-header-inner {
+    max-width: var(--content-width);
+    margin: 0 auto;
+    padding: 20px 0 16px;
+  }
+
+  .sd-title {
+    font-size: clamp(1.8rem, 4vw, 2.6rem);
+    font-weight: 700;
+    line-height: 1.15;
+    letter-spacing: -0.025em;
+    color: var(--text-primary);
+    margin-bottom: 12px;
+  }
+
+  .sd-nav {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-bottom: 12px;
+  }
+
+  .sd-nav-link {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--text-muted);
+    text-decoration: none;
+    padding: 4px 10px;
+    border-radius: var(--radius-sm);
+    transition: color 0.15s, background 0.15s;
+  }
+
+  .sd-nav-link:hover {
+    color: var(--accent);
+    background: var(--accent-faint);
+  }
+
+  /* ── Filter pills ────────────────────────────────────────────────── */
+  .sd-filters {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+    padding-top: 4px;
+  }
+
+  .sd-filter-label {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    margin-right: 4px;
+  }
+
+  .sd-pill {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 12px;
+    font-weight: 500;
+    padding: 3px 12px;
+    border: 1px solid var(--border-medium);
+    border-radius: 100px;
+    background: var(--bg-card);
+    color: var(--text-secondary);
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+
+  .sd-pill:hover {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+
+  .sd-pill-active {
+    background: var(--accent);
+    color: #fff;
+    border-color: var(--accent);
+  }
+
+  .sd-pill-active:hover {
+    background: #1a3fa0;
+    border-color: #1a3fa0;
+    color: #fff;
+  }
+
+  /* ── Main content ────────────────────────────────────────────────── */
+  .sd-main {
+    max-width: var(--content-width);
+    margin: 0 auto;
+    padding: 32px var(--gutter) 80px;
+  }
+
+  .sd-section {
+    margin-bottom: 48px;
+  }
+
+  .sd-section-title {
+    font-size: 1.5rem;
+    font-weight: 700;
+    line-height: 1.3;
+    letter-spacing: -0.01em;
+    margin-bottom: 20px;
+    padding-bottom: 10px;
+    border-bottom: 1px solid var(--border-subtle);
+    color: var(--text-primary);
+  }
+
+  .sd-subsection-title {
+    font-size: 1.1rem;
+    font-weight: 700;
+    margin: 28px 0 14px;
+    color: var(--text-primary);
+  }
+
+  .sd-overview-text {
+    font-size: 1.05rem;
+    line-height: 1.75;
+    color: var(--text-secondary);
+    margin-bottom: 1.4em;
+  }
+
+  .sd-empty {
+    font-style: italic;
+    color: var(--text-muted);
+    padding: 16px 0;
+  }
+
+  /* ── Decisions list ──────────────────────────────────────────────── */
+  .sd-decisions-list {
+    padding-left: 1.6em;
+    color: var(--text-secondary);
+  }
+
+  .sd-decisions-list li {
+    margin-bottom: 0.5em;
+    line-height: 1.6;
+  }
+
+  /* ── Tier labels ─────────────────────────────────────────────────── */
+  .sd-tier-label {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 0.72rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--text-muted);
+    margin: 20px 0 10px;
+  }
+
+  /* ── Service grid ────────────────────────────────────────────────── */
+  .sd-service-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+    gap: 14px;
+    margin-bottom: 8px;
+  }
+
+  .sd-service-card {
+    background: var(--bg-card);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius);
+    padding: 18px;
+    transition: opacity 0.3s, border-color 0.2s, box-shadow 0.2s;
+    cursor: default;
+  }
+
+  .sd-service-card:hover {
+    border-color: var(--accent);
+    box-shadow: 0 2px 12px rgba(45, 91, 227, 0.08);
+  }
+
+  .sd-service-card.sd-highlight {
+    border-color: var(--accent);
+    box-shadow: 0 2px 16px rgba(45, 91, 227, 0.14);
+  }
+
+  .sd-service-icon {
+    font-size: 1.5rem;
+    margin-bottom: 8px;
+  }
+
+  .sd-service-name {
+    font-weight: 700;
+    font-size: 1rem;
+    color: var(--text-primary);
+    margin-bottom: 2px;
+  }
+
+  .sd-service-kind {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 0.72rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-muted);
+    margin-bottom: 6px;
+  }
+
+  .sd-service-tech {
+    font-family: 'SF Mono', 'Fira Code', Menlo, Consolas, monospace;
+    font-size: 0.78rem;
+    color: #1a3fa0;
+    background: var(--accent-faint);
+    display: inline-block;
+    padding: 1px 8px;
+    border-radius: 4px;
+    margin-bottom: 4px;
+  }
+
+  .sd-service-port {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 0.75rem;
+    color: var(--text-muted);
+    margin-bottom: 6px;
+  }
+
+  .sd-service-desc {
+    font-size: 0.88rem;
+    color: var(--text-secondary);
+    line-height: 1.55;
+    margin-top: 6px;
+  }
+
+  /* ── Connections list ────────────────────────────────────────────── */
+  .sd-connections-list {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .sd-connection-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 16px;
+    background: var(--bg-card);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-sm);
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 0.88rem;
+    transition: opacity 0.3s;
+    flex-wrap: wrap;
+  }
+
+  .sd-conn-from, .sd-conn-to {
+    font-weight: 600;
+    color: var(--text-primary);
+  }
+
+  .sd-conn-arrow {
+    color: var(--accent);
+    font-weight: 700;
+  }
+
+  .sd-conn-proto {
+    font-size: 0.78rem;
+    color: var(--text-muted);
+  }
+
+  .sd-conn-label {
+    color: var(--text-secondary);
+    font-weight: 400;
+    margin-left: auto;
+  }
+
+  /* ── Call paths (details/summary) ────────────────────────────────── */
+  .sd-call-path {
+    background: var(--bg-card);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius);
+    margin-bottom: 10px;
+    transition: opacity 0.3s;
+    overflow: hidden;
+  }
+
+  .sd-call-path summary {
+    padding: 14px 18px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-weight: 600;
+    font-size: 0.95rem;
+    color: var(--text-primary);
+    list-style: none;
+  }
+
+  .sd-call-path summary::-webkit-details-marker { display: none; }
+
+  .sd-call-path summary::before {
+    content: '\25B6';
+    font-size: 0.65rem;
+    color: var(--text-muted);
+    transition: transform 0.2s;
+    flex-shrink: 0;
+  }
+
+  .sd-call-path[open] summary::before {
+    transform: rotate(90deg);
+  }
+
+  .sd-cp-name { flex: 1; }
+
+  .sd-cp-journey {
+    font-size: 0.72rem;
+    font-weight: 500;
+    color: var(--accent);
+    background: var(--accent-faint);
+    padding: 2px 8px;
+    border-radius: 100px;
+  }
+
+  .sd-cp-desc {
+    padding: 0 18px 12px;
+    font-size: 0.9rem;
+    color: var(--text-secondary);
+    line-height: 1.6;
+  }
+
+  /* ── Sequence diagram rows ───────────────────────────────────────── */
+  .sd-sequence {
+    margin: 0 18px 18px;
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-sm);
+    overflow-x: auto;
+  }
+
+  .sd-seq-header, .sd-seq-row {
+    display: grid;
+    grid-template-columns: 40px 1fr 32px 1fr 2fr 1.5fr;
+    gap: 8px;
+    padding: 8px 14px;
+    align-items: start;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 0.82rem;
+  }
+
+  .sd-seq-header {
+    background: rgba(0, 0, 0, 0.02);
+    font-weight: 700;
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--text-muted);
+    border-bottom: 1px solid var(--border-subtle);
+  }
+
+  .sd-seq-row {
+    border-bottom: 1px solid var(--border-subtle);
+    color: var(--text-secondary);
+  }
+
+  .sd-seq-row:last-child { border-bottom: none; }
+
+  .sd-seq-row:hover { background: rgba(45, 91, 227, 0.02); }
+
+  .sd-seq-num {
+    font-weight: 700;
+    color: var(--accent);
+    text-align: center;
+  }
+
+  .sd-seq-from, .sd-seq-to { font-weight: 600; color: var(--text-primary); }
+
+  .sd-seq-arrow { color: var(--accent); text-align: center; font-weight: 700; }
+
+  .sd-seq-action { color: var(--text-primary); }
+
+  .sd-seq-detail {
+    font-size: 0.78rem;
+    color: var(--text-muted);
+    margin-top: 2px;
+  }
+
+  .sd-seq-returns {
+    font-family: 'SF Mono', 'Fira Code', Menlo, Consolas, monospace;
+    font-size: 0.78rem;
+    color: var(--text-muted);
+  }
+
+  /* ── Expand/collapse button ──────────────────────────────────────── */
+  .sd-expand-btn {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 12px;
+    font-weight: 500;
+    padding: 4px 14px;
+    border: 1px solid var(--border-medium);
+    border-radius: var(--radius-sm);
+    background: var(--bg-card);
+    color: var(--text-secondary);
+    cursor: pointer;
+    margin-bottom: 14px;
+    transition: all 0.15s;
+  }
+
+  .sd-expand-btn:hover {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+
+  /* ── Tables ──────────────────────────────────────────────────────── */
+  .sd-table-wrap {
+    overflow-x: auto;
+  }
+
+  .sd-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.88rem;
+    border-radius: var(--radius);
+    overflow: hidden;
+    border: 1px solid var(--border-subtle);
+  }
+
+  .sd-table th, .sd-table td {
+    padding: 10px 14px;
+    text-align: left;
+    border-bottom: 1px solid var(--border-subtle);
+  }
+
+  .sd-table th {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-weight: 600;
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--text-muted);
+    background: rgba(0, 0, 0, 0.02);
+  }
+
+  .sd-table tr:last-child td { border-bottom: none; }
+  .sd-table tr:hover td { background: rgba(45, 91, 227, 0.02); }
+
+  .sd-table code {
+    font-family: 'SF Mono', 'Fira Code', Menlo, Consolas, monospace;
+    font-size: 0.82em;
+    background: var(--accent-faint);
+    padding: 2px 6px;
+    border-radius: 4px;
+    color: #1a3fa0;
+    word-break: break-all;
+  }
+
+  .sd-svc-ref {
+    cursor: pointer;
+    font-weight: 500;
+    color: var(--accent);
+    transition: color 0.15s;
+  }
+
+  .sd-svc-ref:hover { color: #1a3fa0; }
+
+  .sd-rel-kind {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 0.78rem;
+    font-weight: 500;
+    color: var(--text-muted);
+    background: rgba(0,0,0,0.03);
+    padding: 2px 8px;
+    border-radius: 4px;
+  }
+
+  /* ── Entity grid ─────────────────────────────────────────────────── */
+  .sd-entity-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+    gap: 14px;
+  }
+
+  .sd-entity-card {
+    background: var(--bg-card);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius);
+    overflow: hidden;
+    transition: opacity 0.3s, border-color 0.2s, box-shadow 0.2s;
+  }
+
+  .sd-entity-card:hover {
+    border-color: var(--accent);
+    box-shadow: 0 2px 12px rgba(45, 91, 227, 0.08);
+  }
+
+  .sd-entity-card.sd-highlight {
+    border-color: var(--accent);
+    box-shadow: 0 2px 16px rgba(45, 91, 227, 0.14);
+  }
+
+  .sd-entity-header {
+    padding: 14px 16px 10px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    border-bottom: 1px solid var(--border-subtle);
+  }
+
+  .sd-entity-name {
+    font-size: 1rem;
+    font-weight: 700;
+    color: var(--text-primary);
+  }
+
+  .sd-entity-svc {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 0.72rem;
+    font-weight: 500;
+    color: var(--accent);
+    background: var(--accent-faint);
+    padding: 2px 8px;
+    border-radius: 100px;
+    cursor: pointer;
+  }
+
+  .sd-field-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.82rem;
+  }
+
+  .sd-field-table th, .sd-field-table td {
+    padding: 7px 16px;
+    text-align: left;
+    border-bottom: 1px solid var(--border-subtle);
+  }
+
+  .sd-field-table th {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-weight: 600;
+    font-size: 0.68rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--text-muted);
+    background: rgba(0, 0, 0, 0.015);
+  }
+
+  .sd-field-table tr:last-child td { border-bottom: none; }
+  .sd-field-table tr:hover td { background: rgba(45, 91, 227, 0.02); }
+
+  .sd-field-table code {
+    font-family: 'SF Mono', 'Fira Code', Menlo, Consolas, monospace;
+    font-size: 0.85em;
+    background: var(--accent-faint);
+    padding: 1px 5px;
+    border-radius: 3px;
+    color: #1a3fa0;
+  }
+
+  /* ── Risks ───────────────────────────────────────────────────────── */
+  .sd-risks-list {
+    list-style: none;
+    padding: 0;
+  }
+
+  .sd-risks-list li {
+    padding: 10px 16px;
+    margin-bottom: 6px;
+    background: #fef3f2;
+    border: 1px solid rgba(239, 68, 68, 0.12);
+    border-left: 3px solid #ef4444;
+    border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+    font-size: 0.92rem;
+    color: var(--text-secondary);
+    line-height: 1.6;
+  }
+
+  /* ── Footer ──────────────────────────────────────────────────────── */
+  .sd-footer {
+    max-width: var(--content-width);
+    margin: 0 auto;
+    padding: 24px var(--gutter) 48px;
+    text-align: center;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 0.75rem;
+    color: var(--text-muted);
+    border-top: 1px solid var(--border-subtle);
+  }
+
+  /* ── Dimmed state for journey filtering ──────────────────────────── */
+  .sd-dimmed {
+    opacity: 0.15 !important;
+    pointer-events: none;
+  }
+
+  /* ── Entrance animation ──────────────────────────────────────────── */
+  @keyframes sd-fade-up {
+    from { opacity: 0; transform: translateY(12px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+
+  .sd-header, .sd-main {
+    animation: sd-fade-up 0.45s ease both;
+  }
+
+  .sd-main { animation-delay: 0.08s; }
+
+  /* ── Responsive ──────────────────────────────────────────────────── */
+  @media (max-width: 700px) {
+    html { font-size: 15px; }
+    .sd-service-grid { grid-template-columns: 1fr; }
+    .sd-entity-grid { grid-template-columns: 1fr; }
+    .sd-seq-header, .sd-seq-row {
+      grid-template-columns: 32px 1fr 24px 1fr 1.5fr 1fr;
+      font-size: 0.75rem;
+    }
+  }
+
+  @media (max-width: 480px) {
+    .sd-header-inner { padding: 16px 0 12px; }
+    .sd-nav { gap: 4px; }
+    .sd-nav-link { font-size: 12px; padding: 3px 8px; }
+    .sd-filters { gap: 4px; }
+  }
+</style>
+</head>
+<body>
+<header class="sd-header">
+<div class="sd-header-inner">
+<h1 class="sd-title">SF-2: DAG Loader &amp; Runner — D-GR-41 Canonical Cross-SF Edge Contracts</h1>
+<nav class="sd-nav" id="sd-nav">
+<a href="#overview" class="sd-nav-link">Overview</a>
+<a href="#topology" class="sd-nav-link">Topology</a>
+<a href="#call-paths" class="sd-nav-link">Call Paths</a>
+<a href="#endpoints" class="sd-nav-link">Endpoints</a>
+<a href="#entities" class="sd-nav-link">Entities</a>
+<a href="#relations" class="sd-nav-link">Relations</a>
+<a href="#risks" class="sd-nav-link">Risks</a>
+</nav>
+<div class="sd-filters" id="sd-filters">
+<span class="sd-filter-label">Filter by journey:</span>
+<button class="sd-pill sd-pill-active" data-journey="__all__" onclick="window.__sd_filter('__all__')">All</button>
+<button class="sd-pill" data-journey="J-1" onclick="window.__sd_filter('J-1')">J-1</button>
+<button class="sd-pill" data-journey="J-2" onclick="window.__sd_filter('J-2')">J-2</button>
+<button class="sd-pill" data-journey="J-3" onclick="window.__sd_filter('J-3')">J-3</button>
+<button class="sd-pill" data-journey="J-5" onclick="window.__sd_filter('J-5')">J-5</button>
+</div>
+</div>
+</header>
+<main class="sd-main">
+<section class="sd-section" id="overview">
+<h2 class="sd-section-title">Overview</h2>
+<p class="sd-overview-text">SF-2 treats the current SF-1 PRD as the only authoritative declarative wire contract. WorkflowConfig root fields are limited to schema_version, workflow_version, name, description, metadata, context_keys, actors, phases, edges, templates, plugins, types, and cost_config. The workflow-level context_keys field (added per D-GR-41) supplies the top layer of the hierarchical merge order workflow→phase→actor→node. All 10 cross-subfeature edge data contracts are defined per D-GR-41: (1) SF-1→SF-2: imports from iriai_compose.schema; 23 valid exports; phantom types MapNode/FoldNode/LoopNode/TransformRef/HookRef do not exist. (2) SF-2→SF-3: run(workflow, config: RuntimeConfig, *, inputs=None) — not the stale (yaml_path, runtime, workspace, transform_registry, hook_registry). (3) SF-1→SF-4: WorkflowConfig carries context_keys at workflow level; AskNode uses task: str (NOT prompt); context_text: str | None is supplementary inline context. (4) SF-5→SF-6: full Foundation REST and schema/validation endpoints with TypeScript response shapes. (5) SF-5→SF-7: in-process mutation hook interface (MutationEvent). (6) SF-7→SF-6: reference-check and tool-list APIs with TypeScript contracts. (7) SF-6→SF-7: indirect — editor saves through SF-5; SF-5 fires MutationEvent; SF-7 refreshes workflow_entity_refs; editor has no direct SF-7 write dependency.</p>
+<h3 class="sd-subsection-title">Architecture Decisions</h3>
+<ol class="sd-decisions-list">
+<li>D-SF2-11: iriai_compose.schema is the canonical module path. Phantom types that do NOT exist: MapNode, FoldNode, LoopNode, TransformRef, HookRef. Correct names: PhaseDefinition, WorkflowCostConfig/PhaseCostConfig/NodeCostConfig. [decision: D-GR-41]</li>
+<li>D-SF2-12: Canonical run() signature is run(workflow: WorkflowConfig|Path|str, config: RuntimeConfig, *, inputs: dict|None = None). Stale signature run(yaml_path, runtime, workspace, transform_registry, hook_registry) is invalid. [decision: D-GR-41]</li>
+<li>D-SF2-13: WorkflowConfig carries context_keys: list[str]|None at workflow level completing the top layer of the workflow→phase→actor→node hierarchy. [decision: D-GR-41]</li>
+<li>D-SF2-14: AskNode uses task: str as the primary prompt field NOT prompt. context_text: str|None is supplementary. Migration: Ask(actor=x, prompt='...') → AskNode(type: ask, actor_ref: 'x', task: '...'). [decision: D-GR-41] [code: iriai-compose/iriai_compose/tasks.py:49-54]</li>
+<li>D-SF2-15: SF-5 mutation hook interface is the only write path from editor to reference index. Editor has no direct SF-7 write dependency. [decision: D-GR-41]</li>
+<li>D-SF2-16: SF-5 mutation hooks fire synchronously in-process after successful DB commit. Callback failures logged but do not rollback. [decision: D-GR-37]</li>
+</ol>
+</section>
+<section class="sd-section" id="topology">
+<h2 class="sd-section-title">Service Topology</h2>
+<h4 class="sd-tier-label">Frontend</h4>
+<div class="sd-service-grid">
+<div class="sd-service-card" data-service-id="composer_editor" data-journeys="J-2 J-5">
+<div class="sd-service-icon">&#x1F310;</div>
+<div class="sd-service-name">Compose Frontend / Workflow Editor (SF-6)</div>
+<div class="sd-service-kind">frontend</div>
+<div class="sd-service-tech">React 18, TypeScript, React Flow, Zustand, Vite</div>
+<div class="sd-service-port">Port 443</div>
+<p class="sd-service-desc">React 18 + TypeScript at tools/compose/frontend. React Flow canvas. Flat internal store; normalizes to canonical nested YAML. Blocks on GET /api/schema/workflow failure. No direct SF-7 write dependency.</p>
+</div>
+</div>
+<h4 class="sd-tier-label">Services &amp; External</h4>
+<div class="sd-service-grid">
+<div class="sd-service-card" data-service-id="sf2_public_api" data-journeys="J-1 J-2 J-3">
+<div class="sd-service-icon">&#x2699;&#xFE0F;</div>
+<div class="sd-service-name">Declarative Runtime API</div>
+<div class="sd-service-kind">service</div>
+<div class="sd-service-tech">Python 3.11+</div>
+<p class="sd-service-desc">Additive iriai_compose.declarative entrypoints: load_workflow(), validate(), run(workflow, config: RuntimeConfig, *, inputs=None).</p>
+</div>
+<div class="sd-service-card" data-service-id="sf2_loader" data-journeys="J-1 J-3">
+<div class="sd-service-icon">&#x2699;&#xFE0F;</div>
+<div class="sd-service-name">Workflow Loader</div>
+<div class="sd-service-kind">service</div>
+<div class="sd-service-tech">Python, PyYAML, Pydantic</div>
+<p class="sd-service-desc">Parses YAML against iriai_compose.schema models. Rejects stale fields.</p>
+</div>
+<div class="sd-service-card" data-service-id="sf2_validator" data-journeys="J-1 J-2 J-3">
+<div class="sd-service-icon">&#x2699;&#xFE0F;</div>
+<div class="sd-service-name">Structural Validator</div>
+<div class="sd-service-kind">service</div>
+<div class="sd-service-tech">Python</div>
+<p class="sd-service-desc">Shared validation used by validate() and run(). Enforces nested containment, typed ports, stale-field rejection.</p>
+</div>
+<div class="sd-service-card" data-service-id="sf2_graph_builder" data-journeys="J-1 J-3">
+<div class="sd-service-icon">&#x2699;&#xFE0F;</div>
+<div class="sd-service-name">Recursive Graph Builder</div>
+<div class="sd-service-kind">service</div>
+<div class="sd-service-tech">Python</div>
+<p class="sd-service-desc">Builds container-local DAGs from phases[].nodes and phases[].children.</p>
+</div>
+<div class="sd-service-card" data-service-id="sf2_phase_runner" data-journeys="J-1">
+<div class="sd-service-icon">&#x2699;&#xFE0F;</div>
+<div class="sd-service-name">Phase Mode Runner</div>
+<div class="sd-service-kind">service</div>
+<div class="sd-service-tech">Python, asyncio</div>
+<p class="sd-service-desc">Executes sequential/map/fold/loop phases recursively. Assembles hierarchical context via ContextVar: workflow→phase→actor→node.</p>
+</div>
+<div class="sd-service-card" data-service-id="sf2_node_executor" data-journeys="J-1">
+<div class="sd-service-icon">&#x2699;&#xFE0F;</div>
+<div class="sd-service-name">Node Executor</div>
+<div class="sd-service-kind">service</div>
+<div class="sd-service-tech">Python, asyncio</div>
+<p class="sd-service-desc">Dispatches Ask (uses task field), Branch (condition_type/condition/paths), Plugin nodes only.</p>
+</div>
+<div class="sd-service-card" data-service-id="sf2_expression_runtime" data-journeys="J-1 J-3">
+<div class="sd-service-icon">&#x2699;&#xFE0F;</div>
+<div class="sd-service-name">Expression Sandbox</div>
+<div class="sd-service-kind">service</div>
+<div class="sd-service-tech">Python AST sandbox</div>
+<p class="sd-service-desc">AST allowlist evaluator for transform_fn, branch expressions, loop/map/fold mode configs.</p>
+</div>
+<div class="sd-service-card" data-service-id="sf2_actor_adapter" data-journeys="J-1">
+<div class="sd-service-icon">&#x2699;&#xFE0F;</div>
+<div class="sd-service-name">Actor Hydrator</div>
+<div class="sd-service-kind">service</div>
+<div class="sd-service-tech">Python</div>
+<p class="sd-service-desc">Bridges agent/human actors to existing runtime ABCs. AgentRuntime.invoke() unchanged.</p>
+</div>
+<div class="sd-service-card" data-service-id="sf2_plugin_runtime" data-journeys="J-1">
+<div class="sd-service-icon">&#x2699;&#xFE0F;</div>
+<div class="sd-service-name">Plugin Runtime</div>
+<div class="sd-service-kind">service</div>
+<div class="sd-service-tech">Python</div>
+<p class="sd-service-desc">Resolves WorkflowConfig.plugins to executable implementations via RuntimeConfig.</p>
+</div>
+<div class="sd-service-card" data-service-id="sf1_schema" data-journeys="J-1 J-2 J-3">
+<div class="sd-service-icon">&#x1F517;</div>
+<div class="sd-service-name">SF-1 Declarative Schema</div>
+<div class="sd-service-kind">external</div>
+<div class="sd-service-tech">Python 3.11+, Pydantic v2</div>
+<p class="sd-service-desc">Module iriai_compose.schema. 23 valid exports. Phantom types that do NOT exist: MapNode, FoldNode, LoopNode, TransformRef, HookRef. Correct names: PhaseDefinition, WorkflowCostConfig/PhaseCostConfig/NodeCostConfig.</p>
+</div>
+<div class="sd-service-card" data-service-id="sf3_testing" data-journeys="J-1 J-3">
+<div class="sd-service-icon">&#x2699;&#xFE0F;</div>
+<div class="sd-service-name">SF-3 Testing Framework</div>
+<div class="sd-service-kind">service</div>
+<div class="sd-service-tech">Python 3.11+, pytest</div>
+<p class="sd-service-desc">Fluent mock runtimes. Consumes run(workflow, config: RuntimeConfig, *, inputs=None) — NOT stale signature. Node matching via ContextVar.</p>
+</div>
+<div class="sd-service-card" data-service-id="sf4_migration" data-journeys="J-1">
+<div class="sd-service-icon">&#x2699;&#xFE0F;</div>
+<div class="sd-service-name">SF-4 Workflow Migration</div>
+<div class="sd-service-kind">service</div>
+<div class="sd-service-tech">Python 3.11+</div>
+<p class="sd-service-desc">Translates iriai-build-v2 → declarative YAML. Ask.prompt → AskNode.task. WorkflowConfig carries context_keys at workflow level.</p>
+</div>
+<div class="sd-service-card" data-service-id="imperative_runtime" data-journeys="J-1">
+<div class="sd-service-icon">&#x1F517;</div>
+<div class="sd-service-name">Existing iriai-compose Runtime Interfaces</div>
+<div class="sd-service-kind">external</div>
+<div class="sd-service-tech">Python ABCs</div>
+<p class="sd-service-desc">AgentRuntime, InteractionRuntime, ArtifactStore, SessionStore, ContextProvider, WorkflowRunner.parallel(), DefaultWorkflowRunner. No breaking ABI changes.</p>
+</div>
+<div class="sd-service-card" data-service-id="composer_backend" data-journeys="J-2 J-5">
+<div class="sd-service-icon">&#x2699;&#xFE0F;</div>
+<div class="sd-service-name">Compose Backend (SF-5)</div>
+<div class="sd-service-kind">service</div>
+<div class="sd-service-tech">FastAPI, PostgreSQL, Alembic</div>
+<div class="sd-service-port">Port 443</div>
+<p class="sd-service-desc">FastAPI at tools/compose/backend. Five foundation tables. GET /api/schema/workflow, workflow CRUD, validation. Fires synchronous in-process MutationEvent after commits. Never creates workflow_entity_refs rows.</p>
+</div>
+<div class="sd-service-card" data-service-id="sf7_libraries" data-journeys="J-5">
+<div class="sd-service-icon">&#x2699;&#xFE0F;</div>
+<div class="sd-service-name">Libraries &amp; Registries (SF-7)</div>
+<div class="sd-service-kind">service</div>
+<div class="sd-service-tech">FastAPI, PostgreSQL, Alembic, React 18, TypeScript</div>
+<div class="sd-service-port">Port 443</div>
+<p class="sd-service-desc">Owns workflow_entity_refs via own Alembic migration. Subscribes to SF-5 mutation hooks. Exposes GET /api/{entity}/references/{id}, tool CRUD, PATCH actor-slots.</p>
+</div>
+<div class="sd-service-card" data-service-id="build_v2_reference" data-journeys="J-1">
+<div class="sd-service-icon">&#x1F517;</div>
+<div class="sd-service-name">iriai-build-v2 Reference Workflows</div>
+<div class="sd-service-kind">external</div>
+<div class="sd-service-tech">Python workflows</div>
+<p class="sd-service-desc">Existing planning/develop/bugfix workflows as the representability litmus test.</p>
+</div>
+</div>
+<h4 class="sd-tier-label">Databases</h4>
+<div class="sd-service-grid">
+<div class="sd-service-card" data-service-id="workflow_yaml" data-journeys="J-1 J-2 J-3">
+<div class="sd-service-icon">&#x1F5C3;&#xFE0F;</div>
+<div class="sd-service-name">Workflow YAML Files</div>
+<div class="sd-service-kind">database</div>
+<div class="sd-service-tech">YAML</div>
+<p class="sd-service-desc">Canonical SF-1 YAML with phases[].nodes, phases[].children, cross-phase edges at root.</p>
+</div>
+</div>
+<h3 class="sd-subsection-title">Connections</h3>
+<div class="sd-connections-list">
+<div class="sd-connection-row" data-journeys="J-1 J-3"><span class="sd-conn-from">Workflow Loader</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">SF-1 Declarative Schema</span><span class="sd-conn-proto"> (Python import)</span><span class="sd-conn-label">D-GR-41 SF-1→SF-2: import from iriai_compose.schema. Valid 23 exports listed. Phantom types NOT in module: MapNode, FoldNode, LoopNode, TransformRef, HookRef.</span></div>
+<div class="sd-connection-row" data-journeys="J-1 J-3"><span class="sd-conn-from">Declarative Runtime API</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">SF-3 Testing Framework</span><span class="sd-conn-proto"> (Python import)</span><span class="sd-conn-label">D-GR-41 SF-2→SF-3: run(workflow, config: RuntimeConfig, *, inputs=None) — NOT stale (yaml_path, runtime, workspace, transform_registry, hook_registry). Node matching via ContextVar not node_id kwarg.</span></div>
+<div class="sd-connection-row" data-journeys="J-1 J-3"><span class="sd-conn-from">SF-1 Declarative Schema</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">SF-3 Testing Framework</span><span class="sd-conn-proto"> (Python import)</span><span class="sd-conn-label">D-GR-41 SF-1→SF-3: fixture types from iriai_compose.schema. AskNode.task not prompt. No phantom type references.</span></div>
+<div class="sd-connection-row" data-journeys="J-1"><span class="sd-conn-from">SF-1 Declarative Schema</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">SF-4 Workflow Migration</span><span class="sd-conn-proto"> (Python import)</span><span class="sd-conn-label">D-GR-41 SF-1→SF-4: WorkflowConfig.context_keys at workflow level; AskNode.task (NOT prompt); context_text is supplementary. Ask.prompt → AskNode.task translation.</span></div>
+<div class="sd-connection-row" data-journeys="J-1"><span class="sd-conn-from">Declarative Runtime API</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">SF-4 Workflow Migration</span><span class="sd-conn-proto"> (Python import)</span><span class="sd-conn-label">D-GR-41 SF-2→SF-4: validate() for smoke testing; run(workflow, config, *, inputs=None) for parity coverage. SF-4 is consumer only.</span></div>
+<div class="sd-connection-row" data-journeys="J-2 J-5"><span class="sd-conn-from">Compose Frontend / Workflow Editor (SF-6)</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">Compose Backend (SF-5)</span><span class="sd-conn-proto"> (HTTPS)</span><span class="sd-conn-label">D-GR-41 SF-6→SF-5: GET /api/schema/workflow at boot; workflow/role/schema/template CRUD; POST .../validate; import/export.</span></div>
+<div class="sd-connection-row" data-journeys="J-5"><span class="sd-conn-from">Compose Backend (SF-5)</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">Libraries &amp; Registries (SF-7)</span><span class="sd-conn-proto"> (in-process callback)</span><span class="sd-conn-label">D-GR-41 SF-5→SF-7: register_mutation_hook(entity_type, callback). MutationEvent: {entity_type, entity_id, user_id, event: created|updated|soft_deleted|restored, timestamp}. Fires after successful DB commit.</span></div>
+<div class="sd-connection-row" data-journeys="J-5"><span class="sd-conn-from">Libraries &amp; Registries (SF-7)</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">Compose Frontend / Workflow Editor (SF-6)</span><span class="sd-conn-proto"> (HTTPS)</span><span class="sd-conn-label">D-GR-41 SF-7→SF-6: GET /api/{entity}/references/{id} → ReferenceCheckResult {entity_type, entity_id, references, can_delete, reference_count}. GET /api/tools → ToolListResponse. EntityDeleteDialogProps, ToolChecklistProps contracts.</span></div>
+<div class="sd-connection-row" data-journeys="J-5"><span class="sd-conn-from">Compose Frontend / Workflow Editor (SF-6)</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">Libraries &amp; Registries (SF-7)</span><span class="sd-conn-proto"> (event-driven via SF-5 hooks)</span><span class="sd-conn-label">D-GR-41 SF-6→SF-7: indirect write only. Editor → SF-5 CRUD → SF-5 fires MutationEvent → SF-7 refreshes workflow_entity_refs. Editor has NO direct write dependency on SF-7.</span></div>
+<div class="sd-connection-row" data-journeys="J-1 J-3"><span class="sd-conn-from">Workflow YAML Files</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">Workflow Loader</span><span class="sd-conn-proto"> (file I/O)</span><span class="sd-conn-label">parse canonical YAML into WorkflowConfig</span></div>
+<div class="sd-connection-row" data-journeys="J-1 J-3"><span class="sd-conn-from">Workflow Loader</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">Structural Validator</span><span class="sd-conn-proto"> (function call)</span><span class="sd-conn-label">reject stale fields and structural violations before execution</span></div>
+<div class="sd-connection-row" data-journeys="J-1 J-3"><span class="sd-conn-from">Declarative Runtime API</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">Workflow Loader</span><span class="sd-conn-proto"> (function call)</span><span class="sd-conn-label">load_workflow() and run() share canonical parse path</span></div>
+<div class="sd-connection-row" data-journeys="J-2 J-3"><span class="sd-conn-from">Declarative Runtime API</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">Structural Validator</span><span class="sd-conn-proto"> (function call)</span><span class="sd-conn-label">validate() returns structural errors without live runtimes</span></div>
+<div class="sd-connection-row" data-journeys="J-1"><span class="sd-conn-from">Declarative Runtime API</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">Recursive Graph Builder</span><span class="sd-conn-proto"> (function call)</span><span class="sd-conn-label">run() builds workflow-level and phase-local DAGs</span></div>
+<div class="sd-connection-row" data-journeys="J-1 J-3"><span class="sd-conn-from">Recursive Graph Builder</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">SF-1 Declarative Schema</span><span class="sd-conn-proto"> (Python import)</span><span class="sd-conn-label">index phases[], children[], typed ports against iriai_compose.schema</span></div>
+<div class="sd-connection-row" data-journeys="J-1"><span class="sd-conn-from">Recursive Graph Builder</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">Phase Mode Runner</span><span class="sd-conn-proto"> (in-memory data)</span><span class="sd-conn-label">hand off container-local execution graphs</span></div>
+<div class="sd-connection-row" data-journeys="J-1"><span class="sd-conn-from">Phase Mode Runner</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">Node Executor</span><span class="sd-conn-proto"> (function call)</span><span class="sd-conn-label">dispatch Ask/Branch/Plugin nodes</span></div>
+<div class="sd-connection-row" data-journeys="J-1"><span class="sd-conn-from">Phase Mode Runner</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">Expression Sandbox</span><span class="sd-conn-proto"> (function call)</span><span class="sd-conn-label">evaluate phase-mode expressions and loop exit conditions</span></div>
+<div class="sd-connection-row" data-journeys="J-1"><span class="sd-conn-from">Phase Mode Runner</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">Existing iriai-compose Runtime Interfaces</span><span class="sd-conn-proto"> (runtime integration)</span><span class="sd-conn-label">publish node identity via ContextVar; merge order workflow→phase→actor→node; AgentRuntime.invoke() unchanged</span></div>
+<div class="sd-connection-row" data-journeys="J-1"><span class="sd-conn-from">Node Executor</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">Actor Hydrator</span><span class="sd-conn-proto"> (function call)</span><span class="sd-conn-label">hydrate actor_type: agent|human</span></div>
+<div class="sd-connection-row" data-journeys="J-1"><span class="sd-conn-from">Node Executor</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">Expression Sandbox</span><span class="sd-conn-proto"> (function call)</span><span class="sd-conn-label">evaluate transform_fn, expression branch conditions</span></div>
+<div class="sd-connection-row" data-journeys="J-1"><span class="sd-conn-from">Node Executor</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">Plugin Runtime</span><span class="sd-conn-proto"> (function call)</span><span class="sd-conn-label">resolve and execute plugin nodes</span></div>
+<div class="sd-connection-row" data-journeys="J-1"><span class="sd-conn-from">Actor Hydrator</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">Existing iriai-compose Runtime Interfaces</span><span class="sd-conn-proto"> (async function call)</span><span class="sd-conn-label">agent actors: AgentRuntime.invoke() unchanged; human actors: bridge channel to InteractionRuntime</span></div>
+<div class="sd-connection-row" data-journeys="J-1"><span class="sd-conn-from">Plugin Runtime</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">Existing iriai-compose Runtime Interfaces</span><span class="sd-conn-proto"> (async function call)</span><span class="sd-conn-label">use artifact/session/context stores via RuntimeConfig</span></div>
+<div class="sd-connection-row" data-journeys="J-2 J-5"><span class="sd-conn-from">Compose Backend (SF-5)</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">SF-1 Declarative Schema</span><span class="sd-conn-proto"> (HTTP + Python import)</span><span class="sd-conn-label">serve WorkflowConfig.model_json_schema() at GET /api/schema/workflow</span></div>
+<div class="sd-connection-row" data-journeys="J-2 J-3"><span class="sd-conn-from">Compose Backend (SF-5)</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">Declarative Runtime API</span><span class="sd-conn-proto"> (Python import)</span><span class="sd-conn-label">use iriai_compose.declarative.validate() and run()</span></div>
+<div class="sd-connection-row" data-journeys="J-1"><span class="sd-conn-from">iriai-build-v2 Reference Workflows</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">Workflow YAML Files</span><span class="sd-conn-proto"> (file generation)</span><span class="sd-conn-label">migrate imperative planning/develop/bugfix to canonical declarative YAML</span></div>
+</div>
+</section>
+<section class="sd-section" id="call-paths">
+<h2 class="sd-section-title">API Call Paths</h2>
+<button class="sd-expand-btn" id="sd-toggle-details" onclick="window.__sd_toggle_details()">Expand All</button>
+<details class="sd-call-path" data-journey-id="J-1">
+<summary>
+<span class="sd-cp-name">Execute Nested Workflow</span>
+<span class="sd-cp-journey">J-1</span>
+</summary>
+<p class="sd-cp-desc">Platform engineer runs canonical nested YAML through the declarative runtime.</p>
+<div class="sd-sequence">
+<div class="sd-seq-header">
+<div class="sd-seq-col sd-seq-num">#</div>
+<div class="sd-seq-col sd-seq-from">From</div>
+<div class="sd-seq-col sd-seq-arrow"></div>
+<div class="sd-seq-col sd-seq-to">To</div>
+<div class="sd-seq-col sd-seq-action">Action</div>
+<div class="sd-seq-col sd-seq-returns">Returns</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">1</div>
+<div class="sd-seq-col sd-seq-from">workflow_yaml</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">sf2_public_api</div>
+<div class="sd-seq-col sd-seq-action"><div>run(workflow_path, config, inputs=None)</div><div class="sd-seq-detail">Start from YAML file.</div></div>
+<div class="sd-seq-col sd-seq-returns">ExecutionResult</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">2</div>
+<div class="sd-seq-col sd-seq-from">sf2_public_api</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">sf2_loader</div>
+<div class="sd-seq-col sd-seq-action"><div>load_workflow — imports from iriai_compose.schema</div><div class="sd-seq-detail">Parse WorkflowConfig.</div></div>
+<div class="sd-seq-col sd-seq-returns">WorkflowConfig</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">3</div>
+<div class="sd-seq-col sd-seq-from">sf2_loader</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">sf2_validator</div>
+<div class="sd-seq-col sd-seq-action"><div>validate nested structure and stale-field rejection</div><div class="sd-seq-detail">Reject port_type, switch_function, stores, plugin_instances.</div></div>
+<div class="sd-seq-col sd-seq-returns">[] or field-path errors</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">4</div>
+<div class="sd-seq-col sd-seq-from">sf2_public_api</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">sf2_graph_builder</div>
+<div class="sd-seq-col sd-seq-action"><div>build workflow graph</div><div class="sd-seq-detail">Build DAGs from nested phases.</div></div>
+<div class="sd-seq-col sd-seq-returns">ExecutionGraph</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">5</div>
+<div class="sd-seq-col sd-seq-from">sf2_graph_builder</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">sf2_phase_runner</div>
+<div class="sd-seq-col sd-seq-action"><div>execute top-level phases recursively</div><div class="sd-seq-detail">Context assembled: WorkflowConfig.context_keys → phase → actor → node.</div></div>
+<div class="sd-seq-col sd-seq-returns">phase outputs</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">6</div>
+<div class="sd-seq-col sd-seq-from">sf2_phase_runner</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">sf2_node_executor</div>
+<div class="sd-seq-col sd-seq-action"><div>dispatch Ask/Branch/Plugin — AskNode.task not prompt</div><div class="sd-seq-detail">Three atomic types only.</div></div>
+<div class="sd-seq-col sd-seq-returns">node outputs</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">7</div>
+<div class="sd-seq-col sd-seq-from">sf2_node_executor</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">sf2_actor_adapter</div>
+<div class="sd-seq-col sd-seq-action"><div>hydrate actor_type: agent|human</div><div class="sd-seq-detail">AgentRuntime.invoke() unchanged.</div></div>
+<div class="sd-seq-col sd-seq-returns">runtime output</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">8</div>
+<div class="sd-seq-col sd-seq-from">sf2_node_executor</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">sf2_expression_runtime</div>
+<div class="sd-seq-col sd-seq-action"><div>evaluate transforms and branch conditions</div><div class="sd-seq-detail">AST sandbox.</div></div>
+<div class="sd-seq-col sd-seq-returns">transformed payloads</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">9</div>
+<div class="sd-seq-col sd-seq-from">sf2_public_api</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">imperative_runtime</div>
+<div class="sd-seq-col sd-seq-action"><div>assemble hierarchical context, collect observability</div><div class="sd-seq-detail">ExecutionResult with history and phase_metrics.</div></div>
+<div class="sd-seq-col sd-seq-returns">ExecutionResult</div>
+</div>
+</div>
+</details>
+<details class="sd-call-path" data-journey-id="J-2">
+<summary>
+<span class="sd-cp-name">Editor Uses Live Schema</span>
+<span class="sd-cp-journey">J-2</span>
+</summary>
+<p class="sd-cp-desc">Backend and editor share live schema from iriai_compose.schema.</p>
+<div class="sd-sequence">
+<div class="sd-seq-header">
+<div class="sd-seq-col sd-seq-num">#</div>
+<div class="sd-seq-col sd-seq-from">From</div>
+<div class="sd-seq-col sd-seq-arrow"></div>
+<div class="sd-seq-col sd-seq-to">To</div>
+<div class="sd-seq-col sd-seq-action">Action</div>
+<div class="sd-seq-col sd-seq-returns">Returns</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">1</div>
+<div class="sd-seq-col sd-seq-from">composer_editor</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">composer_backend</div>
+<div class="sd-seq-col sd-seq-action"><div>GET /api/schema/workflow</div><div class="sd-seq-detail">Blocks on failure — no static fallback.</div></div>
+<div class="sd-seq-col sd-seq-returns">JSON Schema</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">2</div>
+<div class="sd-seq-col sd-seq-from">composer_backend</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">sf1_schema</div>
+<div class="sd-seq-col sd-seq-action"><div>WorkflowConfig.model_json_schema()</div><div class="sd-seq-detail">Same models SF-2 uses at runtime.</div></div>
+<div class="sd-seq-col sd-seq-returns">JSON Schema</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">3</div>
+<div class="sd-seq-col sd-seq-from">composer_editor</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">composer_backend</div>
+<div class="sd-seq-col sd-seq-action"><div>POST /api/workflows/{id}/validate with canonical nested YAML</div><div class="sd-seq-detail">Normalized from flat canvas before submission.</div></div>
+<div class="sd-seq-col sd-seq-returns">ValidationResponse</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">4</div>
+<div class="sd-seq-col sd-seq-from">composer_backend</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">sf2_public_api</div>
+<div class="sd-seq-col sd-seq-action"><div>iriai_compose.declarative.validate(workflow)</div><div class="sd-seq-detail">Same nested contract.</div></div>
+<div class="sd-seq-col sd-seq-returns">list[ValidationError]</div>
+</div>
+</div>
+</details>
+<details class="sd-call-path" data-journey-id="J-3">
+<summary>
+<span class="sd-cp-name">Reject Stale YAML</span>
+<span class="sd-cp-journey">J-3</span>
+</summary>
+<p class="sd-cp-desc">Stale YAML fails fast before execution.</p>
+<div class="sd-sequence">
+<div class="sd-seq-header">
+<div class="sd-seq-col sd-seq-num">#</div>
+<div class="sd-seq-col sd-seq-from">From</div>
+<div class="sd-seq-col sd-seq-arrow"></div>
+<div class="sd-seq-col sd-seq-to">To</div>
+<div class="sd-seq-col sd-seq-action">Action</div>
+<div class="sd-seq-col sd-seq-returns">Returns</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">1</div>
+<div class="sd-seq-col sd-seq-from">workflow_yaml</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">sf2_public_api</div>
+<div class="sd-seq-col sd-seq-action"><div>validate(workflow_path)</div><div class="sd-seq-detail">Stale YAML submitted.</div></div>
+<div class="sd-seq-col sd-seq-returns">list[ValidationError]</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">2</div>
+<div class="sd-seq-col sd-seq-from">sf2_public_api</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">sf2_loader</div>
+<div class="sd-seq-col sd-seq-action"><div>parse raw YAML fields</div><div class="sd-seq-detail">Expose raw field names for precise errors.</div></div>
+<div class="sd-seq-col sd-seq-returns">parsed document</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">3</div>
+<div class="sd-seq-col sd-seq-from">sf2_loader</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">sf2_validator</div>
+<div class="sd-seq-col sd-seq-action"><div>reject stale fields</div><div class="sd-seq-detail">port_type, switch_function, stores, plugin_instances, interaction alias blocked.</div></div>
+<div class="sd-seq-col sd-seq-returns">field-path errors</div>
+</div>
+</div>
+</details>
+<details class="sd-call-path" data-journey-id="J-5">
+<summary>
+<span class="sd-cp-name">Schema Endpoint Failure</span>
+<span class="sd-cp-journey">J-5</span>
+</summary>
+<p class="sd-cp-desc">Editor blocks rather than falling back to stale schema.</p>
+<div class="sd-sequence">
+<div class="sd-seq-header">
+<div class="sd-seq-col sd-seq-num">#</div>
+<div class="sd-seq-col sd-seq-from">From</div>
+<div class="sd-seq-col sd-seq-arrow"></div>
+<div class="sd-seq-col sd-seq-to">To</div>
+<div class="sd-seq-col sd-seq-action">Action</div>
+<div class="sd-seq-col sd-seq-returns">Returns</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">1</div>
+<div class="sd-seq-col sd-seq-from">composer_editor</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">composer_backend</div>
+<div class="sd-seq-col sd-seq-action"><div>GET /api/schema/workflow</div><div class="sd-seq-detail">Boot schema request.</div></div>
+<div class="sd-seq-col sd-seq-returns">HTTP success or failure</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">2</div>
+<div class="sd-seq-col sd-seq-from">composer_backend</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">composer_editor</div>
+<div class="sd-seq-col sd-seq-action"><div>return failure status</div><div class="sd-seq-detail">Surfaces unavailability.</div></div>
+<div class="sd-seq-col sd-seq-returns">error response</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">3</div>
+<div class="sd-seq-col sd-seq-from">composer_editor</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">composer_editor</div>
+<div class="sd-seq-col sd-seq-action"><div>render schema-unavailable blocking state</div><div class="sd-seq-detail">No fallback to workflow-schema.json.</div></div>
+<div class="sd-seq-col sd-seq-returns">blocked editor state</div>
+</div>
+</div>
+</details>
+<details class="sd-call-path" data-journey-id="J-5">
+<summary>
+<span class="sd-cp-name">Delete Library Entity With Reference Preflight</span>
+<span class="sd-cp-journey">J-5</span>
+</summary>
+<p class="sd-cp-desc">SF-7 reference check prevents deletion of referenced library entities.</p>
+<div class="sd-sequence">
+<div class="sd-seq-header">
+<div class="sd-seq-col sd-seq-num">#</div>
+<div class="sd-seq-col sd-seq-from">From</div>
+<div class="sd-seq-col sd-seq-arrow"></div>
+<div class="sd-seq-col sd-seq-to">To</div>
+<div class="sd-seq-col sd-seq-action">Action</div>
+<div class="sd-seq-col sd-seq-returns">Returns</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">1</div>
+<div class="sd-seq-col sd-seq-from">composer_editor</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">sf7_libraries</div>
+<div class="sd-seq-col sd-seq-action"><div>GET /api/{entity}/references/{id}</div><div class="sd-seq-detail">Pre-fetch ReferenceCheckResult before rendering dialog.</div></div>
+<div class="sd-seq-col sd-seq-returns">ReferenceCheckResult { can_delete, references, reference_count }</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">2</div>
+<div class="sd-seq-col sd-seq-from">composer_editor</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">composer_editor</div>
+<div class="sd-seq-col sd-seq-action"><div>render EntityDeleteDialog</div><div class="sd-seq-detail">Blocking message if can_delete: false.</div></div>
+<div class="sd-seq-col sd-seq-returns">user decision</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">3</div>
+<div class="sd-seq-col sd-seq-from">composer_editor</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">composer_backend</div>
+<div class="sd-seq-col sd-seq-action"><div>DELETE /api/{entity}/{id}</div><div class="sd-seq-detail">Only if can_delete: true.</div></div>
+<div class="sd-seq-col sd-seq-returns">204 No Content</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">4</div>
+<div class="sd-seq-col sd-seq-from">composer_backend</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">sf7_libraries</div>
+<div class="sd-seq-col sd-seq-action"><div>MutationEvent { event: soft_deleted } via hook callback</div><div class="sd-seq-detail">SF-7 removes workflow_entity_refs rows.</div></div>
+<div class="sd-seq-col sd-seq-returns">void</div>
+</div>
+</div>
+</details>
+<details class="sd-call-path" data-journey-id="J-5">
+<summary>
+<span class="sd-cp-name">Editor Save Triggers Reference Index Refresh</span>
+<span class="sd-cp-journey">J-5</span>
+</summary>
+<p class="sd-cp-desc">Editor has no direct SF-7 write dependency — refresh flows through SF-5 mutation hooks.</p>
+<div class="sd-sequence">
+<div class="sd-seq-header">
+<div class="sd-seq-col sd-seq-num">#</div>
+<div class="sd-seq-col sd-seq-from">From</div>
+<div class="sd-seq-col sd-seq-arrow"></div>
+<div class="sd-seq-col sd-seq-to">To</div>
+<div class="sd-seq-col sd-seq-action">Action</div>
+<div class="sd-seq-col sd-seq-returns">Returns</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">1</div>
+<div class="sd-seq-col sd-seq-from">composer_editor</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">composer_backend</div>
+<div class="sd-seq-col sd-seq-action"><div>PUT /api/workflows/{id} with canonical nested YAML</div><div class="sd-seq-detail">Flat canvas state serialized to nested YAML.</div></div>
+<div class="sd-seq-col sd-seq-returns">WorkflowRecord</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">2</div>
+<div class="sd-seq-col sd-seq-from">composer_backend</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">composer_backend</div>
+<div class="sd-seq-col sd-seq-action"><div>persist to PostgreSQL</div><div class="sd-seq-detail">Update committed.</div></div>
+<div class="sd-seq-col sd-seq-returns">committed row</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">3</div>
+<div class="sd-seq-col sd-seq-from">composer_backend</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">sf7_libraries</div>
+<div class="sd-seq-col sd-seq-action"><div>MutationEvent { entity_type: workflow, event: updated } via hook callback</div><div class="sd-seq-detail">SF-7 diffs entity_refs, upserts/deletes workflow_entity_refs. Hook failure logged but does not rollback.</div></div>
+<div class="sd-seq-col sd-seq-returns">void</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">4</div>
+<div class="sd-seq-col sd-seq-from">sf7_libraries</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">composer_editor</div>
+<div class="sd-seq-col sd-seq-action"><div>next GET /api/{entity}/references/{id} returns fresh data</div><div class="sd-seq-detail">Reference index current for subsequent delete preflights.</div></div>
+<div class="sd-seq-col sd-seq-returns">ReferenceCheckResult (current)</div>
+</div>
+</div>
+</details>
+</section>
+<section class="sd-section" id="endpoints">
+<h2 class="sd-section-title">API Endpoints</h2>
+<div class="sd-table-wrap">
+<table class="sd-table">
+<thead><tr>
+<th>Method</th><th>Path</th><th>Service</th><th>Auth</th><th>Description</th>
+</tr></thead>
+<tbody>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#22c55e;letter-spacing:0.04em;line-height:1.6;">GET</span></td>
+<td><code>iriai_compose.declarative.load_workflow</code></td>
+<td><span class="sd-svc-ref" data-ref-service="sf2_loader">Workflow Loader</span></td>
+<td>N/A</td>
+<td>Parse YAML into WorkflowConfig from iriai_compose.schema. Rejects phantom types and stale fields.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#3b82f6;letter-spacing:0.04em;line-height:1.6;">POST</span></td>
+<td><code>iriai_compose.declarative.validate</code></td>
+<td><span class="sd-svc-ref" data-ref-service="sf2_public_api">Declarative Runtime API</span></td>
+<td>N/A</td>
+<td>Structural validation without live runtimes. Used by SF-3 and SF-4.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#3b82f6;letter-spacing:0.04em;line-height:1.6;">POST</span></td>
+<td><code>iriai_compose.declarative.run</code></td>
+<td><span class="sd-svc-ref" data-ref-service="sf2_public_api">Declarative Runtime API</span></td>
+<td>N/A</td>
+<td>Execute workflow. Canonical signature: run(workflow, config: RuntimeConfig, *, inputs=None). NOT run(yaml_path, runtime, workspace, transform_registry, hook_registry).</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#22c55e;letter-spacing:0.04em;line-height:1.6;">GET</span></td>
+<td><code>/api/schema/workflow</code></td>
+<td><span class="sd-svc-ref" data-ref-service="composer_backend">Compose Backend (SF-5)</span></td>
+<td>JWT</td>
+<td>Live JSON Schema from WorkflowConfig.model_json_schema(). Only runtime schema source. Editor blocks on failure.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#22c55e;letter-spacing:0.04em;line-height:1.6;">GET</span></td>
+<td><code>/api/workflows</code></td>
+<td><span class="sd-svc-ref" data-ref-service="composer_backend">Compose Backend (SF-5)</span></td>
+<td>JWT</td>
+<td>Cursor-paginated workflow list.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#3b82f6;letter-spacing:0.04em;line-height:1.6;">POST</span></td>
+<td><code>/api/workflows</code></td>
+<td><span class="sd-svc-ref" data-ref-service="composer_backend">Compose Backend (SF-5)</span></td>
+<td>JWT</td>
+<td>Create workflow + v1. Fires MutationEvent created.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#22c55e;letter-spacing:0.04em;line-height:1.6;">GET</span></td>
+<td><code>/api/workflows/{id}</code></td>
+<td><span class="sd-svc-ref" data-ref-service="composer_backend">Compose Backend (SF-5)</span></td>
+<td>JWT</td>
+<td>Get workflow. Returns 404 for cross-user.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#f59e0b;letter-spacing:0.04em;line-height:1.6;">PUT</span></td>
+<td><code>/api/workflows/{id}</code></td>
+<td><span class="sd-svc-ref" data-ref-service="composer_backend">Compose Backend (SF-5)</span></td>
+<td>JWT</td>
+<td>Update workflow. Fires MutationEvent updated.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#ef4444;letter-spacing:0.04em;line-height:1.6;">DELETE</span></td>
+<td><code>/api/workflows/{id}</code></td>
+<td><span class="sd-svc-ref" data-ref-service="composer_backend">Compose Backend (SF-5)</span></td>
+<td>JWT</td>
+<td>Soft-delete. Fires MutationEvent soft_deleted → SF-7 removes workflow_entity_refs.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#3b82f6;letter-spacing:0.04em;line-height:1.6;">POST</span></td>
+<td><code>/api/workflows/{id}/versions</code></td>
+<td><span class="sd-svc-ref" data-ref-service="composer_backend">Compose Backend (SF-5)</span></td>
+<td>JWT</td>
+<td>Append immutable version snapshot.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#3b82f6;letter-spacing:0.04em;line-height:1.6;">POST</span></td>
+<td><code>/api/workflows/{id}/validate</code></td>
+<td><span class="sd-svc-ref" data-ref-service="composer_backend">Compose Backend (SF-5)</span></td>
+<td>JWT</td>
+<td>Server-side deep validation via iriai_compose.declarative.validate(). Two-tier validation with SF-6 client checks.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#3b82f6;letter-spacing:0.04em;line-height:1.6;">POST</span></td>
+<td><code>/api/workflows/import</code></td>
+<td><span class="sd-svc-ref" data-ref-service="composer_backend">Compose Backend (SF-5)</span></td>
+<td>JWT</td>
+<td>Import YAML. Rejects malformed (no rows created). Schema-invalid creates with is_valid=false.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#22c55e;letter-spacing:0.04em;line-height:1.6;">GET</span></td>
+<td><code>/api/workflows/{id}/export</code></td>
+<td><span class="sd-svc-ref" data-ref-service="composer_backend">Compose Backend (SF-5)</span></td>
+<td>JWT</td>
+<td>Export as canonical nested YAML. Content-Type: text/yaml.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#22c55e;letter-spacing:0.04em;line-height:1.6;">GET</span></td>
+<td><code>/api/workflows/starter-templates</code></td>
+<td><span class="sd-svc-ref" data-ref-service="composer_backend">Compose Backend (SF-5)</span></td>
+<td>JWT</td>
+<td>Built-in templates from iriai-build-v2 reference workflows.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#22c55e;letter-spacing:0.04em;line-height:1.6;">GET</span></td>
+<td><code>/api/roles</code></td>
+<td><span class="sd-svc-ref" data-ref-service="composer_backend">Compose Backend (SF-5)</span></td>
+<td>JWT</td>
+<td>List roles. Used by SF-6 actor picker.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#3b82f6;letter-spacing:0.04em;line-height:1.6;">POST</span></td>
+<td><code>/api/roles</code></td>
+<td><span class="sd-svc-ref" data-ref-service="composer_backend">Compose Backend (SF-5)</span></td>
+<td>JWT</td>
+<td>Create role. Fires MutationEvent.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#f59e0b;letter-spacing:0.04em;line-height:1.6;">PUT</span></td>
+<td><code>/api/roles/{id}</code></td>
+<td><span class="sd-svc-ref" data-ref-service="composer_backend">Compose Backend (SF-5)</span></td>
+<td>JWT</td>
+<td>Update role. Fires MutationEvent updated.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#ef4444;letter-spacing:0.04em;line-height:1.6;">DELETE</span></td>
+<td><code>/api/roles/{id}</code></td>
+<td><span class="sd-svc-ref" data-ref-service="composer_backend">Compose Backend (SF-5)</span></td>
+<td>JWT</td>
+<td>Soft-delete role. Caller must pre-check GET /api/roles/references/{id}. Fires MutationEvent soft_deleted.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#22c55e;letter-spacing:0.04em;line-height:1.6;">GET</span></td>
+<td><code>/api/schemas</code></td>
+<td><span class="sd-svc-ref" data-ref-service="composer_backend">Compose Backend (SF-5)</span></td>
+<td>JWT</td>
+<td>List output schemas.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#3b82f6;letter-spacing:0.04em;line-height:1.6;">POST</span></td>
+<td><code>/api/schemas</code></td>
+<td><span class="sd-svc-ref" data-ref-service="composer_backend">Compose Backend (SF-5)</span></td>
+<td>JWT</td>
+<td>Create output schema.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#ef4444;letter-spacing:0.04em;line-height:1.6;">DELETE</span></td>
+<td><code>/api/schemas/{id}</code></td>
+<td><span class="sd-svc-ref" data-ref-service="composer_backend">Compose Backend (SF-5)</span></td>
+<td>JWT</td>
+<td>Soft-delete schema. Pre-check GET /api/schemas/references/{id} first.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#22c55e;letter-spacing:0.04em;line-height:1.6;">GET</span></td>
+<td><code>/api/task-templates</code></td>
+<td><span class="sd-svc-ref" data-ref-service="composer_backend">Compose Backend (SF-5)</span></td>
+<td>JWT</td>
+<td>List task templates. actor_slots present only after SF-7 migration.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#3b82f6;letter-spacing:0.04em;line-height:1.6;">POST</span></td>
+<td><code>/api/task-templates</code></td>
+<td><span class="sd-svc-ref" data-ref-service="composer_backend">Compose Backend (SF-5)</span></td>
+<td>JWT</td>
+<td>Create task template.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#ef4444;letter-spacing:0.04em;line-height:1.6;">DELETE</span></td>
+<td><code>/api/task-templates/{id}</code></td>
+<td><span class="sd-svc-ref" data-ref-service="composer_backend">Compose Backend (SF-5)</span></td>
+<td>JWT</td>
+<td>Soft-delete template. Pre-check references first.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#22c55e;letter-spacing:0.04em;line-height:1.6;">GET</span></td>
+<td><code>/api/roles/references/{id}</code></td>
+<td><span class="sd-svc-ref" data-ref-service="sf7_libraries">Libraries &amp; Registries (SF-7)</span></td>
+<td>JWT</td>
+<td>Pre-delete reference check for role. Queries workflow_entity_refs.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#22c55e;letter-spacing:0.04em;line-height:1.6;">GET</span></td>
+<td><code>/api/schemas/references/{id}</code></td>
+<td><span class="sd-svc-ref" data-ref-service="sf7_libraries">Libraries &amp; Registries (SF-7)</span></td>
+<td>JWT</td>
+<td>Pre-delete reference check for output schema.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#22c55e;letter-spacing:0.04em;line-height:1.6;">GET</span></td>
+<td><code>/api/task-templates/references/{id}</code></td>
+<td><span class="sd-svc-ref" data-ref-service="sf7_libraries">Libraries &amp; Registries (SF-7)</span></td>
+<td>JWT</td>
+<td>Pre-delete reference check for custom task template.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#22c55e;letter-spacing:0.04em;line-height:1.6;">GET</span></td>
+<td><code>/api/tools</code></td>
+<td><span class="sd-svc-ref" data-ref-service="sf7_libraries">Libraries &amp; Registries (SF-7)</span></td>
+<td>JWT</td>
+<td>List tools. Used by SF-6 ToolChecklistProps.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#3b82f6;letter-spacing:0.04em;line-height:1.6;">POST</span></td>
+<td><code>/api/tools</code></td>
+<td><span class="sd-svc-ref" data-ref-service="sf7_libraries">Libraries &amp; Registries (SF-7)</span></td>
+<td>JWT</td>
+<td>Create tool.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#f59e0b;letter-spacing:0.04em;line-height:1.6;">PUT</span></td>
+<td><code>/api/tools/{id}</code></td>
+<td><span class="sd-svc-ref" data-ref-service="sf7_libraries">Libraries &amp; Registries (SF-7)</span></td>
+<td>JWT</td>
+<td>Update tool.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#ef4444;letter-spacing:0.04em;line-height:1.6;">DELETE</span></td>
+<td><code>/api/tools/{id}</code></td>
+<td><span class="sd-svc-ref" data-ref-service="sf7_libraries">Libraries &amp; Registries (SF-7)</span></td>
+<td>JWT</td>
+<td>Soft-delete tool. Role-backed protection: 409 { blocking_roles } if any Role.tools[] references this tool name.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#a855f7;letter-spacing:0.04em;line-height:1.6;">PATCH</span></td>
+<td><code>/api/task-templates/{id}/actor-slots</code></td>
+<td><span class="sd-svc-ref" data-ref-service="sf7_libraries">Libraries &amp; Registries (SF-7)</span></td>
+<td>JWT</td>
+<td>Persist actor slots. SF-7 adds actor_slots JSONB column via its own Alembic migration.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#6b7280;letter-spacing:0.04em;line-height:1.6;">HOOK</span></td>
+<td><code>sf5.services.register_mutation_hook(entity_type, callback)</code></td>
+<td><span class="sd-svc-ref" data-ref-service="composer_backend">Compose Backend (SF-5)</span></td>
+<td>N/A (in-process)</td>
+<td>In-process hook registration. Fires after successful commit. Failures logged but don't rollback.</td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section class="sd-section" id="entities">
+<h2 class="sd-section-title">Entity Model</h2>
+<div class="sd-entity-grid">
+<div class="sd-entity-card" data-service-id="sf1_schema" data-journeys="J-1 J-2 J-3">
+<div class="sd-entity-header">
+<h4 class="sd-entity-name">WorkflowConfig</h4>
+<span class="sd-entity-svc" data-ref-service="sf1_schema">SF-1 Declarative Schema</span>
+</div>
+<table class="sd-field-table">
+<thead><tr><th>Field</th><th>Type</th><th>Constraints</th></tr></thead>
+<tbody>
+<tr>
+<td>schema_version</td>
+<td><code>str</code></td>
+<td>required</td>
+</tr>
+<tr>
+<td>workflow_version</td>
+<td><code>int</code></td>
+<td>required</td>
+</tr>
+<tr>
+<td>name</td>
+<td><code>str</code></td>
+<td>required</td>
+</tr>
+<tr>
+<td>description</td>
+<td><code>str | None</code></td>
+<td>optional</td>
+</tr>
+<tr>
+<td>metadata</td>
+<td><code>dict | None</code></td>
+<td>optional</td>
+</tr>
+<tr>
+<td>context_keys</td>
+<td><code>list[str] | None</code></td>
+<td>optional; workflow-level top layer of hierarchy; added per D-GR-41</td>
+</tr>
+<tr>
+<td>actors</td>
+<td><code>dict[str, ActorDefinition]</code></td>
+<td>required</td>
+</tr>
+<tr>
+<td>phases</td>
+<td><code>list[PhaseDefinition]</code></td>
+<td>required</td>
+</tr>
+<tr>
+<td>edges</td>
+<td><code>list[EdgeDefinition]</code></td>
+<td>cross-phase only; no port_type</td>
+</tr>
+<tr>
+<td>templates</td>
+<td><code>dict[str, TemplateDefinition] | None</code></td>
+<td>optional</td>
+</tr>
+<tr>
+<td>plugins</td>
+<td><code>dict[str, PluginInterface] | None</code></td>
+<td>optional</td>
+</tr>
+<tr>
+<td>types</td>
+<td><code>dict[str, dict] | None</code></td>
+<td>optional</td>
+</tr>
+<tr>
+<td>cost_config</td>
+<td><code>WorkflowCostConfig | None</code></td>
+<td>optional; type is WorkflowCostConfig not dict</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div class="sd-entity-card" data-service-id="sf1_schema" data-journeys="J-1">
+<div class="sd-entity-header">
+<h4 class="sd-entity-name">AskNode</h4>
+<span class="sd-entity-svc" data-ref-service="sf1_schema">SF-1 Declarative Schema</span>
+</div>
+<table class="sd-field-table">
+<thead><tr><th>Field</th><th>Type</th><th>Constraints</th></tr></thead>
+<tbody>
+<tr>
+<td>type</td>
+<td><code>Literal['ask']</code></td>
+<td>required discriminant</td>
+</tr>
+<tr>
+<td>actor_ref</td>
+<td><code>str</code></td>
+<td>required</td>
+</tr>
+<tr>
+<td>task</td>
+<td><code>str</code></td>
+<td>required; field is named 'task' NOT 'prompt'</td>
+</tr>
+<tr>
+<td>context_text</td>
+<td><code>str | None</code></td>
+<td>optional; supplementary context; NOT the main prompt field</td>
+</tr>
+<tr>
+<td>context_keys</td>
+<td><code>list[str] | None</code></td>
+<td>optional; node layer of hierarchy</td>
+</tr>
+<tr>
+<td>inputs</td>
+<td><code>dict[str, WorkflowInputDefinition]</code></td>
+<td>required</td>
+</tr>
+<tr>
+<td>outputs</td>
+<td><code>dict[str, WorkflowOutputDefinition]</code></td>
+<td>required</td>
+</tr>
+<tr>
+<td>hooks</td>
+<td><code>dict[str, WorkflowOutputDefinition]</code></td>
+<td>must include on_start and on_end</td>
+</tr>
+<tr>
+<td>artifact_key</td>
+<td><code>str | None</code></td>
+<td>optional</td>
+</tr>
+<tr>
+<td>cost</td>
+<td><code>NodeCostConfig | None</code></td>
+<td>optional</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div class="sd-entity-card" data-service-id="sf1_schema" data-journeys="J-1">
+<div class="sd-entity-header">
+<h4 class="sd-entity-name">WorkflowCostConfig</h4>
+<span class="sd-entity-svc" data-ref-service="sf1_schema">SF-1 Declarative Schema</span>
+</div>
+<table class="sd-field-table">
+<thead><tr><th>Field</th><th>Type</th><th>Constraints</th></tr></thead>
+<tbody>
+<tr>
+<td>budget_usd</td>
+<td><code>float | None</code></td>
+<td>optional</td>
+</tr>
+<tr>
+<td>alert_threshold_usd</td>
+<td><code>float | None</code></td>
+<td>optional</td>
+</tr>
+<tr>
+<td>track_tokens</td>
+<td><code>bool</code></td>
+<td>default true</td>
+</tr>
+<tr>
+<td>metadata</td>
+<td><code>dict | None</code></td>
+<td>optional</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div class="sd-entity-card" data-service-id="sf1_schema" data-journeys="J-1">
+<div class="sd-entity-header">
+<h4 class="sd-entity-name">PhaseCostConfig</h4>
+<span class="sd-entity-svc" data-ref-service="sf1_schema">SF-1 Declarative Schema</span>
+</div>
+<table class="sd-field-table">
+<thead><tr><th>Field</th><th>Type</th><th>Constraints</th></tr></thead>
+<tbody>
+<tr>
+<td>budget_usd</td>
+<td><code>float | None</code></td>
+<td>optional</td>
+</tr>
+<tr>
+<td>alert_threshold_usd</td>
+<td><code>float | None</code></td>
+<td>optional</td>
+</tr>
+<tr>
+<td>metadata</td>
+<td><code>dict | None</code></td>
+<td>optional</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div class="sd-entity-card" data-service-id="sf1_schema" data-journeys="J-1">
+<div class="sd-entity-header">
+<h4 class="sd-entity-name">NodeCostConfig</h4>
+<span class="sd-entity-svc" data-ref-service="sf1_schema">SF-1 Declarative Schema</span>
+</div>
+<table class="sd-field-table">
+<thead><tr><th>Field</th><th>Type</th><th>Constraints</th></tr></thead>
+<tbody>
+<tr>
+<td>budget_usd</td>
+<td><code>float | None</code></td>
+<td>optional</td>
+</tr>
+<tr>
+<td>max_tokens</td>
+<td><code>int | None</code></td>
+<td>optional</td>
+</tr>
+<tr>
+<td>metadata</td>
+<td><code>dict | None</code></td>
+<td>optional</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div class="sd-entity-card" data-service-id="composer_backend" data-journeys="J-5">
+<div class="sd-entity-header">
+<h4 class="sd-entity-name">MutationEvent</h4>
+<span class="sd-entity-svc" data-ref-service="composer_backend">Compose Backend (SF-5)</span>
+</div>
+<table class="sd-field-table">
+<thead><tr><th>Field</th><th>Type</th><th>Constraints</th></tr></thead>
+<tbody>
+<tr>
+<td>entity_type</td>
+<td><code>Literal['workflow','role','output_schema','custom_task_template']</code></td>
+<td>required</td>
+</tr>
+<tr>
+<td>entity_id</td>
+<td><code>str</code></td>
+<td>required; UUID</td>
+</tr>
+<tr>
+<td>user_id</td>
+<td><code>str</code></td>
+<td>required</td>
+</tr>
+<tr>
+<td>event</td>
+<td><code>Literal['created','updated','soft_deleted','restored']</code></td>
+<td>required</td>
+</tr>
+<tr>
+<td>timestamp</td>
+<td><code>str</code></td>
+<td>required; ISO8601</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div class="sd-entity-card" data-service-id="sf1_schema" data-journeys="J-1 J-2 J-3">
+<div class="sd-entity-header">
+<h4 class="sd-entity-name">PhaseDefinition</h4>
+<span class="sd-entity-svc" data-ref-service="sf1_schema">SF-1 Declarative Schema</span>
+</div>
+<table class="sd-field-table">
+<thead><tr><th>Field</th><th>Type</th><th>Constraints</th></tr></thead>
+<tbody>
+<tr>
+<td>id</td>
+<td><code>str</code></td>
+<td>required</td>
+</tr>
+<tr>
+<td>name</td>
+<td><code>str</code></td>
+<td>required</td>
+</tr>
+<tr>
+<td>mode</td>
+<td><code>'sequential'|'map'|'fold'|'loop'</code></td>
+<td>required</td>
+</tr>
+<tr>
+<td>mode_config</td>
+<td><code>ModeConfig | None</code></td>
+<td>required for non-sequential</td>
+</tr>
+<tr>
+<td>inputs</td>
+<td><code>dict[str, WorkflowInputDefinition]</code></td>
+<td>required</td>
+</tr>
+<tr>
+<td>outputs</td>
+<td><code>dict[str, WorkflowOutputDefinition]</code></td>
+<td>required</td>
+</tr>
+<tr>
+<td>hooks</td>
+<td><code>dict[str, WorkflowOutputDefinition]</code></td>
+<td>on_start and on_end required</td>
+</tr>
+<tr>
+<td>nodes</td>
+<td><code>list[NodeDefinition]</code></td>
+<td>phases[].nodes only</td>
+</tr>
+<tr>
+<td>children</td>
+<td><code>list[PhaseDefinition]</code></td>
+<td>phases[].children only</td>
+</tr>
+<tr>
+<td>edges</td>
+<td><code>list[EdgeDefinition]</code></td>
+<td>phase-local; no port_type</td>
+</tr>
+<tr>
+<td>context_keys</td>
+<td><code>list[str]</code></td>
+<td>required; phase layer of hierarchy</td>
+</tr>
+<tr>
+<td>cost</td>
+<td><code>PhaseCostConfig | None</code></td>
+<td>optional; type is PhaseCostConfig not dict</td>
+</tr>
+<tr>
+<td>metadata</td>
+<td><code>dict | None</code></td>
+<td>optional</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div class="sd-entity-card" data-service-id="sf1_schema" data-journeys="J-1 J-3">
+<div class="sd-entity-header">
+<h4 class="sd-entity-name">EdgeDefinition</h4>
+<span class="sd-entity-svc" data-ref-service="sf1_schema">SF-1 Declarative Schema</span>
+</div>
+<table class="sd-field-table">
+<thead><tr><th>Field</th><th>Type</th><th>Constraints</th></tr></thead>
+<tbody>
+<tr>
+<td>source</td>
+<td><code>str</code></td>
+<td>dot-notation or $input/$output; required</td>
+</tr>
+<tr>
+<td>target</td>
+<td><code>str</code></td>
+<td>dot-notation or $input/$output; required</td>
+</tr>
+<tr>
+<td>transform_fn</td>
+<td><code>str | None</code></td>
+<td>optional; forbidden for hook edges. TransformRef does not exist.</td>
+</tr>
+<tr>
+<td>description</td>
+<td><code>str | None</code></td>
+<td>optional</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div class="sd-entity-card" data-service-id="sf2_public_api" data-journeys="J-1">
+<div class="sd-entity-header">
+<h4 class="sd-entity-name">RuntimeConfig</h4>
+<span class="sd-entity-svc" data-ref-service="sf2_public_api">Declarative Runtime API</span>
+</div>
+<table class="sd-field-table">
+<thead><tr><th>Field</th><th>Type</th><th>Constraints</th></tr></thead>
+<tbody>
+<tr>
+<td>agent_runtime</td>
+<td><code>AgentRuntime</code></td>
+<td>required; invoke() unchanged</td>
+</tr>
+<tr>
+<td>interaction_runtimes</td>
+<td><code>dict[str, InteractionRuntime]</code></td>
+<td>default {}</td>
+</tr>
+<tr>
+<td>artifacts</td>
+<td><code>ArtifactStore</code></td>
+<td>required</td>
+</tr>
+<tr>
+<td>sessions</td>
+<td><code>SessionStore | None</code></td>
+<td>optional</td>
+</tr>
+<tr>
+<td>context_provider</td>
+<td><code>ContextProvider</code></td>
+<td>required</td>
+</tr>
+<tr>
+<td>plugin_registry</td>
+<td><code>dict[str, Any] | None</code></td>
+<td>optional; runtime-only</td>
+</tr>
+<tr>
+<td>workspace</td>
+<td><code>Workspace | None</code></td>
+<td>optional</td>
+</tr>
+<tr>
+<td>feature</td>
+<td><code>Feature | None</code></td>
+<td>optional</td>
+</tr>
+<tr>
+<td>services</td>
+<td><code>dict[str, Any] | None</code></td>
+<td>optional</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div class="sd-entity-card" data-service-id="sf2_public_api" data-journeys="J-1">
+<div class="sd-entity-header">
+<h4 class="sd-entity-name">ExecutionResult</h4>
+<span class="sd-entity-svc" data-ref-service="sf2_public_api">Declarative Runtime API</span>
+</div>
+<table class="sd-field-table">
+<thead><tr><th>Field</th><th>Type</th><th>Constraints</th></tr></thead>
+<tbody>
+<tr>
+<td>success</td>
+<td><code>bool</code></td>
+<td>required</td>
+</tr>
+<tr>
+<td>output</td>
+<td><code>Any</code></td>
+<td>optional</td>
+</tr>
+<tr>
+<td>error</td>
+<td><code>str | None</code></td>
+<td>optional</td>
+</tr>
+<tr>
+<td>trace</td>
+<td><code>dict[str, Any]</code></td>
+<td>required</td>
+</tr>
+<tr>
+<td>history</td>
+<td><code>list[ExecutionHistory]</code></td>
+<td>required</td>
+</tr>
+<tr>
+<td>phase_metrics</td>
+<td><code>dict[str, Any]</code></td>
+<td>keyed by logical phase id</td>
+</tr>
+<tr>
+<td>cost_summary</td>
+<td><code>dict[str, Any]</code></td>
+<td>required</td>
+</tr>
+<tr>
+<td>hook_warnings</td>
+<td><code>list[str]</code></td>
+<td>required</td>
+</tr>
+<tr>
+<td>duration_ms</td>
+<td><code>float</code></td>
+<td>required</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div class="sd-entity-card" data-service-id="sf2_validator" data-journeys="J-2 J-3">
+<div class="sd-entity-header">
+<h4 class="sd-entity-name">ValidationError</h4>
+<span class="sd-entity-svc" data-ref-service="sf2_validator">Structural Validator</span>
+</div>
+<table class="sd-field-table">
+<thead><tr><th>Field</th><th>Type</th><th>Constraints</th></tr></thead>
+<tbody>
+<tr>
+<td>field_path</td>
+<td><code>str</code></td>
+<td>required</td>
+</tr>
+<tr>
+<td>message</td>
+<td><code>str</code></td>
+<td>required</td>
+</tr>
+<tr>
+<td>severity</td>
+<td><code>'error'|'warning'</code></td>
+<td>required</td>
+</tr>
+</tbody>
+</table>
+</div>
+</div>
+</section>
+<section class="sd-section" id="relations">
+<h2 class="sd-section-title">Entity Relationships</h2>
+<div class="sd-table-wrap">
+<table class="sd-table">
+<thead><tr>
+<th>From</th><th>Relationship</th><th>To</th><th>Label</th>
+</tr></thead>
+<tbody>
+<tr>
+<td>workflow_config</td>
+<td><span class="sd-rel-kind">one-to-one</span></td>
+<td>workflow_cost_config</td>
+<td>workflow-level cost config — WorkflowCostConfig not dict</td>
+</tr>
+<tr>
+<td>workflow_config</td>
+<td><span class="sd-rel-kind">one-to-many</span></td>
+<td>phase_definition</td>
+<td>top-level phases — nodes never at workflow root</td>
+</tr>
+<tr>
+<td>workflow_config</td>
+<td><span class="sd-rel-kind">one-to-many</span></td>
+<td>edge_definition</td>
+<td>cross-phase edges only</td>
+</tr>
+<tr>
+<td>phase_definition</td>
+<td><span class="sd-rel-kind">one-to-many</span></td>
+<td>phase_definition</td>
+<td>children via phases[].children — recursion through children only</td>
+</tr>
+<tr>
+<td>phase_definition</td>
+<td><span class="sd-rel-kind">one-to-one</span></td>
+<td>phase_cost_config</td>
+<td>phase-level cost config — PhaseCostConfig not dict</td>
+</tr>
+<tr>
+<td>ask_node</td>
+<td><span class="sd-rel-kind">one-to-one</span></td>
+<td>actor_definition</td>
+<td>actor_ref → ActorDefinition; prompt assembly: context → role → AskNode.task → edge inputs</td>
+</tr>
+<tr>
+<td>mutation_event</td>
+<td><span class="sd-rel-kind">one-to-many</span></td>
+<td>validation_error</td>
+<td>SF-5 MutationEvent drives SF-7 reference index; stale refs surface as ValidationError at save time</td>
+</tr>
+<tr>
+<td>execution_result</td>
+<td><span class="sd-rel-kind">one-to-many</span></td>
+<td>validation_error</td>
+<td>validation errors returned by validate() before execution</td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section class="sd-section" id="risks">
+<h2 class="sd-section-title">Risks</h2>
+<ul class="sd-risks-list">
+<li>RISK-7 (medium): SF-7 mutation hook subscriber fails — reference index becomes stale without transaction rollback. Mitigation: log all hook failures; provide re-index endpoint. [decision: D-GR-37]</li>
+<li>RISK-8 (low): Library entity deleted between editor page load and save causes stale YAML reference. Mitigation: POST /api/workflows/{id}/validate runs SF-2 validate() which catches stale refs before persistence.</li>
+</ul>
+</section>
+</main>
+<footer class="sd-footer">
+<p>System Design Document</p>
+</footer>
+<script>
+(function () {
+  'use strict';
+
+  // ── Journey filtering ──────────────────────────────────────────────
+  var activeJourney = '__all__';
+
+  window.__sd_filter = function (journeyId) {
+    activeJourney = journeyId;
+
+    // Update pill states
+    var pills = document.querySelectorAll('.sd-pill');
+    for (var i = 0; i < pills.length; i++) {
+      var p = pills[i];
+      if (p.getAttribute('data-journey') === journeyId) {
+        p.classList.add('sd-pill-active');
+      } else {
+        p.classList.remove('sd-pill-active');
+      }
+    }
+
+    // Filter elements with data-journeys
+    var tagged = document.querySelectorAll('[data-journeys]');
+    for (var j = 0; j < tagged.length; j++) {
+      var el = tagged[j];
+      if (journeyId === '__all__') {
+        el.classList.remove('sd-dimmed');
+      } else {
+        var jList = (el.getAttribute('data-journeys') || '').split(/\s+/);
+        var match = false;
+        for (var k = 0; k < jList.length; k++) {
+          if (jList[k] === journeyId) { match = true; break; }
+        }
+        el.classList.toggle('sd-dimmed', !match);
+      }
+    }
+
+    // Filter elements with data-journey-id (call paths)
+    var cpTagged = document.querySelectorAll('[data-journey-id]');
+    for (var m = 0; m < cpTagged.length; m++) {
+      var cpEl = cpTagged[m];
+      if (journeyId === '__all__') {
+        cpEl.classList.remove('sd-dimmed');
+      } else {
+        var cpJourney = cpEl.getAttribute('data-journey-id') || '';
+        cpEl.classList.toggle('sd-dimmed', cpJourney !== '' && cpJourney !== journeyId);
+      }
+    }
+  };
+
+  // ── Expand / collapse all details ──────────────────────────────────
+  var detailsExpanded = false;
+
+  window.__sd_toggle_details = function () {
+    detailsExpanded = !detailsExpanded;
+    var details = document.querySelectorAll('.sd-call-path');
+    for (var i = 0; i < details.length; i++) {
+      details[i].open = detailsExpanded;
+    }
+    var btn = document.getElementById('sd-toggle-details');
+    if (btn) {
+      btn.textContent = detailsExpanded ? 'Collapse All' : 'Expand All';
+    }
+  };
+
+  // ── Service hover cross-highlighting ───────────────────────────────
+  function highlightService(serviceId, on) {
+    // Highlight service cards
+    var cards = document.querySelectorAll('.sd-service-card[data-service-id="' + serviceId + '"]');
+    for (var i = 0; i < cards.length; i++) {
+      cards[i].classList.toggle('sd-highlight', on);
+    }
+
+    // Highlight entity cards belonging to this service
+    var entities = document.querySelectorAll('.sd-entity-card[data-service-id="' + serviceId + '"]');
+    for (var j = 0; j < entities.length; j++) {
+      entities[j].classList.toggle('sd-highlight', on);
+    }
+
+    // Highlight service references in tables
+    var refs = document.querySelectorAll('.sd-svc-ref[data-ref-service="' + serviceId + '"]');
+    for (var k = 0; k < refs.length; k++) {
+      refs[k].style.fontWeight = on ? '700' : '';
+      refs[k].style.textDecoration = on ? 'underline' : '';
+    }
+  }
+
+  // Attach hover listeners to service cards
+  document.addEventListener('DOMContentLoaded', function () {
+    var svcCards = document.querySelectorAll('.sd-service-card[data-service-id]');
+    for (var i = 0; i < svcCards.length; i++) {
+      (function (card) {
+        var sid = card.getAttribute('data-service-id');
+        card.addEventListener('mouseenter', function () { highlightService(sid, true); });
+        card.addEventListener('mouseleave', function () { highlightService(sid, false); });
+      })(svcCards[i]);
+    }
+
+    // Attach hover listeners to service refs (entity badges, table refs)
+    var svcRefs = document.querySelectorAll('[data-ref-service]');
+    for (var j = 0; j < svcRefs.length; j++) {
+      (function (ref) {
+        var sid = ref.getAttribute('data-ref-service');
+        ref.addEventListener('mouseenter', function () { highlightService(sid, true); });
+        ref.addEventListener('mouseleave', function () { highlightService(sid, false); });
+      })(svcRefs[j]);
+    }
+  });
+
+  // ── Smooth scroll via nav links ────────────────────────────────────
+  var navLinks = document.querySelectorAll('.sd-nav-link');
+  for (var i = 0; i < navLinks.length; i++) {
+    navLinks[i].addEventListener('click', function (e) {
+      var href = this.getAttribute('href');
+      if (href && href.charAt(0) === '#') {
+        var target = document.getElementById(href.substring(1));
+        if (target) {
+          e.preventDefault();
+          var headerHeight = document.querySelector('.sd-header')
+            ? document.querySelector('.sd-header').offsetHeight
+            : 0;
+          var top = target.getBoundingClientRect().top + window.pageYOffset - headerHeight - 16;
+          window.scrollTo({ top: top, behavior: 'smooth' });
+        }
+      }
+    });
+  }
+})();
+</script>
+</body>
+</html>

@@ -128,12 +128,27 @@ def build_runner(
     *,
     interaction_runtimes: dict[str, Any],
     on_message: Callable[..., Any] | None = None,
+    agent_runtime_name: str = "claude",
 ) -> TrackedWorkflowRunner:
-    """Construct a TrackedWorkflowRunner with the given interaction runtimes."""
-    from ..runtimes.claude import ClaudeAgentRuntime
+    """Construct a TrackedWorkflowRunner with the given interaction runtimes.
+
+    Creates both a primary and secondary agent runtime for adversarial
+    multi-model execution.  The primary is determined by *agent_runtime_name*;
+    the secondary is the other supported runtime.
+    """
+    from ..runtimes import create_agent_runtime
     from ..workflows import TrackedWorkflowRunner
 
-    agent_runtime = ClaudeAgentRuntime(
+    agent_runtime = create_agent_runtime(
+        agent_runtime_name,
+        session_store=env.sessions,
+        on_message=on_message,
+    )
+
+    # Secondary runtime: the other one (for adversarial execution)
+    secondary_name = "codex" if agent_runtime_name != "codex" else "claude"
+    secondary_runtime = create_agent_runtime(
+        secondary_name,
         session_store=env.sessions,
         on_message=on_message,
     )
@@ -141,6 +156,7 @@ def build_runner(
     return TrackedWorkflowRunner(
         feature_store=env.feature_store,
         agent_runtime=agent_runtime,
+        secondary_runtime=secondary_runtime,
         interaction_runtimes=interaction_runtimes,
         artifacts=env.artifacts,
         sessions=env.sessions,

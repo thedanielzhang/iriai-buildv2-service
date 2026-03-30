@@ -876,7 +876,8 @@ async def _extract_revision_plan(
             "You extract structured revision requests from gate review prose. "
             "Read the review and produce a RevisionPlan with a list of "
             "RevisionRequest objects. Each request needs: description (what to change), "
-            "reasoning (why), affected_subfeatures (list of slugs), and "
+            "reasoning (why), affected_subfeatures (list of slugs), "
+            "affected_artifact_types (which artifact types to revise), and "
             "cross_subfeature (true if spans multiple)."
         ),
         tools=[],
@@ -889,11 +890,16 @@ async def _extract_revision_plan(
             actor=AgentActor(name="revision-extractor", role=extractor_role),
             prompt=(
                 f"Extract revision requests from this gate review.\n\n"
-                f"Available subfeature slugs: {', '.join(sf_slugs)}\n\n"
+                f"Available subfeature slugs: {', '.join(sf_slugs)}\n"
+                f"Available artifact types: prd, design, plan, system-design\n\n"
                 f"For each revision request, identify:\n"
                 f"- description: what needs to change\n"
                 f"- reasoning: why (the decision or feedback that prompted it)\n"
                 f"- affected_subfeatures: which slugs need updating (from list above)\n"
+                f"- affected_artifact_types: which artifact types to revise "
+                f"(prd, design, plan, system-design). Look for mentions like "
+                f"'plan rewrite', 'design revision', 'system design update'. "
+                f"If unclear, leave empty (all types will be revised).\n"
                 f"- cross_subfeature: true if the change spans multiple subfeatures\n\n"
                 f"Review:\n{review_text}"
             ),
@@ -1229,6 +1235,205 @@ async def interview_gate_review(
     return compiled_text
 
 
+# ── Patch-based revision helpers ─────────────────────────────────────────────
+
+
+def _parse_markdown_sections(
+    text: str,
+) -> list[tuple[str, int, int, int]]:
+    """Parse document into sections by markdown or HTML headers.
+
+    Supports:
+      - Markdown: ## Header, ### Header, #### Header
+      - HTML: <h2>Header</h2>, <h3>Header</h3>, <h4>Header</h4>
+      - HTML with code: <h4><code>ID</code>: Title</h4>
+
+    Returns list of (header_line, level, start_offset, end_offset).
+    Each section spans from its header to the next header at the same or
+    higher level (lower number).
+    """
+    import re
+
+    # Match both markdown headers and HTML headers
+    header_re = re.compile(
+        r"^(?:"
+        r"(#{2,})\s+(.+)"                     # markdown: ## ...
+        r"|"
+        r"\s*<h([2-6])[^>]*>(.+?)</h\3>"      # HTML: <h3>...</h3>
+        r")",
+        re.MULTILINE,
+    )
+    matches = list(header_re.finditer(text))
+    if not matches:
+        return []
+
+    sections: list[tuple[str, int, int, int]] = []
+    for i, m in enumerate(matches):
+        header_line = m.group(0).strip()
+        # Determine level: markdown group 1 or HTML group 3
+        if m.group(1):
+            level = len(m.group(1))
+        else:
+            level = int(m.group(3))
+        start = m.start()
+        end = len(text)
+        for j in range(i + 1, len(matches)):
+            nm = matches[j]
+            next_level = len(nm.group(1)) if nm.group(1) else int(nm.group(3))
+            if next_level <= level:
+                end = nm.start()
+                break
+        sections.append((header_line, level, start, end))
+    return sections
+
+
+def _clean_header(text: str) -> str:
+    """Strip markdown/HTML markup from a header for comparison."""
+    import re
+
+    text = re.sub(r"^#{2,}\s*", "", text.strip())
+    text = re.sub(r"</?h[2-6][^>]*>", "", text)
+    text = re.sub(r"</?code>", "", text)
+    return text.strip()
+
+
+def _find_section(
+    sections: list[tuple[str, int, int, int]],
+    target: str,
+    occurrence: int = 1,
+) -> tuple[str, int, int, int] | None:
+    """Find a section by header prefix match.
+
+    Handles markdown headers, HTML headers, and targets like:
+      "### STEP-5:", "Overview", "<h3>Services</h3>", "CP-14"
+
+    occurrence=1 returns the first match, occurrence=2 the second, etc.
+    """
+    target_clean = _clean_header(target)
+    found = 0
+
+    for header, level, start, end in sections:
+        header_clean = _clean_header(header)
+        if header_clean.startswith(target_clean) or target_clean in header_clean:
+            found += 1
+            if found == occurrence:
+                return (header, level, start, end)
+    return None
+
+
+def _count_matching_sections(
+    sections: list[tuple[str, int, int, int]], target: str,
+) -> int:
+    """Count how many sections match the target."""
+    target_clean = _clean_header(target)
+    count = 0
+    for header, _lvl, _s, _e in sections:
+        header_clean = _clean_header(header)
+        if header_clean.startswith(target_clean) or target_clean in header_clean:
+            count += 1
+    return count
+
+
+def _apply_patches(text: str, patches: list) -> str:
+    """Apply section-level patches to markdown/HTML text.
+
+    Handles duplicate headers by tracking per-target occurrence counts.
+    When multiple patches target the same header, they are applied to
+    successive occurrences (1st, 2nd, 3rd, ...).
+
+    Re-parses after each patch to handle offset shifts.
+    Unmatched targets are logged and skipped.
+    """
+    # Track how many times each target has been used so far,
+    # so successive patches to the same header hit successive occurrences.
+    target_usage: dict[str, int] = {}
+
+    for patch in patches:
+        # FULL_DOCUMENT: replace entire artifact content
+        if patch.target.strip().upper() == "FULL_DOCUMENT":
+            if patch.operation == "replace":
+                text = patch.content.rstrip("\n") + "\n"
+            continue
+
+        target_key = _clean_header(patch.target)
+        target_usage[target_key] = target_usage.get(target_key, 0) + 1
+        occurrence = target_usage[target_key]
+
+        sections = _parse_markdown_sections(text)
+        match = _find_section(sections, patch.target, occurrence=occurrence)
+
+        # If the nth occurrence doesn't exist, try the first (for non-duplicate targets)
+        if not match and occurrence > 1:
+            logger.warning(
+                "Patch target %r occurrence %d not found — skipping (may be duplicate header issue)",
+                patch.target, occurrence,
+            )
+            continue
+
+        if patch.operation == "replace":
+            if not match:
+                logger.warning(
+                    "Patch target not found for replace: %r — skipping",
+                    patch.target,
+                )
+                continue
+            _, match_level, start, end = match
+            # Only replace up to the first child section, preserving children.
+            # A "child" is any section at a deeper level within this section's range.
+            replace_end = end
+            for ch, clvl, cs, ce in sections:
+                if cs > start and cs < end and clvl > match_level:
+                    replace_end = cs
+                    break
+            content = patch.content.rstrip("\n") + "\n\n"
+            text = text[:start] + content + text[replace_end:]
+
+        elif patch.operation == "insert_after":
+            if not match:
+                logger.warning(
+                    "Patch target not found for insert_after: %r — appending to end",
+                    patch.target,
+                )
+                text = text.rstrip("\n") + "\n\n" + patch.content.rstrip("\n") + "\n\n"
+                continue
+            _, _, _, end = match
+            content = patch.content.rstrip("\n") + "\n\n"
+            text = text[:end] + content + text[end:]
+
+        elif patch.operation == "delete":
+            if not match:
+                logger.warning(
+                    "Patch target not found for delete: %r — skipping",
+                    patch.target,
+                )
+                continue
+            _, _, start, end = match
+            text = text[:start] + text[end:]
+
+        elif patch.operation == "find_replace":
+            if not match:
+                logger.warning(
+                    "Patch target not found for find_replace: %r — skipping",
+                    patch.target,
+                )
+                continue
+            _, _, start, end = match
+            section_text = text[start:end]
+            if not patch.find or patch.find not in section_text:
+                logger.warning(
+                    "find_replace: text %r not found in section %r — skipping",
+                    (patch.find or "")[:50], patch.target[:40],
+                )
+                continue
+            new_section = section_text.replace(patch.find, patch.content, 1)
+            text = text[:start] + new_section + text[end:]
+
+        else:
+            logger.warning("Unknown patch operation: %r — skipping", patch.operation)
+
+    return text
+
+
 async def targeted_revision(
     runner: WorkflowRunner,
     feature: Feature,
@@ -1241,20 +1446,30 @@ async def targeted_revision(
     artifact_prefix: str,
     post_update: Callable[[str, str], Awaitable[None]] | None = None,
     context_keys: list[str] | None = None,
+    checkpoint_prefix: str = "",
+    prior_decisions: str = "",
 ) -> None:
     """Execute revisions on specific subfeatures per the RevisionPlan.
 
     Re-runs affected subfeature agents with revision instructions.
-    Updates subfeature artifacts in store. Regenerates summaries.
-    """
-    from ...models.outputs import Envelope, envelope_done
-    from ...roles import InterviewActor
-    from .._common import HostedInterview
+    Updates subfeature artifacts in store. One-shot Ask per SF (no multi-turn).
+    Summaries are NOT regenerated here — caller should batch them if needed.
 
-    approver = _get_user()
+    If checkpoint_prefix is set, completed revisions are marked in the artifact
+    store. On restart, already-completed revisions are skipped.
+    """
+    import asyncio as _asyncio
+
+    from iriai_compose.actors import Role
+
+    from ...config import BUDGET_TIERS
+
     _keys = context_keys if context_keys is not None else ["project", "scope"]
     valid_slugs = {sf.slug for sf in decomposition.subfeatures}
 
+    # Merge ALL requests per SF slug — same SF may appear in multiple
+    # requests; we collect them all so the revision agent sees every change.
+    sf_requests: dict[str, list[Any]] = {}
     for request in revision_plan.requests:
         for sf_slug in request.affected_subfeatures:
             if sf_slug not in valid_slugs:
@@ -1263,69 +1478,291 @@ async def targeted_revision(
                     "(valid: %s)", sf_slug, ", ".join(sorted(valid_slugs)),
                 )
                 continue
+            sf_requests.setdefault(sf_slug, []).append(request)
+    revision_tasks: list[tuple[list[Any], str]] = [
+        (reqs, slug) for slug, reqs in sf_requests.items()
+    ]
 
-            sf_key = f"{artifact_prefix}:{sf_slug}"
-            existing = await runner.artifacts.get(sf_key, feature=feature) or ""
-            if not existing:
-                logger.warning(
-                    "targeted_revision: no existing artifact for %s — "
-                    "revision agent will have no context to revise", sf_key,
+    # Skip already-completed revisions (checkpoint)
+    if checkpoint_prefix:
+        filtered: list[tuple[list[Any], str]] = []
+        for reqs, slug in revision_tasks:
+            marker = await runner.artifacts.get(
+                f"revision-done:{checkpoint_prefix}:{artifact_prefix}:{slug}",
+                feature=feature,
+            )
+            if marker:
+                logger.info(
+                    "targeted_revision: %s:%s already revised — skipping",
+                    artifact_prefix, slug,
                 )
+            else:
+                filtered.append((reqs, slug))
+        revision_tasks = filtered
 
-            revision_actor = InterviewActor(
+    async def _revise_one(requests: list[Any], sf_slug: str) -> None:
+        request = requests[0]  # Primary request (for checkpoint compat)
+        import json as _json
+
+        from ...models.outputs import ArtifactPatchSet
+
+        sf_key = f"{artifact_prefix}:{sf_slug}"
+        existing = await runner.artifacts.get(sf_key, feature=feature) or ""
+        if not existing:
+            logger.warning(
+                "targeted_revision: no existing artifact for %s — "
+                "revision agent will have no context to revise", sf_key,
+            )
+
+        # ── Two-phase checkpoint ──────────────────────────────────
+        # Phase 1: patches saved to DB (can resume without API call)
+        # Phase 2: revision-done marker (patches applied successfully)
+        patch_key = (
+            f"patches:{checkpoint_prefix}:{artifact_prefix}:{sf_slug}"
+            if checkpoint_prefix
+            else f"patches:{artifact_prefix}:{sf_slug}"
+        )
+
+        patch_set: ArtifactPatchSet | None = None
+
+        # Try loading saved patches from a prior run
+        saved_json = await runner.artifacts.get(patch_key, feature=feature)
+        if saved_json:
+            try:
+                patch_set = ArtifactPatchSet.model_validate(_json.loads(saved_json))
+                logger.info(
+                    "targeted_revision: loaded %d saved patches for %s — skipping API call",
+                    len(patch_set.patches), sf_key,
+                )
+            except Exception:
+                logger.warning(
+                    "targeted_revision: failed to parse saved patches for %s — regenerating",
+                    sf_key,
+                )
+                patch_set = None
+
+        if patch_set is None:
+            # Generate patches via API
+            # Use opus model name directly; Codex runtime will use its own
+            # default model (the model string is a hint, not a hard requirement)
+            revision_role = Role(
+                name=base_role.name,
+                prompt=base_role.prompt,
+                tools=[],
+                model=BUDGET_TIERS["opus"],
+            )
+            revision_actor = AgentActor(
                 name=f"{artifact_prefix}-sf-{sf_slug}-rev",
-                role=base_role,
+                role=revision_role,
                 context_keys=_keys,
             )
 
-            envelope = await runner.run(
-                HostedInterview(
-                    questioner=revision_actor,
-                    responder=approver,
-                    initial_prompt=(
-                        f"Please revise the {artifact_prefix} for subfeature '{sf_slug}' "
-                        f"based on this feedback:\n\n"
-                        f"**Change requested:** {request.description}\n"
-                        f"**Reasoning:** {request.reasoning}\n\n"
+            decisions_block = ""
+            if prior_decisions:
+                decisions_block = (
+                    f"\n\n## Mandatory Decisions (all prior cycles)\n"
+                    f"Apply ALL of these decisions. They are hard requirements.\n\n"
+                    f"{prior_decisions}\n\n"
+                )
+
+            # Build combined change instructions from ALL requests for this SF
+            changes_parts = []
+            for i, req in enumerate(requests, 1):
+                changes_parts.append(
+                    f"**Change {i}:** {req.description}\n"
+                    f"**Reasoning:** {req.reasoning}"
+                )
+            changes_block = "\n\n".join(changes_parts)
+
+            patch_set = await runner.run(
+                Ask(
+                    actor=revision_actor,
+                    prompt=(
+                        f"Revise the {artifact_prefix} for subfeature '{sf_slug}' "
+                        f"by producing a list of PATCHES.\n\n"
+                        f"{changes_block}\n\n"
+                        f"Address ALL {len(requests)} change(s) in a single patch set.\n"
+                        f"{decisions_block}\n"
+                        f"IMPORTANT: Do NOT rewrite the entire document. Produce targeted "
+                        f"patches only for sections that need to change.\n\n"
+                        f"TARGETING RULES for {artifact_prefix}:\n"
+                        + (
+                            f"- Target individual steps by unique header "
+                            f"(e.g. '### STEP-5:', '## Architecture', '## File Manifest').\n"
+                            f"- Each STEP has a unique ID — use it as the target.\n\n"
+                            if artifact_prefix == "plan" else
+                            f"- For system-designs (HTML): target unique section headers "
+                            f"like 'Overview', 'Services', 'CP-14', 'ENT-30'.\n\n"
+                            if artifact_prefix == "system-design" else
+                            f"- This artifact may have non-unique subsection headers. "
+                            f"Produce a SINGLE patch with target 'FULL_DOCUMENT' to "
+                            f"replace the entire artifact content. Include all sections.\n\n"
+                        )
+                        + f"For each patch specify:\n"
+                        f"- target: the header text of the section to modify "
+                        f"(or 'FULL_DOCUMENT' for complete replacement)\n"
+                        f"- operation: 'replace' (replace section intro, children preserved), "
+                        f"'insert_after' (add new section after target), 'delete', or "
+                        f"'find_replace' (surgical text swap within a section)\n"
+                        f"- content: the replacement content (for replace/insert_after/find_replace)\n"
+                        f"- find: the exact text to find within the section (for find_replace only)\n"
+                        f"- reasoning: brief explanation\n\n"
+                        f"Use 'find_replace' for small targeted changes within a section "
+                        f"(fixing field names, changing specific values). "
+                        f"Use 'replace' only when the entire section intro needs rewriting.\n\n"
+                        f"Unchanged sections are preserved automatically.\n\n"
+                        f"If you have questions that MUST be answered before you can "
+                        f"produce correct patches, return an empty patches list and put "
+                        f"your questions in the summary field. You will get a chance to "
+                        f"discuss with the user and then produce patches. Only do this "
+                        f"for genuine ambiguities — not for optional improvements.\n\n"
                         f"Current artifact:\n{existing}"
                     ),
-                    output_type=Envelope[output_type],
-                    done=envelope_done,
-                    artifact_key=sf_key,
-                    artifact_label=f"Revision — {sf_slug}",
+                    output_type=ArtifactPatchSet,
                 ),
                 feature,
                 phase_name=phase_name,
             )
 
-            # Prefer file content over Envelope output
-            revised_text = None
-            mirror = runner.services.get("artifact_mirror")
-            if mirror:
-                from ...services.artifacts import _key_to_path
-                path = mirror.feature_dir(feature.id) / _key_to_path(sf_key)
-                if path.exists():
-                    revised_text = path.read_text(encoding="utf-8").strip()
-            if not revised_text:
-                revised_text = to_str(envelope.output)
-            await runner.artifacts.put(sf_key, revised_text, feature=feature)
-
-            # Update the hosted doc so the browser shows the revised version
-            hosting = runner.services.get("hosting")
-            if hosting:
-                await hosting.update(feature.id, sf_key, revised_text)
-            if post_update:
-                await post_update(sf_key, revised_text)
-
-            # Regenerate summary (best-effort — don't crash pipeline if this fails)
-            try:
-                await generate_summary(runner, feature, artifact_prefix, sf_slug)
-            except Exception:
-                logger.warning(
-                    "targeted_revision: summary generation failed for %s:%s — "
-                    "continuing (revision was applied successfully)",
-                    artifact_prefix, sf_slug, exc_info=True,
+            # If agent returned questions instead of patches, escalate to interview
+            if not patch_set.patches and patch_set.summary:
+                logger.info(
+                    "targeted_revision: agent has questions for %s — escalating to interview",
+                    sf_key,
                 )
+                from ...models.outputs import Envelope, envelope_done
+                from .._common import HostedInterview
+
+                interview_actor = AgentActor(
+                    name=f"{artifact_prefix}-sf-{sf_slug}-rev-q",
+                    role=revision_role,
+                    context_keys=_keys,
+                )
+                await runner.run(
+                    HostedInterview(
+                        questioner=interview_actor,
+                        responder=_get_user(),
+                        initial_prompt=(
+                            f"I need clarification before revising {artifact_prefix} "
+                            f"for subfeature '{sf_slug}':\n\n"
+                            f"{patch_set.summary}\n\n"
+                            f"Please answer these questions so I can produce the patches."
+                        ),
+                        output_type=Envelope[ArtifactPatchSet],
+                        done=envelope_done,
+                        artifact_key=f"revision-questions:{artifact_prefix}:{sf_slug}",
+                        artifact_label=f"Revision Questions — {sf_slug}",
+                    ),
+                    feature,
+                    phase_name=phase_name,
+                )
+
+                # Load the answers from the discussion file
+                answers = ""
+                q_mirror = runner.services.get("artifact_mirror")
+                if q_mirror:
+                    from ...services.artifacts import _key_to_path
+                    q_path = (
+                        q_mirror.feature_dir(feature.id)
+                        / _key_to_path(f"revision-questions:{artifact_prefix}:{sf_slug}")
+                    )
+                    if q_path.exists():
+                        answers = q_path.read_text(encoding="utf-8").strip()
+
+                # Second Ask with the answers
+                patch_set = await runner.run(
+                    Ask(
+                        actor=revision_actor,
+                        prompt=(
+                            f"Revise the {artifact_prefix} for subfeature '{sf_slug}' "
+                            f"by producing a list of PATCHES.\n\n"
+                            f"**Change requested:** {request.description}\n"
+                            f"**Reasoning:** {request.reasoning}\n"
+                            f"{decisions_block}\n"
+                            f"**Clarification from user:**\n{answers}\n\n"
+                            f"Now produce the patches.\n\n"
+                            f"Current artifact:\n{existing}"
+                        ),
+                        output_type=ArtifactPatchSet,
+                    ),
+                    feature,
+                    phase_name=phase_name,
+                )
+
+            # Phase 1 checkpoint: save patches immediately
+            await runner.artifacts.put(
+                patch_key, patch_set.model_dump_json(indent=2), feature=feature,
+            )
+            logger.info(
+                "targeted_revision: saved %d patches for %s",
+                len(patch_set.patches), sf_key,
+            )
+
+        if not patch_set.patches:
+            logger.info(
+                "targeted_revision: no patches produced for %s — skipping",
+                sf_key,
+            )
+            return
+
+        logger.info(
+            "targeted_revision: applying %d patches to %s",
+            len(patch_set.patches), sf_key,
+        )
+        revised_text = _apply_patches(existing, patch_set.patches)
+
+        # Size guard: reject revisions that shrink the artifact by >50%.
+        # Protects against sonnet producing meta-descriptions or truncated output.
+        existing_size = len(existing)
+        revised_size = len(revised_text)
+        if existing_size > 0 and revised_size < existing_size * 0.5:
+            logger.error(
+                "targeted_revision: rejecting %s — revision too small "
+                "(%d → %d bytes, %.0f%% shrink)",
+                sf_key, existing_size, revised_size,
+                (1 - revised_size / existing_size) * 100,
+            )
+            return
+
+        await runner.artifacts.put(sf_key, revised_text, feature=feature)
+
+        # Write to disk via artifact mirror
+        mirror = runner.services.get("artifact_mirror")
+        if mirror:
+            from ...services.artifacts import _key_to_path
+            path = mirror.feature_dir(feature.id) / _key_to_path(sf_key)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(revised_text, encoding="utf-8")
+
+        # Update the hosted doc so the browser shows the revised version
+        hosting = runner.services.get("hosting")
+        if hosting:
+            await hosting.update(feature.id, sf_key, revised_text)
+        if post_update:
+            await post_update(sf_key, revised_text)
+
+        # Checkpoint: mark this revision as done so restarts skip it
+        if checkpoint_prefix:
+            await runner.artifacts.put(
+                f"revision-done:{checkpoint_prefix}:{artifact_prefix}:{sf_slug}",
+                "done",
+                feature=feature,
+            )
+
+    logger.info(
+        "targeted_revision: dispatching %d SF revisions in parallel for %s",
+        len(revision_tasks), artifact_prefix,
+    )
+    results = await _asyncio.gather(
+        *[_revise_one(reqs, slug) for reqs, slug in revision_tasks],
+        return_exceptions=True,
+    )
+    for i, res in enumerate(results):
+        if isinstance(res, BaseException):
+            logger.error(
+                "targeted_revision: %s:%s crashed: %s",
+                artifact_prefix, revision_tasks[i][1], res,
+            )
 
 
 def _get_user() -> Actor:

@@ -26,9 +26,9 @@ CREATE TABLE IF NOT EXISTS artifacts (
     feature_id  TEXT NOT NULL REFERENCES features(id),
     key         TEXT NOT NULL,
     value       TEXT NOT NULL,
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE(feature_id, key)
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+CREATE INDEX IF NOT EXISTS idx_artifacts_feature_key ON artifacts(feature_id, key, id DESC);
 
 CREATE TABLE IF NOT EXISTS sessions (
     session_key TEXT PRIMARY KEY,

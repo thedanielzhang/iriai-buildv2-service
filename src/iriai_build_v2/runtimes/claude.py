@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
@@ -14,6 +15,65 @@ if TYPE_CHECKING:
     from iriai_compose.workflow import Workspace
 
 logger = logging.getLogger(__name__)
+
+
+# ── Write-isolation callback ───────────────────────────────────────────
+# Tools that can create or modify files on disk.
+_WRITE_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
+# File-path parameter name per tool.
+_PATH_PARAMS: dict[str, str] = {
+    "Edit": "file_path",
+    "Write": "file_path",
+    "MultiEdit": "file_path",
+    "NotebookEdit": "file_path",
+}
+
+
+def _make_write_guard(allowed_dir: str) -> Any:
+    """Return an async ``can_use_tool`` callback that denies writes outside *allowed_dir*.
+
+    Reads (Glob, Grep, Read, Bash without mutations) are unrestricted.
+    Writes via Edit/Write/MultiEdit/NotebookEdit are checked: the target
+    ``file_path`` must resolve to a location under *allowed_dir*.
+    """
+    from claude_agent_sdk.types import PermissionResultAllow, PermissionResultDeny
+
+    resolved_root = os.path.realpath(allowed_dir)
+
+    async def _guard(
+        tool_name: str,
+        tool_input: dict[str, Any],
+        _context: Any,
+    ) -> PermissionResultAllow | PermissionResultDeny:
+        if tool_name not in _WRITE_TOOLS:
+            return PermissionResultAllow()
+
+        path_key = _PATH_PARAMS.get(tool_name)
+        if not path_key:
+            return PermissionResultAllow()
+
+        target = tool_input.get(path_key, "")
+        if not target:
+            return PermissionResultDeny(
+                message=f"Write denied: no {path_key} provided",
+            )
+
+        resolved = os.path.realpath(target)
+        if resolved == resolved_root or resolved.startswith(resolved_root + os.sep):
+            return PermissionResultAllow()
+
+        logger.warning(
+            "Write guard: blocked %s to %s (outside %s)",
+            tool_name, resolved, resolved_root,
+        )
+        return PermissionResultDeny(
+            message=(
+                f"Write denied: {target} is outside the allowed workspace "
+                f"({allowed_dir}). All file writes must stay within the workspace."
+            ),
+        )
+
+    return _guard
 
 
 def _inline_defs(schema: dict[str, Any]) -> dict[str, Any]:
@@ -214,6 +274,26 @@ class ClaudeAgentRuntime(AgentRuntime):
                 repr(result_msg.result)[:200] if result_msg.result else None,
                 repr(getattr(result_msg, "structured_output", None))[:200],
             )
+            # For ImplementationResult, synthesize a minimal result instead of
+            # crashing — the agent likely did the work but ran out of budget
+            # before producing the structured output.
+            from ..models.outputs import ImplementationResult
+
+            if output_type is ImplementationResult:
+                logger.warning(
+                    "Synthesizing minimal ImplementationResult for %s — "
+                    "agent exhausted budget before producing structured output",
+                    session_key,
+                )
+                return ImplementationResult(
+                    task_id=session_key.split(":")[0] if session_key else "unknown",
+                    summary=(
+                        result_msg.result
+                        if result_msg.result
+                        else "Agent completed work but could not produce structured summary"
+                    ),
+                )
+
             raise RuntimeError(
                 f"Claude could not produce valid {output_type.__name__} "
                 f"after multiple attempts. Last result: {result_msg.result}"
@@ -392,13 +472,29 @@ class ClaudeAgentRuntime(AgentRuntime):
         """Construct ClaudeAgentOptions from a role."""
         from claude_agent_sdk import ClaudeAgentOptions
 
+        cwd = str(workspace.path) if workspace else None
+
+        # Write isolation: use can_use_tool callback to deny Edit/Write
+        # outside the workspace.  The sandbox setting only restricts Bash
+        # commands (Seatbelt/bubblewrap); Edit/Write bypass it entirely.
+        write_guard = None
+        sandbox = None
+        if cwd and role.metadata.get("sandbox", True):
+            write_guard = _make_write_guard(cwd)
+            sandbox = {
+                "enabled": True,
+            }
+
         options = ClaudeAgentOptions(
             system_prompt=role.prompt,
             allowed_tools=role.tools,
             model=role.model or "claude-sonnet-4-6",
-            cwd=str(workspace.path) if workspace else None,
+            cwd=cwd,
             permission_mode="bypassPermissions",
             effort=role.effort if role.effort is not None else "high",
+            max_buffer_size=50 * 1024 * 1024,  # 50MB — agents may glob large dirs
+            sandbox=sandbox,
+            can_use_tool=write_guard,
         )
 
         if "setting_sources" in role.metadata:

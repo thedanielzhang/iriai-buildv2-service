@@ -133,57 +133,57 @@ operator = AgentActor(
 backend_implementer = AgentActor(
     name="backend-implementer",
     role=backend_implementer_role,
-    context_keys=["project", "plan"],
+    context_keys=["project"],
 )
 frontend_implementer = AgentActor(
     name="frontend-implementer",
     role=frontend_implementer_role,
-    context_keys=["project", "plan"],
+    context_keys=["project"],
 )
 database_implementer = AgentActor(
     name="database-implementer",
     role=database_implementer_role,
-    context_keys=["project", "plan"],
+    context_keys=["project"],
 )
 package_implementer = AgentActor(
     name="package-implementer",
     role=package_implementer_role,
-    context_keys=["project", "plan"],
+    context_keys=["project"],
 )
 implementer = AgentActor(
     name="implementer",
     role=implementer_role,
-    context_keys=["project", "plan"],
+    context_keys=["project"],  # plan excluded — task reference_material has relevant excerpts
 )
 test_author = AgentActor(
     name="test-author",
     role=test_author_role,
-    context_keys=["project", "plan"],
+    context_keys=["project"],
 )
 integration_tester = AgentActor(
     name="integration-tester",
     role=integration_tester_role,
-    context_keys=["project", "plan", "prd", "design", "system-design", "mockup"],
+    context_keys=["project"],
 )
 regression_tester = AgentActor(
     name="regression-tester",
     role=regression_tester_role,
-    context_keys=["project", "plan", "prd"],
+    context_keys=["project"],
 )
 smoke_tester = AgentActor(
     name="smoke-tester",
     role=smoke_tester_role,
-    context_keys=["project", "plan", "prd", "design", "system-design"],
+    context_keys=["project"],
 )
 code_reviewer = AgentActor(
     name="code-reviewer",
     role=code_reviewer_role,
-    context_keys=["project", "plan", "prd", "design", "system-design"],
+    context_keys=["project"],
 )
 security_auditor = AgentActor(
     name="security-auditor",
     role=security_auditor_role,
-    context_keys=["project", "plan", "prd", "design", "system-design"],
+    context_keys=["project"],
 )
 accessibility_auditor = AgentActor(
     name="accessibility-auditor",
@@ -198,7 +198,7 @@ performance_analyst = AgentActor(
 verifier = AgentActor(
     name="verifier",
     role=verifier_role,
-    context_keys=["project", "plan", "prd", "design", "system-design", "mockup"],
+    context_keys=["project"],
 )
 analytics_engineer = AgentActor(
     name="analytics-engineer",

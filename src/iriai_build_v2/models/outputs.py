@@ -381,6 +381,23 @@ class IntegrationReview(BaseModel):
     complete: bool = False
 
 
+class ArtifactPatch(BaseModel):
+    """A single section-level patch to apply to a markdown artifact."""
+
+    target: str  # header prefix to match, e.g. "### STEP-5:", "## Architecture"
+    operation: str  # "replace", "insert_after", "delete", "find_replace"
+    content: str = ""  # replacement content (for replace/insert_after/find_replace)
+    find: str = ""  # text to find within target section (for find_replace only)
+    reasoning: str = ""
+
+
+class ArtifactPatchSet(BaseModel):
+    """Set of patches to apply to a markdown artifact."""
+
+    patches: list[ArtifactPatch] = Field(default_factory=list)
+    summary: str = ""
+
+
 class RevisionRequest(BaseModel):
     """A single change requested during gate review."""
 
@@ -389,6 +406,9 @@ class RevisionRequest(BaseModel):
     affected_subfeatures: list[str] = Field(
         default_factory=list
     )  # slugs of subfeatures that need to change
+    affected_artifact_types: list[str] = Field(
+        default_factory=list
+    )  # prd, design, plan, system-design — empty = all types
     affected_requirement_ids: list[str] = Field(default_factory=list)
     cross_subfeature: bool = False  # true if the change spans multiple subfeatures
 
@@ -436,6 +456,27 @@ class GlobalImplementationStrategy(BaseModel):
     parallel_opportunities: list[str] = Field(default_factory=list)
     execution_constraints: list[str] = Field(default_factory=list)
     citations: list[Citation] = Field(default_factory=list)
+    complete: bool = False
+
+
+class Workstream(BaseModel):
+    """A group of subfeatures that can be planned in parallel."""
+
+    id: str  # e.g., "ws-1"
+    name: str  # e.g., "Runtime Foundation"
+    subfeature_slugs: list[str]  # SFs in this workstream
+    rationale: str  # why these are grouped
+    depends_on: list[str] = Field(default_factory=list)  # workstream IDs that must complete first
+
+
+class WorkstreamDecomposition(BaseModel):
+    """Workstream assignments for parallel task planning."""
+
+    workstreams: list[Workstream] = Field(default_factory=list)
+    execution_order: list[list[str]] = Field(
+        default_factory=list,
+    )  # rounds of workstream IDs — workstreams in the same round run in parallel
+    shared_infrastructure: list[str] = Field(default_factory=list)
     complete: bool = False
 
 
@@ -715,6 +756,7 @@ class ImplementationTask(BaseModel):
         ),
     )
     subfeature_id: str = ""  # SF-1, SF-2, ... for traceability
+    repo_path: str = ""  # workspace-relative path to the git repo (e.g., "tools/compose/backend")
     # Legacy / DAG metadata
     files: list[str] = Field(default_factory=list)
     dependencies: list[str] = Field(default_factory=list)
@@ -738,6 +780,7 @@ class ImplementationResult(BaseModel):
     summary: str
     files_created: list[str] = Field(default_factory=list)
     files_modified: list[str] = Field(default_factory=list)
+    commit_hash: str = ""  # git commit hash for this task's changes
     notes: str = ""
     deviations: list[Deviation] = Field(default_factory=list)
     self_reported_risks: list[Risk] = Field(default_factory=list)

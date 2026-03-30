@@ -53,7 +53,7 @@ class SlackInteractionRuntime(InteractionRuntime):
 
         # Turn persistence: set by orchestrator when a runtime is available
         self._session_store: Any = None
-        self._agent_runtime: Any = None  # ClaudeAgentRuntime with get_active_session_key()
+        self._agent_runtime: Any = None  # Runtime with get_active_session_key()
 
     # ── Channel Registration ──────────────────────────────────────────────
 

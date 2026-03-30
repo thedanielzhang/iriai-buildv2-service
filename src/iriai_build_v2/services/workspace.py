@@ -1,7 +1,7 @@
-"""Workspace management: directory map building and git worktree creation.
+"""Workspace management: directory map building and isolated feature repo setup.
 
 The workspace model centers on GitHub repos (with local-only as fallback).
-Features get isolated worktrees at ``.iriai/features/{slug}/repos/{repo}/``.
+Features get isolated repo copies at ``.iriai/features/{slug}/repos/{repo}/``.
 
 Directory map lifecycle:
 - **Repo catalog** (``## Repos`` section) is built by ``build_directory_map()``
@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+import shutil
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -331,7 +332,7 @@ class WorkspaceManager:
         feature: Feature,
         scope: ScopeOutput,
     ) -> ProjectContext:
-        """Resolve repos, expand with adjacent repos, create worktrees."""
+        """Resolve repos, expand with adjacent repos, create feature-local repo copies."""
         from ..models.outputs import ProjectContext, RepoSpec
 
         feature_dir = self._base / ".iriai" / "features" / feature.slug
@@ -366,7 +367,7 @@ class WorkspaceManager:
                         relevance=f"Adjacent to {', '.join(scoped_names)} in dependency graph",
                     ))
 
-        # Create worktrees for all repos
+        # Create isolated repo copies for all repos
         resolved: list[RepoSpec] = []
         for spec in all_repos:
             resolved_spec = await self._resolve_and_worktree(
@@ -390,14 +391,15 @@ class WorkspaceManager:
         feature_root: Path,
         slug: str,
     ) -> RepoSpec:
-        """Resolve a single repo and create a git worktree for it."""
-        from ..models.outputs import RepoSpec as RS
+        """Resolve a single repo and create an isolated feature-local copy."""
 
         worktree_dest = feature_root / spec.name
 
-        # Already set up (idempotent)
-        if worktree_dest.exists() and (worktree_dest / ".git").exists():
+        # Already set up with an isolated clone (idempotent).
+        if self._is_isolated_repo_copy(worktree_dest):
             return spec
+        if worktree_dest.exists():
+            self._remove_repo_path(worktree_dest)
 
         # Find the source repo
         source_path = self._find_source_repo(spec)
@@ -411,29 +413,41 @@ class WorkspaceManager:
                 f"Clone the repo first or provide a valid local_path."
             )
 
-        # Create worktree
-        branch = f"feature/{slug}"
-        if spec.action == "read_only":
-            # Detached worktree — no feature branch
-            await _run_git(
-                source_path,
-                "worktree", "add", "--detach", str(worktree_dest),
-            )
-        else:
-            # Feature branch worktree
-            try:
-                await _run_git(
-                    source_path,
-                    "worktree", "add", str(worktree_dest), "-b", branch,
-                )
-            except RuntimeError:
-                # Branch may already exist — try without -b
-                await _run_git(
-                    source_path,
-                    "worktree", "add", str(worktree_dest), branch,
-                )
+        branch = None if spec.action == "read_only" else f"feature/{slug}"
+        await self._clone_repo(source_path, worktree_dest, branch=branch)
 
         return spec.model_copy(update={"local_path": str(worktree_dest)})
+
+    async def _clone_repo(
+        self,
+        source_path: Path,
+        dest: Path,
+        *,
+        branch: str | None,
+    ) -> None:
+        """Clone a repo into the feature sandbox without mutating the source repo."""
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        await _run_git(
+            dest.parent,
+            "clone",
+            "--no-local",
+            str(source_path),
+            str(dest),
+        )
+        if branch:
+            await _run_git(dest, "checkout", "-B", branch)
+
+    def _is_isolated_repo_copy(self, path: Path) -> bool:
+        """Return true when *path* is a standalone git clone, not a linked worktree."""
+        return path.exists() and not path.is_symlink() and (path / ".git").is_dir()
+
+    def _remove_repo_path(self, path: Path) -> None:
+        """Remove an existing feature repo path so it can be recreated safely."""
+        if path.is_symlink() or path.is_file():
+            path.unlink()
+            return
+        if path.exists():
+            shutil.rmtree(path)
 
     def _find_source_repo(self, spec: RepoSpec) -> Path | None:
         """Find the source git repo on disk."""
@@ -478,18 +492,11 @@ class WorkspaceManager:
         await _run_git(dest, "commit", "-m", f"chore: scaffold {spec.name}")
 
     async def cleanup_feature(self, feature_slug: str) -> None:
-        """Remove all worktrees for a feature."""
+        """Remove all feature-local repo copies for a feature."""
         feature_root = self._base / ".iriai" / "features" / feature_slug / "repos"
         if not feature_root.exists():
             return
-
-        for repo_dir in feature_root.iterdir():
-            if repo_dir.is_dir() and (repo_dir / ".git").exists():
-                # Find the source repo to remove the worktree from
-                try:
-                    await _run_git(repo_dir, "worktree", "remove", str(repo_dir))
-                except RuntimeError:
-                    pass  # Best-effort cleanup
+        shutil.rmtree(feature_root)
 
 
 async def _run_git(cwd: Path, *args: str) -> str:

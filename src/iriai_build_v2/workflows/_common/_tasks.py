@@ -139,6 +139,7 @@ class HostedInterview(Interview):
                 if p.exists():
                     text = p.read_text(encoding="utf-8").strip()
                     if text:
+                        await runner.artifacts.put(key, text, feature=feature)
                         url = await hosting.push(
                             feature.id,
                             key,
@@ -156,6 +157,7 @@ class HostedInterview(Interview):
                 if path.exists():
                     text = path.read_text(encoding="utf-8").strip()
                     if text:
+                        await runner.artifacts.put(key, text, feature=feature)
                         url = await hosting.push(
                             feature.id,
                             key,
@@ -194,6 +196,7 @@ class HostedInterview(Interview):
                         f"HostedInterview produced empty artifact for {key}"
                     )
 
+                await runner.artifacts.put(key, text, feature=feature)
                 url = await hosting.push(
                     feature.id,
                     key,

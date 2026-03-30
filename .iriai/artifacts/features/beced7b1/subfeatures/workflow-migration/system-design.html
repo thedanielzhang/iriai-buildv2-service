@@ -1,0 +1,3532 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SF-4 Workflow Migration &amp; Litmus Test - System Design</title>
+<style>
+  /* ── Reset & Base ─────────────────────────────────────────────────── */
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  @font-face {
+    font-family: 'Charter';
+    src: local('Charter'), local('Georgia');
+    font-display: swap;
+  }
+
+  :root {
+    --text-primary: #1a1a2e;
+    --text-secondary: #555;
+    --text-muted: #888;
+    --bg-page: #faf9f7;
+    --bg-card: #fff;
+    --border-subtle: rgba(0, 0, 0, 0.06);
+    --border-medium: rgba(0, 0, 0, 0.1);
+    --accent: #2d5be3;
+    --accent-faint: rgba(45, 91, 227, 0.06);
+    --accent-light: rgba(45, 91, 227, 0.12);
+    --content-width: 960px;
+    --gutter: clamp(20px, 5vw, 48px);
+    --radius: 10px;
+    --radius-sm: 6px;
+  }
+
+  html {
+    font-size: 17px;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
+    scroll-behavior: smooth;
+  }
+
+  body {
+    font-family: Charter, Georgia, 'Times New Roman', serif;
+    color: var(--text-primary);
+    background: var(--bg-page);
+    line-height: 1.72;
+    min-height: 100vh;
+  }
+
+  ::selection {
+    background: rgba(45, 91, 227, 0.18);
+    color: inherit;
+  }
+
+  /* ── Header ──────────────────────────────────────────────────────── */
+  .sd-header {
+    position: sticky;
+    top: 0;
+    z-index: 100;
+    background: rgba(250, 249, 247, 0.92);
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
+    border-bottom: 1px solid var(--border-subtle);
+    padding: 0 var(--gutter);
+  }
+
+  .sd-header-inner {
+    max-width: var(--content-width);
+    margin: 0 auto;
+    padding: 20px 0 16px;
+  }
+
+  .sd-title {
+    font-size: clamp(1.8rem, 4vw, 2.6rem);
+    font-weight: 700;
+    line-height: 1.15;
+    letter-spacing: -0.025em;
+    color: var(--text-primary);
+    margin-bottom: 12px;
+  }
+
+  .sd-nav {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-bottom: 12px;
+  }
+
+  .sd-nav-link {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--text-muted);
+    text-decoration: none;
+    padding: 4px 10px;
+    border-radius: var(--radius-sm);
+    transition: color 0.15s, background 0.15s;
+  }
+
+  .sd-nav-link:hover {
+    color: var(--accent);
+    background: var(--accent-faint);
+  }
+
+  /* ── Filter pills ────────────────────────────────────────────────── */
+  .sd-filters {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+    padding-top: 4px;
+  }
+
+  .sd-filter-label {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    margin-right: 4px;
+  }
+
+  .sd-pill {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 12px;
+    font-weight: 500;
+    padding: 3px 12px;
+    border: 1px solid var(--border-medium);
+    border-radius: 100px;
+    background: var(--bg-card);
+    color: var(--text-secondary);
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+
+  .sd-pill:hover {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+
+  .sd-pill-active {
+    background: var(--accent);
+    color: #fff;
+    border-color: var(--accent);
+  }
+
+  .sd-pill-active:hover {
+    background: #1a3fa0;
+    border-color: #1a3fa0;
+    color: #fff;
+  }
+
+  /* ── Main content ────────────────────────────────────────────────── */
+  .sd-main {
+    max-width: var(--content-width);
+    margin: 0 auto;
+    padding: 32px var(--gutter) 80px;
+  }
+
+  .sd-section {
+    margin-bottom: 48px;
+  }
+
+  .sd-section-title {
+    font-size: 1.5rem;
+    font-weight: 700;
+    line-height: 1.3;
+    letter-spacing: -0.01em;
+    margin-bottom: 20px;
+    padding-bottom: 10px;
+    border-bottom: 1px solid var(--border-subtle);
+    color: var(--text-primary);
+  }
+
+  .sd-subsection-title {
+    font-size: 1.1rem;
+    font-weight: 700;
+    margin: 28px 0 14px;
+    color: var(--text-primary);
+  }
+
+  .sd-overview-text {
+    font-size: 1.05rem;
+    line-height: 1.75;
+    color: var(--text-secondary);
+    margin-bottom: 1.4em;
+  }
+
+  .sd-empty {
+    font-style: italic;
+    color: var(--text-muted);
+    padding: 16px 0;
+  }
+
+  /* ── Decisions list ──────────────────────────────────────────────── */
+  .sd-decisions-list {
+    padding-left: 1.6em;
+    color: var(--text-secondary);
+  }
+
+  .sd-decisions-list li {
+    margin-bottom: 0.5em;
+    line-height: 1.6;
+  }
+
+  /* ── Tier labels ─────────────────────────────────────────────────── */
+  .sd-tier-label {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 0.72rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--text-muted);
+    margin: 20px 0 10px;
+  }
+
+  /* ── Service grid ────────────────────────────────────────────────── */
+  .sd-service-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+    gap: 14px;
+    margin-bottom: 8px;
+  }
+
+  .sd-service-card {
+    background: var(--bg-card);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius);
+    padding: 18px;
+    transition: opacity 0.3s, border-color 0.2s, box-shadow 0.2s;
+    cursor: default;
+  }
+
+  .sd-service-card:hover {
+    border-color: var(--accent);
+    box-shadow: 0 2px 12px rgba(45, 91, 227, 0.08);
+  }
+
+  .sd-service-card.sd-highlight {
+    border-color: var(--accent);
+    box-shadow: 0 2px 16px rgba(45, 91, 227, 0.14);
+  }
+
+  .sd-service-icon {
+    font-size: 1.5rem;
+    margin-bottom: 8px;
+  }
+
+  .sd-service-name {
+    font-weight: 700;
+    font-size: 1rem;
+    color: var(--text-primary);
+    margin-bottom: 2px;
+  }
+
+  .sd-service-kind {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 0.72rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-muted);
+    margin-bottom: 6px;
+  }
+
+  .sd-service-tech {
+    font-family: 'SF Mono', 'Fira Code', Menlo, Consolas, monospace;
+    font-size: 0.78rem;
+    color: #1a3fa0;
+    background: var(--accent-faint);
+    display: inline-block;
+    padding: 1px 8px;
+    border-radius: 4px;
+    margin-bottom: 4px;
+  }
+
+  .sd-service-port {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 0.75rem;
+    color: var(--text-muted);
+    margin-bottom: 6px;
+  }
+
+  .sd-service-desc {
+    font-size: 0.88rem;
+    color: var(--text-secondary);
+    line-height: 1.55;
+    margin-top: 6px;
+  }
+
+  /* ── Connections list ────────────────────────────────────────────── */
+  .sd-connections-list {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .sd-connection-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 16px;
+    background: var(--bg-card);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-sm);
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 0.88rem;
+    transition: opacity 0.3s;
+    flex-wrap: wrap;
+  }
+
+  .sd-conn-from, .sd-conn-to {
+    font-weight: 600;
+    color: var(--text-primary);
+  }
+
+  .sd-conn-arrow {
+    color: var(--accent);
+    font-weight: 700;
+  }
+
+  .sd-conn-proto {
+    font-size: 0.78rem;
+    color: var(--text-muted);
+  }
+
+  .sd-conn-label {
+    color: var(--text-secondary);
+    font-weight: 400;
+    margin-left: auto;
+  }
+
+  /* ── Call paths (details/summary) ────────────────────────────────── */
+  .sd-call-path {
+    background: var(--bg-card);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius);
+    margin-bottom: 10px;
+    transition: opacity 0.3s;
+    overflow: hidden;
+  }
+
+  .sd-call-path summary {
+    padding: 14px 18px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-weight: 600;
+    font-size: 0.95rem;
+    color: var(--text-primary);
+    list-style: none;
+  }
+
+  .sd-call-path summary::-webkit-details-marker { display: none; }
+
+  .sd-call-path summary::before {
+    content: '\25B6';
+    font-size: 0.65rem;
+    color: var(--text-muted);
+    transition: transform 0.2s;
+    flex-shrink: 0;
+  }
+
+  .sd-call-path[open] summary::before {
+    transform: rotate(90deg);
+  }
+
+  .sd-cp-name { flex: 1; }
+
+  .sd-cp-journey {
+    font-size: 0.72rem;
+    font-weight: 500;
+    color: var(--accent);
+    background: var(--accent-faint);
+    padding: 2px 8px;
+    border-radius: 100px;
+  }
+
+  .sd-cp-desc {
+    padding: 0 18px 12px;
+    font-size: 0.9rem;
+    color: var(--text-secondary);
+    line-height: 1.6;
+  }
+
+  /* ── Sequence diagram rows ───────────────────────────────────────── */
+  .sd-sequence {
+    margin: 0 18px 18px;
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-sm);
+    overflow-x: auto;
+  }
+
+  .sd-seq-header, .sd-seq-row {
+    display: grid;
+    grid-template-columns: 40px 1fr 32px 1fr 2fr 1.5fr;
+    gap: 8px;
+    padding: 8px 14px;
+    align-items: start;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 0.82rem;
+  }
+
+  .sd-seq-header {
+    background: rgba(0, 0, 0, 0.02);
+    font-weight: 700;
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--text-muted);
+    border-bottom: 1px solid var(--border-subtle);
+  }
+
+  .sd-seq-row {
+    border-bottom: 1px solid var(--border-subtle);
+    color: var(--text-secondary);
+  }
+
+  .sd-seq-row:last-child { border-bottom: none; }
+
+  .sd-seq-row:hover { background: rgba(45, 91, 227, 0.02); }
+
+  .sd-seq-num {
+    font-weight: 700;
+    color: var(--accent);
+    text-align: center;
+  }
+
+  .sd-seq-from, .sd-seq-to { font-weight: 600; color: var(--text-primary); }
+
+  .sd-seq-arrow { color: var(--accent); text-align: center; font-weight: 700; }
+
+  .sd-seq-action { color: var(--text-primary); }
+
+  .sd-seq-detail {
+    font-size: 0.78rem;
+    color: var(--text-muted);
+    margin-top: 2px;
+  }
+
+  .sd-seq-returns {
+    font-family: 'SF Mono', 'Fira Code', Menlo, Consolas, monospace;
+    font-size: 0.78rem;
+    color: var(--text-muted);
+  }
+
+  /* ── Expand/collapse button ──────────────────────────────────────── */
+  .sd-expand-btn {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 12px;
+    font-weight: 500;
+    padding: 4px 14px;
+    border: 1px solid var(--border-medium);
+    border-radius: var(--radius-sm);
+    background: var(--bg-card);
+    color: var(--text-secondary);
+    cursor: pointer;
+    margin-bottom: 14px;
+    transition: all 0.15s;
+  }
+
+  .sd-expand-btn:hover {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+
+  /* ── Tables ──────────────────────────────────────────────────────── */
+  .sd-table-wrap {
+    overflow-x: auto;
+  }
+
+  .sd-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.88rem;
+    border-radius: var(--radius);
+    overflow: hidden;
+    border: 1px solid var(--border-subtle);
+  }
+
+  .sd-table th, .sd-table td {
+    padding: 10px 14px;
+    text-align: left;
+    border-bottom: 1px solid var(--border-subtle);
+  }
+
+  .sd-table th {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-weight: 600;
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--text-muted);
+    background: rgba(0, 0, 0, 0.02);
+  }
+
+  .sd-table tr:last-child td { border-bottom: none; }
+  .sd-table tr:hover td { background: rgba(45, 91, 227, 0.02); }
+
+  .sd-table code {
+    font-family: 'SF Mono', 'Fira Code', Menlo, Consolas, monospace;
+    font-size: 0.82em;
+    background: var(--accent-faint);
+    padding: 2px 6px;
+    border-radius: 4px;
+    color: #1a3fa0;
+    word-break: break-all;
+  }
+
+  .sd-svc-ref {
+    cursor: pointer;
+    font-weight: 500;
+    color: var(--accent);
+    transition: color 0.15s;
+  }
+
+  .sd-svc-ref:hover { color: #1a3fa0; }
+
+  .sd-rel-kind {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 0.78rem;
+    font-weight: 500;
+    color: var(--text-muted);
+    background: rgba(0,0,0,0.03);
+    padding: 2px 8px;
+    border-radius: 4px;
+  }
+
+  /* ── Entity grid ─────────────────────────────────────────────────── */
+  .sd-entity-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+    gap: 14px;
+  }
+
+  .sd-entity-card {
+    background: var(--bg-card);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius);
+    overflow: hidden;
+    transition: opacity 0.3s, border-color 0.2s, box-shadow 0.2s;
+  }
+
+  .sd-entity-card:hover {
+    border-color: var(--accent);
+    box-shadow: 0 2px 12px rgba(45, 91, 227, 0.08);
+  }
+
+  .sd-entity-card.sd-highlight {
+    border-color: var(--accent);
+    box-shadow: 0 2px 16px rgba(45, 91, 227, 0.14);
+  }
+
+  .sd-entity-header {
+    padding: 14px 16px 10px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    border-bottom: 1px solid var(--border-subtle);
+  }
+
+  .sd-entity-name {
+    font-size: 1rem;
+    font-weight: 700;
+    color: var(--text-primary);
+  }
+
+  .sd-entity-svc {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 0.72rem;
+    font-weight: 500;
+    color: var(--accent);
+    background: var(--accent-faint);
+    padding: 2px 8px;
+    border-radius: 100px;
+    cursor: pointer;
+  }
+
+  .sd-field-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.82rem;
+  }
+
+  .sd-field-table th, .sd-field-table td {
+    padding: 7px 16px;
+    text-align: left;
+    border-bottom: 1px solid var(--border-subtle);
+  }
+
+  .sd-field-table th {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-weight: 600;
+    font-size: 0.68rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--text-muted);
+    background: rgba(0, 0, 0, 0.015);
+  }
+
+  .sd-field-table tr:last-child td { border-bottom: none; }
+  .sd-field-table tr:hover td { background: rgba(45, 91, 227, 0.02); }
+
+  .sd-field-table code {
+    font-family: 'SF Mono', 'Fira Code', Menlo, Consolas, monospace;
+    font-size: 0.85em;
+    background: var(--accent-faint);
+    padding: 1px 5px;
+    border-radius: 3px;
+    color: #1a3fa0;
+  }
+
+  /* ── Risks ───────────────────────────────────────────────────────── */
+  .sd-risks-list {
+    list-style: none;
+    padding: 0;
+  }
+
+  .sd-risks-list li {
+    padding: 10px 16px;
+    margin-bottom: 6px;
+    background: #fef3f2;
+    border: 1px solid rgba(239, 68, 68, 0.12);
+    border-left: 3px solid #ef4444;
+    border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+    font-size: 0.92rem;
+    color: var(--text-secondary);
+    line-height: 1.6;
+  }
+
+  /* ── Footer ──────────────────────────────────────────────────────── */
+  .sd-footer {
+    max-width: var(--content-width);
+    margin: 0 auto;
+    padding: 24px var(--gutter) 48px;
+    text-align: center;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 0.75rem;
+    color: var(--text-muted);
+    border-top: 1px solid var(--border-subtle);
+  }
+
+  /* ── Dimmed state for journey filtering ──────────────────────────── */
+  .sd-dimmed {
+    opacity: 0.15 !important;
+    pointer-events: none;
+  }
+
+  /* ── Entrance animation ──────────────────────────────────────────── */
+  @keyframes sd-fade-up {
+    from { opacity: 0; transform: translateY(12px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+
+  .sd-header, .sd-main {
+    animation: sd-fade-up 0.45s ease both;
+  }
+
+  .sd-main { animation-delay: 0.08s; }
+
+  /* ── Responsive ──────────────────────────────────────────────────── */
+  @media (max-width: 700px) {
+    html { font-size: 15px; }
+    .sd-service-grid { grid-template-columns: 1fr; }
+    .sd-entity-grid { grid-template-columns: 1fr; }
+    .sd-seq-header, .sd-seq-row {
+      grid-template-columns: 32px 1fr 24px 1fr 1.5fr 1fr;
+      font-size: 0.75rem;
+    }
+  }
+
+  @media (max-width: 480px) {
+    .sd-header-inner { padding: 16px 0 12px; }
+    .sd-nav { gap: 4px; }
+    .sd-nav-link { font-size: 12px; padding: 3px 8px; }
+    .sd-filters { gap: 4px; }
+  }
+</style>
+</head>
+<body>
+<header class="sd-header">
+<div class="sd-header-inner">
+<h1 class="sd-title">SF-4 Workflow Migration &amp; Litmus Test</h1>
+<nav class="sd-nav" id="sd-nav">
+<a href="#overview" class="sd-nav-link">Overview</a>
+<a href="#topology" class="sd-nav-link">Topology</a>
+<a href="#call-paths" class="sd-nav-link">Call Paths</a>
+<a href="#endpoints" class="sd-nav-link">Endpoints</a>
+<a href="#entities" class="sd-nav-link">Entities</a>
+<a href="#relations" class="sd-nav-link">Relations</a>
+<a href="#risks" class="sd-nav-link">Risks</a>
+</nav>
+<div class="sd-filters" id="sd-filters">
+<span class="sd-filter-label">Filter by journey:</span>
+<button class="sd-pill sd-pill-active" data-journey="__all__" onclick="window.__sd_filter('__all__')">All</button>
+<button class="sd-pill" data-journey="J-1" onclick="window.__sd_filter('J-1')">J-1</button>
+<button class="sd-pill" data-journey="J-2" onclick="window.__sd_filter('J-2')">J-2</button>
+<button class="sd-pill" data-journey="J-3" onclick="window.__sd_filter('J-3')">J-3</button>
+<button class="sd-pill" data-journey="J-4" onclick="window.__sd_filter('J-4')">J-4</button>
+</div>
+</div>
+</header>
+<main class="sd-main">
+<section class="sd-section" id="overview">
+<h2 class="sd-section-title">Overview</h2>
+<p class="sd-overview-text">SF-4 migrates three imperative Python workflows (planning, develop, bugfix) into declarative YAML conforming to the SF-1 schema, reclassifying 12 specialized plugins into three categories: general plugin type instances (store/hosting/mcp/subprocess/http/config), inline edge transforms for pure data functions, and AskNodes for LLM-mediated operations. iriai-build-v2 serves as the runner application with minimal updates: a thin _declarative.py wrapper imports iriai_compose.declarative.run(), maps BootstrappedEnv services to RuntimeConfig via D-A4 bridge adapters, and adds a --yaml CLI flag. RuntimeConfig uses authoritative field names per PRD R5: agent_runtime (singular AgentRuntime, not a dict), plugin_registry (not plugins dict). This revision aligns SF-4 to SF-2's canonical non-breaking runtime ABI: AgentRuntime.invoke() stays unchanged, node_id is propagated through runner-managed ContextVars, hierarchical context assembly is standardized to workflow -&gt; phase -&gt; actor -&gt; node, and core checkpoint/resume is not part of the SF-2 contract. The plan defines six general plugin type interfaces, seven Category B edge transforms, three Category C AskNode conversions, three reusable task templates, ~50-55 behavioral equivalence tests, and a JSON seed package for SF-5 database seeding. D-GR-41 corrections applied: iriai_compose.schema export list corrected (phantom MapNode/FoldNode/LoopNode/TransformRef/HookRef removed, CostConfig replaced by WorkflowCostConfig/PhaseCostConfig/NodeCostConfig, 10+ missing exports added); run() signature fixed to (workflow: WorkflowConfig, config: RuntimeConfig, *, inputs=None); AskNode.actor_ref canonical field and prompt-only contract clarified; ActorDefinition.actor_type enum corrected to agent|human.</p>
+<h3 class="sd-subsection-title">Architecture Decisions</h3>
+<ol class="sd-decisions-list">
+<li>D-GR-41 (SF-1→SF-2): iriai_compose.schema canonical exports corrected — CostConfig replaced by WorkflowCostConfig/PhaseCostConfig/NodeCostConfig, phantoms MapNode/FoldNode/LoopNode/TransformRef/HookRef confirmed absent, renamed types applied (Edge→EdgeDefinition, TemplateRef→TemplateDefinition, MapConfig→MapModeConfig, FoldConfig→FoldModeConfig, LoopConfig→LoopModeConfig, SequentialConfig→SequentialModeConfig), 10+ missing exports added (BranchOutputPort, WorkflowInputDefinition, WorkflowOutputDefinition, HookPortEvent, TemplateDefinition, StoreKeyDefinition, WorkflowCostConfig, PhaseCostConfig, NodeCostConfig).</li>
+<li>D-GR-41 (SF-2→SF-3): run() canonical ABI signature is run(workflow: WorkflowConfig, config: RuntimeConfig, *, inputs: dict | None = None) -&gt; ExecutionResult. Caller must call load_workflow(path) -&gt; WorkflowConfig separately before calling run(). Deprecated signature (yaml_path, runtime, workspace, transform_registry, hook_registry) is not valid.</li>
+<li>D-GR-41 (SF-1→SF-4): AskNode uses actor_ref (not actor) and prompt (not task or context_text) as canonical fields. ActorDefinition.actor_type is Literal['agent', 'human'] — 'interaction' is not valid. WorkflowConfig has context_keys at root level (workflow-level context layer, merged first).</li>
+<li>D-GR-35: BranchNode uses BranchOutputPort per output port, each with its own condition expression. Non-exclusive fan-out — multiple ports fire if conditions met. merge_function valid for gather. switch_function and output_field removed entirely.</li>
+<li>D-GR-34: ActorDefinition.actor_type Literal['agent', 'human'] only. No 'interaction' alias. ExecutionResult includes history (list[NodeExecutionRecord]) and phase_metrics (dict[str, PhaseMetrics]) fields.</li>
+<li>D-SF4-1: Three-category reclassification of 12 specialized plugins: (A) infrastructure connectors → 6 general plugin type instances (store/hosting/mcp/subprocess/http/config), (B) pure data transforms → inline EdgeDefinition.transform_fn, (C) LLM-mediated computation → AskNodes.</li>
+<li>D-SF4-7: Store plugins are WRITE-ONLY (D-GR-14). context_keys = READ. PluginNode with plugin_type=store = WRITE. No artifact_key auto-write.</li>
+<li>D-SF4-10: Hierarchical context: workflow -&gt; phase -&gt; actor -&gt; node, deduplicated first-seen order. Authoritative SF-2 ABI shared by SF-3 and SF-4.</li>
+<li>D-SF4-22: iriai-build-v2 is read-only for all existing Python workflow classes. Only additive: workflows/_declarative.py wrapper + --yaml CLI flag.</li>
+<li>D-SF4-25: D-A4 bridge in iriai_compose/plugins/adapters.py uses Protocol-based structural typing. No consumer type imports.</li>
+<li>D-SF4-27: SF-2 dag-loader-runner owns canonical runtime ABI: AgentRuntime.invoke() unchanged, ContextVars publish phase_id/node_id, fixed context merge order, checkpoint/resume out of SF-2 boundary.</li>
+</ol>
+</section>
+<section class="sd-section" id="topology">
+<h2 class="sd-section-title">Service Topology</h2>
+<h4 class="sd-tier-label">Services &amp; External</h4>
+<div class="sd-service-grid">
+<div class="sd-service-card" data-service-id="iriai_compose_schema" data-journeys="">
+<div class="sd-service-icon">&#x2699;&#xFE0F;</div>
+<div class="sd-service-name">iriai_compose.schema</div>
+<div class="sd-service-kind">service</div>
+<div class="sd-service-tech">Python</div>
+<p class="sd-service-desc">SF-1 declarative schema module. Canonical exports: WorkflowConfig, PhaseDefinition, AskNode, BranchNode, BranchOutputPort, PluginNode, ErrorNode, EdgeDefinition, PortDefinition, ActorDefinition, RoleDefinition, TypeDefinition, MapModeConfig, FoldModeConfig, LoopModeConfig, SequentialModeConfig, StoreDefinition, StoreKeyDefinition, PluginInterface, PluginInstanceConfig, TemplateDefinition, WorkflowInputDefinition, WorkflowOutputDefinition, HookPortEvent, WorkflowCostConfig, PhaseCostConfig, NodeCostConfig. NOT exported (phantoms removed): MapNode, FoldNode, LoopNode, TransformRef, HookRef. Replaced: CostConfig (split into WorkflowCostConfig/PhaseCostConfig/NodeCostConfig). Renamed: Edge→EdgeDefinition, TemplateRef→TemplateDefinition, MapConfig/FoldConfig/LoopConfig/SequentialConfig→MapModeConfig/FoldModeConfig/LoopModeConfig/SequentialModeConfig.</p>
+</div>
+<div class="sd-service-card" data-service-id="schema_validation" data-journeys="">
+<div class="sd-service-icon">&#x2699;&#xFE0F;</div>
+<div class="sd-service-name">iriai_compose.schema.validation</div>
+<div class="sd-service-kind">service</div>
+<div class="sd-service-tech">Python</div>
+<p class="sd-service-desc">Structural validation: validate_workflow(), validate_type_flow(), detect_cycles() — returns list[ValidationError] using 21 canonical error codes (H-3)</p>
+</div>
+<div class="sd-service-card" data-service-id="schema_io" data-journeys="">
+<div class="sd-service-icon">&#x2699;&#xFE0F;</div>
+<div class="sd-service-name">iriai_compose.schema.io</div>
+<div class="sd-service-kind">service</div>
+<div class="sd-service-tech">Python</div>
+<p class="sd-service-desc">YAML serialization: load_workflow(path: str | Path) -&gt; WorkflowConfig and dump_workflow(config: WorkflowConfig) -&gt; str</p>
+</div>
+<div class="sd-service-card" data-service-id="iriai_compose_declarative" data-journeys="">
+<div class="sd-service-icon">&#x2699;&#xFE0F;</div>
+<div class="sd-service-name">iriai_compose.declarative</div>
+<div class="sd-service-kind">service</div>
+<div class="sd-service-tech">Python</div>
+<p class="sd-service-desc">SF-2 DAG loader and runner. Canonical ABI: run(workflow: WorkflowConfig, config: RuntimeConfig, *, inputs: dict | None = None) -&gt; ExecutionResult. Also exports: load_workflow(path) -&gt; WorkflowConfig (convenience wrapper around schema_io.load_workflow), validate(source: WorkflowConfig, plugins: PluginRegistry | None = None) -&gt; list[ValidationIssue], RuntimeConfig, ExecutionResult, PluginRegistry, ErrorRoute, CostSummary. Evaluates AST-validated transform_fn on edge traversal, dispatches PluginNode execution by plugin_type + instance config, sets phase/node ContextVars for each node execution, assembles deduplicated context in workflow -&gt; phase -&gt; actor -&gt; node order before calling AgentRuntime.invoke() with its existing unchanged signature. Checkpoint/resume is NOT part of this ABI.</p>
+</div>
+<div class="sd-service-card" data-service-id="iriai_compose_testing" data-journeys="">
+<div class="sd-service-icon">&#x2699;&#xFE0F;</div>
+<div class="sd-service-name">iriai_compose.testing</div>
+<div class="sd-service-kind">service</div>
+<div class="sd-service-tech">Python</div>
+<p class="sd-service-desc">SF-3 testing framework (downstream consumer of SF-2 ABI): MockAgentRuntime, MockInteractionRuntime, MockPluginRuntime, fluent mock API (when_node/when_role/default_response), exception injection (raise_error/SimulatedCrash), 12+ assertion functions, 10 preset fixture factories, WorkflowTestCase, execution trace snapshots. Contract: MockAgentRuntime.invoke() matches AgentRuntime.invoke() unchanged signature; node_id is captured from ContextVar-backed execution scope (not invoke kwargs). Exports: run_test(workflow, mocks, initial_input) -&gt; ExecutionResult, assert_node_reached, assert_artifact, assert_branch_taken, assert_phase_executed, assert_loop_iterations, assert_fold_items_processed, assert_error_routed, assert_yaml_round_trip, assert_validation_error, assert_node_count.</p>
+</div>
+<div class="sd-service-card" data-service-id="iriai_compose_plugins" data-journeys="">
+<div class="sd-service-icon">&#x2699;&#xFE0F;</div>
+<div class="sd-service-name">iriai_compose.plugins</div>
+<div class="sd-service-kind">service</div>
+<div class="sd-service-tech">Python</div>
+<p class="sd-service-desc">Plugin system root: register_plugin_types(registry: PluginRegistry) -&gt; None and register_instances(registry: PluginRegistry) -&gt; None. Includes adapters.py with D-A4 bridge (create_plugin_runtimes factory, Protocol-based structural typing).</p>
+</div>
+<div class="sd-service-card" data-service-id="plugins_types" data-journeys="">
+<div class="sd-service-icon">&#x2699;&#xFE0F;</div>
+<div class="sd-service-name">iriai_compose.plugins.types</div>
+<div class="sd-service-kind">service</div>
+<div class="sd-service-tech">Python</div>
+<p class="sd-service-desc">6 general PluginInterface declarations: STORE_INTERFACE (operations: put, delete), HOSTING_INTERFACE (operations: push, update, collect_annotations, clear_feedback), MCP_INTERFACE (operations: call_tool), SUBPROCESS_INTERFACE (operations: execute), HTTP_INTERFACE (operations: request), CONFIG_INTERFACE (operations: resolve — for secret/env resolution per D-GR-10)</p>
+</div>
+<div class="sd-service-card" data-service-id="plugins_instances" data-journeys="">
+<div class="sd-service-icon">&#x2699;&#xFE0F;</div>
+<div class="sd-service-name">iriai_compose.plugins.instances</div>
+<div class="sd-service-kind">service</div>
+<div class="sd-service-tech">Python</div>
+<p class="sd-service-desc">Concrete PluginInstanceConfig entries: artifact_db (plugin_type: store, backend: postgres), artifact_mirror (plugin_type: store, backend: filesystem), doc_host (plugin_type: hosting, backend: iriai-feedback), preview (plugin_type: mcp, server: preview-service), playwright (plugin_type: mcp, server: playwright), git (plugin_type: subprocess, executable: git), feedback_notify (plugin_type: http, url: ${FEEDBACK_SERVICE_URL}/notify), env_overrides (plugin_type: config — secrets configured on instance per D-GR-10)</p>
+</div>
+<div class="sd-service-card" data-service-id="plugins_transforms" data-journeys="">
+<div class="sd-service-icon">&#x2699;&#xFE0F;</div>
+<div class="sd-service-name">iriai_compose.plugins.transforms</div>
+<div class="sd-service-kind">service</div>
+<div class="sd-service-tech">Python</div>
+<p class="sd-service-desc">7 Category B edge transform Python string constants (AST-validated, pure functions): tiered_context_builder, handover_compress, feedback_formatter, id_renumberer, collect_files, normalize_review_slugs, build_task_prompt. build_env_overrides reclassified to config Plugin per D-GR-10 and NOT in this module.</p>
+</div>
+<div class="sd-service-card" data-service-id="plugins_adapters" data-journeys="J-1 J-2 J-3">
+<div class="sd-service-icon">&#x2699;&#xFE0F;</div>
+<div class="sd-service-name">iriai_compose.plugins.adapters</div>
+<div class="sd-service-kind">service</div>
+<div class="sd-service-tech">Python</div>
+<p class="sd-service-desc">D-A4 runtime bridge adapters: StorePluginAdapter, HostingPluginAdapter, McpPluginAdapter, SubprocessPluginAdapter, HttpPluginAdapter, ConfigPluginAdapter. Protocol-based structural typing (D-SF4-25). create_plugin_runtimes(services: dict, feature_id: str, artifacts: ArtifactStore) -&gt; dict[str, PluginRuntime] factory maps consumer service objects to PluginRuntime instances without importing consumer types.</p>
+</div>
+<div class="sd-service-card" data-service-id="iriai_build_v2_runner" data-journeys="J-1 J-2 J-3">
+<div class="sd-service-icon">&#x2699;&#xFE0F;</div>
+<div class="sd-service-name">iriai-build-v2 (Runner Application)</div>
+<div class="sd-service-kind">service</div>
+<div class="sd-service-tech">Python</div>
+<p class="sd-service-desc">Thin declarative runner wrapper (D-SF4-26). workflows/_declarative.py (~100 lines): calls schema_io.load_workflow(yaml_path) -&gt; WorkflowConfig, then run(workflow=loaded_config, config=RuntimeConfig(agent_runtime=ClaudeAgentRuntime(...), plugin_registry=registry, ...), inputs=None). CLI app.py gains --yaml flag on plan/develop/bugfix commands. Additive only — existing PlanningWorkflow, FullDevelopWorkflow, BugFixWorkflow and TrackedWorkflowRunner untouched. Existing ClaudeAgentRuntime/CodexAgentRuntime invoke signatures remain unchanged.</p>
+</div>
+<div class="sd-service-card" data-service-id="planning_workflow" data-journeys="">
+<div class="sd-service-icon">&#x2699;&#xFE0F;</div>
+<div class="sd-service-name">planning.yaml</div>
+<div class="sd-service-kind">service</div>
+<div class="sd-service-tech">YAML</div>
+<p class="sd-service-desc">6-phase planning workflow: scoping (loop) → PM (sequential) → design (sequential) → architecture (sequential) → plan_review (loop) → task_planning (sequential). Declares input_type: ScopeOutput. Artifact writes via explicit store PluginNodes (D-GR-14). All actor_refs use actor_type: agent or human (not interaction).</p>
+</div>
+<div class="sd-service-card" data-service-id="develop_workflow" data-journeys="">
+<div class="sd-service-icon">&#x2699;&#xFE0F;</div>
+<div class="sd-service-name">develop.yaml</div>
+<div class="sd-service-kind">service</div>
+<div class="sd-service-tech">YAML</div>
+<p class="sd-service-desc">7-phase development workflow: 6 planning phases (standalone, no cross-file $ref) + ImplementationPhase (loop with fold &gt; map &gt; loop nesting). Standalone — no cross-file $ref to planning.yaml. Artifact writes via explicit store PluginNodes (D-GR-14).</p>
+</div>
+<div class="sd-service-card" data-service-id="bugfix_workflow" data-journeys="">
+<div class="sd-service-icon">&#x2699;&#xFE0F;</div>
+<div class="sd-service-name">bugfix.yaml</div>
+<div class="sd-service-kind">service</div>
+<div class="sd-service-tech">YAML</div>
+<p class="sd-service-desc">8-phase bugfix workflow: intake (loop) → env_setup → baseline → reproduction → diagnosis_fix (loop, max 3) → regression → approval → cleanup. Declares input_type: BugReport. Uses env_overrides config plugin (D-GR-10) in env_setup phase. Artifact writes via explicit store PluginNodes (D-GR-14).</p>
+</div>
+<div class="sd-service-card" data-service-id="task_templates" data-journeys="">
+<div class="sd-service-icon">&#x2699;&#xFE0F;</div>
+<div class="sd-service-name">Task Templates</div>
+<div class="sd-service-kind">service</div>
+<div class="sd-service-tech">YAML</div>
+<p class="sd-service-desc">3 reusable actor-centric YAML task templates (TemplateDefinition): gate_and_revise (approval loop), broad_interview (single-actor interview-to-completion), interview_gate_review (compiled artifact review with revision routing and fresh_sessions: true)</p>
+</div>
+<div class="sd-service-card" data-service-id="migration_test_suite" data-journeys="">
+<div class="sd-service-icon">&#x2699;&#xFE0F;</div>
+<div class="sd-service-name">tests/migration/</div>
+<div class="sd-service-kind">service</div>
+<div class="sd-service-tech">Python/pytest</div>
+<p class="sd-service-desc">~50-55 behavioral equivalence tests: conftest.py + test_planning.py (15) + test_develop.py (15) + test_bugfix.py (12) + test_yaml_roundtrip.py (5) + test_plugin_instances.py (8) + test_edge_transforms.py (10) + contract tests for unchanged AgentRuntime.invoke(), ContextVar node_id propagation, and workflow -&gt; phase -&gt; actor -&gt; node context merge order.</p>
+</div>
+<div class="sd-service-card" data-service-id="seed_data_package" data-journeys="">
+<div class="sd-service-icon">&#x2699;&#xFE0F;</div>
+<div class="sd-service-name">Seed Data Package</div>
+<div class="sd-service-kind">service</div>
+<div class="sd-service-tech">Python/JSON</div>
+<p class="sd-service-desc">migration_seed.json (3 workflows, 10 roles, 11 schemas, 3 templates, 6 plugin types, 8 plugin instances, 7 edge transforms — all is_example: true) + idempotent seed_loader.py. CLI: python seed_loader.py [--database-url URL] [--seed-file PATH]. Prints inserted/updated/unchanged summary.</p>
+</div>
+<div class="sd-service-card" data-service-id="doc_host_service" data-journeys="">
+<div class="sd-service-icon">&#x1F517;</div>
+<div class="sd-service-name">doc_host (iriai-feedback)</div>
+<div class="sd-service-kind">external</div>
+<div class="sd-service-tech">iriai-feedback</div>
+<p class="sd-service-desc">Document hosting service providing URL generation and feedback annotation collection. Triggered via on_end hook edges from store PluginNodes (D-GR-14).</p>
+</div>
+<div class="sd-service-card" data-service-id="preview_mcp_server" data-journeys="">
+<div class="sd-service-icon">&#x1F517;</div>
+<div class="sd-service-name">preview MCP Server</div>
+<div class="sd-service-kind">external</div>
+<div class="sd-service-tech">MCP</div>
+<p class="sd-service-desc">Preview deployment MCP server invoked via mcp PluginNode. Tools: preview_deploy, preview_teardown.</p>
+</div>
+<div class="sd-service-card" data-service-id="playwright_mcp_server" data-journeys="">
+<div class="sd-service-icon">&#x1F517;</div>
+<div class="sd-service-name">playwright MCP Server</div>
+<div class="sd-service-kind">external</div>
+<div class="sd-service-tech">MCP</div>
+<p class="sd-service-desc">E2E testing MCP server. Tool: run_e2e. Used in bugfix baseline and regression phases.</p>
+</div>
+<div class="sd-service-card" data-service-id="git_cli" data-journeys="">
+<div class="sd-service-icon">&#x1F517;</div>
+<div class="sd-service-name">git CLI</div>
+<div class="sd-service-kind">external</div>
+<div class="sd-service-tech">Git</div>
+<p class="sd-service-desc">Git CLI for branch creation (checkout -b), commit, and push via subprocess PluginNode.</p>
+</div>
+<div class="sd-service-card" data-service-id="feedback_notify_service" data-journeys="">
+<div class="sd-service-icon">&#x1F517;</div>
+<div class="sd-service-name">feedback_notify (HTTP)</div>
+<div class="sd-service-kind">external</div>
+<div class="sd-service-tech">HTTP</div>
+<p class="sd-service-desc">Browser refresh notification endpoint. POST ${FEEDBACK_SERVICE_URL}/notify triggered after hosting updates.</p>
+</div>
+</div>
+<h4 class="sd-tier-label">Databases</h4>
+<div class="sd-service-grid">
+<div class="sd-service-card" data-service-id="sf5_database" data-journeys="">
+<div class="sd-service-icon">&#x1F5C3;&#xFE0F;</div>
+<div class="sd-service-name">SF-5 Database (tools/compose)</div>
+<div class="sd-service-kind">database</div>
+<div class="sd-service-tech">Postgres</div>
+<p class="sd-service-desc">PostgreSQL database in tools/compose receiving seeded workflow, role, schema, template, plugin type, plugin instance, and edge transform records via seed_loader.py upsert. Tables: workflows, roles, schemas, templates, plugin_types, plugin_instances, edge_transforms (all with is_example column).</p>
+</div>
+<div class="sd-service-card" data-service-id="artifact_db_store" data-journeys="">
+<div class="sd-service-icon">&#x1F5C3;&#xFE0F;</div>
+<div class="sd-service-name">artifact_db (Postgres Store)</div>
+<div class="sd-service-kind">database</div>
+<div class="sd-service-tech">Postgres</div>
+<p class="sd-service-desc">Primary artifact persistence. Written via explicit store PluginNode (operation: put) per D-GR-14. Read via context_keys on nodes/phases — never via store PluginNode read operations.</p>
+</div>
+</div>
+<h3 class="sd-subsection-title">Connections</h3>
+<div class="sd-connections-list">
+<div class="sd-connection-row" data-journeys="J-1 J-2 J-3"><span class="sd-conn-from">iriai-build-v2 (Runner Application)</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">iriai_compose.declarative</span><span class="sd-conn-proto"> (Python import)</span><span class="sd-conn-label">calls run(workflow=loaded_config, config=RuntimeConfig(agent_runtime=ClaudeAgentRuntime(...), plugin_registry=registry, artifacts=env.artifacts, sessions=env.sessions, workspace=workspace, feature=feature), inputs=None) -&gt; ExecutionResult. node_id stays internal via ContextVar. run() signature: (workflow: WorkflowConfig, config: RuntimeConfig, *, inputs: dict | None = None) -&gt; ExecutionResult.</span></div>
+<div class="sd-connection-row" data-journeys="J-1 J-2 J-3"><span class="sd-conn-from">iriai-build-v2 (Runner Application)</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">iriai_compose.schema.io</span><span class="sd-conn-proto"> (Python import)</span><span class="sd-conn-label">calls load_workflow(yaml_path: str | Path) -&gt; WorkflowConfig before calling declarative.run(). Load and run are separate steps: load first, validate, then run.</span></div>
+<div class="sd-connection-row" data-journeys="J-1 J-2 J-3"><span class="sd-conn-from">iriai-build-v2 (Runner Application)</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">iriai_compose.plugins.adapters</span><span class="sd-conn-proto"> (Python import)</span><span class="sd-conn-label">calls create_plugin_runtimes(services=env_services_dict, feature_id=feature.id, artifacts=env.artifacts) -&gt; dict[str, PluginRuntime] to map BootstrappedEnv services to PluginRuntime instances for PluginRegistry</span></div>
+<div class="sd-connection-row" data-journeys="J-1"><span class="sd-conn-from">iriai-build-v2 (Runner Application)</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">planning.yaml</span><span class="sd-conn-proto"> (YAML file)</span><span class="sd-conn-label">loads planning.yaml via --yaml flag; passes to load_workflow()</span></div>
+<div class="sd-connection-row" data-journeys="J-2"><span class="sd-conn-from">iriai-build-v2 (Runner Application)</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">develop.yaml</span><span class="sd-conn-proto"> (YAML file)</span><span class="sd-conn-label">loads develop.yaml via --yaml flag; passes to load_workflow()</span></div>
+<div class="sd-connection-row" data-journeys="J-3"><span class="sd-conn-from">iriai-build-v2 (Runner Application)</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">bugfix.yaml</span><span class="sd-conn-proto"> (YAML file)</span><span class="sd-conn-label">loads bugfix.yaml via --yaml flag; passes to load_workflow()</span></div>
+<div class="sd-connection-row" data-journeys=""><span class="sd-conn-from">iriai_compose.declarative</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">iriai_compose.schema</span><span class="sd-conn-proto"> (Python import)</span><span class="sd-conn-label">imports from iriai_compose.schema: WorkflowConfig, PhaseDefinition, AskNode, BranchNode, BranchOutputPort, PluginNode, ErrorNode, EdgeDefinition, PortDefinition, ActorDefinition, TypeDefinition, MapModeConfig, FoldModeConfig, LoopModeConfig, SequentialModeConfig, TemplateDefinition, PluginInterface, PluginInstanceConfig, WorkflowCostConfig, PhaseCostConfig, NodeCostConfig. NOT MapNode, FoldNode, LoopNode, TransformRef, HookRef.</span></div>
+<div class="sd-connection-row" data-journeys=""><span class="sd-conn-from">iriai_compose.plugins.adapters</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">iriai_compose.schema</span><span class="sd-conn-proto"> (Python import)</span><span class="sd-conn-label">imports PluginInterface, PluginInstanceConfig from iriai_compose.schema for Protocol definitions</span></div>
+<div class="sd-connection-row" data-journeys="J-1 J-2 J-3"><span class="sd-conn-from">iriai_compose.plugins.types</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">iriai_compose.schema</span><span class="sd-conn-proto"> (Python import)</span><span class="sd-conn-label">imports PluginInterface, PortDefinition, WorkflowInputDefinition, WorkflowOutputDefinition from iriai_compose.schema</span></div>
+<div class="sd-connection-row" data-journeys="J-1 J-2 J-3"><span class="sd-conn-from">iriai_compose.plugins.instances</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">iriai_compose.schema</span><span class="sd-conn-proto"> (Python import)</span><span class="sd-conn-label">imports PluginInstanceConfig from iriai_compose.schema</span></div>
+<div class="sd-connection-row" data-journeys=""><span class="sd-conn-from">iriai_compose.plugins.transforms</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">iriai_compose.plugins</span><span class="sd-conn-proto"> (Python import)</span><span class="sd-conn-label">exported as named transform string constants from iriai_compose.plugins</span></div>
+<div class="sd-connection-row" data-journeys=""><span class="sd-conn-from">iriai_compose.plugins</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">iriai_compose.plugins.types</span><span class="sd-conn-proto"> (Python import)</span><span class="sd-conn-label">calls register_plugin_types(registry) to populate PluginRegistry with 6 general interfaces</span></div>
+<div class="sd-connection-row" data-journeys=""><span class="sd-conn-from">iriai_compose.plugins</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">iriai_compose.plugins.instances</span><span class="sd-conn-proto"> (Python import)</span><span class="sd-conn-label">calls register_instances(registry) to populate PluginRegistry with 8 concrete instance configs</span></div>
+<div class="sd-connection-row" data-journeys=""><span class="sd-conn-from">iriai_compose.plugins</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">iriai_compose.plugins.adapters</span><span class="sd-conn-proto"> (Python import)</span><span class="sd-conn-label">exports create_plugin_runtimes() factory for D-A4 consumers</span></div>
+<div class="sd-connection-row" data-journeys=""><span class="sd-conn-from">iriai_compose.declarative</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">iriai_compose.plugins</span><span class="sd-conn-proto"> (Python import)</span><span class="sd-conn-label">receives PluginRegistry (populated via register_plugin_types + register_instances) for plugin dispatch during execution</span></div>
+<div class="sd-connection-row" data-journeys=""><span class="sd-conn-from">iriai_compose.schema.validation</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">iriai_compose.schema</span><span class="sd-conn-proto"> (Python import)</span><span class="sd-conn-label">imports WorkflowConfig, PhaseDefinition, EdgeDefinition, PortDefinition, ActorDefinition from iriai_compose.schema; validates instances against 21 canonical error codes</span></div>
+<div class="sd-connection-row" data-journeys=""><span class="sd-conn-from">iriai_compose.schema.io</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">iriai_compose.schema</span><span class="sd-conn-proto"> (Python import)</span><span class="sd-conn-label">imports WorkflowConfig and all sub-models from iriai_compose.schema; serializes/deserializes via YAML</span></div>
+<div class="sd-connection-row" data-journeys=""><span class="sd-conn-from">planning.yaml</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">iriai_compose.schema.io</span><span class="sd-conn-proto"> (YAML file)</span><span class="sd-conn-label">loaded by schema_io.load_workflow() -&gt; WorkflowConfig</span></div>
+<div class="sd-connection-row" data-journeys="J-1"><span class="sd-conn-from">planning.yaml</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">iriai_compose.declarative</span><span class="sd-conn-proto"> (YAML/Python)</span><span class="sd-conn-label">executed by declarative.run(workflow=loaded_config, config=RuntimeConfig(...))</span></div>
+<div class="sd-connection-row" data-journeys="J-1"><span class="sd-conn-from">planning.yaml</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">iriai_compose.plugins.instances</span><span class="sd-conn-proto"> (YAML ref)</span><span class="sd-conn-label">plugin_ref references: artifact_db, doc_host</span></div>
+<div class="sd-connection-row" data-journeys=""><span class="sd-conn-from">planning.yaml</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">Task Templates</span><span class="sd-conn-proto"> (YAML $ref)</span><span class="sd-conn-label">intra-file $ref: gate_and_revise, broad_interview, interview_gate_review</span></div>
+<div class="sd-connection-row" data-journeys=""><span class="sd-conn-from">planning.yaml</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">artifact_db (Postgres Store)</span><span class="sd-conn-proto"> (store plugin)</span><span class="sd-conn-label">explicit store PluginNode writes: scope, prd, design, plan, system_design (D-GR-14)</span></div>
+<div class="sd-connection-row" data-journeys=""><span class="sd-conn-from">planning.yaml</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">doc_host (iriai-feedback)</span><span class="sd-conn-proto"> (hosting plugin)</span><span class="sd-conn-label">hosting PluginNode pushes documents via on_end hook edges from store PluginNodes</span></div>
+<div class="sd-connection-row" data-journeys=""><span class="sd-conn-from">develop.yaml</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">iriai_compose.schema.io</span><span class="sd-conn-proto"> (YAML file)</span><span class="sd-conn-label">loaded by schema_io.load_workflow() -&gt; WorkflowConfig</span></div>
+<div class="sd-connection-row" data-journeys="J-2"><span class="sd-conn-from">develop.yaml</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">iriai_compose.declarative</span><span class="sd-conn-proto"> (YAML/Python)</span><span class="sd-conn-label">executed by declarative.run(workflow=loaded_config, config=RuntimeConfig(...))</span></div>
+<div class="sd-connection-row" data-journeys="J-2"><span class="sd-conn-from">develop.yaml</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">iriai_compose.plugins.instances</span><span class="sd-conn-proto"> (YAML ref)</span><span class="sd-conn-label">plugin_ref references: artifact_db, doc_host, git, preview</span></div>
+<div class="sd-connection-row" data-journeys=""><span class="sd-conn-from">develop.yaml</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">Task Templates</span><span class="sd-conn-proto"> (YAML $ref)</span><span class="sd-conn-label">intra-file $ref to gate_and_revise, broad_interview, interview_gate_review</span></div>
+<div class="sd-connection-row" data-journeys=""><span class="sd-conn-from">develop.yaml</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">artifact_db (Postgres Store)</span><span class="sd-conn-proto"> (store plugin)</span><span class="sd-conn-label">explicit store PluginNode writes implementation artifacts (D-GR-14)</span></div>
+<div class="sd-connection-row" data-journeys=""><span class="sd-conn-from">develop.yaml</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">doc_host (iriai-feedback)</span><span class="sd-conn-proto"> (hosting plugin)</span><span class="sd-conn-label">hosting PluginNode via on_end hooks from store PluginNodes</span></div>
+<div class="sd-connection-row" data-journeys=""><span class="sd-conn-from">develop.yaml</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">git CLI</span><span class="sd-conn-proto"> (subprocess plugin)</span><span class="sd-conn-label">subprocess PluginNode: git checkout -b, git commit, git push</span></div>
+<div class="sd-connection-row" data-journeys=""><span class="sd-conn-from">develop.yaml</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">preview MCP Server</span><span class="sd-conn-proto"> (MCP plugin)</span><span class="sd-conn-label">mcp PluginNode: call_tool(tool_name='preview_deploy', ...)</span></div>
+<div class="sd-connection-row" data-journeys=""><span class="sd-conn-from">bugfix.yaml</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">iriai_compose.schema.io</span><span class="sd-conn-proto"> (YAML file)</span><span class="sd-conn-label">loaded by schema_io.load_workflow() -&gt; WorkflowConfig</span></div>
+<div class="sd-connection-row" data-journeys="J-3"><span class="sd-conn-from">bugfix.yaml</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">iriai_compose.declarative</span><span class="sd-conn-proto"> (YAML/Python)</span><span class="sd-conn-label">executed by declarative.run(workflow=loaded_config, config=RuntimeConfig(...))</span></div>
+<div class="sd-connection-row" data-journeys="J-3"><span class="sd-conn-from">bugfix.yaml</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">iriai_compose.plugins.instances</span><span class="sd-conn-proto"> (YAML ref)</span><span class="sd-conn-label">plugin_ref references: artifact_db, doc_host, git, preview, playwright, env_overrides</span></div>
+<div class="sd-connection-row" data-journeys=""><span class="sd-conn-from">bugfix.yaml</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">artifact_db (Postgres Store)</span><span class="sd-conn-proto"> (store plugin)</span><span class="sd-conn-label">explicit store PluginNode writes: bug_report, reproduction, rca, fix_result (D-GR-14)</span></div>
+<div class="sd-connection-row" data-journeys=""><span class="sd-conn-from">bugfix.yaml</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">git CLI</span><span class="sd-conn-proto"> (subprocess plugin)</span><span class="sd-conn-label">subprocess PluginNode: git checkout -b, git commit -am, git push</span></div>
+<div class="sd-connection-row" data-journeys=""><span class="sd-conn-from">bugfix.yaml</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">preview MCP Server</span><span class="sd-conn-proto"> (MCP plugin)</span><span class="sd-conn-label">mcp PluginNode: call_tool(tool_name='preview_deploy', force=True) and call_tool(tool_name='preview_teardown')</span></div>
+<div class="sd-connection-row" data-journeys=""><span class="sd-conn-from">bugfix.yaml</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">playwright MCP Server</span><span class="sd-conn-proto"> (MCP plugin)</span><span class="sd-conn-label">mcp PluginNode: call_tool(tool_name='run_e2e', ...) in baseline and regression phases</span></div>
+<div class="sd-connection-row" data-journeys=""><span class="sd-conn-from">bugfix.yaml</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">feedback_notify (HTTP)</span><span class="sd-conn-proto"> (HTTP)</span><span class="sd-conn-label">http PluginNode: request(method='POST', url='${FEEDBACK_SERVICE_URL}/notify') after hosting updates</span></div>
+<div class="sd-connection-row" data-journeys=""><span class="sd-conn-from">Task Templates</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">iriai_compose.plugins.instances</span><span class="sd-conn-proto"> (YAML ref)</span><span class="sd-conn-label">uses artifact_db and doc_host plugin instance refs</span></div>
+<div class="sd-connection-row" data-journeys="J-4"><span class="sd-conn-from">tests/migration/</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">iriai_compose.schema</span><span class="sd-conn-proto"> (Python import)</span><span class="sd-conn-label">imports ValidationError from iriai_compose.schema (via schema_validation re-export)</span></div>
+<div class="sd-connection-row" data-journeys="J-4"><span class="sd-conn-from">tests/migration/</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">iriai_compose.schema.validation</span><span class="sd-conn-proto"> (Python import)</span><span class="sd-conn-label">calls validate_workflow(config) -&gt; list[ValidationError], validate_type_flow(config) -&gt; list[ValidationError], detect_cycles(config) -&gt; list[ValidationError]</span></div>
+<div class="sd-connection-row" data-journeys="J-4"><span class="sd-conn-from">tests/migration/</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">iriai_compose.declarative</span><span class="sd-conn-proto"> (Python import)</span><span class="sd-conn-label">imports run(workflow: WorkflowConfig, config: RuntimeConfig, *, inputs=None) -&gt; ExecutionResult, load_workflow(path) -&gt; WorkflowConfig, PluginRegistry. Does NOT use deprecated (yaml_path, runtime, workspace, transform_registry, hook_registry) signature.</span></div>
+<div class="sd-connection-row" data-journeys="J-4"><span class="sd-conn-from">tests/migration/</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">iriai_compose.testing</span><span class="sd-conn-proto"> (Python import)</span><span class="sd-conn-label">imports MockAgentRuntime, MockInteractionRuntime, MockPluginRuntime, run_test, assert_node_reached, assert_artifact, assert_branch_taken, assert_phase_executed, assert_loop_iterations, assert_fold_items_processed, assert_error_routed, assert_yaml_round_trip, assert_validation_error, assert_node_count. MockAgentRuntime.invoke() matches AgentRuntime.invoke() unchanged; node_id from ContextVar scope.</span></div>
+<div class="sd-connection-row" data-journeys=""><span class="sd-conn-from">tests/migration/</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">iriai_compose.plugins</span><span class="sd-conn-proto"> (Python import)</span><span class="sd-conn-label">calls register_plugin_types(registry), register_instances(registry) to populate test PluginRegistry</span></div>
+<div class="sd-connection-row" data-journeys=""><span class="sd-conn-from">tests/migration/</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">planning.yaml</span><span class="sd-conn-proto"> (File read)</span><span class="sd-conn-label">loads fixture YAML via load_workflow(FIXTURES_DIR / 'planning.yaml')</span></div>
+<div class="sd-connection-row" data-journeys=""><span class="sd-conn-from">tests/migration/</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">develop.yaml</span><span class="sd-conn-proto"> (File read)</span><span class="sd-conn-label">loads fixture YAML via load_workflow(FIXTURES_DIR / 'develop.yaml')</span></div>
+<div class="sd-connection-row" data-journeys=""><span class="sd-conn-from">tests/migration/</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">bugfix.yaml</span><span class="sd-conn-proto"> (File read)</span><span class="sd-conn-label">loads fixture YAML via load_workflow(FIXTURES_DIR / 'bugfix.yaml')</span></div>
+<div class="sd-connection-row" data-journeys=""><span class="sd-conn-from">Seed Data Package</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">planning.yaml</span><span class="sd-conn-proto"> (File ref)</span><span class="sd-conn-label">reads YAML path and content for workflow seed record</span></div>
+<div class="sd-connection-row" data-journeys=""><span class="sd-conn-from">Seed Data Package</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">develop.yaml</span><span class="sd-conn-proto"> (File ref)</span><span class="sd-conn-label">reads YAML path and content for workflow seed record</span></div>
+<div class="sd-connection-row" data-journeys=""><span class="sd-conn-from">Seed Data Package</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">bugfix.yaml</span><span class="sd-conn-proto"> (File ref)</span><span class="sd-conn-label">reads YAML path and content for workflow seed record</span></div>
+<div class="sd-connection-row" data-journeys=""><span class="sd-conn-from">Seed Data Package</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">SF-5 Database (tools/compose)</span><span class="sd-conn-proto"> (DB/SQL)</span><span class="sd-conn-label">idempotent upsert via seed_loader.py: INSERT INTO workflows/roles/schemas/templates/plugin_types/plugin_instances/edge_transforms ... ON CONFLICT (slug) DO UPDATE SET ... WHERE is_example = true</span></div>
+</div>
+</section>
+<section class="sd-section" id="call-paths">
+<h2 class="sd-section-title">API Call Paths</h2>
+<button class="sd-expand-btn" id="sd-toggle-details" onclick="window.__sd_toggle_details()">Expand All</button>
+<details class="sd-call-path" data-journey-id="J-1">
+<summary>
+<span class="sd-cp-name">iriai-build-v2 Declarative Runner Bootstrap</span>
+<span class="sd-cp-journey">J-1</span>
+</summary>
+<p class="sd-cp-desc">CLI --yaml flag triggers _declarative.py wrapper: loads WorkflowConfig from YAML, bootstraps BootstrappedEnv services into RuntimeConfig, then calls iriai_compose.declarative.run(workflow=loaded_config, config=RuntimeConfig(...))</p>
+<div class="sd-sequence">
+<div class="sd-seq-header">
+<div class="sd-seq-col sd-seq-num">#</div>
+<div class="sd-seq-col sd-seq-from">From</div>
+<div class="sd-seq-col sd-seq-arrow"></div>
+<div class="sd-seq-col sd-seq-to">To</div>
+<div class="sd-seq-col sd-seq-action">Action</div>
+<div class="sd-seq-col sd-seq-returns">Returns</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">1</div>
+<div class="sd-seq-col sd-seq-from">iriai_build_v2_runner</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">iriai_build_v2_runner</div>
+<div class="sd-seq-col sd-seq-action"><div>CLI: iriai-build plan 'test' --workspace /path --yaml planning.yaml</div><div class="sd-seq-detail">Click command parses --yaml flag, calls _run() with yaml_path parameter passed to _declarative.run_declarative()</div></div>
+<div class="sd-seq-col sd-seq-returns">&mdash;</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">2</div>
+<div class="sd-seq-col sd-seq-from">iriai_build_v2_runner</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">iriai_build_v2_runner</div>
+<div class="sd-seq-col sd-seq-action"><div>bootstrap(workspace_path) -&gt; BootstrappedEnv</div><div class="sd-seq-detail">Standard bootstrap: asyncpg pool, stores, services. Same path as imperative workflows.</div></div>
+<div class="sd-seq-col sd-seq-returns">BootstrappedEnv</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">3</div>
+<div class="sd-seq-col sd-seq-from">iriai_build_v2_runner</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">schema_io</div>
+<div class="sd-seq-col sd-seq-action"><div>load_workflow(yaml_path) -&gt; WorkflowConfig</div><div class="sd-seq-detail">Load and hydrate YAML into WorkflowConfig before calling run(). REQUIRED: run() accepts WorkflowConfig object, not a yaml_path string.</div></div>
+<div class="sd-seq-col sd-seq-returns">WorkflowConfig</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">4</div>
+<div class="sd-seq-col sd-seq-from">iriai_build_v2_runner</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">plugins_adapters</div>
+<div class="sd-seq-col sd-seq-action"><div>create_plugin_runtimes(services=env_services, feature_id=feature.id, artifacts=env.artifacts) -&gt; dict[str, PluginRuntime]</div><div class="sd-seq-detail">D-A4 bridge maps BootstrappedEnv services to PluginRuntime instances via Protocol-based adapters. hosting-&gt;HostingPluginAdapter, preview-&gt;McpPluginAdapter, git-&gt;SubprocessPluginAdapter, etc.</div></div>
+<div class="sd-seq-col sd-seq-returns">dict[str, PluginRuntime]</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">5</div>
+<div class="sd-seq-col sd-seq-from">iriai_build_v2_runner</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">iriai_build_v2_runner</div>
+<div class="sd-seq-col sd-seq-action"><div>RuntimeConfig(agent_runtime=ClaudeAgentRuntime(session_store=env.sessions), plugin_registry=registry, artifacts=env.artifacts, sessions=env.sessions, workspace=workspace, feature=feature)</div><div class="sd-seq-detail">Assemble RuntimeConfig. agent_runtime is a singular AgentRuntime instance (not dict[str, AgentRuntime]). plugin_registry wraps type_interfaces + instances.</div></div>
+<div class="sd-seq-col sd-seq-returns">RuntimeConfig</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">6</div>
+<div class="sd-seq-col sd-seq-from">iriai_build_v2_runner</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">iriai_compose_declarative</div>
+<div class="sd-seq-col sd-seq-action"><div>run(workflow=loaded_config, config=runtime_config, inputs=None) -&gt; ExecutionResult</div><div class="sd-seq-detail">Calls SF-2 canonical ABI with WorkflowConfig object (not yaml_path). The wrapper does NOT pass node_id into AgentRuntime.invoke(); declarative runner injects phase/node identity through ContextVars per SF-2 contract.</div></div>
+<div class="sd-seq-col sd-seq-returns">ExecutionResult</div>
+</div>
+</div>
+</details>
+<details class="sd-call-path" data-journey-id="J-1">
+<summary>
+<span class="sd-cp-name">Planning Workflow Full Execution</span>
+<span class="sd-cp-journey">J-1</span>
+</summary>
+<p class="sd-cp-desc">Runner invokes planning.yaml with ScopeOutput input, executes all 6 phases sequentially with explicit store PluginNode writes and hosting hooks</p>
+<div class="sd-sequence">
+<div class="sd-seq-header">
+<div class="sd-seq-col sd-seq-num">#</div>
+<div class="sd-seq-col sd-seq-from">From</div>
+<div class="sd-seq-col sd-seq-arrow"></div>
+<div class="sd-seq-col sd-seq-to">To</div>
+<div class="sd-seq-col sd-seq-action">Action</div>
+<div class="sd-seq-col sd-seq-returns">Returns</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">1</div>
+<div class="sd-seq-col sd-seq-from">iriai_compose_declarative</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">schema_validation</div>
+<div class="sd-seq-col sd-seq-action"><div>validate_workflow(config) -&gt; list[ValidationError]</div><div class="sd-seq-detail">Validate DAG structure, type flow, and cycles using 21 canonical codes. Strictly blocking per D-GR-38 — empty list required to proceed.</div></div>
+<div class="sd-seq-col sd-seq-returns">list[ValidationError] (empty on success)</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">2</div>
+<div class="sd-seq-col sd-seq-from">iriai_compose_declarative</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">planning_workflow</div>
+<div class="sd-seq-col sd-seq-action"><div>execute ScopingPhase (mode: loop, exit_condition: 'data.complete')</div><div class="sd-seq-detail">Run interview loop until Envelope.complete=true. AskNodes use actor_ref (not actor). actor_type: human for scope_interviewer interaction, agent for scope_resolver. Each node: SF-2 runner sets phase/node ContextVars, merges workflow-&gt;phase-&gt;actor-&gt;node context, calls AgentRuntime.invoke() unchanged.</div></div>
+<div class="sd-seq-col sd-seq-returns">ScopeOutput</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">3</div>
+<div class="sd-seq-col sd-seq-from">planning_workflow</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">artifact_db_store</div>
+<div class="sd-seq-col sd-seq-action"><div>explicit store PluginNode: operation=put, key='scope' (D-GR-14)</div><div class="sd-seq-detail">Write via store PluginNode only. No artifact_key auto-write. plugin_ref: artifact_db, config: {operation: put, key: scope}.</div></div>
+<div class="sd-seq-col sd-seq-returns">StoreWriteResult</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">4</div>
+<div class="sd-seq-col sd-seq-from">planning_workflow</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">doc_host_service</div>
+<div class="sd-seq-col sd-seq-action"><div>hosting PluginNode PUSH (on_end hook edge from store PluginNode)</div><div class="sd-seq-detail">Hook EdgeDefinition from write_scope.on_end triggers doc_host PluginNode (fire-and-forget). D-GR-14: hooks fire from explicit store PluginNodes.</div></div>
+<div class="sd-seq-col sd-seq-returns">hosted_url</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">5</div>
+<div class="sd-seq-col sd-seq-from">iriai_compose_declarative</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">planning_workflow</div>
+<div class="sd-seq-col sd-seq-action"><div>execute PM -&gt; Design -&gt; Architecture phases (mode: sequential)</div><div class="sd-seq-detail">Each phase uses TemplateDefinition refs (broad_interview, interview_gate_review). tiered_context_builder edge transform_fn applied on fold accumulator edges. SF-2 ABI governs: unchanged invoke(), ContextVar node identity, fixed context merge order.</div></div>
+<div class="sd-seq-col sd-seq-returns">PRD, DesignDecisions, TechnicalPlan, SystemDesign</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">6</div>
+<div class="sd-seq-col sd-seq-from">iriai_compose_declarative</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">planning_workflow</div>
+<div class="sd-seq-col sd-seq-action"><div>execute PlanReviewPhase (mode: loop, max_iterations: 3)</div><div class="sd-seq-detail">Map sub-phase: 3 parallel reviewer AskNodes. BranchNode per D-GR-12/D-GR-35: each output port has its own condition (non-exclusive fan-out). all_approved port -&gt; exit. architect revises on failure. max_exceeded -&gt; human escalation.</div></div>
+<div class="sd-seq-col sd-seq-returns">Verdict</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">7</div>
+<div class="sd-seq-col sd-seq-from">iriai_compose_declarative</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">planning_workflow</div>
+<div class="sd-seq-col sd-seq-action"><div>execute TaskPlanningPhase (mode: sequential)</div><div class="sd-seq-detail">broad_interview TemplateDefinition for GlobalImplementationStrategy, fold sub-phase for ImplementationDAG, interview_gate_review TemplateDefinition</div></div>
+<div class="sd-seq-col sd-seq-returns">ImplementationDAG</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">8</div>
+<div class="sd-seq-col sd-seq-from">planning_workflow</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">artifact_db_store</div>
+<div class="sd-seq-col sd-seq-action"><div>explicit store PluginNode PUT final artifacts: prd, design, plan, system_design (D-GR-14)</div><div class="sd-seq-detail">All compiled artifacts explicitly written via store PluginNodes. id_renumberer edge transform_fn applied before writes.</div></div>
+<div class="sd-seq-col sd-seq-returns">StoreWriteResult</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">9</div>
+<div class="sd-seq-col sd-seq-from">iriai_compose_declarative</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">iriai_build_v2_runner</div>
+<div class="sd-seq-col sd-seq-action"><div>return ExecutionResult</div><div class="sd-seq-detail">Returns: nodes_executed (ordered trace from ContextVar scope), artifacts, branch_paths, loop_iterations, fold_progress, map_fan_out, errors_routed, cost_summary, duration_ms, workflow_output, hook_warnings</div></div>
+<div class="sd-seq-col sd-seq-returns">ExecutionResult</div>
+</div>
+</div>
+</details>
+<details class="sd-call-path" data-journey-id="J-2">
+<summary>
+<span class="sd-cp-name">Develop ImplementationPhase (fold &gt; map &gt; loop)</span>
+<span class="sd-cp-journey">J-2</span>
+</summary>
+<p class="sd-cp-desc">ImplementationPhase executes a 3-level nested DAG: outer loop (user approval), fold over task groups, map over parallel tasks, inner retry loop per group</p>
+<div class="sd-sequence">
+<div class="sd-seq-header">
+<div class="sd-seq-col sd-seq-num">#</div>
+<div class="sd-seq-col sd-seq-from">From</div>
+<div class="sd-seq-col sd-seq-arrow"></div>
+<div class="sd-seq-col sd-seq-to">To</div>
+<div class="sd-seq-col sd-seq-action">Action</div>
+<div class="sd-seq-col sd-seq-returns">Returns</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">1</div>
+<div class="sd-seq-col sd-seq-from">iriai_compose_declarative</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">develop_workflow</div>
+<div class="sd-seq-col sd-seq-action"><div>start ImplementationPhase (mode: loop, exit_condition: 'data.user_approved')</div><div class="sd-seq-detail">Outer loop exits when user approves. max_exceeded -&gt; human escalation via BranchNode port.</div></div>
+<div class="sd-seq-col sd-seq-returns">&mdash;</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">2</div>
+<div class="sd-seq-col sd-seq-from">develop_workflow</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">develop_workflow</div>
+<div class="sd-seq-col sd-seq-action"><div>BranchNode: has_feedback condition on input port</div><div class="sd-seq-detail">Per D-GR-12/D-GR-35: each BranchOutputPort carries its own condition expression. rejection port fires when feedback present. no_feedback port fires otherwise. Non-exclusive fan-out.</div></div>
+<div class="sd-seq-col sd-seq-returns">&mdash;</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">3</div>
+<div class="sd-seq-col sd-seq-from">develop_workflow</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">develop_workflow</div>
+<div class="sd-seq-col sd-seq-action"><div>FoldModeConfig sub-phase over dag.execution_order (groups)</div><div class="sd-seq-detail">accumulator_init: '{&quot;handover&quot;: None, &quot;all_files&quot;: []}'. Each iteration processes one dependency group. reducer merges ImplementationResult into accumulator.</div></div>
+<div class="sd-seq-col sd-seq-returns">&mdash;</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">4</div>
+<div class="sd-seq-col sd-seq-from">develop_workflow</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">develop_workflow</div>
+<div class="sd-seq-col sd-seq-action"><div>EdgeDefinition: transform_fn = build_task_prompt</div><div class="sd-seq-detail">AST-validated pure Python transform constructs structured implementation prompt from task spec. No secrets in transform_fn sandbox (D-GR-10).</div></div>
+<div class="sd-seq-col sd-seq-returns">prompt string</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">5</div>
+<div class="sd-seq-col sd-seq-from">develop_workflow</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">develop_workflow</div>
+<div class="sd-seq-col sd-seq-action"><div>MapModeConfig sub-phase over group.tasks (parallel)</div><div class="sd-seq-detail">Each task gets unique actor_ref: implementer-g{idx}-t{idx} to prevent state collision. SF-2 runner wraps each parallel dispatch with ContextVar token reset.</div></div>
+<div class="sd-seq-col sd-seq-returns">list[ImplementationResult]</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">6</div>
+<div class="sd-seq-col sd-seq-from">develop_workflow</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">develop_workflow</div>
+<div class="sd-seq-col sd-seq-action"><div>EdgeDefinition: collect_files transform_fn -&gt; smoke_tester AskNode -&gt; RetryLoop (max_iterations: 2)</div><div class="sd-seq-detail">collect_files flattens ImplementationResult file lists. Retry: on failure fix AskNode re-verifies. condition_met port -&gt; next group. max_exceeded port -&gt; escalation.</div></div>
+<div class="sd-seq-col sd-seq-returns">&mdash;</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">7</div>
+<div class="sd-seq-col sd-seq-from">develop_workflow</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">develop_workflow</div>
+<div class="sd-seq-col sd-seq-action"><div>EdgeDefinition: handover_compress transform_fn between fold iterations</div><div class="sd-seq-detail">Compresses older completed_tasks, keeps last 3 uncompressed. NEVER touches failed_attempts. Prevents unbounded accumulator growth.</div></div>
+<div class="sd-seq-col sd-seq-returns">compressed HandoverDoc</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">8</div>
+<div class="sd-seq-col sd-seq-from">develop_workflow</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">git_cli</div>
+<div class="sd-seq-col sd-seq-action"><div>subprocess PluginNode: execute(command=['git', 'commit', ...]) fire-and-forget</div><div class="sd-seq-detail">plugin_ref: git, config: {subcommand: commit}. outputs: [] = fire-and-forget (not blocking).</div></div>
+<div class="sd-seq-col sd-seq-returns">&mdash;</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">9</div>
+<div class="sd-seq-col sd-seq-from">develop_workflow</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">artifact_db_store</div>
+<div class="sd-seq-col sd-seq-action"><div>explicit store PluginNode PUT implementation artifacts (D-GR-14)</div><div class="sd-seq-detail">Writes ImplementationResult and updated HandoverDoc via explicit store PluginNodes.</div></div>
+<div class="sd-seq-col sd-seq-returns">StoreWriteResult</div>
+</div>
+</div>
+</details>
+<details class="sd-call-path" data-journey-id="J-3">
+<summary>
+<span class="sd-cp-name">Bugfix DiagnosisAndFixPhase (loop with parallel RCA)</span>
+<span class="sd-cp-journey">J-3</span>
+</summary>
+<p class="sd-cp-desc">Diagnosis loop: parallel RCA from two perspectives -&gt; fix -&gt; verify. Repeats up to 3 times. max_exceeded routes to approval with failure context.</p>
+<div class="sd-sequence">
+<div class="sd-seq-header">
+<div class="sd-seq-col sd-seq-num">#</div>
+<div class="sd-seq-col sd-seq-from">From</div>
+<div class="sd-seq-col sd-seq-arrow"></div>
+<div class="sd-seq-col sd-seq-to">To</div>
+<div class="sd-seq-col sd-seq-action">Action</div>
+<div class="sd-seq-col sd-seq-returns">Returns</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">1</div>
+<div class="sd-seq-col sd-seq-from">iriai_compose_declarative</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">bugfix_workflow</div>
+<div class="sd-seq-col sd-seq-action"><div>start DiagnosisAndFixPhase (mode: loop, max_iterations: 3)</div><div class="sd-seq-detail">exit_condition: 'not data.reproduced' (fix verified). max_exceeded BranchOutputPort routes to ApprovalPhase with failure context.</div></div>
+<div class="sd-seq-col sd-seq-returns">&mdash;</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">2</div>
+<div class="sd-seq-col sd-seq-from">bugfix_workflow</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">bugfix_workflow</div>
+<div class="sd-seq-col sd-seq-action"><div>MapModeConfig: 2 parallel RCA AskNodes</div><div class="sd-seq-detail">collection: [{role: symptoms}, {role: architecture}]. actor_refs: rca_symptoms_analyst, rca_architecture_analyst. Distinct prompt fields — no task or context_text fields. SF-2 runner issues separate ContextVar tokens per parallel task.</div></div>
+<div class="sd-seq-col sd-seq-returns">list[RootCauseAnalysis]</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">3</div>
+<div class="sd-seq-col sd-seq-from">bugfix_workflow</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">bugfix_workflow</div>
+<div class="sd-seq-col sd-seq-action"><div>bug_fixer AskNode: actor_ref=bug_fixer, prompt='Synthesize RCA analyses...'</div><div class="sd-seq-detail">actor_type: agent, model: claude-sonnet-4-6. prompt is the canonical field (NOT task or context_text). SF-2 runner sets current node ContextVar before calling unchanged AgentRuntime.invoke().</div></div>
+<div class="sd-seq-col sd-seq-returns">BugFixResult</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">4</div>
+<div class="sd-seq-col sd-seq-from">bugfix_workflow</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">git_cli</div>
+<div class="sd-seq-col sd-seq-action"><div>subprocess PluginNode: execute(command=['git', 'commit', '-am', 'fix: {slug}'])</div><div class="sd-seq-detail">plugin_ref: git. Fire-and-forget (outputs: []).</div></div>
+<div class="sd-seq-col sd-seq-returns">&mdash;</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">5</div>
+<div class="sd-seq-col sd-seq-from">bugfix_workflow</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">preview_mcp_server</div>
+<div class="sd-seq-col sd-seq-action"><div>mcp PluginNode: call_tool(tool_name='preview_deploy', force=True)</div><div class="sd-seq-detail">plugin_ref: preview. Redeploys to preview environment.</div></div>
+<div class="sd-seq-col sd-seq-returns">&mdash;</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">6</div>
+<div class="sd-seq-col sd-seq-from">bugfix_workflow</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">bugfix_workflow</div>
+<div class="sd-seq-col sd-seq-action"><div>bug_reproducer AskNode: actor_ref=bug_reproducer, prompt='Re-run reproduction steps against preview...'</div><div class="sd-seq-detail">actor_type: agent. prompt field only — no task/context_text. Re-runs reproduction steps.</div></div>
+<div class="sd-seq-col sd-seq-returns">ReproductionResult</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">7</div>
+<div class="sd-seq-col sd-seq-from">bugfix_workflow</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">bugfix_workflow</div>
+<div class="sd-seq-col sd-seq-action"><div>BranchNode: not_reproduced port condition: 'not data.reproduced'</div><div class="sd-seq-detail">Per D-GR-35: per-port condition. not_reproduced=True -&gt; condition_met exits loop. still_reproducing -&gt; EdgeDefinition with handover_compress transform_fn -&gt; loop back.</div></div>
+<div class="sd-seq-col sd-seq-returns">&mdash;</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">8</div>
+<div class="sd-seq-col sd-seq-from">bugfix_workflow</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">artifact_db_store</div>
+<div class="sd-seq-col sd-seq-action"><div>explicit store PluginNode PUT: rca, fix_result (D-GR-14)</div><div class="sd-seq-detail">Explicit writes via artifact_db store PluginNodes. Reads happen via context_keys only.</div></div>
+<div class="sd-seq-col sd-seq-returns">&mdash;</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">9</div>
+<div class="sd-seq-col sd-seq-from">bugfix_workflow</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">preview_mcp_server</div>
+<div class="sd-seq-col sd-seq-action"><div>CleanupPhase: mcp PluginNode call_tool(tool_name='preview_teardown') fire-and-forget</div><div class="sd-seq-detail">plugin_ref: preview. outputs: [] = fire-and-forget.</div></div>
+<div class="sd-seq-col sd-seq-returns">&mdash;</div>
+</div>
+</div>
+</details>
+<details class="sd-call-path" data-journey-id="J-4">
+<summary>
+<span class="sd-cp-name">Migration Test Suite Execution</span>
+<span class="sd-cp-journey">J-4</span>
+</summary>
+<p class="sd-cp-desc">pytest runs ~50-55 behavioral equivalence tests across Tier 1 (schema validation), Tier 2 (MockRuntime execution), plugin instance config, edge transform correctness, YAML round-trips</p>
+<div class="sd-sequence">
+<div class="sd-seq-header">
+<div class="sd-seq-col sd-seq-num">#</div>
+<div class="sd-seq-col sd-seq-from">From</div>
+<div class="sd-seq-col sd-seq-arrow"></div>
+<div class="sd-seq-col sd-seq-to">To</div>
+<div class="sd-seq-col sd-seq-action">Action</div>
+<div class="sd-seq-col sd-seq-returns">Returns</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">1</div>
+<div class="sd-seq-col sd-seq-from">migration_test_suite</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">schema_io</div>
+<div class="sd-seq-col sd-seq-action"><div>load_workflow(FIXTURES_DIR / 'planning.yaml') -&gt; WorkflowConfig (x3)</div><div class="sd-seq-detail">conftest.py fixtures load all 3 YAMLs. Returns WorkflowConfig objects with hydrated AskNode (actor_ref field), PhaseDefinition (mode enum), BranchNode (per-port conditions).</div></div>
+<div class="sd-seq-col sd-seq-returns">WorkflowConfig x3</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">2</div>
+<div class="sd-seq-col sd-seq-from">migration_test_suite</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">iriai_compose_plugins</div>
+<div class="sd-seq-col sd-seq-action"><div>register_plugin_types(registry), register_instances(registry)</div><div class="sd-seq-detail">PluginRegistry populated with 6 type interfaces and 8 instance configs.</div></div>
+<div class="sd-seq-col sd-seq-returns">PluginRegistry</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">3</div>
+<div class="sd-seq-col sd-seq-from">migration_test_suite</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">schema_validation</div>
+<div class="sd-seq-col sd-seq-action"><div>validate_workflow(config), validate_type_flow(config), detect_cycles(config)</div><div class="sd-seq-detail">Tier 1. Each must return empty list[ValidationError]. Verifies: actor_ref resolves to ActorDefinition with actor_type=agent|human (not interaction), plugin_ref resolves to PluginInstanceConfig, AskNode has prompt field (not task/context_text), no phantom MapNode/FoldNode/LoopNode/TransformRef/HookRef nodes.</div></div>
+<div class="sd-seq-col sd-seq-returns">list[ValidationError] (empty)</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">4</div>
+<div class="sd-seq-col sd-seq-from">migration_test_suite</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">plugins_transforms</div>
+<div class="sd-seq-col sd-seq-action"><div>compile(transform_fn_str, '&lt;string&gt;', 'exec') for all 7 transforms</div><div class="sd-seq-detail">test_edge_transforms.py verifies syntactic validity and purity. AST-validated per D-GR-5. No secrets accessed inside transform_fn (D-GR-10). build_env_overrides NOT in transforms catalog.</div></div>
+<div class="sd-seq-col sd-seq-returns">compiled code objects</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">5</div>
+<div class="sd-seq-col sd-seq-from">migration_test_suite</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">iriai_compose_testing</div>
+<div class="sd-seq-col sd-seq-action"><div>MockAgentRuntime + MockInteractionRuntime + MockPluginRuntime setup via when_node().respond_sequence()</div><div class="sd-seq-detail">Fluent mock API. MockAgentRuntime.invoke() matches AgentRuntime.invoke() unchanged signature. when_node() resolution reads current node_id from ContextVar-backed scope per SF-2 ABI.</div></div>
+<div class="sd-seq-col sd-seq-returns">MockRuntimeBundle</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">6</div>
+<div class="sd-seq-col sd-seq-from">migration_test_suite</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">iriai_compose_testing</div>
+<div class="sd-seq-col sd-seq-action"><div>run_test(workflow=loaded_config, mocks=mock_bundle, initial_input=scope_output) -&gt; ExecutionResult</div><div class="sd-seq-detail">Tier 2 execution. MockRuntime drives through all phases including loop/fold/map modes. Same workflow-&gt;phase-&gt;actor-&gt;node context assembly as SF-2 production ABI.</div></div>
+<div class="sd-seq-col sd-seq-returns">ExecutionResult</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">7</div>
+<div class="sd-seq-col sd-seq-from">migration_test_suite</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">iriai_compose_testing</div>
+<div class="sd-seq-col sd-seq-action"><div>assert_node_reached, assert_artifact, assert_branch_taken, assert_phase_executed, assert_loop_iterations, assert_fold_items_processed, assert_error_routed</div><div class="sd-seq-detail">Verify correct nodes reached, artifacts written via explicit store PluginNodes, correct BranchOutputPort conditions fired, phases in order. node_id assertions read nodes_executed trace from ContextVar scope per SF-2 ABI.</div></div>
+<div class="sd-seq-col sd-seq-returns">&mdash;</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">8</div>
+<div class="sd-seq-col sd-seq-from">migration_test_suite</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">iriai_compose_testing</div>
+<div class="sd-seq-col sd-seq-action"><div>assert_yaml_round_trip for all 3 workflows and 3 TemplateDefinition files</div><div class="sd-seq-detail">test_yaml_roundtrip.py: load -&gt; dump -&gt; reload -&gt; compare. No data loss. Verifies TemplateDefinition (not TemplateRef), EdgeDefinition (not Edge), MapModeConfig/FoldModeConfig/LoopModeConfig (not MapConfig/FoldConfig/LoopConfig) survive round-trip.</div></div>
+<div class="sd-seq-col sd-seq-returns">&mdash;</div>
+</div>
+</div>
+</details>
+<details class="sd-call-path" data-journey-id="">
+<summary>
+<span class="sd-cp-name">SF-5 Database Seed Loading</span>
+</summary>
+<p class="sd-cp-desc">seed_loader.py idempotently upserts all migration seed records into SF-5 PostgreSQL database (tools/compose)</p>
+<div class="sd-sequence">
+<div class="sd-seq-header">
+<div class="sd-seq-col sd-seq-num">#</div>
+<div class="sd-seq-col sd-seq-from">From</div>
+<div class="sd-seq-col sd-seq-arrow"></div>
+<div class="sd-seq-col sd-seq-to">To</div>
+<div class="sd-seq-col sd-seq-action">Action</div>
+<div class="sd-seq-col sd-seq-returns">Returns</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">1</div>
+<div class="sd-seq-col sd-seq-from">seed_data_package</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">seed_data_package</div>
+<div class="sd-seq-col sd-seq-action"><div>parse migration_seed.json</div><div class="sd-seq-detail">Reads and validates JSON: 3 workflows, 10 roles, 11 schemas, 3 templates, 6 plugin types, 8 instances, 7 edge transforms.</div></div>
+<div class="sd-seq-col sd-seq-returns">seed: dict</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">2</div>
+<div class="sd-seq-col sd-seq-from">seed_data_package</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">sf5_database</div>
+<div class="sd-seq-col sd-seq-action"><div>check existing records by slug/name/instance_id across all 7 tables</div><div class="sd-seq-detail">Queries each table for existing records matching slug/name/instance_id to determine insert vs update.</div></div>
+<div class="sd-seq-col sd-seq-returns">existing_records: dict</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">3</div>
+<div class="sd-seq-col sd-seq-from">seed_data_package</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">sf5_database</div>
+<div class="sd-seq-col sd-seq-action"><div>upsert workflows (3 records, is_example: true)</div><div class="sd-seq-detail">INSERT INTO workflows ... ON CONFLICT (slug) DO UPDATE SET ... for planning, develop, bugfix.</div></div>
+<div class="sd-seq-col sd-seq-returns">&mdash;</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">4</div>
+<div class="sd-seq-col sd-seq-from">seed_data_package</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">sf5_database</div>
+<div class="sd-seq-col sd-seq-action"><div>upsert plugin_types (6 records) + plugin_instances (8 records)</div><div class="sd-seq-detail">6 general plugin type interfaces (store, hosting, mcp, subprocess, http, config) + 8 concrete instances including env_overrides. Replaces old 12 specialized plugin records.</div></div>
+<div class="sd-seq-col sd-seq-returns">&mdash;</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">5</div>
+<div class="sd-seq-col sd-seq-from">seed_data_package</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">sf5_database</div>
+<div class="sd-seq-col sd-seq-action"><div>upsert roles (10), schemas (11), templates (3), edge_transforms (7)</div><div class="sd-seq-detail">All remaining seed entities upserted in single transaction. Includes summarizer, extractor Category C actors, StoreWriteResult schema.</div></div>
+<div class="sd-seq-col sd-seq-returns">&mdash;</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">6</div>
+<div class="sd-seq-col sd-seq-from">seed_data_package</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">seed_data_package</div>
+<div class="sd-seq-col sd-seq-action"><div>print summary: N inserted, M updated, K unchanged</div><div class="sd-seq-detail">Transaction committed. Safe to run multiple times — never deletes records.</div></div>
+<div class="sd-seq-col sd-seq-returns">{inserted: int, updated: int, unchanged: int}</div>
+</div>
+</div>
+</details>
+</section>
+<section class="sd-section" id="endpoints">
+<h2 class="sd-section-title">API Endpoints</h2>
+<div class="sd-table-wrap">
+<table class="sd-table">
+<thead><tr>
+<th>Method</th><th>Path</th><th>Service</th><th>Auth</th><th>Description</th>
+</tr></thead>
+<tbody>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#3b82f6;letter-spacing:0.04em;line-height:1.6;">POST</span></td>
+<td><code>/schema/validate_workflow</code></td>
+<td><span class="sd-svc-ref" data-ref-service="schema_validation">iriai_compose.schema.validation</span></td>
+<td>&mdash;</td>
+<td>validate_workflow(config: WorkflowConfig) -&gt; list[ValidationError]. Empty list on success. Uses 21 canonical error codes (H-3). Strictly blocking — no view-only fallback per D-GR-38.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#3b82f6;letter-spacing:0.04em;line-height:1.6;">POST</span></td>
+<td><code>/schema/validate_type_flow</code></td>
+<td><span class="sd-svc-ref" data-ref-service="schema_validation">iriai_compose.schema.validation</span></td>
+<td>&mdash;</td>
+<td>validate_type_flow(config: WorkflowConfig) -&gt; list[ValidationError]. Validates type_ref compatibility across all EdgeDefinition instances.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#3b82f6;letter-spacing:0.04em;line-height:1.6;">POST</span></td>
+<td><code>/schema/detect_cycles</code></td>
+<td><span class="sd-svc-ref" data-ref-service="schema_validation">iriai_compose.schema.validation</span></td>
+<td>&mdash;</td>
+<td>detect_cycles(config: WorkflowConfig) -&gt; list[ValidationError]. Returns error per cycle found outside intentional loop semantics.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#3b82f6;letter-spacing:0.04em;line-height:1.6;">POST</span></td>
+<td><code>/schema/io/load_workflow</code></td>
+<td><span class="sd-svc-ref" data-ref-service="schema_io">iriai_compose.schema.io</span></td>
+<td>&mdash;</td>
+<td>load_workflow(path: str | Path) -&gt; WorkflowConfig. Parses YAML, hydrates all iriai_compose.schema models. Raises SchemaError on unknown fields (strict mode).</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#3b82f6;letter-spacing:0.04em;line-height:1.6;">POST</span></td>
+<td><code>/schema/io/dump_workflow</code></td>
+<td><span class="sd-svc-ref" data-ref-service="schema_io">iriai_compose.schema.io</span></td>
+<td>&mdash;</td>
+<td>dump_workflow(config: WorkflowConfig) -&gt; str. Serializes WorkflowConfig to YAML string. Round-trip safe: load_workflow(dump_workflow(config)) == config.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#3b82f6;letter-spacing:0.04em;line-height:1.6;">POST</span></td>
+<td><code>/declarative/run</code></td>
+<td><span class="sd-svc-ref" data-ref-service="iriai_compose_declarative">iriai_compose.declarative</span></td>
+<td>&mdash;</td>
+<td>run(workflow: WorkflowConfig, config: RuntimeConfig, *, inputs: dict | None = None) -&gt; ExecutionResult. Canonical SF-2 ABI. Caller must load WorkflowConfig separately via load_workflow() before calling run(). AgentRuntime.invoke() unchanged; node_id set via ContextVar per node. Context merged workflow -&gt; phase -&gt; actor -&gt; node. Checkpoint/resume not in this ABI.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#3b82f6;letter-spacing:0.04em;line-height:1.6;">POST</span></td>
+<td><code>/declarative/validate</code></td>
+<td><span class="sd-svc-ref" data-ref-service="iriai_compose_declarative">iriai_compose.declarative</span></td>
+<td>&mdash;</td>
+<td>validate(source: WorkflowConfig, plugins: PluginRegistry | None = None) -&gt; list[ValidationIssue]. Runtime correctness validation beyond schema structural checks.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#3b82f6;letter-spacing:0.04em;line-height:1.6;">POST</span></td>
+<td><code>/declarative/load_workflow</code></td>
+<td><span class="sd-svc-ref" data-ref-service="iriai_compose_declarative">iriai_compose.declarative</span></td>
+<td>&mdash;</td>
+<td>load_workflow(path: str | Path) -&gt; WorkflowConfig. Convenience wrapper around schema_io.load_workflow(). Caller should call this before run().</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#3b82f6;letter-spacing:0.04em;line-height:1.6;">POST</span></td>
+<td><code>/plugins/register_plugin_types</code></td>
+<td><span class="sd-svc-ref" data-ref-service="iriai_compose_plugins">iriai_compose.plugins</span></td>
+<td>&mdash;</td>
+<td>register_plugin_types(registry: PluginRegistry) -&gt; None. Registers 6 general PluginInterface declarations (store, hosting, mcp, subprocess, http, config) into a PluginRegistry instance.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#3b82f6;letter-spacing:0.04em;line-height:1.6;">POST</span></td>
+<td><code>/plugins/register_instances</code></td>
+<td><span class="sd-svc-ref" data-ref-service="iriai_compose_plugins">iriai_compose.plugins</span></td>
+<td>&mdash;</td>
+<td>register_instances(registry: PluginRegistry) -&gt; None. Registers 8 concrete PluginInstanceConfig entries (artifact_db, artifact_mirror, doc_host, preview, playwright, git, feedback_notify, env_overrides) into a PluginRegistry instance.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#3b82f6;letter-spacing:0.04em;line-height:1.6;">POST</span></td>
+<td><code>/plugins/adapters/create_plugin_runtimes</code></td>
+<td><span class="sd-svc-ref" data-ref-service="plugins_adapters">iriai_compose.plugins.adapters</span></td>
+<td>&mdash;</td>
+<td>create_plugin_runtimes(services: dict, feature_id: str, artifacts: ArtifactStore) -&gt; dict[str, PluginRuntime]. D-A4 factory. Protocol-based structural typing — accepts any service matching the structural interface without importing consumer types.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#3b82f6;letter-spacing:0.04em;line-height:1.6;">POST</span></td>
+<td><code>/testing/run_test</code></td>
+<td><span class="sd-svc-ref" data-ref-service="iriai_compose_testing">iriai_compose.testing</span></td>
+<td>&mdash;</td>
+<td>run_test(workflow: WorkflowConfig, mocks: MockRuntimeBundle, initial_input: dict | None = None) -&gt; ExecutionResult. Executes workflow with mock runtimes. No live API calls. SF-2 ABI: run(workflow, config, inputs=None) internally.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#3b82f6;letter-spacing:0.04em;line-height:1.6;">POST</span></td>
+<td><code>/testing/assert_node_reached</code></td>
+<td><span class="sd-svc-ref" data-ref-service="iriai_compose_testing">iriai_compose.testing</span></td>
+<td>&mdash;</td>
+<td>assert_node_reached(result: ExecutionResult, node_id: str) -&gt; None. Reads result.nodes_executed trace (populated from ContextVar scope per SF-2 ABI). Raises AssertionError if node_id not found.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#3b82f6;letter-spacing:0.04em;line-height:1.6;">POST</span></td>
+<td><code>/testing/assert_artifact</code></td>
+<td><span class="sd-svc-ref" data-ref-service="iriai_compose_testing">iriai_compose.testing</span></td>
+<td>&mdash;</td>
+<td>assert_artifact(result: ExecutionResult, key: str, matcher: Any = None) -&gt; None. Asserts artifact written via explicit store PluginNode. Optional matcher for value comparison.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#3b82f6;letter-spacing:0.04em;line-height:1.6;">POST</span></td>
+<td><code>/testing/assert_branch_taken</code></td>
+<td><span class="sd-svc-ref" data-ref-service="iriai_compose_testing">iriai_compose.testing</span></td>
+<td>&mdash;</td>
+<td>assert_branch_taken(result: ExecutionResult, node_id: str, port_name: str) -&gt; None. Asserts specific BranchOutputPort was activated at a BranchNode.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#3b82f6;letter-spacing:0.04em;line-height:1.6;">POST</span></td>
+<td><code>/testing/assert_phase_executed</code></td>
+<td><span class="sd-svc-ref" data-ref-service="iriai_compose_testing">iriai_compose.testing</span></td>
+<td>&mdash;</td>
+<td>assert_phase_executed(result: ExecutionResult, phase_id: str) -&gt; None. Asserts named phase was executed in the workflow run.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#3b82f6;letter-spacing:0.04em;line-height:1.6;">POST</span></td>
+<td><code>/testing/assert_loop_iterations</code></td>
+<td><span class="sd-svc-ref" data-ref-service="iriai_compose_testing">iriai_compose.testing</span></td>
+<td>&mdash;</td>
+<td>assert_loop_iterations(result: ExecutionResult, phase_id: str, expected: int) -&gt; None. Reads result.loop_iterations[phase_id].</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#3b82f6;letter-spacing:0.04em;line-height:1.6;">POST</span></td>
+<td><code>/testing/assert_fold_items_processed</code></td>
+<td><span class="sd-svc-ref" data-ref-service="iriai_compose_testing">iriai_compose.testing</span></td>
+<td>&mdash;</td>
+<td>assert_fold_items_processed(result: ExecutionResult, phase_id: str, expected: int) -&gt; None. Reads result.fold_progress[phase_id].</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#3b82f6;letter-spacing:0.04em;line-height:1.6;">POST</span></td>
+<td><code>/testing/assert_error_routed</code></td>
+<td><span class="sd-svc-ref" data-ref-service="iriai_compose_testing">iriai_compose.testing</span></td>
+<td>&mdash;</td>
+<td>assert_error_routed(result: ExecutionResult, from_node: str, to_node: str) -&gt; None. Reads result.errors_routed.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#3b82f6;letter-spacing:0.04em;line-height:1.6;">POST</span></td>
+<td><code>/testing/assert_yaml_round_trip</code></td>
+<td><span class="sd-svc-ref" data-ref-service="iriai_compose_testing">iriai_compose.testing</span></td>
+<td>&mdash;</td>
+<td>assert_yaml_round_trip(path: str | Path) -&gt; None. Calls load_workflow(path), dump_workflow(config), load_workflow(yaml_str), then compares. Asserts structural equivalence — no data loss on serialization.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#3b82f6;letter-spacing:0.04em;line-height:1.6;">POST</span></td>
+<td><code>/testing/assert_validation_error</code></td>
+<td><span class="sd-svc-ref" data-ref-service="iriai_compose_testing">iriai_compose.testing</span></td>
+<td>&mdash;</td>
+<td>assert_validation_error(config: WorkflowConfig, error_code: str | None = None) -&gt; None. Calls validate_workflow(config) and asserts at least one error matches.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#3b82f6;letter-spacing:0.04em;line-height:1.6;">POST</span></td>
+<td><code>/testing/assert_node_count</code></td>
+<td><span class="sd-svc-ref" data-ref-service="iriai_compose_testing">iriai_compose.testing</span></td>
+<td>&mdash;</td>
+<td>assert_node_count(result: ExecutionResult, expected: int) -&gt; None. Asserts len(result.nodes_executed) == expected.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#3b82f6;letter-spacing:0.04em;line-height:1.6;">POST</span></td>
+<td><code>/seed/load</code></td>
+<td><span class="sd-svc-ref" data-ref-service="seed_data_package">Seed Data Package</span></td>
+<td>&mdash;</td>
+<td>CLI: python seed_loader.py [--database-url URL] [--seed-file PATH]. Idempotently upserts all is_example: true records into SF-5 PostgreSQL database (tools/compose). Prints '{N} inserted, {M} updated, {K} unchanged'. Safe to re-run.</td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section class="sd-section" id="entities">
+<h2 class="sd-section-title">Entity Model</h2>
+<div class="sd-entity-grid">
+<div class="sd-entity-card" data-service-id="iriai_compose_schema" data-journeys="J-1 J-2 J-3">
+<div class="sd-entity-header">
+<h4 class="sd-entity-name">WorkflowConfig</h4>
+<span class="sd-entity-svc" data-ref-service="iriai_compose_schema">iriai_compose.schema</span>
+</div>
+<table class="sd-field-table">
+<thead><tr><th>Field</th><th>Type</th><th>Constraints</th></tr></thead>
+<tbody>
+<tr>
+<td>schema_version</td>
+<td><code>str</code></td>
+<td>required</td>
+</tr>
+<tr>
+<td>workflow_version</td>
+<td><code>int</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>name</td>
+<td><code>str</code></td>
+<td>required</td>
+</tr>
+<tr>
+<td>description</td>
+<td><code>str</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>metadata</td>
+<td><code>dict | None</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>context_keys</td>
+<td><code>list[str]</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>input_type</td>
+<td><code>str</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>actors</td>
+<td><code>dict[str, ActorDefinition]</code></td>
+<td>required</td>
+</tr>
+<tr>
+<td>phases</td>
+<td><code>list[PhaseDefinition]</code></td>
+<td>required</td>
+</tr>
+<tr>
+<td>edges</td>
+<td><code>list[EdgeDefinition]</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>templates</td>
+<td><code>dict[str, TemplateDefinition]</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>plugins</td>
+<td><code>dict[str, PluginInstanceConfig]</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>types</td>
+<td><code>dict[str, JsonSchema]</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>cost_config</td>
+<td><code>WorkflowCostConfig | None</code></td>
+<td>&mdash;</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div class="sd-entity-card" data-service-id="iriai_compose_schema" data-journeys="">
+<div class="sd-entity-header">
+<h4 class="sd-entity-name">AskNode</h4>
+<span class="sd-entity-svc" data-ref-service="iriai_compose_schema">iriai_compose.schema</span>
+</div>
+<table class="sd-field-table">
+<thead><tr><th>Field</th><th>Type</th><th>Constraints</th></tr></thead>
+<tbody>
+<tr>
+<td>id</td>
+<td><code>str</code></td>
+<td>required</td>
+</tr>
+<tr>
+<td>type</td>
+<td><code>str</code></td>
+<td>Literal['ask']</td>
+</tr>
+<tr>
+<td>actor_ref</td>
+<td><code>str</code></td>
+<td>required</td>
+</tr>
+<tr>
+<td>prompt</td>
+<td><code>str</code></td>
+<td>required</td>
+</tr>
+<tr>
+<td>inputs</td>
+<td><code>dict[str, WorkflowInputDefinition]</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>outputs</td>
+<td><code>dict[str, WorkflowOutputDefinition]</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>hooks</td>
+<td><code>dict[str, WorkflowOutputDefinition]</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>artifact_key</td>
+<td><code>str | None</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>output_type</td>
+<td><code>str</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>context_keys</td>
+<td><code>list[str]</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>cost</td>
+<td><code>NodeCostConfig | None</code></td>
+<td>&mdash;</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div class="sd-entity-card" data-service-id="iriai_compose_schema" data-journeys="">
+<div class="sd-entity-header">
+<h4 class="sd-entity-name">BranchNode</h4>
+<span class="sd-entity-svc" data-ref-service="iriai_compose_schema">iriai_compose.schema</span>
+</div>
+<table class="sd-field-table">
+<thead><tr><th>Field</th><th>Type</th><th>Constraints</th></tr></thead>
+<tbody>
+<tr>
+<td>id</td>
+<td><code>str</code></td>
+<td>required</td>
+</tr>
+<tr>
+<td>type</td>
+<td><code>str</code></td>
+<td>Literal['branch']</td>
+</tr>
+<tr>
+<td>inputs</td>
+<td><code>list[PortDefinition]</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>merge_function</td>
+<td><code>str</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>outputs</td>
+<td><code>list[BranchOutputPort]</code></td>
+<td>&mdash;</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div class="sd-entity-card" data-service-id="iriai_compose_schema" data-journeys="">
+<div class="sd-entity-header">
+<h4 class="sd-entity-name">BranchOutputPort</h4>
+<span class="sd-entity-svc" data-ref-service="iriai_compose_schema">iriai_compose.schema</span>
+</div>
+<table class="sd-field-table">
+<thead><tr><th>Field</th><th>Type</th><th>Constraints</th></tr></thead>
+<tbody>
+<tr>
+<td>name</td>
+<td><code>str</code></td>
+<td>required</td>
+</tr>
+<tr>
+<td>condition</td>
+<td><code>str</code></td>
+<td>required</td>
+</tr>
+<tr>
+<td>type_ref</td>
+<td><code>str</code></td>
+<td>&mdash;</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div class="sd-entity-card" data-service-id="iriai_compose_schema" data-journeys="">
+<div class="sd-entity-header">
+<h4 class="sd-entity-name">PluginNode</h4>
+<span class="sd-entity-svc" data-ref-service="iriai_compose_schema">iriai_compose.schema</span>
+</div>
+<table class="sd-field-table">
+<thead><tr><th>Field</th><th>Type</th><th>Constraints</th></tr></thead>
+<tbody>
+<tr>
+<td>id</td>
+<td><code>str</code></td>
+<td>required</td>
+</tr>
+<tr>
+<td>type</td>
+<td><code>str</code></td>
+<td>Literal['plugin']</td>
+</tr>
+<tr>
+<td>plugin_ref</td>
+<td><code>str</code></td>
+<td>required, resolves to workflow.plugins key</td>
+</tr>
+<tr>
+<td>config</td>
+<td><code>dict</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>inputs</td>
+<td><code>list[PortDefinition]</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>outputs</td>
+<td><code>list[PortDefinition]</code></td>
+<td>&mdash;</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div class="sd-entity-card" data-service-id="iriai_compose_schema" data-journeys="">
+<div class="sd-entity-header">
+<h4 class="sd-entity-name">ErrorNode</h4>
+<span class="sd-entity-svc" data-ref-service="iriai_compose_schema">iriai_compose.schema</span>
+</div>
+<table class="sd-field-table">
+<thead><tr><th>Field</th><th>Type</th><th>Constraints</th></tr></thead>
+<tbody>
+<tr>
+<td>id</td>
+<td><code>str</code></td>
+<td>required</td>
+</tr>
+<tr>
+<td>type</td>
+<td><code>str</code></td>
+<td>Literal['error']</td>
+</tr>
+<tr>
+<td>message</td>
+<td><code>str</code></td>
+<td>required, Jinja2 template</td>
+</tr>
+<tr>
+<td>inputs</td>
+<td><code>list[PortDefinition]</code></td>
+<td>1+ required</td>
+</tr>
+<tr>
+<td>outputs</td>
+<td><code>list[PortDefinition]</code></td>
+<td>must be empty</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div class="sd-entity-card" data-service-id="iriai_compose_schema" data-journeys="">
+<div class="sd-entity-header">
+<h4 class="sd-entity-name">PhaseDefinition</h4>
+<span class="sd-entity-svc" data-ref-service="iriai_compose_schema">iriai_compose.schema</span>
+</div>
+<table class="sd-field-table">
+<thead><tr><th>Field</th><th>Type</th><th>Constraints</th></tr></thead>
+<tbody>
+<tr>
+<td>id</td>
+<td><code>str</code></td>
+<td>required</td>
+</tr>
+<tr>
+<td>mode</td>
+<td><code>str</code></td>
+<td>enum: sequential|loop|map|fold</td>
+</tr>
+<tr>
+<td>loop_config</td>
+<td><code>LoopModeConfig</code></td>
+<td>required when mode=loop</td>
+</tr>
+<tr>
+<td>fold_config</td>
+<td><code>FoldModeConfig</code></td>
+<td>required when mode=fold</td>
+</tr>
+<tr>
+<td>map_config</td>
+<td><code>MapModeConfig</code></td>
+<td>required when mode=map</td>
+</tr>
+<tr>
+<td>context_keys</td>
+<td><code>list[str]</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>nodes</td>
+<td><code>list[AskNode|BranchNode|PluginNode|ErrorNode]</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>edges</td>
+<td><code>list[EdgeDefinition]</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>cost</td>
+<td><code>PhaseCostConfig | None</code></td>
+<td>&mdash;</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div class="sd-entity-card" data-service-id="iriai_compose_schema" data-journeys="">
+<div class="sd-entity-header">
+<h4 class="sd-entity-name">EdgeDefinition</h4>
+<span class="sd-entity-svc" data-ref-service="iriai_compose_schema">iriai_compose.schema</span>
+</div>
+<table class="sd-field-table">
+<thead><tr><th>Field</th><th>Type</th><th>Constraints</th></tr></thead>
+<tbody>
+<tr>
+<td>source</td>
+<td><code>str</code></td>
+<td>required, format: node_id.port_name or $input</td>
+</tr>
+<tr>
+<td>target</td>
+<td><code>str</code></td>
+<td>required, format: node_id.port_name or $output</td>
+</tr>
+<tr>
+<td>transform_fn</td>
+<td><code>str</code></td>
+<td>&mdash;</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div class="sd-entity-card" data-service-id="iriai_compose_schema" data-journeys="">
+<div class="sd-entity-header">
+<h4 class="sd-entity-name">LoopModeConfig</h4>
+<span class="sd-entity-svc" data-ref-service="iriai_compose_schema">iriai_compose.schema</span>
+</div>
+<table class="sd-field-table">
+<thead><tr><th>Field</th><th>Type</th><th>Constraints</th></tr></thead>
+<tbody>
+<tr>
+<td>exit_condition</td>
+<td><code>str</code></td>
+<td>required, Python expression</td>
+</tr>
+<tr>
+<td>max_iterations</td>
+<td><code>int</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>fresh_sessions</td>
+<td><code>bool</code></td>
+<td>&mdash;</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div class="sd-entity-card" data-service-id="iriai_compose_schema" data-journeys="">
+<div class="sd-entity-header">
+<h4 class="sd-entity-name">FoldModeConfig</h4>
+<span class="sd-entity-svc" data-ref-service="iriai_compose_schema">iriai_compose.schema</span>
+</div>
+<table class="sd-field-table">
+<thead><tr><th>Field</th><th>Type</th><th>Constraints</th></tr></thead>
+<tbody>
+<tr>
+<td>collection</td>
+<td><code>str</code></td>
+<td>required, Python expression resolving to iterable</td>
+</tr>
+<tr>
+<td>accumulator_init</td>
+<td><code>str</code></td>
+<td>required, Python expression for initial accumulator</td>
+</tr>
+<tr>
+<td>reducer</td>
+<td><code>str</code></td>
+<td>required, Python expression merging result into accumulator</td>
+</tr>
+<tr>
+<td>fresh_sessions</td>
+<td><code>bool</code></td>
+<td>&mdash;</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div class="sd-entity-card" data-service-id="iriai_compose_schema" data-journeys="">
+<div class="sd-entity-header">
+<h4 class="sd-entity-name">MapModeConfig</h4>
+<span class="sd-entity-svc" data-ref-service="iriai_compose_schema">iriai_compose.schema</span>
+</div>
+<table class="sd-field-table">
+<thead><tr><th>Field</th><th>Type</th><th>Constraints</th></tr></thead>
+<tbody>
+<tr>
+<td>collection</td>
+<td><code>str</code></td>
+<td>required, Python expression resolving to iterable</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div class="sd-entity-card" data-service-id="iriai_compose_schema" data-journeys="">
+<div class="sd-entity-header">
+<h4 class="sd-entity-name">SequentialModeConfig</h4>
+<span class="sd-entity-svc" data-ref-service="iriai_compose_schema">iriai_compose.schema</span>
+</div>
+<table class="sd-field-table">
+<thead><tr><th>Field</th><th>Type</th><th>Constraints</th></tr></thead>
+<tbody>
+<tr>
+<td>description</td>
+<td><code>str</code></td>
+<td>&mdash;</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div class="sd-entity-card" data-service-id="iriai_compose_schema" data-journeys="">
+<div class="sd-entity-header">
+<h4 class="sd-entity-name">ActorDefinition</h4>
+<span class="sd-entity-svc" data-ref-service="iriai_compose_schema">iriai_compose.schema</span>
+</div>
+<table class="sd-field-table">
+<thead><tr><th>Field</th><th>Type</th><th>Constraints</th></tr></thead>
+<tbody>
+<tr>
+<td>id</td>
+<td><code>str</code></td>
+<td>required</td>
+</tr>
+<tr>
+<td>actor_type</td>
+<td><code>str</code></td>
+<td>Literal['agent', 'human']</td>
+</tr>
+<tr>
+<td>provider</td>
+<td><code>str</code></td>
+<td>agent only</td>
+</tr>
+<tr>
+<td>model</td>
+<td><code>str</code></td>
+<td>agent only</td>
+</tr>
+<tr>
+<td>role</td>
+<td><code>RoleDefinition</code></td>
+<td>agent only</td>
+</tr>
+<tr>
+<td>persistent</td>
+<td><code>bool</code></td>
+<td>agent only</td>
+</tr>
+<tr>
+<td>context_keys</td>
+<td><code>list[str]</code></td>
+<td>agent only</td>
+</tr>
+<tr>
+<td>identity</td>
+<td><code>str</code></td>
+<td>human only</td>
+</tr>
+<tr>
+<td>channel</td>
+<td><code>str</code></td>
+<td>human only</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div class="sd-entity-card" data-service-id="iriai_compose_schema" data-journeys="">
+<div class="sd-entity-header">
+<h4 class="sd-entity-name">RoleDefinition</h4>
+<span class="sd-entity-svc" data-ref-service="iriai_compose_schema">iriai_compose.schema</span>
+</div>
+<table class="sd-field-table">
+<thead><tr><th>Field</th><th>Type</th><th>Constraints</th></tr></thead>
+<tbody>
+<tr>
+<td>model</td>
+<td><code>str</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>tools</td>
+<td><code>list[str]</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>system_prompt</td>
+<td><code>str</code></td>
+<td>&mdash;</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div class="sd-entity-card" data-service-id="iriai_compose_schema" data-journeys="">
+<div class="sd-entity-header">
+<h4 class="sd-entity-name">TypeDefinition</h4>
+<span class="sd-entity-svc" data-ref-service="iriai_compose_schema">iriai_compose.schema</span>
+</div>
+<table class="sd-field-table">
+<thead><tr><th>Field</th><th>Type</th><th>Constraints</th></tr></thead>
+<tbody>
+<tr>
+<td>name</td>
+<td><code>str</code></td>
+<td>required</td>
+</tr>
+<tr>
+<td>schema_def</td>
+<td><code>dict</code></td>
+<td>required, JSON Schema Draft 2020-12</td>
+</tr>
+<tr>
+<td>description</td>
+<td><code>str</code></td>
+<td>&mdash;</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div class="sd-entity-card" data-service-id="iriai_compose_schema" data-journeys="">
+<div class="sd-entity-header">
+<h4 class="sd-entity-name">TemplateDefinition</h4>
+<span class="sd-entity-svc" data-ref-service="iriai_compose_schema">iriai_compose.schema</span>
+</div>
+<table class="sd-field-table">
+<thead><tr><th>Field</th><th>Type</th><th>Constraints</th></tr></thead>
+<tbody>
+<tr>
+<td>ref</td>
+<td><code>str</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>bind</td>
+<td><code>dict</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>description</td>
+<td><code>str</code></td>
+<td>&mdash;</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div class="sd-entity-card" data-service-id="iriai_compose_schema" data-journeys="">
+<div class="sd-entity-header">
+<h4 class="sd-entity-name">StoreDefinition</h4>
+<span class="sd-entity-svc" data-ref-service="iriai_compose_schema">iriai_compose.schema</span>
+</div>
+<table class="sd-field-table">
+<thead><tr><th>Field</th><th>Type</th><th>Constraints</th></tr></thead>
+<tbody>
+<tr>
+<td>description</td>
+<td><code>str</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>keys</td>
+<td><code>dict[str, StoreKeyDefinition]</code></td>
+<td>&mdash;</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div class="sd-entity-card" data-service-id="iriai_compose_schema" data-journeys="">
+<div class="sd-entity-header">
+<h4 class="sd-entity-name">StoreKeyDefinition</h4>
+<span class="sd-entity-svc" data-ref-service="iriai_compose_schema">iriai_compose.schema</span>
+</div>
+<table class="sd-field-table">
+<thead><tr><th>Field</th><th>Type</th><th>Constraints</th></tr></thead>
+<tbody>
+<tr>
+<td>type_ref</td>
+<td><code>str</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>description</td>
+<td><code>str</code></td>
+<td>&mdash;</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div class="sd-entity-card" data-service-id="iriai_compose_schema" data-journeys="">
+<div class="sd-entity-header">
+<h4 class="sd-entity-name">PortDefinition</h4>
+<span class="sd-entity-svc" data-ref-service="iriai_compose_schema">iriai_compose.schema</span>
+</div>
+<table class="sd-field-table">
+<thead><tr><th>Field</th><th>Type</th><th>Constraints</th></tr></thead>
+<tbody>
+<tr>
+<td>name</td>
+<td><code>str</code></td>
+<td>required</td>
+</tr>
+<tr>
+<td>type_ref</td>
+<td><code>str</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>schema_def</td>
+<td><code>dict</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>description</td>
+<td><code>str</code></td>
+<td>&mdash;</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div class="sd-entity-card" data-service-id="iriai_compose_schema" data-journeys="">
+<div class="sd-entity-header">
+<h4 class="sd-entity-name">WorkflowInputDefinition</h4>
+<span class="sd-entity-svc" data-ref-service="iriai_compose_schema">iriai_compose.schema</span>
+</div>
+<table class="sd-field-table">
+<thead><tr><th>Field</th><th>Type</th><th>Constraints</th></tr></thead>
+<tbody>
+<tr>
+<td>type_ref</td>
+<td><code>str</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>required</td>
+<td><code>bool</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>description</td>
+<td><code>str</code></td>
+<td>&mdash;</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div class="sd-entity-card" data-service-id="iriai_compose_schema" data-journeys="">
+<div class="sd-entity-header">
+<h4 class="sd-entity-name">WorkflowOutputDefinition</h4>
+<span class="sd-entity-svc" data-ref-service="iriai_compose_schema">iriai_compose.schema</span>
+</div>
+<table class="sd-field-table">
+<thead><tr><th>Field</th><th>Type</th><th>Constraints</th></tr></thead>
+<tbody>
+<tr>
+<td>type_ref</td>
+<td><code>str</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>description</td>
+<td><code>str</code></td>
+<td>&mdash;</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div class="sd-entity-card" data-service-id="iriai_compose_schema" data-journeys="">
+<div class="sd-entity-header">
+<h4 class="sd-entity-name">HookPortEvent</h4>
+<span class="sd-entity-svc" data-ref-service="iriai_compose_schema">iriai_compose.schema</span>
+</div>
+<table class="sd-field-table">
+<thead><tr><th>Field</th><th>Type</th><th>Constraints</th></tr></thead>
+<tbody>
+<tr>
+<td>event</td>
+<td><code>str</code></td>
+<td>enum: on_end|on_error|on_start</td>
+</tr>
+<tr>
+<td>port_name</td>
+<td><code>str</code></td>
+<td>&mdash;</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div class="sd-entity-card" data-service-id="plugins_types" data-journeys="">
+<div class="sd-entity-header">
+<h4 class="sd-entity-name">PluginInterface</h4>
+<span class="sd-entity-svc" data-ref-service="plugins_types">iriai_compose.plugins.types</span>
+</div>
+<table class="sd-field-table">
+<thead><tr><th>Field</th><th>Type</th><th>Constraints</th></tr></thead>
+<tbody>
+<tr>
+<td>name</td>
+<td><code>str</code></td>
+<td>required, enum: store|hosting|mcp|subprocess|http|config</td>
+</tr>
+<tr>
+<td>description</td>
+<td><code>str</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>inputs</td>
+<td><code>list[PortDefinition]</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>outputs</td>
+<td><code>list[PortDefinition]</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>config_schema</td>
+<td><code>dict</code></td>
+<td>JSON Schema for instance config validation</td>
+</tr>
+<tr>
+<td>operations</td>
+<td><code>list[str]</code></td>
+<td>required</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div class="sd-entity-card" data-service-id="plugins_instances" data-journeys="">
+<div class="sd-entity-header">
+<h4 class="sd-entity-name">PluginInstanceConfig</h4>
+<span class="sd-entity-svc" data-ref-service="plugins_instances">iriai_compose.plugins.instances</span>
+</div>
+<table class="sd-field-table">
+<thead><tr><th>Field</th><th>Type</th><th>Constraints</th></tr></thead>
+<tbody>
+<tr>
+<td>instance_id</td>
+<td><code>str</code></td>
+<td>required</td>
+</tr>
+<tr>
+<td>plugin_type</td>
+<td><code>str</code></td>
+<td>required, enum: store|hosting|mcp|subprocess|http|config</td>
+</tr>
+<tr>
+<td>description</td>
+<td><code>str</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>config</td>
+<td><code>dict</code></td>
+<td>&mdash;</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div class="sd-entity-card" data-service-id="iriai_compose_schema" data-journeys="">
+<div class="sd-entity-header">
+<h4 class="sd-entity-name">WorkflowCostConfig</h4>
+<span class="sd-entity-svc" data-ref-service="iriai_compose_schema">iriai_compose.schema</span>
+</div>
+<table class="sd-field-table">
+<thead><tr><th>Field</th><th>Type</th><th>Constraints</th></tr></thead>
+<tbody>
+<tr>
+<td>max_cost_usd</td>
+<td><code>float | None</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>alert_threshold_usd</td>
+<td><code>float | None</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>enforce</td>
+<td><code>bool</code></td>
+<td>default: false</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div class="sd-entity-card" data-service-id="iriai_compose_schema" data-journeys="">
+<div class="sd-entity-header">
+<h4 class="sd-entity-name">PhaseCostConfig</h4>
+<span class="sd-entity-svc" data-ref-service="iriai_compose_schema">iriai_compose.schema</span>
+</div>
+<table class="sd-field-table">
+<thead><tr><th>Field</th><th>Type</th><th>Constraints</th></tr></thead>
+<tbody>
+<tr>
+<td>max_cost_usd</td>
+<td><code>float | None</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>alert_threshold_usd</td>
+<td><code>float | None</code></td>
+<td>&mdash;</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div class="sd-entity-card" data-service-id="iriai_compose_schema" data-journeys="">
+<div class="sd-entity-header">
+<h4 class="sd-entity-name">NodeCostConfig</h4>
+<span class="sd-entity-svc" data-ref-service="iriai_compose_schema">iriai_compose.schema</span>
+</div>
+<table class="sd-field-table">
+<thead><tr><th>Field</th><th>Type</th><th>Constraints</th></tr></thead>
+<tbody>
+<tr>
+<td>max_cost_usd</td>
+<td><code>float | None</code></td>
+<td>&mdash;</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div class="sd-entity-card" data-service-id="iriai_compose_declarative" data-journeys="">
+<div class="sd-entity-header">
+<h4 class="sd-entity-name">ExecutionResult</h4>
+<span class="sd-entity-svc" data-ref-service="iriai_compose_declarative">iriai_compose.declarative</span>
+</div>
+<table class="sd-field-table">
+<thead><tr><th>Field</th><th>Type</th><th>Constraints</th></tr></thead>
+<tbody>
+<tr>
+<td>success</td>
+<td><code>bool</code></td>
+<td>required</td>
+</tr>
+<tr>
+<td>error</td>
+<td><code>str | None</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>nodes_executed</td>
+<td><code>list[str]</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>artifacts</td>
+<td><code>dict[str, Any]</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>branch_paths</td>
+<td><code>dict[str, list[str]]</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>loop_iterations</td>
+<td><code>dict[str, int]</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>fold_progress</td>
+<td><code>dict[str, int]</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>map_fan_out</td>
+<td><code>dict[str, int]</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>errors_routed</td>
+<td><code>list[ErrorRoute]</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>cost_summary</td>
+<td><code>CostSummary</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>duration_ms</td>
+<td><code>int</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>workflow_output</td>
+<td><code>Any</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>hook_warnings</td>
+<td><code>list[str]</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>history</td>
+<td><code>list[NodeExecutionRecord]</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>phase_metrics</td>
+<td><code>dict[str, PhaseMetrics]</code></td>
+<td>&mdash;</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div class="sd-entity-card" data-service-id="iriai_compose_declarative" data-journeys="">
+<div class="sd-entity-header">
+<h4 class="sd-entity-name">RuntimeConfig</h4>
+<span class="sd-entity-svc" data-ref-service="iriai_compose_declarative">iriai_compose.declarative</span>
+</div>
+<table class="sd-field-table">
+<thead><tr><th>Field</th><th>Type</th><th>Constraints</th></tr></thead>
+<tbody>
+<tr>
+<td>agent_runtime</td>
+<td><code>AgentRuntime</code></td>
+<td>required, singular instance</td>
+</tr>
+<tr>
+<td>interaction_runtimes</td>
+<td><code>dict[str, InteractionRuntime]</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>artifacts</td>
+<td><code>ArtifactStore</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>sessions</td>
+<td><code>SessionStore</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>context_provider</td>
+<td><code>HierarchicalContext</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>plugin_registry</td>
+<td><code>PluginRegistry</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>workspace</td>
+<td><code>Workspace | None</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>feature</td>
+<td><code>Feature</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>max_cost</td>
+<td><code>float | None</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>dry_run</td>
+<td><code>bool</code></td>
+<td>&mdash;</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div class="sd-entity-card" data-service-id="iriai_compose_declarative" data-journeys="">
+<div class="sd-entity-header">
+<h4 class="sd-entity-name">PluginRegistry</h4>
+<span class="sd-entity-svc" data-ref-service="iriai_compose_declarative">iriai_compose.declarative</span>
+</div>
+<table class="sd-field-table">
+<thead><tr><th>Field</th><th>Type</th><th>Constraints</th></tr></thead>
+<tbody>
+<tr>
+<td>type_interfaces</td>
+<td><code>dict[str, PluginInterface]</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>instances</td>
+<td><code>dict[str, PluginInstanceConfig]</code></td>
+<td>&mdash;</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div class="sd-entity-card" data-service-id="iriai_compose_declarative" data-journeys="">
+<div class="sd-entity-header">
+<h4 class="sd-entity-name">ErrorRoute</h4>
+<span class="sd-entity-svc" data-ref-service="iriai_compose_declarative">iriai_compose.declarative</span>
+</div>
+<table class="sd-field-table">
+<thead><tr><th>Field</th><th>Type</th><th>Constraints</th></tr></thead>
+<tbody>
+<tr>
+<td>from_node</td>
+<td><code>str</code></td>
+<td>required</td>
+</tr>
+<tr>
+<td>to_node</td>
+<td><code>str</code></td>
+<td>required</td>
+</tr>
+<tr>
+<td>error_type</td>
+<td><code>str</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>phase_id</td>
+<td><code>str</code></td>
+<td>&mdash;</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div class="sd-entity-card" data-service-id="iriai_compose_testing" data-journeys="">
+<div class="sd-entity-header">
+<h4 class="sd-entity-name">MockAgentRuntime</h4>
+<span class="sd-entity-svc" data-ref-service="iriai_compose_testing">iriai_compose.testing</span>
+</div>
+<table class="sd-field-table">
+<thead><tr><th>Field</th><th>Type</th><th>Constraints</th></tr></thead>
+<tbody>
+<tr>
+<td>responses</td>
+<td><code>dict[tuple[str, str], Any]</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>store</td>
+<td><code>dict[str, Any]</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>executed_nodes</td>
+<td><code>list[str]</code></td>
+<td>&mdash;</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div class="sd-entity-card" data-service-id="iriai_compose_testing" data-journeys="">
+<div class="sd-entity-header">
+<h4 class="sd-entity-name">MockInteractionRuntime</h4>
+<span class="sd-entity-svc" data-ref-service="iriai_compose_testing">iriai_compose.testing</span>
+</div>
+<table class="sd-field-table">
+<thead><tr><th>Field</th><th>Type</th><th>Constraints</th></tr></thead>
+<tbody>
+<tr>
+<td>responses</td>
+<td><code>list[Any]</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>node_id_capture</td>
+<td><code>str | None</code></td>
+<td>&mdash;</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div class="sd-entity-card" data-service-id="planning_workflow" data-journeys="J-1 J-2 J-3">
+<div class="sd-entity-header">
+<h4 class="sd-entity-name">Envelope</h4>
+<span class="sd-entity-svc" data-ref-service="planning_workflow">planning.yaml</span>
+</div>
+<table class="sd-field-table">
+<thead><tr><th>Field</th><th>Type</th><th>Constraints</th></tr></thead>
+<tbody>
+<tr>
+<td>complete</td>
+<td><code>bool</code></td>
+<td>required</td>
+</tr>
+<tr>
+<td>artifact_path</td>
+<td><code>str | None</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>question</td>
+<td><code>str | None</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>options</td>
+<td><code>list | None</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>output</td>
+<td><code>Any</code></td>
+<td>&mdash;</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div class="sd-entity-card" data-service-id="planning_workflow" data-journeys="">
+<div class="sd-entity-header">
+<h4 class="sd-entity-name">Verdict</h4>
+<span class="sd-entity-svc" data-ref-service="planning_workflow">planning.yaml</span>
+</div>
+<table class="sd-field-table">
+<thead><tr><th>Field</th><th>Type</th><th>Constraints</th></tr></thead>
+<tbody>
+<tr>
+<td>approved</td>
+<td><code>bool</code></td>
+<td>required</td>
+</tr>
+<tr>
+<td>feedback</td>
+<td><code>str | None</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>annotations</td>
+<td><code>dict | None</code></td>
+<td>&mdash;</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div class="sd-entity-card" data-service-id="planning_workflow" data-journeys="">
+<div class="sd-entity-header">
+<h4 class="sd-entity-name">ReviewOutcome</h4>
+<span class="sd-entity-svc" data-ref-service="planning_workflow">planning.yaml</span>
+</div>
+<table class="sd-field-table">
+<thead><tr><th>Field</th><th>Type</th><th>Constraints</th></tr></thead>
+<tbody>
+<tr>
+<td>verdict</td>
+<td><code>str</code></td>
+<td>enum: approved|needs_revision</td>
+</tr>
+<tr>
+<td>issues</td>
+<td><code>list</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>suggestions</td>
+<td><code>list</code></td>
+<td>&mdash;</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div class="sd-entity-card" data-service-id="planning_workflow" data-journeys="">
+<div class="sd-entity-header">
+<h4 class="sd-entity-name">HandoverDoc</h4>
+<span class="sd-entity-svc" data-ref-service="planning_workflow">planning.yaml</span>
+</div>
+<table class="sd-field-table">
+<thead><tr><th>Field</th><th>Type</th><th>Constraints</th></tr></thead>
+<tbody>
+<tr>
+<td>completed_tasks</td>
+<td><code>list</code></td>
+<td>required</td>
+</tr>
+<tr>
+<td>failed_attempts</td>
+<td><code>list</code></td>
+<td>required, NEVER compressed</td>
+</tr>
+<tr>
+<td>context_summary</td>
+<td><code>str</code></td>
+<td>&mdash;</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div class="sd-entity-card" data-service-id="plugins_types" data-journeys="">
+<div class="sd-entity-header">
+<h4 class="sd-entity-name">StoreWriteResult</h4>
+<span class="sd-entity-svc" data-ref-service="plugins_types">iriai_compose.plugins.types</span>
+</div>
+<table class="sd-field-table">
+<thead><tr><th>Field</th><th>Type</th><th>Constraints</th></tr></thead>
+<tbody>
+<tr>
+<td>key</td>
+<td><code>str</code></td>
+<td>required</td>
+</tr>
+<tr>
+<td>timestamp</td>
+<td><code>str</code></td>
+<td>ISO 8601 datetime</td>
+</tr>
+<tr>
+<td>success</td>
+<td><code>bool</code></td>
+<td>required</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div class="sd-entity-card" data-service-id="planning_workflow" data-journeys="J-1 J-2">
+<div class="sd-entity-header">
+<h4 class="sd-entity-name">ScopeOutput</h4>
+<span class="sd-entity-svc" data-ref-service="planning_workflow">planning.yaml</span>
+</div>
+<table class="sd-field-table">
+<thead><tr><th>Field</th><th>Type</th><th>Constraints</th></tr></thead>
+<tbody>
+<tr>
+<td>feature_name</td>
+<td><code>str</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>feature_description</td>
+<td><code>str</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>repos</td>
+<td><code>list</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>codebase_root</td>
+<td><code>str</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>target_branch</td>
+<td><code>str</code></td>
+<td>&mdash;</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div class="sd-entity-card" data-service-id="develop_workflow" data-journeys="J-2">
+<div class="sd-entity-header">
+<h4 class="sd-entity-name">ImplementationDAG</h4>
+<span class="sd-entity-svc" data-ref-service="develop_workflow">develop.yaml</span>
+</div>
+<table class="sd-field-table">
+<thead><tr><th>Field</th><th>Type</th><th>Constraints</th></tr></thead>
+<tbody>
+<tr>
+<td>groups</td>
+<td><code>list</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>execution_order</td>
+<td><code>list</code></td>
+<td>&mdash;</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div class="sd-entity-card" data-service-id="develop_workflow" data-journeys="J-2">
+<div class="sd-entity-header">
+<h4 class="sd-entity-name">ImplementationResult</h4>
+<span class="sd-entity-svc" data-ref-service="develop_workflow">develop.yaml</span>
+</div>
+<table class="sd-field-table">
+<thead><tr><th>Field</th><th>Type</th><th>Constraints</th></tr></thead>
+<tbody>
+<tr>
+<td>files_created</td>
+<td><code>list</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>files_modified</td>
+<td><code>list</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>tests_added</td>
+<td><code>list</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>summary</td>
+<td><code>str</code></td>
+<td>&mdash;</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div class="sd-entity-card" data-service-id="bugfix_workflow" data-journeys="J-3">
+<div class="sd-entity-header">
+<h4 class="sd-entity-name">BugReport</h4>
+<span class="sd-entity-svc" data-ref-service="bugfix_workflow">bugfix.yaml</span>
+</div>
+<table class="sd-field-table">
+<thead><tr><th>Field</th><th>Type</th><th>Constraints</th></tr></thead>
+<tbody>
+<tr>
+<td>title</td>
+<td><code>str</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>description</td>
+<td><code>str</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>reproduction_steps</td>
+<td><code>list</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>expected_behavior</td>
+<td><code>str</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>actual_behavior</td>
+<td><code>str</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>severity</td>
+<td><code>str</code></td>
+<td>&mdash;</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div class="sd-entity-card" data-service-id="bugfix_workflow" data-journeys="J-3">
+<div class="sd-entity-header">
+<h4 class="sd-entity-name">ReproductionResult</h4>
+<span class="sd-entity-svc" data-ref-service="bugfix_workflow">bugfix.yaml</span>
+</div>
+<table class="sd-field-table">
+<thead><tr><th>Field</th><th>Type</th><th>Constraints</th></tr></thead>
+<tbody>
+<tr>
+<td>reproduced</td>
+<td><code>bool</code></td>
+<td>required</td>
+</tr>
+<tr>
+<td>steps_executed</td>
+<td><code>list</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>evidence</td>
+<td><code>str</code></td>
+<td>&mdash;</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div class="sd-entity-card" data-service-id="bugfix_workflow" data-journeys="J-3">
+<div class="sd-entity-header">
+<h4 class="sd-entity-name">RootCauseAnalysis</h4>
+<span class="sd-entity-svc" data-ref-service="bugfix_workflow">bugfix.yaml</span>
+</div>
+<table class="sd-field-table">
+<thead><tr><th>Field</th><th>Type</th><th>Constraints</th></tr></thead>
+<tbody>
+<tr>
+<td>root_cause</td>
+<td><code>str</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>evidence</td>
+<td><code>list</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>affected_files</td>
+<td><code>list</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>confidence</td>
+<td><code>float</code></td>
+<td>&mdash;</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div class="sd-entity-card" data-service-id="bugfix_workflow" data-journeys="J-3">
+<div class="sd-entity-header">
+<h4 class="sd-entity-name">BugFixResult</h4>
+<span class="sd-entity-svc" data-ref-service="bugfix_workflow">bugfix.yaml</span>
+</div>
+<table class="sd-field-table">
+<thead><tr><th>Field</th><th>Type</th><th>Constraints</th></tr></thead>
+<tbody>
+<tr>
+<td>fix_description</td>
+<td><code>str</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>files_changed</td>
+<td><code>list</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>tests_added</td>
+<td><code>list</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>verification_status</td>
+<td><code>str</code></td>
+<td>&mdash;</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div class="sd-entity-card" data-service-id="seed_data_package" data-journeys="">
+<div class="sd-entity-header">
+<h4 class="sd-entity-name">migration_seed.json</h4>
+<span class="sd-entity-svc" data-ref-service="seed_data_package">Seed Data Package</span>
+</div>
+<table class="sd-field-table">
+<thead><tr><th>Field</th><th>Type</th><th>Constraints</th></tr></thead>
+<tbody>
+<tr>
+<td>version</td>
+<td><code>str</code></td>
+<td>'2.0'</td>
+</tr>
+<tr>
+<td>generated_from</td>
+<td><code>str</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>workflows</td>
+<td><code>list</code></td>
+<td>3 records</td>
+</tr>
+<tr>
+<td>roles</td>
+<td><code>list</code></td>
+<td>10 records</td>
+</tr>
+<tr>
+<td>schemas</td>
+<td><code>list</code></td>
+<td>11 records</td>
+</tr>
+<tr>
+<td>templates</td>
+<td><code>list</code></td>
+<td>3 records</td>
+</tr>
+<tr>
+<td>plugin_types</td>
+<td><code>list</code></td>
+<td>6 records</td>
+</tr>
+<tr>
+<td>plugin_instances</td>
+<td><code>list</code></td>
+<td>8 records</td>
+</tr>
+<tr>
+<td>edge_transforms</td>
+<td><code>list</code></td>
+<td>7 records</td>
+</tr>
+</tbody>
+</table>
+</div>
+</div>
+</section>
+<section class="sd-section" id="relations">
+<h2 class="sd-section-title">Entity Relationships</h2>
+<div class="sd-table-wrap">
+<table class="sd-table">
+<thead><tr>
+<th>From</th><th>Relationship</th><th>To</th><th>Label</th>
+</tr></thead>
+<tbody>
+<tr>
+<td>workflow_config</td>
+<td><span class="sd-rel-kind">one-to-many</span></td>
+<td>phase_definition</td>
+<td>phases</td>
+</tr>
+<tr>
+<td>workflow_config</td>
+<td><span class="sd-rel-kind">one-to-many</span></td>
+<td>actor_definition</td>
+<td>actors</td>
+</tr>
+<tr>
+<td>workflow_config</td>
+<td><span class="sd-rel-kind">one-to-many</span></td>
+<td>type_definition</td>
+<td>types</td>
+</tr>
+<tr>
+<td>workflow_config</td>
+<td><span class="sd-rel-kind">one-to-many</span></td>
+<td>plugin_instance_config</td>
+<td>plugins (local instance configs)</td>
+</tr>
+<tr>
+<td>workflow_config</td>
+<td><span class="sd-rel-kind">one-to-many</span></td>
+<td>template_definition</td>
+<td>templates (TemplateDefinition, not TemplateRef)</td>
+</tr>
+<tr>
+<td>workflow_config</td>
+<td><span class="sd-rel-kind">one-to-many</span></td>
+<td>edge_definition</td>
+<td>edges (cross-phase at root)</td>
+</tr>
+<tr>
+<td>workflow_config</td>
+<td><span class="sd-rel-kind">one-to-one</span></td>
+<td>workflow_cost_config</td>
+<td>cost_config</td>
+</tr>
+<tr>
+<td>phase_definition</td>
+<td><span class="sd-rel-kind">one-to-many</span></td>
+<td>ask_node</td>
+<td>nodes</td>
+</tr>
+<tr>
+<td>phase_definition</td>
+<td><span class="sd-rel-kind">one-to-many</span></td>
+<td>branch_node</td>
+<td>nodes</td>
+</tr>
+<tr>
+<td>phase_definition</td>
+<td><span class="sd-rel-kind">one-to-many</span></td>
+<td>plugin_node</td>
+<td>nodes</td>
+</tr>
+<tr>
+<td>phase_definition</td>
+<td><span class="sd-rel-kind">one-to-many</span></td>
+<td>error_node</td>
+<td>nodes (D-GR-13)</td>
+</tr>
+<tr>
+<td>phase_definition</td>
+<td><span class="sd-rel-kind">one-to-many</span></td>
+<td>edge_definition</td>
+<td>edges</td>
+</tr>
+<tr>
+<td>phase_definition</td>
+<td><span class="sd-rel-kind">one-to-one</span></td>
+<td>loop_mode_config</td>
+<td>loop_config (mode=loop)</td>
+</tr>
+<tr>
+<td>phase_definition</td>
+<td><span class="sd-rel-kind">one-to-one</span></td>
+<td>fold_mode_config</td>
+<td>fold_config (mode=fold)</td>
+</tr>
+<tr>
+<td>phase_definition</td>
+<td><span class="sd-rel-kind">one-to-one</span></td>
+<td>map_mode_config</td>
+<td>map_config (mode=map)</td>
+</tr>
+<tr>
+<td>phase_definition</td>
+<td><span class="sd-rel-kind">one-to-one</span></td>
+<td>phase_cost_config</td>
+<td>cost</td>
+</tr>
+<tr>
+<td>ask_node</td>
+<td><span class="sd-rel-kind">many-to-one</span></td>
+<td>actor_definition</td>
+<td>actor_ref resolves to ActorDefinition</td>
+</tr>
+<tr>
+<td>ask_node</td>
+<td><span class="sd-rel-kind">one-to-many</span></td>
+<td>workflow_input_definition</td>
+<td>inputs</td>
+</tr>
+<tr>
+<td>ask_node</td>
+<td><span class="sd-rel-kind">one-to-many</span></td>
+<td>workflow_output_definition</td>
+<td>outputs + hooks</td>
+</tr>
+<tr>
+<td>ask_node</td>
+<td><span class="sd-rel-kind">one-to-one</span></td>
+<td>node_cost_config</td>
+<td>cost</td>
+</tr>
+<tr>
+<td>branch_node</td>
+<td><span class="sd-rel-kind">one-to-many</span></td>
+<td>branch_output_port</td>
+<td>outputs (per-port conditions, non-exclusive)</td>
+</tr>
+<tr>
+<td>actor_definition</td>
+<td><span class="sd-rel-kind">one-to-one</span></td>
+<td>role_definition</td>
+<td>role (agent actor_type only)</td>
+</tr>
+<tr>
+<td>plugin_instance_config</td>
+<td><span class="sd-rel-kind">many-to-one</span></td>
+<td>plugin_interface</td>
+<td>plugin_type references interface</td>
+</tr>
+<tr>
+<td>store_definition</td>
+<td><span class="sd-rel-kind">one-to-many</span></td>
+<td>store_key_definition</td>
+<td>keys</td>
+</tr>
+<tr>
+<td>store_key_definition</td>
+<td><span class="sd-rel-kind">many-to-one</span></td>
+<td>type_definition</td>
+<td>type_ref</td>
+</tr>
+<tr>
+<td>plugin_registry</td>
+<td><span class="sd-rel-kind">one-to-many</span></td>
+<td>plugin_interface</td>
+<td>type_interfaces (6 general types)</td>
+</tr>
+<tr>
+<td>plugin_registry</td>
+<td><span class="sd-rel-kind">one-to-many</span></td>
+<td>plugin_instance_config</td>
+<td>instances (8 concrete configs)</td>
+</tr>
+<tr>
+<td>mock_agent_runtime</td>
+<td><span class="sd-rel-kind">one-to-many</span></td>
+<td>mock_interaction_runtime</td>
+<td>scripted responses by actor_type</td>
+</tr>
+<tr>
+<td>scope_output</td>
+<td><span class="sd-rel-kind">one-to-many</span></td>
+<td>implementation_dag</td>
+<td>decomposed into task groups</td>
+</tr>
+<tr>
+<td>implementation_dag</td>
+<td><span class="sd-rel-kind">one-to-many</span></td>
+<td>implementation_result</td>
+<td>per-task results</td>
+</tr>
+<tr>
+<td>bug_report</td>
+<td><span class="sd-rel-kind">one-to-one</span></td>
+<td>reproduction_result</td>
+<td>reproduction</td>
+</tr>
+<tr>
+<td>reproduction_result</td>
+<td><span class="sd-rel-kind">one-to-one</span></td>
+<td>root_cause_analysis</td>
+<td>leads to RCA</td>
+</tr>
+<tr>
+<td>root_cause_analysis</td>
+<td><span class="sd-rel-kind">one-to-one</span></td>
+<td>bug_fix_result</td>
+<td>informs fix</td>
+</tr>
+<tr>
+<td>handover_doc</td>
+<td><span class="sd-rel-kind">one-to-many</span></td>
+<td>implementation_result</td>
+<td>completed_tasks (compressed by handover_compress, failed_attempts never compressed)</td>
+</tr>
+<tr>
+<td>execution_result</td>
+<td><span class="sd-rel-kind">one-to-many</span></td>
+<td>store_write_result</td>
+<td>artifact writes</td>
+</tr>
+<tr>
+<td>execution_result</td>
+<td><span class="sd-rel-kind">one-to-many</span></td>
+<td>error_route</td>
+<td>errors_routed (D-GR-4)</td>
+</tr>
+<tr>
+<td>seed_file</td>
+<td><span class="sd-rel-kind">one-to-many</span></td>
+<td>plugin_interface</td>
+<td>plugin_types section (6 general types)</td>
+</tr>
+<tr>
+<td>seed_file</td>
+<td><span class="sd-rel-kind">one-to-many</span></td>
+<td>plugin_instance_config</td>
+<td>plugin_instances section (8 records)</td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section class="sd-section" id="risks">
+<h2 class="sd-section-title">Risks</h2>
+<ul class="sd-risks-list">
+<li>RISK-1 (medium): SF-1 schema module may still use stale names (Edge, TemplateRef, MapConfig/FoldConfig/LoopConfig, CostConfig) in implementation before D-GR-41 corrections land. Mitigation: SF-4's import statements must use canonical names; add compatibility shim in _compat.py if SF-1 ships stale names. Affects STEP-1, STEP-3, STEP-4.</li>
+<li>RISK-2 (medium): Edge transform complexity — tiered_context_builder and build_task_prompt (~20 lines inline in YAML) are hard to read/debug. Mitigation: Catalog all 7 transforms as named constants in plugins/transforms.py; unit-test in test_edge_transforms.py. Affects STEP-1, STEP-3.</li>
+<li>RISK-3 (medium): Runner transform sandbox — inline Python in EdgeDefinition.transform_fn requires AST-validated exec per D-GR-5. No secrets in sandbox (D-GR-10). env_overrides is config Plugin, NOT a transform. Affects STEP-3, STEP-4, STEP-5.</li>
+<li>RISK-4 (low): Category C AskNode proliferation — 3 new actors (summarizer, extractor, sd_converter_agent). Mitigation: summarizer/extractor use claude-haiku; sd_converter_agent uses claude-sonnet-4-6. Actor defs shared across phases. Affects STEP-3, STEP-4.</li>
+<li>RISK-5 (medium): Develop-planning structural drift — planning phases in develop.yaml may diverge from planning.yaml. Mitigation: test_develop_planning_phases_match consistency tests in CI. Affects STEP-4, STEP-7.</li>
+<li>RISK-6 (medium): SF-2 runner may lag on nested phase modes, fresh_sessions, AST-validated transform eval, ContextVar node publication, error-port routing, history/phase_metrics fields per D-GR-34. Mitigation: Build order STEP-1/2 (no SF-2 dep) -&gt; STEP-3/4/5 (SF-1 structural only) -&gt; STEP-7 (SF-2 required). Affects STEP-7.</li>
+<li>RISK-7 (medium): Missing store writes — converting implicit artifacts.put() to explicit store PluginNodes (D-GR-14) may miss calls. Mitigation: grep audit all artifacts.put() in iriai-build-v2 read-only. test_store_writes_are_explicit verifies every artifact has a store PluginNode. Affects STEP-3, STEP-4, STEP-5.</li>
+<li>RISK-8 (low): YAML file size — develop.yaml with 60+ nodes, 7 phases, nested fold &gt; map &gt; loop, inline transform_fn. Mitigation: TemplateDefinitions absorb ~15 nodes each. Named transform constants reduce inline YAML. Affects STEP-4.</li>
+<li>RISK-9 (low): iriai-build-v2 integration timing — _declarative.py depends on SF-2 shipping run() + RuntimeConfig + PluginRuntime ABC. Mitigation: lazy import iriai_compose.declarative with graceful error if unavailable. AgentRuntime.invoke() unchanged so no Claude/Codex runtime updates needed. Affects STEP-10.</li>
+<li>RISK-10 (medium): ContextVar scope leakage across nested map/parallel execution could mis-attribute node_id. Mitigation: wrap every node dispatch in ContextVar token reset; SF-3/SF-4 contract tests cover ContextVar node propagation and workflow-&gt;phase-&gt;actor-&gt;node merge order. Affects STEP-7, STEP-8.</li>
+</ul>
+</section>
+</main>
+<footer class="sd-footer">
+<p>System Design Document</p>
+</footer>
+<script>
+(function () {
+  'use strict';
+
+  // ── Journey filtering ──────────────────────────────────────────────
+  var activeJourney = '__all__';
+
+  window.__sd_filter = function (journeyId) {
+    activeJourney = journeyId;
+
+    // Update pill states
+    var pills = document.querySelectorAll('.sd-pill');
+    for (var i = 0; i < pills.length; i++) {
+      var p = pills[i];
+      if (p.getAttribute('data-journey') === journeyId) {
+        p.classList.add('sd-pill-active');
+      } else {
+        p.classList.remove('sd-pill-active');
+      }
+    }
+
+    // Filter elements with data-journeys
+    var tagged = document.querySelectorAll('[data-journeys]');
+    for (var j = 0; j < tagged.length; j++) {
+      var el = tagged[j];
+      if (journeyId === '__all__') {
+        el.classList.remove('sd-dimmed');
+      } else {
+        var jList = (el.getAttribute('data-journeys') || '').split(/\s+/);
+        var match = false;
+        for (var k = 0; k < jList.length; k++) {
+          if (jList[k] === journeyId) { match = true; break; }
+        }
+        el.classList.toggle('sd-dimmed', !match);
+      }
+    }
+
+    // Filter elements with data-journey-id (call paths)
+    var cpTagged = document.querySelectorAll('[data-journey-id]');
+    for (var m = 0; m < cpTagged.length; m++) {
+      var cpEl = cpTagged[m];
+      if (journeyId === '__all__') {
+        cpEl.classList.remove('sd-dimmed');
+      } else {
+        var cpJourney = cpEl.getAttribute('data-journey-id') || '';
+        cpEl.classList.toggle('sd-dimmed', cpJourney !== '' && cpJourney !== journeyId);
+      }
+    }
+  };
+
+  // ── Expand / collapse all details ──────────────────────────────────
+  var detailsExpanded = false;
+
+  window.__sd_toggle_details = function () {
+    detailsExpanded = !detailsExpanded;
+    var details = document.querySelectorAll('.sd-call-path');
+    for (var i = 0; i < details.length; i++) {
+      details[i].open = detailsExpanded;
+    }
+    var btn = document.getElementById('sd-toggle-details');
+    if (btn) {
+      btn.textContent = detailsExpanded ? 'Collapse All' : 'Expand All';
+    }
+  };
+
+  // ── Service hover cross-highlighting ───────────────────────────────
+  function highlightService(serviceId, on) {
+    // Highlight service cards
+    var cards = document.querySelectorAll('.sd-service-card[data-service-id="' + serviceId + '"]');
+    for (var i = 0; i < cards.length; i++) {
+      cards[i].classList.toggle('sd-highlight', on);
+    }
+
+    // Highlight entity cards belonging to this service
+    var entities = document.querySelectorAll('.sd-entity-card[data-service-id="' + serviceId + '"]');
+    for (var j = 0; j < entities.length; j++) {
+      entities[j].classList.toggle('sd-highlight', on);
+    }
+
+    // Highlight service references in tables
+    var refs = document.querySelectorAll('.sd-svc-ref[data-ref-service="' + serviceId + '"]');
+    for (var k = 0; k < refs.length; k++) {
+      refs[k].style.fontWeight = on ? '700' : '';
+      refs[k].style.textDecoration = on ? 'underline' : '';
+    }
+  }
+
+  // Attach hover listeners to service cards
+  document.addEventListener('DOMContentLoaded', function () {
+    var svcCards = document.querySelectorAll('.sd-service-card[data-service-id]');
+    for (var i = 0; i < svcCards.length; i++) {
+      (function (card) {
+        var sid = card.getAttribute('data-service-id');
+        card.addEventListener('mouseenter', function () { highlightService(sid, true); });
+        card.addEventListener('mouseleave', function () { highlightService(sid, false); });
+      })(svcCards[i]);
+    }
+
+    // Attach hover listeners to service refs (entity badges, table refs)
+    var svcRefs = document.querySelectorAll('[data-ref-service]');
+    for (var j = 0; j < svcRefs.length; j++) {
+      (function (ref) {
+        var sid = ref.getAttribute('data-ref-service');
+        ref.addEventListener('mouseenter', function () { highlightService(sid, true); });
+        ref.addEventListener('mouseleave', function () { highlightService(sid, false); });
+      })(svcRefs[j]);
+    }
+  });
+
+  // ── Smooth scroll via nav links ────────────────────────────────────
+  var navLinks = document.querySelectorAll('.sd-nav-link');
+  for (var i = 0; i < navLinks.length; i++) {
+    navLinks[i].addEventListener('click', function (e) {
+      var href = this.getAttribute('href');
+      if (href && href.charAt(0) === '#') {
+        var target = document.getElementById(href.substring(1));
+        if (target) {
+          e.preventDefault();
+          var headerHeight = document.querySelector('.sd-header')
+            ? document.querySelector('.sd-header').offsetHeight
+            : 0;
+          var top = target.getBoundingClientRect().top + window.pageYOffset - headerHeight - 16;
+          window.scrollTo({ top: top, behavior: 'smooth' });
+        }
+      }
+    });
+  }
+})();
+</script>
+</body>
+</html>

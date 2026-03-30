@@ -17,6 +17,7 @@ async def run_slack_bridge(
     planning_channel: str,
     workspace: str | None = None,
     mode: Literal["multiplayer", "singleplayer"] = "multiplayer",
+    agent_runtime: str = "claude",
 ) -> None:
     """Start the long-lived Slack bridge.
 
@@ -61,6 +62,7 @@ async def run_slack_bridge(
         adapter=adapter,
         interaction_runtime=interaction_runtime,
         workspace_path=workspace_path,
+        agent_runtime_name=agent_runtime,
     )
     await orchestrator.start()
 
@@ -70,6 +72,7 @@ async def run_slack_bridge(
     # 5. Log successful connection
     print(f"\niriai-build-v2 Slack bridge")
     print(f"  Default mode: {mode}")
+    print(f"  Agent runtime: {agent_runtime}")
     print(f"  Channel: {planning_channel}")
     print(f"  Bot: @{adapter.bot_user_id}")
     print(f"  Listening for [FEATURE] messages...\n")

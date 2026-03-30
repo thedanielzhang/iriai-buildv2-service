@@ -1,0 +1,2832 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SF-6 Workflow Editor &amp; Canvas - System Design</title>
+<style>
+  /* ── Reset & Base ─────────────────────────────────────────────────── */
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  @font-face {
+    font-family: 'Charter';
+    src: local('Charter'), local('Georgia');
+    font-display: swap;
+  }
+
+  :root {
+    --text-primary: #1a1a2e;
+    --text-secondary: #555;
+    --text-muted: #888;
+    --bg-page: #faf9f7;
+    --bg-card: #fff;
+    --border-subtle: rgba(0, 0, 0, 0.06);
+    --border-medium: rgba(0, 0, 0, 0.1);
+    --accent: #2d5be3;
+    --accent-faint: rgba(45, 91, 227, 0.06);
+    --accent-light: rgba(45, 91, 227, 0.12);
+    --content-width: 960px;
+    --gutter: clamp(20px, 5vw, 48px);
+    --radius: 10px;
+    --radius-sm: 6px;
+  }
+
+  html {
+    font-size: 17px;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
+    scroll-behavior: smooth;
+  }
+
+  body {
+    font-family: Charter, Georgia, 'Times New Roman', serif;
+    color: var(--text-primary);
+    background: var(--bg-page);
+    line-height: 1.72;
+    min-height: 100vh;
+  }
+
+  ::selection {
+    background: rgba(45, 91, 227, 0.18);
+    color: inherit;
+  }
+
+  /* ── Header ──────────────────────────────────────────────────────── */
+  .sd-header {
+    position: sticky;
+    top: 0;
+    z-index: 100;
+    background: rgba(250, 249, 247, 0.92);
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
+    border-bottom: 1px solid var(--border-subtle);
+    padding: 0 var(--gutter);
+  }
+
+  .sd-header-inner {
+    max-width: var(--content-width);
+    margin: 0 auto;
+    padding: 20px 0 16px;
+  }
+
+  .sd-title {
+    font-size: clamp(1.8rem, 4vw, 2.6rem);
+    font-weight: 700;
+    line-height: 1.15;
+    letter-spacing: -0.025em;
+    color: var(--text-primary);
+    margin-bottom: 12px;
+  }
+
+  .sd-nav {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-bottom: 12px;
+  }
+
+  .sd-nav-link {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--text-muted);
+    text-decoration: none;
+    padding: 4px 10px;
+    border-radius: var(--radius-sm);
+    transition: color 0.15s, background 0.15s;
+  }
+
+  .sd-nav-link:hover {
+    color: var(--accent);
+    background: var(--accent-faint);
+  }
+
+  /* ── Filter pills ────────────────────────────────────────────────── */
+  .sd-filters {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+    padding-top: 4px;
+  }
+
+  .sd-filter-label {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    margin-right: 4px;
+  }
+
+  .sd-pill {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 12px;
+    font-weight: 500;
+    padding: 3px 12px;
+    border: 1px solid var(--border-medium);
+    border-radius: 100px;
+    background: var(--bg-card);
+    color: var(--text-secondary);
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+
+  .sd-pill:hover {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+
+  .sd-pill-active {
+    background: var(--accent);
+    color: #fff;
+    border-color: var(--accent);
+  }
+
+  .sd-pill-active:hover {
+    background: #1a3fa0;
+    border-color: #1a3fa0;
+    color: #fff;
+  }
+
+  /* ── Main content ────────────────────────────────────────────────── */
+  .sd-main {
+    max-width: var(--content-width);
+    margin: 0 auto;
+    padding: 32px var(--gutter) 80px;
+  }
+
+  .sd-section {
+    margin-bottom: 48px;
+  }
+
+  .sd-section-title {
+    font-size: 1.5rem;
+    font-weight: 700;
+    line-height: 1.3;
+    letter-spacing: -0.01em;
+    margin-bottom: 20px;
+    padding-bottom: 10px;
+    border-bottom: 1px solid var(--border-subtle);
+    color: var(--text-primary);
+  }
+
+  .sd-subsection-title {
+    font-size: 1.1rem;
+    font-weight: 700;
+    margin: 28px 0 14px;
+    color: var(--text-primary);
+  }
+
+  .sd-overview-text {
+    font-size: 1.05rem;
+    line-height: 1.75;
+    color: var(--text-secondary);
+    margin-bottom: 1.4em;
+  }
+
+  .sd-empty {
+    font-style: italic;
+    color: var(--text-muted);
+    padding: 16px 0;
+  }
+
+  /* ── Decisions list ──────────────────────────────────────────────── */
+  .sd-decisions-list {
+    padding-left: 1.6em;
+    color: var(--text-secondary);
+  }
+
+  .sd-decisions-list li {
+    margin-bottom: 0.5em;
+    line-height: 1.6;
+  }
+
+  /* ── Tier labels ─────────────────────────────────────────────────── */
+  .sd-tier-label {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 0.72rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--text-muted);
+    margin: 20px 0 10px;
+  }
+
+  /* ── Service grid ────────────────────────────────────────────────── */
+  .sd-service-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+    gap: 14px;
+    margin-bottom: 8px;
+  }
+
+  .sd-service-card {
+    background: var(--bg-card);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius);
+    padding: 18px;
+    transition: opacity 0.3s, border-color 0.2s, box-shadow 0.2s;
+    cursor: default;
+  }
+
+  .sd-service-card:hover {
+    border-color: var(--accent);
+    box-shadow: 0 2px 12px rgba(45, 91, 227, 0.08);
+  }
+
+  .sd-service-card.sd-highlight {
+    border-color: var(--accent);
+    box-shadow: 0 2px 16px rgba(45, 91, 227, 0.14);
+  }
+
+  .sd-service-icon {
+    font-size: 1.5rem;
+    margin-bottom: 8px;
+  }
+
+  .sd-service-name {
+    font-weight: 700;
+    font-size: 1rem;
+    color: var(--text-primary);
+    margin-bottom: 2px;
+  }
+
+  .sd-service-kind {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 0.72rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-muted);
+    margin-bottom: 6px;
+  }
+
+  .sd-service-tech {
+    font-family: 'SF Mono', 'Fira Code', Menlo, Consolas, monospace;
+    font-size: 0.78rem;
+    color: #1a3fa0;
+    background: var(--accent-faint);
+    display: inline-block;
+    padding: 1px 8px;
+    border-radius: 4px;
+    margin-bottom: 4px;
+  }
+
+  .sd-service-port {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 0.75rem;
+    color: var(--text-muted);
+    margin-bottom: 6px;
+  }
+
+  .sd-service-desc {
+    font-size: 0.88rem;
+    color: var(--text-secondary);
+    line-height: 1.55;
+    margin-top: 6px;
+  }
+
+  /* ── Connections list ────────────────────────────────────────────── */
+  .sd-connections-list {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .sd-connection-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 16px;
+    background: var(--bg-card);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-sm);
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 0.88rem;
+    transition: opacity 0.3s;
+    flex-wrap: wrap;
+  }
+
+  .sd-conn-from, .sd-conn-to {
+    font-weight: 600;
+    color: var(--text-primary);
+  }
+
+  .sd-conn-arrow {
+    color: var(--accent);
+    font-weight: 700;
+  }
+
+  .sd-conn-proto {
+    font-size: 0.78rem;
+    color: var(--text-muted);
+  }
+
+  .sd-conn-label {
+    color: var(--text-secondary);
+    font-weight: 400;
+    margin-left: auto;
+  }
+
+  /* ── Call paths (details/summary) ────────────────────────────────── */
+  .sd-call-path {
+    background: var(--bg-card);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius);
+    margin-bottom: 10px;
+    transition: opacity 0.3s;
+    overflow: hidden;
+  }
+
+  .sd-call-path summary {
+    padding: 14px 18px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-weight: 600;
+    font-size: 0.95rem;
+    color: var(--text-primary);
+    list-style: none;
+  }
+
+  .sd-call-path summary::-webkit-details-marker { display: none; }
+
+  .sd-call-path summary::before {
+    content: '\25B6';
+    font-size: 0.65rem;
+    color: var(--text-muted);
+    transition: transform 0.2s;
+    flex-shrink: 0;
+  }
+
+  .sd-call-path[open] summary::before {
+    transform: rotate(90deg);
+  }
+
+  .sd-cp-name { flex: 1; }
+
+  .sd-cp-journey {
+    font-size: 0.72rem;
+    font-weight: 500;
+    color: var(--accent);
+    background: var(--accent-faint);
+    padding: 2px 8px;
+    border-radius: 100px;
+  }
+
+  .sd-cp-desc {
+    padding: 0 18px 12px;
+    font-size: 0.9rem;
+    color: var(--text-secondary);
+    line-height: 1.6;
+  }
+
+  /* ── Sequence diagram rows ───────────────────────────────────────── */
+  .sd-sequence {
+    margin: 0 18px 18px;
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-sm);
+    overflow-x: auto;
+  }
+
+  .sd-seq-header, .sd-seq-row {
+    display: grid;
+    grid-template-columns: 40px 1fr 32px 1fr 2fr 1.5fr;
+    gap: 8px;
+    padding: 8px 14px;
+    align-items: start;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 0.82rem;
+  }
+
+  .sd-seq-header {
+    background: rgba(0, 0, 0, 0.02);
+    font-weight: 700;
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--text-muted);
+    border-bottom: 1px solid var(--border-subtle);
+  }
+
+  .sd-seq-row {
+    border-bottom: 1px solid var(--border-subtle);
+    color: var(--text-secondary);
+  }
+
+  .sd-seq-row:last-child { border-bottom: none; }
+
+  .sd-seq-row:hover { background: rgba(45, 91, 227, 0.02); }
+
+  .sd-seq-num {
+    font-weight: 700;
+    color: var(--accent);
+    text-align: center;
+  }
+
+  .sd-seq-from, .sd-seq-to { font-weight: 600; color: var(--text-primary); }
+
+  .sd-seq-arrow { color: var(--accent); text-align: center; font-weight: 700; }
+
+  .sd-seq-action { color: var(--text-primary); }
+
+  .sd-seq-detail {
+    font-size: 0.78rem;
+    color: var(--text-muted);
+    margin-top: 2px;
+  }
+
+  .sd-seq-returns {
+    font-family: 'SF Mono', 'Fira Code', Menlo, Consolas, monospace;
+    font-size: 0.78rem;
+    color: var(--text-muted);
+  }
+
+  /* ── Expand/collapse button ──────────────────────────────────────── */
+  .sd-expand-btn {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 12px;
+    font-weight: 500;
+    padding: 4px 14px;
+    border: 1px solid var(--border-medium);
+    border-radius: var(--radius-sm);
+    background: var(--bg-card);
+    color: var(--text-secondary);
+    cursor: pointer;
+    margin-bottom: 14px;
+    transition: all 0.15s;
+  }
+
+  .sd-expand-btn:hover {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+
+  /* ── Tables ──────────────────────────────────────────────────────── */
+  .sd-table-wrap {
+    overflow-x: auto;
+  }
+
+  .sd-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.88rem;
+    border-radius: var(--radius);
+    overflow: hidden;
+    border: 1px solid var(--border-subtle);
+  }
+
+  .sd-table th, .sd-table td {
+    padding: 10px 14px;
+    text-align: left;
+    border-bottom: 1px solid var(--border-subtle);
+  }
+
+  .sd-table th {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-weight: 600;
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--text-muted);
+    background: rgba(0, 0, 0, 0.02);
+  }
+
+  .sd-table tr:last-child td { border-bottom: none; }
+  .sd-table tr:hover td { background: rgba(45, 91, 227, 0.02); }
+
+  .sd-table code {
+    font-family: 'SF Mono', 'Fira Code', Menlo, Consolas, monospace;
+    font-size: 0.82em;
+    background: var(--accent-faint);
+    padding: 2px 6px;
+    border-radius: 4px;
+    color: #1a3fa0;
+    word-break: break-all;
+  }
+
+  .sd-svc-ref {
+    cursor: pointer;
+    font-weight: 500;
+    color: var(--accent);
+    transition: color 0.15s;
+  }
+
+  .sd-svc-ref:hover { color: #1a3fa0; }
+
+  .sd-rel-kind {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 0.78rem;
+    font-weight: 500;
+    color: var(--text-muted);
+    background: rgba(0,0,0,0.03);
+    padding: 2px 8px;
+    border-radius: 4px;
+  }
+
+  /* ── Entity grid ─────────────────────────────────────────────────── */
+  .sd-entity-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+    gap: 14px;
+  }
+
+  .sd-entity-card {
+    background: var(--bg-card);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius);
+    overflow: hidden;
+    transition: opacity 0.3s, border-color 0.2s, box-shadow 0.2s;
+  }
+
+  .sd-entity-card:hover {
+    border-color: var(--accent);
+    box-shadow: 0 2px 12px rgba(45, 91, 227, 0.08);
+  }
+
+  .sd-entity-card.sd-highlight {
+    border-color: var(--accent);
+    box-shadow: 0 2px 16px rgba(45, 91, 227, 0.14);
+  }
+
+  .sd-entity-header {
+    padding: 14px 16px 10px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    border-bottom: 1px solid var(--border-subtle);
+  }
+
+  .sd-entity-name {
+    font-size: 1rem;
+    font-weight: 700;
+    color: var(--text-primary);
+  }
+
+  .sd-entity-svc {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 0.72rem;
+    font-weight: 500;
+    color: var(--accent);
+    background: var(--accent-faint);
+    padding: 2px 8px;
+    border-radius: 100px;
+    cursor: pointer;
+  }
+
+  .sd-field-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.82rem;
+  }
+
+  .sd-field-table th, .sd-field-table td {
+    padding: 7px 16px;
+    text-align: left;
+    border-bottom: 1px solid var(--border-subtle);
+  }
+
+  .sd-field-table th {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-weight: 600;
+    font-size: 0.68rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--text-muted);
+    background: rgba(0, 0, 0, 0.015);
+  }
+
+  .sd-field-table tr:last-child td { border-bottom: none; }
+  .sd-field-table tr:hover td { background: rgba(45, 91, 227, 0.02); }
+
+  .sd-field-table code {
+    font-family: 'SF Mono', 'Fira Code', Menlo, Consolas, monospace;
+    font-size: 0.85em;
+    background: var(--accent-faint);
+    padding: 1px 5px;
+    border-radius: 3px;
+    color: #1a3fa0;
+  }
+
+  /* ── Risks ───────────────────────────────────────────────────────── */
+  .sd-risks-list {
+    list-style: none;
+    padding: 0;
+  }
+
+  .sd-risks-list li {
+    padding: 10px 16px;
+    margin-bottom: 6px;
+    background: #fef3f2;
+    border: 1px solid rgba(239, 68, 68, 0.12);
+    border-left: 3px solid #ef4444;
+    border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+    font-size: 0.92rem;
+    color: var(--text-secondary);
+    line-height: 1.6;
+  }
+
+  /* ── Footer ──────────────────────────────────────────────────────── */
+  .sd-footer {
+    max-width: var(--content-width);
+    margin: 0 auto;
+    padding: 24px var(--gutter) 48px;
+    text-align: center;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 0.75rem;
+    color: var(--text-muted);
+    border-top: 1px solid var(--border-subtle);
+  }
+
+  /* ── Dimmed state for journey filtering ──────────────────────────── */
+  .sd-dimmed {
+    opacity: 0.15 !important;
+    pointer-events: none;
+  }
+
+  /* ── Entrance animation ──────────────────────────────────────────── */
+  @keyframes sd-fade-up {
+    from { opacity: 0; transform: translateY(12px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+
+  .sd-header, .sd-main {
+    animation: sd-fade-up 0.45s ease both;
+  }
+
+  .sd-main { animation-delay: 0.08s; }
+
+  /* ── Responsive ──────────────────────────────────────────────────── */
+  @media (max-width: 700px) {
+    html { font-size: 15px; }
+    .sd-service-grid { grid-template-columns: 1fr; }
+    .sd-entity-grid { grid-template-columns: 1fr; }
+    .sd-seq-header, .sd-seq-row {
+      grid-template-columns: 32px 1fr 24px 1fr 1.5fr 1fr;
+      font-size: 0.75rem;
+    }
+  }
+
+  @media (max-width: 480px) {
+    .sd-header-inner { padding: 16px 0 12px; }
+    .sd-nav { gap: 4px; }
+    .sd-nav-link { font-size: 12px; padding: 3px 8px; }
+    .sd-filters { gap: 4px; }
+  }
+</style>
+</head>
+<body>
+<header class="sd-header">
+<div class="sd-header-inner">
+<h1 class="sd-title">SF-6 Workflow Editor &amp; Canvas</h1>
+<nav class="sd-nav" id="sd-nav">
+<a href="#overview" class="sd-nav-link">Overview</a>
+<a href="#topology" class="sd-nav-link">Topology</a>
+<a href="#call-paths" class="sd-nav-link">Call Paths</a>
+<a href="#endpoints" class="sd-nav-link">Endpoints</a>
+<a href="#entities" class="sd-nav-link">Entities</a>
+<a href="#relations" class="sd-nav-link">Relations</a>
+<a href="#risks" class="sd-nav-link">Risks</a>
+</nav>
+<div class="sd-filters" id="sd-filters">
+<span class="sd-filter-label">Filter by journey:</span>
+<button class="sd-pill sd-pill-active" data-journey="__all__" onclick="window.__sd_filter('__all__')">All</button>
+<button class="sd-pill" data-journey="J-16" onclick="window.__sd_filter('J-16')">J-16</button>
+<button class="sd-pill" data-journey="J-17" onclick="window.__sd_filter('J-17')">J-17</button>
+<button class="sd-pill" data-journey="J-18" onclick="window.__sd_filter('J-18')">J-18</button>
+<button class="sd-pill" data-journey="J-20" onclick="window.__sd_filter('J-20')">J-20</button>
+<button class="sd-pill" data-journey="J-22" onclick="window.__sd_filter('J-22')">J-22</button>
+</div>
+</div>
+</header>
+<main class="sd-main">
+<section class="sd-section" id="overview">
+<h2 class="sd-section-title">Overview</h2>
+<p class="sd-overview-text">SF-6 is the React Flow workflow editor mounted inside the accepted `tools/compose` application contract (`tools/compose/frontend` + `tools/compose/backend`). PostgreSQL 15 plus Alembic back only the five SF-5 foundation tables — `workflows`, `workflow_versions`, `roles`, `output_schemas`, and `custom_task_templates` — with no SQLite, no plugin-management tables, and no `workflow_entity_refs` at the foundation layer. SF-5 exposes workflow mutation hooks (create/update/delete lifecycle events) that SF-7 subscribes to for reference-index synchronization; the editor's save and auto-save paths flow through SF-5 CRUD and validate endpoints only and carry no write dependency on `workflow_entity_refs` or SF-7 reference-index endpoints. The editor keeps a flat React Flow node and edge array as its internal Zustand store, but save, load, export, and validation always round-trip through the canonical nested YAML contract: WorkflowConfig.phases[] with per-phase nodes, children, and cross-phase edges. Hook wiring is serialized only as ordinary source and target edges whose hook-versus-data meaning is inferred from the source port container; there is no separate serialized hooks section and no persisted port_type. GET /api/schema/workflow remains the canonical schema source, explicit saves append immutable workflow_versions rows, idle auto-save updates the draft workflow row, and the editor does not assume foundation-level plugin CRUD, SQLite storage, or workflow_entity_refs indexing. BranchNode is standardized on the D-GR-35 per-port non-exclusive fan-out model across editor, schema, runner, and migration artifacts: each entry in the dict-keyed paths map carries its own condition expression string evaluated independently at runtime, and multiple paths can fire if their conditions are met. There is no node-level condition_type or condition field. output_field mode is fully removed from the BranchNode schema. switch_function is rejected. merge_function is valid for multi-input gather. Each path key becomes an output handle ID on the canvas and an edge source port name in YAML. Service ID aliases: sf1-backend = compose-backend (tools/compose/backend, schema/workflow API layer); sf5-shell = compose-frontend authenticated shell (SF-5, tools/compose/frontend); sf7-library = SF-7 library surface of compose-backend owning workflow_entity_refs.</p>
+<h3 class="sd-subsection-title">Architecture Decisions</h3>
+<ol class="sd-decisions-list">
+<li>D-SF6-1: Phases and templates use the same expand-to-real-nodes pattern. Collapsed state renders a lightweight metadata card; expanded state renders real child React Flow nodes via parentId grouping.</li>
+<li>D-SF6-2: Undo and redo use full structuredClone snapshots capped at 50 entries instead of command-pattern inverses.</li>
+<li>D-SF6-3: React Flow flat node and edge arrays remain the internal editor store shape. The persisted workflow contract stays nested YAML via WorkflowConfig.phases with per-phase nodes and children, and the serializer reconstructs that tree only during save and load.</li>
+<li>D-SF6-4: Validation is hybrid. isValidConnection handles fast synchronous connection guards, while clientValidator performs debounced structural and type checks after mutations.</li>
+<li>D-SF6-5: Auto-layout uses recursive dagre because phase nesting requires child-first layout and explicit collapsed group bounds.</li>
+<li>D-SF6-6: YAML serialization uses js-yaml and preserves the canonical BranchNode contract while targeting the D-GR-22 schema baseline. The serializer emits nested phase.nodes and phase.children plus ordinary source and target refs for both data and hook edges; hook semantics are reconstructed from source-port resolution, so no serialized port_type is emitted.</li>
+<li>D-SF6-7: Templates use stamp-and-detach semantics. Dropping a template creates independent read-only copies until the user detaches them.</li>
+<li>D-SF6-8: inputs, outputs, hooks, and BranchNode.paths are all dict-keyed maps. Port and path names live in the map key, not as redundant nested fields. Branch paths use PathPortDefinition which extends PortDefinition with a required per-port condition expression.</li>
+<li>D-SF6-9: BranchNode adopts the D-GR-35 per-port non-exclusive fan-out model (superseding the prior exclusive routing rule and aligning with D-GR-12): each entry in the dict-keyed paths map carries its own condition expression string evaluated independently at runtime, and multiple paths can fire if their conditions are met. There is no node-level condition_type or condition field. output_field mode is fully removed from the BranchNode schema everywhere. switch_function is rejected and never a valid field. merge_function remains valid for multi-input gather before fan-out evaluation. The editor renders per-port condition summaries on each path handle; BranchInspector exposes per-port condition expression editors per path row, not a single node-level condition editor. connectionValidator does not block multi-fan-out connections from a Branch node.</li>
+<li>D-SF6-10: GET /api/schema/workflow is the canonical composer schema source. The editor hydrates runtime field contracts and defaults from that endpoint; static workflow-schema.json artifacts are build and test only.</li>
+<li>D-SF6-11: SF-5 (compose-backend, alias sf1-backend) exposes workflow mutation hooks for create, update, and delete lifecycle events. SF-7 (alias sf7-library) subscribes to these hooks to keep the workflow_entity_refs reference index synchronized. The editor's save and auto-save paths target only SF-5 CRUD, validate, and schema endpoints and carry no direct write dependency on workflow_entity_refs or SF-7 reference-index endpoints. This boundary is enforced in both the FastAPI router layer (SF-5 endpoints do not return or accept workflow_entity_refs fields) and in the editor's API client (no requests to /api/{entity}/references/{id} on the core boot or save paths).</li>
+<li>D-SF6-12: Service ID aliases in this design: sf1-backend = compose-backend (tools/compose/backend) serving schema and workflow endpoints; sf5-shell = compose-frontend (tools/compose/frontend) authenticated shell providing auth context and route mount; sf7-library = the SF-7 library and registries surface of compose-backend serving role/schema/template/tool CRUD and owning workflow_entity_refs. All three run in the tools/compose topology on PostgreSQL 15. No SQLite, no tools/iriai-workflows, no separate plugin-management service.</li>
+<li>D-U1: Phases use expand-to-real-nodes, not mini topology thumbnails.</li>
+<li>D-U2: Templates use the same expand-to-real-nodes pattern as phases.</li>
+<li>D-U3: Template children are read-only but fully inspectable. The inspector shows values but disables edits and destructive actions.</li>
+<li>D-U4: Detaching a template group removes read-only constraints and turns stamped nodes into normal editable nodes.</li>
+<li>nodeTypes and edgeTypes objects must be defined at module scope so React Flow receives stable references.</li>
+<li>Zustand selectors must not allocate new filtered or mapped collections; derived arrays belong in component-level memoization.</li>
+<li>The palette stays on the right side of the canvas and the editor has no version-history UI.</li>
+<li>Phase creation is driven by Select-tool rectangle grouping rather than a phase palette item.</li>
+<li>Auto-save runs after 30 seconds of inactivity and beforeunload warns only when the editor is dirty.</li>
+<li>CodeMirror loads lazily the first time an inspector needs code editing.</li>
+<li>Drag operations capture one undo snapshot on drag-stop rather than pushing snapshots for each pointer move.</li>
+<li>Cross-phase rectangle selection is rejected. A new phase may only contain nodes that already share the same parent boundary.</li>
+<li>Template groups serialize as $template_ref blocks instead of expanded child nodes. version_hash is used to detect drift between save and load.</li>
+<li>D-35: CollapsedGroupCard is a fixed-size metadata card rather than a mini-canvas preview. Performance benefit comes from not rendering nested canvases in collapsed state.</li>
+<li>D-58: Three-layer component ownership remains in force. SF-1 owns type definitions, SF-7 owns pure visual primitives, and SF-6 owns thin React Flow adapters. Branch visuals come from BranchNodePrimitive with per-port condition badges and named path handles, not from SF-6 re-implementations.</li>
+</ol>
+</section>
+<section class="sd-section" id="topology">
+<h2 class="sd-section-title">Service Topology</h2>
+<h4 class="sd-tier-label">Frontend</h4>
+<div class="sd-service-grid">
+<div class="sd-service-card" data-service-id="workflow-editor-page" data-journeys="J-16 J-22">
+<div class="sd-service-icon">&#x1F310;</div>
+<div class="sd-service-name">WorkflowEditorPage</div>
+<div class="sd-service-kind">frontend</div>
+<div class="sd-service-tech">React 18</div>
+<p class="sd-service-desc">Top-level route component at /workflows/:id/edit. Mounts canvas, toolbar, palette, inspectors, and validation panel inside the authenticated shell.</p>
+</div>
+<div class="sd-service-card" data-service-id="validation-panel" data-journeys="J-22">
+<div class="sd-service-icon">&#x1F310;</div>
+<div class="sd-service-name">ValidationPanel</div>
+<div class="sd-service-kind">frontend</div>
+<div class="sd-service-tech">React</div>
+<p class="sd-service-desc">Floating panel listing structural and server-side validation issues with severity badges and go-to actions that focus the offending node or edge.</p>
+</div>
+<div class="sd-service-card" data-service-id="editor-canvas" data-journeys="J-16 J-17 J-20 J-22">
+<div class="sd-service-icon">&#x1F310;</div>
+<div class="sd-service-name">EditorCanvas</div>
+<div class="sd-service-kind">frontend</div>
+<div class="sd-service-tech">React, @xyflow/react</div>
+<p class="sd-service-desc">React Flow wrapper that renders visible nodes and edges, filters collapsed children, wires nodeTypes and edgeTypes, and derives hook-versus-data edge visuals from resolved source handles on the dot-grid canvas.</p>
+</div>
+<div class="sd-service-card" data-service-id="sf6-canvas-primitives" data-journeys="J-17 J-20">
+<div class="sd-service-icon">&#x1F310;</div>
+<div class="sd-service-name">SF-6 Canvas Primitives</div>
+<div class="sd-service-kind">frontend</div>
+<div class="sd-service-tech">React</div>
+<p class="sd-service-desc">Canvas-only primitives owned by SF-6, primarily CollapsedGroupCard for collapsed phases and template groups.</p>
+</div>
+<div class="sd-service-card" data-service-id="ask-flow-node" data-journeys="J-16 J-18 J-20">
+<div class="sd-service-icon">&#x1F310;</div>
+<div class="sd-service-name">AskFlowNode</div>
+<div class="sd-service-kind">frontend</div>
+<div class="sd-service-tech">React, @xyflow/react</div>
+<p class="sd-service-desc">Thin React Flow adapter wrapping SF-7's AskNodePrimitive. Generates input and output Handles from dict-keyed ports, adds selection styling, and forwards all visual rendering to SF-7.</p>
+</div>
+<div class="sd-service-card" data-service-id="branch-flow-node" data-journeys="J-16 J-20 J-22">
+<div class="sd-service-icon">&#x1F310;</div>
+<div class="sd-service-name">BranchFlowNode</div>
+<div class="sd-service-kind">frontend</div>
+<div class="sd-service-tech">React, @xyflow/react</div>
+<p class="sd-service-desc">Thin React Flow adapter wrapping SF-7's BranchNodePrimitive. Generates one output Handle per entry in node.data.paths and uses the path key as both the Handle ID and serialized edge source port name. Displays per-port condition expression summary on each path handle and optional merge_function summary for gather; never shows switch_function, never shows output_field, and never exposes a node-level condition_type. Supports non-exclusive fan-out where multiple output handles can fire independently if their per-port conditions are met.</p>
+</div>
+<div class="sd-service-card" data-service-id="plugin-flow-node" data-journeys="J-16 J-20">
+<div class="sd-service-icon">&#x1F310;</div>
+<div class="sd-service-name">PluginFlowNode</div>
+<div class="sd-service-kind">frontend</div>
+<div class="sd-service-tech">React, @xyflow/react</div>
+<p class="sd-service-desc">Thin React Flow adapter wrapping SF-7's PluginNodePrimitive. Generates Handles from dict-keyed inputs and outputs and delegates visual rendering to SF-7. Plugin nodes store workflow-local plugin_ref keys and inline plugin_config only; they do not depend on /api/plugins or foundation-managed plugin rows.</p>
+</div>
+<div class="sd-service-card" data-service-id="template-group" data-journeys="J-20">
+<div class="sd-service-icon">&#x1F310;</div>
+<div class="sd-service-name">TemplateGroup</div>
+<div class="sd-service-kind">frontend</div>
+<div class="sd-service-tech">React, @xyflow/react</div>
+<p class="sd-service-desc">React Flow group node with green dashed border. Collapsed mode renders CollapsedGroupCard with template metadata; expanded mode renders stamped read-only child nodes.</p>
+</div>
+<div class="sd-service-card" data-service-id="phase-container" data-journeys="J-17">
+<div class="sd-service-icon">&#x1F310;</div>
+<div class="sd-service-name">PhaseContainer</div>
+<div class="sd-service-kind">frontend</div>
+<div class="sd-service-tech">React, @xyflow/react</div>
+<p class="sd-service-desc">React Flow group node for sequential, map, fold, and loop phases. Supports collapse and expand, nested children, and loop exit ports condition_met and max_exceeded.</p>
+</div>
+<div class="sd-service-card" data-service-id="edge-components" data-journeys="J-16 J-22">
+<div class="sd-service-icon">&#x1F310;</div>
+<div class="sd-service-name">Edge Components</div>
+<div class="sd-service-kind">frontend</div>
+<div class="sd-service-tech">React, @xyflow/react</div>
+<p class="sd-service-desc">DataEdge and HookEdge render typed data-flow and fire-and-forget hook connections. Edge kind is reconstructed from the resolved source port container rather than a persisted port_type; data edges surface type labels and mismatch warnings while hook edges stay dashed and unlabeled.</p>
+</div>
+<div class="sd-service-card" data-service-id="toolbar" data-journeys="J-16 J-17 J-22">
+<div class="sd-service-icon">&#x1F310;</div>
+<div class="sd-service-name">Toolbar</div>
+<div class="sd-service-kind">frontend</div>
+<div class="sd-service-tech">React</div>
+<p class="sd-service-desc">Paint-style menu bar and icon toolbar for save, undo, redo, validate, export, tool mode, and zoom controls.</p>
+</div>
+<div class="sd-service-card" data-service-id="palette" data-journeys="J-16 J-20">
+<div class="sd-service-icon">&#x1F310;</div>
+<div class="sd-service-name">NodePalette + RolePalette</div>
+<div class="sd-service-kind">frontend</div>
+<div class="sd-service-tech">React</div>
+<p class="sd-service-desc">Right-side drag source for Ask, Branch, Plugin, templates, and role chips. Dropping a Branch creates a node with two starter paths (keyed path_1 and path_2) each carrying a blank per-port condition expression, plus an empty inputs dict. Dropping a Plugin creates a node with a blank workflow-local plugin_ref and inline config placeholder rather than selecting a persisted plugin entity.</p>
+</div>
+<div class="sd-service-card" data-service-id="inspector-system" data-journeys="J-16 J-18 J-20">
+<div class="sd-service-icon">&#x1F310;</div>
+<div class="sd-service-name">Inspector Window System</div>
+<div class="sd-service-kind">frontend</div>
+<div class="sd-service-tech">React, Portal</div>
+<p class="sd-service-desc">Portal-based manager for draggable XP-style inspectors with tether lines to canvas elements. Supports multiple inspectors, z-ordering, and read-only mode for template children.</p>
+</div>
+<div class="sd-service-card" data-service-id="node-inspectors" data-journeys="J-16 J-18 J-20 J-22">
+<div class="sd-service-icon">&#x1F310;</div>
+<div class="sd-service-name">Node Inspectors</div>
+<div class="sd-service-kind">frontend</div>
+<div class="sd-service-tech">React, @uiw/react-codemirror</div>
+<p class="sd-service-desc">Inspector content for Ask, Branch, Plugin, Phase, and Edge editing. Inspector field constraints and defaults are hydrated from GET /api/schema/workflow while keeping hand-authored XP layouts. BranchInspector edits per-port condition expressions in the named paths dict and optional merge_function for multi-input gather; each path row shows a name field and a condition expression editor. It never exposes switch_function, routing-mode toggles, output_field mode, or node-level condition_type or condition fields. PluginInspector edits a workflow-local plugin_ref plus inline plugin_config and never depends on a plugin registry API.</p>
+</div>
+<div class="sd-service-card" data-service-id="editor-dialogs" data-journeys="J-18 J-20 J-22">
+<div class="sd-service-icon">&#x1F310;</div>
+<div class="sd-service-name">Editor Dialogs</div>
+<div class="sd-service-kind">frontend</div>
+<div class="sd-service-tech">React</div>
+<p class="sd-service-desc">Dialogs for import confirmation, inline-to-library promotion, and save-as-template flows.</p>
+</div>
+<div class="sd-service-card" data-service-id="selection-rectangle" data-journeys="J-17">
+<div class="sd-service-icon">&#x1F310;</div>
+<div class="sd-service-name">SelectionRectangle</div>
+<div class="sd-service-kind">frontend</div>
+<div class="sd-service-tech">React</div>
+<p class="sd-service-desc">Marching-ants selection rectangle active in Select mode. Creates phases from enclosed editable nodes that share a parent boundary.</p>
+</div>
+<div class="sd-service-card" data-service-id="compose-frontend" data-journeys="J-16 J-17 J-18 J-20 J-22">
+<div class="sd-service-icon">&#x1F310;</div>
+<div class="sd-service-name">compose-frontend</div>
+<div class="sd-service-kind">frontend</div>
+<div class="sd-service-tech">React 18, Vite, auth-react, React Router</div>
+<p class="sd-service-desc">React 18 + Vite SPA at tools/compose/frontend/. Hosts the Explorer shell, auth-react providers, shared XP chrome, and the /workflows/{id}/edit route that mounts WorkflowEditorPage.</p>
+</div>
+<div class="sd-service-card" data-service-id="sf5-shell" data-journeys="J-16 J-17 J-18 J-20 J-22">
+<div class="sd-service-icon">&#x1F310;</div>
+<div class="sd-service-name">compose-frontend shell (SF-5)</div>
+<div class="sd-service-kind">frontend</div>
+<div class="sd-service-tech">React 18, Vite, auth-react, React Router</div>
+<p class="sd-service-desc">The tools/compose/frontend authenticated shell provided by the SF-5 foundation. Supplies auth context (auth-react), XP chrome, Explorer sidebar with Workflows/Roles/Schemas/Templates folders, and the /workflows/{id}/edit route mount point for WorkflowEditorPage. Backed entirely by PostgreSQL via compose-backend — no SQLite, no tools/iriai-workflows shell.</p>
+</div>
+</div>
+<h4 class="sd-tier-label">Services &amp; External</h4>
+<div class="sd-service-grid">
+<div class="sd-service-card" data-service-id="user" data-journeys="J-16 J-17 J-18 J-20 J-22">
+<div class="sd-service-icon">&#x1F517;</div>
+<div class="sd-service-name">User / Browser</div>
+<div class="sd-service-kind">external</div>
+<p class="sd-service-desc">End user authoring workflows in the browser.</p>
+</div>
+<div class="sd-service-card" data-service-id="editor-store" data-journeys="J-16 J-17 J-18 J-20 J-22">
+<div class="sd-service-icon">&#x2699;&#xFE0F;</div>
+<div class="sd-service-name">editorStore</div>
+<div class="sd-service-kind">service</div>
+<div class="sd-service-tech">Zustand, TypeScript</div>
+<p class="sd-service-desc">Zustand single source of truth for flat React Flow nodes and edges, registries, collapse state, undo and redo stacks, inspectors, dirty state, and all editor mutations. Branch nodes store dict-keyed paths where each path entry contains its own per-port condition expression string; Ask and Plugin nodes store dict-keyed inputs, outputs, and hooks. No node-level condition_type or condition field is stored for Branch nodes.</p>
+</div>
+<div class="sd-service-card" data-service-id="undo-middleware" data-journeys="J-16 J-22">
+<div class="sd-service-icon">&#x2699;&#xFE0F;</div>
+<div class="sd-service-name">undoMiddleware</div>
+<div class="sd-service-kind">service</div>
+<div class="sd-service-tech">TypeScript, structuredClone</div>
+<p class="sd-service-desc">Higher-order mutation wrapper that snapshots workflow state with structuredClone before structural edits and caps undo and redo depth at 50 entries.</p>
+</div>
+<div class="sd-service-card" data-service-id="selectors" data-journeys="">
+<div class="sd-service-icon">&#x2699;&#xFE0F;</div>
+<div class="sd-service-name">selectors</div>
+<div class="sd-service-kind">service</div>
+<div class="sd-service-tech">TypeScript</div>
+<p class="sd-service-desc">Stable Zustand selector helpers that avoid creating new array or object references inside selector bodies.</p>
+</div>
+<div class="sd-service-card" data-service-id="serialization" data-journeys="J-16 J-20 J-22">
+<div class="sd-service-icon">&#x2699;&#xFE0F;</div>
+<div class="sd-service-name">Serialization Module</div>
+<div class="sd-service-kind">service</div>
+<div class="sd-service-tech">js-yaml, TypeScript</div>
+<p class="sd-service-desc">Bidirectional conversion between flat React Flow nodes and edges and nested WorkflowConfig YAML trees using phases[].nodes and phases[].children. Hook wiring serializes as ordinary dot-notation edges whose hook-versus-data meaning is inferred from the source port container, so no serialized port_type is emitted. Branch nodes serialize dict-keyed paths where each path entry carries its own per-port condition expression string; each path key becomes an output Handle ID on canvas and an edge source port name in YAML. No node-level condition_type or condition field is emitted for Branch nodes. Template groups serialize as $template_ref blocks.</p>
+</div>
+<div class="sd-service-card" data-service-id="auto-layout" data-journeys="J-16">
+<div class="sd-service-icon">&#x2699;&#xFE0F;</div>
+<div class="sd-service-name">autoLayout</div>
+<div class="sd-service-kind">service</div>
+<div class="sd-service-tech">@dagrejs/dagre</div>
+<p class="sd-service-desc">Recursive dagre layout for nested phases. Lays out leaf children first, then computes parent bounds and positions collapsed groups as fixed-size nodes.</p>
+</div>
+<div class="sd-service-card" data-service-id="yaml-schema" data-journeys="J-16 J-22">
+<div class="sd-service-icon">&#x2699;&#xFE0F;</div>
+<div class="sd-service-name">workflowSchemaAdapters</div>
+<div class="sd-service-kind">service</div>
+<div class="sd-service-tech">TypeScript, JSON Schema</div>
+<p class="sd-service-desc">Runtime schema cache and TypeScript adapter layer built from GET /api/schema/workflow. Local interfaces are projections of the backend JSON Schema for inspector layout, defaults, and client validation, not a competing static source of truth.</p>
+</div>
+<div class="sd-service-card" data-service-id="client-validator" data-journeys="J-22">
+<div class="sd-service-icon">&#x2699;&#xFE0F;</div>
+<div class="sd-service-name">clientValidator</div>
+<div class="sd-service-kind">service</div>
+<div class="sd-service-tech">TypeScript</div>
+<p class="sd-service-desc">Debounced structural validation that detects dangling edges, duplicate IDs, cycles, missing required fields, BranchNode paths with blank or missing per-port condition expressions, too few branch paths (minimum 2), path-handle mismatches, and type mismatches between connected ports. Also flags stale BranchNode fields (condition_type, node-level condition, switch_function, output_field) as errors. Hook edges are identified from source-port container resolution rather than persisted port_type. Type mismatch stays a warning; invalid branch structure is an error.</p>
+</div>
+<div class="sd-service-card" data-service-id="connection-validator" data-journeys="J-16 J-22">
+<div class="sd-service-icon">&#x2699;&#xFE0F;</div>
+<div class="sd-service-name">connectionValidator</div>
+<div class="sd-service-kind">service</div>
+<div class="sd-service-tech">TypeScript</div>
+<p class="sd-service-desc">Synchronous isValidConnection callback for self-loop, duplicate-edge, read-only-target, and cycle checks during drag. It does not decide Branch runtime routing and does not block fan-out connections.</p>
+</div>
+<div class="sd-service-card" data-service-id="editor-hooks" data-journeys="J-16 J-22">
+<div class="sd-service-icon">&#x2699;&#xFE0F;</div>
+<div class="sd-service-name">Editor Hooks</div>
+<div class="sd-service-kind">service</div>
+<div class="sd-service-tech">React hooks</div>
+<p class="sd-service-desc">useAutoSave, useKeyboardShortcuts, and useDragAndDrop for idle auto-save, canvas-scoped commands, and palette and role drag behavior.</p>
+</div>
+<div class="sd-service-card" data-service-id="compose-backend" data-journeys="J-16 J-18 J-20 J-22">
+<div class="sd-service-icon">&#x2699;&#xFE0F;</div>
+<div class="sd-service-name">compose-backend</div>
+<div class="sd-service-kind">service</div>
+<div class="sd-service-tech">Python 3.11, FastAPI, SQLAlchemy 2.x, Alembic, auth-python</div>
+<div class="sd-service-port">Port 8000</div>
+<p class="sd-service-desc">FastAPI backend at tools/compose/backend/. Serves workflow CRUD, workflow versioning, validation, export, runtime schema delivery, and the SF-7 role/schema/template/tool routes consumed by the editor. Persists only the SF-5 foundation tables `workflows`, `workflow_versions`, `roles`, `output_schemas`, and `custom_task_templates`; plugin keys remain workflow-local YAML data and workflow_entity_refs expansion is owned by SF-7 as a downstream extension.</p>
+</div>
+<div class="sd-service-card" data-service-id="sf7-node-primitives" data-journeys="J-16 J-20">
+<div class="sd-service-icon">&#x1F517;</div>
+<div class="sd-service-name">SF-7 Node Primitives</div>
+<div class="sd-service-kind">external</div>
+<div class="sd-service-tech">React</div>
+<p class="sd-service-desc">Pure React visual primitives shared between SF-6 and SF-7. Exports AskNodePrimitive, BranchNodePrimitive, PluginNodePrimitive, NodePortDot, EdgeTypeLabel, and ActorSlot. BranchNodePrimitive receives paths (each path entry includes a per-port conditionSummary string) and optional mergeFunctionSummary; there is no SwitchFunctionLabel, no node-level conditionType prop, and no output_field rendering. Per-port condition summaries are rendered on each path handle.</p>
+</div>
+<div class="sd-service-card" data-service-id="sf1-backend" data-journeys="J-16 J-17 J-18 J-20 J-22">
+<div class="sd-service-icon">&#x2699;&#xFE0F;</div>
+<div class="sd-service-name">compose-backend (schema/workflow API layer)</div>
+<div class="sd-service-kind">service</div>
+<div class="sd-service-tech">Python 3.11, FastAPI, SQLAlchemy 2.x, Alembic, PostgreSQL 15</div>
+<div class="sd-service-port">Port 8000</div>
+<p class="sd-service-desc">Alias for the tools/compose/backend FastAPI service as referenced in API endpoints and call-path steps (sf1-backend). SF-1 owns the WorkflowConfig schema that drives GET /api/schema/workflow, hence the naming. Persists only the five SF-5 foundation tables on PostgreSQL 15 via Alembic — no SQLite, no workflow_entity_refs, no plugin-management tables. Fires workflow mutation hooks (create/update/delete lifecycle events) that SF-7 subscribes to for reference-index synchronization; the editor interacts only with the direct CRUD/validate/schema endpoints.</p>
+</div>
+<div class="sd-service-card" data-service-id="sf7-library" data-journeys="J-18 J-20">
+<div class="sd-service-icon">&#x2699;&#xFE0F;</div>
+<div class="sd-service-name">SF-7 Libraries &amp; Registries API</div>
+<div class="sd-service-kind">service</div>
+<div class="sd-service-tech">Python 3.11, FastAPI, SQLAlchemy 2.x, PostgreSQL 15</div>
+<div class="sd-service-port">Port 8000</div>
+<p class="sd-service-desc">SF-7 library and registries surface served by compose-backend. Provides role/schema/task-template/tool CRUD endpoints consumed by the editor pickers, inline-to-library promotion flows, and template browser. Primary owner of the workflow_entity_refs reference-index table and its Alembic migration. Subscribes to SF-5 workflow mutation hooks (create/update/delete) to keep entity references synchronized after editor save/create/delete flows. Plugin registry and reference-check affordances must remain non-blocking additive surfaces for the core editor; the editor core never depends on SF-7 endpoints for boot or save.</p>
+</div>
+</div>
+<h4 class="sd-tier-label">Databases</h4>
+<div class="sd-service-grid">
+<div class="sd-service-card" data-service-id="compose-db" data-journeys="J-16 J-18 J-20 J-22">
+<div class="sd-service-icon">&#x1F5C3;&#xFE0F;</div>
+<div class="sd-service-name">compose-db</div>
+<div class="sd-service-kind">database</div>
+<div class="sd-service-tech">PostgreSQL 15, Alembic</div>
+<p class="sd-service-desc">PostgreSQL 15 database managed by Alembic for compose-backend. SF-5 foundation is limited to exactly five tables: `workflows`, `workflow_versions`, `roles`, `output_schemas`, and `custom_task_templates`. SQLite, plugin-management tables, tool tables, and workflow_entity_refs are not part of the SF-5 foundation slice; workflow_entity_refs is a SF-7 extension table added in a separate Alembic migration.</p>
+</div>
+</div>
+<h3 class="sd-subsection-title">Connections</h3>
+<div class="sd-connections-list">
+<div class="sd-connection-row" data-journeys="J-16"><span class="sd-conn-from">WorkflowEditorPage</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">editorStore</span><span class="sd-conn-proto"> (Zustand)</span><span class="sd-conn-label">initWorkflow after schema hydration and state reads</span></div>
+<div class="sd-connection-row" data-journeys="J-16"><span class="sd-conn-from">WorkflowEditorPage</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">compose-frontend shell (SF-5)</span><span class="sd-conn-proto"> (React context)</span><span class="sd-conn-label">auth context and shell mount</span></div>
+<div class="sd-connection-row" data-journeys="J-16 J-22"><span class="sd-conn-from">WorkflowEditorPage</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">compose-backend (schema/workflow API layer)</span><span class="sd-conn-proto"> (REST/HTTP)</span><span class="sd-conn-label">fetch /api/schema/workflow on mount</span></div>
+<div class="sd-connection-row" data-journeys="J-16"><span class="sd-conn-from">WorkflowEditorPage</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">EditorCanvas</span><span class="sd-conn-proto"> (React props)</span><span class="sd-conn-label">mount canvas</span></div>
+<div class="sd-connection-row" data-journeys="J-16"><span class="sd-conn-from">WorkflowEditorPage</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">Toolbar</span><span class="sd-conn-proto"> (React props)</span><span class="sd-conn-label">mount toolbar</span></div>
+<div class="sd-connection-row" data-journeys="J-16"><span class="sd-conn-from">WorkflowEditorPage</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">NodePalette + RolePalette</span><span class="sd-conn-proto"> (React props)</span><span class="sd-conn-label">mount palette</span></div>
+<div class="sd-connection-row" data-journeys="J-16"><span class="sd-conn-from">WorkflowEditorPage</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">Inspector Window System</span><span class="sd-conn-proto"> (React Portal)</span><span class="sd-conn-label">mount inspector manager</span></div>
+<div class="sd-connection-row" data-journeys="J-22"><span class="sd-conn-from">WorkflowEditorPage</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">ValidationPanel</span><span class="sd-conn-proto"> (React props)</span><span class="sd-conn-label">mount validation panel</span></div>
+<div class="sd-connection-row" data-journeys="J-16 J-17 J-20"><span class="sd-conn-from">EditorCanvas</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">editorStore</span><span class="sd-conn-proto"> (Zustand selector)</span><span class="sd-conn-label">read nodes, edges, collapse state, tool mode</span></div>
+<div class="sd-connection-row" data-journeys="J-16 J-22"><span class="sd-conn-from">EditorCanvas</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">connectionValidator</span><span class="sd-conn-proto"> (function call)</span><span class="sd-conn-label">isValidConnection during drag</span></div>
+<div class="sd-connection-row" data-journeys="J-16"><span class="sd-conn-from">EditorCanvas</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">AskFlowNode</span><span class="sd-conn-proto"> (React Flow nodeTypes)</span><span class="sd-conn-label">register ask node type</span></div>
+<div class="sd-connection-row" data-journeys="J-16 J-22"><span class="sd-conn-from">EditorCanvas</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">BranchFlowNode</span><span class="sd-conn-proto"> (React Flow nodeTypes)</span><span class="sd-conn-label">register branch node type</span></div>
+<div class="sd-connection-row" data-journeys="J-16"><span class="sd-conn-from">EditorCanvas</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">PluginFlowNode</span><span class="sd-conn-proto"> (React Flow nodeTypes)</span><span class="sd-conn-label">register plugin node type</span></div>
+<div class="sd-connection-row" data-journeys="J-20"><span class="sd-conn-from">EditorCanvas</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">TemplateGroup</span><span class="sd-conn-proto"> (React Flow nodeTypes)</span><span class="sd-conn-label">register template group type</span></div>
+<div class="sd-connection-row" data-journeys="J-17"><span class="sd-conn-from">EditorCanvas</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">PhaseContainer</span><span class="sd-conn-proto"> (React Flow nodeTypes)</span><span class="sd-conn-label">register phase node type</span></div>
+<div class="sd-connection-row" data-journeys="J-16 J-22"><span class="sd-conn-from">EditorCanvas</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">Edge Components</span><span class="sd-conn-proto"> (React Flow edgeTypes)</span><span class="sd-conn-label">register edge types</span></div>
+<div class="sd-connection-row" data-journeys="J-16 J-18 J-20"><span class="sd-conn-from">EditorCanvas</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">Inspector Window System</span><span class="sd-conn-proto"> (Zustand action)</span><span class="sd-conn-label">double-click opens inspector</span></div>
+<div class="sd-connection-row" data-journeys="J-16 J-20 J-22"><span class="sd-conn-from">editorStore</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">Serialization Module</span><span class="sd-conn-proto"> (function call)</span><span class="sd-conn-label">loadFromYaml and serializeToYaml</span></div>
+<div class="sd-connection-row" data-journeys="J-16 J-22"><span class="sd-conn-from">editorStore</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">compose-backend (schema/workflow API layer)</span><span class="sd-conn-proto"> (REST/HTTP)</span><span class="sd-conn-label">GET and PUT workflow YAML, POST validate</span></div>
+<div class="sd-connection-row" data-journeys="J-16 J-22"><span class="sd-conn-from">editorStore</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">undoMiddleware</span><span class="sd-conn-proto"> (function call)</span><span class="sd-conn-label">wrap structural mutations</span></div>
+<div class="sd-connection-row" data-journeys="J-16"><span class="sd-conn-from">Serialization Module</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">autoLayout</span><span class="sd-conn-proto"> (function call)</span><span class="sd-conn-label">layout nodes lacking position</span></div>
+<div class="sd-connection-row" data-journeys="J-16"><span class="sd-conn-from">Serialization Module</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">workflowSchemaAdapters</span><span class="sd-conn-proto"> (type import)</span><span class="sd-conn-label">runtime schema adapters and nested workflow types</span></div>
+<div class="sd-connection-row" data-journeys="J-16 J-22"><span class="sd-conn-from">connectionValidator</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">editorStore</span><span class="sd-conn-proto"> (closure / function call)</span><span class="sd-conn-label">inspect current nodes and edges for cycle checks</span></div>
+<div class="sd-connection-row" data-journeys="J-16 J-18 J-20"><span class="sd-conn-from">Inspector Window System</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">editorStore</span><span class="sd-conn-proto"> (Zustand selector)</span><span class="sd-conn-label">read and mutate inspectors array</span></div>
+<div class="sd-connection-row" data-journeys="J-16 J-18 J-22"><span class="sd-conn-from">Node Inspectors</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">editorStore</span><span class="sd-conn-proto"> (Zustand action)</span><span class="sd-conn-label">update node and edge data</span></div>
+<div class="sd-connection-row" data-journeys="J-18"><span class="sd-conn-from">Node Inspectors</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">SF-7 Libraries &amp; Registries API</span><span class="sd-conn-proto"> (REST/HTTP)</span><span class="sd-conn-label">fetch roles, schemas, and plugins for pickers</span></div>
+<div class="sd-connection-row" data-journeys="J-16 J-20"><span class="sd-conn-from">NodePalette + RolePalette</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">editorStore</span><span class="sd-conn-proto"> (Zustand action)</span><span class="sd-conn-label">addNode and stampTemplate on drop</span></div>
+<div class="sd-connection-row" data-journeys="J-20"><span class="sd-conn-from">NodePalette + RolePalette</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">SF-7 Libraries &amp; Registries API</span><span class="sd-conn-proto"> (REST/HTTP)</span><span class="sd-conn-label">fetch templates</span></div>
+<div class="sd-connection-row" data-journeys="J-22"><span class="sd-conn-from">clientValidator</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">editorStore</span><span class="sd-conn-proto"> (Zustand action)</span><span class="sd-conn-label">publish validation issues</span></div>
+<div class="sd-connection-row" data-journeys="J-22"><span class="sd-conn-from">ValidationPanel</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">editorStore</span><span class="sd-conn-proto"> (Zustand selector)</span><span class="sd-conn-label">read validationIssues</span></div>
+<div class="sd-connection-row" data-journeys="J-22"><span class="sd-conn-from">ValidationPanel</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">compose-backend (schema/workflow API layer)</span><span class="sd-conn-proto"> (REST/HTTP)</span><span class="sd-conn-label">manual server-side validate</span></div>
+<div class="sd-connection-row" data-journeys="J-16 J-17 J-22"><span class="sd-conn-from">Toolbar</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">editorStore</span><span class="sd-conn-proto"> (Zustand action)</span><span class="sd-conn-label">undo, redo, save, validate, tool mode</span></div>
+<div class="sd-connection-row" data-journeys="J-16 J-22"><span class="sd-conn-from">Editor Hooks</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">editorStore</span><span class="sd-conn-proto"> (Zustand action)</span><span class="sd-conn-label">auto-save and keyboard shortcuts</span></div>
+<div class="sd-connection-row" data-journeys="J-18 J-20"><span class="sd-conn-from">Editor Dialogs</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">SF-7 Libraries &amp; Registries API</span><span class="sd-conn-proto"> (REST/HTTP)</span><span class="sd-conn-label">promote inline assets and save templates</span></div>
+<div class="sd-connection-row" data-journeys="J-20 J-22"><span class="sd-conn-from">Editor Dialogs</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">editorStore</span><span class="sd-conn-proto"> (Zustand selector)</span><span class="sd-conn-label">read selection and confirm destructive actions</span></div>
+<div class="sd-connection-row" data-journeys="J-16"><span class="sd-conn-from">AskFlowNode</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">SF-7 Node Primitives</span><span class="sd-conn-proto"> (React import)</span><span class="sd-conn-label">wrap AskNodePrimitive and NodePortDot</span></div>
+<div class="sd-connection-row" data-journeys="J-16 J-22"><span class="sd-conn-from">BranchFlowNode</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">SF-7 Node Primitives</span><span class="sd-conn-proto"> (React import)</span><span class="sd-conn-label">wrap BranchNodePrimitive and render per-port condition handles from node.data.paths</span></div>
+<div class="sd-connection-row" data-journeys="J-16"><span class="sd-conn-from">PluginFlowNode</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">SF-7 Node Primitives</span><span class="sd-conn-proto"> (React import)</span><span class="sd-conn-label">wrap PluginNodePrimitive and NodePortDot</span></div>
+<div class="sd-connection-row" data-journeys="J-16 J-22"><span class="sd-conn-from">Edge Components</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">SF-7 Node Primitives</span><span class="sd-conn-proto"> (React import)</span><span class="sd-conn-label">use EdgeTypeLabel</span></div>
+<div class="sd-connection-row" data-journeys="J-20"><span class="sd-conn-from">TemplateGroup</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">SF-6 Canvas Primitives</span><span class="sd-conn-proto"> (React component)</span><span class="sd-conn-label">use CollapsedGroupCard</span></div>
+<div class="sd-connection-row" data-journeys="J-20"><span class="sd-conn-from">TemplateGroup</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">SF-7 Node Primitives</span><span class="sd-conn-proto"> (React import)</span><span class="sd-conn-label">use NodePortDot for collapsed ports</span></div>
+<div class="sd-connection-row" data-journeys="J-17"><span class="sd-conn-from">PhaseContainer</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">SF-6 Canvas Primitives</span><span class="sd-conn-proto"> (React component)</span><span class="sd-conn-label">use CollapsedGroupCard</span></div>
+<div class="sd-connection-row" data-journeys="J-17"><span class="sd-conn-from">PhaseContainer</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">SF-7 Node Primitives</span><span class="sd-conn-proto"> (React import)</span><span class="sd-conn-label">use NodePortDot for collapsed ports</span></div>
+<div class="sd-connection-row" data-journeys="J-17"><span class="sd-conn-from">SelectionRectangle</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">editorStore</span><span class="sd-conn-proto"> (Zustand action)</span><span class="sd-conn-label">createPhase from enclosed nodes</span></div>
+<div class="sd-connection-row" data-journeys=""><span class="sd-conn-from">selectors</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">editorStore</span><span class="sd-conn-proto"> (function import)</span><span class="sd-conn-label">export stable selector helpers</span></div>
+<div class="sd-connection-row" data-journeys="J-16 J-18"><span class="sd-conn-from">compose-backend (schema/workflow API layer)</span><span class="sd-conn-arrow">&#x2192;</span><span class="sd-conn-to">SF-7 Libraries &amp; Registries API</span><span class="sd-conn-proto"> (internal event / background task)</span><span class="sd-conn-label">workflow mutation hooks (create/update/delete lifecycle events for reference-index synchronization)</span></div>
+</div>
+</section>
+<section class="sd-section" id="call-paths">
+<h2 class="sd-section-title">API Call Paths</h2>
+<button class="sd-expand-btn" id="sd-toggle-details" onclick="window.__sd_toggle_details()">Expand All</button>
+<details class="sd-call-path" data-journey-id="J-16">
+<summary>
+<span class="sd-cp-name">J-16: Build a Workflow from Scratch</span>
+<span class="sd-cp-journey">J-16</span>
+</summary>
+<p class="sd-cp-desc">User opens a workflow, adds an Ask node and a Branch node, configures the Branch with per-port condition expressions in the paths dict per the D-GR-35 model, wires the flow, and saves.</p>
+<div class="sd-sequence">
+<div class="sd-seq-header">
+<div class="sd-seq-col sd-seq-num">#</div>
+<div class="sd-seq-col sd-seq-from">From</div>
+<div class="sd-seq-col sd-seq-arrow"></div>
+<div class="sd-seq-col sd-seq-to">To</div>
+<div class="sd-seq-col sd-seq-action">Action</div>
+<div class="sd-seq-col sd-seq-returns">Returns</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">1</div>
+<div class="sd-seq-col sd-seq-from">user</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">workflow-editor-page</div>
+<div class="sd-seq-col sd-seq-action"><div>navigate to /workflows/:id/edit</div><div class="sd-seq-detail">User opens the editor route for a workflow.</div></div>
+<div class="sd-seq-col sd-seq-returns">&mdash;</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">2</div>
+<div class="sd-seq-col sd-seq-from">workflow-editor-page</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">sf5-shell</div>
+<div class="sd-seq-col sd-seq-action"><div>useAuth()</div><div class="sd-seq-detail">Page retrieves auth context and shared shell dependencies.</div></div>
+<div class="sd-seq-col sd-seq-returns">auth token and shell state</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">3</div>
+<div class="sd-seq-col sd-seq-from">workflow-editor-page</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">sf1-backend</div>
+<div class="sd-seq-col sd-seq-action"><div>GET /api/schema/workflow</div><div class="sd-seq-detail">Page hydrates the canonical runtime schema contract before initializing inspectors, defaults, and validation rules.</div></div>
+<div class="sd-seq-col sd-seq-returns">JSON Schema document</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">4</div>
+<div class="sd-seq-col sd-seq-from">workflow-editor-page</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">editor-store</div>
+<div class="sd-seq-col sd-seq-action"><div>initWorkflow(id, name)</div><div class="sd-seq-detail">Store initializes workflow identity and transient editor state after schema hydration.</div></div>
+<div class="sd-seq-col sd-seq-returns">empty or hydrated EditorState</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">5</div>
+<div class="sd-seq-col sd-seq-from">editor-store</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">sf1-backend</div>
+<div class="sd-seq-col sd-seq-action"><div>GET /api/workflows/:id</div><div class="sd-seq-detail">Fetch existing workflow YAML from the backend.</div></div>
+<div class="sd-seq-col sd-seq-returns">Workflow YAML string</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">6</div>
+<div class="sd-seq-col sd-seq-from">editor-store</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">serialization</div>
+<div class="sd-seq-col sd-seq-action"><div>deserializeFromYaml(yaml)</div><div class="sd-seq-detail">Convert nested YAML phase.nodes and phase.children to flat React Flow nodes and edges. Hook edges are inferred from the source port container. BranchNode path keys become output Handle IDs and per-port condition expressions are extracted from each path entry.</div></div>
+<div class="sd-seq-col sd-seq-returns">nodes, edges, registries</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">7</div>
+<div class="sd-seq-col sd-seq-from">serialization</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">auto-layout</div>
+<div class="sd-seq-col sd-seq-action"><div>autoLayout(nodes, edges)</div><div class="sd-seq-detail">Compute initial positions for nodes missing saved coordinates.</div></div>
+<div class="sd-seq-col sd-seq-returns">positioned nodes</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">8</div>
+<div class="sd-seq-col sd-seq-from">editor-canvas</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">editor-store</div>
+<div class="sd-seq-col sd-seq-action"><div>select visible nodes and edges</div><div class="sd-seq-detail">Canvas derives visible elements after collapse-state filtering.</div></div>
+<div class="sd-seq-col sd-seq-returns">visible nodes and edges</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">9</div>
+<div class="sd-seq-col sd-seq-from">user</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">palette</div>
+<div class="sd-seq-col sd-seq-action"><div>drag Ask item onto canvas</div><div class="sd-seq-detail">User drops a new Ask node on the canvas.</div></div>
+<div class="sd-seq-col sd-seq-returns">&mdash;</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">10</div>
+<div class="sd-seq-col sd-seq-from">palette</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">editor-store</div>
+<div class="sd-seq-col sd-seq-action"><div>addNode(type='ask')</div><div class="sd-seq-detail">Store inserts an Ask node with default input and output ports and an undo snapshot.</div></div>
+<div class="sd-seq-col sd-seq-returns">Ask node</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">11</div>
+<div class="sd-seq-col sd-seq-from">user</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">editor-canvas</div>
+<div class="sd-seq-col sd-seq-action"><div>double-click Ask node</div><div class="sd-seq-detail">User opens the Ask inspector.</div></div>
+<div class="sd-seq-col sd-seq-returns">&mdash;</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">12</div>
+<div class="sd-seq-col sd-seq-from">editor-canvas</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">inspector-system</div>
+<div class="sd-seq-col sd-seq-action"><div>openInspector(askNode)</div><div class="sd-seq-detail">Inspector manager renders AskInspector tethered to the node.</div></div>
+<div class="sd-seq-col sd-seq-returns">AskInspector window</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">13</div>
+<div class="sd-seq-col sd-seq-from">user</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">node-inspectors</div>
+<div class="sd-seq-col sd-seq-action"><div>fill actor and prompt fields</div><div class="sd-seq-detail">User selects a role and edits the Ask prompt.</div></div>
+<div class="sd-seq-col sd-seq-returns">&mdash;</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">14</div>
+<div class="sd-seq-col sd-seq-from">node-inspectors</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">editor-store</div>
+<div class="sd-seq-col sd-seq-action"><div>updateNodeData(askNodeId, data)</div><div class="sd-seq-detail">Store persists Ask edits and re-renders the card face.</div></div>
+<div class="sd-seq-col sd-seq-returns">updated Ask node</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">15</div>
+<div class="sd-seq-col sd-seq-from">user</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">palette</div>
+<div class="sd-seq-col sd-seq-action"><div>drag Branch item onto canvas</div><div class="sd-seq-detail">User drops a new Branch node on the canvas.</div></div>
+<div class="sd-seq-col sd-seq-returns">&mdash;</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">16</div>
+<div class="sd-seq-col sd-seq-from">palette</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">editor-store</div>
+<div class="sd-seq-col sd-seq-action"><div>addNode(type='branch')</div><div class="sd-seq-detail">Store inserts a Branch node with one input port and two starter paths keyed path_1 and path_2, each carrying a blank per-port condition expression string. No node-level condition_type or condition field is added.</div></div>
+<div class="sd-seq-col sd-seq-returns">Branch node</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">17</div>
+<div class="sd-seq-col sd-seq-from">user</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">node-inspectors</div>
+<div class="sd-seq-col sd-seq-action"><div>configure Branch path conditions and names</div><div class="sd-seq-detail">User opens BranchInspector, renames path_1 to 'approved' and sets its per-port condition expression (e.g. output.verdict == 'approved'), then renames path_2 to 'rejected' and sets its condition expression (e.g. output.verdict != 'approved'). Both paths are evaluated independently at runtime — non-exclusive fan-out means both could fire if both conditions are true. Branch output Handles update immediately because each path key is the Handle ID.</div></div>
+<div class="sd-seq-col sd-seq-returns">&mdash;</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">18</div>
+<div class="sd-seq-col sd-seq-from">node-inspectors</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">editor-store</div>
+<div class="sd-seq-col sd-seq-action"><div>updateNodeData(branchNodeId, data)</div><div class="sd-seq-detail">Store saves the canonical D-GR-35 BranchNode contract: dict-keyed paths where each path entry carries its own condition expression string. No node-level condition_type or condition fields are written.</div></div>
+<div class="sd-seq-col sd-seq-returns">updated Branch node</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">19</div>
+<div class="sd-seq-col sd-seq-from">user</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">editor-canvas</div>
+<div class="sd-seq-col sd-seq-action"><div>connect Ask output to Branch input</div><div class="sd-seq-detail">User draws a data edge from the Ask result port to the Branch input port.</div></div>
+<div class="sd-seq-col sd-seq-returns">&mdash;</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">20</div>
+<div class="sd-seq-col sd-seq-from">editor-canvas</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">editor-store</div>
+<div class="sd-seq-col sd-seq-action"><div>addEdge(edgeDraft)</div><div class="sd-seq-detail">Store adds the edge and preserves sourceHandle and targetHandle IDs.</div></div>
+<div class="sd-seq-col sd-seq-returns">data edge</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">21</div>
+<div class="sd-seq-col sd-seq-from">user</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">toolbar</div>
+<div class="sd-seq-col sd-seq-action"><div>Ctrl+S</div><div class="sd-seq-detail">User saves the workflow.</div></div>
+<div class="sd-seq-col sd-seq-returns">&mdash;</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">22</div>
+<div class="sd-seq-col sd-seq-from">toolbar</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">editor-store</div>
+<div class="sd-seq-col sd-seq-action"><div>serializeToYaml()</div><div class="sd-seq-detail">Store rebuilds nested WorkflowConfig YAML under phases[].nodes and phases[].children, emits ordinary source and target refs for hook edges with no serialized port_type, and serializes BranchNode dict-keyed paths with per-port condition expressions — no node-level condition_type, condition, switch_function, or output_field.</div></div>
+<div class="sd-seq-col sd-seq-returns">Workflow YAML string</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">23</div>
+<div class="sd-seq-col sd-seq-from">editor-store</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">sf1-backend</div>
+<div class="sd-seq-col sd-seq-action"><div>PUT /api/workflows/:id</div><div class="sd-seq-detail">Persist YAML and clear dirty state on success. SF-5 fires workflow update mutation hook for SF-7 reference-index synchronization after the PUT succeeds.</div></div>
+<div class="sd-seq-col sd-seq-returns">saved workflow</div>
+</div>
+</div>
+</details>
+<details class="sd-call-path" data-journey-id="J-17">
+<summary>
+<span class="sd-cp-name">J-17: Create Nested Phases</span>
+<span class="sd-cp-journey">J-17</span>
+</summary>
+<p class="sd-cp-desc">User creates a phase from a selection, changes its mode, collapses and expands it, then creates a nested loop phase inside it.</p>
+<div class="sd-sequence">
+<div class="sd-seq-header">
+<div class="sd-seq-col sd-seq-num">#</div>
+<div class="sd-seq-col sd-seq-from">From</div>
+<div class="sd-seq-col sd-seq-arrow"></div>
+<div class="sd-seq-col sd-seq-to">To</div>
+<div class="sd-seq-col sd-seq-action">Action</div>
+<div class="sd-seq-col sd-seq-returns">Returns</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">1</div>
+<div class="sd-seq-col sd-seq-from">user</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">toolbar</div>
+<div class="sd-seq-col sd-seq-action"><div>click Select tool</div><div class="sd-seq-detail">Toolbar switches to rectangle-selection mode.</div></div>
+<div class="sd-seq-col sd-seq-returns">&mdash;</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">2</div>
+<div class="sd-seq-col sd-seq-from">user</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">editor-canvas</div>
+<div class="sd-seq-col sd-seq-action"><div>drag selection rectangle over nodes</div><div class="sd-seq-detail">SelectionRectangle renders a marching-ants overlay over the chosen nodes.</div></div>
+<div class="sd-seq-col sd-seq-returns">&mdash;</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">3</div>
+<div class="sd-seq-col sd-seq-from">selection-rectangle</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">editor-store</div>
+<div class="sd-seq-col sd-seq-action"><div>createPhase(enclosedNodeIds, bounds)</div><div class="sd-seq-detail">Store creates a new phase container and assigns parentId on enclosed children.</div></div>
+<div class="sd-seq-col sd-seq-returns">phase node</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">4</div>
+<div class="sd-seq-col sd-seq-from">editor-canvas</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">phase-container</div>
+<div class="sd-seq-col sd-seq-action"><div>render expanded phase</div><div class="sd-seq-detail">Canvas renders the new phase with mode-specific border styling and visible children.</div></div>
+<div class="sd-seq-col sd-seq-returns">&mdash;</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">5</div>
+<div class="sd-seq-col sd-seq-from">user</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">phase-container</div>
+<div class="sd-seq-col sd-seq-action"><div>open PhaseInspector and change mode</div><div class="sd-seq-detail">User sets the phase mode to fold in the inspector.</div></div>
+<div class="sd-seq-col sd-seq-returns">&mdash;</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">6</div>
+<div class="sd-seq-col sd-seq-from">node-inspectors</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">editor-store</div>
+<div class="sd-seq-col sd-seq-action"><div>updateNodeData(phaseId, { mode: 'fold' })</div><div class="sd-seq-detail">Store updates phase mode and the border styling changes immediately.</div></div>
+<div class="sd-seq-col sd-seq-returns">updated phase</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">7</div>
+<div class="sd-seq-col sd-seq-from">user</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">phase-container</div>
+<div class="sd-seq-col sd-seq-action"><div>click collapse toggle</div><div class="sd-seq-detail">User collapses the phase.</div></div>
+<div class="sd-seq-col sd-seq-returns">&mdash;</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">8</div>
+<div class="sd-seq-col sd-seq-from">phase-container</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">editor-store</div>
+<div class="sd-seq-col sd-seq-action"><div>toggleCollapse(phaseId)</div><div class="sd-seq-detail">Store hides child nodes from visible canvas state and preserves their positions.</div></div>
+<div class="sd-seq-col sd-seq-returns">collapsedGroups</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">9</div>
+<div class="sd-seq-col sd-seq-from">editor-canvas</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">editor-store</div>
+<div class="sd-seq-col sd-seq-action"><div>recompute visible nodes</div><div class="sd-seq-detail">Canvas hides children and renders CollapsedGroupCard with mode badge and node count.</div></div>
+<div class="sd-seq-col sd-seq-returns">visible nodes</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">10</div>
+<div class="sd-seq-col sd-seq-from">user</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">editor-canvas</div>
+<div class="sd-seq-col sd-seq-action"><div>expand collapsed phase</div><div class="sd-seq-detail">User restores the phase to expanded mode.</div></div>
+<div class="sd-seq-col sd-seq-returns">&mdash;</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">11</div>
+<div class="sd-seq-col sd-seq-from">editor-canvas</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">editor-store</div>
+<div class="sd-seq-col sd-seq-action"><div>recompute visible nodes</div><div class="sd-seq-detail">Canvas restores child visibility and original positions.</div></div>
+<div class="sd-seq-col sd-seq-returns">visible nodes</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">12</div>
+<div class="sd-seq-col sd-seq-from">user</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">selection-rectangle</div>
+<div class="sd-seq-col sd-seq-action"><div>draw nested selection inside the phase</div><div class="sd-seq-detail">User encloses nodes that share the fold phase as parent.</div></div>
+<div class="sd-seq-col sd-seq-returns">&mdash;</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">13</div>
+<div class="sd-seq-col sd-seq-from">selection-rectangle</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">editor-store</div>
+<div class="sd-seq-col sd-seq-action"><div>createPhase(innerNodeIds, parentId=foldPhaseId)</div><div class="sd-seq-detail">Store creates a nested loop phase with extent set to parent.</div></div>
+<div class="sd-seq-col sd-seq-returns">nested loop phase</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">14</div>
+<div class="sd-seq-col sd-seq-from">editor-canvas</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">phase-container</div>
+<div class="sd-seq-col sd-seq-action"><div>render nested loop phase</div><div class="sd-seq-detail">Canvas renders the loop phase with dashed amber border and condition_met and max_exceeded exit ports.</div></div>
+<div class="sd-seq-col sd-seq-returns">&mdash;</div>
+</div>
+</div>
+</details>
+<details class="sd-call-path" data-journey-id="J-18">
+<summary>
+<span class="sd-cp-name">J-18: Configure Ask with Inline Role</span>
+<span class="sd-cp-journey">J-18</span>
+</summary>
+<p class="sd-cp-desc">User creates an inline role inside AskInspector and promotes it to the shared library.</p>
+<div class="sd-sequence">
+<div class="sd-seq-header">
+<div class="sd-seq-col sd-seq-num">#</div>
+<div class="sd-seq-col sd-seq-from">From</div>
+<div class="sd-seq-col sd-seq-arrow"></div>
+<div class="sd-seq-col sd-seq-to">To</div>
+<div class="sd-seq-col sd-seq-action">Action</div>
+<div class="sd-seq-col sd-seq-returns">Returns</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">1</div>
+<div class="sd-seq-col sd-seq-from">user</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">editor-canvas</div>
+<div class="sd-seq-col sd-seq-action"><div>double-click Ask node</div><div class="sd-seq-detail">Open AskInspector for the selected node.</div></div>
+<div class="sd-seq-col sd-seq-returns">&mdash;</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">2</div>
+<div class="sd-seq-col sd-seq-from">inspector-system</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">node-inspectors</div>
+<div class="sd-seq-col sd-seq-action"><div>render AskInspector</div><div class="sd-seq-detail">Inspector shows role picker and inline role controls.</div></div>
+<div class="sd-seq-col sd-seq-returns">AskInspector</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">3</div>
+<div class="sd-seq-col sd-seq-from">user</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">node-inspectors</div>
+<div class="sd-seq-col sd-seq-action"><div>create inline role</div><div class="sd-seq-detail">User expands the inline role creator and fills the role fields.</div></div>
+<div class="sd-seq-col sd-seq-returns">&mdash;</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">4</div>
+<div class="sd-seq-col sd-seq-from">node-inspectors</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">editor-store</div>
+<div class="sd-seq-col sd-seq-action"><div>updateNodeData(nodeId, { inline_role })</div><div class="sd-seq-detail">Store saves inline role data and the Ask card reflects the assigned role.</div></div>
+<div class="sd-seq-col sd-seq-returns">updated Ask node</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">5</div>
+<div class="sd-seq-col sd-seq-from">user</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">node-inspectors</div>
+<div class="sd-seq-col sd-seq-action"><div>click Save to Library</div><div class="sd-seq-detail">Promotion dialog opens with the role name pre-filled.</div></div>
+<div class="sd-seq-col sd-seq-returns">&mdash;</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">6</div>
+<div class="sd-seq-col sd-seq-from">editor-dialogs</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">sf7-library</div>
+<div class="sd-seq-col sd-seq-action"><div>POST /api/roles</div><div class="sd-seq-detail">Persist the inline role to the shared library via the SF-7 library surface.</div></div>
+<div class="sd-seq-col sd-seq-returns">RoleDefinition</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">7</div>
+<div class="sd-seq-col sd-seq-from">node-inspectors</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">editor-store</div>
+<div class="sd-seq-col sd-seq-action"><div>updateNodeData(nodeId, { actor, inline_role: undefined })</div><div class="sd-seq-detail">Ask node switches from inline role data to a library role reference.</div></div>
+<div class="sd-seq-col sd-seq-returns">updated Ask node</div>
+</div>
+</div>
+</details>
+<details class="sd-call-path" data-journey-id="J-20">
+<summary>
+<span class="sd-cp-name">J-20: Template Stamp and Inspect</span>
+<span class="sd-cp-journey">J-20</span>
+</summary>
+<p class="sd-cp-desc">User stamps a task template, inspects a read-only child, and detaches the template group to edit the stamped nodes freely.</p>
+<div class="sd-sequence">
+<div class="sd-seq-header">
+<div class="sd-seq-col sd-seq-num">#</div>
+<div class="sd-seq-col sd-seq-from">From</div>
+<div class="sd-seq-col sd-seq-arrow"></div>
+<div class="sd-seq-col sd-seq-to">To</div>
+<div class="sd-seq-col sd-seq-action">Action</div>
+<div class="sd-seq-col sd-seq-returns">Returns</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">1</div>
+<div class="sd-seq-col sd-seq-from">user</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">palette</div>
+<div class="sd-seq-col sd-seq-action"><div>drag template from TemplateBrowser</div><div class="sd-seq-detail">Template item is dragged from the right-side palette.</div></div>
+<div class="sd-seq-col sd-seq-returns">&mdash;</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">2</div>
+<div class="sd-seq-col sd-seq-from">palette</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">sf7-library</div>
+<div class="sd-seq-col sd-seq-action"><div>GET /api/templates</div><div class="sd-seq-detail">Load the full template definition including nodes, edges, and interfaces from the SF-7 library surface.</div></div>
+<div class="sd-seq-col sd-seq-returns">TemplateDefinition</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">3</div>
+<div class="sd-seq-col sd-seq-from">palette</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">editor-store</div>
+<div class="sd-seq-col sd-seq-action"><div>stampTemplate(templateId, dropPosition, templateData)</div><div class="sd-seq-detail">Store creates a template group and cloned read-only child nodes with new IDs.</div></div>
+<div class="sd-seq-col sd-seq-returns">TemplateGroup and children</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">4</div>
+<div class="sd-seq-col sd-seq-from">editor-canvas</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">template-group</div>
+<div class="sd-seq-col sd-seq-action"><div>render expanded template group</div><div class="sd-seq-detail">Canvas shows the green dashed group and dimmed read-only child nodes.</div></div>
+<div class="sd-seq-col sd-seq-returns">&mdash;</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">5</div>
+<div class="sd-seq-col sd-seq-from">user</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">editor-canvas</div>
+<div class="sd-seq-col sd-seq-action"><div>double-click read-only child</div><div class="sd-seq-detail">User opens a read-only inspector for a stamped child node.</div></div>
+<div class="sd-seq-col sd-seq-returns">&mdash;</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">6</div>
+<div class="sd-seq-col sd-seq-from">inspector-system</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">node-inspectors</div>
+<div class="sd-seq-col sd-seq-action"><div>render read-only inspector</div><div class="sd-seq-detail">Inspector shows all fields disabled with a lock banner.</div></div>
+<div class="sd-seq-col sd-seq-returns">read-only inspector</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">7</div>
+<div class="sd-seq-col sd-seq-from">user</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">template-group</div>
+<div class="sd-seq-col sd-seq-action"><div>click Detach</div><div class="sd-seq-detail">User confirms that the stamped template should become editable.</div></div>
+<div class="sd-seq-col sd-seq-returns">&mdash;</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">8</div>
+<div class="sd-seq-col sd-seq-from">editor-dialogs</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">editor-store</div>
+<div class="sd-seq-col sd-seq-action"><div>detachTemplateGroup(groupId)</div><div class="sd-seq-detail">Store removes read-only flags, converts positions to absolute coordinates, and deletes the wrapper group.</div></div>
+<div class="sd-seq-col sd-seq-returns">detached nodes</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">9</div>
+<div class="sd-seq-col sd-seq-from">editor-canvas</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">editor-store</div>
+<div class="sd-seq-col sd-seq-action"><div>recompute visible nodes</div><div class="sd-seq-detail">Detached nodes render as normal editable Ask, Branch, and Plugin cards.</div></div>
+<div class="sd-seq-col sd-seq-returns">visible nodes</div>
+</div>
+</div>
+</details>
+<details class="sd-call-path" data-journey-id="J-22">
+<summary>
+<span class="sd-cp-name">J-22: Editor Failure Paths</span>
+<span class="sd-cp-journey">J-22</span>
+</summary>
+<p class="sd-cp-desc">Covers invalid BranchNode structure, type mismatch edge warnings, auto-save failure, undo recovery, and malformed import handling.</p>
+<div class="sd-sequence">
+<div class="sd-seq-header">
+<div class="sd-seq-col sd-seq-num">#</div>
+<div class="sd-seq-col sd-seq-from">From</div>
+<div class="sd-seq-col sd-seq-arrow"></div>
+<div class="sd-seq-col sd-seq-to">To</div>
+<div class="sd-seq-col sd-seq-action">Action</div>
+<div class="sd-seq-col sd-seq-returns">Returns</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">1</div>
+<div class="sd-seq-col sd-seq-from">user</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">node-inspectors</div>
+<div class="sd-seq-col sd-seq-action"><div>clear a Branch per-port condition or reduce paths below two</div><div class="sd-seq-detail">User edits a Branch node by clearing a per-port condition expression on one of its paths or deleting a path row to bring the total below the two-path minimum, creating an invalid structural state.</div></div>
+<div class="sd-seq-col sd-seq-returns">&mdash;</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">2</div>
+<div class="sd-seq-col sd-seq-from">node-inspectors</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">editor-store</div>
+<div class="sd-seq-col sd-seq-action"><div>updateNodeData(branchNodeId, invalidData)</div><div class="sd-seq-detail">Store persists the edit so validation can evaluate it.</div></div>
+<div class="sd-seq-col sd-seq-returns">updated Branch node</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">3</div>
+<div class="sd-seq-col sd-seq-from">client-validator</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">editor-store</div>
+<div class="sd-seq-col sd-seq-action"><div>setValidationIssues([{ code: 'invalid_branch_config' }])</div><div class="sd-seq-detail">Validator flags blank or missing per-port condition expressions or insufficient paths (fewer than two). Branch card shows an error badge and ValidationPanel lists the issue.</div></div>
+<div class="sd-seq-col sd-seq-returns">ValidationIssue[]</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">4</div>
+<div class="sd-seq-col sd-seq-from">user</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">editor-canvas</div>
+<div class="sd-seq-col sd-seq-action"><div>connect incompatible port types</div><div class="sd-seq-detail">User draws a data edge between incompatible types.</div></div>
+<div class="sd-seq-col sd-seq-returns">&mdash;</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">5</div>
+<div class="sd-seq-col sd-seq-from">editor-canvas</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">editor-store</div>
+<div class="sd-seq-col sd-seq-action"><div>addEdge(typeMismatchEdge)</div><div class="sd-seq-detail">Store creates the edge immediately because type mismatches are warnings, not connection blockers.</div></div>
+<div class="sd-seq-col sd-seq-returns">data edge</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">6</div>
+<div class="sd-seq-col sd-seq-from">client-validator</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">editor-store</div>
+<div class="sd-seq-col sd-seq-action"><div>setValidationIssues([{ code: 'type_mismatch', severity: 'warning' }])</div><div class="sd-seq-detail">Edge re-renders as a red dashed warning edge and ValidationPanel lists the warning.</div></div>
+<div class="sd-seq-col sd-seq-returns">ValidationIssue[]</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">7</div>
+<div class="sd-seq-col sd-seq-from">editor-hooks</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">sf1-backend</div>
+<div class="sd-seq-col sd-seq-action"><div>PUT /api/workflows/:id</div><div class="sd-seq-detail">Idle auto-save attempts to persist the workflow and the backend returns an error.</div></div>
+<div class="sd-seq-col sd-seq-returns">HTTP 500</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">8</div>
+<div class="sd-seq-col sd-seq-from">editor-store</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">toolbar</div>
+<div class="sd-seq-col sd-seq-action"><div>set autoSaveStatus='error'</div><div class="sd-seq-detail">Toolbar shows the save error state and the workflow remains dirty.</div></div>
+<div class="sd-seq-col sd-seq-returns">&mdash;</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">9</div>
+<div class="sd-seq-col sd-seq-from">user</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">toolbar</div>
+<div class="sd-seq-col sd-seq-action"><div>Ctrl+Z</div><div class="sd-seq-detail">User undoes the last destructive edit.</div></div>
+<div class="sd-seq-col sd-seq-returns">&mdash;</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">10</div>
+<div class="sd-seq-col sd-seq-from">undo-middleware</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">editor-store</div>
+<div class="sd-seq-col sd-seq-action"><div>restore previous snapshot</div><div class="sd-seq-detail">Undo restores the prior valid Branch path configuration and edge state.</div></div>
+<div class="sd-seq-col sd-seq-returns">WorkflowSnapshot</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">11</div>
+<div class="sd-seq-col sd-seq-from">user</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">editor-dialogs</div>
+<div class="sd-seq-col sd-seq-action"><div>import malformed YAML</div><div class="sd-seq-detail">User selects an invalid YAML file through the import flow.</div></div>
+<div class="sd-seq-col sd-seq-returns">&mdash;</div>
+</div>
+<div class="sd-seq-row">
+<div class="sd-seq-col sd-seq-num">12</div>
+<div class="sd-seq-col sd-seq-from">serialization</div>
+<div class="sd-seq-col sd-seq-arrow">&#x2192;</div>
+<div class="sd-seq-col sd-seq-to">editor-canvas</div>
+<div class="sd-seq-col sd-seq-action"><div>deserializeFromYaml fails</div><div class="sd-seq-detail">Editor catches the parse error, shows a toast, and leaves the existing canvas untouched.</div></div>
+<div class="sd-seq-col sd-seq-returns">error toast</div>
+</div>
+</div>
+</details>
+</section>
+<section class="sd-section" id="endpoints">
+<h2 class="sd-section-title">API Endpoints</h2>
+<div class="sd-table-wrap">
+<table class="sd-table">
+<thead><tr>
+<th>Method</th><th>Path</th><th>Service</th><th>Auth</th><th>Description</th>
+</tr></thead>
+<tbody>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#22c55e;letter-spacing:0.04em;line-height:1.6;">GET</span></td>
+<td><code>/api/workflows/:id</code></td>
+<td><span class="sd-svc-ref" data-ref-service="sf1-backend">compose-backend (schema/workflow API layer)</span></td>
+<td>Bearer token</td>
+<td>Fetch workflow definition as YAML for editor initialization using the nested phase contract: workflow.phases with phase.nodes, phase.children, and cross-phase edges.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#f59e0b;letter-spacing:0.04em;line-height:1.6;">PUT</span></td>
+<td><code>/api/workflows/:id</code></td>
+<td><span class="sd-svc-ref" data-ref-service="sf1-backend">compose-backend (schema/workflow API layer)</span></td>
+<td>Bearer token</td>
+<td>Persist serialized workflow YAML on manual save or idle auto-save. Saves nested phase children and edge-based hook wiring without a serialized port_type or separate hooks section. Branch nodes are serialized as dict-keyed paths with per-port condition expressions — no node-level condition_type, condition, switch_function, or output_field fields. Fires workflow mutation hook (update) for SF-7 reference-index synchronization.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#3b82f6;letter-spacing:0.04em;line-height:1.6;">POST</span></td>
+<td><code>/api/workflows/:id/validate</code></td>
+<td><span class="sd-svc-ref" data-ref-service="sf1-backend">compose-backend (schema/workflow API layer)</span></td>
+<td>Bearer token</td>
+<td>Run server-side validation against the canonical schema, including nested phase children, hook-edge inference from source ports, and BranchNode per-port condition expression and paths invariants. Explicitly rejects stale BranchNode fields: condition_type, node-level condition, switch_function, and output_field.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#22c55e;letter-spacing:0.04em;line-height:1.6;">GET</span></td>
+<td><code>/api/schema/workflow</code></td>
+<td><span class="sd-svc-ref" data-ref-service="sf1-backend">compose-backend (schema/workflow API layer)</span></td>
+<td>Bearer token</td>
+<td>Fetch the canonical composer JSON Schema generated from iriai-compose's current WorkflowConfig model. The editor uses this runtime schema for inspector constraints, defaults, and validation; static workflow-schema.json is build and test only.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#22c55e;letter-spacing:0.04em;line-height:1.6;">GET</span></td>
+<td><code>/api/roles</code></td>
+<td><span class="sd-svc-ref" data-ref-service="sf7-library">SF-7 Libraries &amp; Registries API</span></td>
+<td>Bearer token</td>
+<td>Fetch role definitions for role pickers and palette chips.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#3b82f6;letter-spacing:0.04em;line-height:1.6;">POST</span></td>
+<td><code>/api/roles</code></td>
+<td><span class="sd-svc-ref" data-ref-service="sf7-library">SF-7 Libraries &amp; Registries API</span></td>
+<td>Bearer token</td>
+<td>Promote an inline role to the shared library.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#22c55e;letter-spacing:0.04em;line-height:1.6;">GET</span></td>
+<td><code>/api/schemas</code></td>
+<td><span class="sd-svc-ref" data-ref-service="sf7-library">SF-7 Libraries &amp; Registries API</span></td>
+<td>Bearer token</td>
+<td>Fetch schema definitions for output schema pickers.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#3b82f6;letter-spacing:0.04em;line-height:1.6;">POST</span></td>
+<td><code>/api/schemas</code></td>
+<td><span class="sd-svc-ref" data-ref-service="sf7-library">SF-7 Libraries &amp; Registries API</span></td>
+<td>Bearer token</td>
+<td>Promote an inline schema to the shared library.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#22c55e;letter-spacing:0.04em;line-height:1.6;">GET</span></td>
+<td><code>/api/plugins</code></td>
+<td><span class="sd-svc-ref" data-ref-service="sf7-library">SF-7 Libraries &amp; Registries API</span></td>
+<td>Bearer token</td>
+<td>Fetch plugin definitions and instance metadata for PluginInspector. Non-blocking additive surface; editor core never calls this on boot or save.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#22c55e;letter-spacing:0.04em;line-height:1.6;">GET</span></td>
+<td><code>/api/templates</code></td>
+<td><span class="sd-svc-ref" data-ref-service="sf7-library">SF-7 Libraries &amp; Registries API</span></td>
+<td>Bearer token</td>
+<td>Fetch reusable task templates for the palette.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#3b82f6;letter-spacing:0.04em;line-height:1.6;">POST</span></td>
+<td><code>/api/templates</code></td>
+<td><span class="sd-svc-ref" data-ref-service="sf7-library">SF-7 Libraries &amp; Registries API</span></td>
+<td>Bearer token</td>
+<td>Persist a selected subgraph as a reusable task template.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#3b82f6;letter-spacing:0.04em;line-height:1.6;">POST</span></td>
+<td><code>/store/addNode</code></td>
+<td><span class="sd-svc-ref" data-ref-service="editor-store">editorStore</span></td>
+<td>&mdash;</td>
+<td>Add a node with type-specific defaults. Branch defaults to two starter paths keyed path_1 and path_2, each with a blank per-port condition expression string, plus an empty inputs dict. No condition_type or node-level condition field is added.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#a855f7;letter-spacing:0.04em;line-height:1.6;">PATCH</span></td>
+<td><code>/store/updateNodeData</code></td>
+<td><span class="sd-svc-ref" data-ref-service="editor-store">editorStore</span></td>
+<td>&mdash;</td>
+<td>Apply partial node-data edits from inspectors with undo snapshot support.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#3b82f6;letter-spacing:0.04em;line-height:1.6;">POST</span></td>
+<td><code>/store/addEdge</code></td>
+<td><span class="sd-svc-ref" data-ref-service="editor-store">editorStore</span></td>
+<td>&mdash;</td>
+<td>Add a connection. For Branch nodes, sourceHandle must match a key in node.data.paths; multiple output paths can fire concurrently if their per-port conditions are met (non-exclusive fan-out). Does not block fan-out connections.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#3b82f6;letter-spacing:0.04em;line-height:1.6;">POST</span></td>
+<td><code>/store/toggleCollapse</code></td>
+<td><span class="sd-svc-ref" data-ref-service="editor-store">editorStore</span></td>
+<td>&mdash;</td>
+<td>Toggle collapse state for a phase or template group and snapshot child visibility state.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#3b82f6;letter-spacing:0.04em;line-height:1.6;">POST</span></td>
+<td><code>/store/stampTemplate</code></td>
+<td><span class="sd-svc-ref" data-ref-service="editor-store">editorStore</span></td>
+<td>&mdash;</td>
+<td>Stamp a template group with cloned read-only child nodes and edges at a canvas position.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#3b82f6;letter-spacing:0.04em;line-height:1.6;">POST</span></td>
+<td><code>/store/detachTemplateGroup</code></td>
+<td><span class="sd-svc-ref" data-ref-service="editor-store">editorStore</span></td>
+<td>&mdash;</td>
+<td>Convert stamped template children into independent editable nodes and remove the wrapper group.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#3b82f6;letter-spacing:0.04em;line-height:1.6;">POST</span></td>
+<td><code>/store/undo</code></td>
+<td><span class="sd-svc-ref" data-ref-service="editor-store">editorStore</span></td>
+<td>&mdash;</td>
+<td>Restore the previous workflow snapshot and push the current state to redo.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#3b82f6;letter-spacing:0.04em;line-height:1.6;">POST</span></td>
+<td><code>/store/redo</code></td>
+<td><span class="sd-svc-ref" data-ref-service="editor-store">editorStore</span></td>
+<td>&mdash;</td>
+<td>Restore the next workflow snapshot from redo.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#3b82f6;letter-spacing:0.04em;line-height:1.6;">POST</span></td>
+<td><code>/store/loadFromYaml</code></td>
+<td><span class="sd-svc-ref" data-ref-service="editor-store">editorStore</span></td>
+<td>&mdash;</td>
+<td>Deserialize nested workflow YAML into flat editor state. phase.nodes and phase.children are flattened into parentId-grouped React Flow nodes, and hook edges gain UI edge kind by resolving the source port container. BranchNode path keys become output Handle IDs and per-port condition expressions are extracted from each path entry.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#22c55e;letter-spacing:0.04em;line-height:1.6;">GET</span></td>
+<td><code>/store/serializeToYaml</code></td>
+<td><span class="sd-svc-ref" data-ref-service="editor-store">editorStore</span></td>
+<td>&mdash;</td>
+<td>Serialize flat editor state back to nested WorkflowConfig YAML under phases[].nodes and phases[].children. Hook edges stay ordinary source and target refs with no serialized port_type. Branch nodes emit dict-keyed paths where each path entry carries its own per-port condition expression; no switch_function, no output_field, and no node-level condition_type or condition fields are emitted.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#3b82f6;letter-spacing:0.04em;line-height:1.6;">POST</span></td>
+<td><code>/store/initWorkflow</code></td>
+<td><span class="sd-svc-ref" data-ref-service="editor-store">editorStore</span></td>
+<td>&mdash;</td>
+<td>Initialize workflow identifiers, load YAML if present, and clear transient editor state.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#3b82f6;letter-spacing:0.04em;line-height:1.6;">POST</span></td>
+<td><code>/store/openInspector</code></td>
+<td><span class="sd-svc-ref" data-ref-service="editor-store">editorStore</span></td>
+<td>&mdash;</td>
+<td>Add an inspector window descriptor for a node, edge, phase, or template group.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#ef4444;letter-spacing:0.04em;line-height:1.6;">DELETE</span></td>
+<td><code>/store/closeInspector</code></td>
+<td><span class="sd-svc-ref" data-ref-service="editor-store">editorStore</span></td>
+<td>&mdash;</td>
+<td>Close an inspector window by windowId.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#22c55e;letter-spacing:0.04em;line-height:1.6;">GET</span></td>
+<td><code>/serialization/serializeToYaml</code></td>
+<td><span class="sd-svc-ref" data-ref-service="serialization">Serialization Module</span></td>
+<td>&mdash;</td>
+<td>Walk flat React Flow nodes and edges into nested PhaseDefinition trees using phases[].nodes and phases[].children, then emit ordinary source and target refs for both data and hook edges with no serialized port_type. Branch nodes emit dict-keyed paths where each path entry carries a per-port condition expression; no node-level condition_type, condition, switch_function, or output_field fields are emitted.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#3b82f6;letter-spacing:0.04em;line-height:1.6;">POST</span></td>
+<td><code>/serialization/deserializeFromYaml</code></td>
+<td><span class="sd-svc-ref" data-ref-service="serialization">Serialization Module</span></td>
+<td>&mdash;</td>
+<td>Parse YAML, flatten phase.nodes and phase.children into parentId-linked React Flow nodes, infer hook-versus-data edge kind from source port resolution, materialize BranchNode path keys as output Handle IDs, and extract per-port condition expressions from each path entry. Run auto-layout when positions are missing.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#3b82f6;letter-spacing:0.04em;line-height:1.6;">POST</span></td>
+<td><code>/validation/validateStructural</code></td>
+<td><span class="sd-svc-ref" data-ref-service="client-validator">clientValidator</span></td>
+<td>&mdash;</td>
+<td>Check dangling edges, duplicate IDs, missing required fields, BranchNode per-port condition expressions (blank or missing per path is an error), minimum-2 paths invariant, path-handle mismatches, cycles, and type mismatches. Also rejects stale node-level condition_type, condition, switch_function, and output_field fields on Branch nodes.</td>
+</tr>
+<tr>
+<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#fff;background:#22c55e;letter-spacing:0.04em;line-height:1.6;">GET</span></td>
+<td><code>/validation/isValidConnection</code></td>
+<td><span class="sd-svc-ref" data-ref-service="connection-validator">connectionValidator</span></td>
+<td>&mdash;</td>
+<td>Synchronously block self-loops, duplicate edges, cycle creation, and connections to read-only targets during drag.</td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section class="sd-section" id="entities">
+<h2 class="sd-section-title">Entity Model</h2>
+<div class="sd-entity-grid">
+<div class="sd-entity-card" data-service-id="yaml-schema" data-journeys="J-16 J-22">
+<div class="sd-entity-header">
+<h4 class="sd-entity-name">WorkflowConfig</h4>
+<span class="sd-entity-svc" data-ref-service="yaml-schema">workflowSchemaAdapters</span>
+</div>
+<table class="sd-field-table">
+<thead><tr><th>Field</th><th>Type</th><th>Constraints</th></tr></thead>
+<tbody>
+<tr>
+<td>name</td>
+<td><code>string</code></td>
+<td>required</td>
+</tr>
+<tr>
+<td>schema_version</td>
+<td><code>string</code></td>
+<td>required</td>
+</tr>
+<tr>
+<td>actors</td>
+<td><code>Record&lt;string, ActorDefinition&gt;</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>types</td>
+<td><code>Record&lt;string, TypeDefinition&gt;</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>plugins</td>
+<td><code>Record&lt;string, PluginInterface&gt;</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>plugin_instances</td>
+<td><code>Record&lt;string, PluginInstanceConfig&gt;</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>stores</td>
+<td><code>Record&lt;string, StoreDefinition&gt;</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>context_keys</td>
+<td><code>string[]</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>context_text</td>
+<td><code>Record&lt;string, string&gt;</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>phases</td>
+<td><code>PhaseDefinition[]</code></td>
+<td>required</td>
+</tr>
+<tr>
+<td>edges</td>
+<td><code>EdgeDefinition[]</code></td>
+<td>cross-phase and workflow-boundary edges</td>
+</tr>
+<tr>
+<td>cost</td>
+<td><code>CostConfig</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>templates</td>
+<td><code>Record&lt;string, TemplateRef&gt;</code></td>
+<td>&mdash;</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div class="sd-entity-card" data-service-id="yaml-schema" data-journeys="J-17">
+<div class="sd-entity-header">
+<h4 class="sd-entity-name">PhaseDefinition</h4>
+<span class="sd-entity-svc" data-ref-service="yaml-schema">workflowSchemaAdapters</span>
+</div>
+<table class="sd-field-table">
+<thead><tr><th>Field</th><th>Type</th><th>Constraints</th></tr></thead>
+<tbody>
+<tr>
+<td>id</td>
+<td><code>string</code></td>
+<td>required</td>
+</tr>
+<tr>
+<td>name</td>
+<td><code>string</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>mode</td>
+<td><code>'sequential' | 'map' | 'fold' | 'loop'</code></td>
+<td>required</td>
+</tr>
+<tr>
+<td>mode_config</td>
+<td><code>SequentialConfig | MapConfig | FoldConfig | LoopConfig</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>nodes</td>
+<td><code>NodeDefinition[]</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>edges</td>
+<td><code>EdgeDefinition[]</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>children</td>
+<td><code>PhaseDefinition[]</code></td>
+<td>nested child phases</td>
+</tr>
+<tr>
+<td>context_keys</td>
+<td><code>string[]</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>context_text</td>
+<td><code>Record&lt;string, string&gt;</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>input_type</td>
+<td><code>string</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>input_schema</td>
+<td><code>Record&lt;string, unknown&gt;</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>output_type</td>
+<td><code>string</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>output_schema</td>
+<td><code>Record&lt;string, unknown&gt;</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>inputs</td>
+<td><code>Record&lt;string, PortDefinition&gt;</code></td>
+<td>dict keyed by port name</td>
+</tr>
+<tr>
+<td>outputs</td>
+<td><code>Record&lt;string, PortDefinition&gt;</code></td>
+<td>dict keyed by port name</td>
+</tr>
+<tr>
+<td>hooks</td>
+<td><code>Record&lt;string, PortDefinition&gt;</code></td>
+<td>dict keyed by hook name</td>
+</tr>
+<tr>
+<td>position</td>
+<td><code>{ x: number; y: number }</code></td>
+<td>&mdash;</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div class="sd-entity-card" data-service-id="yaml-schema" data-journeys="J-16 J-18 J-20 J-22">
+<div class="sd-entity-header">
+<h4 class="sd-entity-name">NodeDefinition</h4>
+<span class="sd-entity-svc" data-ref-service="yaml-schema">workflowSchemaAdapters</span>
+</div>
+<table class="sd-field-table">
+<thead><tr><th>Field</th><th>Type</th><th>Constraints</th></tr></thead>
+<tbody>
+<tr>
+<td>id</td>
+<td><code>string</code></td>
+<td>required</td>
+</tr>
+<tr>
+<td>type</td>
+<td><code>'ask' | 'branch' | 'plugin'</code></td>
+<td>required</td>
+</tr>
+<tr>
+<td>summary</td>
+<td><code>string</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>context_keys</td>
+<td><code>string[]</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>context_text</td>
+<td><code>Record&lt;string, string&gt;</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>artifact_key</td>
+<td><code>string</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>input_type</td>
+<td><code>string</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>input_schema</td>
+<td><code>Record&lt;string, unknown&gt;</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>output_type</td>
+<td><code>string</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>output_schema</td>
+<td><code>Record&lt;string, unknown&gt;</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>inputs</td>
+<td><code>Record&lt;string, PortDefinition&gt;</code></td>
+<td>dict keyed by port name</td>
+</tr>
+<tr>
+<td>outputs</td>
+<td><code>Record&lt;string, PortDefinition&gt;</code></td>
+<td>Ask and Plugin nodes only</td>
+</tr>
+<tr>
+<td>hooks</td>
+<td><code>Record&lt;string, PortDefinition&gt;</code></td>
+<td>dict keyed by hook name</td>
+</tr>
+<tr>
+<td>position</td>
+<td><code>{ x: number; y: number }</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>actor</td>
+<td><code>string</code></td>
+<td>Ask nodes only</td>
+</tr>
+<tr>
+<td>inline_role</td>
+<td><code>InlineRoleDefinition</code></td>
+<td>Ask nodes only</td>
+</tr>
+<tr>
+<td>prompt</td>
+<td><code>string</code></td>
+<td>Ask nodes only</td>
+</tr>
+<tr>
+<td>paths</td>
+<td><code>Record&lt;string, PathPortDefinition&gt;</code></td>
+<td>Branch nodes only, dict keyed by path name, minimum 2</td>
+</tr>
+<tr>
+<td>merge_function</td>
+<td><code>string</code></td>
+<td>Branch nodes only, optional</td>
+</tr>
+<tr>
+<td>plugin_ref</td>
+<td><code>string</code></td>
+<td>Plugin nodes only, workflow-local key</td>
+</tr>
+<tr>
+<td>instance_ref</td>
+<td><code>string</code></td>
+<td>Plugin nodes only</td>
+</tr>
+<tr>
+<td>plugin_config</td>
+<td><code>Record&lt;string, unknown&gt;</code></td>
+<td>Plugin nodes only</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div class="sd-entity-card" data-service-id="yaml-schema" data-journeys="J-16 J-22">
+<div class="sd-entity-header">
+<h4 class="sd-entity-name">PathPortDefinition</h4>
+<span class="sd-entity-svc" data-ref-service="yaml-schema">workflowSchemaAdapters</span>
+</div>
+<table class="sd-field-table">
+<thead><tr><th>Field</th><th>Type</th><th>Constraints</th></tr></thead>
+<tbody>
+<tr>
+<td>condition</td>
+<td><code>string</code></td>
+<td>required, non-empty expression string</td>
+</tr>
+<tr>
+<td>direction</td>
+<td><code>'output'</code></td>
+<td>always 'output' for Branch paths</td>
+</tr>
+<tr>
+<td>type_ref</td>
+<td><code>string</code></td>
+<td>optional when schema_def is absent</td>
+</tr>
+<tr>
+<td>schema_def</td>
+<td><code>Record&lt;string, unknown&gt;</code></td>
+<td>optional when type_ref is absent</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div class="sd-entity-card" data-service-id="yaml-schema" data-journeys="J-16 J-22">
+<div class="sd-entity-header">
+<h4 class="sd-entity-name">EdgeDefinition</h4>
+<span class="sd-entity-svc" data-ref-service="yaml-schema">workflowSchemaAdapters</span>
+</div>
+<table class="sd-field-table">
+<thead><tr><th>Field</th><th>Type</th><th>Constraints</th></tr></thead>
+<tbody>
+<tr>
+<td>source</td>
+<td><code>string</code></td>
+<td>required, format node_id.port_name</td>
+</tr>
+<tr>
+<td>target</td>
+<td><code>string</code></td>
+<td>required, format node_id.port_name</td>
+</tr>
+<tr>
+<td>transform_fn</td>
+<td><code>string</code></td>
+<td>optional inline Python expression, absent on hook edges</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div class="sd-entity-card" data-service-id="yaml-schema" data-journeys="J-16 J-22">
+<div class="sd-entity-header">
+<h4 class="sd-entity-name">PortDefinition</h4>
+<span class="sd-entity-svc" data-ref-service="yaml-schema">workflowSchemaAdapters</span>
+</div>
+<table class="sd-field-table">
+<thead><tr><th>Field</th><th>Type</th><th>Constraints</th></tr></thead>
+<tbody>
+<tr>
+<td>direction</td>
+<td><code>'input' | 'output'</code></td>
+<td>required</td>
+</tr>
+<tr>
+<td>type_ref</td>
+<td><code>string</code></td>
+<td>optional when schema_def is absent</td>
+</tr>
+<tr>
+<td>schema_def</td>
+<td><code>Record&lt;string, unknown&gt;</code></td>
+<td>optional when type_ref is absent</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div class="sd-entity-card" data-service-id="yaml-schema" data-journeys="J-18">
+<div class="sd-entity-header">
+<h4 class="sd-entity-name">ActorDefinition</h4>
+<span class="sd-entity-svc" data-ref-service="yaml-schema">workflowSchemaAdapters</span>
+</div>
+<table class="sd-field-table">
+<thead><tr><th>Field</th><th>Type</th><th>Constraints</th></tr></thead>
+<tbody>
+<tr>
+<td>id</td>
+<td><code>string</code></td>
+<td>required</td>
+</tr>
+<tr>
+<td>model</td>
+<td><code>string</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>system_prompt</td>
+<td><code>string</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>tools</td>
+<td><code>string[]</code></td>
+<td>&mdash;</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div class="sd-entity-card" data-service-id="yaml-schema" data-journeys="J-18">
+<div class="sd-entity-header">
+<h4 class="sd-entity-name">InlineRoleDefinition</h4>
+<span class="sd-entity-svc" data-ref-service="yaml-schema">workflowSchemaAdapters</span>
+</div>
+<table class="sd-field-table">
+<thead><tr><th>Field</th><th>Type</th><th>Constraints</th></tr></thead>
+<tbody>
+<tr>
+<td>name</td>
+<td><code>string</code></td>
+<td>required</td>
+</tr>
+<tr>
+<td>model</td>
+<td><code>string</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>system_prompt</td>
+<td><code>string</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>tools</td>
+<td><code>string[]</code></td>
+<td>&mdash;</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div class="sd-entity-card" data-service-id="yaml-schema" data-journeys="J-20">
+<div class="sd-entity-header">
+<h4 class="sd-entity-name">TemplateRef</h4>
+<span class="sd-entity-svc" data-ref-service="yaml-schema">workflowSchemaAdapters</span>
+</div>
+<table class="sd-field-table">
+<thead><tr><th>Field</th><th>Type</th><th>Constraints</th></tr></thead>
+<tbody>
+<tr>
+<td>template_id</td>
+<td><code>string</code></td>
+<td>required</td>
+</tr>
+<tr>
+<td>version_hash</td>
+<td><code>string</code></td>
+<td>required for round-trip checks</td>
+</tr>
+<tr>
+<td>position</td>
+<td><code>{ x: number; y: number }</code></td>
+<td>&mdash;</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div class="sd-entity-card" data-service-id="client-validator" data-journeys="J-22">
+<div class="sd-entity-header">
+<h4 class="sd-entity-name">ValidationIssue</h4>
+<span class="sd-entity-svc" data-ref-service="client-validator">clientValidator</span>
+</div>
+<table class="sd-field-table">
+<thead><tr><th>Field</th><th>Type</th><th>Constraints</th></tr></thead>
+<tbody>
+<tr>
+<td>code</td>
+<td><code>string</code></td>
+<td>required</td>
+</tr>
+<tr>
+<td>path</td>
+<td><code>string</code></td>
+<td>required</td>
+</tr>
+<tr>
+<td>message</td>
+<td><code>string</code></td>
+<td>required</td>
+</tr>
+<tr>
+<td>nodeId</td>
+<td><code>string</code></td>
+<td>optional</td>
+</tr>
+<tr>
+<td>edgeId</td>
+<td><code>string</code></td>
+<td>optional</td>
+</tr>
+<tr>
+<td>severity</td>
+<td><code>'error' | 'warning'</code></td>
+<td>required</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div class="sd-entity-card" data-service-id="undo-middleware" data-journeys="J-16 J-22">
+<div class="sd-entity-header">
+<h4 class="sd-entity-name">WorkflowSnapshot</h4>
+<span class="sd-entity-svc" data-ref-service="undo-middleware">undoMiddleware</span>
+</div>
+<table class="sd-field-table">
+<thead><tr><th>Field</th><th>Type</th><th>Constraints</th></tr></thead>
+<tbody>
+<tr>
+<td>nodes</td>
+<td><code>Node[]</code></td>
+<td>required</td>
+</tr>
+<tr>
+<td>edges</td>
+<td><code>Edge[]</code></td>
+<td>required</td>
+</tr>
+<tr>
+<td>actors</td>
+<td><code>Record&lt;string, ActorDef&gt;</code></td>
+<td>required</td>
+</tr>
+<tr>
+<td>types</td>
+<td><code>Record&lt;string, TypeDef&gt;</code></td>
+<td>required</td>
+</tr>
+<tr>
+<td>plugins</td>
+<td><code>Record&lt;string, PluginDef&gt;</code></td>
+<td>required</td>
+</tr>
+<tr>
+<td>pluginInstances</td>
+<td><code>Record&lt;string, PluginInstanceDef&gt;</code></td>
+<td>required</td>
+</tr>
+<tr>
+<td>stores</td>
+<td><code>Record&lt;string, StoreDef&gt;</code></td>
+<td>required</td>
+</tr>
+<tr>
+<td>contextKeys</td>
+<td><code>string[]</code></td>
+<td>required</td>
+</tr>
+<tr>
+<td>collapsedGroups</td>
+<td><code>Record&lt;string, boolean&gt;</code></td>
+<td>undoable</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div class="sd-entity-card" data-service-id="editor-store" data-journeys="J-16 J-17 J-18 J-20 J-22">
+<div class="sd-entity-header">
+<h4 class="sd-entity-name">EditorState</h4>
+<span class="sd-entity-svc" data-ref-service="editor-store">editorStore</span>
+</div>
+<table class="sd-field-table">
+<thead><tr><th>Field</th><th>Type</th><th>Constraints</th></tr></thead>
+<tbody>
+<tr>
+<td>workflowId</td>
+<td><code>string</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>workflowName</td>
+<td><code>string</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>nodes</td>
+<td><code>Node[]</code></td>
+<td>canonical flat React Flow array</td>
+</tr>
+<tr>
+<td>edges</td>
+<td><code>Edge[]</code></td>
+<td>canonical flat React Flow array</td>
+</tr>
+<tr>
+<td>collapsedGroups</td>
+<td><code>Record&lt;string, boolean&gt;</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>actors</td>
+<td><code>Record&lt;string, ActorDef&gt;</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>types</td>
+<td><code>Record&lt;string, TypeDef&gt;</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>plugins</td>
+<td><code>Record&lt;string, PluginDef&gt;</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>pluginInstances</td>
+<td><code>Record&lt;string, PluginInstanceDef&gt;</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>stores</td>
+<td><code>Record&lt;string, StoreDef&gt;</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>contextKeys</td>
+<td><code>string[]</code></td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td>undoStack</td>
+<td><code>WorkflowSnapshot[]</code></td>
+<td>max 50</td>
+</tr>
+<tr>
+<td>redoStack</td>
+<td><code>WorkflowSnapshot[]</code></td>
+<td>max 50</td>
+</tr>
+<tr>
+<td>validationIssues</td>
+<td><code>ValidationIssue[]</code></td>
+<td>not undoable</td>
+</tr>
+<tr>
+<td>toolMode</td>
+<td><code>'hand' | 'select'</code></td>
+<td>not undoable</td>
+</tr>
+<tr>
+<td>autoSaveStatus</td>
+<td><code>'clean' | 'dirty' | 'saving' | 'error'</code></td>
+<td>not undoable</td>
+</tr>
+<tr>
+<td>inspectors</td>
+<td><code>InspectorState[]</code></td>
+<td>not undoable</td>
+</tr>
+<tr>
+<td>isDirty</td>
+<td><code>boolean</code></td>
+<td>not undoable</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div class="sd-entity-card" data-service-id="inspector-system" data-journeys="J-16 J-18 J-20">
+<div class="sd-entity-header">
+<h4 class="sd-entity-name">InspectorState</h4>
+<span class="sd-entity-svc" data-ref-service="inspector-system">Inspector Window System</span>
+</div>
+<table class="sd-field-table">
+<thead><tr><th>Field</th><th>Type</th><th>Constraints</th></tr></thead>
+<tbody>
+<tr>
+<td>windowId</td>
+<td><code>string</code></td>
+<td>required</td>
+</tr>
+<tr>
+<td>elementId</td>
+<td><code>string</code></td>
+<td>required</td>
+</tr>
+<tr>
+<td>elementType</td>
+<td><code>'node' | 'edge' | 'phase' | 'template-group'</code></td>
+<td>required</td>
+</tr>
+<tr>
+<td>position</td>
+<td><code>{ x: number; y: number }</code></td>
+<td>required</td>
+</tr>
+<tr>
+<td>readOnly</td>
+<td><code>boolean</code></td>
+<td>&mdash;</td>
+</tr>
+</tbody>
+</table>
+</div>
+</div>
+</section>
+<section class="sd-section" id="relations">
+<h2 class="sd-section-title">Entity Relationships</h2>
+<div class="sd-table-wrap">
+<table class="sd-table">
+<thead><tr>
+<th>From</th><th>Relationship</th><th>To</th><th>Label</th>
+</tr></thead>
+<tbody>
+<tr>
+<td>workflow-config</td>
+<td><span class="sd-rel-kind">one-to-many</span></td>
+<td>phase-definition</td>
+<td>phases</td>
+</tr>
+<tr>
+<td>workflow-config</td>
+<td><span class="sd-rel-kind">one-to-many</span></td>
+<td>edge-definition</td>
+<td>workflow boundary and cross-phase edges</td>
+</tr>
+<tr>
+<td>workflow-config</td>
+<td><span class="sd-rel-kind">one-to-many</span></td>
+<td>actor-definition</td>
+<td>actors registry</td>
+</tr>
+<tr>
+<td>workflow-config</td>
+<td><span class="sd-rel-kind">one-to-many</span></td>
+<td>template-ref</td>
+<td>template refs</td>
+</tr>
+<tr>
+<td>phase-definition</td>
+<td><span class="sd-rel-kind">one-to-many</span></td>
+<td>node-definition</td>
+<td>child nodes</td>
+</tr>
+<tr>
+<td>phase-definition</td>
+<td><span class="sd-rel-kind">one-to-many</span></td>
+<td>edge-definition</td>
+<td>child edges</td>
+</tr>
+<tr>
+<td>phase-definition</td>
+<td><span class="sd-rel-kind">one-to-many</span></td>
+<td>phase-definition</td>
+<td>children (nested sub-phases)</td>
+</tr>
+<tr>
+<td>phase-definition</td>
+<td><span class="sd-rel-kind">one-to-many</span></td>
+<td>port-definition</td>
+<td>inputs, outputs, hooks</td>
+</tr>
+<tr>
+<td>node-definition</td>
+<td><span class="sd-rel-kind">one-to-many</span></td>
+<td>port-definition</td>
+<td>inputs, outputs, and hooks (Ask and Plugin)</td>
+</tr>
+<tr>
+<td>node-definition</td>
+<td><span class="sd-rel-kind">one-to-many</span></td>
+<td>path-port-definition</td>
+<td>Branch paths (per-port condition expressions)</td>
+</tr>
+<tr>
+<td>node-definition</td>
+<td><span class="sd-rel-kind">one-to-one</span></td>
+<td>inline-role-definition</td>
+<td>inline_role</td>
+</tr>
+<tr>
+<td>node-definition</td>
+<td><span class="sd-rel-kind">one-to-one</span></td>
+<td>actor-definition</td>
+<td>actor reference</td>
+</tr>
+<tr>
+<td>editor-state</td>
+<td><span class="sd-rel-kind">one-to-many</span></td>
+<td>workflow-snapshot</td>
+<td>undo and redo stacks</td>
+</tr>
+<tr>
+<td>editor-state</td>
+<td><span class="sd-rel-kind">one-to-many</span></td>
+<td>inspector-state</td>
+<td>open inspectors</td>
+</tr>
+<tr>
+<td>editor-state</td>
+<td><span class="sd-rel-kind">one-to-many</span></td>
+<td>validation-issue</td>
+<td>current validation issues</td>
+</tr>
+<tr>
+<td>workflow-snapshot</td>
+<td><span class="sd-rel-kind">one-to-many</span></td>
+<td>node-definition</td>
+<td>frozen nodes</td>
+</tr>
+<tr>
+<td>workflow-snapshot</td>
+<td><span class="sd-rel-kind">one-to-many</span></td>
+<td>edge-definition</td>
+<td>frozen edges</td>
+</tr>
+<tr>
+<td>template-ref</td>
+<td><span class="sd-rel-kind">one-to-many</span></td>
+<td>node-definition</td>
+<td>stamped read-only children</td>
+</tr>
+<tr>
+<td>path-port-definition</td>
+<td><span class="sd-rel-kind">one-to-one</span></td>
+<td>port-definition</td>
+<td>extends PortDefinition with per-port condition</td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section class="sd-section" id="risks">
+<h2 class="sd-section-title">Risks</h2>
+<ul class="sd-risks-list">
+<li>RISK-1 (high): Template round-trip fidelity depends on referenced library templates remaining available. Mitigation: persist version_hash and surface drift warnings on load.</li>
+<li>RISK-2 (medium): React Flow performance may degrade when many expanded phases and templates are visible at once. Mitigation: memoized node wrappers, collapsed-by-default loading, and fixed collapsed bounds.</li>
+<li>RISK-3 (medium): Debounced inspector writes can race with undo and redo. Mitigation: flush pending debounced writes before snapshot restoration and force inspectors to re-read store state after undo.</li>
+<li>RISK-4 (medium): Read-only template children could be mutated indirectly through edge creation or grouping actions. Mitigation: connectionValidator and all structural store actions reject edits against read-only targets.</li>
+<li>RISK-5 (low): Lazy-loaded code editing still adds a meaningful bundle chunk when first opened. Mitigation: load CodeMirror only on demand; per-port condition expression editors in BranchInspector share the same lazy chunk.</li>
+<li>RISK-6 (medium): SF-7 primitives and picker APIs may lag SF-6 implementation. Mitigation: lock the prop contract early (BranchNodePrimitive receives paths with per-port conditionSummary, not node-level conditionType), use temporary stubs that match final signatures, and reserve the swap to real primitives as the final integration step.</li>
+<li>RISK-7 (medium): Collapsed group dimensions must stay explicit for both layout and edge routing. Mitigation: persist fixed collapsed dimensions in node data and reuse them in layout passes.</li>
+<li>RISK-8 (medium): Branch path-key drift can break serialization if a Handle ID no longer matches the paths dict key. Mitigation: paths are the single source of truth, Handle IDs are derived from the dict keys, and client validation enforces path-handle parity.</li>
+<li>RISK-9 (high): If SF-1, SF-2, or SF-4 retains stale node-level condition_type, condition, switch_function, or output_field fields on BranchNode, editor-authored YAML could validate locally but execute differently downstream. Mitigation: this artifact standardizes the D-GR-35 per-port non-exclusive fan-out model; the validation endpoint explicitly rejects all four stale BranchNode fields (condition_type at node level, node-level condition, switch_function, output_field); migration fixtures must include per-port condition expression assertions and zero switch_function or output_field references.</li>
+<li>RISK-10 (medium): If runtime /api/schema/workflow changes while local adapter types or serializer assumptions still target older field names such as root nodes, phases, or static schema copies, the editor could render stale inspectors or emit invalid YAML. Mitigation: fetch schema on editor boot, keep adapter tests against the endpoint, and maintain round-trip fixtures that assert phases[].nodes, phases[].children, per-port Branch path conditions, and absence of serialized port_type.</li>
+</ul>
+</section>
+</main>
+<footer class="sd-footer">
+<p>System Design Document</p>
+</footer>
+<script>
+(function () {
+  'use strict';
+
+  // ── Journey filtering ──────────────────────────────────────────────
+  var activeJourney = '__all__';
+
+  window.__sd_filter = function (journeyId) {
+    activeJourney = journeyId;
+
+    // Update pill states
+    var pills = document.querySelectorAll('.sd-pill');
+    for (var i = 0; i < pills.length; i++) {
+      var p = pills[i];
+      if (p.getAttribute('data-journey') === journeyId) {
+        p.classList.add('sd-pill-active');
+      } else {
+        p.classList.remove('sd-pill-active');
+      }
+    }
+
+    // Filter elements with data-journeys
+    var tagged = document.querySelectorAll('[data-journeys]');
+    for (var j = 0; j < tagged.length; j++) {
+      var el = tagged[j];
+      if (journeyId === '__all__') {
+        el.classList.remove('sd-dimmed');
+      } else {
+        var jList = (el.getAttribute('data-journeys') || '').split(/\s+/);
+        var match = false;
+        for (var k = 0; k < jList.length; k++) {
+          if (jList[k] === journeyId) { match = true; break; }
+        }
+        el.classList.toggle('sd-dimmed', !match);
+      }
+    }
+
+    // Filter elements with data-journey-id (call paths)
+    var cpTagged = document.querySelectorAll('[data-journey-id]');
+    for (var m = 0; m < cpTagged.length; m++) {
+      var cpEl = cpTagged[m];
+      if (journeyId === '__all__') {
+        cpEl.classList.remove('sd-dimmed');
+      } else {
+        var cpJourney = cpEl.getAttribute('data-journey-id') || '';
+        cpEl.classList.toggle('sd-dimmed', cpJourney !== '' && cpJourney !== journeyId);
+      }
+    }
+  };
+
+  // ── Expand / collapse all details ──────────────────────────────────
+  var detailsExpanded = false;
+
+  window.__sd_toggle_details = function () {
+    detailsExpanded = !detailsExpanded;
+    var details = document.querySelectorAll('.sd-call-path');
+    for (var i = 0; i < details.length; i++) {
+      details[i].open = detailsExpanded;
+    }
+    var btn = document.getElementById('sd-toggle-details');
+    if (btn) {
+      btn.textContent = detailsExpanded ? 'Collapse All' : 'Expand All';
+    }
+  };
+
+  // ── Service hover cross-highlighting ───────────────────────────────
+  function highlightService(serviceId, on) {
+    // Highlight service cards
+    var cards = document.querySelectorAll('.sd-service-card[data-service-id="' + serviceId + '"]');
+    for (var i = 0; i < cards.length; i++) {
+      cards[i].classList.toggle('sd-highlight', on);
+    }
+
+    // Highlight entity cards belonging to this service
+    var entities = document.querySelectorAll('.sd-entity-card[data-service-id="' + serviceId + '"]');
+    for (var j = 0; j < entities.length; j++) {
+      entities[j].classList.toggle('sd-highlight', on);
+    }
+
+    // Highlight service references in tables
+    var refs = document.querySelectorAll('.sd-svc-ref[data-ref-service="' + serviceId + '"]');
+    for (var k = 0; k < refs.length; k++) {
+      refs[k].style.fontWeight = on ? '700' : '';
+      refs[k].style.textDecoration = on ? 'underline' : '';
+    }
+  }
+
+  // Attach hover listeners to service cards
+  document.addEventListener('DOMContentLoaded', function () {
+    var svcCards = document.querySelectorAll('.sd-service-card[data-service-id]');
+    for (var i = 0; i < svcCards.length; i++) {
+      (function (card) {
+        var sid = card.getAttribute('data-service-id');
+        card.addEventListener('mouseenter', function () { highlightService(sid, true); });
+        card.addEventListener('mouseleave', function () { highlightService(sid, false); });
+      })(svcCards[i]);
+    }
+
+    // Attach hover listeners to service refs (entity badges, table refs)
+    var svcRefs = document.querySelectorAll('[data-ref-service]');
+    for (var j = 0; j < svcRefs.length; j++) {
+      (function (ref) {
+        var sid = ref.getAttribute('data-ref-service');
+        ref.addEventListener('mouseenter', function () { highlightService(sid, true); });
+        ref.addEventListener('mouseleave', function () { highlightService(sid, false); });
+      })(svcRefs[j]);
+    }
+  });
+
+  // ── Smooth scroll via nav links ────────────────────────────────────
+  var navLinks = document.querySelectorAll('.sd-nav-link');
+  for (var i = 0; i < navLinks.length; i++) {
+    navLinks[i].addEventListener('click', function (e) {
+      var href = this.getAttribute('href');
+      if (href && href.charAt(0) === '#') {
+        var target = document.getElementById(href.substring(1));
+        if (target) {
+          e.preventDefault();
+          var headerHeight = document.querySelector('.sd-header')
+            ? document.querySelector('.sd-header').offsetHeight
+            : 0;
+          var top = target.getBoundingClientRect().top + window.pageYOffset - headerHeight - 16;
+          window.scrollTo({ top: top, behavior: 'smooth' });
+        }
+      }
+    });
+  }
+})();
+</script>
+</body>
+</html>
