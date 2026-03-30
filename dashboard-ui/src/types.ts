@@ -10,6 +10,7 @@ export interface FeatureData {
   timeline: TimelineEntry[]
   workstreams: Workstream[]
   events: EventEntry[]
+  active_agent: string | null
 }
 
 export interface DagInfo {

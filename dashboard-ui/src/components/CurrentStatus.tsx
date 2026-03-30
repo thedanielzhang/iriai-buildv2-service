@@ -1,6 +1,8 @@
+import { useState } from 'react'
 import { useStore } from '../store/useStore'
 import { getActiveStatus, phaseCls, relTime } from '../utils'
 import type { FeatureData, Group } from '../types'
+import { DispatchDetail, FixAttemptsDetail } from './BugDetail'
 
 export function CurrentStatus() {
   const { view, data } = useStore()
@@ -28,6 +30,9 @@ export function CurrentStatus() {
           <div className={`cs-dot ${isFixLoop ? 'fix-loop' : 'running'}`} />
           <div className="cs-status-text">{status}</div>
           <span className={`phase-badge ${phaseCls(d.phase)}`}>{d.phase}</span>
+          {d.active_agent && (
+            <span className="cs-agent-badge">{d.active_agent}</span>
+          )}
         </div>
 
         {active && <ActiveGroupDetail group={active} isFixLoop={isFixLoop} />}
@@ -57,6 +62,10 @@ function ActiveGroupDetail({ group, isFixLoop }: { group: Group; isFixLoop: bool
   const fixCount = group.fix_steps.filter(s => s.type === 'fix').length
   const verifyCount = group.verify_steps.length
 
+  // Find most recent dispatch record and fix-attempts
+  const lastDispatch = [...group.fix_steps].reverse().find(s => s.type === 'dispatch')
+  const fixAttempts = group.fix_steps.find(s => s.type === 'fix-attempts')
+
   return (
     <div className="cs-detail">
       <div className="cs-detail-row">
@@ -83,21 +92,17 @@ function ActiveGroupDetail({ group, isFixLoop }: { group: Group; isFixLoop: bool
             {lastVerify.passed ? 'PASS' : 'FAIL'}
           </span>
           <div className="cs-detail-body">{lastVerify.summary}</div>
+          {lastDispatch && (
+            <div className="cs-detail-body">
+              <DispatchDetail raw={lastDispatch.summary} />
+            </div>
+          )}
         </div>
       )}
 
-      {group.fix_steps.length > 0 && (() => {
-        const lastFix = group.fix_steps[group.fix_steps.length - 1]
-        return (
-          <div className="cs-detail-block">
-            <span className="cs-detail-label">Last Fix</span>
-            <span className={`cs-verdict-badge ${lastFix.passed === true ? 'cs-pass' : lastFix.passed === false ? 'cs-fail' : 'cs-neutral'}`}>
-              {lastFix.type}
-            </span>
-            <div className="cs-detail-body">{lastFix.summary}</div>
-          </div>
-        )
-      })()}
+      {fixAttempts && fixAttempts.summary && (
+        <FixAttemptsCollapsible raw={fixAttempts.summary} />
+      )}
     </div>
   )
 }
@@ -116,6 +121,27 @@ function GatesSummary({ data, passedGates, totalGates }: { data: FeatureData; pa
           {pendingGates.length > 0 && ` — pending: ${pendingGates.join(', ')}`}
         </span>
       </div>
+    </div>
+  )
+}
+
+function FixAttemptsCollapsible({ raw }: { raw: string }) {
+  const [open, setOpen] = useState(false)
+  const count = (raw.match(/"bug_id"/g) || []).length
+
+  return (
+    <div className="cs-detail-block">
+      <div className="cs-detail-row" style={{ cursor: 'pointer' }} onClick={() => setOpen(!open)}>
+        <span className="cs-detail-label">Fix Attempts</span>
+        <span className="cs-detail-value">
+          {open ? '▼' : '▶'} {count} attempt{count !== 1 ? 's' : ''}
+        </span>
+      </div>
+      {open && (
+        <div className="cs-detail-body">
+          <FixAttemptsDetail raw={raw} />
+        </div>
+      )}
     </div>
   )
 }

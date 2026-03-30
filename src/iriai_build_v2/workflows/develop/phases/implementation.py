@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio as _asyncio
 import itertools
+import json
 import logging
 import shutil
 from pathlib import Path
@@ -1624,6 +1625,40 @@ async def _diagnose_and_fix(
     # Build lookup dicts
     rca_by_group = dict(group_rcas)
     group_by_id = {g.group_id: g for g in triage.groups}
+
+    # 3b. Store verbose dispatch artifact
+    dispatch_record = {
+        "source": source,
+        "attempt_number": attempt_number,
+        "total_issues": len(verdict.concerns) + len(verdict.gaps),
+        "groups": [
+            {
+                "group_id": g.group_id,
+                "likely_root_cause": g.likely_root_cause,
+                "severity": g.severity,
+                "affected_files_hint": g.affected_files_hint,
+                "issue_count": len(g.issue_indices) + len(g.gap_indices),
+                "rca": {
+                    "hypothesis": rca_by_group[g.group_id].hypothesis,
+                    "evidence": rca_by_group[g.group_id].evidence,
+                    "affected_files": rca_by_group[g.group_id].affected_files,
+                    "proposed_approach": rca_by_group[g.group_id].proposed_approach,
+                    "confidence": rca_by_group[g.group_id].confidence,
+                } if g.group_id in rca_by_group else None,
+            }
+            for g in triage.groups
+        ],
+        "schedule": [
+            {"round": i, "group_ids": ids}
+            for i, ids in enumerate(schedule)
+        ],
+        "total_rounds": len(schedule),
+    }
+    await runner.artifacts.put(
+        f"bug-dispatch:{source}:attempt-{attempt_number}",
+        json.dumps(dispatch_record),
+        feature=feature,
+    )
 
     # 4. Fix dispatch: parallel within each round, sequential between rounds
     feature_root = _get_feature_root(runner, feature)

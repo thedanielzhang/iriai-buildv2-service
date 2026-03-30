@@ -78,6 +78,11 @@ class TrackedWorkflowRunner(DefaultWorkflowRunner):
                 )
                 self._workspaces[feature.workspace_id] = workspace_override
 
+        if isinstance(actor, AgentActor):
+            await self.feature_store.log_event(
+                feature.id, "agent_start", actor.name,
+            )
+
         try:
             # ── Secondary runtime routing ───────────────────────────
             if (

@@ -98,6 +98,37 @@ async def get_feature(feature_id: str):
         except (json.JSONDecodeError, KeyError):
             pass
 
+    # Workstreams
+    workstreams_list = []
+    if "dag:strategy" in artifacts:
+        try:
+            ws_data = json.loads(artifacts["dag:strategy"][0])
+            for ws in ws_data.get("workstreams", []):
+                total = 0
+                completed = 0
+                for slug in ws.get("subfeature_slugs", []):
+                    sf_key = f"dag:{slug}"
+                    if sf_key in artifacts:
+                        try:
+                            sf_dag = json.loads(artifacts[sf_key][0])
+                            sf_tasks = sf_dag.get("tasks", [])
+                            total += len(sf_tasks)
+                            for t in sf_tasks:
+                                if f"dag-task:{t['id']}" in artifacts:
+                                    completed += 1
+                        except (json.JSONDecodeError, KeyError):
+                            pass
+                workstreams_list.append({
+                    "id": ws.get("id", ""),
+                    "name": ws.get("name", ""),
+                    "subfeature_slugs": ws.get("subfeature_slugs", []),
+                    "depends_on": ws.get("depends_on", []),
+                    "total_tasks": total,
+                    "completed_tasks": completed,
+                })
+        except (json.JSONDecodeError, KeyError):
+            pass
+
     # Group statuses
     groups = []
     if dag_info:
@@ -207,6 +238,13 @@ async def get_feature(feature_id: str):
             "created_at": e["created_at"].isoformat(),
         })
 
+    # Active agent
+    active_agent = None
+    for e in events:
+        if e["event_type"] == "agent_start":
+            active_agent = e["source"]
+            break  # events ordered DESC by created_at
+
     return {
         "id": feat["id"],
         "name": feat["name"],
@@ -217,7 +255,9 @@ async def get_feature(feature_id: str):
         "groups": groups,
         "gates": gates,
         "timeline": timeline,
+        "workstreams": workstreams_list,
         "events": event_list,
+        "active_agent": active_agent,
     }
 
 
@@ -280,22 +320,14 @@ def _parse_timeline_entry(key: str, value: str, created_at) -> dict | None:
     if key.startswith("bug-dispatch:"):
         summary = ""
         try:
-            v = json.loads(value)
-            groups = v.get("groups", [])
-            summary = f"{len(groups)} bug groups dispatched"
+            json.loads(value)  # validate JSON
+            summary = value  # pass full JSON for expanded view
         except (json.JSONDecodeError, KeyError):
             summary = value if value else ""
         return {"key": key, "type": "dispatch", "passed": None, "summary": summary, "created_at": ts}
 
     if key == "bug-fix-attempts":
-        summary = ""
-        try:
-            # This is a text blob of multiple JSON objects
-            count = value.count('"bug_id"')
-            summary = f"{count} fix attempt(s) recorded"
-        except Exception:
-            summary = "fix attempts"
-        return {"key": key, "type": "fix-attempts", "passed": None, "summary": summary, "created_at": ts}
+        return {"key": key, "type": "fix-attempts", "passed": None, "summary": value or "", "created_at": ts}
 
     return None
 

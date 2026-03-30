@@ -20,14 +20,14 @@ export function WorkstreamView() {
 
   return (
     <>
-      <CurrentStatus />
-
       <div className="ws-header">
         <div className="ws-back" onClick={() => setView('overview')}>←</div>
         <div className="ws-title">{d.name}</div>
         <span className={`phase-badge ${phaseCls(d.phase)}`}>{d.phase}</span>
         <div className="ws-meta">{d.id} · {d.workflow_name} · {relTime(d.updated_at)}</div>
       </div>
+
+      <CurrentStatus />
 
       {d.workstreams?.length > 0 && (
         <Workstreams workstreams={d.workstreams} />
