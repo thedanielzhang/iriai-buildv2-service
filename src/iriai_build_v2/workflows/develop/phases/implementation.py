@@ -1182,9 +1182,9 @@ async def _implement_dag(
                 phase_name="implementation",
             )
             all_results.append(fix_result)
-            if isinstance(fix_result, ImplementationResult) and fix_result.task_id:
+            if isinstance(fix_result, ImplementationResult):
                 await runner.artifacts.put(
-                    f"dag-task:{fix_result.task_id}",
+                    f"dag-fix:g{group_idx}:retry-{retry}",
                     fix_result.model_dump_json(),
                     feature=feature,
                 )
