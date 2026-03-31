@@ -1389,19 +1389,10 @@ async def _implement_dag(
                     f"Apply this direction — it overrides any conflicting spec.\n"
                 )
 
-            # Determine the primary repo worktree for the fix agent
-            # Use the most common repo_path across this group's tasks
-            fix_ws_path = None
-            if feature_root:
-                repo_counts: dict[str, int] = {}
-                for t in group_tasks:
-                    if t.repo_path:
-                        repo_counts[t.repo_path] = repo_counts.get(t.repo_path, 0) + 1
-                if repo_counts:
-                    primary_repo = max(repo_counts, key=repo_counts.get)
-                    worktree = feature_root / primary_repo
-                    if worktree.exists():
-                        fix_ws_path = str(worktree)
+            # Give the fix agent access to ALL repos in the feature workspace.
+            # The fixer may need to fix issues across multiple repos (e.g.,
+            # iriai-compose + tools/compose/frontend + tools/compose/backend).
+            fix_ws_path = str(feature_root) if feature_root else None
             logger.info(
                 "DAG verify fix workspace: feature_root=%s, repo_counts=%s, "
                 "fix_ws_path=%s, tasks=%s",
