@@ -1252,6 +1252,65 @@ async def _implement_dag(
 
             feedback = _format_feedback("Verify", verdict)
 
+            # ── RCA before fix: check for contradictions/oscillation ──
+            workspace_hint = (
+                f"\n\n### Workspace\nFeature repos at: `{feature_root}`\n"
+                if feature_root else ""
+            )
+            prior_ctx = ""
+            if retry > 0:
+                prior_ctx = (
+                    f"\n\n## Prior Verify Attempt\n"
+                    f"This is retry {retry + 1}/{VERIFY_RETRIES}. "
+                    f"The previous fix attempt did not resolve the issue.\n"
+                )
+
+            rca_result: RootCauseAnalysis | None = None
+            try:
+                rca_result = await runner.run(
+                    Ask(
+                        actor=_make_parallel_actor(
+                            root_cause_analyst, f"dag-rca-g{group_idx}-r{retry}",
+                        ),
+                        prompt=(
+                            f"## DAG Verify Failed (group {group_idx}, attempt {retry + 1})\n\n"
+                            f"{feedback}\n\n"
+                            "Investigate the root cause. Check git history for "
+                            "oscillating changes. Check if the issue is a spec "
+                            "contradiction (task reference_material says X but "
+                            "a D-GR decision says Y)."
+                            f"{prior_ctx}{workspace_hint}"
+                        ),
+                        output_type=RootCauseAnalysis,
+                    ),
+                    feature,
+                    phase_name="implementation",
+                )
+            except Exception as rca_err:
+                logger.warning("DAG verify RCA failed: %s", rca_err)
+
+            # If RCA found a contradiction, escalate and use resolution
+            fix_direction = ""
+            if isinstance(rca_result, RootCauseAnalysis) and rca_result.confidence == "contradiction":
+                logger.warning(
+                    "DAG verify RCA detected contradiction in group %d: %s",
+                    group_idx, rca_result.contradiction_detail[:200],
+                )
+                resolution = await _escalate_contradiction(
+                    runner, feature, "implementation", "verify",
+                    BugGroup(
+                        group_id=f"dag-g{group_idx}-r{retry}",
+                        likely_root_cause=rca_result.hypothesis,
+                        severity="blocker",
+                    ),
+                    rca_result,
+                )
+                fix_direction = (
+                    f"\n\n## User Decision (from contradiction resolution)\n"
+                    f"{resolution}\n\n"
+                    f"Apply this direction — it overrides any conflicting spec.\n"
+                )
+
             # Determine the primary repo worktree for the fix agent
             # Use the most common repo_path across this group's tasks
             fix_ws_path = None
@@ -1266,6 +1325,14 @@ async def _implement_dag(
                     if worktree.exists():
                         fix_ws_path = str(worktree)
 
+            rca_guidance = ""
+            if isinstance(rca_result, RootCauseAnalysis) and rca_result.confidence != "contradiction":
+                rca_guidance = (
+                    f"\n\n## RCA Analysis\n"
+                    f"**Hypothesis:** {rca_result.hypothesis}\n"
+                    f"**Proposed approach:** {rca_result.proposed_approach}\n"
+                )
+
             fix_actor = _make_parallel_actor(
                 implementer, f"g{group_idx}-fix-{retry}",
                 runtime=impl_runtime,
@@ -1277,7 +1344,7 @@ async def _implement_dag(
                     prompt=(
                         f"Verification failed (attempt {retry + 1}/{VERIFY_RETRIES}). "
                         f"Read the issues below carefully, then fix them.\n\n"
-                        f"{feedback}\n\n"
+                        f"{feedback}{rca_guidance}{fix_direction}\n\n"
                         "## Instructions\n"
                         "1. Read each affected file listed above\n"
                         "2. Identify the root cause of each issue\n"
