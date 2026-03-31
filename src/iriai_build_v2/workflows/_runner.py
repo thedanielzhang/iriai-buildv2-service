@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextvars
 import logging
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
@@ -18,6 +19,12 @@ if TYPE_CHECKING:
     from ..storage.features import PostgresFeatureStore
 
 logger = logging.getLogger(__name__)
+
+# Per-coroutine workspace override. Each asyncio.Task gets its own copy,
+# so parallel tasks don't race on the shared _workspaces dict.
+_workspace_override_var: contextvars.ContextVar[Any] = contextvars.ContextVar(
+    "_workspace_override", default=None,
+)
 
 
 class TrackedWorkflowRunner(DefaultWorkflowRunner):
@@ -59,8 +66,9 @@ class TrackedWorkflowRunner(DefaultWorkflowRunner):
         # 1. Per-actor metadata "workspace_override" (most specific — e.g., repos/iriai-compose/)
         # 2. Phase-level "worktree_root" service (set once by implementation phase — repos/)
         # 3. Default runner workspace (main workspace — only for non-implementation phases)
-        workspace_override = None
-        original_workspace = None
+        #
+        # Uses a ContextVar so parallel coroutines each get their own
+        # workspace without racing on the shared _workspaces dict.
         ws_path = None
         if isinstance(actor, AgentActor):
             from iriai_compose import Workspace
@@ -72,12 +80,9 @@ class TrackedWorkflowRunner(DefaultWorkflowRunner):
                     ws_path = str(worktree_root)
 
             if ws_path:
-                original_workspace = self._workspaces.get(feature.workspace_id)
-                workspace_override = Workspace(
-                    id=feature.workspace_id,
-                    path=Path(ws_path),
+                _workspace_override_var.set(
+                    Workspace(id=feature.workspace_id, path=Path(ws_path))
                 )
-                self._workspaces[feature.workspace_id] = workspace_override
 
         # Inject workspace write boundary into the prompt so the agent
         # knows where to write even if Seatbelt sandbox isn't enforcing.
@@ -133,11 +138,15 @@ class TrackedWorkflowRunner(DefaultWorkflowRunner):
                 continuation=continuation,
             )
         finally:
-            # Restore original workspace
-            if original_workspace is not None:
-                self._workspaces[feature.workspace_id] = original_workspace
-            elif workspace_override is not None:
-                self._workspaces.pop(feature.workspace_id, None)
+            # Clear the per-coroutine workspace override
+            _workspace_override_var.set(None)
+
+    def get_workspace(self, workspace_id: str | None) -> Any:
+        """Return the per-coroutine workspace override if set, else default."""
+        override = _workspace_override_var.get(None)
+        if override is not None:
+            return override
+        return super().get_workspace(workspace_id)
 
     # ── Workflow execution with phase tracking ──────────────────────
 
