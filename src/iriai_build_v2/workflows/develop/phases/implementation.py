@@ -1375,13 +1375,23 @@ async def _implement_dag(
                 runtime=impl_runtime,
                 workspace_path=fix_ws_path,
             )
+            workspace_ctx = ""
+            if fix_ws_path:
+                workspace_ctx = (
+                    f"\n\n## Workspace\n"
+                    f"Your working directory is: `{fix_ws_path}`\n"
+                    f"All file reads and writes MUST use paths within this directory.\n"
+                    f"Do NOT use absolute paths from search results that point to "
+                    f"other copies of the same repo.\n"
+                )
+
             fix_result = await runner.run(
                 Ask(
                     actor=fix_actor,
                     prompt=(
                         f"Verification failed (attempt {retry + 1}/{VERIFY_RETRIES}). "
                         f"Read the issues below carefully, then fix them.\n\n"
-                        f"{feedback}{rca_guidance}{fix_direction}\n\n"
+                        f"{feedback}{rca_guidance}{fix_direction}{workspace_ctx}\n\n"
                         "## Instructions\n"
                         "1. Read each affected file listed above\n"
                         "2. Identify the root cause of each issue\n"
@@ -1962,6 +1972,13 @@ async def _diagnose_and_fix(
         for gid in round_ids:
             rca = rca_by_group[gid]
             ws_path = _resolve_fix_workspace(feature_root, rca.affected_files)
+            ws_ctx = (
+                f"\n\n## Workspace\n"
+                f"Your working directory is: `{ws_path}`\n"
+                f"All file reads and writes MUST use paths within this directory.\n"
+                f"Do NOT use absolute paths from search results that point to "
+                f"other copies of the same repo.\n"
+            ) if ws_path else ""
             fix_tasks.append(Ask(
                 actor=_make_parallel_actor(
                     fixer, f"fix-{gid}",
@@ -1977,6 +1994,7 @@ async def _diagnose_and_fix(
                     + "\n".join(f"- `{f}`" for f in rca.affected_files)
                     + f"\n\n**Proposed Approach:** {rca.proposed_approach}\n\n"
                     f"### Issues\n{_extract_group_issues(verdict, group_by_id[gid])}\n\n"
+                    f"{ws_ctx}\n"
                     "## Instructions\n"
                     "1. Read each affected file listed above\n"
                     "2. Apply the fix described in the RCA — be precise\n"
@@ -2135,6 +2153,13 @@ async def _single_rca_fix_verify(
     # 2. Fix via implementer (with workspace_path for correct cwd)
     feature_root = _get_feature_root(runner, feature)
     ws_path = _resolve_fix_workspace(feature_root, rca.affected_files)
+    ws_ctx = (
+        f"\n\n## Workspace\n"
+        f"Your working directory is: `{ws_path}`\n"
+        f"All file reads and writes MUST use paths within this directory.\n"
+        f"Do NOT use absolute paths from search results that point to "
+        f"other copies of the same repo.\n"
+    ) if ws_path else ""
 
     fix_actor = _make_parallel_actor(
         fixer, f"fix-{bug_id}",
@@ -2153,6 +2178,7 @@ async def _single_rca_fix_verify(
                 + "\n".join(f"- `{f}`" for f in rca.affected_files)
                 + f"\n\n**Proposed Approach:** {rca.proposed_approach}\n\n"
                 f"### Original Verdict\n\n{verdict_text}\n\n"
+                f"{ws_ctx}\n"
                 "## Instructions\n"
                 "1. Read each affected file listed above\n"
                 "2. Apply the fix described in the RCA — be precise\n"
