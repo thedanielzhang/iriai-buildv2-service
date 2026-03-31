@@ -441,6 +441,50 @@ class ImplementationPhase(Phase):
                 except Exception:
                     pass
 
+            # Append resolved contradiction decisions so all gates
+            # respect user overrides (e.g., "use Nixpacks, not Dockerfile").
+            contradiction_keys = []
+            for f_record in (await _load_ledger(runner, feature)).findings:
+                if f_record.status == "contradiction":
+                    contradiction_keys.append(f_record.id)
+            # Also scan artifacts directly for contradiction resolutions
+            ledger = await _load_ledger(runner, feature)
+            contradiction_artifacts = []
+            for key_prefix in ("contradiction:verify:", "contradiction:regression:"):
+                for suffix in [
+                    f"dag-g{g}-r{r}" for g in range(10) for r in range(5)
+                ]:
+                    raw = await runner.artifacts.get(
+                        f"{key_prefix}{suffix}", feature=feature,
+                    )
+                    if raw:
+                        contradiction_artifacts.append(raw)
+            if contradiction_artifacts:
+                decisions_parts = []
+                for raw in contradiction_artifacts:
+                    try:
+                        import json as _json
+                        data = _json.loads(raw) if isinstance(raw, str) else raw
+                        reqs = (
+                            data.get("revision_plan", {}).get("requests", [])
+                            if isinstance(data, dict) else []
+                        )
+                        for req in reqs:
+                            desc = req.get("description", "")
+                            if desc:
+                                decisions_parts.append(f"- {desc}")
+                    except Exception:
+                        pass
+                if decisions_parts:
+                    handover_context += (
+                        f"\n\n## User Contradiction Decisions (AUTHORITATIVE)\n"
+                        f"The user resolved the following spec contradictions. "
+                        f"These decisions override any conflicting task spec or "
+                        f"reference material. Do NOT revert these.\n\n"
+                        + "\n".join(decisions_parts)
+                        + "\n"
+                    )
+
             # ── Adversarial runtime routing for post-DAG gates ──────────
             # The last implementation group used impl_runtime based on its
             # index parity.  Post-DAG gates (review, security, QA,
@@ -1606,6 +1650,27 @@ async def _verify(
                 )
         except Exception:
             pass
+
+    # Load user contradiction decisions
+    user_decisions = ""
+    for suffix in [f"dag-g{g}-r{r}" for g in range(10) for r in range(5)]:
+        for prefix in ("contradiction:verify:", "contradiction:regression:"):
+            raw = await runner.artifacts.get(f"{prefix}{suffix}", feature=feature)
+            if raw:
+                try:
+                    import json as _json
+                    data = _json.loads(raw) if isinstance(raw, str) else raw
+                    reqs = data.get("revision_plan", {}).get("requests", []) if isinstance(data, dict) else []
+                    parts = [r.get("description", "") for r in reqs if r.get("description")]
+                    if parts:
+                        user_decisions += "\n".join(f"- {p}" for p in parts) + "\n"
+                except Exception:
+                    pass
+    if user_decisions:
+        known_issues += (
+            f"\n\n## User Contradiction Decisions (AUTHORITATIVE)\n"
+            f"These decisions override any conflicting spec.\n\n{user_decisions}"
+        )
 
     verifier = _make_parallel_actor(qa_engineer, "verify", runtime=runtime)
 
