@@ -13,18 +13,27 @@ from iriai_compose.actors import Role
 from ....config import BUDGET_TIERS
 from ....models.outputs import (
     BugFixAttempt,
+    BugGroup,
     BugTriage,
+    EnhancementBacklog,
+    EnhancementItem,
+    Envelope,
+    FindingLedger,
+    FindingRecord,
     HandoverDoc,
     ImplementationDAG,
     ImplementationResult,
     ImplementationTask,
+    ReviewOutcome,
     RootCauseAnalysis,
     Verdict,
+    envelope_done,
 )
 from ....models.state import BuildState
 from ....roles import (
     implementer,
     integration_tester,
+    lead_architect_gate_reviewer,
     qa_engineer,
     regression_tester,
     reviewer,
@@ -35,12 +44,14 @@ from ....roles import (
     verifier,
 )
 from ....services.markdown import to_markdown
+from ..._common._tasks import HostedInterview
 
 logger = logging.getLogger(__name__)
 
 VERIFY_RETRIES = 2
 WARN_AFTER_CYCLES = 3
 MAX_FIX_ATTEMPTS = 7
+BLOCKING_SEVERITIES = frozenset({"blocker", "major"})
 
 # ── Inline triage role (lightweight, no tools) ───────────────────────────────
 
@@ -446,10 +457,22 @@ class ImplementationPhase(Phase):
                 await runner.artifacts.put(
                     "review-verdict", to_str(review_verdict), feature=feature
                 )
-                if _is_approved(review_verdict):
-                    await runner.artifacts.put(
-                        "dag-gate:code-review", "approved", feature=feature
-                    )
+
+            # Ledger dedup + severity partition
+            if isinstance(review_verdict, Verdict):
+                ledger = await _load_ledger(runner, feature)
+                review_verdict, _suppressed = _dedup_findings(review_verdict, ledger, "code_reviewer")
+                if _suppressed:
+                    logger.info("Suppressed %d duplicate findings from code_reviewer", len(_suppressed))
+                review_verdict, _enhancements = _partition_verdict(review_verdict, "code_reviewer", "post-dag-gate")
+                await _append_enhancements(runner, feature, _enhancements)
+                ledger = _update_ledger(ledger, review_verdict, "code_reviewer", cycle)
+                await _save_ledger(runner, feature, ledger)
+
+            if _is_approved(review_verdict):
+                await runner.artifacts.put(
+                    "dag-gate:code-review", "approved", feature=feature
+                )
 
             if not _is_approved(review_verdict):
                 attempts = await _diagnose_and_fix(
@@ -495,10 +518,21 @@ class ImplementationPhase(Phase):
                 await runner.artifacts.put(
                     "security-verdict", to_str(security_verdict), feature=feature
                 )
-                if _is_approved(security_verdict):
-                    await runner.artifacts.put(
-                        "dag-gate:security", "approved", feature=feature
-                    )
+
+            if isinstance(security_verdict, Verdict):
+                ledger = await _load_ledger(runner, feature)
+                security_verdict, _suppressed = _dedup_findings(security_verdict, ledger, "security_auditor")
+                if _suppressed:
+                    logger.info("Suppressed %d duplicate findings from security_auditor", len(_suppressed))
+                security_verdict, _enhancements = _partition_verdict(security_verdict, "security_auditor", "post-dag-gate")
+                await _append_enhancements(runner, feature, _enhancements)
+                ledger = _update_ledger(ledger, security_verdict, "security_auditor", cycle)
+                await _save_ledger(runner, feature, ledger)
+
+            if _is_approved(security_verdict):
+                await runner.artifacts.put(
+                    "dag-gate:security", "approved", feature=feature
+                )
 
             if not _is_approved(security_verdict):
                 attempts = await _diagnose_and_fix(
@@ -580,8 +614,19 @@ class ImplementationPhase(Phase):
                     phase_name=self.name,
                 )
                 await runner.artifacts.put("qa-verdict", to_str(qa_verdict), feature=feature)
-                if _is_approved(qa_verdict):
-                    await runner.artifacts.put("dag-gate:qa", "approved", feature=feature)
+
+            if isinstance(qa_verdict, Verdict):
+                ledger = await _load_ledger(runner, feature)
+                qa_verdict, _suppressed = _dedup_findings(qa_verdict, ledger, "qa_engineer")
+                if _suppressed:
+                    logger.info("Suppressed %d duplicate findings from qa_engineer", len(_suppressed))
+                qa_verdict, _enhancements = _partition_verdict(qa_verdict, "qa_engineer", "post-dag-gate")
+                await _append_enhancements(runner, feature, _enhancements)
+                ledger = _update_ledger(ledger, qa_verdict, "qa_engineer", cycle)
+                await _save_ledger(runner, feature, ledger)
+
+            if _is_approved(qa_verdict):
+                await runner.artifacts.put("dag-gate:qa", "approved", feature=feature)
 
             if not _is_approved(qa_verdict):
                 attempts = await _diagnose_and_fix(
@@ -628,10 +673,21 @@ class ImplementationPhase(Phase):
                 await runner.artifacts.put(
                     "integration-verdict", to_str(integration_verdict), feature=feature
                 )
-                if _is_approved(integration_verdict):
-                    await runner.artifacts.put(
-                        "dag-gate:integration", "approved", feature=feature
-                    )
+
+            if isinstance(integration_verdict, Verdict):
+                ledger = await _load_ledger(runner, feature)
+                integration_verdict, _suppressed = _dedup_findings(integration_verdict, ledger, "integration_tester")
+                if _suppressed:
+                    logger.info("Suppressed %d duplicate findings from integration_tester", len(_suppressed))
+                integration_verdict, _enhancements = _partition_verdict(integration_verdict, "integration_tester", "post-dag-gate")
+                await _append_enhancements(runner, feature, _enhancements)
+                ledger = _update_ledger(ledger, integration_verdict, "integration_tester", cycle)
+                await _save_ledger(runner, feature, ledger)
+
+            if _is_approved(integration_verdict):
+                await runner.artifacts.put(
+                    "dag-gate:integration", "approved", feature=feature
+                )
 
             if not _is_approved(integration_verdict):
                 attempts = await _diagnose_and_fix(
@@ -688,10 +744,21 @@ class ImplementationPhase(Phase):
                 await runner.artifacts.put(
                     "verifier-verdict", to_str(verifier_verdict), feature=feature
                 )
-                if _is_approved(verifier_verdict):
-                    await runner.artifacts.put(
-                        "dag-gate:verifier", "approved", feature=feature
-                    )
+
+            if isinstance(verifier_verdict, Verdict):
+                ledger = await _load_ledger(runner, feature)
+                verifier_verdict, _suppressed = _dedup_findings(verifier_verdict, ledger, "verifier")
+                if _suppressed:
+                    logger.info("Suppressed %d duplicate findings from verifier", len(_suppressed))
+                verifier_verdict, _enhancements = _partition_verdict(verifier_verdict, "verifier", "post-dag-gate")
+                await _append_enhancements(runner, feature, _enhancements)
+                ledger = _update_ledger(ledger, verifier_verdict, "verifier", cycle)
+                await _save_ledger(runner, feature, ledger)
+
+            if _is_approved(verifier_verdict):
+                await runner.artifacts.put(
+                    "dag-gate:verifier", "approved", feature=feature
+                )
 
             if not _is_approved(verifier_verdict):
                 attempts = await _diagnose_and_fix(
@@ -769,6 +836,30 @@ class ImplementationPhase(Phase):
                 "implementation-report", report_html, feature=feature
             )
 
+            # Host enhancement backlog as separate artifact
+            backlog_url = ""
+            backlog_json = await runner.artifacts.get(
+                "enhancement-backlog", feature=feature,
+            )
+            if backlog_json:
+                try:
+                    backlog = EnhancementBacklog.model_validate_json(backlog_json)
+                except Exception:
+                    backlog = EnhancementBacklog()
+                if backlog.items:
+                    backlog_html = _render_enhancement_backlog_html(
+                        backlog, feature.name,
+                    )
+                    if hosting:
+                        backlog_url = await hosting.push_qa(
+                            feature.id, "enhancement-backlog",
+                            backlog_html, "Enhancement Backlog",
+                        )
+                    await runner.artifacts.put(
+                        "enhancement-backlog-report", backlog_html,
+                        feature=feature,
+                    )
+
             # Notify user via Slack with report link
             notification = "All quality gates passed. Implementation complete."
             if report_url:
@@ -777,6 +868,11 @@ class ImplementationPhase(Phase):
                     f"**[View Implementation Report]({report_url})**\n\n"
                     f"The report contains journey evidence, gate verdicts, "
                     f"bug fix history, and artifact references."
+                )
+            if backlog_url:
+                notification += (
+                    f"\n\n**[View Enhancement Backlog]({backlog_url})** "
+                    f"({len(backlog.items)} items deferred)"
                 )
             await runner.run(
                 Respond(
@@ -1139,6 +1235,17 @@ async def _implement_dag(
             feature=feature,
         )
 
+        # Ledger dedup + severity partition for initial verify
+        if isinstance(verdict, Verdict):
+            ledger = await _load_ledger(runner, feature)
+            verdict, _suppressed = _dedup_findings(verdict, ledger, "verify")
+            if _suppressed:
+                logger.info("Suppressed %d duplicate findings from verify (group %d)", len(_suppressed), group_idx)
+            verdict, _enhancements = _partition_verdict(verdict, "verify", f"group-{group_idx}")
+            await _append_enhancements(runner, feature, _enhancements)
+            ledger = _update_ledger(ledger, verdict, "verify", 0)
+            await _save_ledger(runner, feature, ledger)
+
         for retry in range(VERIFY_RETRIES):
             if _is_approved(verdict):
                 break
@@ -1203,6 +1310,17 @@ async def _implement_dag(
                 to_str(verdict),
                 feature=feature,
             )
+
+            # Ledger dedup + severity partition for re-verify
+            if isinstance(verdict, Verdict):
+                ledger = await _load_ledger(runner, feature)
+                verdict, _suppressed = _dedup_findings(verdict, ledger, "verify")
+                if _suppressed:
+                    logger.info("Suppressed %d duplicate findings from verify retry (group %d)", len(_suppressed), group_idx)
+                verdict, _enhancements = _partition_verdict(verdict, "verify", f"group-{group_idx}-retry-{retry}")
+                await _append_enhancements(runner, feature, _enhancements)
+                ledger = _update_ledger(ledger, verdict, "verify", 0)
+                await _save_ledger(runner, feature, ledger)
 
         # ── Record outcomes + checkpoint ─────────────────────────────
         if _is_approved(verdict):
@@ -1269,11 +1387,10 @@ async def _commit_repos(
 
     Returns a comma-separated list of commit hashes (one per repo).
     """
-    workspace = runner.get_workspace(feature.workspace_id)
-    if not workspace or not workspace.path:
+    repos_root = _get_feature_root(runner, feature)
+    if not repos_root:
+        logger.warning("_commit_repos: no feature workspace found — skipping")
         return ""
-
-    repos_root = workspace.path  # .iriai/features/{slug}/repos/
 
     hashes: list[str] = []
 
@@ -1289,7 +1406,7 @@ async def _commit_repos(
             if not stdout.decode().strip():
                 return None  # No changes
 
-            await _run_git(repo_path, "add", "-A")
+            await _run_git(repo_path, "add", "--all", ".")
             await _run_git(repo_path, "commit", "-m", msg)
             commit_hash = await _run_git(repo_path, "rev-parse", "HEAD")
             logger.info("Committed in %s: %s", repo_path.name, commit_hash[:8])
@@ -1507,6 +1624,13 @@ async def _diagnose_and_fix(
     prior_context = _format_prior_attempts(prior_attempts)
     attempt_number = sum(1 for a in prior_attempts if a.source_verdict == source) + 1
 
+    # Resolve workspace path for RCA git access
+    feature_root = _get_feature_root(runner, feature)
+    workspace_hint = (
+        f"\n\n### Workspace\nFeature repos at: `{feature_root}`\n"
+        if feature_root else ""
+    )
+
     # ── Short-circuit: string verdict or ≤1 issue ────────────────────
     use_single_path = True
     if isinstance(verdict, Verdict):
@@ -1581,7 +1705,7 @@ async def _diagnose_and_fix(
                 "relevant code, trace the data flow, and identify the exact "
                 "point of failure. Propose a conceptual fix approach — do NOT "
                 "implement anything."
-                f"{prior_context}"
+                f"{prior_context}{workspace_hint}"
             ),
             output_type=RootCauseAnalysis,
         )
@@ -1615,6 +1739,52 @@ async def _diagnose_and_fix(
         )
         return [attempt]
 
+    # Build lookup dicts early (needed for contradiction handling)
+    group_by_id = {g.group_id: g for g in triage.groups}
+
+    # ── Contradiction handling ──────────────────────────────────────
+    contradiction_groups = [
+        (gid, rca) for gid, rca in group_rcas
+        if rca.confidence == "contradiction"
+    ]
+    fixable_groups = [
+        (gid, rca) for gid, rca in group_rcas
+        if rca.confidence != "contradiction"
+    ]
+
+    contradiction_results: list[BugFixAttempt] = []
+    if contradiction_groups:
+        logger.warning(
+            "%d of %d bug groups are spec contradictions — escalating",
+            len(contradiction_groups), len(group_rcas),
+        )
+        for gid, rca in contradiction_groups:
+            group = group_by_id[gid]
+            resolution = await _escalate_contradiction(
+                runner, feature, "implementation", source, group, rca,
+            )
+            # User resolved it — add to fixable with their direction
+            resolved_rca = rca.model_copy(update={
+                "proposed_approach": resolution,
+                "confidence": "high",
+            })
+            fixable_groups.append((gid, resolved_rca))
+            contradiction_results.append(BugFixAttempt(
+                bug_id=f"{source.upper()}-CONTRADICTION-{gid}",
+                group_id=gid,
+                source_verdict=source,
+                description=rca.hypothesis,
+                root_cause=rca.contradiction_detail or rca.hypothesis,
+                fix_applied=f"User decision: {resolution[:200]}",
+                re_verify_result="RESOLVED",
+                attempt_number=attempt_number,
+            ))
+
+    if not fixable_groups:
+        return contradiction_results
+
+    group_rcas = fixable_groups
+
     # 3. File-overlap scheduling
     schedule = _compute_fix_schedule(group_rcas)
     logger.info(
@@ -1624,7 +1794,6 @@ async def _diagnose_and_fix(
 
     # Build lookup dicts
     rca_by_group = dict(group_rcas)
-    group_by_id = {g.group_id: g for g in triage.groups}
 
     # 3b. Store verbose dispatch artifact
     dispatch_record = {
@@ -1799,7 +1968,7 @@ async def _diagnose_and_fix(
             attempt_number=attempt_number,
         ))
 
-    return attempts
+    return contradiction_results + attempts
 
 
 async def _single_rca_fix_verify(
@@ -1978,6 +2147,57 @@ async def _escalate_to_user(
     )
 
 
+async def _escalate_contradiction(
+    runner: WorkflowRunner,
+    feature: Feature,
+    phase_name: str,
+    source: str,
+    group: BugGroup,
+    rca: RootCauseAnalysis,
+) -> str:
+    """Interview the user about a spec contradiction. Blocks until resolved."""
+    result = await runner.run(
+        HostedInterview(
+            questioner=lead_architect_gate_reviewer,
+            responder=user,
+            initial_prompt=(
+                f"## Specification Contradiction Detected\n\n"
+                f"**Source:** {source} verification\n"
+                f"**Bug Group:** {group.group_id} — {group.likely_root_cause}\n\n"
+                f"### The Contradiction\n{rca.contradiction_detail}\n\n"
+                f"### Evidence\n"
+                + "\n".join(f"- {e}" for e in rca.evidence)
+                + "\n\n"
+                f"### Best-Guess Resolution\n{rca.proposed_approach}\n"
+                f"*(Based on D-GR-1: most recent authoritative source)*\n\n"
+                f"Please confirm the best-guess direction, override with the "
+                f"other source, or provide a new decision."
+            ),
+            output_type=Envelope[ReviewOutcome],
+            done=envelope_done,
+            artifact_key=f"contradiction:{source}:{group.group_id}",
+            artifact_label=f"Contradiction — {group.group_id}",
+        ),
+        feature,
+        phase_name=phase_name,
+    )
+    if result and result.output:
+        outcome = result.output
+        if outcome.approved:
+            return rca.proposed_approach  # user confirmed best-guess
+        # User overrode — extract direction from revision_plan
+        if outcome.revision_plan and outcome.revision_plan.requests:
+            return outcome.revision_plan.requests[0].description
+        return rca.proposed_approach  # fallback
+    # Also check the written artifact for the user's response
+    discussion = await runner.artifacts.get(
+        f"contradiction:{source}:{group.group_id}", feature=feature,
+    )
+    if discussion:
+        return discussion[:500]  # use the discussion text as direction
+    return rca.proposed_approach
+
+
 async def _store_attempts(
     runner: WorkflowRunner,
     feature: Feature,
@@ -2070,7 +2290,276 @@ def _collect_files(results: list[object]) -> list[str]:
 
 
 def _is_approved(verdict: object) -> bool:
-    return isinstance(verdict, Verdict) and verdict.approved
+    """Approve if no blocker/major findings exist, regardless of agent opinion."""
+    if not isinstance(verdict, Verdict):
+        return False
+    for c in verdict.concerns:
+        if c.severity in BLOCKING_SEVERITIES:
+            return False
+    for g in verdict.gaps:
+        if g.severity in BLOCKING_SEVERITIES:
+            return False
+    for ch in verdict.checks:
+        if ch.result == "FAIL":
+            return False
+    return True
+
+
+# ── Finding ledger ──────────────────────────────────────────────────────────
+
+
+async def _load_ledger(
+    runner: WorkflowRunner, feature: Feature,
+) -> FindingLedger:
+    """Load the finding ledger from the artifact store."""
+    raw = await runner.artifacts.get("finding-ledger", feature=feature)
+    if raw:
+        try:
+            return FindingLedger.model_validate_json(raw)
+        except Exception:
+            logger.warning("Failed to parse finding ledger — starting fresh")
+    return FindingLedger()
+
+
+async def _save_ledger(
+    runner: WorkflowRunner, feature: Feature, ledger: FindingLedger,
+) -> None:
+    """Save the finding ledger to the artifact store."""
+    await runner.artifacts.put(
+        "finding-ledger", ledger.model_dump_json(), feature=feature,
+    )
+
+
+def _text_overlap(a: str, b: str) -> float:
+    """Word-level Jaccard similarity between two strings."""
+    words_a = set(a.lower().split())
+    words_b = set(b.lower().split())
+    if not words_a or not words_b:
+        return 0.0
+    return len(words_a & words_b) / len(words_a | words_b)
+
+
+def _dedup_findings(
+    verdict: Verdict, ledger: FindingLedger, source: str,
+) -> tuple[Verdict, list[FindingRecord]]:
+    """Remove findings that match resolved ledger entries (unchanged files).
+
+    Returns (filtered_verdict, list_of_suppressed_records).
+    """
+    resolved = [
+        f for f in ledger.findings
+        if f.status == "resolved" and f.source == source
+    ]
+    if not resolved:
+        return verdict, []
+
+    new_concerns = []
+    suppressed: list[FindingRecord] = []
+    for c in verdict.concerns:
+        is_dup = False
+        for r in resolved:
+            if _text_overlap(c.description, r.description) > 0.5:
+                # Same finding — only suppress if the file hasn't changed
+                if c.file and c.file == r.file:
+                    is_dup = True
+                    suppressed.append(r)
+                    break
+        if not is_dup:
+            new_concerns.append(c)
+
+    new_gaps = []
+    for g in verdict.gaps:
+        is_dup = False
+        for r in resolved:
+            if _text_overlap(g.description, r.description) > 0.5:
+                is_dup = True
+                suppressed.append(r)
+                break
+        if not is_dup:
+            new_gaps.append(g)
+
+    filtered = verdict.model_copy(update={
+        "concerns": new_concerns,
+        "gaps": new_gaps,
+    })
+    return filtered, suppressed
+
+
+def _update_ledger(
+    ledger: FindingLedger, verdict: Verdict, source: str, cycle: int,
+) -> FindingLedger:
+    """Add new findings from a verdict, mark resolved ones.
+
+    Findings from the same source that appeared in prior cycles but are
+    absent from the current verdict are marked ``resolved``.
+    """
+    # Collect current verdict descriptions for comparison
+    current_descs = {c.description for c in verdict.concerns}
+    current_descs |= {g.description for g in verdict.gaps}
+
+    # Mark previously-open findings from this source as resolved
+    # if they no longer appear in the current verdict
+    for f in ledger.findings:
+        if f.source == source and f.status == "open":
+            if not any(
+                _text_overlap(f.description, d) > 0.5 for d in current_descs
+            ):
+                f.status = "resolved"
+                f.cycle_resolved = cycle
+
+    existing_descs = {f.description for f in ledger.findings}
+    next_id = len(ledger.findings) + 1
+
+    # Add new findings
+    for c in verdict.concerns:
+        if c.description not in existing_descs:
+            ledger.findings.append(FindingRecord(
+                id=f"F-{next_id:03d}",
+                source=source,
+                description=c.description,
+                file=c.file,
+                line=c.line,
+                severity=c.severity,
+                status="open",
+                cycle_introduced=cycle,
+            ))
+            next_id += 1
+
+    for g in verdict.gaps:
+        if g.description not in existing_descs:
+            ledger.findings.append(FindingRecord(
+                id=f"F-{next_id:03d}",
+                source=source,
+                description=g.description,
+                severity=g.severity,
+                category=g.category,
+                status="open",
+                cycle_introduced=cycle,
+            ))
+            next_id += 1
+
+    ledger.cycle = cycle
+    return ledger
+
+
+# ── Enhancement backlog ─────────────────────────────────────────────────────
+
+
+def _partition_verdict(
+    verdict: Verdict, source: str, task_context: str = "",
+) -> tuple[Verdict, list[EnhancementItem]]:
+    """Split a verdict into blocking-only and non-blocking enhancement items."""
+    blocking_concerns = [
+        c for c in verdict.concerns if c.severity in BLOCKING_SEVERITIES
+    ]
+    non_blocking_concerns = [
+        c for c in verdict.concerns if c.severity not in BLOCKING_SEVERITIES
+    ]
+    blocking_gaps = [
+        g for g in verdict.gaps if g.severity in BLOCKING_SEVERITIES
+    ]
+    non_blocking_gaps = [
+        g for g in verdict.gaps if g.severity not in BLOCKING_SEVERITIES
+    ]
+
+    blocking_verdict = verdict.model_copy(update={
+        "concerns": blocking_concerns,
+        "gaps": blocking_gaps,
+    })
+
+    enhancements: list[EnhancementItem] = []
+    for c in non_blocking_concerns:
+        enhancements.append(EnhancementItem(
+            source=source, severity=c.severity,
+            description=c.description, file=c.file, line=c.line,
+            task_context=task_context,
+        ))
+    for g in non_blocking_gaps:
+        enhancements.append(EnhancementItem(
+            source=source, severity=g.severity,
+            description=g.description, category=g.category,
+            task_context=task_context,
+        ))
+    for s in verdict.suggestions:
+        enhancements.append(EnhancementItem(
+            source=source, severity="nit",
+            description=s, task_context=task_context,
+        ))
+
+    return blocking_verdict, enhancements
+
+
+async def _append_enhancements(
+    runner: WorkflowRunner, feature: Feature,
+    items: list[EnhancementItem],
+) -> None:
+    """Append non-blocking findings to the feature's enhancement backlog."""
+    if not items:
+        return
+    raw = await runner.artifacts.get("enhancement-backlog", feature=feature)
+    if raw:
+        try:
+            backlog = EnhancementBacklog.model_validate_json(raw)
+        except Exception:
+            backlog = EnhancementBacklog()
+    else:
+        backlog = EnhancementBacklog()
+
+    backlog.items.extend(items)
+    await runner.artifacts.put(
+        "enhancement-backlog", backlog.model_dump_json(), feature=feature,
+    )
+    logger.info(
+        "Enhancement backlog: +%d items (total: %d)",
+        len(items), len(backlog.items),
+    )
+
+
+def _render_enhancement_backlog_html(
+    backlog: EnhancementBacklog, feature_name: str,
+) -> str:
+    """Render the enhancement backlog as a standalone HTML page."""
+    from html import escape
+
+    # Group by source
+    by_source: dict[str, list[EnhancementItem]] = {}
+    for item in backlog.items:
+        by_source.setdefault(item.source, []).append(item)
+
+    rows = []
+    for source, items in sorted(by_source.items()):
+        for item in items:
+            sev_class = "minor" if item.severity == "minor" else "nit"
+            file_ref = f"<code>{escape(item.file)}</code>" if item.file else ""
+            rows.append(
+                f"<tr>"
+                f"<td>{escape(source)}</td>"
+                f'<td><span class="sev-{sev_class}">{escape(item.severity)}</span></td>'
+                f"<td>{escape(item.description)}</td>"
+                f"<td>{file_ref}</td>"
+                f"</tr>"
+            )
+
+    return f"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<title>Enhancement Backlog — {escape(feature_name)}</title>
+<style>
+body {{ font-family: -apple-system, BlinkMacSystemFont, sans-serif; margin: 2rem; color: #1a1a2e; }}
+h1 {{ font-size: 1.5rem; }}
+table {{ border-collapse: collapse; width: 100%; margin-top: 1rem; }}
+th, td {{ border: 1px solid #ddd; padding: 8px; text-align: left; font-size: 0.875rem; }}
+th {{ background: #f5f5f5; }}
+.sev-minor {{ background: #fef3c7; color: #92400e; padding: 2px 6px; border-radius: 3px; font-size: 0.75rem; }}
+.sev-nit {{ background: #e0e7ff; color: #3730a3; padding: 2px 6px; border-radius: 3px; font-size: 0.75rem; }}
+code {{ background: #f3f4f6; padding: 1px 4px; border-radius: 2px; font-size: 0.8rem; }}
+</style></head><body>
+<h1>Enhancement Backlog — {escape(feature_name)}</h1>
+<p>{len(backlog.items)} non-blocking findings deferred from implementation verification.</p>
+<table>
+<thead><tr><th>Source</th><th>Severity</th><th>Description</th><th>File</th></tr></thead>
+<tbody>{"".join(rows)}</tbody>
+</table>
+</body></html>"""
 
 
 def _format_feedback(source: str, verdict: object) -> str:

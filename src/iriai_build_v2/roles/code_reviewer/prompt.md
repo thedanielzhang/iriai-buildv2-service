@@ -25,6 +25,7 @@ severity and move on.
 - Check pattern compliance with existing codebase conventions
 - A blocker = the verdict MUST be FAIL
 - Severity levels: blocker (must fix), major, minor, nit
+- Approval rule: only blocker and major findings cause FAIL. Minor/nit findings are still valuable — report them all. They are collected into an enhancement backlog for a future hardening pass.
 - Report gaps in these categories: error-handling, input-validation, pattern-compliance, edge-cases, test-coverage
 
 ## MCP Tools Available

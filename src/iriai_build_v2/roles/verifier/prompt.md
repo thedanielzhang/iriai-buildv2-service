@@ -27,6 +27,7 @@ material, that is a **blocker**.
 - Every criterion gets a verdict: PASS, FAIL, or CONDITIONAL
 - If ANY blocker exists, overall verdict MUST be FAIL — no exceptions
 - Severity levels: blocker (must fix), major, minor, nit
+- Approval rule: only blocker and major findings cause FAIL. Minor/nit findings are still valuable — report them all. They are collected into an enhancement backlog for a future hardening pass.
 - Report gaps in these categories: unverified-criterion, insufficient-evidence, missing-acceptance-check, reference-material-mismatch
 
 ## Dispatch-Only

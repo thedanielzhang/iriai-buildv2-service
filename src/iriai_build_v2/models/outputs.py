@@ -828,6 +828,53 @@ class BugFixResult(BaseModel):
     notes: str = ""
 
 
+# ── Finding ledger ──────────────────────────────────────────────────────────
+
+
+class FindingRecord(BaseModel):
+    """A single finding tracked across fix cycles."""
+
+    id: str  # e.g., "F-001"
+    source: str  # gate that found it: "code_reviewer", "verifier", etc.
+    description: str
+    file: str = ""
+    line: int = 0
+    severity: str = ""  # blocker | major | minor | nit
+    category: str = ""  # gap category if from Gap
+    status: str = "open"  # open | fix_attempted | resolved | contradiction | wont_fix
+    cycle_introduced: int = 0
+    cycle_resolved: int = 0
+    fix_attempts: list[str] = Field(default_factory=list)
+
+
+class FindingLedger(BaseModel):
+    """Accumulated findings across all fix cycles for a feature."""
+
+    findings: list[FindingRecord] = Field(default_factory=list)
+    cycle: int = 0
+
+
+# ── Enhancement backlog ─────────────────────────────────────────────────────
+
+
+class EnhancementItem(BaseModel):
+    """A non-blocking finding deferred to a future hardening pass."""
+
+    source: str  # "verify", "code_reviewer", "security_auditor", etc.
+    severity: str  # minor | nit
+    description: str
+    file: str = ""
+    line: int = 0
+    category: str = ""  # gap category if from Gap
+    task_context: str = ""
+
+
+class EnhancementBacklog(BaseModel):
+    """Accumulated non-blocking findings across all tasks for a feature."""
+
+    items: list[EnhancementItem] = Field(default_factory=list)
+
+
 # ── Handover document ────────────────────────────────────────────────────────
 
 
@@ -955,8 +1002,10 @@ class RootCauseAnalysis(BaseModel):
     evidence: list[str] = Field(default_factory=list)
     affected_files: list[str] = Field(default_factory=list)
     proposed_approach: str  # conceptual fix strategy, not code
-    confidence: str  # high | medium | low
+    confidence: str  # high | medium | low | contradiction
     alternative_hypotheses: list[str] = Field(default_factory=list)
+    contradiction_detail: str = ""  # both sides cited when confidence="contradiction"
+    prior_attempt_analysis: str = ""  # what was tried before and why it failed
 
 
 class FeatureLeadVerdict(BaseModel):

@@ -71,6 +71,7 @@ Every bug found gets its own Issue entry with severity. Minor bugs count — nit
 - Check ALL `NOT` conditions in journeys — a violated NOT is an automatic FAIL
 - Every verify block (browser, api, database) must produce evidence
 - Severity levels: blocker (must fix), major, minor, nit
+- Approval rule: only blocker and major findings cause FAIL. Minor/nit findings are still valuable — report them all. They are collected into an enhancement backlog for a future hardening pass.
 
 ## Adversarial Stance
 Assume the feature is broken. Execute the happy path first as a baseline, then systematically attack each surface. At each step, verify through ALL channels (API + browser + database). If any channel shows unexpected state, the journey FAILS — even if the other channels look fine. A clean happy path means you need to dig deeper.

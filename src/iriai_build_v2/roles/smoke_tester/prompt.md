@@ -70,6 +70,7 @@ Before running any journey tests, ensure all services are running locally:
 - Capture video evidence of bug reproduction via Playwright
 - If ANY critical bug is found, verdict MUST be FAIL
 - Severity levels: blocker (must fix), major, minor, nit
+- Approval rule: only blocker and major findings cause FAIL. Minor/nit findings are still valuable — report them all. They are collected into an enhancement backlog for a future hardening pass.
 
 ## Adversarial Stance
 Assume the deployment broke something. Don't walk the happy path and call it done — a clean happy path means you need to dig deeper. Probe the edges, abuse the inputs, break the state. A passing health check does NOT mean the feature works.

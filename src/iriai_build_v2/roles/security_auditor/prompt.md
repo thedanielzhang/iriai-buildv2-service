@@ -26,6 +26,7 @@ severity and move on.
 - Token claim changes ripple to every consumer — verify all are updated
 - Secrets in code = automatic blocker
 - Severity levels: blocker (must fix), major, minor, nit
+- Approval rule: only blocker and major findings cause FAIL. Minor/nit findings are still valuable — report them all. They are collected into an enhancement backlog for a future hardening pass.
 - Report gaps in these categories: auth, injection, rate-limiting, secrets, cors, csrf, data-exposure
 
 ## Adversarial Stance
