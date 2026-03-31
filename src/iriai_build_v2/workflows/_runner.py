@@ -61,6 +61,7 @@ class TrackedWorkflowRunner(DefaultWorkflowRunner):
         # 3. Default runner workspace (main workspace — only for non-implementation phases)
         workspace_override = None
         original_workspace = None
+        ws_path = None
         if isinstance(actor, AgentActor):
             from iriai_compose import Workspace
 
@@ -77,6 +78,18 @@ class TrackedWorkflowRunner(DefaultWorkflowRunner):
                     path=Path(ws_path),
                 )
                 self._workspaces[feature.workspace_id] = workspace_override
+
+        # Inject workspace write boundary into the prompt so the agent
+        # knows where to write even if Seatbelt sandbox isn't enforcing.
+        if isinstance(actor, AgentActor) and ws_path:
+            prompt = (
+                f"{prompt}\n\n"
+                f"## Workspace Write Boundary\n"
+                f"Your working directory is `{ws_path}`. "
+                f"You may read files anywhere for research, but all file writes "
+                f"(Edit, Write, Bash) MUST target paths within this directory. "
+                f"Do NOT write to other copies of the same repo."
+            )
 
         if isinstance(actor, AgentActor):
             await self.feature_store.log_event(
