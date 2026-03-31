@@ -2051,13 +2051,17 @@ async def _diagnose_and_fix(
     else:
         verify_results = await runner.parallel(verify_tasks, feature)
 
-    # Persist per-group re-verify verdicts
+    # Persist per-group re-verify verdicts + update ledger
     for gid, rv in zip(fix_results.keys(), verify_results):
         await runner.artifacts.put(
             f"bug-reverify:{source}:{gid}:attempt-{attempt_number}",
             to_str(rv),
             feature=feature,
         )
+        if isinstance(rv, Verdict):
+            ledger = await _load_ledger(runner, feature)
+            ledger = _update_ledger(ledger, rv, f"reverify:{source}", 0)
+            await _save_ledger(runner, feature, ledger)
 
     # 6. Regression test on all modified files from passed groups
     passed_gids = [
@@ -2081,9 +2085,34 @@ async def _diagnose_and_fix(
                     feature=feature,
                 )
                 if not _is_approved(regression_verdict):
-                    logger.warning("Regression found after multi-group fixes")
-                    # Mark all passed groups as failed due to regression
-                    regression_failed_gids = set(passed_gids)
+                    logger.warning("Regression found after multi-group fixes — attempting in-place fix")
+                    # Add regression findings to ledger
+                    if isinstance(regression_verdict, Verdict):
+                        ledger = await _load_ledger(runner, feature)
+                        ledger = _update_ledger(
+                            ledger, regression_verdict, f"regression:{source}", 0,
+                        )
+                        await _save_ledger(runner, feature, ledger)
+                    # Fix regression in-place
+                    regression_attempt = await _single_rca_fix_verify(
+                        runner, feature,
+                        _format_feedback("Regression", regression_verdict),
+                        f"regression:{source}",
+                        original_reviewer, fixer,
+                        _format_prior_attempts(prior_attempts),
+                        bug_id=f"{source.upper()}-REGRESSION-{attempt_number}",
+                        attempt_number=attempt_number,
+                        handover_context=handover_context,
+                        skip_regression=True,
+                    )
+                    if regression_attempt.re_verify_result == "PASS":
+                        await _commit_repos(
+                            runner, feature,
+                            f"fix: regression after {source} attempt {attempt_number}",
+                        )
+                    else:
+                        # Regression fix failed — mark all passed groups as failed
+                        regression_failed_gids = set(passed_gids)
 
     # 7. Collect BugFixAttempt records
     attempts: list[BugFixAttempt] = []
@@ -2124,8 +2153,14 @@ async def _single_rca_fix_verify(
     bug_id: str,
     attempt_number: int,
     handover_context: str = "",
+    skip_regression: bool = False,
 ) -> BugFixAttempt:
-    """Single-bug RCA → fix → re-verify (no triage needed)."""
+    """Single-bug RCA → fix → re-verify (no triage needed).
+
+    When *skip_regression* is True, the regression test step is skipped.
+    Used when this function is called to fix a regression — prevents
+    infinite nesting.
+    """
     # 1. Root Cause Analysis
     rca: RootCauseAnalysis = await runner.run(
         Ask(
@@ -2223,9 +2258,15 @@ async def _single_rca_fix_verify(
         feature=feature,
     )
 
-    # 4. Regression test on modified files
+    # Update ledger with re-verify results
+    if isinstance(re_verdict, Verdict):
+        ledger = await _load_ledger(runner, feature)
+        ledger = _update_ledger(ledger, re_verdict, f"reverify:{source}", 0)
+        await _save_ledger(runner, feature, ledger)
+
+    # 4. Regression test on modified files (skip if fixing a regression)
     passed = _is_approved(re_verdict)
-    if passed:
+    if passed and not skip_regression:
         modified = fix_result.files_created + fix_result.files_modified
         regression_verdict = await _run_regression(
             runner, feature, modified, handover_context=handover_context,
@@ -2237,8 +2278,30 @@ async def _single_rca_fix_verify(
                 feature=feature,
             )
             if not _is_approved(regression_verdict):
-                logger.warning("Regression found after fix %s", bug_id)
-                passed = False
+                logger.warning("Regression found after fix %s — attempting in-place fix", bug_id)
+                # Add regression findings to ledger
+                if isinstance(regression_verdict, Verdict):
+                    ledger = await _load_ledger(runner, feature)
+                    ledger = _update_ledger(
+                        ledger, regression_verdict, f"regression:{source}", 0,
+                    )
+                    await _save_ledger(runner, feature, ledger)
+                # Fix regression in-place (skip_regression=True prevents recursion)
+                regression_attempt = await _single_rca_fix_verify(
+                    runner, feature,
+                    _format_feedback("Regression", regression_verdict),
+                    f"regression:{source}",
+                    original_reviewer, fixer, prior_context,
+                    bug_id=f"{bug_id}-REGRESSION",
+                    attempt_number=attempt_number,
+                    handover_context=handover_context,
+                    skip_regression=True,
+                )
+                passed = regression_attempt.re_verify_result == "PASS"
+                if passed:
+                    await _commit_repos(
+                        runner, feature, f"fix: regression after {bug_id}",
+                    )
 
     return BugFixAttempt(
         bug_id=bug_id,
