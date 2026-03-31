@@ -13,10 +13,30 @@ interface Store {
 
 const saved = JSON.parse(localStorage.getItem('iriai_tracked') || '[]') as string[]
 
+function viewFromPath(): string {
+  const seg = window.location.pathname.replace(/^\/+|\/+$/g, '')
+  return seg || 'overview'
+}
+
+function pushView(v: string) {
+  const path = v === 'overview' ? '/' : `/${v}`
+  if (window.location.pathname !== path) {
+    window.history.pushState(null, '', path)
+  }
+}
+
+const initialView = viewFromPath()
+const initialTracked = initialView !== 'overview' && !saved.includes(initialView)
+  ? [...saved, initialView]
+  : saved
+if (initialTracked !== saved) {
+  localStorage.setItem('iriai_tracked', JSON.stringify(initialTracked))
+}
+
 export const useStore = create<Store>((set, get) => ({
-  tracked: saved,
+  tracked: initialTracked,
   data: {},
-  view: 'overview',
+  view: initialView,
 
   addFeature: (id) => {
     const { tracked } = get()
@@ -32,10 +52,25 @@ export const useStore = create<Store>((set, get) => ({
     const next = tracked.filter(f => f !== id)
     localStorage.setItem('iriai_tracked', JSON.stringify(next))
     const { [id]: _, ...rest } = data
-    set({ tracked: next, data: rest, view: view === id ? 'overview' : view })
+    const nextView = view === id ? 'overview' : view
+    pushView(nextView)
+    set({ tracked: next, data: rest, view: nextView })
   },
 
-  setView: (v) => set({ view: v }),
+  setView: (v) => {
+    pushView(v)
+    set({ view: v })
+  },
 
   setData: (id, d) => set(s => ({ data: { ...s.data, [id]: d } })),
 }))
+
+// Handle browser back/forward
+window.addEventListener('popstate', () => {
+  const v = viewFromPath()
+  const { view, addFeature } = useStore.getState()
+  if (v !== view) {
+    if (v !== 'overview') addFeature(v)
+    useStore.setState({ view: v })
+  }
+})

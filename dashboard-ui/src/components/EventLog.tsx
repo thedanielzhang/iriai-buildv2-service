@@ -3,20 +3,11 @@ import type { EventEntry } from '../types'
 import { relTime } from '../utils'
 
 export function EventLog({ events }: { events: EventEntry[] }) {
-  const [open, setOpen] = useState(false)
-
   if (!events.length) return null
 
   return (
-    <div className="section">
-      <div className="events-toggle" onClick={() => setOpen(!open)}>
-        {open ? '▼' : '▶'} Event Log ({events.length})
-      </div>
-      {open && (
-        <div className="events-table open">
-          {events.map((e, i) => <EventRow key={i} event={e} />)}
-        </div>
-      )}
+    <div className="events-table open">
+      {events.map((e, i) => <EventRow key={i} event={e} />)}
     </div>
   )
 }

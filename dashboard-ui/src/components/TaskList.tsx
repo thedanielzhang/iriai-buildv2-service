@@ -1,15 +1,10 @@
 import { useState } from 'react'
 import type { Task } from '../types'
 
-export function TaskList({ tasks, groupIndex }: { tasks: Task[]; groupIndex: number }) {
+export function TaskList({ tasks }: { tasks: Task[]; groupIndex: number }) {
   return (
-    <div className="section">
-      <div className="section-title">
-        Group {groupIndex} Tasks — {tasks.filter(t => t.status === 'complete').length}/{tasks.length} complete
-      </div>
-      <div className="task-list">
-        {tasks.map(t => <TaskItem key={t.id} task={t} />)}
-      </div>
+    <div className="task-list">
+      {tasks.map(t => <TaskItem key={t.id} task={t} />)}
     </div>
   )
 }
@@ -38,7 +33,7 @@ function TaskItem({ task }: { task: Task }) {
               <div>{task.description}</div>
             </>
           )}
-          {task.file_scope.length > 0 && (
+          {task.file_scope?.length > 0 && (
             <>
               <h4>File Scope</h4>
               {task.file_scope.map((f, i) => (
@@ -49,7 +44,7 @@ function TaskItem({ task }: { task: Task }) {
               ))}
             </>
           )}
-          {task.acceptance_criteria.length > 0 && (
+          {task.acceptance_criteria?.length > 0 && (
             <>
               <h4>Acceptance Criteria</h4>
               {task.acceptance_criteria.map((ac, i) => (

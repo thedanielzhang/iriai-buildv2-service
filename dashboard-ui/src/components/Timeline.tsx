@@ -18,16 +18,16 @@ export function Timeline({ entries }: { entries: TimelineEntry[] }) {
   return (
     <>
       {verifyEntries.length > 0 && (
-        <div className="section">
-          <div className="section-title">Verify Timeline</div>
+        <>
+          <div className="tl-section-label">Verify</div>
           <div className="timeline">
             {verifyEntries.map((t, i) => <TimelineItem key={`${t.key}-${i}`} entry={t} />)}
           </div>
-        </div>
+        </>
       )}
       {(fixEntries.length > 0 || parsedAttempts.length > 0) && (
-        <div className="section">
-          <div className="section-title">Fix Timeline</div>
+        <>
+          <div className="tl-section-label" style={{ marginTop: verifyEntries.length > 0 ? 12 : 0 }}>Fix</div>
           <div className="timeline">
             {fixEntries.map((t, i) => <TimelineItem key={`${t.key}-${i}`} entry={t} />)}
             {parsedAttempts.length > 0 && (
@@ -39,7 +39,7 @@ export function Timeline({ entries }: { entries: TimelineEntry[] }) {
               </div>
             )}
           </div>
-        </div>
+        </>
       )}
     </>
   )

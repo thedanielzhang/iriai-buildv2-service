@@ -148,11 +148,10 @@ async def get_feature(feature_id: str):
             completed_count = 0
             for tid in task_ids:
                 tkey = f"dag-task:{tid}"
-                task_name = ""
+                task_def = tasks_by_id.get(tid, {})
+                task_name = task_def.get("name", "")
                 task_summary = ""
                 task_status = "pending"
-                if tid in tasks_by_id:
-                    task_name = tasks_by_id[tid].get("name", "")
                 if tkey in artifacts:
                     task_status = "complete"
                     completed_count += 1
@@ -168,6 +167,11 @@ async def get_feature(feature_id: str):
                     "name": task_name,
                     "status": task_status,
                     "summary": task_summary,
+                    "description": task_def.get("description", ""),
+                    "subfeature_id": task_def.get("subfeature_id", ""),
+                    "repo_path": task_def.get("repo_path", ""),
+                    "file_scope": task_def.get("file_scope", []),
+                    "acceptance_criteria": task_def.get("acceptance_criteria", []),
                 })
 
             # Collect verify artifacts for this group

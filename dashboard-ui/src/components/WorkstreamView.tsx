@@ -7,6 +7,7 @@ import { TaskList } from './TaskList'
 import { Gates } from './Gates'
 import { Timeline } from './Timeline'
 import { EventLog } from './EventLog'
+import { CollapsibleSection } from './CollapsibleSection'
 
 export function WorkstreamView() {
   const { view, data, setView } = useStore()
@@ -44,13 +45,23 @@ export function WorkstreamView() {
         </div>
       )}
 
-      {activeGroup && <TaskList tasks={activeGroup.tasks} groupIndex={activeGroup.index} />}
+      {activeGroup && activeGroup.tasks.length > 0 && (
+        <CollapsibleSection title={`Group ${activeGroup.index} Tasks — ${activeGroup.tasks.filter(t => t.status === 'complete').length}/${activeGroup.tasks.length}`}>
+          <TaskList tasks={activeGroup.tasks} groupIndex={activeGroup.index} />
+        </CollapsibleSection>
+      )}
 
-      <Gates gates={d.gates} />
+      <CollapsibleSection title={`Post-DAG Gates — ${Object.values(d.gates).filter(Boolean).length}/${Object.keys(d.gates).length}`}>
+        <Gates gates={d.gates} />
+      </CollapsibleSection>
 
-      <Timeline entries={d.timeline} />
+      <CollapsibleSection title={`Verify / Fix Timeline — ${d.timeline.length} entries`}>
+        <Timeline entries={d.timeline} />
+      </CollapsibleSection>
 
-      <EventLog events={d.events} />
+      <CollapsibleSection title={`Event Log — ${d.events.length} events`}>
+        <EventLog events={d.events} />
+      </CollapsibleSection>
     </>
   )
 }
