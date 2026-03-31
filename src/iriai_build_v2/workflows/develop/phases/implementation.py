@@ -1289,6 +1289,13 @@ async def _implement_dag(
             except Exception as rca_err:
                 logger.warning("DAG verify RCA failed: %s", rca_err)
 
+            if isinstance(rca_result, RootCauseAnalysis):
+                await runner.artifacts.put(
+                    f"dag-verify-rca:g{group_idx}:retry-{retry}",
+                    rca_result.model_dump_json(),
+                    feature=feature,
+                )
+
             # If RCA found a contradiction, escalate and use resolution
             fix_direction = ""
             if isinstance(rca_result, RootCauseAnalysis) and rca_result.confidence == "contradiction":
@@ -1324,6 +1331,14 @@ async def _implement_dag(
                     worktree = feature_root / primary_repo
                     if worktree.exists():
                         fix_ws_path = str(worktree)
+            logger.info(
+                "DAG verify fix workspace: feature_root=%s, repo_counts=%s, "
+                "fix_ws_path=%s, tasks=%s",
+                feature_root,
+                {t.repo_path: sum(1 for x in group_tasks if x.repo_path == t.repo_path) for t in group_tasks if t.repo_path},
+                fix_ws_path,
+                [t.id for t in group_tasks[:3]],
+            )
 
             rca_guidance = ""
             if isinstance(rca_result, RootCauseAnalysis) and rca_result.confidence != "contradiction":
