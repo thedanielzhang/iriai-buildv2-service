@@ -419,6 +419,28 @@ class ImplementationPhase(Phase):
             handover.compress()
             handover_context = to_markdown(handover)
 
+            # Append enhancement backlog so all gates know what's deferred
+            backlog_raw = await runner.artifacts.get(
+                "enhancement-backlog", feature=feature,
+            )
+            if backlog_raw:
+                try:
+                    backlog = EnhancementBacklog.model_validate_json(backlog_raw)
+                    if backlog.items:
+                        deferred = "\n".join(
+                            f"- [{it.severity}] {it.description[:150]}"
+                            for it in backlog.items[:30]
+                        )
+                        handover_context += (
+                            f"\n\n## Already-Deferred Issues (DO NOT re-report these)\n"
+                            f"The following {len(backlog.items)} minor/nit issues are "
+                            f"already tracked in the enhancement backlog. Do NOT include "
+                            f"them in your verdict — they are intentionally deferred.\n\n"
+                            f"{deferred}\n"
+                        )
+                except Exception:
+                    pass
+
             # ── Adversarial runtime routing for post-DAG gates ──────────
             # The last implementation group used impl_runtime based on its
             # index parity.  Post-DAG gates (review, security, QA,
@@ -1555,6 +1577,26 @@ async def _verify(
                 + "\n\n---\n\n".join(ref_parts)
             )
 
+    # Load enhancement backlog so the verifier knows what's already deferred
+    known_issues = ""
+    backlog_raw = await runner.artifacts.get("enhancement-backlog", feature=feature)
+    if backlog_raw:
+        try:
+            backlog = EnhancementBacklog.model_validate_json(backlog_raw)
+            if backlog.items:
+                deferred = "\n".join(
+                    f"- [{it.severity}] {it.description[:150]}"
+                    for it in backlog.items[:30]  # cap to avoid prompt bloat
+                )
+                known_issues = (
+                    f"\n\n## Already-Deferred Issues (DO NOT re-report these)\n"
+                    f"The following {len(backlog.items)} minor/nit issues are already "
+                    f"tracked in the enhancement backlog. Do NOT include them in your "
+                    f"verdict — they are intentionally deferred.\n\n{deferred}\n"
+                )
+        except Exception:
+            pass
+
     verifier = _make_parallel_actor(qa_engineer, "verify", runtime=runtime)
 
     return await runner.run(
@@ -1569,7 +1611,7 @@ async def _verify(
                 "4. The code compiles, imports correctly, and passes "
                 "any existing tests for these files\n"
                 "5. Implementation matches the upstream specs in Reference Material"
-                f"{ref_context}\n\n"
+                f"{ref_context}{known_issues}\n\n"
                 "This is a per-group verification, not a full QA pass."
             ),
             output_type=Verdict,
@@ -2587,13 +2629,25 @@ async def _append_enhancements(
     else:
         backlog = EnhancementBacklog()
 
-    backlog.items.extend(items)
+    # Dedup: skip items that match existing ones (exact or fuzzy)
+    existing_descs = [i.description for i in backlog.items]
+    new_items = []
+    for item in items:
+        if item.description in existing_descs:
+            continue  # exact match
+        if any(_text_overlap(item.description, d) > 0.5 for d in existing_descs):
+            continue  # fuzzy match
+        new_items.append(item)
+        existing_descs.append(item.description)  # prevent intra-batch dupes
+    if not new_items:
+        return
+    backlog.items.extend(new_items)
     await runner.artifacts.put(
         "enhancement-backlog", backlog.model_dump_json(), feature=feature,
     )
     logger.info(
-        "Enhancement backlog: +%d items (total: %d)",
-        len(items), len(backlog.items),
+        "Enhancement backlog: +%d items, %d dupes skipped (total: %d)",
+        len(new_items), len(items) - len(new_items), len(backlog.items),
     )
 
 
