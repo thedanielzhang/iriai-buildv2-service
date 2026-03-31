@@ -1169,11 +1169,15 @@ async def _implement_dag(
             )
             if task_marker:
                 try:
-                    completed_results.append(
-                        ImplementationResult.model_validate_json(task_marker),
+                    result = ImplementationResult.model_validate_json(task_marker)
+                    # Only skip if the task actually completed successfully
+                    if result.status == "completed":
+                        completed_results.append(result)
+                        logger.info("Task %s already complete — skipping", tid)
+                        continue
+                    logger.warning(
+                        "Task %s has status %r — re-running", tid, result.status,
                     )
-                    logger.info("Task %s already complete — skipping", tid)
-                    continue
                 except Exception:
                     pass
             pending_tasks.append(tasks_by_id[tid])
@@ -1259,9 +1263,10 @@ async def _implement_dag(
                             return ImplementationResult(
                                 task_id=t.id,
                                 summary=f"FAILED after {TASK_MAX_RETRIES + 1} attempts: {e}",
+                                status="blocked",
                             )
                 # Unreachable but satisfies type checker
-                return ImplementationResult(task_id=t.id, summary="FAILED")
+                return ImplementationResult(task_id=t.id, summary="FAILED", status="blocked")
 
             # Dispatch all tasks in parallel with individual error handling
             gathered = await _asyncio.gather(

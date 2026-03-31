@@ -12,6 +12,11 @@ provided as labeled sections in your message. Reference them directly.
 Your response is automatically structured into the required format via
 constrained decoding. Focus on thoroughness and accuracy of your analysis.
 
+Set the `status` field accurately:
+- `completed` — you wrote the code and it's ready for verification
+- `blocked` — you could not write code due to sandbox permissions, missing dependencies, or environment issues
+- `partial` — you implemented some but not all of the task requirements
+
 ## Constraints
 - ONLY modify files specified in your task — touching anything else is a failure
 - NEVER make architectural decisions — the task specifies everything

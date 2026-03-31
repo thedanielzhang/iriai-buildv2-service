@@ -778,6 +778,7 @@ class ImplementationResult(BaseModel):
 
     task_id: str
     summary: str
+    status: str = "completed"  # completed | blocked | partial
     files_created: list[str] = Field(default_factory=list)
     files_modified: list[str] = Field(default_factory=list)
     commit_hash: str = ""  # git commit hash for this task's changes
