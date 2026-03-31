@@ -130,6 +130,131 @@ class TestCodexAgentRuntime:
         assert prepared["required"] == ["question", "options", "output", "complete", "artifact_path"]
         assert prepared["properties"]["output"]["anyOf"][0]["additionalProperties"] is False
 
+    def test_mcp_config_flags_generates_correct_flags(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        runtime = self._runtime(monkeypatch)
+        role = Role(
+            name="verifier",
+            prompt="Verify the implementation",
+            tools=["Read", "Bash"],
+            metadata={
+                "mcp_servers": {
+                    "playwright": {
+                        "type": "stdio",
+                        "command": "npx",
+                        "args": ["-y", "@anthropic/mcp-playwright"],
+                    },
+                    "github": {
+                        "type": "stdio",
+                        "command": "npx",
+                        "args": ["-y", "@modelcontextprotocol/server-github"],
+                        "env": {"GITHUB_TOKEN": "test-token"},
+                    },
+                },
+            },
+        )
+
+        flags = runtime._mcp_config_flags(role)
+
+        assert "-c" in flags
+        assert 'mcp_servers.playwright.command="npx"' in flags
+        assert 'mcp_servers.playwright.args=["-y", "@anthropic/mcp-playwright"]' in flags
+        assert 'mcp_servers.github.command="npx"' in flags
+        assert 'mcp_servers.github.env.GITHUB_TOKEN="test-token"' in flags
+        # type field should NOT appear
+        assert not any("type" in f and "stdio" in f for f in flags)
+
+    def test_mcp_config_flags_empty_when_no_servers(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        runtime = self._runtime(monkeypatch)
+        role = Role(name="pm", prompt="Plan", tools=["Read"])
+        assert runtime._mcp_config_flags(role) == []
+
+    def test_build_command_includes_mcp_flags(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        runtime = self._runtime(monkeypatch)
+        role = Role(
+            name="verifier",
+            prompt="Verify",
+            tools=["Read"],
+            metadata={
+                "mcp_servers": {
+                    "playwright": {
+                        "type": "stdio",
+                        "command": "npx",
+                        "args": ["-y", "@anthropic/mcp-playwright"],
+                    },
+                },
+            },
+        )
+
+        command = runtime._build_command(
+            role=role,
+            workspace=SimpleNamespace(path="/tmp/project"),
+            output_schema_path=None,
+            output_path="/tmp/out.txt",
+            resume_thread_id=None,
+            ephemeral=True,
+        )
+
+        assert 'mcp_servers.playwright.command="npx"' in command
+        assert command[-1] == "-"
+
+    def test_build_command_includes_add_dir_npm(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        runtime = self._runtime(monkeypatch)
+        role = Role(name="impl", prompt="Implement", tools=["Read", "Write"])
+
+        command = runtime._build_command(
+            role=role,
+            workspace=SimpleNamespace(path="/tmp/project"),
+            output_schema_path=None,
+            output_path="/tmp/out.txt",
+            resume_thread_id=None,
+            ephemeral=True,
+        )
+
+        assert "--add-dir" in command
+        idx = command.index("--add-dir")
+        assert ".npm" in command[idx + 1]
+
+    def test_compose_prompt_includes_mcp_tools_section(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        runtime = self._runtime(monkeypatch)
+        role = Role(
+            name="verifier",
+            prompt="Verify the implementation.",
+            tools=["Read"],
+            metadata={
+                "mcp_servers": {
+                    "playwright": {"command": "npx", "args": []},
+                    "qa-feedback": {"command": "node", "args": []},
+                },
+            },
+        )
+
+        prompt = runtime._compose_prompt(
+            role,
+            "Run verification.",
+            feature_id=None,
+            session=None,
+            output_type=None,
+        )
+
+        assert "## MCP Tools Available" in prompt
+        assert "playwright" in prompt
+        assert "qa-feedback" in prompt
+
     @pytest.mark.asyncio
     async def test_read_stdout_handles_large_jsonl_events(
         self,

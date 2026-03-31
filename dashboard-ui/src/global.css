@@ -65,6 +65,10 @@ body { background: var(--bg-0); color: var(--text-0); font-family: var(--sans); 
 .cs-verdict-badge.cs-pass { color: var(--green); background: var(--green-dim); }
 .cs-verdict-badge.cs-fail { color: var(--red); background: var(--red-dim); }
 .cs-verdict-badge.cs-neutral { color: var(--purple); background: #2e1065; }
+.cs-detail-time { font-family: var(--mono); font-size: 10px; color: var(--text-2); }
+.cs-link-row { cursor: pointer; }
+.cs-link-row:hover { color: var(--cyan); }
+.cs-link-row:hover .cs-detail-value { color: var(--cyan); }
 .cs-detail-body { font-size: 12px; color: var(--text-1); line-height: 1.7; white-space: pre-wrap; word-break: break-word; background: var(--bg-0); padding: 10px 12px; border-radius: 6px; max-height: 400px; overflow-y: auto; }
 .cs-stats { display: flex; gap: 16px; }
 .cs-stat { text-align: center; min-width: 56px; }
@@ -235,6 +239,13 @@ body { background: var(--bg-0); color: var(--text-0); font-family: var(--sans); 
 .dispatch-files code { font-size: 10px; padding: 2px 6px; background: var(--bg-3); border-radius: 3px; color: var(--text-1); }
 .fix-attempt-pass { font-family: var(--mono); font-size: 10px; font-weight: 600; color: var(--green); }
 .fix-attempt-fail { font-family: var(--mono); font-size: 10px; font-weight: 600; color: var(--red); }
+.tl-section-label { font-family: var(--mono); font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-2); padding: 8px 12px 4px; border-top: 1px solid var(--border); }
+.fix-attempts-list { display: flex; flex-direction: column; gap: 0; margin-top: 4px; }
+.fix-attempt-row { display: flex; align-items: center; gap: 8px; padding: 5px 10px; font-size: 11px; color: var(--text-1); border-bottom: 1px solid var(--border); }
+.fix-attempt-row:last-child { border-bottom: none; }
+.fix-attempt-id { font-family: var(--mono); font-weight: 600; color: var(--text-0); white-space: nowrap; }
+.fix-attempt-group { font-family: var(--mono); font-size: 10px; color: var(--text-2); padding: 1px 5px; background: var(--bg-3); border-radius: 3px; }
+.fix-attempt-desc { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-2); }
 
 /* ── Events ─────────────────────── */
 .events-toggle { font-family: var(--mono); font-size: 11px; color: var(--text-2); cursor: pointer; padding: 8px 0; display: flex; align-items: center; gap: 6px; user-select: none; }

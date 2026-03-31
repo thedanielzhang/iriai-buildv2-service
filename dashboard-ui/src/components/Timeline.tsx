@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import type { TimelineEntry } from '../types'
 import { relTime } from '../utils'
-import { DispatchDetail, FixAttemptsDetail } from './BugDetail'
+import { DispatchDetail, FixAttemptItem, parseFixAttempts } from './BugDetail'
 
 const VERIFY_TYPES = new Set(['verify', 're-verify'])
 
@@ -9,7 +9,11 @@ export function Timeline({ entries }: { entries: TimelineEntry[] }) {
   if (!entries.length) return null
 
   const verifyEntries = entries.filter(e => VERIFY_TYPES.has(e.type))
-  const fixEntries = entries.filter(e => !VERIFY_TYPES.has(e.type))
+  const fixEntries = entries.filter(e => !VERIFY_TYPES.has(e.type) && e.type !== 'fix-attempts')
+
+  // Flatten fix-attempts into individual items
+  const fixAttemptsEntry = entries.find(e => e.type === 'fix-attempts')
+  const parsedAttempts = fixAttemptsEntry ? parseFixAttempts(fixAttemptsEntry.summary) : []
 
   return (
     <>
@@ -21,11 +25,19 @@ export function Timeline({ entries }: { entries: TimelineEntry[] }) {
           </div>
         </div>
       )}
-      {fixEntries.length > 0 && (
+      {(fixEntries.length > 0 || parsedAttempts.length > 0) && (
         <div className="section">
           <div className="section-title">Fix Timeline</div>
           <div className="timeline">
             {fixEntries.map((t, i) => <TimelineItem key={`${t.key}-${i}`} entry={t} />)}
+            {parsedAttempts.length > 0 && (
+              <div id="fix-attempts-section" className="fix-attempts-anchor">
+                <div className="tl-section-label">Fix Attempts — {parsedAttempts.length} total</div>
+                {parsedAttempts.slice().reverse().map((a, i) => (
+                  <FixAttemptItem key={`attempt-${i}`} attempt={a} index={parsedAttempts.length - i} />
+                ))}
+              </div>
+            )}
           </div>
         </div>
       )}
@@ -36,13 +48,6 @@ export function Timeline({ entries }: { entries: TimelineEntry[] }) {
 function TimelineItem({ entry }: { entry: TimelineEntry }) {
   const [open, setOpen] = useState(false)
 
-  const renderDetail = () => {
-    if (!entry.summary) return null
-    if (entry.type === 'dispatch') return <div className="tl-summary"><DispatchDetail raw={entry.summary} /></div>
-    if (entry.type === 'fix-attempts') return <div className="tl-summary"><FixAttemptsDetail raw={entry.summary} /></div>
-    return <div className="tl-summary">{entry.summary}</div>
-  }
-
   return (
     <div className={`tl-item ${open ? 'expanded' : ''}`} onClick={() => setOpen(!open)}>
       <div className="tl-header">
@@ -52,7 +57,11 @@ function TimelineItem({ entry }: { entry: TimelineEntry }) {
         <span className="tl-key">{entry.key}</span>
         <span className="tl-time">{relTime(entry.created_at)}</span>
       </div>
-      {open && renderDetail()}
+      {open && entry.summary && (
+        entry.type === 'dispatch'
+          ? <div className="tl-summary"><DispatchDetail raw={entry.summary} /></div>
+          : <div className="tl-summary">{entry.summary}</div>
+      )}
     </div>
   )
 }

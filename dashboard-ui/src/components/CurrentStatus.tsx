@@ -2,7 +2,7 @@ import { useState } from 'react'
 import { useStore } from '../store/useStore'
 import { getActiveStatus, phaseCls, relTime } from '../utils'
 import type { FeatureData, Group } from '../types'
-import { DispatchDetail, FixAttemptsDetail } from './BugDetail'
+import { DispatchDetail, FixAttemptsList } from './BugDetail'
 
 export function CurrentStatus() {
   const { view, data } = useStore()
@@ -91,9 +91,11 @@ function ActiveGroupDetail({ group, isFixLoop }: { group: Group; isFixLoop: bool
           <span className={`cs-verdict-badge ${lastVerify.passed ? 'cs-pass' : 'cs-fail'}`}>
             {lastVerify.passed ? 'PASS' : 'FAIL'}
           </span>
+          <span className="cs-detail-time">{relTime(lastVerify.created_at)}</span>
           <div className="cs-detail-body">{lastVerify.summary}</div>
           {lastDispatch && (
             <div className="cs-detail-body">
+              <div className="cs-detail-time" style={{ marginBottom: 6 }}>Dispatched {relTime(lastDispatch.created_at)}</div>
               <DispatchDetail raw={lastDispatch.summary} />
             </div>
           )}
@@ -101,7 +103,7 @@ function ActiveGroupDetail({ group, isFixLoop }: { group: Group; isFixLoop: bool
       )}
 
       {fixAttempts && fixAttempts.summary && (
-        <FixAttemptsCollapsible raw={fixAttempts.summary} />
+        <FixAttemptsCollapsible raw={fixAttempts.summary} time={fixAttempts.created_at} />
       )}
     </div>
   )
@@ -125,23 +127,20 @@ function GatesSummary({ data, passedGates, totalGates }: { data: FeatureData; pa
   )
 }
 
-function FixAttemptsCollapsible({ raw }: { raw: string }) {
+function FixAttemptsCollapsible({ raw, time }: { raw: string; time: string }) {
   const [open, setOpen] = useState(false)
   const count = (raw.match(/"bug_id"/g) || []).length
 
   return (
     <div className="cs-detail-block">
-      <div className="cs-detail-row" style={{ cursor: 'pointer' }} onClick={() => setOpen(!open)}>
+      <div className="cs-detail-row cs-link-row" onClick={() => setOpen(!open)}>
         <span className="cs-detail-label">Fix Attempts</span>
         <span className="cs-detail-value">
           {open ? '▼' : '▶'} {count} attempt{count !== 1 ? 's' : ''}
         </span>
+        <span className="cs-detail-time">{relTime(time)}</span>
       </div>
-      {open && (
-        <div className="cs-detail-body">
-          <FixAttemptsDetail raw={raw} />
-        </div>
-      )}
+      {open && <FixAttemptsList raw={raw} />}
     </div>
   )
 }

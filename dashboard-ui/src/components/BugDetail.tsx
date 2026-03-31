@@ -43,32 +43,24 @@ export function DispatchDetail({ raw }: { raw: string }) {
   )
 }
 
-export function FixAttemptsDetail({ raw }: { raw: string }) {
+export function parseFixAttempts(raw: string): any[] {
   const chunks = raw.split(/\n\n+/).filter(Boolean)
   const attempts: any[] = []
   for (const chunk of chunks) {
     try { attempts.push(JSON.parse(chunk)) } catch { /* skip */ }
   }
-
-  if (!attempts.length) return <div className="tl-summary">{raw}</div>
-
-  // Most recent first
-  const reversed = [...attempts].reverse()
-
-  return (
-    <div className="timeline">
-      {reversed.map((a, i) => <FixAttemptItem key={i} attempt={a} index={attempts.length - i} />)}
-    </div>
-  )
+  return attempts
 }
 
-function FixAttemptItem({ attempt: a, index }: { attempt: any; index: number }) {
-  const [open, setOpen] = useState(false)
+/** Timeline-style expandable item for a single fix attempt (used in Fix Timeline). */
+export function FixAttemptItem({ attempt: a, index, defaultOpen }: { attempt: any; index: number; defaultOpen?: boolean }) {
+  const [open, setOpen] = useState(defaultOpen ?? false)
   const passed = a.re_verify_result === 'PASS'
   const pending = !a.re_verify_result
+  const itemId = `fix-attempt-${a.bug_id}`
 
   return (
-    <div className={`tl-item ${open ? 'expanded' : ''}`} onClick={() => setOpen(!open)}>
+    <div id={itemId} className={`tl-item ${open ? 'expanded' : ''}`} onClick={() => setOpen(!open)}>
       <div className="tl-header">
         <span className={`tl-type ${passed ? 'verify' : 'fix'}`}>{a.bug_id}</span>
         {!pending && (
@@ -92,6 +84,43 @@ function FixAttemptItem({ attempt: a, index }: { attempt: any; index: number }) 
           )}
         </div>
       )}
+    </div>
+  )
+}
+
+/** Compact list for the CurrentStatus panel (no nested timeline chrome). */
+export function FixAttemptsList({ raw }: { raw: string }) {
+  const attempts = parseFixAttempts(raw)
+  if (!attempts.length) return null
+
+  const reversed = [...attempts].reverse()
+
+  return (
+    <div className="fix-attempts-list">
+      {reversed.map((a, i) => {
+        const passed = a.re_verify_result === 'PASS'
+        const pending = !a.re_verify_result
+        return (
+          <div key={i} className="fix-attempt-row" onClick={(e) => {
+            e.stopPropagation()
+            const el = document.getElementById(`fix-attempt-${a.bug_id}`)
+            if (el) {
+              // Expand it if collapsed
+              if (!el.classList.contains('expanded')) el.click()
+              el.scrollIntoView({ behavior: 'smooth', block: 'center' })
+            }
+          }}>
+            <span className="fix-attempt-id">{a.bug_id}</span>
+            {a.group_id && <span className="fix-attempt-group">{a.group_id}</span>}
+            {!pending && (
+              <span className={passed ? 'fix-attempt-pass' : 'fix-attempt-fail'}>
+                {a.re_verify_result}
+              </span>
+            )}
+            <span className="fix-attempt-desc">{a.description}</span>
+          </div>
+        )
+      })}
     </div>
   )
 }

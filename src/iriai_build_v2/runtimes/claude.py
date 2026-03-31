@@ -497,6 +497,9 @@ class ClaudeAgentRuntime(AgentRuntime):
             can_use_tool=write_guard,
         )
 
+        if cwd:
+            options.add_dirs = [os.path.expanduser("~/.npm")]
+
         if "setting_sources" in role.metadata:
             options.setting_sources = role.metadata["setting_sources"]
 

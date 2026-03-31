@@ -21,7 +21,7 @@ MCP_SERVERS = {
     "playwright": {
         "type": "stdio",
         "command": "npx",
-        "args": ["-y", "@anthropic/mcp-playwright"],
+        "args": ["-y", "@playwright/mcp"],
     },
     "context7": {
         "type": "stdio",

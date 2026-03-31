@@ -252,6 +252,15 @@ class CodexAgentRuntime(AgentRuntime):
                 f"Use Codex tools to cover these intended capabilities when possible: {tools}."
             )
 
+        mcp_servers = role.metadata.get("mcp_servers") or {}
+        if mcp_servers:
+            names = ", ".join(mcp_servers.keys())
+            sections.append(
+                "## MCP Tools Available\n"
+                f"The following MCP servers are configured and available for this session: {names}. "
+                "Use the tools they provide when relevant to your task."
+            )
+
         notes = self._consume_user_notes(feature_id)
         if notes:
             sections.append(
@@ -330,6 +339,9 @@ class CodexAgentRuntime(AgentRuntime):
 
         if output_schema_path:
             args.extend(["--output-schema", output_schema_path])
+
+        args.extend(self._mcp_config_flags(role))
+        args.extend(["--add-dir", os.path.expanduser("~/.npm")])
 
         if workspace and workspace.path:
             args.extend(["-C", str(workspace.path)])
@@ -653,13 +665,32 @@ class CodexAgentRuntime(AgentRuntime):
             self._warned_roles.add(warning_key)
         return None
 
+    def _mcp_config_flags(self, role: Role) -> list[str]:
+        """Convert role MCP server config to Codex ``-c`` CLI flags."""
+        servers: dict[str, dict[str, Any]] = role.metadata.get("mcp_servers") or {}
+        flags: list[str] = []
+        for name, config in servers.items():
+            command = config.get("command")
+            if command:
+                flags.extend(["-c", f'mcp_servers.{name}.command="{command}"'])
+            args = config.get("args")
+            if args:
+                toml_array = "[" + ", ".join(f'"{a}"' for a in args) + "]"
+                flags.extend(["-c", f"mcp_servers.{name}.args={toml_array}"])
+            env = config.get("env")
+            if isinstance(env, dict):
+                for env_key, env_val in env.items():
+                    flags.extend(["-c", f'mcp_servers.{name}.env.{env_key}="{env_val}"'])
+        return flags
+
     def _log_runtime_differences(self, role: Role) -> None:
-        if role.metadata.get("mcp_servers"):
+        mcp = role.metadata.get("mcp_servers")
+        if mcp:
             warning_key = ("mcp", role.name)
             if warning_key not in self._warned_roles:
-                logger.info(
-                    "Role %s declares per-role MCP servers; Codex runtime uses the user's Codex CLI MCP configuration instead",
-                    role.name,
+                logger.debug(
+                    "Role %s: passing %d MCP server(s) via -c flags: %s",
+                    role.name, len(mcp), ", ".join(mcp.keys()),
                 )
                 self._warned_roles.add(warning_key)
 
