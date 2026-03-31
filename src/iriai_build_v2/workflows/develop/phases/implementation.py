@@ -2398,16 +2398,19 @@ async def _escalate_contradiction(
         outcome = result.output
         if outcome.approved:
             return rca.proposed_approach  # user confirmed best-guess
-        # User overrode — extract direction from revision_plan
+        # User overrode — extract ALL directions from revision_plan
         if outcome.revision_plan and outcome.revision_plan.requests:
-            return outcome.revision_plan.requests[0].description
+            directions = []
+            for i, req in enumerate(outcome.revision_plan.requests, 1):
+                directions.append(f"{i}. {req.description}")
+            return "\n\n".join(directions)
         return rca.proposed_approach  # fallback
     # Also check the written artifact for the user's response
     discussion = await runner.artifacts.get(
         f"contradiction:{source}:{group.group_id}", feature=feature,
     )
     if discussion:
-        return discussion[:500]  # use the discussion text as direction
+        return discussion  # user decisions are authoritative — never truncate
     return rca.proposed_approach
 
 
