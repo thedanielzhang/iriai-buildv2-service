@@ -1,15 +1,21 @@
 import { useState, useRef, useEffect } from 'react'
 import { useStore } from '../store/useStore'
-import { phaseColor, phaseCls } from '../utils'
-import type { SearchResult } from '../types'
+import { phaseCls, getHealthState, healthColor, minutesSince } from '../utils'
+import type { SearchResult, FeatureData } from '../types'
 
 export function TopBar() {
-  const { tracked, data, view, setView, addFeature, removeFeature } = useStore()
+  const tracked = useStore(s => s.tracked)
+  const data = useStore(s => s.data)
+  const view = useStore(s => s.view)
+  const setView = useStore(s => s.setView)
+  const addFeature = useStore(s => s.addFeature)
+  const removeFeature = useStore(s => s.removeFeature)
+
   const [modalOpen, setModalOpen] = useState(false)
   const [query, setQuery] = useState('')
   const [results, setResults] = useState<SearchResult[]>([])
   const inputRef = useRef<HTMLInputElement>(null)
-  const timerRef = useRef<ReturnType<typeof setTimeout>>()
+  const timerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
 
   useEffect(() => {
     if (modalOpen) inputRef.current?.focus()
@@ -41,21 +47,48 @@ export function TopBar() {
         </div>
         <div className="topbar-tabs">
           {tracked.map(id => {
-            const d = data[id]
+            const d = data[id] as FeatureData | undefined
+            const health = d ? getHealthState(d) : 'idle'
+            const staleMin = health === 'stuck' ? Math.round(minutesSince(d?.last_activity_at)) : 0
             return (
               <div
                 key={id}
                 className={`tab ${view === id ? 'active' : ''}`}
                 onClick={() => setView(id)}
               >
-                <span className="phase-dot" style={{ background: phaseColor(d?.phase || '') }} />
+                <span className="phase-dot" style={{ background: healthColor(health) }} />
                 <span>{d ? (d.name.length > 24 ? d.name.slice(0, 22) + '..' : d.name) : id}</span>
+                {health === 'stuck' && staleMin > 0 && (
+                  <span
+                    className="tab-stale-badge"
+                    style={{
+                      fontSize: 9,
+                      fontFamily: 'var(--mono)',
+                      color: 'var(--red)',
+                      background: 'rgba(239,68,68,0.12)',
+                      padding: '0 4px',
+                      borderRadius: 3,
+                      marginLeft: 4,
+                      lineHeight: '16px',
+                    }}
+                  >
+                    {staleMin >= 60 ? `${Math.floor(staleMin / 60)}h` : `${staleMin}m`}
+                  </span>
+                )}
                 <span className="close-tab" onClick={e => { e.stopPropagation(); removeFeature(id) }}>
                   &times;
                 </span>
               </div>
             )
           })}
+        </div>
+        <div
+          className={`tab ${view === 'terminal' ? 'active' : ''}`}
+          onClick={() => setView('terminal')}
+          style={{ flexShrink: 0 }}
+        >
+          <span style={{ fontFamily: 'var(--mono)', fontSize: 11 }}>{'>_'}</span>
+          <span>Terminal</span>
         </div>
         <div className="add-btn" onClick={() => setModalOpen(true)} title="Add feature">+</div>
       </div>

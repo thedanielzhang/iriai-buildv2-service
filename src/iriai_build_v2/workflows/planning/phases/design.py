@@ -114,7 +114,7 @@ class DesignPhase(Phase):
                 additional_urls=mockup_urls or None,
                 post_compile=_refresh_mockup_resume,
             )
-            await runner.artifacts.put("design", final_text, feature=feature)
+            # DB write now happens inside interview_gate_review() on approval.
             state.design = final_text
             return state
 
@@ -232,7 +232,7 @@ class DesignPhase(Phase):
             post_compile=_refresh_mockup,
         )
 
-        await runner.artifacts.put("design", final_text, feature=feature)
+        # DB write now happens inside interview_gate_review() on approval.
         state.design = final_text
         return state
 

@@ -178,11 +178,23 @@ def bugfix(
     default=None,
     help="Agent runtime to use for workflow agents (claude or codex).",
 )
+@click.option(
+    "--claude-only",
+    is_flag=True,
+    help="When using Claude primary, also use Claude as the secondary runtime.",
+)
+@click.option(
+    "--budget",
+    is_flag=True,
+    help="Use Sonnet for implementers, Opus for verifiers.",
+)
 def slack_cmd(
     channel: str,
     workspace: str | None,
     mode: str,
     agent_runtime: str | None,
+    claude_only: bool,
+    budget: bool,
 ) -> None:
     """Start the Slack bridge (long-lived process)."""
     import logging as _logging
@@ -193,6 +205,11 @@ def slack_cmd(
         resolved_runtime = normalize_agent_runtime(agent_runtime)
     except ValueError as exc:
         raise click.BadParameter(str(exc), param_hint="--agent-runtime") from exc
+    if claude_only and resolved_runtime != "claude":
+        raise click.BadParameter(
+            "--claude-only can only be used with Claude as the primary runtime.",
+            param_hint="--claude-only",
+        )
 
     _logging.basicConfig(
         level=_logging.INFO,
@@ -208,6 +225,9 @@ def slack_cmd(
             workspace=workspace,
             mode=mode,
             agent_runtime=resolved_runtime,
+            agent_runtime_override=agent_runtime is not None,
+            single_agent_runtime=claude_only,
+            budget=budget,
         )
     )
 

@@ -170,7 +170,7 @@ class DiagnosisAndFixPhase(Phase):
                 task_id=f"fix-iter-{iteration + 1}",
                 summary=fix_result.summary,
                 failure_reason=(
-                    f"Bug still reproducible. Verification: {verification_text[:500]}"
+                    f"Bug still reproducible. Verification: {verification_text}"
                 ),
             )
             state.handover = to_str(handover)

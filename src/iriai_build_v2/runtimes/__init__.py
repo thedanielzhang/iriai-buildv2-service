@@ -30,6 +30,23 @@ def normalize_agent_runtime(name: str | None = None) -> AgentRuntimeName:
     return cast(AgentRuntimeName, resolved)
 
 
+def secondary_agent_runtime_name(
+    name: str | None = None,
+    *,
+    single_runtime: bool = False,
+) -> AgentRuntimeName:
+    """Return the secondary runtime paired with the selected primary runtime.
+
+    Claude primary still pairs with Codex for adversarial review.
+    Codex primary stays fully Codex-only by pairing with Codex again,
+    so no Claude runtime is instantiated behind the scenes.
+    """
+    primary = normalize_agent_runtime(name)
+    if single_runtime:
+        return primary
+    return "codex" if primary == "claude" else primary
+
+
 def create_agent_runtime(
     name: str | None,
     *,
@@ -61,4 +78,5 @@ __all__ = [
     "SUPPORTED_AGENT_RUNTIMES",
     "create_agent_runtime",
     "normalize_agent_runtime",
+    "secondary_agent_runtime_name",
 ]

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import contextvars
 import logging
 import os
+from contextlib import asynccontextmanager
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
@@ -15,6 +17,9 @@ if TYPE_CHECKING:
     from iriai_compose.workflow import Workspace
 
 logger = logging.getLogger(__name__)
+_current_invocation_var: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "claude_runtime_invocation_id", default=None,
+)
 
 
 # ── Write-isolation callback ───────────────────────────────────────────
@@ -146,6 +151,22 @@ class ClaudeAgentRuntime(AgentRuntime):
         self._session_sizes: dict[str, int] = {}  # session_key → actual byte count of full prompts/responses
         self._session_context: dict[str, str] = {}  # session_key → compressed context after cycle
         self._retry_depth: int = 0  # prevent infinite retry loops
+        self._invocation_activity: dict[str, Callable[[], None] | None] = {}
+        self._active_invocations: set[str] = set()
+
+    @asynccontextmanager
+    async def bind_invocation(self, invocation_id: str, activity_sink: Callable[[], None] | None):
+        token = _current_invocation_var.set(invocation_id)
+        self._invocation_activity[invocation_id] = activity_sink
+        try:
+            yield
+        finally:
+            _current_invocation_var.reset(token)
+            self._invocation_activity.pop(invocation_id, None)
+            self._active_invocations.discard(invocation_id)
+
+    def invocation_has_live_work(self, invocation_id: str) -> bool:
+        return invocation_id in self._active_invocations
 
     async def invoke(
         self,
@@ -256,7 +277,7 @@ class ClaudeAgentRuntime(AgentRuntime):
             turns = session.metadata.get("turns", [])
             turns.append({
                 "role": "assistant",
-                "text": result_text[:5000],
+                "text": result_text,
                 "turn": len(turns) + 1,
             })
             session.metadata["turns"] = turns
@@ -271,8 +292,8 @@ class ClaudeAgentRuntime(AgentRuntime):
                 "Structured output failed for %s. subtype=%s, result=%s, structured_output=%s",
                 output_type.__name__,
                 result_msg.subtype,
-                repr(result_msg.result)[:200] if result_msg.result else None,
-                repr(getattr(result_msg, "structured_output", None))[:200],
+                repr(result_msg.result) if result_msg.result else None,
+                repr(getattr(result_msg, "structured_output", None)),
             )
             # For ImplementationResult, synthesize a minimal result instead of
             # crashing — the agent likely did the work but ran out of budget
@@ -292,6 +313,27 @@ class ClaudeAgentRuntime(AgentRuntime):
                         if result_msg.result
                         else "Agent completed work but could not produce structured summary"
                     ),
+                )
+
+            from ..models.outputs import Verdict, Issue
+
+            if output_type is Verdict:
+                logger.warning(
+                    "Synthesizing rejected Verdict for %s — "
+                    "agent could not produce structured output",
+                    session_key,
+                )
+                return Verdict(
+                    approved=False,
+                    summary="Verdict could not be produced (structured output failed)",
+                    concerns=[Issue(
+                        severity="blocker",
+                        description=(
+                            f"Agent failed to produce structured Verdict after "
+                            f"multiple attempts. Last result: "
+                            f"{result_msg.result or 'empty'}"
+                        ),
+                    )],
                 )
 
             raise RuntimeError(
@@ -319,7 +361,7 @@ class ClaudeAgentRuntime(AgentRuntime):
             raise RuntimeError(
                 f"structured_output is None for {output_type.__name__} "
                 f"(session {session_key}) after retry. "
-                f"Result text: {repr(result_msg.result)[:300] if result_msg.result else 'empty'}"
+                f"Result text: {repr(result_msg.result) if result_msg.result else 'empty'}"
             )
 
         return output_type.model_validate(result_msg.structured_output)
@@ -328,14 +370,20 @@ class ClaudeAgentRuntime(AgentRuntime):
         """Ephemeral client, receive_response(). Original code path."""
         from claude_agent_sdk import ClaudeSDKClient
 
+        invocation_id = _current_invocation_var.get()
         async with ClaudeSDKClient(options=options) as client:
-            await client.query(prompt)
-            result_msg = None
-            async for msg in client.receive_response():
-                if self.on_message is not None:
-                    self.on_message(msg)
-                if isinstance(msg, ResultMessage):
-                    result_msg = msg
+                if invocation_id:
+                    self._active_invocations.add(invocation_id)
+                await client.query(prompt)
+                result_msg = None
+                try:
+                    async for msg in client.receive_response():
+                        self._emit_message(msg)
+                        if isinstance(msg, ResultMessage):
+                            result_msg = msg
+                finally:
+                    if invocation_id:
+                        self._active_invocations.discard(invocation_id)
         return result_msg
 
     async def _invoke_interactive(
@@ -345,8 +393,11 @@ class ClaudeAgentRuntime(AgentRuntime):
         from claude_agent_sdk import ClaudeSDKClient
 
         feature_id = session_key.rsplit(":", 1)[-1] if session_key else None
+        invocation_id = _current_invocation_var.get()
 
         async with ClaudeSDKClient(options=options) as client:
+            if invocation_id:
+                self._active_invocations.add(invocation_id)
             if session_key:
                 self._active_clients[session_key] = client
                 self._pending_counts[session_key] = 1
@@ -357,11 +408,12 @@ class ClaudeAgentRuntime(AgentRuntime):
                 await client.query(prompt)
                 result_msg = None
                 async for msg in client.receive_response():
-                    if self.on_message is not None:
-                        self.on_message(msg)
+                    self._emit_message(msg)
                     if isinstance(msg, ResultMessage):
                         result_msg = msg
             finally:
+                if invocation_id:
+                    self._active_invocations.discard(invocation_id)
                 if session_key:
                     self._active_clients.pop(session_key, None)
                     self._pending_counts.pop(session_key, None)
@@ -369,6 +421,15 @@ class ClaudeAgentRuntime(AgentRuntime):
                     self._feature_sessions.pop(feature_id, None)
 
         return result_msg
+
+    def _emit_message(self, msg: Any) -> None:
+        invocation_id = _current_invocation_var.get()
+        if invocation_id:
+            sink = self._invocation_activity.get(invocation_id)
+            if callable(sink):
+                sink()
+        if self.on_message is not None:
+            self.on_message(msg)
 
     async def inject_user_message(self, feature_id: str, text: str) -> bool:
         """Inject a user message into the active agent for a feature.

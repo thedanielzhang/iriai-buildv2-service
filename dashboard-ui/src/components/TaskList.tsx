@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, memo } from 'react'
 import type { Task } from '../types'
 
 export function TaskList({ tasks }: { tasks: Task[]; groupIndex: number }) {
@@ -9,7 +9,7 @@ export function TaskList({ tasks }: { tasks: Task[]; groupIndex: number }) {
   )
 }
 
-function TaskItem({ task }: { task: Task }) {
+const TaskItem = memo(function TaskItem({ task }: { task: Task }) {
   const [open, setOpen] = useState(false)
   const icon = task.status === 'complete' ? '✓' : task.status === 'in_progress' ? '◈' : '○'
 
@@ -62,4 +62,4 @@ function TaskItem({ task }: { task: Task }) {
       )}
     </div>
   )
-}
+})

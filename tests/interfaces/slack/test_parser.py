@@ -6,15 +6,15 @@ from iriai_build_v2.interfaces.slack.parser import ParsedRequest, parse_workflow
 class TestParseWorkflowRequest:
     def test_feature_tag(self):
         result = parse_workflow_request("[FEATURE] Add dark mode")
-        assert result == ParsedRequest("full-develop", "Add dark mode")
+        assert result == ParsedRequest("full-develop", "Add dark mode", None)
 
     def test_bug_tag(self):
-        result = parse_workflow_request("[BUG] Login page crash")
-        assert result == ParsedRequest("bugfix", "Login page crash")
+        result = parse_workflow_request("[BUG] beced7b1")
+        assert result == ParsedRequest("bugfix-v2", "beced7b1", "beced7b1")
 
     def test_plan_tag(self):
         result = parse_workflow_request("[PLAN] API redesign")
-        assert result == ParsedRequest("planning", "API redesign")
+        assert result == ParsedRequest("planning", "API redesign", None)
 
     def test_case_insensitive(self):
         result = parse_workflow_request("[feature] lowercase works")
@@ -53,3 +53,22 @@ class TestParseWorkflowRequest:
         result = parse_workflow_request("[FEATURE] Add [beta] mode")
         assert result is not None
         assert result.feature_name == "Add [beta] mode"
+
+    def test_bug_tag_sets_source_feature_id(self):
+        result = parse_workflow_request("[bug] 04ff5ee5 ")
+        assert result is not None
+        assert result.workflow_name == "bugfix-v2"
+        assert result.source_feature_id == "04ff5ee5"
+
+    def test_bug_tag_extracts_source_feature_id_from_bold_slack_formatting(self):
+        result = parse_workflow_request("[BUG] *beced7b1*")
+        assert result is not None
+        assert result.workflow_name == "bugfix-v2"
+        assert result.feature_name == "*beced7b1*"
+        assert result.source_feature_id == "beced7b1"
+
+    def test_bug_tag_extracts_source_feature_id_from_code_slack_formatting(self):
+        result = parse_workflow_request("[BUG] `beced7b1`")
+        assert result is not None
+        assert result.workflow_name == "bugfix-v2"
+        assert result.source_feature_id == "beced7b1"

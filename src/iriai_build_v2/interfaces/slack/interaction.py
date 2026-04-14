@@ -10,9 +10,18 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
+from uuid import uuid4
 
 from iriai_compose.runner import InteractionRuntime
+from iriai_compose.tasks import Ask, Select
+
+try:
+    from iriai_compose.prompts import Confirm
+except Exception:  # pragma: no cover - older iriai_compose versions
+    class Confirm:  # type: ignore[no-redef]
+        pass
 
 from .cards import ApproveCard, ChooseCard, RespondCard, build_modal_view
 from .helpers import build_resolved_blocks, split_mrkdwn_blocks
@@ -23,6 +32,18 @@ if TYPE_CHECKING:
     from .adapter import SlackAdapter
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(slots=True)
+class _SlackPending:
+    """Compatibility wrapper for both old Pending and new Ask-based runtimes."""
+
+    id: str
+    kind: str
+    prompt: str
+    feature_id: str
+    phase_name: str
+    options: list[str] | None = None
 
 
 class SlackInteractionRuntime(InteractionRuntime):
@@ -45,8 +66,14 @@ class SlackInteractionRuntime(InteractionRuntime):
         self._pending_options: dict[str, list[str]] = {}
         # pending_id → (channel, message_ts) for updating card on resolution
         self._pending_messages: dict[str, tuple[str, str]] = {}
+        # pending_id → thread_ts for the posted card, if any
+        self._pending_threads: dict[str, str | None] = {}
         # pending_id → feature_id for turn persistence
         self._pending_features: dict[str, str] = {}
+        # pending_id → whether to persist user turns back into an agent session
+        self._pending_persist: dict[str, bool] = {}
+        # pending_id → runtime instance whose active session should receive the user turn
+        self._pending_agent_runtimes: dict[str, Any] = {}
         # feature_id ↔ channel bidirectional mapping
         self._feature_channels: dict[str, str] = {}
         self._channel_features: dict[str, str] = {}
@@ -76,7 +103,34 @@ class SlackInteractionRuntime(InteractionRuntime):
             for pid in self._pending_futures
         )
 
+    def make_thread_runtime(
+        self,
+        *,
+        feature_id: str,
+        channel: str,
+        thread_ts: str,
+        persist_turns: bool = False,
+        agent_runtime: Any = None,
+    ) -> SlackThreadInteractionRuntime:
+        """Return a wrapper runtime that posts cards into a fixed Slack thread."""
+        return SlackThreadInteractionRuntime(
+            root=self,
+            feature_id=feature_id,
+            channel=channel,
+            thread_ts=thread_ts,
+            persist_turns=persist_turns,
+            agent_runtime=agent_runtime,
+        )
+
     # ── InteractionRuntime.resolve() ──────────────────────────────────────
+
+    async def ask(self, task: Ask, **kwargs: Any) -> str | bool:
+        pending = _pending_from_task(
+            task,
+            feature_id=str(kwargs.get("feature_id", "") or ""),
+            phase_name=str(kwargs.get("phase_name", "") or ""),
+        )
+        return await self.resolve(pending)
 
     async def resolve(self, pending: Pending) -> str | bool:
         channel = self._feature_channels.get(pending.feature_id)
@@ -84,6 +138,23 @@ class SlackInteractionRuntime(InteractionRuntime):
             raise RuntimeError(
                 f"No Slack channel registered for feature {pending.feature_id}"
             )
+        return await self._resolve_with_target(
+            pending,
+            channel=channel,
+            thread_ts=None,
+            persist_turns=True,
+        )
+
+    async def _resolve_with_target(
+        self,
+        pending: Pending,
+        *,
+        channel: str,
+        thread_ts: str | None,
+        persist_turns: bool,
+        agent_runtime: Any | None = None,
+    ) -> str | bool:
+        """Resolve a pending interaction against a specific Slack target."""
 
         # Don't block on empty-question Envelopes — let the Interview
         # continue without user input so the agent gets another turn.
@@ -94,13 +165,16 @@ class SlackInteractionRuntime(InteractionRuntime):
         future: asyncio.Future[str | bool] = loop.create_future()
         self._pending_futures[pending.id] = future
         self._pending_features[pending.id] = pending.feature_id
+        self._pending_persist[pending.id] = persist_turns
+        self._pending_threads[pending.id] = thread_ts
+        self._pending_agent_runtimes[pending.id] = agent_runtime
 
         if pending.kind == "approve":
-            await self._post_approve(pending, channel)
+            await self._post_approve(pending, channel, thread_ts=thread_ts)
         elif pending.kind == "choose":
-            await self._post_choose(pending, channel)
+            await self._post_choose(pending, channel, thread_ts=thread_ts)
         else:  # respond
-            await self._post_respond(pending, channel)
+            await self._post_respond(pending, channel, thread_ts=thread_ts)
 
         try:
             result = await future
@@ -109,6 +183,9 @@ class SlackInteractionRuntime(InteractionRuntime):
             self._pending_options.pop(pending.id, None)
             self._pending_messages.pop(pending.id, None)
             self._pending_features.pop(pending.id, None)
+            self._pending_persist.pop(pending.id, None)
+            self._pending_threads.pop(pending.id, None)
+            self._pending_agent_runtimes.pop(pending.id, None)
 
         return result
 
@@ -306,7 +383,13 @@ class SlackInteractionRuntime(InteractionRuntime):
 
     # ── Post Helpers ──────────────────────────────────────────────────────
 
-    async def _post_respond(self, pending: Pending, channel: str) -> None:
+    async def _post_respond(
+        self,
+        pending: Pending,
+        channel: str,
+        *,
+        thread_ts: str | None = None,
+    ) -> None:
         """Post an Interview question card with options + inline text input + Expand.
 
         If the question exceeds Slack's 3000-char section limit, the full
@@ -319,7 +402,12 @@ class SlackInteractionRuntime(InteractionRuntime):
         if len(full_text) > 2900:
             # Post full content as context message(s) — no truncation
             context_blocks = split_mrkdwn_blocks(full_text)
-            await self._adapter.post_blocks(channel, context_blocks, question[:100])
+            await self._adapter.post_blocks(
+                channel,
+                context_blocks,
+                question[:100],
+                thread_ts=thread_ts,
+            )
 
             # Post compact interactive card with just the buttons
             short_q = question[:200] + "..." if len(question) > 200 else question
@@ -338,12 +426,23 @@ class SlackInteractionRuntime(InteractionRuntime):
             )
 
         blocks = card.build_blocks()
-        ts = await self._adapter.post_blocks(channel, blocks, question[:100])
+        ts = await self._adapter.post_blocks(
+            channel,
+            blocks,
+            question[:100],
+            thread_ts=thread_ts,
+        )
         self._pending_messages[pending.id] = (channel, ts)
         if options:
             self._pending_options[pending.id] = options
 
-    async def _post_approve(self, pending: Pending, channel: str) -> None:
+    async def _post_approve(
+        self,
+        pending: Pending,
+        channel: str,
+        *,
+        thread_ts: str | None = None,
+    ) -> None:
         """Post a Gate approval card with buttons + feedback modal.
 
         If the context exceeds Slack's 3000-char section limit, the full
@@ -358,7 +457,12 @@ class SlackInteractionRuntime(InteractionRuntime):
 
         if len(full_text) > 2900:
             context_blocks = split_mrkdwn_blocks(full_text)
-            await self._adapter.post_blocks(channel, context_blocks, "Approval Required")
+            await self._adapter.post_blocks(
+                channel,
+                context_blocks,
+                "Approval Required",
+                thread_ts=thread_ts,
+            )
             # Compact card with just title + URLs + buttons
             card = ApproveCard(
                 pending_id=pending.id,
@@ -375,10 +479,21 @@ class SlackInteractionRuntime(InteractionRuntime):
             )
 
         blocks = card.build_blocks()
-        ts = await self._adapter.post_blocks(channel, blocks, "Approval Required")
+        ts = await self._adapter.post_blocks(
+            channel,
+            blocks,
+            "Approval Required",
+            thread_ts=thread_ts,
+        )
         self._pending_messages[pending.id] = (channel, ts)
 
-    async def _post_choose(self, pending: Pending, channel: str) -> None:
+    async def _post_choose(
+        self,
+        pending: Pending,
+        channel: str,
+        *,
+        thread_ts: str | None = None,
+    ) -> None:
         """Post a Choose selection card with one button per option."""
         question, _ = _extract_question(pending.prompt)
         options_list = pending.options or []
@@ -389,7 +504,12 @@ class SlackInteractionRuntime(InteractionRuntime):
             options=options_list,
         )
         blocks = card.build_blocks()
-        ts = await self._adapter.post_blocks(channel, blocks, question[:100])
+        ts = await self._adapter.post_blocks(
+            channel,
+            blocks,
+            question[:100],
+            thread_ts=thread_ts,
+        )
         self._pending_messages[pending.id] = (channel, ts)
         if options_list:
             self._pending_options[pending.id] = options_list
@@ -414,12 +534,20 @@ class SlackInteractionRuntime(InteractionRuntime):
             future.set_result(value)
 
         # Persist user turn for mid-interview resume
-        if isinstance(value, str) and self._session_store and self._agent_runtime:
+        should_persist = self._pending_persist.get(pending_id, True)
+        if (
+            should_persist
+            and isinstance(value, str)
+            and self._session_store
+        ):
             feature_id = self._pending_features.get(pending_id)
             if feature_id:
                 try:
                     loop = asyncio.get_running_loop()
-                    loop.create_task(self._persist_user_turn(feature_id, value))
+                    agent_runtime = self._pending_agent_runtimes.get(pending_id) or self._agent_runtime
+                    loop.create_task(
+                        self._persist_user_turn(feature_id, value, agent_runtime=agent_runtime)
+                    )
                 except RuntimeError:
                     pass
 
@@ -438,17 +566,25 @@ class SlackInteractionRuntime(InteractionRuntime):
             except RuntimeError:
                 pass
 
-    async def _persist_user_turn(self, feature_id: str, text: str) -> None:
+    async def _persist_user_turn(
+        self,
+        feature_id: str,
+        text: str,
+        *,
+        agent_runtime: Any | None,
+    ) -> None:
         """Persist a user turn to session metadata for mid-interview resume."""
         try:
-            session_key = self._agent_runtime.get_active_session_key(feature_id)
+            if not agent_runtime:
+                return
+            session_key = agent_runtime.get_active_session_key(feature_id)
             if not session_key:
                 return
             session = await self._session_store.load(session_key)
             if not session:
                 return
             turns = session.metadata.get("turns", [])
-            turns.append({"role": "user", "text": text[:5000], "turn": len(turns) + 1})
+            turns.append({"role": "user", "text": text, "turn": len(turns) + 1})
             session.metadata["turns"] = turns
             await self._session_store.save(session)
         except Exception:
@@ -463,6 +599,45 @@ class SlackInteractionRuntime(InteractionRuntime):
             await self._adapter.update_message(channel, ts, blocks=blocks, text=f"Resolved: {display}")
         except Exception:
             logger.exception("Failed to update card to resolved state")
+
+
+class SlackThreadInteractionRuntime(InteractionRuntime):
+    """Wrapper runtime that posts all interactions into a fixed Slack thread."""
+
+    def __init__(
+        self,
+        *,
+        root: SlackInteractionRuntime,
+        feature_id: str,
+        channel: str,
+        thread_ts: str,
+        persist_turns: bool = False,
+        agent_runtime: Any = None,
+    ) -> None:
+        self.name = f"terminal.thread.{thread_ts}"
+        self._root = root
+        self._feature_id = feature_id
+        self._channel = channel
+        self._thread_ts = thread_ts
+        self._persist_turns = persist_turns
+        self._agent_runtime = agent_runtime
+
+    async def ask(self, task: Ask, **kwargs: Any) -> str | bool:
+        pending = _pending_from_task(
+            task,
+            feature_id=self._feature_id,
+            phase_name=str(kwargs.get("phase_name", "") or ""),
+        )
+        return await self.resolve(pending)
+
+    async def resolve(self, pending: Pending) -> str | bool:
+        return await self._root._resolve_with_target(
+            pending,
+            channel=self._channel,
+            thread_ts=self._thread_ts,
+            persist_turns=self._persist_turns,
+            agent_runtime=self._agent_runtime,
+        )
 
 
 def _extract_gate_info(prompt: str) -> tuple[str, list[str]]:
@@ -515,6 +690,29 @@ def _has_question(prompt: str) -> bool:
     if not isinstance(data, dict):
         return True
     return bool(data.get("question"))
+
+
+def _pending_from_task(task: Ask, *, feature_id: str, phase_name: str) -> _SlackPending:
+    kind, options = _pending_kind_and_options(task)
+    return _SlackPending(
+        id=str(uuid4()),
+        kind=kind,
+        prompt=task.prompt,
+        feature_id=feature_id,
+        phase_name=phase_name,
+        options=options,
+    )
+
+
+def _pending_kind_and_options(task: Ask) -> tuple[str, list[str] | None]:
+    if isinstance(task.input, Select):
+        options = list(task.input.options)
+        if options == ["Approve", "Reject", "Give feedback"]:
+            return "approve", options
+        return "choose", options
+    if isinstance(task.input, Confirm):
+        return "approve", ["Approve", "Reject"]
+    return "respond", None
 
 
 def _extract_question(prompt: str) -> tuple[str, list[str]]:

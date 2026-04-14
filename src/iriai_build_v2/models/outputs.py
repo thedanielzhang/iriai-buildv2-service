@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Generic, TypeVar
+from typing import Generic, Literal, TypeVar
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -91,6 +91,32 @@ class ReviewerComments(BaseModel):
     verdict: str = ""  # convinced | not_convinced
     reasoning: str = ""
     concerns: list[str] = Field(default_factory=list)
+
+
+class EvidenceArtifact(BaseModel):
+    """A single proof artifact captured during reproduce/verify work."""
+
+    kind: str
+    label: str = ""
+    role: str = ""  # trigger | response | postcondition | supporting
+    source: str = ""  # playwright | api | database | logs | repo | other
+    local_path: str = ""
+    public_url: str = ""
+    mime_type: str = ""
+    excerpt: str = ""
+
+
+class EvidenceBundle(BaseModel):
+    """Structured proof attached to reproduction and verification outcomes."""
+
+    ui_involved: bool = False
+    evidence_modes: list[str] = Field(default_factory=list)
+    summary: str = ""
+    steps_executed: list[str] = Field(default_factory=list)
+    environment_notes: str = ""
+    principal_context: str = ""
+    state_change: bool = False
+    artifacts: list[EvidenceArtifact] = Field(default_factory=list)
 
 
 # ── Structured planning sub-models (traceability) ───────────────────────────
@@ -410,6 +436,7 @@ class RevisionRequest(BaseModel):
         default_factory=list
     )  # prd, design, plan, system-design — empty = all types
     affected_requirement_ids: list[str] = Field(default_factory=list)
+    severity: Literal["blocker", "major", "minor", "nit", ""] = ""
     cross_subfeature: bool = False  # true if the change spans multiple subfeatures
 
 
@@ -659,6 +686,7 @@ class Verdict(BaseModel):
     suggestions: list[str] = Field(default_factory=list)
     checks: list[Check] = Field(default_factory=list)
     gaps: list[Gap] = Field(default_factory=list)
+    proof: EvidenceBundle | None = None
 
 
 # ── Generic envelope for Interview phases ────────────────────────────────────
@@ -855,6 +883,37 @@ class FindingLedger(BaseModel):
     cycle: int = 0
 
 
+# ── Gate review ledger ─────────────────────────────────────────────────────
+
+
+class GateReviewFinding(BaseModel):
+    """A single finding tracked across gate review cycles."""
+
+    id: str  # "GF-001", "GF-002"
+    source: str  # artifact_prefix: "prd", "design", etc.
+    description: str  # from RevisionRequest.description
+    reasoning: str = ""  # from RevisionRequest.reasoning
+    affected_subfeatures: list[str] = Field(default_factory=list)
+    severity: str = ""  # blocker | major | minor | nit
+    status: str = "open"  # open | fix_attempted | resolved | wont_fix
+    cycle_introduced: int = 0
+    cycle_resolved: int = 0
+    revision_attempts: list[str] = Field(default_factory=list)
+
+
+class GateReviewLedger(BaseModel):
+    """Accumulated findings across gate review cycles for one artifact type."""
+
+    findings: list[GateReviewFinding] = Field(default_factory=list)
+    cycle: int = 0
+
+
+class SeverityClassification(BaseModel):
+    """Output of the Haiku severity classifier for revision requests."""
+
+    severities: list[Literal["blocker", "major", "minor", "nit"]] = Field(default_factory=list)
+
+
 # ── Enhancement backlog ─────────────────────────────────────────────────────
 
 
@@ -874,6 +933,36 @@ class EnhancementBacklog(BaseModel):
     """Accumulated non-blocking findings across all tasks for a feature."""
 
     items: list[EnhancementItem] = Field(default_factory=list)
+
+
+class EnhancementRepoTask(BaseModel):
+    """A group of enhancement items assigned to a specific repo."""
+
+    repo_path: str = Field(
+        description="Workspace-relative repo path (e.g. 'iriai-compose', 'tools/compose/backend').",
+    )
+    item_indices: list[int] = Field(
+        description="0-based indices into the enhancement backlog items list.",
+    )
+    summary: str = Field(
+        description="One-line summary of what this repo task covers.",
+    )
+
+
+class EnhancementDecomposition(BaseModel):
+    """Opus-generated decomposition of the enhancement backlog into per-repo tasks."""
+
+    tasks: list[EnhancementRepoTask] = Field(
+        description="Per-repo task groups. Every backlog item index must appear in exactly one task.",
+    )
+    already_resolved: list[int] = Field(
+        default_factory=list,
+        description=(
+            "Indices of items that are likely already resolved by subsequent "
+            "implementation groups and can be skipped. The implementer will "
+            "still verify these are truly resolved."
+        ),
+    )
 
 
 # ── Handover document ────────────────────────────────────────────────────────
@@ -923,7 +1012,7 @@ class HandoverDoc(BaseModel):
         self.completed = self.completed[-keep_recent:]
 
         old_text = "\n".join(
-            f"- {t.task_id}: {t.summary} (files: {', '.join(t.files_changed[:5])})"
+            f"- {t.task_id}: {t.summary} (files: {', '.join(t.files_changed)})"
             for t in old
         )
         self.summary_of_prior_work += (
@@ -994,6 +1083,7 @@ class ReproductionResult(BaseModel):
     observations: list[str] = Field(default_factory=list)
     error_messages: list[str] = Field(default_factory=list)
     summary: str
+    proof: EvidenceBundle | None = None
 
 
 class RootCauseAnalysis(BaseModel):
@@ -1009,6 +1099,31 @@ class RootCauseAnalysis(BaseModel):
     prior_attempt_analysis: str = ""  # what was tried before and why it failed
 
 
+class RepairStrategyDecision(BaseModel):
+    """Agent-chosen convergence strategy for the next bugfix attempt."""
+
+    strategy_mode: Literal[
+        "ordinary_retry",
+        "minimize_counterexample",
+        "broaden_scope",
+        "contract_reconciliation",
+        "human_attention",
+    ]
+    reasoning: str
+    stable_blockers: list[Issue] = Field(default_factory=list)
+    new_blockers: list[Issue] = Field(default_factory=list)
+    failing_checks: list[Check] = Field(default_factory=list)
+    stable_failure_family: str = ""
+    bundle_summary: str = ""
+    scope_expansion: list[str] = Field(default_factory=list)
+    required_files: list[str] = Field(default_factory=list)
+    required_checks: list[str] = Field(default_factory=list)
+    required_evidence_modes: list[str] = Field(default_factory=list)
+    similar_cluster_hints: list[str] = Field(default_factory=list)
+    merge_recommendation: Literal["none", "retriage", "merge_candidate"] = "none"
+    why_not_ordinary_retry: str = ""
+
+
 class FeatureLeadVerdict(BaseModel):
     """Structured output for feature lead gate reviews."""
 
@@ -1018,3 +1133,30 @@ class FeatureLeadVerdict(BaseModel):
     cross_team_surface: list[CrossTeamInterface] = Field(default_factory=list)
     deviations: list[Deviation] = Field(default_factory=list)
     reviewer_comments: ReviewerComments = Field(default_factory=ReviewerComments)
+
+
+# ── Post-test observations ─────────────────────────────────────────────────
+
+
+class Observation(BaseModel):
+    """A single post-test observation from the user."""
+
+    id: str  # OBS-1, OBS-2, ...
+    category: str  # bug | missing_test | clarification | requirement
+    severity: str  # blocker | major | minor
+    title: str
+    description: str
+    affected_area: str = ""  # component/file area for grouping
+    steps_to_reproduce: list[str] = Field(default_factory=list)
+    expected_behavior: str = ""
+    decision: str = ""  # clarifications only: user's chosen direction
+    ui_involved: bool = False
+    evidence_modes: list[str] = Field(default_factory=list)
+
+
+class ObservationReport(BaseModel):
+    """Categorized backlog from post-test observation interview."""
+
+    observations: list[Observation] = Field(default_factory=list)
+    summary: str = ""
+    complete: bool = False

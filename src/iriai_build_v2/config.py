@@ -6,6 +6,8 @@ DATABASE_URL = os.environ.get(
     "postgresql://danielzhang@localhost:5431/iriai_build_v2",
 )
 
+DASHBOARD_BASE_URL = os.environ.get("IRIAI_DASHBOARD_BASE_URL", "").rstrip("/")
+
 BUDGET_TIERS = {
     "sonnet": "claude-sonnet-4-6",
     "opus": "claude-opus-4-6",

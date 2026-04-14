@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import json
+from contextlib import asynccontextmanager
 from typing import Any
 
 import asyncpg
@@ -92,6 +94,20 @@ class PostgresFeatureStore:
         )
         return [dict(row) for row in rows]
 
+    @asynccontextmanager
+    async def advisory_lock(self, feature_id: str, name: str):
+        """Hold a transaction-scoped advisory lock for the duration of a block."""
+        conn = await self._pool.acquire()
+        tx = conn.transaction()
+        await tx.start()
+        try:
+            lock_key = _advisory_lock_key(feature_id, name)
+            await conn.execute("SELECT pg_advisory_xact_lock($1)", lock_key)
+            yield conn
+        finally:
+            await tx.rollback()
+            await self._pool.release(conn)
+
 
 def _row_to_feature(row: asyncpg.Record) -> Feature:
     meta = row["metadata"]
@@ -107,3 +123,11 @@ def _row_to_feature(row: asyncpg.Record) -> Feature:
         workspace_id=row["workspace_id"],
         metadata=metadata,
     )
+
+
+def _advisory_lock_key(feature_id: str, name: str) -> int:
+    digest = hashlib.blake2b(
+        f"{feature_id}:{name}".encode("utf-8"),
+        digest_size=8,
+    ).digest()
+    return int.from_bytes(digest, byteorder="big", signed=True)

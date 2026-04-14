@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, memo } from 'react'
 import type { EventEntry } from '../types'
 import { relTime } from '../utils'
 
@@ -12,7 +12,7 @@ export function EventLog({ events }: { events: EventEntry[] }) {
   )
 }
 
-function EventRow({ event }: { event: EventEntry }) {
+const EventRow = memo(function EventRow({ event }: { event: EventEntry }) {
   const [expanded, setExpanded] = useState(false)
   const needsTruncation = event.content.length > 80
 
@@ -25,7 +25,7 @@ function EventRow({ event }: { event: EventEntry }) {
       <span>{relTime(event.created_at)}</span>
       <span>{event.event_type}</span>
       <span>{event.source}</span>
-      <span>{expanded ? event.content : event.content.slice(0, 80)}{!expanded && needsTruncation ? '…' : ''}</span>
+      <span>{expanded ? event.content : event.content.slice(0, 80)}{!expanded && needsTruncation ? '...' : ''}</span>
     </div>
   )
-}
+})

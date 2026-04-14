@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeVar
 
 from pydantic import BaseModel
@@ -20,6 +21,36 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 T = TypeVar("T", bound=BaseModel)
+
+# ── Prompt offloading ────────────────────────────────────────────────────────
+
+PROMPT_FILE_THRESHOLD = 100_000  # chars — offload to files above this
+
+
+def _offload_if_large(
+    prompt: str,
+    context_base: Path | None,
+    label: str,
+) -> str:
+    """Write *prompt* to a file if it exceeds the threshold, returning a
+    compact Read-pointer prompt.  If the prompt is small enough or there
+    is no writable *context_base*, returns *prompt* unchanged.
+    """
+    if len(prompt) <= PROMPT_FILE_THRESHOLD or context_base is None:
+        return prompt
+    context_dir = context_base / ".iriai-context"
+    context_dir.mkdir(parents=True, exist_ok=True)
+    file_name = f"{label}.md"
+    file_path = context_dir / file_name
+    file_path.write_text(prompt, encoding="utf-8")
+    rel_path = f".iriai-context/{file_name}"
+    logger.info(
+        "Prompt offloaded to %s (%d chars)", rel_path, len(prompt),
+    )
+    return (
+        f"Your full task prompt is in `{rel_path}` ({len(prompt)} chars).\n"
+        f"**Read that file** before proceeding."
+    )
 
 
 async def get_existing_artifact(
@@ -912,6 +943,287 @@ async def _extract_revision_plan(
     return result
 
 
+# ── Gate review convergence tracking ──────────────────────────────────────
+
+
+DEFERRABLE_SEVERITIES = frozenset({"minor", "nit"})  # only these get deferred
+
+
+def _text_overlap(a: str, b: str) -> float:
+    """Word-level Jaccard similarity between two strings."""
+    words_a = set(a.lower().split())
+    words_b = set(b.lower().split())
+    if not words_a or not words_b:
+        return 0.0
+    return len(words_a & words_b) / len(words_a | words_b)
+
+
+async def _load_gate_ledger(
+    runner: WorkflowRunner, feature: Feature, artifact_prefix: str,
+) -> Any:  # GateReviewLedger
+    """Load the gate review ledger for an artifact type."""
+    from ...models.outputs import GateReviewLedger
+
+    raw = await runner.artifacts.get(
+        f"gate-review-ledger:{artifact_prefix}", feature=feature,
+    )
+    if raw:
+        try:
+            return GateReviewLedger.model_validate_json(raw)
+        except Exception:
+            logger.warning("Failed to parse gate review ledger for %s — starting fresh", artifact_prefix)
+    return GateReviewLedger()
+
+
+async def _save_gate_ledger(
+    runner: WorkflowRunner, feature: Feature,
+    ledger: Any, artifact_prefix: str,
+) -> None:
+    """Save the gate review ledger."""
+    await runner.artifacts.put(
+        f"gate-review-ledger:{artifact_prefix}",
+        ledger.model_dump_json(), feature=feature,
+    )
+
+
+def _dedup_revision_requests(
+    plan: Any, ledger: Any, source: str,
+) -> tuple[Any, list]:  # (RevisionPlan, list[GateReviewFinding])
+    """Remove revision requests that match resolved ledger entries.
+
+    Returns (filtered_plan, suppressed_findings).
+    """
+    resolved = [
+        f for f in ledger.findings
+        if f.status == "resolved" and f.source == source
+    ]
+    if not resolved:
+        return plan, []
+
+    new_requests = []
+    suppressed = []
+    for req in plan.requests:
+        is_dup = False
+        for r in resolved:
+            if _text_overlap(req.description, r.description) > 0.5:
+                is_dup = True
+                suppressed.append(r)
+                break
+        if not is_dup:
+            new_requests.append(req)
+
+    filtered = plan.model_copy(update={"requests": new_requests})
+    return filtered, suppressed
+
+
+def _update_gate_ledger(
+    ledger: Any, plan: Any, source: str, cycle: int,
+) -> Any:  # GateReviewLedger
+    """Update ledger: mark resolved findings, add new ones, track attempts.
+
+    Mirrors implementation.py _update_ledger() logic.
+    """
+    from ...models.outputs import GateReviewFinding
+
+    current_descs = {r.description for r in plan.requests}
+
+    # Mark previously-open findings as resolved if absent from current plan
+    for f in ledger.findings:
+        if f.source == source and f.status in ("open", "fix_attempted"):
+            if not any(_text_overlap(f.description, d) > 0.5 for d in current_descs):
+                f.status = "resolved"
+                f.cycle_resolved = cycle
+
+    # Track attempts on existing open findings, add new findings
+    existing_descs = {f.description for f in ledger.findings}
+    next_id = len(ledger.findings) + 1
+
+    for req in plan.requests:
+        # Check if this matches an existing open finding
+        matched = False
+        for f in ledger.findings:
+            if f.source == source and f.status in ("open", "fix_attempted") and \
+               _text_overlap(req.description, f.description) > 0.5:
+                f.status = "fix_attempted"
+                f.revision_attempts.append(f"cycle-{cycle}: {req.description}")
+                matched = True
+                break
+
+        if not matched and req.description not in existing_descs:
+            ledger.findings.append(GateReviewFinding(
+                id=f"GF-{next_id:03d}",
+                source=source,
+                description=req.description,
+                reasoning=req.reasoning,
+                affected_subfeatures=req.affected_subfeatures,
+                severity=req.severity,
+                status="open",
+                cycle_introduced=cycle,
+            ))
+            next_id += 1
+
+    ledger.cycle = cycle
+    return ledger
+
+
+async def _classify_revision_severity(
+    runner: WorkflowRunner, feature: Feature,
+    phase_name: str, plan: Any,
+) -> Any:  # RevisionPlan
+    """Classify severity of revision requests via Haiku.
+
+    Only classifies requests where severity is empty.
+    """
+    unclassified = [r for r in plan.requests if not r.severity]
+    if not unclassified:
+        return plan
+
+    descriptions = "\n".join(
+        f"{i+1}. {r.description}" for i, r in enumerate(unclassified)
+    )
+
+    from iriai_compose.actors import Role
+
+    classifier_role = Role(
+        name="severity-classifier",
+        prompt=(
+            "You classify revision requests by severity. "
+            "blocker = factual error, missing requirement, spec contradiction. "
+            "major = significant gap, unclear spec, structural issue. "
+            "minor = style, formatting, wording improvement. "
+            "nit = cosmetic, optional preference."
+        ),
+        tools=[],
+        model="claude-haiku-4-5-20251001",
+        effort="low",
+    )
+
+    from ...models.outputs import SeverityClassification
+
+    try:
+        result = await runner.run(
+            Ask(
+                actor=AgentActor(name="severity-classifier", role=classifier_role),
+                prompt=(
+                    f"Classify each revision request as blocker, major, minor, or nit.\n\n"
+                    f"{descriptions}\n\n"
+                    f"Return a list of severity strings, one per request, in the same order."
+                ),
+                output_type=SeverityClassification,
+            ),
+            feature,
+            phase_name=phase_name,
+        )
+        severities = result.severities if hasattr(result, "severities") else []
+    except Exception:
+        logger.warning("Severity classification failed — defaulting to blocker", exc_info=True)
+        severities = []
+
+    # Apply classifications back to the unclassified requests
+    for i, req in enumerate(unclassified):
+        if i < len(severities) and severities[i] in ("blocker", "major", "minor", "nit"):
+            req.severity = severities[i]
+        else:
+            req.severity = "blocker"  # conservative default
+
+    return plan
+
+
+def _partition_revision_plan(
+    plan: Any, source: str,
+) -> tuple[Any, list]:  # (RevisionPlan, list[RevisionRequest])
+    """Split revision plan into blocking and deferred requests.
+
+    Only ``minor`` and ``nit`` are deferred.  Everything else — including
+    unknown/non-standard severity values — is treated as blocking.
+    """
+    deferred = [r for r in plan.requests if r.severity in DEFERRABLE_SEVERITIES]
+    blocking = [r for r in plan.requests if r.severity not in DEFERRABLE_SEVERITIES]
+
+    filtered = plan.model_copy(update={"requests": blocking})
+    return filtered, deferred
+
+
+async def _append_gate_enhancements(
+    runner: WorkflowRunner, feature: Feature,
+    items: list, artifact_prefix: str,
+) -> None:
+    """Append deferred revision requests to the gate enhancement backlog."""
+    if not items:
+        return
+
+    from ...models.outputs import EnhancementBacklog, EnhancementItem
+
+    key = f"gate-enhancement-backlog:{artifact_prefix}"
+    raw = await runner.artifacts.get(key, feature=feature)
+    if raw:
+        try:
+            backlog = EnhancementBacklog.model_validate_json(raw)
+        except Exception:
+            backlog = EnhancementBacklog()
+    else:
+        backlog = EnhancementBacklog()
+
+    existing_descs = [i.description for i in backlog.items]
+    new_items = []
+    for req in items:
+        if req.description in existing_descs:
+            continue
+        if any(_text_overlap(req.description, d) > 0.5 for d in existing_descs):
+            continue
+        new_items.append(EnhancementItem(
+            source=artifact_prefix,
+            severity=req.severity or "minor",
+            description=req.description,
+            task_context=f"gate-review:{artifact_prefix}",
+        ))
+        existing_descs.append(req.description)
+
+    if not new_items:
+        return
+    backlog.items.extend(new_items)
+    await runner.artifacts.put(key, backlog.model_dump_json(), feature=feature)
+    logger.info(
+        "Gate enhancement backlog (%s): +%d items, %d dupes skipped (total: %d)",
+        artifact_prefix, len(new_items), len(items) - len(new_items), len(backlog.items),
+    )
+
+
+def _build_prior_revision_context(
+    ledger: Any, cycle: int, context_base: Any = None,
+) -> str:
+    """Build markdown of prior review history for the gate reviewer.
+
+    No truncation — all findings are included with full descriptions.
+    If the result exceeds the prompt file threshold, offloads to a file.
+    """
+    from pathlib import Path
+
+    if not ledger.findings:
+        return ""
+
+    resolved = [f for f in ledger.findings if f.status == "resolved"]
+    open_findings = [f for f in ledger.findings if f.status in ("open", "fix_attempted")]
+
+    parts = [f"\n\n## Prior Review History (cycle {cycle}, {len(ledger.findings)} findings tracked)\n"]
+
+    if resolved:
+        parts.append(f"### Resolved ({len(resolved)}) — do NOT re-raise these")
+        for f in resolved:
+            parts.append(f"- ~~{f.id}: {f.description}~~ (resolved cycle {f.cycle_resolved})")
+
+    if open_findings:
+        parts.append(f"\n### Still Open ({len(open_findings)})")
+        for f in open_findings:
+            attempts = f", {len(f.revision_attempts)} prior attempts" if f.revision_attempts else ""
+            parts.append(f"- {f.id}: {f.description} [{f.severity or 'unclassified'}]{attempts}")
+
+    result = "\n".join(parts)
+
+    base = Path(context_base) if context_base else None
+    return _offload_if_large(result, base, "gate-review-history")
+
+
 async def compile_artifacts(
     runner: WorkflowRunner,
     feature: Feature,
@@ -1026,6 +1338,7 @@ async def interview_gate_review(
     context_keys: list[str] | None = None,
     additional_urls: dict[str, str] | None = None,
     post_compile: Callable[[], Awaitable[None]] | None = None,
+    warn_after_cycles: int = 3,
 ) -> str:
     """Interview-based gate review. Replaces gate_and_revise for compiled artifacts.
 
@@ -1034,6 +1347,12 @@ async def interview_gate_review(
     2. If changes requested: produce RevisionPlan, route to affected subfeature agents
     3. Re-compile and re-present
     4. Loop until user approves
+
+    Convergence tracking (mirrors implementation.py verify/fix cycle):
+    - GateReviewLedger tracks findings across review cycles
+    - Dedup suppresses re-raised issues that were already resolved
+    - Severity classification defers minor/nit requests to enhancement backlog
+    - Prior revision context injected into reviewer prompt
     """
     from ...models.outputs import Envelope, ReviewOutcome, envelope_done
 
@@ -1042,8 +1361,6 @@ async def interview_gate_review(
     compiled_text = await get_existing_artifact(runner, feature, compiled_key) or ""
 
     # ── Gate review artifact key ──
-    # Used for both file persistence (agent writes review to disk) and
-    # loading prior revision decisions on restart.
     from pathlib import Path
 
     gate_review_key = f"gate-review:{artifact_prefix}"
@@ -1059,10 +1376,11 @@ async def interview_gate_review(
         if gate_review_path.exists():
             prior_review_text = gate_review_path.read_text(encoding="utf-8").strip()
 
+    # ── Initialize convergence tracking ──
+    gate_ledger = await _load_gate_ledger(runner, feature, artifact_prefix)
+    review_cycle = gate_ledger.cycle
+
     # ── Auto-execute prior agreed revisions ──
-    # If a prior gate review file exists with revision requests, the user
-    # already agreed to them in a previous session.  Extract and execute
-    # them now, then present the updated artifact for approval.
     if prior_review_text:
         logger.info(
             "interview_gate_review: found prior gate review — extracting "
@@ -1087,7 +1405,16 @@ async def interview_gate_review(
                 artifact_prefix=artifact_prefix,
                 post_update=post_update,
                 context_keys=context_keys,
+                checkpoint_prefix=f"gate-{review_cycle}",
             )
+            # Track auto-executed revisions in the ledger
+            review_cycle += 1
+            gate_ledger = _update_gate_ledger(
+                gate_ledger, extracted_plan, artifact_prefix, review_cycle,
+            )
+            gate_ledger.cycle = review_cycle
+            await _save_gate_ledger(runner, feature, gate_ledger, artifact_prefix)
+
             # Re-compile with revisions applied
             compiled_text = await compile_artifacts(
                 runner, feature, phase_name,
@@ -1110,6 +1437,14 @@ async def interview_gate_review(
             )
 
     while True:
+        # ── Cycle tracking ──
+        review_cycle += 1
+        if review_cycle > warn_after_cycles:
+            logger.warning(
+                "Gate review cycle %d for %s (exceeded %d without approval)",
+                review_cycle, artifact_prefix, warn_after_cycles,
+            )
+
         # Clear any prior gate reviewer session so each review iteration
         # starts fresh — prevents auto-approval from session continuity
         # and cross-gate contamination when actors are reused.
@@ -1126,6 +1461,10 @@ async def interview_gate_review(
             )
             extra_links = f"\n\nAdditional resources for review:\n{links}"
 
+        # ── Build prior revision context for the reviewer ──
+        context_base = Path(mirror.feature_dir(feature.id)) if mirror else None
+        prior_context = _build_prior_revision_context(gate_ledger, review_cycle, context_base)
+
         envelope = await runner.run(
             HostedInterview(
                 questioner=lead_actor,
@@ -1139,6 +1478,7 @@ async def interview_gate_review(
                     f"Please review it and let me know if there is anything you'd like changed.{url_note}"
                     f"{extra_links}\n\n"
                     f"Compiled artifact for review:\n{compiled_text}"
+                    f"{prior_context}"
                 ),
                 output_type=Envelope[ReviewOutcome],
                 done=envelope_done,
@@ -1152,8 +1492,6 @@ async def interview_gate_review(
         outcome: ReviewOutcome = envelope.output
 
         # Guard: agent set approved=True but also populated revision_plan.
-        # The model_validator on ReviewOutcome should already auto-correct
-        # this, but defend in depth.
         if outcome.approved and outcome.revision_plan.requests:
             logger.warning(
                 "interview_gate_review: agent set approved=True but "
@@ -1166,9 +1504,6 @@ async def interview_gate_review(
             break
 
         # ── Fallback: extract revision plan from gate review file ──
-        # The agent often describes the revision plan in prose but fails to
-        # populate revision_plan.requests in structured output.  Use a Haiku
-        # extraction call (same pattern as _extract_review_fields).
         if not outcome.revision_plan.requests:
             logger.warning(
                 "interview_gate_review: approved=False but revision_plan.requests "
@@ -1200,6 +1535,45 @@ async def interview_gate_review(
                     "interview_gate_review: no gate review file to extract from"
                 )
 
+        # ── Convergence: dedup + partition ──
+        if outcome.revision_plan.requests:
+            # Classify severity if missing
+            if any(not r.severity for r in outcome.revision_plan.requests):
+                outcome.revision_plan = await _classify_revision_severity(
+                    runner, feature, phase_name, outcome.revision_plan,
+                )
+
+            # Dedup against resolved findings
+            outcome.revision_plan, suppressed = _dedup_revision_requests(
+                outcome.revision_plan, gate_ledger, artifact_prefix,
+            )
+            if suppressed:
+                logger.info(
+                    "interview_gate_review: suppressed %d duplicate revision requests for %s",
+                    len(suppressed), artifact_prefix,
+                )
+
+            # Partition blocking vs deferred
+            outcome.revision_plan, deferred = _partition_revision_plan(
+                outcome.revision_plan, artifact_prefix,
+            )
+            if deferred:
+                await _append_gate_enhancements(runner, feature, deferred, artifact_prefix)
+                logger.info(
+                    "interview_gate_review: deferred %d minor revision requests for %s",
+                    len(deferred), artifact_prefix,
+                )
+
+            # If all requests were resolved/deferred, skip revision+recompile
+            if not outcome.revision_plan.requests:
+                logger.info(
+                    "interview_gate_review: all revision requests resolved/deferred "
+                    "for %s — skipping recompile", artifact_prefix,
+                )
+                gate_ledger.cycle = review_cycle
+                await _save_gate_ledger(runner, feature, gate_ledger, artifact_prefix)
+                continue  # re-present artifact without recompilation
+
         # Update prior_review_text for next iteration
         updated_review = _read_artifact_file(runner, feature, gate_review_key)
         if updated_review:
@@ -1215,7 +1589,15 @@ async def interview_gate_review(
             artifact_prefix=artifact_prefix,
             post_update=post_update,
             context_keys=context_keys,
+            checkpoint_prefix=f"gate-{review_cycle}",
         )
+
+        # ── Update ledger after revisions ──
+        gate_ledger = _update_gate_ledger(
+            gate_ledger, outcome.revision_plan, artifact_prefix, review_cycle,
+        )
+        gate_ledger.cycle = review_cycle
+        await _save_gate_ledger(runner, feature, gate_ledger, artifact_prefix)
 
         # Re-compile
         compiled_text = await compile_artifacts(
@@ -1227,10 +1609,24 @@ async def interview_gate_review(
             final_key=compiled_key,
         )
 
-        # Refresh secondary hosted resources (e.g., re-compile unified mockup,
-        # re-convert system design HTML) after the text artifacts are updated.
+        # Refresh secondary hosted resources
         if post_compile:
             await post_compile()
+
+    # ── Persist gate-approved artifact to DB immediately ──
+    # compile_artifacts() intentionally writes to the filesystem mirror only,
+    # deferring the DB write until gate approval.  Writing here (inside
+    # interview_gate_review rather than in the calling phase) eliminates the
+    # crash window between approval and the caller's runner.artifacts.put().
+    await runner.artifacts.put(compiled_key, compiled_text, feature=feature)
+
+    # ── Mark all open findings as resolved on approval ──
+    for f in gate_ledger.findings:
+        if f.status in ("open", "fix_attempted"):
+            f.status = "resolved"
+            f.cycle_resolved = review_cycle
+    gate_ledger.cycle = review_cycle
+    await _save_gate_ledger(runner, feature, gate_ledger, artifact_prefix)
 
     return compiled_text
 

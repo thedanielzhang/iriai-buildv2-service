@@ -14,6 +14,7 @@ class BuildState(BaseModel):
     dag: str = ""
     implementation: str = ""
     handover: str = ""
+    observations: str = ""
     phase: str = "scoping"
     metadata: dict[str, object] = Field(default_factory=dict)
 
@@ -31,4 +32,16 @@ class BugFixState(BaseModel):
     preview_url: str = ""
     project: str = ""
     phase: str = "intake"
+    metadata: dict[str, object] = Field(default_factory=dict)
+
+
+class BugFixV2State(BaseModel):
+    source_feature_id: str = ""
+    source_feature_name: str = ""
+    source_workspace_path: str = ""
+    project: str = ""
+    queue_summary: str = ""
+    decision_summary: str = ""
+    history_summary: str = ""
+    phase: str = "bugflow-setup"
     metadata: dict[str, object] = Field(default_factory=dict)

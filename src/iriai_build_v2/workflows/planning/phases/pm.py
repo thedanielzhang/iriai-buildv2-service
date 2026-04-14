@@ -77,7 +77,7 @@ class PMPhase(Phase):
                 compiler_actor=pm_compiler,
                 broad_key="prd:broad",
             )
-            await runner.artifacts.put("prd", final_text, feature=feature)
+            # DB write now happens inside interview_gate_review() on approval.
             state.prd = final_text
             return state
 
@@ -177,7 +177,7 @@ class PMPhase(Phase):
             broad_key="prd:broad",
         )
 
-        await runner.artifacts.put("prd", final_text, feature=feature)
+        # DB write now happens inside interview_gate_review() on approval.
         state.prd = final_text
         return state
 

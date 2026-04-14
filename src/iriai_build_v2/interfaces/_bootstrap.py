@@ -129,14 +129,17 @@ def build_runner(
     interaction_runtimes: dict[str, Any],
     on_message: Callable[..., Any] | None = None,
     agent_runtime_name: str = "claude",
+    single_agent_runtime: bool = False,
 ) -> TrackedWorkflowRunner:
     """Construct a TrackedWorkflowRunner with the given interaction runtimes.
 
-    Creates both a primary and secondary agent runtime for adversarial
-    multi-model execution.  The primary is determined by *agent_runtime_name*;
-    the secondary is the other supported runtime.
+    Creates both a primary and secondary agent runtime. Claude primary still
+    pairs with Codex for adversarial review; Codex primary pairs with Codex
+    again so no Claude runtime is instantiated behind the scenes. When
+    ``single_agent_runtime`` is true, the secondary runtime matches the
+    primary runtime exactly.
     """
-    from ..runtimes import create_agent_runtime
+    from ..runtimes import create_agent_runtime, secondary_agent_runtime_name
     from ..workflows import TrackedWorkflowRunner
 
     agent_runtime = create_agent_runtime(
@@ -145,8 +148,12 @@ def build_runner(
         on_message=on_message,
     )
 
-    # Secondary runtime: the other one (for adversarial execution)
-    secondary_name = "codex" if agent_runtime_name != "codex" else "claude"
+    # Secondary runtime: Codex for Claude-primary runs, Codex again for
+    # Codex-primary runs so "codex" means fully Codex-only.
+    secondary_name = secondary_agent_runtime_name(
+        agent_runtime_name,
+        single_runtime=single_agent_runtime,
+    )
     secondary_runtime = create_agent_runtime(
         secondary_name,
         session_store=env.sessions,
@@ -210,7 +217,7 @@ async def rebuild_state(
     feature: Feature,
 ) -> BuildState | BugFixState:
     """Reconstruct workflow state from persisted artifacts for resume."""
-    from ..models.state import BugFixState, BuildState
+    from ..models.state import BugFixState, BugFixV2State, BuildState
 
     if workflow_name == "bugfix":
         state = BugFixState()
@@ -225,6 +232,20 @@ async def rebuild_state(
             "regression": "regression",
             "project": "project",
         }
+    elif workflow_name == "bugfix-v2":
+        metadata = feature.metadata or {}
+        state = BugFixV2State(
+            source_feature_id=str(metadata.get("source_feature_id", "") or ""),
+            source_feature_name=str(metadata.get("source_feature_name", "") or ""),
+            source_workspace_path=str(metadata.get("workspace_path", "") or ""),
+            project=str(await artifacts.get("project", feature=feature) or ""),
+        )
+        mapping = {
+            "project": "project",
+            "bugflow-queue": "queue_summary",
+            "bugflow-decisions": "decision_summary",
+            "bugflow-source-context": "history_summary",
+        }
     else:
         state = BuildState()
         mapping = {
@@ -235,6 +256,7 @@ async def rebuild_state(
             "system-design": "system_design",
             "dag": "dag",
             "implementation": "implementation",
+            "observations": "observations",
         }
 
     for artifact_key, field_name in mapping.items():
@@ -247,12 +269,19 @@ async def rebuild_state(
 
 def select_workflow(workflow_name: str):
     """Return the appropriate workflow instance."""
-    from ..workflows import BugFixWorkflow, FullDevelopWorkflow, PlanningWorkflow
+    from ..workflows import (
+        BugFixV2Workflow,
+        BugFixWorkflow,
+        FullDevelopWorkflow,
+        PlanningWorkflow,
+    )
 
     if workflow_name == "planning":
         return PlanningWorkflow()
     elif workflow_name == "bugfix":
         return BugFixWorkflow()
+    elif workflow_name == "bugfix-v2":
+        return BugFixV2Workflow()
     else:
         return FullDevelopWorkflow()
 
@@ -264,8 +293,10 @@ def build_state(
     bug_report: str = "",
 ):
     """Construct the initial state for the given workflow."""
-    from ..models.state import BugFixState, BuildState
+    from ..models.state import BugFixState, BugFixV2State, BuildState
 
     if workflow_name == "bugfix":
         return BugFixState(project=project, bug_report=bug_report)
+    if workflow_name == "bugfix-v2":
+        return BugFixV2State()
     return BuildState()

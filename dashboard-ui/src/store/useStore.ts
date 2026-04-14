@@ -15,11 +15,18 @@ const saved = JSON.parse(localStorage.getItem('iriai_tracked') || '[]') as strin
 
 function viewFromPath(): string {
   const seg = window.location.pathname.replace(/^\/+|\/+$/g, '')
-  return seg || 'overview'
+  if (!seg) return 'overview'
+
+  const parts = seg.split('/')
+  if (parts[0] === 'feature' && parts[1]) return parts[1]
+  if (parts[0] === 'terminal') return 'terminal'
+  return parts[0]
 }
 
 function pushView(v: string) {
-  const path = v === 'overview' ? '/' : `/${v}`
+  let path = '/'
+  if (v === 'terminal') path = '/terminal'
+  else if (v !== 'overview') path = `/feature/${v}`
   if (window.location.pathname !== path) {
     window.history.pushState(null, '', path)
   }

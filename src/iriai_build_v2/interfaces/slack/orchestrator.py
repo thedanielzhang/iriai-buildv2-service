@@ -7,10 +7,14 @@ Manages the lifecycle of concurrent workflow runs.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from ...config import DASHBOARD_BASE_URL
+from ...workflows.bugfix_v2.models import BugflowReportSnapshot, new_short_id, report_key, utc_now
 from .._bootstrap import (
     bootstrap,
     create_feature,
@@ -33,7 +37,15 @@ logger = logging.getLogger(__name__)
 
 # Roles that benefit from persistent client + mid-stream user message injection.
 # Short-lived reviewers use the fast ephemeral client path.
-_INTERACTIVE_ROLES = {"pm", "designer", "architect", "task_planner", "implementer"}
+_INTERACTIVE_ROLES = {
+    "pm",
+    "designer",
+    "architect",
+    "task_planner",
+    "implementer",
+    "bug-interviewer",
+    "observation-collector",
+}
 
 
 class SlackWorkflowOrchestrator:
@@ -45,17 +57,24 @@ class SlackWorkflowOrchestrator:
         interaction_runtime: SlackInteractionRuntime,
         workspace_path: Path | None = None,
         agent_runtime_name: str = "claude",
+        agent_runtime_override: bool = False,
+        single_agent_runtime: bool = False,
+        budget: bool = False,
     ) -> None:
         self._adapter = adapter
         self._interaction = interaction_runtime
         self._default_workspace = workspace_path  # suggestion, not binding
         self._agent_runtime_name = agent_runtime_name
+        self._agent_runtime_override = agent_runtime_override
+        self._single_agent_runtime = single_agent_runtime
+        self._budget = budget
         self._env: BootstrappedEnv | None = None
 
         # Workflow tracking
         self._active_workflows: dict[str, asyncio.Task] = {}  # feature_id → task
         self._active_runtimes: dict[str, Any] = {}  # feature_id → runtime instance
         self._channel_features: dict[str, str] = {}  # channel → feature_id
+        self._feature_workflows: dict[str, str] = {}  # feature_id → workflow_name
         self._user_notes: dict[str, list[str]] = {}  # feature_id → queued notes
 
         # Recovery: features that survived a restart and can be resumed on first message
@@ -89,9 +108,10 @@ class SlackWorkflowOrchestrator:
 
         await self._recover_active_features()
         logger.info(
-            "Orchestrator started, default_workspace=%s, agent_runtime=%s",
+            "Orchestrator started, default_workspace=%s, agent_runtime=%s, single_agent_runtime=%s",
             self._default_workspace,
             self._agent_runtime_name,
+            self._single_agent_runtime,
         )
 
     async def shutdown(self) -> None:
@@ -117,11 +137,16 @@ class SlackWorkflowOrchestrator:
             parsed = parse_workflow_request(text)
             if parsed and parsed.workflow_name == "full-develop":
                 await self._start_workflow(parsed, event)
+            elif parsed and parsed.workflow_name == "bugfix-v2":
+                await self._start_bugflow_workflow(parsed, event)
             return
 
         # Messages in workflow channels
         feature_id = self._channel_features.get(channel)
         if not feature_id:
+            return
+
+        if await self._maybe_capture_bugflow_report(feature_id, event):
             return
 
         if self._interaction.has_pending(channel):
@@ -196,6 +221,7 @@ class SlackWorkflowOrchestrator:
         feature = await create_feature(
             self._env.feature_store, parsed.feature_name, parsed.workflow_name
         )
+        self._feature_workflows[feature.id] = parsed.workflow_name
 
         # 3. Create channel
         channel_name = f"iriai-{slugify(parsed.feature_name)}-{feature.id}"
@@ -214,25 +240,34 @@ class SlackWorkflowOrchestrator:
                 f"Workflow started in <#{channel_id}>",
             )
 
-        # 5. Post mode selection card
+        # 5. Post dashboard URL first for bugflow-style workflows.
+        await self._maybe_post_dashboard_url(
+            feature.id,
+            channel_id,
+            workflow_name=parsed.workflow_name,
+            recovery=False,
+        )
+
+        # 6. Post mode selection card
         mode = await self._ask_mode_selection(channel_id, feature.id)
         self._adapter.set_channel_mode(channel_id, mode)
 
-        # 6. Ask which project workspace to target
+        # 7. Ask which project workspace to target
         workspace_path = await self._ask_workspace(channel_id, feature.id)
 
-        # 6b. Persist channel/workspace/mode for resume after restart
+        # 7b. Persist channel/workspace/mode for resume after restart
         await self._env.feature_store.update_metadata(feature.id, {
             "channel_id": channel_id,
             "workspace_path": str(workspace_path),
             "mode": mode,
             "agent_runtime": self._agent_runtime_name,
         })
+        feature = await self._env.feature_store.get_feature(feature.id) or feature
 
-        # 7. Register channel with interaction runtime
+        # 8. Register channel with interaction runtime
         self._interaction.register_channel(feature.id, channel_id)
 
-        # 8. Create streamer + runner with per-feature workspace
+        # 9. Create streamer + runner with per-feature workspace
         agent_runtime, runner = self._create_runtime_and_runner(
             workspace_path=workspace_path,
             channel_id=channel_id,
@@ -240,29 +275,159 @@ class SlackWorkflowOrchestrator:
         )
         self._active_runtimes[feature.id] = agent_runtime
 
-        # 9. Select workflow + build state
+        # 10. Select workflow + build state
         workflow = select_workflow(parsed.workflow_name)
         state = build_state(parsed.workflow_name)
 
-        # 10. Seed project artifact
+        # 11. Seed project artifact
         await self._env.artifacts.put(
             "project",
             f"Project workspace: {workspace_path}\n\nFeature: {parsed.feature_name}",
             feature=feature,
         )
 
-        # 11. Post kickoff message
+        # 12. Post kickoff message
         await self._adapter.post_message(
             channel_id,
             f"Starting *{parsed.workflow_name}* workflow for: *{parsed.feature_name}*\n"
             f"Workspace: `{workspace_path}`\nMode: _{mode}_\nRuntime: _{self._agent_runtime_name}_",
         )
 
-        # 12. Launch workflow as background task
+        # 13. Launch workflow as background task
         task = asyncio.create_task(
             self._run_workflow(runner, workflow, feature, state, channel_id)
         )
         self._active_workflows[feature.id] = task
+
+    async def _start_bugflow_workflow(self, parsed: Any, trigger_event: dict) -> None:
+        assert self._env is not None
+
+        trigger_ts = trigger_event.get("ts", "")
+        await self._adapter.add_reaction(
+            self._adapter.planning_channel,
+            trigger_ts,
+            "rocket",
+        )
+
+        source_feature_id = parsed.source_feature_id or parsed.feature_name
+        source_feature = await self._env.feature_store.get_feature(source_feature_id)
+        if not source_feature:
+            await self._post_planning_error(
+                trigger_ts,
+                f"Could not start bugflow: source feature `{source_feature_id}` was not found.",
+            )
+            return
+
+        source_workspace = str(source_feature.metadata.get("workspace_path", "") or "")
+        if not source_workspace:
+            await self._post_planning_error(
+                trigger_ts,
+                f"Could not start bugflow for `{source_feature_id}`: source feature is missing `workspace_path` metadata.",
+            )
+            return
+
+        feature_name = f"Bugflow: {source_feature.name}"
+        feature = await create_feature(
+            self._env.feature_store,
+            feature_name,
+            "bugfix-v2",
+        )
+        self._feature_workflows[feature.id] = "bugfix-v2"
+        channel_id = ""
+        try:
+            channel_name = f"iriai-{slugify(source_feature.name)}-bugs-{feature.id}"
+            channel_id = await self._adapter.create_channel(channel_name)
+            self._channel_features[channel_id] = feature.id
+            self._adapter.set_channel_mode(channel_id, "singleplayer")
+
+            if trigger_ts:
+                from .helpers import post_to_thread
+
+                await post_to_thread(
+                    self._adapter.web,
+                    self._adapter.planning_channel,
+                    trigger_ts,
+                    f"Bugflow started in <#{channel_id}>",
+                )
+
+            await self._env.feature_store.update_metadata(
+                feature.id,
+                {
+                    "channel_id": channel_id,
+                    "workspace_path": source_workspace,
+                    "mode": "singleplayer",
+                    "agent_runtime": self._agent_runtime_name,
+                    "source_feature_id": source_feature.id,
+                    "source_feature_name": source_feature.name,
+                    "source_channel_id": source_feature.metadata.get("channel_id", ""),
+                },
+            )
+            await self._env.feature_store.transition_phase(feature.id, "bugflow-setup")
+            feature = await self._env.feature_store.get_feature(feature.id) or feature
+
+            await self._maybe_post_dashboard_url(
+                feature.id,
+                channel_id,
+                workflow_name="bugfix-v2",
+                recovery=False,
+            )
+
+            self._interaction.register_channel(feature.id, channel_id)
+            agent_runtime, runner = self._create_runtime_and_runner(
+                workspace_path=Path(source_workspace),
+                channel_id=channel_id,
+                runtime_name=self._agent_runtime_name,
+            )
+            self._active_runtimes[feature.id] = agent_runtime
+
+            workflow = select_workflow("bugfix-v2")
+            state = build_state("bugfix-v2")
+            state.source_feature_id = source_feature.id
+            state.source_feature_name = source_feature.name
+            state.source_workspace_path = source_workspace
+
+            await self._adapter.post_message(
+                channel_id,
+                f"Starting *bugfix-v2* for source feature *{source_feature.name}* (`{source_feature.id}`)\n"
+                f"Workspace: `{source_workspace}`\nMode: _singleplayer_\nRuntime: _{self._agent_runtime_name}_",
+            )
+
+            task = asyncio.create_task(
+                self._run_workflow(runner, workflow, feature, state, channel_id)
+            )
+            self._active_workflows[feature.id] = task
+        except Exception as exc:
+            logger.exception("Failed to start bugflow workflow for %s", source_feature_id)
+            self._active_runtimes.pop(feature.id, None)
+            self._feature_workflows.pop(feature.id, None)
+            self._interaction.unregister_channel(feature.id)
+            if channel_id:
+                self._channel_features.pop(channel_id, None)
+            try:
+                await self._env.feature_store.transition_phase(feature.id, "failed")
+            except Exception:
+                logger.warning(
+                    "Failed to mark bugflow feature %s as failed after launch error",
+                    feature.id,
+                    exc_info=True,
+                )
+            await self._post_planning_error(
+                trigger_ts,
+                f"Could not start bugflow for `{source_feature_id}`: {exc}",
+            )
+            if channel_id:
+                try:
+                    await self._adapter.post_message(
+                        channel_id,
+                        f"Bugflow startup failed: {exc}",
+                    )
+                except Exception:
+                    logger.warning(
+                        "Failed to post bugflow launch failure in %s",
+                        channel_id,
+                        exc_info=True,
+                    )
+            return
 
     async def _run_workflow(
         self,
@@ -280,13 +445,28 @@ class SlackWorkflowOrchestrator:
             )
         except Exception as e:
             logger.exception("Workflow failed for %s", feature.id)
+            if feature.workflow_name == "bugfix-v2":
+                current_feature = await self._env.feature_store.get_feature(feature.id) or feature
+                current_meta = current_feature.metadata or {}
+                self._recoverable_features[feature.id] = {
+                    "workspace_path": str(current_meta.get("workspace_path", "") or ""),
+                    "mode": str(current_meta.get("mode", "singleplayer") or "singleplayer"),
+                    "phase": str(current_meta.get("_db_phase", "bugflow-setup") or "bugflow-setup"),
+                    "agent_runtime": str(current_meta.get("agent_runtime", self._agent_runtime_name) or self._agent_runtime_name),
+                }
+                self._feature_workflows[feature.id] = current_feature.workflow_name
+                self._interaction.register_channel(feature.id, channel_id)
             await self._adapter.post_message(
-                channel_id, f"Workflow failed: {e}"
+                channel_id,
+                f"Workflow failed: {e}"
+                + ("\nSend any message to retry." if feature.workflow_name == "bugfix-v2" else ""),
             )
         finally:
             self._active_workflows.pop(feature.id, None)
             self._active_runtimes.pop(feature.id, None)
-            self._interaction.unregister_channel(feature.id)
+            if feature.id not in self._recoverable_features:
+                self._feature_workflows.pop(feature.id, None)
+                self._interaction.unregister_channel(feature.id)
             self._user_notes.pop(feature.id, None)
 
     # ── Mode Selection ────────────────────────────────────────────────────
@@ -447,10 +627,16 @@ class SlackWorkflowOrchestrator:
 
         for feature in features:
             meta = feature.metadata or {}
+            workflow_name = getattr(feature, "workflow_name", "full-develop")
             channel_id = meta.get("channel_id")
             workspace_path = meta.get("workspace_path")
             mode = meta.get("mode", "singleplayer")
-            agent_runtime = meta.get("agent_runtime", self._agent_runtime_name)
+            saved_agent_runtime = meta.get("agent_runtime")
+            agent_runtime = (
+                self._agent_runtime_name
+                if self._agent_runtime_override
+                else saved_agent_runtime or self._agent_runtime_name
+            )
 
             if not channel_id or not workspace_path:
                 logger.warning(
@@ -461,6 +647,7 @@ class SlackWorkflowOrchestrator:
 
             # Rebuild routing tables
             self._channel_features[channel_id] = feature.id
+            self._feature_workflows[feature.id] = workflow_name
             self._interaction.register_channel(feature.id, channel_id)
             self._adapter.set_channel_mode(channel_id, mode)
 
@@ -474,15 +661,44 @@ class SlackWorkflowOrchestrator:
             }
 
             try:
-                await self._adapter.post_message(
-                    channel_id,
-                    f"Bridge restarted. Feature is in phase `{phase}`. "
-                    f"Runtime: `{agent_runtime}`. Send any message to resume.",
-                )
+                try:
+                    await self._maybe_post_dashboard_url(
+                        feature.id,
+                        channel_id,
+                        workflow_name=workflow_name,
+                        recovery=True,
+                    )
+                except Exception:
+                    logger.warning(
+                        "Failed to post dashboard URL in %s",
+                        channel_id,
+                        exc_info=True,
+                    )
+                if workflow_name == "bugfix-v2":
+                    await self._adapter.post_message(
+                        channel_id,
+                        f"Bridge restarted. Feature is in phase `{phase}`. "
+                        f"Runtime: `{agent_runtime}`. Resuming bugflow automatically.",
+                    )
+                else:
+                    await self._adapter.post_message(
+                        channel_id,
+                        f"Bridge restarted. Feature is in phase `{phase}`. "
+                        f"Runtime: `{agent_runtime}`. Send any message to resume.",
+                    )
             except Exception:
                 logger.warning("Failed to post recovery message in %s", channel_id, exc_info=True)
 
             recovered += 1
+            if workflow_name == "bugfix-v2":
+                try:
+                    await self._resume_workflow(feature.id, channel_id)
+                except Exception:
+                    logger.warning(
+                        "Failed to auto-resume bugflow feature %s",
+                        feature.id,
+                        exc_info=True,
+                    )
 
         if recovered:
             logger.info("Recovered %d feature channel mappings", recovered)
@@ -490,7 +706,7 @@ class SlackWorkflowOrchestrator:
     async def _resume_workflow(self, feature_id: str, channel_id: str) -> None:
         """Resume an interrupted workflow from its last known phase."""
         assert self._env is not None
-        recovery_info = self._recoverable_features.pop(feature_id, None)
+        recovery_info = self._recoverable_features.get(feature_id)
         if not recovery_info:
             return
 
@@ -508,41 +724,54 @@ class SlackWorkflowOrchestrator:
             )
             return
 
-        # Load feature from DB
-        feature = await self._env.feature_store.get_feature(feature_id)
-        if not feature:
+        try:
+            # Load feature from DB
+            feature = await self._env.feature_store.get_feature(feature_id)
+            if not feature:
+                await self._adapter.post_message(
+                    channel_id,
+                    f"Cannot resume: feature `{feature_id}` not found in database.",
+                )
+                return
+
+            # Reconstruct state from artifacts
+            workflow = select_workflow(feature.workflow_name)
+            state = await rebuild_state(
+                feature.workflow_name, self._env.artifacts, feature
+            )
+
+            self._interaction.register_channel(feature.id, channel_id)
+            self._feature_workflows[feature.id] = feature.workflow_name
+
+            # Create streamer, runtime, runner (same as _start_workflow steps 8-9)
+            agent_runtime, runner = self._create_runtime_and_runner(
+                workspace_path=workspace_path,
+                channel_id=channel_id,
+                runtime_name=agent_runtime_name,
+            )
+            self._active_runtimes[feature_id] = agent_runtime
+
             await self._adapter.post_message(
                 channel_id,
-                f"Cannot resume: feature `{feature_id}` not found in database.",
+                f"Resuming *{feature.workflow_name}* workflow from phase: *{resume_phase}*\n"
+                f"Workspace: `{workspace_path}`\nMode: _{mode}_\nRuntime: _{agent_runtime_name}_",
+            )
+
+            task = asyncio.create_task(
+                self._run_workflow_resumed(
+                    runner, workflow, feature, state, channel_id, resume_phase
+                )
+            )
+            self._active_workflows[feature_id] = task
+            self._recoverable_features.pop(feature_id, None)
+        except Exception as exc:
+            logger.exception("Failed to resume workflow for %s", feature_id)
+            self._active_runtimes.pop(feature_id, None)
+            await self._adapter.post_message(
+                channel_id,
+                f"Resume failed for `{feature_id}`: {exc}\nSend any message to retry.",
             )
             return
-
-        # Reconstruct state from artifacts
-        workflow = select_workflow(feature.workflow_name)
-        state = await rebuild_state(
-            feature.workflow_name, self._env.artifacts, feature
-        )
-
-        # Create streamer, runtime, runner (same as _start_workflow steps 8-9)
-        agent_runtime, runner = self._create_runtime_and_runner(
-            workspace_path=workspace_path,
-            channel_id=channel_id,
-            runtime_name=agent_runtime_name,
-        )
-        self._active_runtimes[feature_id] = agent_runtime
-
-        await self._adapter.post_message(
-            channel_id,
-            f"Resuming *{feature.workflow_name}* workflow from phase: *{resume_phase}*\n"
-            f"Workspace: `{workspace_path}`\nMode: _{mode}_\nRuntime: _{agent_runtime_name}_",
-        )
-
-        task = asyncio.create_task(
-            self._run_workflow_resumed(
-                runner, workflow, feature, state, channel_id, resume_phase
-            )
-        )
-        self._active_workflows[feature_id] = task
 
     async def _run_workflow_resumed(
         self,
@@ -560,13 +789,25 @@ class SlackWorkflowOrchestrator:
             await self._adapter.post_message(channel_id, "Workflow complete!")
         except Exception as e:
             logger.exception("Resumed workflow failed for %s", feature.id)
+            current_feature = await self._env.feature_store.get_feature(feature.id) or feature
+            current_meta = current_feature.metadata or {}
+            self._recoverable_features[feature.id] = {
+                "workspace_path": str(current_meta.get("workspace_path", "") or ""),
+                "mode": str(current_meta.get("mode", "singleplayer") or "singleplayer"),
+                "phase": str(current_meta.get("_db_phase", resume_phase) or resume_phase),
+                "agent_runtime": str(current_meta.get("agent_runtime", self._agent_runtime_name) or self._agent_runtime_name),
+            }
+            self._feature_workflows[feature.id] = current_feature.workflow_name
+            self._interaction.register_channel(feature.id, channel_id)
             await self._adapter.post_message(
-                channel_id, f"Resumed workflow failed: {e}"
+                channel_id, f"Resumed workflow failed: {e}\nSend any message to retry."
             )
         finally:
             self._active_workflows.pop(feature.id, None)
             self._active_runtimes.pop(feature.id, None)
-            self._interaction.unregister_channel(feature.id)
+            if feature.id not in self._recoverable_features:
+                self._feature_workflows.pop(feature.id, None)
+                self._interaction.unregister_channel(feature.id)
             self._user_notes.pop(feature.id, None)
 
     # ── Helpers ───────────────────────────────────────────────────────────
@@ -582,6 +823,127 @@ class SlackWorkflowOrchestrator:
         runtime = self._active_runtimes.get(feature_id)
         if runtime and hasattr(runtime, "queue_user_note"):
             runtime.queue_user_note(feature_id, text)
+
+    async def _maybe_capture_bugflow_report(self, feature_id: str, event: dict) -> bool:
+        assert self._env is not None
+
+        if self._feature_workflows.get(feature_id) != "bugfix-v2":
+            return False
+
+        text = (event.get("text") or "").strip()
+        if not text:
+            return False
+
+        event_ts = event.get("ts", "")
+        thread_ts = event.get("thread_ts")
+        if thread_ts and thread_ts != event_ts:
+            return False
+
+        match = re.match(r"^\[bug\]\s*(.+)", text, re.IGNORECASE | re.DOTALL)
+        if not match:
+            return False
+
+        summary = match.group(1).strip()
+        if not summary:
+            return False
+
+        feature = await self._env.feature_store.get_feature(feature_id)
+        if not feature:
+            return False
+
+        report_id = new_short_id("BR")
+        timestamp = utc_now()
+        snapshot = BugflowReportSnapshot(
+            report_id=report_id,
+            root_message_ts=event_ts,
+            thread_ts=event_ts,
+            root_message_text=text,
+            title=summary[:80],
+            summary=summary,
+            status="intake_pending",
+            current_step=f"Awaiting intake interview for {report_id}",
+            created_at=timestamp,
+            updated_at=timestamp,
+        )
+        await self._env.artifacts.put(
+            report_key(report_id),
+            snapshot.model_dump_json(),
+            feature=feature,
+        )
+        await self._env.feature_store.log_event(
+            feature_id,
+            "bugflow_report_created",
+            "slack",
+            report_id,
+            metadata={
+                "report_id": report_id,
+                "thread_ts": event_ts,
+                "root_message_ts": event_ts,
+                "summary": summary,
+            },
+        )
+        await self._adapter.post_message(
+            event.get("channel", ""),
+            f"Captured *{report_id}*. I'll ask clarifying questions in this thread before launching the fix flow.",
+            thread_ts=event_ts,
+        )
+        if feature_id in self._recoverable_features and feature_id not in self._active_workflows:
+            await self._resume_workflow(feature_id, event.get("channel", ""))
+        return True
+
+    async def _post_planning_error(self, trigger_ts: str, text: str) -> None:
+        if not trigger_ts:
+            return
+        from .helpers import post_to_thread
+
+        await post_to_thread(
+            self._adapter.web,
+            self._adapter.planning_channel,
+            trigger_ts,
+            text,
+        )
+
+    async def _maybe_post_dashboard_url(
+        self,
+        feature_id: str,
+        channel_id: str,
+        *,
+        workflow_name: str | None,
+        recovery: bool,
+    ) -> None:
+        """Post or repost the dashboard URL when one is configured for the feature."""
+        assert self._env is not None
+        feature_store = self._env.feature_store
+        if not hasattr(feature_store, "get_feature"):
+            return
+
+        feature = await feature_store.get_feature(feature_id)
+        if not feature:
+            return
+
+        metadata = feature.metadata or {}
+        effective_workflow = workflow_name or feature.workflow_name
+        dashboard_url = (
+            f"{DASHBOARD_BASE_URL}/feature/{feature_id}"
+            if effective_workflow == "bugfix-v2" and DASHBOARD_BASE_URL
+            else metadata.get("dashboard_url")
+        )
+
+        if not dashboard_url:
+            return
+
+        suffix = "\nBridge restarted — reposting dashboard link." if recovery else ""
+        message_ts = await self._adapter.post_message(
+            channel_id,
+            f"Dashboard: {dashboard_url}{suffix}",
+        )
+        await self._env.feature_store.update_metadata(
+            feature_id,
+            {
+                "dashboard_url": dashboard_url,
+                "dashboard_message_ts": message_ts,
+            },
+        )
 
     def _create_runtime_and_runner(
         self,
@@ -605,8 +967,14 @@ class SlackWorkflowOrchestrator:
             interactive_roles=_INTERACTIVE_ROLES,
         )
 
-        # Secondary runtime for adversarial multi-model execution
-        secondary_name = "codex" if runtime_name != "codex" else "claude"
+        # Secondary runtime mirrors shared runner behavior: Claude-primary
+        # pairs with Codex, while Codex-primary stays fully Codex-only.
+        from ...runtimes import secondary_agent_runtime_name
+
+        secondary_name = secondary_agent_runtime_name(
+            runtime_name,
+            single_runtime=self._single_agent_runtime,
+        )
         secondary_runtime = create_agent_runtime(
             secondary_name,
             session_store=self._env.sessions,
@@ -631,6 +999,7 @@ class SlackWorkflowOrchestrator:
             sessions=self._env.sessions,
             context_provider=self._env.context_provider,
             workspaces={"main": ws},
+            budget=self._budget,
             services={
                 "feedback": self._env.feedback_service,
                 "preview": self._env.preview_service,
@@ -638,6 +1007,7 @@ class SlackWorkflowOrchestrator:
                 "artifact_mirror": self._env.artifact_mirror,
                 "workspace_manager": workspace_manager,
                 "tunnel": self._tunnel,
+                "slack_adapter": self._adapter,
             },
         )
         return agent_runtime, runner

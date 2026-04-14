@@ -71,6 +71,7 @@ from .scoper import role as scoper_role
 from .bug_interviewer import role as bug_interviewer_role
 from .bug_reproducer import role as bug_reproducer_role
 from .root_cause_analyst import role as root_cause_analyst_role
+from .convergence_strategist import role as convergence_strategist_role
 from .bug_fixer import role as bug_fixer_role
 from .lead_pm import role as lead_pm_role
 from .lead_designer import role as lead_designer_role
@@ -79,6 +80,7 @@ from .lead_task_planner import role as lead_task_planner_role
 from .compiler import role as compiler_role
 from .summarizer import role as summarizer_role
 from .citation_reviewer import role as citation_reviewer_role
+from .observation_collector import role as observation_collector_role
 
 # Backward compat aliases
 task_planner_role = planning_lead_role
@@ -315,8 +317,16 @@ dag_compiler = AgentActor(
 bug_interviewer = AgentActor(name="bug-interviewer", role=bug_interviewer_role, context_keys=["project"])
 bug_reproducer = AgentActor(name="bug-reproducer", role=bug_reproducer_role, context_keys=["project"])
 root_cause_analyst = AgentActor(name="root-cause-analyst", role=root_cause_analyst_role, context_keys=["project"])
+convergence_strategist = AgentActor(
+    name="convergence-strategist",
+    role=convergence_strategist_role,
+    context_keys=["project"],
+)
 rca_symptoms_analyst = AgentActor(name="rca-symptoms", role=root_cause_analyst_role, context_keys=["project"])
 rca_architecture_analyst = AgentActor(name="rca-architecture", role=root_cause_analyst_role, context_keys=["project"])
 bug_fixer = AgentActor(name="bug-fixer", role=bug_fixer_role, context_keys=["project"])
+observation_collector = InterviewActor(
+    name="observation-collector", role=observation_collector_role, context_keys=["project"],
+)
 
 user = InteractionActor(name="user", resolver="terminal")

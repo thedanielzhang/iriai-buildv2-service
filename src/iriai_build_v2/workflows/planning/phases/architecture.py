@@ -77,9 +77,8 @@ class ArchitecturePhase(Phase):
             logger.info("Compiled plan exists but not gate-reviewed — running gate review")
             decomposition = await self._load_decomposition(runner, feature, state)
             plan_text = await self._plan_gate_review(runner, feature, decomposition)
-            await runner.artifacts.put("plan", plan_text, feature=feature)
+            # DB write now happens inside interview_gate_review() on approval.
             sd_text = await self._system_design_gate_review(runner, feature, decomposition)
-            await runner.artifacts.put("system-design", sd_text, feature=feature)
             state.plan = plan_text
             state.system_design = sd_text
             return state
@@ -168,8 +167,7 @@ class ArchitecturePhase(Phase):
         # 6b: System Design gate review
         sd_text = await self._system_design_gate_review(runner, feature, decomposition)
 
-        await runner.artifacts.put("plan", plan_text, feature=feature)
-        await runner.artifacts.put("system-design", sd_text, feature=feature)
+        # DB writes now happen inside interview_gate_review() on approval.
         state.plan = plan_text
         state.system_design = sd_text
         return state

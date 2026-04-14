@@ -476,11 +476,9 @@ def _render_handover(m: HandoverDoc) -> str:
         parts.append("| Task | Summary | Files | Status |")
         parts.append("|---|---|---|---|")
         for t in m.completed:
-            files = ", ".join(f"`{_esc(f)}`" for f in t.files_changed[:5])
-            if len(t.files_changed) > 5:
-                files += f" (+{len(t.files_changed) - 5} more)"
+            files = ", ".join(f"`{_esc(f)}`" for f in t.files_changed)
             parts.append(
-                f"| {_esc(t.task_id)} | {_esc(t.summary[:100])} | {files} | {_esc(t.status)} |"
+                f"| {_esc(t.task_id)} | {_esc(t.summary)} | {files} | {_esc(t.status)} |"
             )
 
     if m.failed_attempts:
@@ -489,7 +487,7 @@ def _render_handover(m: HandoverDoc) -> str:
         parts.append("|---|---|---|")
         for t in m.failed_attempts:
             parts.append(
-                f"| {_esc(t.task_id)} | {_esc(t.summary[:100])} | {_esc(t.failure_reason[:200])} |"
+                f"| {_esc(t.task_id)} | {_esc(t.summary)} | {_esc(t.failure_reason)} |"
             )
 
     if m.all_files_changed:

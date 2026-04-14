@@ -10,5 +10,7 @@ role = Role(
     model=BUDGET_TIERS["opus"],
     metadata={
         "mcp_servers": mcp_servers_for("github"),
+        "max_session_chars": 800_000,
+        "keep_recent_messages": 6,
     },
 )

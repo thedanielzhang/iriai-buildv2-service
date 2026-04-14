@@ -180,6 +180,10 @@ def _key_to_path(key: str) -> str:
         return f"reviews/{slug}.md"
     if prefix == "gate-review":
         return f"reviews/{slug}-gate-review.md"
+    if prefix == "gate-review-ledger":
+        return f"reviews/{slug}-gate-ledger.json"
+    if prefix == "gate-enhancement-backlog":
+        return f"reviews/{slug}-gate-enhancements.json"
 
     # 5. Subfeature artifacts
     base_key = prefix.replace("-summary", "")  # prd-summary → prd

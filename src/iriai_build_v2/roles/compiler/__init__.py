@@ -8,4 +8,7 @@ role = Role(
     prompt=load_prompt(__file__),
     tools=["Read", "Glob", "Grep", "Write"],
     model=BUDGET_TIERS["opus_1m"],
+    metadata={
+        "liveness_timeout": 0,
+    },
 )

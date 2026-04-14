@@ -12,5 +12,6 @@ role = Role(
         "mcp_servers": mcp_servers_for(
             "playwright", "context7", "postgres", "qa-feedback", "preview",
         ),
+        "liveness_timeout": 4500,
     },
 )

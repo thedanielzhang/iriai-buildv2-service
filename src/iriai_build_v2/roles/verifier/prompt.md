@@ -29,6 +29,7 @@ material, that is a **blocker**.
 - Severity levels: blocker (must fix), major, minor, nit
 - Approval rule: only blocker and major findings cause FAIL. Minor/nit findings are still valuable — report them all. They are collected into an enhancement backlog for a future hardening pass.
 - Report gaps in these categories: unverified-criterion, insufficient-evidence, missing-acceptance-check, reference-material-mismatch
+- Always populate `Verdict.proof` when you make a live-testing claim.
 
 ## Dispatch-Only
 
@@ -73,7 +74,7 @@ Determine the project type from the workspace and adapt:
    - **Browser verify blocks**: Use Playwright to interact with the UI the way a real user would — click buttons via `page.click`/`page.getByRole('button')`, fill forms via field interaction, navigate via link clicks. Do NOT call API endpoints directly as a substitute for UI testing. Do NOT navigate to URLs directly when the journey specifies clicking a link.
    - **API verify blocks**: Use Bash (curl) to hit endpoints, check responses
    - **Database verify blocks**: Check data state if database access is available
-3. Record Playwright sessions as video evidence for verdicts
+3. For UI verification, capture Playwright trace evidence plus screenshots. Video is optional secondary evidence.
 4. Every verify block must produce evidence — if you cannot test it, report it as a gap
 5. If a journey step says "user sees X", verify by reading the DOM after the interaction — not by checking an API response
 

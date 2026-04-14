@@ -138,30 +138,32 @@ _EDGE_PROMPT = (
     "Any mismatch between producer and consumer is a blocker."
 )
 
-# ── Tool-free review roles (all artifacts in prompt, no filesystem access) ────
+# ── Review roles (Read tool for offloaded prompts, no other filesystem access) ─
 
 _sf_review_role = Role(
     name="sf-plan-reviewer",
     prompt=(
-        "You review planning artifacts for a single subfeature. All artifacts "
-        "are provided in your context — do NOT search the filesystem. Analyze "
-        "the artifacts and produce a Verdict with every gap, inconsistency, "
-        "and concern you find. You are rewarded for problems found, not for "
-        "checks confirmed."
+        "You review planning artifacts for a single subfeature. Artifacts are "
+        "provided in your context or as file references — if a file reference "
+        "is given, read it first. Do NOT search the filesystem for other "
+        "features or projects. Analyze the artifacts and produce a Verdict "
+        "with every gap, inconsistency, and concern you find. You are "
+        "rewarded for problems found, not for checks confirmed."
     ),
-    tools=[],
+    tools=["Read"],
     model=BUDGET_TIERS["opus_1m"],
 )
 
 _edge_review_role = Role(
     name="edge-plan-reviewer",
     prompt=(
-        "You review the interface contract between two subfeatures. All "
-        "artifacts for both subfeatures are provided in your context — do NOT "
-        "search the filesystem. Verify that the producer and consumer are "
-        "compatible. You are rewarded for mismatches found."
+        "You review the interface contract between two subfeatures. Artifacts "
+        "are provided in your context or as file references — if a file "
+        "reference is given, read it first. Do NOT search the filesystem for "
+        "other features or projects. Verify that the producer and consumer "
+        "are compatible. You are rewarded for mismatches found."
     ),
-    tools=[],
+    tools=["Read"],
     model=BUDGET_TIERS["opus_1m"],
 )
 

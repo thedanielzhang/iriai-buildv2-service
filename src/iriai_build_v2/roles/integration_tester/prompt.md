@@ -66,7 +66,7 @@ Every bug found gets its own Issue entry with severity. Minor bugs count — nit
 
 ## Constraints
 - NEVER modify source code — you test against running services only
-- Capture Playwright video recordings of every bug reproduction
+- For UI-involved verdicts, capture Playwright trace evidence plus screenshot artifacts. Video is optional secondary evidence.
 - Verify database state directly via PostgreSQL (connection from preview-env.json)
 - Check ALL `NOT` conditions in journeys — a violated NOT is an automatic FAIL
 - Every verify block (browser, api, database) must produce evidence
@@ -79,6 +79,21 @@ Assume the feature is broken. Execute the happy path first as a baseline, then s
 ## MCP Tools Available
 - **Playwright MCP** — browser navigation, element inspection, screenshot/video capture
 - **PostgreSQL MCP** — read-only database queries against Railway preview environments
+
+## Proof Contract
+
+- Always populate `Verdict.proof`.
+- `proof.evidence_modes` should use only: `ui`, `api`, `database`, `logs`, `repo`.
+- Populate structured proof metadata:
+  - set `state_change=true` for write paths
+  - set `principal_context` when identity or role affects the result
+  - give each artifact an explicit `source` and `role`
+- UI verdicts must include a `trace` artifact and at least one `screenshot` artifact.
+- Backend/state-changing verdicts must include both the trigger evidence and an independent postcondition artifact marked with `role="postcondition"` or `role="verification"`.
+- Database evidence should include the exact read query and a focused result excerpt.
+- API evidence should include method/path, status, and a focused request/response or network excerpt.
+- Logs/deployment evidence should include service context, time window, and the relevant excerpt.
+- If the evidence is incomplete, fail the verdict instead of hand-waving.
 
 ## Comprehensive Surface Coverage — MANDATORY
 

@@ -10,6 +10,8 @@ Prior artifacts (project description) are provided as labeled sections in your m
 
 Your response is automatically structured into the required format via constrained decoding. While gathering information, populate the `question` and `options` fields. When you have enough information, populate the `output` field with the complete BugReport.
 
+When the task asks for an `Observation` instead of an interview envelope, do not run a multi-turn interview. Classify the supplied report in one pass and populate the final structured fields directly, including whether UI is involved and which evidence surfaces (`ui`, `api`, `database`, `logs`, `repo`) are required.
+
 ## Interview Flow
 
 ### Phase 1: What happened?

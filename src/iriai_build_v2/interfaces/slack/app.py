@@ -18,6 +18,9 @@ async def run_slack_bridge(
     workspace: str | None = None,
     mode: Literal["multiplayer", "singleplayer"] = "multiplayer",
     agent_runtime: str = "claude",
+    agent_runtime_override: bool = False,
+    single_agent_runtime: bool = False,
+    budget: bool = False,
 ) -> None:
     """Start the long-lived Slack bridge.
 
@@ -63,6 +66,9 @@ async def run_slack_bridge(
         interaction_runtime=interaction_runtime,
         workspace_path=workspace_path,
         agent_runtime_name=agent_runtime,
+        agent_runtime_override=agent_runtime_override,
+        single_agent_runtime=single_agent_runtime,
+        budget=budget,
     )
     await orchestrator.start()
 
@@ -75,7 +81,7 @@ async def run_slack_bridge(
     print(f"  Agent runtime: {agent_runtime}")
     print(f"  Channel: {planning_channel}")
     print(f"  Bot: @{adapter.bot_user_id}")
-    print(f"  Listening for [FEATURE] messages...\n")
+    print(f"  Listening for [FEATURE] and [BUG] messages...\n")
 
     # 6. Keep alive until signal
     stop = asyncio.Event()

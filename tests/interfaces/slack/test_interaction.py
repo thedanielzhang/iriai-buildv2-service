@@ -4,14 +4,18 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from iriai_compose.storage import AgentSession
+from iriai_compose.tasks import Ask, Select
 
 from iriai_build_v2.interfaces.slack.interaction import (
     SlackInteractionRuntime,
     _extract_question,
 )
+from iriai_build_v2.roles import user
 
 
 # ── Fixtures / Mocks ────────────────────────────────────────────────────────
@@ -22,12 +26,14 @@ class MockAdapter:
     """Minimal adapter mock for testing interaction runtime."""
 
     posted_blocks: list[tuple[str, list[dict], str]] = field(default_factory=list)
+    posted_block_kwargs: list[dict[str, Any]] = field(default_factory=list)
     posted_decisions: list[dict] = field(default_factory=list)
     updated_messages: list[dict] = field(default_factory=list)
     opened_modals: list[dict] = field(default_factory=list)
 
     async def post_blocks(self, channel, blocks, text, **kwargs):
         self.posted_blocks.append((channel, blocks, text))
+        self.posted_block_kwargs.append(kwargs)
         return "1234.5678"
 
     async def post_decision(self, channel, decision_id, title, context, options, **kwargs):
@@ -62,6 +68,17 @@ class FakePending:
     options: list[str] | None = None
 
 
+@dataclass
+class MockSessionStore:
+    sessions: dict[str, AgentSession] = field(default_factory=dict)
+
+    async def load(self, session_key: str) -> AgentSession | None:
+        return self.sessions.get(session_key)
+
+    async def save(self, session: AgentSession) -> None:
+        self.sessions[session.session_key] = session
+
+
 # ── Channel Registration ────────────────────────────────────────────────────
 
 
@@ -82,6 +99,28 @@ class TestChannelRegistration:
 
 
 class TestResolveRespond:
+    @pytest.mark.asyncio
+    async def test_ask_posts_respond_blocks(self):
+        adapter = MockAdapter()
+        runtime = SlackInteractionRuntime(adapter)
+        runtime.register_channel("feat-1", "C001")
+
+        task = Ask(actor=user, prompt="What is the goal?")
+
+        async def resolve_later():
+            await asyncio.sleep(0.01)
+            pending_id = next(iter(runtime._pending_futures))
+            runtime._resolve_pending(pending_id, "Build a dashboard")
+
+        waiter = asyncio.create_task(resolve_later())
+        result = await runtime.ask(task, feature_id="feat-1", phase_name="pm")
+        await waiter
+
+        assert result == "Build a dashboard"
+        assert len(adapter.posted_blocks) == 1
+        channel, _blocks, _text = adapter.posted_blocks[0]
+        assert channel == "C001"
+
     @pytest.mark.asyncio
     async def test_posts_respond_blocks(self):
         adapter = MockAdapter()
@@ -132,6 +171,63 @@ class TestResolveRespond:
         with pytest.raises(RuntimeError, match="No Slack channel"):
             await runtime.resolve(pending)
 
+    @pytest.mark.asyncio
+    async def test_thread_runtime_posts_into_thread(self):
+        adapter = MockAdapter()
+        runtime = SlackInteractionRuntime(adapter)
+        runtime.register_channel("feat-1", "C001")
+        thread_runtime = runtime.make_thread_runtime(
+            feature_id="feat-1",
+            channel="C001",
+            thread_ts="1111.2222",
+        )
+
+        pending = FakePending(id="p-thread", kind="respond", prompt="What happened?")
+
+        async def resolve_later():
+            await asyncio.sleep(0.01)
+            runtime._resolve_pending("p-thread", "It broke")
+
+        task = asyncio.create_task(resolve_later())
+        result = await thread_runtime.resolve(pending)
+        await task
+
+        assert result == "It broke"
+        assert adapter.posted_block_kwargs[-1]["thread_ts"] == "1111.2222"
+
+    @pytest.mark.asyncio
+    async def test_thread_runtime_persists_user_turns_to_thread_runtime_session(self):
+        adapter = MockAdapter()
+        runtime = SlackInteractionRuntime(adapter)
+        runtime.register_channel("feat-1", "C001")
+        runtime._session_store = MockSessionStore(
+            {"thread-session": AgentSession(session_key="thread-session", metadata={"turns": []})}
+        )
+        runtime._agent_runtime = SimpleNamespace(get_active_session_key=lambda _feature_id: "wrong-session")
+        thread_runtime = runtime.make_thread_runtime(
+            feature_id="feat-1",
+            channel="C001",
+            thread_ts="1111.2222",
+            persist_turns=True,
+            agent_runtime=SimpleNamespace(get_active_session_key=lambda _feature_id: "thread-session"),
+        )
+
+        pending = FakePending(id="p-thread-persist", kind="respond", prompt="What happened?")
+
+        async def resolve_later():
+            await asyncio.sleep(0.01)
+            runtime._resolve_pending("p-thread-persist", "It broke")
+
+        task = asyncio.create_task(resolve_later())
+        result = await thread_runtime.resolve(pending)
+        await task
+        await asyncio.sleep(0)
+
+        assert result == "It broke"
+        saved = await runtime._session_store.load("thread-session")
+        assert saved is not None
+        assert saved.metadata["turns"] == [{"role": "user", "text": "It broke", "turn": 1}]
+
 
 # ── Resolve: Approve Card ──────────────────────────────────────────────────
 
@@ -161,6 +257,31 @@ class TestResolveApprove:
 
 
 class TestResolveChoose:
+    @pytest.mark.asyncio
+    async def test_ask_select_maps_to_choose(self):
+        adapter = MockAdapter()
+        runtime = SlackInteractionRuntime(adapter)
+        runtime.register_channel("feat-1", "C001")
+
+        task = Ask(
+            actor=user,
+            prompt="Pick an option",
+            input=Select(options=["Option A", "Option B"]),
+            input_type=Select,
+        )
+
+        async def choose_later():
+            await asyncio.sleep(0.01)
+            pending_id = next(iter(runtime._pending_futures))
+            runtime._resolve_pending(pending_id, "Option A")
+
+        waiter = asyncio.create_task(choose_later())
+        result = await runtime.ask(task, feature_id="feat-1", phase_name="pm")
+        await waiter
+
+        assert result == "Option A"
+        assert len(adapter.posted_blocks) == 1
+
     @pytest.mark.asyncio
     async def test_posts_choose_card(self):
         adapter = MockAdapter()

@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useMemo, memo } from 'react'
 import type { TimelineEntry } from '../types'
 import { relTime } from '../utils'
 import { DispatchDetail, FixAttemptItem, parseFixAttempts } from './BugDetail'
@@ -8,12 +8,20 @@ const VERIFY_TYPES = new Set(['verify', 're-verify'])
 export function Timeline({ entries }: { entries: TimelineEntry[] }) {
   if (!entries.length) return null
 
-  const verifyEntries = entries.filter(e => VERIFY_TYPES.has(e.type))
-  const fixEntries = entries.filter(e => !VERIFY_TYPES.has(e.type) && e.type !== 'fix-attempts')
+  const verifyEntries = useMemo(
+    () => entries.filter(e => VERIFY_TYPES.has(e.type)),
+    [entries],
+  )
+  const fixEntries = useMemo(
+    () => entries.filter(e => !VERIFY_TYPES.has(e.type) && e.type !== 'fix-attempts'),
+    [entries],
+  )
 
   // Flatten fix-attempts into individual items
-  const fixAttemptsEntry = entries.find(e => e.type === 'fix-attempts')
-  const parsedAttempts = fixAttemptsEntry ? parseFixAttempts(fixAttemptsEntry.summary) : []
+  const parsedAttempts = useMemo(() => {
+    const fixAttemptsEntry = entries.find(e => e.type === 'fix-attempts')
+    return fixAttemptsEntry ? parseFixAttempts(fixAttemptsEntry.summary) : []
+  }, [entries])
 
   return (
     <>
@@ -45,7 +53,7 @@ export function Timeline({ entries }: { entries: TimelineEntry[] }) {
   )
 }
 
-function TimelineItem({ entry }: { entry: TimelineEntry }) {
+const TimelineItem = memo(function TimelineItem({ entry }: { entry: TimelineEntry }) {
   const [open, setOpen] = useState(false)
 
   return (
@@ -64,4 +72,4 @@ function TimelineItem({ entry }: { entry: TimelineEntry }) {
       )}
     </div>
   )
-}
+})

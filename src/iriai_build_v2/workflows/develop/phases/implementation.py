@@ -5,7 +5,9 @@ import itertools
 import json
 import logging
 import shutil
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable
 
 from iriai_compose import AgentActor, Ask, Feature, Gate, Phase, Respond, WorkflowRunner, to_str
 from iriai_compose.actors import Role
@@ -16,6 +18,7 @@ from ....models.outputs import (
     BugGroup,
     BugTriage,
     EnhancementBacklog,
+    EnhancementDecomposition,
     EnhancementItem,
     Envelope,
     FindingLedger,
@@ -24,6 +27,7 @@ from ....models.outputs import (
     ImplementationDAG,
     ImplementationResult,
     ImplementationTask,
+    RepairStrategyDecision,
     ReviewOutcome,
     RootCauseAnalysis,
     Verdict,
@@ -44,13 +48,13 @@ from ....roles import (
     verifier,
 )
 from ....services.markdown import to_markdown
+from ..._common._helpers import PROMPT_FILE_THRESHOLD, _offload_if_large
 from ..._common._tasks import HostedInterview
 
 logger = logging.getLogger(__name__)
 
 VERIFY_RETRIES = 2
 WARN_AFTER_CYCLES = 3
-MAX_FIX_ATTEMPTS = 7
 BLOCKING_SEVERITIES = frozenset({"blocker", "major"})
 
 # ── Inline triage role (lightweight, no tools) ───────────────────────────────
@@ -67,6 +71,31 @@ _triage_role = Role(
     tools=[],
     model=BUDGET_TIERS["opus"],
 )
+
+
+@dataclass(slots=True)
+class PlannedBugGroup:
+    group: BugGroup
+    rca: RootCauseAnalysis
+    issue_text: str
+    rca_key: str
+
+
+@dataclass(slots=True)
+class PlannedBugDispatch:
+    attempt_number: int
+    triage: BugTriage
+    groups: list[PlannedBugGroup]
+    fixable_groups: list[PlannedBugGroup]
+    contradiction_groups: list[PlannedBugGroup]
+    schedule: list[list[str]]
+    dispatch_key: str
+    strategy_mode: str = "ordinary_retry"
+    strategy_reason: str = ""
+    required_checks: list[str] = field(default_factory=list)
+    required_files: list[str] = field(default_factory=list)
+    stable_blocker_summary: str = ""
+    similar_cluster_hints: list[str] = field(default_factory=list)
 
 
 # ── Worktree management ─────────────────────────────────────────────────────
@@ -378,8 +407,17 @@ class ImplementationPhase(Phase):
         dag_json = await runner.artifacts.get("dag", feature=feature)
         dag = ImplementationDAG.model_validate_json(dag_json)
 
-        prior_attempts: list[BugFixAttempt] = []
-        bug_counter = itertools.count(1)
+        prior_attempts = _load_prior_attempts(
+            await runner.artifacts.get("bug-fix-attempts", feature=feature)
+        )
+        if prior_attempts:
+            logger.info(
+                "Restored %d prior fix attempts from artifact store",
+                len(prior_attempts),
+            )
+        bug_counter = itertools.count(
+            max((a.attempt_number for a in prior_attempts), default=0) + 1
+        )
         cycle = 0
 
         while True:
@@ -406,12 +444,6 @@ class ImplementationPhase(Phase):
                 )
                 prior_attempts.extend(attempts)
                 await _store_attempts(runner, feature, prior_attempts)
-                failed = [a for a in attempts if a.re_verify_result != "PASS"]
-                if failed and _count_source_attempts(prior_attempts, "verify") >= MAX_FIX_ATTEMPTS:
-                    await _escalate_to_user(
-                        runner, feature, self.name,
-                        "DAG verification", failed[0], prior_attempts,
-                    )
                 cycle += 1
                 continue
 
@@ -428,8 +460,8 @@ class ImplementationPhase(Phase):
                     backlog = EnhancementBacklog.model_validate_json(backlog_raw)
                     if backlog.items:
                         deferred = "\n".join(
-                            f"- [{it.severity}] {it.description[:150]}"
-                            for it in backlog.items[:30]
+                            f"- [{it.severity}] {it.description}"
+                            for it in backlog.items
                         )
                         handover_context += (
                             f"\n\n## Already-Deferred Issues (DO NOT re-report these)\n"
@@ -484,6 +516,13 @@ class ImplementationPhase(Phase):
                         + "\n".join(decisions_parts)
                         + "\n"
                     )
+
+            # Offload handover context to file if too large for inline prompts
+            handover_context = _offload_if_large(
+                handover_context,
+                _get_feature_root(runner, feature),
+                "post-dag-handover",
+            )
 
             # ── Adversarial runtime routing for post-DAG gates ──────────
             # The last implementation group used impl_runtime based on its
@@ -550,12 +589,6 @@ class ImplementationPhase(Phase):
                 )
                 prior_attempts.extend(attempts)
                 await _store_attempts(runner, feature, prior_attempts)
-                failed = [a for a in attempts if a.re_verify_result != "PASS"]
-                if failed and _count_source_attempts(prior_attempts, "code_reviewer") >= MAX_FIX_ATTEMPTS:
-                    await _escalate_to_user(
-                        runner, feature, self.name,
-                        "Code Review", failed[0], prior_attempts,
-                    )
                 cycle += 1
                 continue
 
@@ -610,12 +643,6 @@ class ImplementationPhase(Phase):
                 )
                 prior_attempts.extend(attempts)
                 await _store_attempts(runner, feature, prior_attempts)
-                failed = [a for a in attempts if a.re_verify_result != "PASS"]
-                if failed and _count_source_attempts(prior_attempts, "security_auditor") >= MAX_FIX_ATTEMPTS:
-                    await _escalate_to_user(
-                        runner, feature, self.name,
-                        "Security Audit", failed[0], prior_attempts,
-                    )
                 cycle += 1
                 continue
 
@@ -704,12 +731,6 @@ class ImplementationPhase(Phase):
                 )
                 prior_attempts.extend(attempts)
                 await _store_attempts(runner, feature, prior_attempts)
-                failed = [a for a in attempts if a.re_verify_result != "PASS"]
-                if failed and _count_source_attempts(prior_attempts, "qa_engineer") >= MAX_FIX_ATTEMPTS:
-                    await _escalate_to_user(
-                        runner, feature, self.name,
-                        "QA", failed[0], prior_attempts,
-                    )
                 cycle += 1
                 continue
 
@@ -765,12 +786,6 @@ class ImplementationPhase(Phase):
                 )
                 prior_attempts.extend(attempts)
                 await _store_attempts(runner, feature, prior_attempts)
-                failed = [a for a in attempts if a.re_verify_result != "PASS"]
-                if failed and _count_source_attempts(prior_attempts, "integration_tester") >= MAX_FIX_ATTEMPTS:
-                    await _escalate_to_user(
-                        runner, feature, self.name,
-                        "Integration Test", failed[0], prior_attempts,
-                    )
                 cycle += 1
                 continue
 
@@ -836,12 +851,6 @@ class ImplementationPhase(Phase):
                 )
                 prior_attempts.extend(attempts)
                 await _store_attempts(runner, feature, prior_attempts)
-                failed = [a for a in attempts if a.re_verify_result != "PASS"]
-                if failed and _count_source_attempts(prior_attempts, "verifier") >= MAX_FIX_ATTEMPTS:
-                    await _escalate_to_user(
-                        runner, feature, self.name,
-                        "Verifier", failed[0], prior_attempts,
-                    )
                 cycle += 1
                 continue
 
@@ -964,15 +973,23 @@ async def _push_clones_to_source(
     if not workspace_mgr:
         return
 
-    feature_root = Path(workspace_mgr._base) / ".iriai" / "features" / feature.slug / "repos"
-    if not feature_root.exists():
+    feature_root = _get_feature_root(runner, feature)
+    if not feature_root:
         return
 
-    for git_dir in feature_root.rglob(".git"):
+    await _push_clones_to_source_root(feature_root)
+
+
+async def _push_clones_to_source_root(repos_root: Path) -> None:
+    """Push commits from all repo clones rooted under *repos_root*."""
+    if not repos_root.exists():
+        return
+
+    for git_dir in repos_root.rglob(".git"):
         if not git_dir.is_dir():
             continue  # Skip worktree .git files (shouldn't exist with clones)
         repo_dir = git_dir.parent
-        if repo_dir == feature_root:
+        if repo_dir == repos_root:
             continue
 
         try:
@@ -987,21 +1004,30 @@ async def _push_clones_to_source(
                 await _run_git(repo_dir, "commit", "-m", "feat: final uncommitted changes")
 
             await _run_git(repo_dir, "push", "origin", branch)
-            rel = repo_dir.relative_to(feature_root)
+            rel = repo_dir.relative_to(repos_root)
             logger.info("Pushed %s (branch: %s) to source", rel, branch)
         except Exception as e:
-            rel = repo_dir.relative_to(feature_root)
+            rel = repo_dir.relative_to(repos_root)
             logger.warning("Failed to push %s: %s", rel, e)
 
 
 # ── DAG execution ────────────────────────────────────────────────────────────
 
 
-def _build_task_prompt(task: ImplementationTask, *, repo_prefix: str = "") -> str:
+def _build_task_prompt(
+    task: ImplementationTask,
+    *,
+    repo_prefix: str = "",
+    context_dir: Path | None = None,
+) -> str:
     """Construct a rich prompt from an ImplementationTask's structured fields.
 
     When *repo_prefix* is set, file_scope paths are stripped of the prefix
     so they're relative to the repo root (matching the agent's cwd).
+
+    When *context_dir* is set, reference material is written to a file
+    inside that directory and the prompt includes a Read pointer instead of
+    inlining the full content.
     """
     parts: list[str] = [
         f"# {task.name}\n\n"
@@ -1075,7 +1101,22 @@ def _build_task_prompt(task: ImplementationTask, *, repo_prefix: str = "") -> st
         ref_lines = []
         for ref in task.reference_material:
             ref_lines.append(f"### {ref.source}\n{ref.content}")
-        parts.append("## Reference Material\n\n" + "\n\n".join(ref_lines))
+        ref_content = "\n\n".join(ref_lines)
+
+        if context_dir is not None:
+            refs_path = context_dir / "refs.md"
+            refs_path.write_text(
+                f"# Reference Material — {task.name}\n\n{ref_content}",
+                encoding="utf-8",
+            )
+            rel_path = f".iriai-context/{task.id}/refs.md"
+            parts.append(
+                f"## Reference Material\n"
+                f"Reference material for this task is in `{rel_path}`.\n"
+                f"**Read that file before starting implementation.**"
+            )
+        else:
+            parts.append("## Reference Material\n\n" + ref_content)
 
     # ── Traceability ─────────────────────────────────────────────────
     trace_lines: list[str] = []
@@ -1089,6 +1130,284 @@ def _build_task_prompt(task: ImplementationTask, *, repo_prefix: str = "") -> st
         parts.append("## Traceability\n" + "\n".join(trace_lines))
 
     return "\n\n".join(parts)
+
+
+async def _verify_and_fix_group(
+    runner: WorkflowRunner,
+    feature: Feature,
+    group_idx: int,
+    group_tasks: list[ImplementationTask],
+    results: list[object],
+    all_results: list[object],
+    handover: HandoverDoc,
+    feature_root: Path | None,
+    impl_runtime: str,
+    review_runtime: str,
+    *,
+    verify_fn: Any | None = None,
+    fix_context: str = "",
+) -> tuple[bool, str]:
+    """Verify a group's implementation and fix issues via RCA → fix → re-verify.
+
+    Returns ``(approved, failure_message)``.  When *approved* is True the
+    group is checkpointed and recorded in the handover.  When False the
+    caller decides how to handle the failure (e.g. halt the DAG).
+
+    When *verify_fn* is provided it replaces the default ``_verify()`` call.
+    It must accept ``(runner, feature, results, files, tasks, *, runtime)``.
+
+    When *fix_context* is provided it is injected into the fix agent's prompt
+    so it has additional context about what needs to be fixed (e.g. the
+    original enhancement items for the enhancement group).
+    """
+    import json as _json
+
+    _do_verify = verify_fn or _verify
+
+    # ── Initial verify ────────────────────────────────────────────────
+    group_files = _collect_files(results)
+    verdict = await _do_verify(
+        runner, feature, results, group_files, group_tasks,
+        runtime=review_runtime,
+    )
+    await runner.artifacts.put(
+        f"dag-verify:g{group_idx}:initial",
+        to_str(verdict),
+        feature=feature,
+    )
+
+    # Ledger dedup + severity partition
+    if isinstance(verdict, Verdict):
+        ledger = await _load_ledger(runner, feature)
+        verdict, _suppressed = _dedup_findings(verdict, ledger, "verify")
+        if _suppressed:
+            logger.info("Suppressed %d duplicate findings from verify (group %d)", len(_suppressed), group_idx)
+        verdict, _enhancements = _partition_verdict(verdict, "verify", f"group-{group_idx}")
+        await _append_enhancements(runner, feature, _enhancements)
+        ledger = _update_ledger(ledger, verdict, "verify", 0)
+        await _save_ledger(runner, feature, ledger)
+
+    # ── RCA → fix → re-verify loop ───────────────────────────────────
+    for retry in range(VERIFY_RETRIES):
+        if _is_approved(verdict):
+            break
+
+        feedback = _format_feedback("Verify", verdict)
+
+        workspace_hint = (
+            f"\n\n### Workspace\nFeature repos at: `{feature_root}`\n"
+            if feature_root else ""
+        )
+        prior_ctx = ""
+        if retry > 0:
+            prior_ctx = (
+                f"\n\n## Prior Verify Attempt\n"
+                f"This is retry {retry + 1}/{VERIFY_RETRIES}. "
+                f"The previous fix attempt did not resolve the issue.\n"
+            )
+
+        # Extract specific issues from verdict
+        verifier_issues_section = ""
+        if isinstance(verdict, Verdict) and verdict.concerns:
+            flagged_files = sorted({c.file for c in verdict.concerns if c.file})
+            issue_lines = []
+            for c in verdict.concerns:
+                file_ref = f"`{c.file}`" if c.file else "(no file)"
+                line_ref = f" line {c.line}" if c.line else ""
+                issue_lines.append(f"- **[{c.severity}]** {file_ref}{line_ref}: {c.description}")
+            verifier_issues_section = (
+                "\n\n## Verifier's Specific Findings (START HERE)\n"
+                "The verifier flagged these exact issues. Investigate THESE first:\n\n"
+                + "\n".join(issue_lines)
+                + "\n\n**Flagged files:** " + ", ".join(f"`{f}`" for f in flagged_files)
+                + "\n\nYour `affected_files` output MUST include these files "
+                "unless you demonstrate with evidence that the root cause is "
+                "entirely in a different file — in which case, explain the chain "
+                "from each flagged file to the actual root cause."
+            )
+
+        rca_prompt = _offload_if_large(
+            f"## DAG Verify Failed (group {group_idx}, attempt {retry + 1})\n\n"
+            f"{feedback}"
+            f"{verifier_issues_section}\n\n"
+            "Investigate the root cause of the specific issues listed above. "
+            "Read each flagged file and check git history for "
+            "oscillating changes. Check if the issue is a spec "
+            "contradiction (task reference_material says X but "
+            "a D-GR decision says Y)."
+            f"{prior_ctx}{workspace_hint}",
+            feature_root,
+            f"g{group_idx}-rca-{retry}",
+        )
+        rca_result: RootCauseAnalysis | None = None
+        try:
+            rca_result = await runner.run(
+                Ask(
+                    actor=_make_parallel_actor(
+                        root_cause_analyst, f"dag-rca-g{group_idx}-r{retry}",
+                        workspace_path=str(feature_root) if feature_root else None,
+                    ),
+                    prompt=rca_prompt,
+                    output_type=RootCauseAnalysis,
+                ),
+                feature,
+                phase_name="implementation",
+            )
+        except Exception as rca_err:
+            logger.warning("DAG verify RCA failed: %s", rca_err)
+
+        if isinstance(rca_result, RootCauseAnalysis):
+            await runner.artifacts.put(
+                f"dag-verify-rca:g{group_idx}:retry-{retry}",
+                rca_result.model_dump_json(),
+                feature=feature,
+            )
+
+        # If RCA found a contradiction, escalate and use resolution
+        fix_direction = ""
+        if isinstance(rca_result, RootCauseAnalysis) and rca_result.confidence == "contradiction":
+            logger.warning(
+                "DAG verify RCA detected contradiction in group %d: %s",
+                group_idx, rca_result.contradiction_detail[:200],
+            )
+            resolution = await _escalate_contradiction(
+                runner, feature, "implementation", "verify",
+                BugGroup(
+                    group_id=f"dag-g{group_idx}-r{retry}",
+                    likely_root_cause=rca_result.hypothesis,
+                    severity="blocker",
+                ),
+                rca_result,
+            )
+            fix_direction = (
+                f"\n\n## User Decision (from contradiction resolution)\n"
+                f"{resolution}\n\n"
+                f"Apply this direction — it overrides any conflicting spec.\n"
+            )
+
+        fix_ws_path = str(feature_root) if feature_root else None
+        logger.info(
+            "DAG verify fix workspace: feature_root=%s, repo_counts=%s, "
+            "fix_ws_path=%s, tasks=%s",
+            feature_root,
+            {t.repo_path: sum(1 for x in group_tasks if x.repo_path == t.repo_path) for t in group_tasks if t.repo_path},
+            fix_ws_path,
+            [t.id for t in group_tasks[:3]],
+        )
+
+        rca_guidance = ""
+        if isinstance(rca_result, RootCauseAnalysis) and rca_result.confidence != "contradiction":
+            rca_guidance = (
+                f"\n\n## RCA Analysis\n"
+                f"**Hypothesis:** {rca_result.hypothesis}\n"
+                f"**Proposed approach:** {rca_result.proposed_approach}\n"
+            )
+
+        fix_actor = _make_parallel_actor(
+            implementer, f"g{group_idx}-fix-{retry}",
+            runtime=impl_runtime,
+            workspace_path=fix_ws_path,
+        )
+        workspace_ctx = ""
+        if fix_ws_path:
+            workspace_ctx = (
+                f"\n\n## Workspace\n"
+                f"Your working directory is: `{fix_ws_path}`\n"
+                f"All file reads and writes MUST use paths within this directory.\n"
+                f"Do NOT use absolute paths from search results that point to "
+                f"other copies of the same repo.\n"
+            )
+
+        fix_prompt = (
+            f"Verification failed (attempt {retry + 1}/{VERIFY_RETRIES}). "
+            f"Read the issues below carefully, then fix them.\n\n"
+            f"{feedback}{rca_guidance}{fix_direction}{fix_context}{workspace_ctx}\n\n"
+            "## Instructions\n"
+            "1. Read each affected file listed above\n"
+            "2. Identify the root cause of each issue\n"
+            "3. Apply targeted fixes — do NOT rewrite files unnecessarily\n"
+            "4. Verify your fix addresses the specific concern/gap described"
+        )
+        fix_prompt = _offload_if_large(
+            fix_prompt, feature_root, f"g{group_idx}-fix-{retry}",
+        )
+        fix_result = await runner.run(
+            Ask(
+                actor=fix_actor,
+                prompt=fix_prompt,
+                output_type=ImplementationResult,
+            ),
+            feature,
+            phase_name="implementation",
+        )
+        all_results.append(fix_result)
+        if isinstance(fix_result, ImplementationResult):
+            await runner.artifacts.put(
+                f"dag-fix:g{group_idx}:retry-{retry}",
+                fix_result.model_dump_json(),
+                feature=feature,
+            )
+        await _commit_repos(
+            runner, feature,
+            f"fix: group {group_idx} verify retry {retry + 1}",
+        )
+        group_files = list(set(group_files + _collect_files([fix_result])))
+        verdict = await _do_verify(
+            runner, feature, [*results, fix_result], group_files, group_tasks,
+            runtime=review_runtime,
+        )
+        await runner.artifacts.put(
+            f"dag-verify:g{group_idx}:retry-{retry}",
+            to_str(verdict),
+            feature=feature,
+        )
+
+        # Ledger dedup + severity partition for re-verify
+        if isinstance(verdict, Verdict):
+            ledger = await _load_ledger(runner, feature)
+            verdict, _suppressed = _dedup_findings(verdict, ledger, "verify")
+            if _suppressed:
+                logger.info("Suppressed %d duplicate findings from verify retry (group %d)", len(_suppressed), group_idx)
+            verdict, _enhancements = _partition_verdict(verdict, "verify", f"group-{group_idx}-retry-{retry}")
+            await _append_enhancements(runner, feature, _enhancements)
+            ledger = _update_ledger(ledger, verdict, "verify", 0)
+            await _save_ledger(runner, feature, ledger)
+
+    # ── Record outcomes + checkpoint ──────────────────────────────────
+    if _is_approved(verdict):
+        for r in results:
+            if isinstance(r, ImplementationResult):
+                handover.record_success(r)
+
+        commit_hash = await _commit_group(runner, feature, group_idx, group_tasks)
+
+        checkpoint = {
+            "group_idx": group_idx,
+            "task_ids": [t.id for t in group_tasks],
+            "results": [
+                r.model_dump()
+                for r in results
+                if isinstance(r, ImplementationResult)
+            ],
+            "verdict": "approved",
+            "commit_hash": commit_hash,
+        }
+        await runner.artifacts.put(
+            f"dag-group:{group_idx}",
+            _json.dumps(checkpoint),
+            feature=feature,
+        )
+        logger.info(
+            "Group %d checkpointed (commit %s)", group_idx, commit_hash,
+        )
+        return True, ""
+    else:
+        for r in results:
+            if isinstance(r, ImplementationResult):
+                handover.record_failure(
+                    r.task_id, r.summary, _format_feedback("Verify", verdict),
+                )
+        return False, _format_feedback("Verify", verdict)
 
 
 async def _implement_dag(
@@ -1205,6 +1524,39 @@ async def _implement_dag(
                     if worktree.exists():
                         ws_path = str(worktree)
 
+                # ── Build prompt, offloading to files if too large ──
+                prefix = f"{repo_prefix}/" if repo_prefix else ""
+                inline_prompt = _build_task_prompt(t, repo_prefix=prefix) + handover_context
+
+                context_base = ws_path or (str(feature_root) if feature_root else None)
+                if len(inline_prompt) > PROMPT_FILE_THRESHOLD and context_base:
+                    context_dir = Path(context_base) / ".iriai-context" / t.id
+                    context_dir.mkdir(parents=True, exist_ok=True)
+
+                    task_prompt = _build_task_prompt(
+                        t, repo_prefix=prefix, context_dir=context_dir,
+                    )
+                    if handover_context:
+                        handover_path = context_dir / "handover.md"
+                        handover_path.write_text(
+                            handover_context.lstrip(), encoding="utf-8",
+                        )
+                        rel_handover = f".iriai-context/{t.id}/handover.md"
+                        task_prompt += (
+                            f"\n\n## Handover — Prior Work\n"
+                            f"Prior work context is in `{rel_handover}`.\n"
+                            f"**Read that file to understand what has been completed.**"
+                        )
+                    else:
+                        task_prompt += handover_context
+
+                    logger.info(
+                        "Task %s: prompt offloaded to files (%d → %d chars)",
+                        t.id, len(inline_prompt), len(task_prompt),
+                    )
+                else:
+                    task_prompt = inline_prompt
+
                 for attempt in range(TASK_MAX_RETRIES + 1):
                     try:
                         result = await runner.run(
@@ -1214,10 +1566,7 @@ async def _implement_dag(
                                     runtime=impl_runtime,
                                     workspace_path=ws_path,
                                 ),
-                                prompt=_build_task_prompt(
-                                    t,
-                                    repo_prefix=f"{repo_prefix}/" if repo_prefix else "",
-                                ) + handover_context,
+                                prompt=task_prompt,
                                 output_type=ImplementationResult,
                             ),
                             feature,
@@ -1231,12 +1580,27 @@ async def _implement_dag(
                                     result.task_id, t.id,
                                 )
                                 result.task_id = t.id
+                            # Enrich fallback results that have empty file metadata
+                            if not result.files_created and not result.files_modified:
+                                await _enrich_fallback_result(result, ws_path, t)
                         return result
                     except Exception as e:
                         logger.warning(
                             "Task %s crashed (attempt %d/%d): %s",
                             t.id, attempt + 1, TASK_MAX_RETRIES + 1, e,
                         )
+                        # Prompt overflow is deterministic — retrying is futile
+                        err_msg = str(e).lower()
+                        if "prompt too long" in err_msg or "input too long" in err_msg:
+                            logger.error(
+                                "Task %s: prompt exceeds model context — skipping retries",
+                                t.id,
+                            )
+                            return ImplementationResult(
+                                task_id=t.id,
+                                summary=f"BLOCKED: prompt too large for model context window: {e}",
+                                status="blocked",
+                            )
                         if attempt + 1 == TASK_WARN_AT:
                             # Notify user via Slack that a task is struggling
                             try:
@@ -1246,7 +1610,7 @@ async def _implement_dag(
                                         prompt=(
                                             f"⚠️ Task `{t.id}` ({t.name}) has crashed "
                                             f"{TASK_WARN_AT} times in group {group_idx}.\n"
-                                            f"Last error: `{str(e)[:200]}`\n"
+                                            f"Last error: `{str(e)}`\n"
                                             f"Retrying ({TASK_MAX_RETRIES - attempt} attempts left)..."
                                         ),
                                     ),
@@ -1294,229 +1658,17 @@ async def _implement_dag(
         results = list(completed_results) + list(new_results)
         all_results.extend(new_results)  # Don't double-count resumed results
 
-        # ── Verify: confirm claimed work + basic correctness ─────────
-        group_files = _collect_files(results)
-        verdict = await _verify(
-            runner, feature, results, group_files, group_tasks,
-            runtime=review_runtime,
+        # ── Verify + fix loop (shared with enhancement group) ─────────
+        approved, failure = await _verify_and_fix_group(
+            runner, feature, group_idx, group_tasks,
+            results, all_results, handover, feature_root,
+            impl_runtime, review_runtime,
         )
-        await runner.artifacts.put(
-            f"dag-verify:g{group_idx}:initial",
-            to_str(verdict),
-            feature=feature,
-        )
-
-        # Ledger dedup + severity partition for initial verify
-        if isinstance(verdict, Verdict):
-            ledger = await _load_ledger(runner, feature)
-            verdict, _suppressed = _dedup_findings(verdict, ledger, "verify")
-            if _suppressed:
-                logger.info("Suppressed %d duplicate findings from verify (group %d)", len(_suppressed), group_idx)
-            verdict, _enhancements = _partition_verdict(verdict, "verify", f"group-{group_idx}")
-            await _append_enhancements(runner, feature, _enhancements)
-            ledger = _update_ledger(ledger, verdict, "verify", 0)
-            await _save_ledger(runner, feature, ledger)
-
-        for retry in range(VERIFY_RETRIES):
-            if _is_approved(verdict):
-                break
-
-            feedback = _format_feedback("Verify", verdict)
-
-            # ── RCA before fix: check for contradictions/oscillation ──
-            workspace_hint = (
-                f"\n\n### Workspace\nFeature repos at: `{feature_root}`\n"
-                if feature_root else ""
-            )
-            prior_ctx = ""
-            if retry > 0:
-                prior_ctx = (
-                    f"\n\n## Prior Verify Attempt\n"
-                    f"This is retry {retry + 1}/{VERIFY_RETRIES}. "
-                    f"The previous fix attempt did not resolve the issue.\n"
-                )
-
-            rca_result: RootCauseAnalysis | None = None
-            try:
-                rca_result = await runner.run(
-                    Ask(
-                        actor=_make_parallel_actor(
-                            root_cause_analyst, f"dag-rca-g{group_idx}-r{retry}",
-                        ),
-                        prompt=(
-                            f"## DAG Verify Failed (group {group_idx}, attempt {retry + 1})\n\n"
-                            f"{feedback}\n\n"
-                            "Investigate the root cause. Check git history for "
-                            "oscillating changes. Check if the issue is a spec "
-                            "contradiction (task reference_material says X but "
-                            "a D-GR decision says Y)."
-                            f"{prior_ctx}{workspace_hint}"
-                        ),
-                        output_type=RootCauseAnalysis,
-                    ),
-                    feature,
-                    phase_name="implementation",
-                )
-            except Exception as rca_err:
-                logger.warning("DAG verify RCA failed: %s", rca_err)
-
-            if isinstance(rca_result, RootCauseAnalysis):
-                await runner.artifacts.put(
-                    f"dag-verify-rca:g{group_idx}:retry-{retry}",
-                    rca_result.model_dump_json(),
-                    feature=feature,
-                )
-
-            # If RCA found a contradiction, escalate and use resolution
-            fix_direction = ""
-            if isinstance(rca_result, RootCauseAnalysis) and rca_result.confidence == "contradiction":
-                logger.warning(
-                    "DAG verify RCA detected contradiction in group %d: %s",
-                    group_idx, rca_result.contradiction_detail[:200],
-                )
-                resolution = await _escalate_contradiction(
-                    runner, feature, "implementation", "verify",
-                    BugGroup(
-                        group_id=f"dag-g{group_idx}-r{retry}",
-                        likely_root_cause=rca_result.hypothesis,
-                        severity="blocker",
-                    ),
-                    rca_result,
-                )
-                fix_direction = (
-                    f"\n\n## User Decision (from contradiction resolution)\n"
-                    f"{resolution}\n\n"
-                    f"Apply this direction — it overrides any conflicting spec.\n"
-                )
-
-            # Give the fix agent access to ALL repos in the feature workspace.
-            # The fixer may need to fix issues across multiple repos (e.g.,
-            # iriai-compose + tools/compose/frontend + tools/compose/backend).
-            fix_ws_path = str(feature_root) if feature_root else None
-            logger.info(
-                "DAG verify fix workspace: feature_root=%s, repo_counts=%s, "
-                "fix_ws_path=%s, tasks=%s",
-                feature_root,
-                {t.repo_path: sum(1 for x in group_tasks if x.repo_path == t.repo_path) for t in group_tasks if t.repo_path},
-                fix_ws_path,
-                [t.id for t in group_tasks[:3]],
-            )
-
-            rca_guidance = ""
-            if isinstance(rca_result, RootCauseAnalysis) and rca_result.confidence != "contradiction":
-                rca_guidance = (
-                    f"\n\n## RCA Analysis\n"
-                    f"**Hypothesis:** {rca_result.hypothesis}\n"
-                    f"**Proposed approach:** {rca_result.proposed_approach}\n"
-                )
-
-            fix_actor = _make_parallel_actor(
-                implementer, f"g{group_idx}-fix-{retry}",
-                runtime=impl_runtime,
-                workspace_path=fix_ws_path,
-            )
-            workspace_ctx = ""
-            if fix_ws_path:
-                workspace_ctx = (
-                    f"\n\n## Workspace\n"
-                    f"Your working directory is: `{fix_ws_path}`\n"
-                    f"All file reads and writes MUST use paths within this directory.\n"
-                    f"Do NOT use absolute paths from search results that point to "
-                    f"other copies of the same repo.\n"
-                )
-
-            fix_result = await runner.run(
-                Ask(
-                    actor=fix_actor,
-                    prompt=(
-                        f"Verification failed (attempt {retry + 1}/{VERIFY_RETRIES}). "
-                        f"Read the issues below carefully, then fix them.\n\n"
-                        f"{feedback}{rca_guidance}{fix_direction}{workspace_ctx}\n\n"
-                        "## Instructions\n"
-                        "1. Read each affected file listed above\n"
-                        "2. Identify the root cause of each issue\n"
-                        "3. Apply targeted fixes — do NOT rewrite files unnecessarily\n"
-                        "4. Verify your fix addresses the specific concern/gap described"
-                    ),
-                    output_type=ImplementationResult,
-                ),
-                feature,
-                phase_name="implementation",
-            )
-            all_results.append(fix_result)
-            if isinstance(fix_result, ImplementationResult):
-                await runner.artifacts.put(
-                    f"dag-fix:g{group_idx}:retry-{retry}",
-                    fix_result.model_dump_json(),
-                    feature=feature,
-                )
-            await _commit_repos(
-                runner, feature,
-                f"fix: group {group_idx} verify retry {retry + 1}",
-            )
-            group_files = list(set(group_files + _collect_files([fix_result])))
-            verdict = await _verify(
-                runner, feature, [*results, fix_result], group_files, group_tasks,
-                runtime=review_runtime,
-            )
-            await runner.artifacts.put(
-                f"dag-verify:g{group_idx}:retry-{retry}",
-                to_str(verdict),
-                feature=feature,
-            )
-
-            # Ledger dedup + severity partition for re-verify
-            if isinstance(verdict, Verdict):
-                ledger = await _load_ledger(runner, feature)
-                verdict, _suppressed = _dedup_findings(verdict, ledger, "verify")
-                if _suppressed:
-                    logger.info("Suppressed %d duplicate findings from verify retry (group %d)", len(_suppressed), group_idx)
-                verdict, _enhancements = _partition_verdict(verdict, "verify", f"group-{group_idx}-retry-{retry}")
-                await _append_enhancements(runner, feature, _enhancements)
-                ledger = _update_ledger(ledger, verdict, "verify", 0)
-                await _save_ledger(runner, feature, ledger)
-
-        # ── Record outcomes + checkpoint ─────────────────────────────
-        if _is_approved(verdict):
-            for r in results:
-                if isinstance(r, ImplementationResult):
-                    handover.record_success(r)
-
-            # Git commit the group's changes
-            commit_hash = await _commit_group(runner, feature, group_idx, group_tasks)
-
-            # Persist group checkpoint
-            checkpoint = {
-                "group_idx": group_idx,
-                "task_ids": [t.id for t in group_tasks],
-                "results": [
-                    r.model_dump()
-                    for r in results
-                    if isinstance(r, ImplementationResult)
-                ],
-                "verdict": "approved",
-                "commit_hash": commit_hash,
-            }
-            await runner.artifacts.put(
-                f"dag-group:{group_idx}",
-                _json.dumps(checkpoint),
-                feature=feature,
-            )
-            logger.info(
-                "Group %d checkpointed (commit %s)", group_idx, commit_hash,
-            )
-        else:
-            # Group failed — record and stop
-            for r in results:
-                if isinstance(r, ImplementationResult):
-                    handover.record_failure(
-                        r.task_id, r.summary, _format_feedback("Verify", verdict),
-                    )
+        if not approved:
             remaining = dag.execution_order[group_idx + 1 :]
             remaining_names = [
                 tasks_by_id[tid].name for g in remaining for tid in g
             ]
-            failure = _format_feedback("Verify", verdict)
             if remaining_names:
                 failure += (
                     "\n\nThe DAG was halted. Unexecuted tasks: "
@@ -1525,7 +1677,432 @@ async def _implement_dag(
             impl_text = "\n\n".join(to_str(r) for r in all_results)
             return impl_text, failure, handover
 
+    # ── Enhancement group: fix accumulated non-blocking findings ──────
+    enh_failure = await _run_enhancement_group(
+        runner, feature, dag, all_results, handover,
+    )
+    if enh_failure:
+        return "\n\n".join(to_str(r) for r in all_results), enh_failure, handover
+
     return "\n\n".join(to_str(r) for r in all_results), "", handover
+
+
+async def _run_enhancement_group(
+    runner: WorkflowRunner,
+    feature: Feature,
+    dag: ImplementationDAG,
+    all_results: list[object],
+    handover: HandoverDoc,
+) -> str:
+    """Run an extra implementation group to fix accumulated enhancements.
+
+    Returns an empty string on success (or when the backlog is empty).
+    Returns a failure message string when the enhancement group fails
+    verification.
+    """
+    import json as _json
+
+    backlog_raw = await runner.artifacts.get("enhancement-backlog", feature=feature)
+    if not backlog_raw:
+        return ""
+    try:
+        backlog = EnhancementBacklog.model_validate_json(backlog_raw)
+    except Exception:
+        return ""
+    if not backlog.items:
+        return ""
+
+    enhancement_group_idx = len(dag.execution_order)
+
+    # ── Resume: skip if enhancement group already passed ──────────
+    checkpoint_json = await runner.artifacts.get(
+        f"dag-group:{enhancement_group_idx}", feature=feature,
+    )
+    if checkpoint_json:
+        try:
+            data = _json.loads(checkpoint_json)
+            if data.get("verdict") == "approved":
+                logger.info("Enhancement group already complete — skipping")
+                return ""
+        except (ValueError, TypeError):
+            pass
+
+    logger.info(
+        "Enhancement group: %d items to fix", len(backlog.items),
+    )
+
+    # ── Resolve workspace root (needed by analysis + dispatch) ────
+    workspace_mgr = runner.services.get("workspace_manager")
+    feature_root = (
+        Path(workspace_mgr._base) / ".iriai" / "features" / feature.slug / "repos"
+        if workspace_mgr
+        else None
+    )
+
+    # ── Opus analysis: decompose backlog into per-repo tasks ────────
+    known_repos = sorted({t.repo_path for t in dag.tasks if t.repo_path})
+
+    indexed_items = []
+    for i, item in enumerate(backlog.items):
+        file_hint = f" (file: `{item.file}`)" if item.file else ""
+        indexed_items.append(f"[{i}] [{item.severity}] {item.description}{file_hint}")
+
+    # ── Resume: load cached decomposition if available ──────────
+    decomposition: EnhancementDecomposition | None = None
+    decomp_raw = await runner.artifacts.get(
+        "enhancement-decomposition", feature=feature,
+    )
+    if decomp_raw:
+        try:
+            decomposition = EnhancementDecomposition.model_validate_json(decomp_raw)
+            logger.info(
+                "Loaded cached enhancement decomposition: %d tasks, %d already-resolved",
+                len(decomposition.tasks), len(decomposition.already_resolved),
+            )
+        except Exception:
+            pass
+
+    if decomposition is None:
+        try:
+            from ....config import BUDGET_TIERS
+
+            analyst_role = Role(
+                name="enhancement-analyst",
+                prompt=(
+                    "You are a senior engineer analyzing deferred code issues. "
+                    "Your job is to route each issue to the correct repository "
+                    "so that per-repo implementers can fix them in parallel."
+                ),
+                tools=["Read", "Glob", "Grep"],
+                model=BUDGET_TIERS["opus"],
+            )
+            analyst = AgentActor(
+                name="enhancement-analyst",
+                role=analyst_role,
+                context_keys=["project"],
+            )
+            decomposition = await runner.run(
+                Ask(
+                    actor=_make_parallel_actor(
+                        analyst, "decompose",
+                        workspace_path=str(feature_root) if feature_root else None,
+                    ),
+                prompt=(
+                    f"## Enhancement Backlog Decomposition\n\n"
+                    f"There are {len(backlog.items)} deferred issues to fix. "
+                    f"Assign each to a repository so per-repo agents can work "
+                    f"in parallel.\n\n"
+                    f"### Available Repositories\n"
+                    + "\n".join(f"- `{r}`" for r in known_repos)
+                    + "\n\n### Enhancement Items\n\n"
+                    + "\n".join(indexed_items)
+                    + "\n\n### Instructions\n"
+                    "1. For each item, determine which repo it belongs to. "
+                    "Use the file path if present, otherwise search the codebase "
+                    "(Grep for class/function names mentioned in the description).\n"
+                    "2. Group items by repo in your output.\n"
+                    "3. If an item clearly references work that was completed in "
+                    "a later group (the items are ordered by group), mark it as "
+                    "`already_resolved`.\n"
+                    "4. Every item index (0 to "
+                    f"{len(backlog.items) - 1}) must appear in exactly one task "
+                    "or in `already_resolved`.\n"
+                ),
+                output_type=EnhancementDecomposition,
+            ),
+            feature,
+            phase_name="implementation",
+        )
+        except Exception as e:
+            logger.warning("Enhancement decomposition failed: %s — falling back to single task", e)
+
+        # Checkpoint the decomposition so it survives restarts
+        if isinstance(decomposition, EnhancementDecomposition):
+            await runner.artifacts.put(
+                "enhancement-decomposition",
+                decomposition.model_dump_json(),
+                feature=feature,
+            )
+
+    # ── Build tasks from decomposition (or fallback) ──────────────
+    if isinstance(decomposition, EnhancementDecomposition) and decomposition.tasks:
+        logger.info(
+            "Enhancement decomposition: %d repo tasks, %d already-resolved",
+            len(decomposition.tasks), len(decomposition.already_resolved),
+        )
+        # Track which items are assigned to tasks (for verification)
+        assigned_indices: set[int] = set()
+        for rt in decomposition.tasks:
+            assigned_indices.update(rt.item_indices)
+
+        enhancement_tasks: list[ImplementationTask] = []
+        for rt in decomposition.tasks:
+            desc_lines = []
+            for idx in rt.item_indices:
+                if 0 <= idx < len(backlog.items):
+                    item = backlog.items[idx]
+                    file_hint = f" (`{item.file}`)" if item.file else ""
+                    desc_lines.append(f"- [{item.severity}] {item.description}{file_hint}")
+            if not desc_lines:
+                continue
+            enhancement_tasks.append(ImplementationTask(
+                id=f"enhancement-{rt.repo_path}",
+                name=f"Fix enhancements in {rt.repo_path} ({len(desc_lines)} items)",
+                description=(
+                    f"Fix the following deferred issues in `{rt.repo_path}`.\n\n"
+                    "**Important:** Some issues may have been resolved by subsequent "
+                    "implementation groups. For each item, **check whether the issue "
+                    "still exists** before fixing. If already resolved, skip it and "
+                    "note it in your summary.\n\n"
+                    + "\n".join(desc_lines)
+                ),
+                repo_path=rt.repo_path,
+            ))
+
+        # Items for verification: only those assigned to tasks
+        verify_items = [
+            backlog.items[i] for i in sorted(assigned_indices)
+            if 0 <= i < len(backlog.items)
+        ]
+    else:
+        # Fallback: single task with all items
+        desc_lines = []
+        for item in backlog.items:
+            file_hint = f" (`{item.file}`)" if item.file else ""
+            desc_lines.append(f"- [{item.severity}] {item.description}{file_hint}")
+
+        enhancement_tasks = [
+            ImplementationTask(
+                id="enhancement-all",
+                name=f"Fix enhancement backlog ({len(backlog.items)} items)",
+                description=(
+                    "Fix the following non-blocking issues that were deferred "
+                    "during prior implementation and review passes.\n\n"
+                    "**Important:** Some issues may have been resolved by subsequent "
+                    "implementation groups. For each item, **check whether the issue "
+                    "still exists** before fixing. If already resolved, skip it and "
+                    "note it in your summary.\n\n"
+                    + "\n".join(desc_lines)
+                ),
+            ),
+        ]
+        verify_items = list(backlog.items)
+
+    enh_tasks_by_id = {t.id: t for t in enhancement_tasks}
+
+    # ── Ensure worktrees ──────────────────────────────────────────
+    await _ensure_task_worktrees(runner, feature, enhancement_tasks)
+
+    # ── Runtime alternation (continue from last DAG group) ────────
+    impl_runtime = "primary" if enhancement_group_idx % 2 == 0 else "secondary"
+    review_runtime = "secondary" if enhancement_group_idx % 2 == 0 else "primary"
+
+    # ── Build handover context ────────────────────────────────────
+    handover_context = ""
+    if handover.completed or handover.failed_attempts:
+        handover.compress()
+        handover_context = f"\n\n## Handover — Prior Work\n\n{to_markdown(handover)}"
+
+    # ── Per-task resume ───────────────────────────────────────────
+    pending_tasks: list[ImplementationTask] = []
+    completed_results: list[ImplementationResult] = []
+    for tid in enh_tasks_by_id:
+        task_marker = await runner.artifacts.get(
+            f"dag-task:{tid}", feature=feature,
+        )
+        if task_marker:
+            try:
+                result = ImplementationResult.model_validate_json(task_marker)
+                if result.status == "completed":
+                    completed_results.append(result)
+                    logger.info("Enhancement task %s already complete — skipping", tid)
+                    continue
+            except Exception:
+                pass
+        pending_tasks.append(enh_tasks_by_id[tid])
+
+    # ── Dispatch pending tasks with retry on crash ────────────────
+    TASK_MAX_RETRIES = 5
+    TASK_WARN_AT = 3
+    new_results: list[object] = []
+
+    if pending_tasks:
+
+        async def _run_enh_task(task_idx: int, t: ImplementationTask) -> ImplementationResult:
+            repo_prefix = t.repo_path
+            ws_path = None
+            if feature_root and repo_prefix:
+                worktree = feature_root / repo_prefix
+                if worktree.exists():
+                    ws_path = str(worktree)
+
+            # ── Build prompt, offloading to files if too large ──
+            prefix = f"{repo_prefix}/" if repo_prefix else ""
+            inline_prompt = _build_task_prompt(t, repo_prefix=prefix) + handover_context
+
+            # Use ws_path for context files, falling back to feature_root
+            # for tasks without a specific repo (e.g. enhancement-general).
+            context_base = ws_path or (str(feature_root) if feature_root else None)
+            if len(inline_prompt) > PROMPT_FILE_THRESHOLD and context_base:
+                context_dir = Path(context_base) / ".iriai-context" / t.id
+                context_dir.mkdir(parents=True, exist_ok=True)
+
+                task_prompt = _build_task_prompt(
+                    t, repo_prefix=prefix, context_dir=context_dir,
+                )
+                if handover_context:
+                    handover_path = context_dir / "handover.md"
+                    handover_path.write_text(
+                        handover_context.lstrip(), encoding="utf-8",
+                    )
+                    rel_handover = f".iriai-context/{t.id}/handover.md"
+                    task_prompt += (
+                        f"\n\n## Handover — Prior Work\n"
+                        f"Prior work context is in `{rel_handover}`.\n"
+                        f"**Read that file to understand what has been completed.**"
+                    )
+                else:
+                    task_prompt += handover_context
+
+                logger.info(
+                    "Enhancement task %s: prompt offloaded to files (%d → %d chars)",
+                    t.id, len(inline_prompt), len(task_prompt),
+                )
+            else:
+                task_prompt = inline_prompt
+
+            for attempt in range(TASK_MAX_RETRIES + 1):
+                try:
+                    result = await runner.run(
+                        Ask(
+                            actor=_make_parallel_actor(
+                                implementer,
+                                f"enh-t{task_idx}-a{attempt}",
+                                runtime=impl_runtime,
+                                workspace_path=ws_path,
+                            ),
+                            prompt=task_prompt,
+                            output_type=ImplementationResult,
+                        ),
+                        feature,
+                        phase_name="implementation",
+                    )
+                    if isinstance(result, ImplementationResult):
+                        if result.task_id != t.id:
+                            result.task_id = t.id
+                        if not result.files_created and not result.files_modified:
+                            await _enrich_fallback_result(result, ws_path, t)
+                    return result
+                except Exception as e:
+                    logger.warning(
+                        "Enhancement task %s crashed (attempt %d/%d): %s",
+                        t.id, attempt + 1, TASK_MAX_RETRIES + 1, e,
+                    )
+                    err_msg = str(e).lower()
+                    if "prompt too long" in err_msg or "input too long" in err_msg:
+                        logger.error(
+                            "Enhancement task %s: prompt exceeds model context — skipping retries",
+                            t.id,
+                        )
+                        return ImplementationResult(
+                            task_id=t.id,
+                            summary=f"BLOCKED: prompt too large for model context window: {e}",
+                            status="blocked",
+                        )
+                    if attempt + 1 == TASK_WARN_AT:
+                        try:
+                            await runner.run(
+                                Respond(
+                                    responder=user,
+                                    prompt=(
+                                        f"⚠️ Enhancement task `{t.id}` ({t.name}) has crashed "
+                                        f"{TASK_WARN_AT} times.\n"
+                                        f"Last error: `{str(e)}`\n"
+                                        f"Retrying ({TASK_MAX_RETRIES - attempt} attempts left)..."
+                                    ),
+                                ),
+                                feature,
+                                phase_name="implementation",
+                            )
+                        except Exception:
+                            pass
+                    if attempt >= TASK_MAX_RETRIES:
+                        return ImplementationResult(
+                            task_id=t.id,
+                            summary=f"FAILED after {TASK_MAX_RETRIES + 1} attempts: {e}",
+                            status="blocked",
+                        )
+            return ImplementationResult(task_id=t.id, summary="FAILED", status="blocked")
+
+        gathered = await _asyncio.gather(
+            *[_run_enh_task(i, t) for i, t in enumerate(pending_tasks)],
+        )
+        new_results = list(gathered)
+
+        # Save per-task markers
+        for r in new_results:
+            if isinstance(r, ImplementationResult) and r.task_id:
+                await runner.artifacts.put(
+                    f"dag-task:{r.task_id}",
+                    r.model_dump_json(),
+                    feature=feature,
+                )
+
+        await _commit_repos(
+            runner, feature,
+            f"feat: enhancement group — {len(backlog.items)} items",
+        )
+
+    results = list(completed_results) + list(new_results)
+    all_results.extend(new_results)
+
+    # ── Verify + fix loop (custom verify for enhancements) ─────────
+    # Use _verify_enhancements instead of _verify so the verifier checks
+    # each enhancement item was addressed and doesn't suppress them.
+    async def _enh_verify(
+        runner: WorkflowRunner,
+        feature: Feature,
+        results: list[object],
+        files: list[str],
+        tasks: list[ImplementationTask] | None = None,
+        *,
+        runtime: str | None = None,
+    ) -> Verdict:
+        return await _verify_enhancements(
+            runner, feature, results, files, verify_items,
+            runtime=runtime,
+            feature_root=feature_root,
+        )
+
+    # Build fix context so the fix agent knows the original enhancement spec
+    enh_fix_lines = []
+    for item in verify_items:
+        file_hint = f" (`{item.file}`)" if item.file else ""
+        enh_fix_lines.append(f"- [{item.severity}] {item.description}{file_hint}")
+    enh_fix_context = (
+        f"\n\n## Original Enhancement Items\n"
+        f"These are the deferred issues this group was supposed to fix. "
+        f"The verifier checked each one — address the ones it flagged.\n\n"
+        + "\n".join(enh_fix_lines)
+    )
+
+    approved, failure = await _verify_and_fix_group(
+        runner, feature, enhancement_group_idx, enhancement_tasks,
+        results, all_results, handover, feature_root,
+        impl_runtime, review_runtime,
+        verify_fn=_enh_verify,
+        fix_context=enh_fix_context,
+    )
+    if approved:
+        # Clear the backlog — enhancements are now fixed
+        await runner.artifacts.put(
+            "enhancement-backlog",
+            EnhancementBacklog().model_dump_json(),
+            feature=feature,
+        )
+        logger.info("Enhancement backlog cleared after successful verification")
+
+    return failure
 
 
 async def _commit_repos(
@@ -1542,8 +2119,16 @@ async def _commit_repos(
     Returns a comma-separated list of commit hashes (one per repo).
     """
     repos_root = _get_feature_root(runner, feature)
+    return await _commit_repos_in_root(repos_root, msg)
+
+
+async def _commit_repos_in_root(
+    repos_root: Path | None,
+    msg: str,
+) -> str:
+    """Commit uncommitted changes in all repo clones rooted under *repos_root*."""
     if not repos_root:
-        logger.warning("_commit_repos: no feature workspace found — skipping")
+        logger.warning("_commit_repos_in_root: no feature workspace found — skipping")
         return ""
 
     hashes: list[str] = []
@@ -1558,7 +2143,7 @@ async def _commit_repos(
             )
             stdout, _ = await proc.communicate()
             if not stdout.decode().strip():
-                return None  # No changes
+                return None
 
             await _run_git(repo_path, "add", "--all", ".")
             await _run_git(repo_path, "commit", "-m", msg)
@@ -1569,11 +2154,7 @@ async def _commit_repos(
             logger.warning("Failed to commit in %s: %s", repo_path, e)
             return None
 
-    # Walk repos root for git repos (may be nested: repos/tools/compose/backend/)
-    for dirpath in repos_root.rglob(".git"):
-        repo_dir = dirpath.parent
-        if repo_dir == repos_root:
-            continue
+    for repo_dir in _discover_repo_roots_under(repos_root):
         h = await _commit_in_repo(repo_dir)
         if h:
             hashes.append(h)
@@ -1635,8 +2216,8 @@ async def _verify(
             backlog = EnhancementBacklog.model_validate_json(backlog_raw)
             if backlog.items:
                 deferred = "\n".join(
-                    f"- [{it.severity}] {it.description[:150]}"
-                    for it in backlog.items[:30]  # cap to avoid prompt bloat
+                    f"- [{it.severity}] {it.description}"
+                    for it in backlog.items
                 )
                 known_issues = (
                     f"\n\n## Already-Deferred Issues (DO NOT re-report these)\n"
@@ -1670,20 +2251,102 @@ async def _verify(
 
     verifier = _make_parallel_actor(qa_engineer, "verify", runtime=runtime)
 
+    verify_prompt = (
+        f"Verify this implementation group:\n\n{results_summary}\n\n"
+        "For each result, confirm:\n"
+        f"1. All claimed files exist on disk: {file_list}\n"
+        "2. Files listed as modified were actually changed\n"
+        "3. The changes align with the described summary\n"
+        "4. The code compiles, imports correctly, and passes "
+        "any existing tests for these files\n"
+        "5. Implementation matches the upstream specs in Reference Material"
+        f"{ref_context}{known_issues}\n\n"
+        "This is a per-group verification, not a full QA pass."
+    )
+    verify_prompt = _offload_if_large(
+        verify_prompt, _get_feature_root(runner, feature), "verify",
+    )
+
+    return await runner.run(
+        Ask(
+            actor=verifier,
+            prompt=verify_prompt,
+            output_type=Verdict,
+        ),
+        feature,
+        phase_name="implementation",
+    )
+
+
+async def _verify_enhancements(
+    runner: WorkflowRunner,
+    feature: Feature,
+    results: list[object],
+    files: list[str],
+    enhancement_items: list[EnhancementItem],
+    *,
+    runtime: str | None = None,
+    feature_root: Path | None = None,
+) -> Verdict:
+    """Verify that enhancement fixes are correct and don't introduce regressions.
+
+    Unlike ``_verify()``, this function:
+    - Uses the enhancement items themselves as the spec to check against
+      (instead of ``reference_material``).
+    - Does NOT suppress the enhancement backlog findings — the whole point
+      is to verify they were fixed.
+    - Explicitly checks for regressions in existing functionality.
+    """
+    results_summary = "\n\n".join(to_str(r) for r in results)
+    file_list = ", ".join(files) if files else "recently changed files"
+
+    # Build the enhancement spec for the verifier
+    enh_spec_lines = []
+    for item in enhancement_items:
+        file_hint = f" (file: `{item.file}`)" if item.file else ""
+        enh_spec_lines.append(
+            f"- **[{item.severity}]** {item.description}{file_hint}"
+        )
+    enh_spec = "\n".join(enh_spec_lines)
+
+    enh_spec_section = _offload_if_large(
+        f"### Enhancement Items (the spec)\n\n"
+        f"Each item below should have been addressed or confirmed as "
+        f"already resolved by prior work. Check each one:\n\n{enh_spec}",
+        feature_root,
+        "enh-verify-spec",
+    )
+    results_section = _offload_if_large(
+        f"### Implementation Results\n\n{results_summary}",
+        feature_root,
+        "enh-verify-results",
+    )
+
+    verifier = _make_parallel_actor(qa_engineer, "verify-enh", runtime=runtime)
+
     return await runner.run(
         Ask(
             actor=verifier,
             prompt=(
-                f"Verify this implementation group:\n\n{results_summary}\n\n"
-                "For each result, confirm:\n"
-                f"1. All claimed files exist on disk: {file_list}\n"
-                "2. Files listed as modified were actually changed\n"
-                "3. The changes align with the described summary\n"
-                "4. The code compiles, imports correctly, and passes "
-                "any existing tests for these files\n"
-                "5. Implementation matches the upstream specs in Reference Material"
-                f"{ref_context}{known_issues}\n\n"
-                "This is a per-group verification, not a full QA pass."
+                f"## Enhancement Group Verification\n\n"
+                f"An implementer was tasked with fixing {len(enhancement_items)} "
+                f"deferred non-blocking issues. Verify their work.\n\n"
+                f"{results_section}\n\n"
+                f"{enh_spec_section}\n\n"
+                f"### Verification Checklist\n\n"
+                f"For each file in [{file_list}]:\n"
+                f"1. The file exists and the changes compile/import correctly\n"
+                f"2. Changes address the specific enhancement items listed above\n"
+                f"3. **Regression check:** Existing tests still pass. Run any "
+                f"test suites that cover modified files. If no tests exist, "
+                f"verify the changes don't break imports or existing behavior\n"
+                f"4. Items marked as 'already resolved' by the implementer are "
+                f"actually resolved — spot-check a sample\n"
+                f"5. Fixes are minimal and targeted — no unnecessary rewrites\n\n"
+                f"**Do NOT approve if:**\n"
+                f"- Any existing test fails after the changes\n"
+                f"- A fix introduces a new bug or breaks an import\n"
+                f"- The implementer skipped items that are clearly still broken"
             ),
             output_type=Verdict,
         ),
@@ -1748,8 +2411,16 @@ def _compute_fix_schedule(
     return schedule
 
 
-def _format_prior_attempts(prior_attempts: list[BugFixAttempt]) -> str:
-    """Format prior attempts as context for RCA/fix agents."""
+def _format_prior_attempts(
+    prior_attempts: list[BugFixAttempt],
+    context_base: Path | None = None,
+) -> str:
+    """Format prior attempts as context for RCA/fix agents.
+
+    When the formatted text exceeds *PROMPT_FILE_THRESHOLD* and a
+    *context_base* is available, the full content is written to a file
+    and a read-pointer is returned instead.
+    """
     if not prior_attempts:
         return ""
     prior_lines = []
@@ -1764,10 +2435,11 @@ def _format_prior_attempts(prior_attempts: list[BugFixAttempt]) -> str:
             f"- **Files Modified:** {', '.join(a.files_modified)}\n"
             f"- **Result:** {a.re_verify_result}"
         )
-    return (
+    text = (
         "\n\n## Prior Fix Attempts (DO NOT REPEAT these approaches)\n\n"
         + "\n\n".join(prior_lines)
     )
+    return _offload_if_large(text, context_base, "prior-fix-attempts")
 
 
 def _get_feature_root(runner: WorkflowRunner, feature: Feature) -> Path | None:
@@ -1779,21 +2451,251 @@ def _get_feature_root(runner: WorkflowRunner, feature: Feature) -> Path | None:
     return root if root.exists() else None
 
 
+def _discover_repo_roots_under(repos_root: Path) -> list[Path]:
+    repos: list[Path] = []
+    for git_dir in repos_root.rglob(".git"):
+        repo_dir = git_dir.parent
+        if repo_dir == repos_root:
+            continue
+        if not git_dir.exists():
+            continue
+        repos.append(repo_dir)
+    return sorted(set(repos))
+
+
 def _resolve_fix_workspace(
     feature_root: Path | None,
     affected_files: list[str],
 ) -> str | None:
     """Find the worktree path for a fix agent based on affected files."""
-    if not feature_root or not affected_files:
+    return _resolve_fix_workspace_from_root(feature_root, affected_files)
+
+
+def _resolve_fix_workspace_from_root(
+    repos_root: Path | None,
+    affected_files: list[str],
+) -> str | None:
+    """Find the repo worktree path for an execution agent based on affected files."""
+    if not repos_root or not affected_files:
         return None
-    # Find the repo from the first affected file
     for f in affected_files:
         parts = Path(f).parts
-        for depth in range(1, min(len(parts), 5)):
-            candidate = feature_root / Path(*parts[:depth])
+        for depth in range(1, min(len(parts), 6)):
+            candidate = repos_root / Path(*parts[:depth])
             if (candidate / ".git").exists():
                 return str(candidate)
     return None
+
+
+async def _repo_heads_for_root(repos_root: Path | None) -> dict[str, str]:
+    """Return current HEAD commits keyed by repo-relative path for *repos_root*."""
+    if not repos_root:
+        return {}
+    heads: dict[str, str] = {}
+    for repo_dir in _discover_repo_roots_under(repos_root):
+        try:
+            rel_path = str(repo_dir.relative_to(repos_root))
+            heads[rel_path] = await _run_git(repo_dir, "rev-parse", "HEAD")
+        except Exception:
+            logger.warning("Failed to read HEAD for %s", repo_dir, exc_info=True)
+    return heads
+
+
+async def _plan_bug_groups(
+    runner: WorkflowRunner,
+    feature: Feature,
+    verdict: Verdict,
+    source: str,
+    prior_attempts: list[BugFixAttempt],
+    *,
+    phase_name: str = "implementation",
+    repos_root: Path | None = None,
+    rca_runtime: str | None = None,
+    actor_factory: Callable[[AgentActor, str], AgentActor] | None = None,
+    strategy_context: RepairStrategyDecision | None = None,
+) -> PlannedBugDispatch:
+    """Plan multi-issue bug work without mutating the codebase."""
+    attempt_number = sum(1 for a in prior_attempts if a.source_verdict == source) + 1
+    feature_root = repos_root or _get_feature_root(runner, feature)
+    prior_context = _format_prior_attempts(prior_attempts, context_base=feature_root)
+    workspace_hint = (
+        f"\n\n### Workspace\nFeature repos at: `{feature_root}`\n"
+        if feature_root else ""
+    )
+    strategy_prompt = ""
+    if strategy_context is not None:
+        stable_blockers = "\n".join(
+            f"- [{item.severity}] {item.description}{f' ({item.file}:{item.line})' if item.file else ''}"
+            for item in strategy_context.stable_blockers
+        ) or "- none recorded"
+        new_blockers = "\n".join(
+            f"- [{item.severity}] {item.description}{f' ({item.file}:{item.line})' if item.file else ''}"
+            for item in strategy_context.new_blockers
+        ) or "- none recorded"
+        failing_checks = "\n".join(
+            f"- {item.criterion}: {item.result}{f' — {item.detail}' if item.detail else ''}"
+            for item in strategy_context.failing_checks
+        ) or "- none recorded"
+        required_files = "\n".join(f"- `{path}`" for path in strategy_context.required_files) or "- none recorded"
+        required_checks = "\n".join(f"- {item}" for item in strategy_context.required_checks) or "- none recorded"
+        similar_hints = "\n".join(f"- {item}" for item in strategy_context.similar_cluster_hints) or "- none recorded"
+        strategy_prompt = (
+            "\n\n### Current Repair Strategy\n"
+            f"Mode: {strategy_context.strategy_mode}\n"
+            f"Reasoning: {strategy_context.reasoning}\n"
+            f"Why not ordinary retry: {strategy_context.why_not_ordinary_retry or 'not provided'}\n"
+            f"Stable failure family: {strategy_context.stable_failure_family or 'not yet named'}\n"
+            f"Bundle summary: {strategy_context.bundle_summary or 'not recorded'}\n\n"
+            f"Stable blockers:\n{stable_blockers}\n\n"
+            f"New blockers:\n{new_blockers}\n\n"
+            f"Failing checks:\n{failing_checks}\n\n"
+            f"Required files:\n{required_files}\n\n"
+            f"Required checks:\n{required_checks}\n\n"
+            f"Similar cluster hints:\n{similar_hints}\n\n"
+            "Use this strategy context to choose a materially different and better-targeted next approach."
+        )
+
+    triage_base = AgentActor(name="bug-triager", role=_triage_role)
+    triage_actor = (
+        actor_factory(triage_base, "triage")
+        if actor_factory is not None
+        else _make_parallel_actor(triage_base, "triage", runtime=rca_runtime)
+    )
+    indexed_issues = _format_indexed_issues(verdict)
+    triage: BugTriage = await runner.run(
+        Ask(
+            actor=triage_actor,
+            prompt=(
+                f"## Verdict from: {source}\n\n"
+                f"### Summary\n{verdict.summary}\n\n"
+                f"### Issues (reference by index)\n{indexed_issues}\n\n"
+                "Group ALL issues by likely root cause. Every index must appear "
+                "in exactly one group. Use issue_indices for [C*] entries and "
+                "gap_indices for [G*] entries."
+                f"{strategy_prompt}"
+            ),
+            output_type=BugTriage,
+        ),
+        feature,
+        phase_name=phase_name,
+    )
+
+    await runner.artifacts.put(
+        f"bug-triage:{source}:attempt-{attempt_number}",
+        to_str(triage),
+        feature=feature,
+    )
+
+    if not triage.groups:
+        return PlannedBugDispatch(
+            attempt_number=attempt_number,
+            triage=triage,
+            groups=[],
+            fixable_groups=[],
+            contradiction_groups=[],
+            schedule=[],
+            dispatch_key=f"bug-dispatch:{source}:attempt-{attempt_number}",
+            strategy_mode=strategy_context.strategy_mode if strategy_context else "ordinary_retry",
+            strategy_reason=strategy_context.reasoning if strategy_context else "",
+            required_checks=list(strategy_context.required_checks) if strategy_context else [],
+            required_files=list(strategy_context.required_files) if strategy_context else [],
+            stable_blocker_summary=strategy_context.bundle_summary if strategy_context else "",
+            similar_cluster_hints=list(strategy_context.similar_cluster_hints) if strategy_context else [],
+        )
+
+    rca_tasks = [
+        Ask(
+            actor=(
+                actor_factory(root_cause_analyst, f"rca-{group.group_id}")
+                if actor_factory is not None
+                else _make_parallel_actor(
+                    root_cause_analyst,
+                    f"rca-{group.group_id}",
+                    runtime=rca_runtime,
+                )
+            ),
+            prompt=(
+                f"## Bug Group: {group.group_id}\n\n"
+                f"### Likely Root Cause (from triage)\n{group.likely_root_cause}\n\n"
+                f"### Issues in this group\n{_extract_group_issues(verdict, group)}\n\n"
+                f"### Full Verdict Summary\n{verdict.summary}\n\n"
+                "Investigate the root cause of these specific issues. Read the "
+                "relevant code, trace the data flow, and identify the exact "
+                "point of failure. Propose a conceptual fix approach — do NOT "
+                "implement anything."
+                f"{strategy_prompt}{prior_context}{workspace_hint}"
+            ),
+            output_type=RootCauseAnalysis,
+        )
+        for group in triage.groups
+    ]
+    if len(rca_tasks) == 1:
+        rca_results = [await runner.run(rca_tasks[0], feature, phase_name=phase_name)]
+    else:
+        rca_results = await runner.parallel(rca_tasks, feature)
+
+    groups: list[PlannedBugGroup] = []
+    fixable_groups: list[PlannedBugGroup] = []
+    contradiction_groups: list[PlannedBugGroup] = []
+    for group, result in zip(triage.groups, rca_results):
+        if not isinstance(result, RootCauseAnalysis):
+            continue
+        rca_key = f"bug-rca:{source}:{group.group_id}:attempt-{attempt_number}"
+        await runner.artifacts.put(rca_key, to_str(result), feature=feature)
+        planned = PlannedBugGroup(
+            group=group,
+            rca=result,
+            issue_text=_extract_group_issues(verdict, group),
+            rca_key=rca_key,
+        )
+        groups.append(planned)
+        if result.confidence == "contradiction":
+            contradiction_groups.append(planned)
+        else:
+            fixable_groups.append(planned)
+
+    schedule = _compute_fix_schedule([(item.group.group_id, item.rca) for item in fixable_groups])
+    dispatch_key = f"bug-dispatch:{source}:attempt-{attempt_number}"
+    dispatch_record = {
+        "source": source,
+        "attempt_number": attempt_number,
+        "total_issues": len(verdict.concerns) + len(verdict.gaps),
+        "groups": [
+            {
+                "group_id": item.group.group_id,
+                "likely_root_cause": item.group.likely_root_cause,
+                "severity": item.group.severity,
+                "affected_files_hint": item.group.affected_files_hint,
+                "issue_count": len(item.group.issue_indices) + len(item.group.gap_indices),
+                "rca": {
+                    "hypothesis": item.rca.hypothesis,
+                    "evidence": item.rca.evidence,
+                    "affected_files": item.rca.affected_files,
+                    "proposed_approach": item.rca.proposed_approach,
+                    "confidence": item.rca.confidence,
+                },
+            }
+            for item in groups
+        ],
+        "schedule": [{"round": idx, "group_ids": ids} for idx, ids in enumerate(schedule)],
+        "total_rounds": len(schedule),
+    }
+    await runner.artifacts.put(dispatch_key, json.dumps(dispatch_record), feature=feature)
+    return PlannedBugDispatch(
+        attempt_number=attempt_number,
+        triage=triage,
+        groups=groups,
+        fixable_groups=fixable_groups,
+        contradiction_groups=contradiction_groups,
+        schedule=schedule,
+        dispatch_key=dispatch_key,
+        strategy_mode=strategy_context.strategy_mode if strategy_context else "ordinary_retry",
+        strategy_reason=strategy_context.reasoning if strategy_context else "",
+        required_checks=list(strategy_context.required_checks) if strategy_context else [],
+        required_files=list(strategy_context.required_files) if strategy_context else [],
+        stable_blocker_summary=strategy_context.bundle_summary if strategy_context else "",
+        similar_cluster_hints=list(strategy_context.similar_cluster_hints) if strategy_context else [],
+    )
 
 
 async def _diagnose_and_fix(
@@ -1806,6 +2708,7 @@ async def _diagnose_and_fix(
     prior_attempts: list[BugFixAttempt],
     bug_counter: itertools.count,  # type: ignore[type-arg]
     handover_context: str = "",
+    phase_name: str = "implementation",
 ) -> list[BugFixAttempt]:
     """Structured failure handling: triage → parallel RCA → fix → re-verify.
 
@@ -1816,11 +2719,11 @@ async def _diagnose_and_fix(
     Returns a list of BugFixAttempt records (one per bug group).
     """
     verdict_text = to_str(verdict)
-    prior_context = _format_prior_attempts(prior_attempts)
     attempt_number = sum(1 for a in prior_attempts if a.source_verdict == source) + 1
 
     # Resolve workspace path for RCA git access
     feature_root = _get_feature_root(runner, feature)
+    prior_context = _format_prior_attempts(prior_attempts, context_base=feature_root)
     workspace_hint = (
         f"\n\n### Workspace\nFeature repos at: `{feature_root}`\n"
         if feature_root else ""
@@ -1840,6 +2743,7 @@ async def _diagnose_and_fix(
             bug_id=f"{source.upper().replace(' ', '-')}-FAIL-{next(bug_counter)}",
             attempt_number=attempt_number,
             handover_context=handover_context,
+            phase_name=phase_name,
         )
         return [attempt]
 
@@ -1862,7 +2766,7 @@ async def _diagnose_and_fix(
             output_type=BugTriage,
         ),
         feature,
-        phase_name="implementation",
+        phase_name=phase_name,
     )
 
     await runner.artifacts.put(
@@ -1879,6 +2783,7 @@ async def _diagnose_and_fix(
             bug_id=f"{source.upper().replace(' ', '-')}-FAIL-{next(bug_counter)}",
             attempt_number=attempt_number,
             handover_context=handover_context,
+            phase_name=phase_name,
         )
         return [attempt]
 
@@ -1908,7 +2813,7 @@ async def _diagnose_and_fix(
     ]
 
     if len(rca_tasks) == 1:
-        rca_results = [await runner.run(rca_tasks[0], feature, phase_name="implementation")]
+        rca_results = [await runner.run(rca_tasks[0], feature, phase_name=phase_name)]
     else:
         rca_results = await runner.parallel(rca_tasks, feature)
 
@@ -1931,6 +2836,7 @@ async def _diagnose_and_fix(
             bug_id=f"{source.upper().replace(' ', '-')}-FAIL-{next(bug_counter)}",
             attempt_number=attempt_number,
             handover_context=handover_context,
+            phase_name=phase_name,
         )
         return [attempt]
 
@@ -1956,7 +2862,7 @@ async def _diagnose_and_fix(
         for gid, rca in contradiction_groups:
             group = group_by_id[gid]
             resolution = await _escalate_contradiction(
-                runner, feature, "implementation", source, group, rca,
+                runner, feature, phase_name, source, group, rca,
             )
             # User resolved it — add to fixable with their direction
             resolved_rca = rca.model_copy(update={
@@ -1970,7 +2876,7 @@ async def _diagnose_and_fix(
                 source_verdict=source,
                 description=rca.hypothesis,
                 root_cause=rca.contradiction_detail or rca.hypothesis,
-                fix_applied=f"User decision: {resolution[:200]}",
+                fix_applied=f"User decision: {resolution}",
                 re_verify_result="RESOLVED",
                 attempt_number=attempt_number,
             ))
@@ -2067,7 +2973,7 @@ async def _diagnose_and_fix(
             ))
 
         if len(fix_tasks) == 1:
-            results = [await runner.run(fix_tasks[0], feature, phase_name="implementation")]
+            results = [await runner.run(fix_tasks[0], feature, phase_name=phase_name)]
         else:
             results = await runner.parallel(fix_tasks, feature)
 
@@ -2108,7 +3014,7 @@ async def _diagnose_and_fix(
     ]
 
     if len(verify_tasks) == 1:
-        verify_results = [await runner.run(verify_tasks[0], feature, phase_name="implementation")]
+        verify_results = [await runner.run(verify_tasks[0], feature, phase_name=phase_name)]
     else:
         verify_results = await runner.parallel(verify_tasks, feature)
 
@@ -2138,6 +3044,7 @@ async def _diagnose_and_fix(
         if all_modified:
             regression_verdict = await _run_regression(
                 runner, feature, all_modified, handover_context=handover_context,
+                phase_name=phase_name,
             )
             if regression_verdict is not None:
                 await runner.artifacts.put(
@@ -2160,11 +3067,12 @@ async def _diagnose_and_fix(
                         _format_feedback("Regression", regression_verdict),
                         f"regression:{source}",
                         original_reviewer, fixer,
-                        _format_prior_attempts(prior_attempts),
+                        _format_prior_attempts(prior_attempts, context_base=feature_root),
                         bug_id=f"{source.upper()}-REGRESSION-{attempt_number}",
                         attempt_number=attempt_number,
                         handover_context=handover_context,
                         skip_regression=True,
+                        phase_name=phase_name,
                     )
                     if regression_attempt.re_verify_result == "PASS":
                         await _commit_repos(
@@ -2215,6 +3123,10 @@ async def _single_rca_fix_verify(
     attempt_number: int,
     handover_context: str = "",
     skip_regression: bool = False,
+    phase_name: str = "implementation",
+    workspace_root: Path | None = None,
+    rca_runtime: str | None = None,
+    actor_factory: Callable[..., AgentActor] | None = None,
 ) -> BugFixAttempt:
     """Single-bug RCA → fix → re-verify (no triage needed).
 
@@ -2222,10 +3134,18 @@ async def _single_rca_fix_verify(
     Used when this function is called to fix a regression — prevents
     infinite nesting.
     """
+    feature_root = workspace_root or _get_feature_root(runner, feature)
+    actor_builder = actor_factory or _make_parallel_actor
+
     # 1. Root Cause Analysis
     rca: RootCauseAnalysis = await runner.run(
         Ask(
-            actor=root_cause_analyst,
+            actor=actor_builder(
+                root_cause_analyst,
+                f"rca-{bug_id}",
+                runtime=rca_runtime,
+                workspace_path=str(feature_root) if feature_root else None,
+            ),
             prompt=(
                 f"## Bug Report: {bug_id}\n\n"
                 f"### Failure Source: {source}\n\n"
@@ -2238,7 +3158,7 @@ async def _single_rca_fix_verify(
             output_type=RootCauseAnalysis,
         ),
         feature,
-        phase_name="implementation",
+        phase_name=phase_name,
     )
     await runner.artifacts.put(
         f"bug-rca:{source}:{bug_id}",
@@ -2247,8 +3167,7 @@ async def _single_rca_fix_verify(
     )
 
     # 2. Fix via implementer (with workspace_path for correct cwd)
-    feature_root = _get_feature_root(runner, feature)
-    ws_path = _resolve_fix_workspace(feature_root, rca.affected_files)
+    ws_path = _resolve_fix_workspace_from_root(feature_root, rca.affected_files)
     ws_ctx = (
         f"\n\n## Workspace\n"
         f"Your working directory is: `{ws_path}`\n"
@@ -2257,7 +3176,7 @@ async def _single_rca_fix_verify(
         f"other copies of the same repo.\n"
     ) if ws_path else ""
 
-    fix_actor = _make_parallel_actor(
+    fix_actor = actor_builder(
         fixer, f"fix-{bug_id}",
         workspace_path=ws_path,
     )
@@ -2285,16 +3204,23 @@ async def _single_rca_fix_verify(
             output_type=ImplementationResult,
         ),
         feature,
-        phase_name="implementation",
+        phase_name=phase_name,
     )
 
     # Commit fix before re-verification
-    await _commit_repos(runner, feature, f"fix: {bug_id}")
+    if workspace_root is None:
+        await _commit_repos(runner, feature, f"fix: {bug_id}")
+    else:
+        await _commit_repos_in_root(feature_root, f"fix: {bug_id}")
 
     # 3. Re-verify with the SAME reviewer that found the bug
     re_verdict: Verdict = await runner.run(
         Ask(
-            actor=original_reviewer,
+            actor=actor_builder(
+                original_reviewer,
+                f"reverify-{bug_id}",
+                workspace_path=str(feature_root) if feature_root else None,
+            ),
             prompt=(
                 f"## Re-verification: {bug_id}\n\n"
                 f"A fix was applied for the following failure.\n\n"
@@ -2310,7 +3236,7 @@ async def _single_rca_fix_verify(
             output_type=Verdict,
         ),
         feature,
-        phase_name="implementation",
+        phase_name=phase_name,
     )
 
     await runner.artifacts.put(
@@ -2331,6 +3257,11 @@ async def _single_rca_fix_verify(
         modified = fix_result.files_created + fix_result.files_modified
         regression_verdict = await _run_regression(
             runner, feature, modified, handover_context=handover_context,
+            phase_name=phase_name,
+            workspace_root=feature_root if workspace_root else None,
+            regression_runtime=rca_runtime,
+            integration_runtime=rca_runtime,
+            actor_factory=actor_factory,
         )
         if regression_verdict is not None:
             await runner.artifacts.put(
@@ -2357,17 +3288,26 @@ async def _single_rca_fix_verify(
                     attempt_number=attempt_number,
                     handover_context=handover_context,
                     skip_regression=True,
+                    phase_name=phase_name,
+                    workspace_root=feature_root if workspace_root else None,
+                    rca_runtime=rca_runtime,
+                    actor_factory=actor_factory,
                 )
                 passed = regression_attempt.re_verify_result == "PASS"
                 if passed:
-                    await _commit_repos(
-                        runner, feature, f"fix: regression after {bug_id}",
-                    )
+                    if workspace_root is None:
+                        await _commit_repos(
+                            runner, feature, f"fix: regression after {bug_id}",
+                        )
+                    else:
+                        await _commit_repos_in_root(
+                            feature_root, f"fix: regression after {bug_id}",
+                        )
 
     return BugFixAttempt(
         bug_id=bug_id,
         source_verdict=source,
-        description=verdict_text[:200],
+        description=verdict_text,
         root_cause=rca.hypothesis,
         fix_applied=fix_result.summary,
         files_modified=fix_result.files_created + fix_result.files_modified,
@@ -2376,49 +3316,7 @@ async def _single_rca_fix_verify(
     )
 
 
-# ── Escalation and persistence ───────────────────────────────────────────────
-
-
-async def _escalate_to_user(
-    runner: WorkflowRunner,
-    feature: Feature,
-    phase_name: str,
-    stage: str,
-    failed_attempt: BugFixAttempt,
-    all_attempts: list[BugFixAttempt],
-) -> None:
-    """Escalate to the user after MAX_FIX_ATTEMPTS failures from one source."""
-    source_attempts = [a for a in all_attempts if a.source_verdict == failed_attempt.source_verdict]
-    attempts_text = "\n".join(
-        f"- **{a.bug_id}** (group {a.group_id or 'single'}, attempt {a.attempt_number}): "
-        f"{a.description[:80]} → root cause: {a.root_cause[:80]} → {a.re_verify_result}"
-        for a in source_attempts
-    )
-    logger.warning(
-        "Escalating to user after %d failed attempts at %s stage",
-        len(source_attempts), stage,
-    )
-    await runner.run(
-        Gate(
-            approver=user,
-            prompt=(
-                f"## Escalation: {stage} — {len(source_attempts)} fix attempts failed\n\n"
-                f"Bug fixes from **{stage}** have failed {len(source_attempts)} times "
-                f"(limit: {MAX_FIX_ATTEMPTS}).\n\n"
-                f"### Latest Attempt\n"
-                f"- **Bug:** {failed_attempt.bug_id} (group {failed_attempt.group_id or 'single'})\n"
-                f"- **Root Cause:** {failed_attempt.root_cause}\n"
-                f"- **Fix Applied:** {failed_attempt.fix_applied}\n"
-                f"- **Files:** {', '.join(failed_attempt.files_modified)}\n"
-                f"- **Result:** {failed_attempt.re_verify_result}\n\n"
-                f"### All {stage} Attempts\n{attempts_text}\n\n"
-                "Review the situation and approve to continue with "
-                "the next implementation cycle, or provide guidance."
-            ),
-        ),
-        feature,
-        phase_name=phase_name,
-    )
+# ── Persistence ──────────────────────────────────────────────────────────────
 
 
 async def _escalate_contradiction(
@@ -2475,6 +3373,31 @@ async def _escalate_contradiction(
     return rca.proposed_approach
 
 
+def _load_prior_attempts(raw: str | None) -> list[BugFixAttempt]:
+    """Reconstruct prior fix attempts from the stored artifact."""
+    if not raw:
+        return []
+    attempts: list[BugFixAttempt] = []
+    depth = 0
+    start = None
+    for i, ch in enumerate(raw):
+        if ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0 and start is not None:
+                try:
+                    obj = json.loads(raw[start : i + 1])
+                    if isinstance(obj, dict) and "bug_id" in obj:
+                        attempts.append(BugFixAttempt.model_validate(obj))
+                except Exception:
+                    pass
+                start = None
+    return attempts
+
+
 async def _store_attempts(
     runner: WorkflowRunner,
     feature: Feature,
@@ -2490,6 +3413,11 @@ async def _run_regression(
     feature: Feature,
     modified_files: list[str],
     handover_context: str = "",
+    phase_name: str = "implementation",
+    workspace_root: Path | None = None,
+    regression_runtime: str | None = None,
+    integration_runtime: str | None = None,
+    actor_factory: Callable[..., AgentActor] | None = None,
 ) -> Verdict | None:
     """Run regression tests on files modified by bug fixes.
 
@@ -2500,10 +3428,18 @@ async def _run_regression(
     if not modified_files:
         return None
 
-    file_list = "\n".join(f"- `{f}`" for f in sorted(set(modified_files)))
+    actor_builder = actor_factory or _make_parallel_actor
+    deduped_files = sorted(set(modified_files))
+    actor_suffix = str(abs(hash("|".join(deduped_files))))[:8]
+    file_list = "\n".join(f"- `{f}`" for f in deduped_files)
     regression_verdict: Verdict = await runner.run(
         Ask(
-            actor=regression_tester,
+            actor=actor_builder(
+                regression_tester,
+                f"regression-{feature.id}-{actor_suffix}",
+                runtime=regression_runtime,
+                workspace_path=str(workspace_root) if workspace_root else None,
+            ),
             prompt=(
                 f"## Regression Check After Bug Fixes\n\n"
                 f"The following files were modified during bug fix cycles:\n"
@@ -2515,7 +3451,7 @@ async def _run_regression(
             output_type=Verdict,
         ),
         feature,
-        phase_name="implementation",
+        phase_name=phase_name,
     )
 
     if not _is_approved(regression_verdict):
@@ -2525,7 +3461,12 @@ async def _run_regression(
     if handover_context:
         integration_verdict: Verdict = await runner.run(
             Ask(
-                actor=integration_tester,
+                actor=actor_builder(
+                    integration_tester,
+                    f"integration-regression-{feature.id}-{actor_suffix}",
+                    runtime=integration_runtime,
+                    workspace_path=str(workspace_root) if workspace_root else None,
+                ),
                 prompt=(
                     f"## Integration Regression Check\n\n"
                     f"The following files were modified during bug fix cycles:\n"
@@ -2540,7 +3481,7 @@ async def _run_regression(
                 output_type=Verdict,
             ),
             feature,
-            phase_name="implementation",
+            phase_name=phase_name,
         )
         if not _is_approved(integration_verdict):
             return integration_verdict
@@ -2551,9 +3492,54 @@ async def _run_regression(
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 
-def _count_source_attempts(prior: list[BugFixAttempt], source: str) -> int:
-    """Count total failed fix attempts from a given source verdict."""
-    return sum(1 for a in prior if a.source_verdict == source and a.re_verify_result != "PASS")
+
+async def _enrich_fallback_result(
+    result: ImplementationResult,
+    ws_path: str | None,
+    task: ImplementationTask,
+) -> None:
+    """Populate files_created/files_modified from git when agent failed to produce structured output."""
+    if result.files_created or result.files_modified:
+        return  # Agent reported files — no enrichment needed
+    if not ws_path:
+        return
+
+    try:
+        status_output = await _run_git(Path(ws_path), "status", "--porcelain")
+    except Exception:
+        logger.warning("Could not run git status for fallback enrichment in %s", ws_path)
+        return
+
+    if not status_output:
+        return
+
+    # Build expected paths from file_scope for filtering in parallel-task groups
+    scope_paths = {fs.path for fs in task.file_scope} if task.file_scope else set()
+
+    created: list[str] = []
+    modified: list[str] = []
+    for line in status_output.splitlines():
+        if len(line) < 4:
+            continue
+        xy = line[:2]
+        path = line[3:].strip().strip('"')
+
+        # Filter to task's file_scope when available
+        if scope_paths and path not in scope_paths:
+            continue
+
+        if xy in ("??", "A ", "AM"):
+            created.append(path)
+        elif "M" in xy or "R" in xy:
+            modified.append(path)
+
+    if created or modified:
+        result.files_created = created
+        result.files_modified = modified
+        logger.info(
+            "Enriched fallback result for %s: %d created, %d modified",
+            result.task_id, len(created), len(modified),
+        )
 
 
 def _collect_files(results: list[object]) -> list[str]:

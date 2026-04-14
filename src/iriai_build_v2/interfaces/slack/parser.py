@@ -10,7 +10,7 @@ from dataclasses import dataclass
 
 TAG_MAP: dict[str, str] = {
     "feature": "full-develop",
-    "bug": "bugfix",
+    "bug": "bugfix-v2",
     "plan": "planning",
 }
 
@@ -18,12 +18,14 @@ _TAG_RE = re.compile(
     r"^\[(" + "|".join(TAG_MAP) + r")\]\s*(.+)",
     re.IGNORECASE,
 )
+_FEATURE_ID_RE = re.compile(r"(?i)\b([0-9a-f]{8})\b")
 
 
 @dataclass
 class ParsedRequest:
     workflow_name: str
     feature_name: str
+    source_feature_id: str | None = None
 
 
 def parse_workflow_request(text: str) -> ParsedRequest | None:
@@ -46,4 +48,18 @@ def parse_workflow_request(text: str) -> ParsedRequest | None:
     workflow_name = TAG_MAP.get(tag)
     if not workflow_name:
         return None
-    return ParsedRequest(workflow_name=workflow_name, feature_name=name)
+    source_feature_id = _extract_source_feature_id(name) if workflow_name == "bugfix-v2" else None
+    return ParsedRequest(
+        workflow_name=workflow_name,
+        feature_name=name,
+        source_feature_id=source_feature_id,
+    )
+
+
+def _extract_source_feature_id(text: str) -> str | None:
+    """Extract a bare feature id from Slack-formatted bugflow launch text."""
+    cleaned = text.strip().strip("*_`~ ")
+    match = _FEATURE_ID_RE.search(cleaned)
+    if match:
+        return match.group(1).lower()
+    return cleaned or None

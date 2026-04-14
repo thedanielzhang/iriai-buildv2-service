@@ -10,5 +10,6 @@ role = Role(
     model=BUDGET_TIERS["opus_1m"],
     metadata={
         "mcp_servers": mcp_servers_for("playwright", "qa-feedback"),
+        "liveness_timeout": 4500,
     },
 )

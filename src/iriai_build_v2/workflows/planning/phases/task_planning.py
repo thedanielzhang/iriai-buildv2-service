@@ -84,7 +84,7 @@ class TaskPlanningPhase(Phase):
                 broad_key="dag:strategy",
                 context_keys=["project", "scope", "decomposition"],
             )
-            await runner.artifacts.put("dag", final_text, feature=feature)
+            # DB write now happens inside interview_gate_review() on approval.
             state.dag = final_text
             return state
 
@@ -186,7 +186,7 @@ class TaskPlanningPhase(Phase):
             context_keys=["project", "scope", "decomposition"],
         )
 
-        await runner.artifacts.put("dag", final_text, feature=feature)
+        # DB write now happens inside interview_gate_review() on approval.
         state.dag = final_text
         return state
 
@@ -291,17 +291,13 @@ class TaskPlanningPhase(Phase):
             plan = sf_arts.get("plan", "")
             if plan:
                 context_parts.append(f"## Plan: {slug}\n\n{plan}")
-            # Other artifacts: include full if small, truncate if large
+            # Other artifacts: include full upstream context so task
+            # decomposition never loses detail from large specs.
             for prefix in ("prd", "design", "system-design"):
                 text = sf_arts.get(prefix, "")
                 if not text:
                     continue
-                if len(text) > 10_000:
-                    context_parts.append(
-                        f"## {prefix.upper()} (excerpt): {slug}\n\n{text[:10_000]}\n\n[truncated — {len(text)} chars total]"
-                    )
-                else:
-                    context_parts.append(f"## {prefix.upper()}: {slug}\n\n{text}")
+                context_parts.append(f"## {prefix.upper()}: {slug}\n\n{text}")
 
         ws_context = "\n\n---\n\n".join(context_parts)
 
