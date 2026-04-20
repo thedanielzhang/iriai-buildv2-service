@@ -12,15 +12,66 @@ from uuid import uuid4
 
 from iriai_compose import Feature
 
-from ...models.outputs import EvidenceArtifact, EvidenceBundle
+from ...models.outputs import Check, EvidenceArtifact, EvidenceBundle
 from .models import BugflowProofRecord
 
 _TRACE_KINDS = {"trace", "playwright-trace"}
 _SCREENSHOT_KINDS = {"screenshot", "image"}
-_API_KINDS = {"api", "api-request", "api-response", "http", "network"}
-_DATABASE_KINDS = {"database", "sql", "query"}
-_LOG_KINDS = {"logs", "command", "healthcheck"}
-_REPO_KINDS = {"repo", "diff", "code-reference", "static"}
+_API_KINDS = {
+    "api", "api-request", "api-response", "api-capture", "api-headers", "http", "network",
+    "api_request", "api_response", "api_capture", "api_headers",
+}
+_DATABASE_KINDS = {
+    "database", "database-query", "database_query", "query", "query-result", "query_result", "sql",
+}
+_LOG_KINDS = {
+    "logs", "log", "command", "console-log", "console_log",
+    "healthcheck", "network-log", "network_log", "test-output", "test_output",
+}
+_REPO_KINDS = {
+    "repo", "repo-reference", "repo_excerpt", "repo-excerpt", "repo_reference",
+    "diff", "code", "code_excerpt", "code-excerpt", "code-reference", "code_reference",
+}
+_UI_STATE_KINDS = {"ui-state", "ui_state"}
+_SNAPSHOT_KINDS = {"snapshot"}
+_COMMAND_OUTPUT_KINDS = {"command-output", "command_output"}
+_CORE_EVIDENCE_MODES = frozenset({"ui", "api", "database", "logs", "repo"})
+_DIRECTIVE_TO_CORE_SURFACE = {
+    "ui": "ui",
+    "trace": "ui",
+    "screenshot": "ui",
+    "image": "ui",
+    "api": "api",
+    "api_request": "api",
+    "api_response": "api",
+    "api_capture": "api",
+    "api_headers": "api",
+    "http": "api",
+    "network": "api",
+    "database": "database",
+    "database_query": "database",
+    "query": "database",
+    "query_result": "database",
+    "sql": "database",
+    "logs": "logs",
+    "log": "logs",
+    "console_log": "logs",
+    "network_log": "logs",
+    "test_output": "logs",
+    "healthcheck": "logs",
+    "command_output": "logs",
+    "repo": "repo",
+    "repo_reference": "repo",
+    "repo_excerpt": "repo",
+    "diff": "repo",
+    "code": "repo",
+    "code_excerpt": "repo",
+    "code_reference": "repo",
+}
+_GENERIC_API_SOURCE_HINTS = ("api", "curl", "http", "request", "response")
+_GENERIC_DATABASE_SOURCE_HINTS = ("database", "postgres", "sql", "query")
+_GENERIC_LOG_SOURCE_HINTS = ("log", "console", "vitest", "pytest", "health", "network capture")
+_GENERIC_REPO_SOURCE_HINTS = ("repo", "git", "diff", "code excerpt", "source tree")
 _ALLOWED_SUFFIXES = {
     ".zip", ".png", ".jpg", ".jpeg", ".webp", ".gif", ".json", ".txt", ".log",
     ".md", ".html", ".csv", ".har", ".mp4",
@@ -73,16 +124,178 @@ def normalize_evidence_modes(*mode_sets: Iterable[str], ui_involved: bool = Fals
     return ordered
 
 
+def normalize_evidence_directives(*mode_sets: Iterable[str], ui_involved: bool = False) -> list[str]:
+    ordered: list[str] = []
+    if ui_involved:
+        ordered.append("ui")
+    for modes in mode_sets:
+        for mode in modes:
+            value = re.sub(r"[-\s]+", "_", str(mode or "").strip().lower())
+            if not value or value in ordered:
+                continue
+            ordered.append(value)
+    return ordered
+
+
+def core_evidence_modes(*mode_sets: Iterable[str], ui_involved: bool = False) -> list[str]:
+    return [
+        mode
+        for mode in normalize_evidence_modes(*mode_sets, ui_involved=ui_involved)
+        if mode in _CORE_EVIDENCE_MODES
+    ]
+
+
+def directive_core_surface(directive: str) -> str | None:
+    normalized = normalize_evidence_directives([directive])
+    if not normalized:
+        return None
+    return _DIRECTIVE_TO_CORE_SURFACE.get(normalized[0])
+
+
+def core_surfaces_for_directives(*mode_sets: Iterable[str], ui_involved: bool = False) -> list[str]:
+    surfaces: list[str] = []
+    for directive in normalize_evidence_directives(*mode_sets, ui_involved=ui_involved):
+        surface = directive_core_surface(directive)
+        if surface and surface not in surfaces:
+            surfaces.append(surface)
+    return surfaces
+
+
 def required_evidence_modes(*, ui_involved: bool, evidence_modes: list[str]) -> list[str]:
     required = normalize_evidence_modes(evidence_modes, ui_involved=ui_involved)
     return required or (["ui"] if ui_involved else [])
+
+
+def canonical_artifact_surface(artifact: EvidenceArtifact) -> str:
+    token = re.sub(r"[_\s]+", "-", str(artifact.kind or "").strip().lower())
+    if token in _TRACE_KINDS:
+        return "trace"
+    if token in _SCREENSHOT_KINDS:
+        return "screenshot"
+    if token in _API_KINDS:
+        return "api"
+    if token in _DATABASE_KINDS:
+        return "database"
+    if token in _LOG_KINDS:
+        return "logs"
+    if token in _REPO_KINDS:
+        return "repo"
+    if token in _UI_STATE_KINDS:
+        return "ui-state"
+    if token in _SNAPSHOT_KINDS:
+        return "snapshot"
+    if token in _COMMAND_OUTPUT_KINDS:
+        return "command-output"
+
+    hint = " ".join(
+        value.strip().lower()
+        for value in [artifact.source, artifact.label]
+        if str(value or "").strip()
+    )
+    if token in {"json", "text", "result", "response"}:
+        if any(word in hint for word in _GENERIC_DATABASE_SOURCE_HINTS):
+            return "database"
+        if any(word in hint for word in _GENERIC_API_SOURCE_HINTS):
+            return "api"
+        if any(word in hint for word in _GENERIC_LOG_SOURCE_HINTS):
+            return "logs"
+        if any(word in hint for word in _GENERIC_REPO_SOURCE_HINTS):
+            return "repo"
+    return token
+
+
+def bundle_artifact_surfaces(bundle: EvidenceBundle | None) -> list[str]:
+    if bundle is None:
+        return []
+    return sorted({canonical_artifact_surface(artifact) for artifact in bundle.artifacts if artifact.kind})
+
+
+def bundle_provided_evidence_modes(bundle: EvidenceBundle | None) -> list[str]:
+    surfaces = set(bundle_artifact_surfaces(bundle))
+    provided: list[str] = []
+    if {"trace", "screenshot"}.issubset(surfaces):
+        provided.append("ui")
+    if "api" in surfaces:
+        provided.append("api")
+    if "database" in surfaces:
+        provided.append("database")
+    if "logs" in surfaces or "command-output" in surfaces:
+        provided.append("logs")
+    if "repo" in surfaces:
+        provided.append("repo")
+    return provided
+
+
+def bundle_declared_core_modes(bundle: EvidenceBundle | None) -> list[str]:
+    if bundle is None:
+        return []
+    return core_surfaces_for_directives(bundle.evidence_modes, ui_involved=bundle.ui_involved)
+
+
+def proof_requirement_diagnostics(
+    *,
+    required_modes: list[str],
+    bundle: EvidenceBundle | None,
+    require_ui_proof: bool,
+    state_change: bool,
+) -> dict[str, object]:
+    if bundle is None:
+        return {
+            "required_modes": core_evidence_modes(required_modes, ui_involved=require_ui_proof),
+            "provided_modes": [],
+            "artifact_surfaces": [],
+            "declared_modes": [],
+            "declared_without_artifacts": [],
+            "has_postcondition": False,
+            "missing": ["proof bundle"],
+        }
+
+    required = core_evidence_modes(required_modes, ui_involved=require_ui_proof)
+    artifact_surfaces = bundle_artifact_surfaces(bundle)
+    provided_modes = bundle_provided_evidence_modes(bundle)
+    declared_modes = bundle_declared_core_modes(bundle)
+    missing: list[str] = []
+    if require_ui_proof and "ui" in required and "ui" not in provided_modes:
+        surface_set = set(artifact_surfaces)
+        if "trace" not in surface_set:
+            missing.append("Playwright trace")
+        if "screenshot" not in surface_set:
+            missing.append("screenshot")
+    for mode in required:
+        if mode == "ui":
+            continue
+        if mode == "api" and "api" not in provided_modes:
+            missing.append("API request/response evidence")
+        if mode == "database" and "database" not in provided_modes:
+            missing.append("database query/result evidence")
+        if mode == "logs" and "logs" not in provided_modes:
+            missing.append("logs or health evidence")
+        if mode == "repo" and "repo" not in provided_modes:
+            missing.append("repo/static diagnostic evidence")
+
+    has_postcondition = any(
+        artifact.role.strip().lower() in {"postcondition", "verification"}
+        for artifact in bundle.artifacts
+    )
+    if state_change and not has_postcondition:
+        missing.append("independent postcondition evidence")
+
+    return {
+        "required_modes": required,
+        "provided_modes": provided_modes,
+        "artifact_surfaces": artifact_surfaces,
+        "declared_modes": declared_modes,
+        "declared_without_artifacts": [mode for mode in declared_modes if mode not in provided_modes],
+        "has_postcondition": has_postcondition,
+        "missing": missing,
+    }
 
 
 def bundle_primary_artifact_url(bundle: EvidenceBundle) -> str:
     screenshots = [
         artifact.public_url
         for artifact in bundle.artifacts
-        if artifact.public_url and artifact.kind.strip().lower() in _SCREENSHOT_KINDS
+        if artifact.public_url and canonical_artifact_surface(artifact) == "screenshot"
     ]
     if screenshots:
         return screenshots[0]
@@ -99,40 +312,13 @@ def evidence_missing_requirements(
     require_ui_proof: bool,
     state_change: bool,
 ) -> list[str]:
-    if bundle is None:
-        return ["proof bundle"]
-
-    artifacts = bundle.artifacts
-    artifact_kinds = {artifact.kind.strip().lower() for artifact in artifacts}
-    missing: list[str] = []
-
-    if require_ui_proof:
-        if not artifact_kinds.intersection(_TRACE_KINDS):
-            missing.append("Playwright trace")
-        if not artifact_kinds.intersection(_SCREENSHOT_KINDS):
-            missing.append("screenshot")
-
-    for mode in required_modes:
-        if mode == "ui":
-            continue
-        if mode == "api" and not artifact_kinds.intersection(_API_KINDS):
-            missing.append("API request/response evidence")
-        if mode == "database" and not artifact_kinds.intersection(_DATABASE_KINDS):
-            missing.append("database query/result evidence")
-        if mode == "logs" and not artifact_kinds.intersection(_LOG_KINDS):
-            missing.append("logs or health evidence")
-        if mode == "repo" and not artifact_kinds.intersection(_REPO_KINDS):
-            missing.append("repo/static diagnostic evidence")
-
-    if state_change:
-        has_postcondition = any(
-            artifact.role.strip().lower() in {"postcondition", "verification"}
-            for artifact in artifacts
-        )
-        if not has_postcondition:
-            missing.append("independent postcondition evidence")
-
-    return missing
+    diagnostics = proof_requirement_diagnostics(
+        required_modes=required_modes,
+        bundle=bundle,
+        require_ui_proof=require_ui_proof,
+        state_change=state_change,
+    )
+    return list(diagnostics["missing"])
 
 
 def render_proof_index(record: BugflowProofRecord) -> str:
@@ -164,6 +350,16 @@ def render_proof_index(record: BugflowProofRecord) -> str:
     modes = ", ".join(record.bundle.evidence_modes) or "none"
     steps = "".join(f"<li>{escape(step)}</li>" for step in record.bundle.steps_executed)
     steps_html = f"<ul>{steps}</ul>" if steps else "<p>No explicit steps were recorded.</p>"
+    checks = "".join(
+        (
+            "<li>"
+            f"<strong>{escape(check.criterion)}</strong>: {escape(check.result)}"
+            + (f"<div>{escape(check.detail)}</div>" if check.detail else "")
+            + "</li>"
+        )
+        for check in record.checks
+    )
+    checks_html = f"<ul>{checks}</ul>" if checks else "<p>No structured evidence coverage was recorded.</p>"
     return (
         "<!doctype html><html><head><meta charset='utf-8'>"
         f"<title>Bugflow Proof — {escape(record.report_id)} — {escape(record.stage)}</title>"
@@ -186,6 +382,8 @@ def render_proof_index(record: BugflowProofRecord) -> str:
         )
         + "<h2>Steps Executed</h2>"
         + steps_html
+        + "<h2>Structured Coverage</h2>"
+        + checks_html
         + "<h2>Artifacts</h2>"
         + artifacts_html
         + "</body></html>"
@@ -199,6 +397,7 @@ def persist_proof_record(
     report_id: str,
     stage: str,
     bundle: EvidenceBundle,
+    checks: list[Check] | None = None,
     context_root: Path | None = None,
 ) -> BugflowProofRecord:
     storage_stage = _storage_stage_name(stage)
@@ -236,6 +435,7 @@ def persist_proof_record(
         stage=stage,
         storage_stage=storage_stage,
         bundle=stored_bundle,
+        checks=list(checks or []),
         bundle_url=proof_public_url(base_url, feature.id, report_id, storage_stage, "index.html"),
         primary_artifact_url=bundle_primary_artifact_url(stored_bundle),
     )
@@ -283,6 +483,7 @@ def snapshot_proof_record(
         stage=stage,
         storage_stage=storage_stage,
         bundle=stored_bundle,
+        checks=list(source.checks),
         bundle_url=proof_public_url(base_url, feature.id, source.report_id, storage_stage, "index.html"),
         primary_artifact_url=bundle_primary_artifact_url(stored_bundle),
     )

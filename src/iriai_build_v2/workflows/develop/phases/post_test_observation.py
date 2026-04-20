@@ -6,7 +6,7 @@ import logging
 from pathlib import Path
 from typing import Any, Callable
 
-from iriai_compose import Ask, Feature, Interview, Phase, WorkflowRunner, to_str
+from iriai_compose import Ask, Feature, Phase, WorkflowRunner, to_str
 
 from ....models.outputs import (
     Envelope,
@@ -28,6 +28,7 @@ from ....roles import (
     user,
     verifier,
 )
+from ..._common import Interview
 from ..._common._helpers import _offload_if_large
 from .implementation import (
     _commit_repos,

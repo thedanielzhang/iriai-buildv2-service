@@ -516,6 +516,39 @@ async def test_serve_bugflow_proof_reads_from_feature_proof_store(tmp_path: Path
     assert Path(response.path) == proof_file
 
 
+@pytest.mark.asyncio
+async def test_serve_bugflow_proof_reads_storage_stage_suffix(tmp_path: Path):
+    feature_root = tmp_path / ".iriai" / "features" / "bugflow-abcd1234"
+    proof_file = feature_root / "proof" / "BR-12" / "promotion-verify-deadbeef" / "index.html"
+    proof_file.parent.mkdir(parents=True, exist_ok=True)
+    proof_file.write_text("<html>proof</html>", encoding="utf-8")
+
+    class _Conn:
+        async def fetchrow(self, _query: str, _feature_id: str):
+            return {"slug": "bugflow-abcd1234", "metadata": {"workspace_path": str(tmp_path)}}
+
+    class _Acquire:
+        async def __aenter__(self):
+            return _Conn()
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    original_pool = dashboard.pool
+    dashboard.pool = SimpleNamespace(acquire=lambda: _Acquire())
+    try:
+        response = await dashboard.serve_bugflow_proof(
+            "abcd1234",
+            "BR-12",
+            "promotion-verify-deadbeef",
+            "index.html",
+        )
+    finally:
+        dashboard.pool = original_pool
+
+    assert Path(response.path) == proof_file
+
+
 def test_derive_bugflow_health_prefers_degraded_when_recovery_and_blocked_mix():
     health = dashboard._derive_bugflow_health(
         {
@@ -528,6 +561,42 @@ def test_derive_bugflow_health_prefers_degraded_when_recovery_and_blocked_mix():
         promoting_lane=None,
         active_report=None,
         counts={"blocked": 2},
+    )
+
+    assert health == "degraded"
+
+
+def test_derive_bugflow_status_text_prefers_proof_capture_retry():
+    text = dashboard._derive_bugflow_status_text(
+        {
+            "promotion_status_text": "",
+            "recovering_lane_ids": [],
+            "stalled_lane_ids": [],
+            "proof_capture_retry_lane_ids": ["L-proof"],
+            "strategy_pending_cluster_ids": [],
+        },
+        active_lanes=[],
+        active_report=None,
+        promoting_lane=None,
+        counts={},
+    )
+
+    assert text == "Recapturing promotion proof for lanes: L-proof"
+
+
+def test_derive_bugflow_health_treats_proof_capture_retry_as_degraded():
+    health = dashboard._derive_bugflow_health(
+        {
+            "recovering_lane_ids": [],
+            "stalled_lane_ids": [],
+            "proof_capture_retry_lane_ids": ["L-proof"],
+            "strategy_pending_cluster_ids": [],
+        },
+        reports=[],
+        active_lanes=[],
+        promoting_lane=None,
+        active_report=None,
+        counts={"blocked": 1},
     )
 
     assert health == "degraded"

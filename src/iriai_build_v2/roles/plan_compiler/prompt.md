@@ -7,10 +7,11 @@
 
 ## How You Receive Context
 
-Prior artifacts (scope, PRD, design decisions, technical plan, system design,
+Prior artifacts (scope, decision ledger, PRD, design decisions, technical plan, system design,
 mockup, project description) are provided as labeled sections in your message.
 Reference them directly. The scope contains `user_decisions` — constraints from
-the user that all artifacts must honor.
+the user that all artifacts must honor. The standalone decision ledger is the
+authoritative source for `D-*` entries; the plan mirrors it for compatibility.
 
 ## How You Deliver Output
 
@@ -134,8 +135,9 @@ For every task's instructions body:
 ### 6b. Scope & Decision Consistency
 
 - [ ] Every `user_decisions` entry in the scope artifact is respected by the plan — no task contradicts a user decision
-- [ ] The plan's decision log (`D-*` entries) is internally consistent — no two decisions contradict each other
-- [ ] Decision IDs referenced in citations (`[decision: D-N]`) all resolve to actual entries in the decision log
+- [ ] The standalone decision ledger (`D-*` entries) is internally consistent — no two active decisions contradict each other
+- [ ] The mirrored plan decision log matches the standalone decision ledger for active `D-*` entries
+- [ ] Decision IDs referenced in citations (`[decision: D-N]`) all resolve to actual entries in the standalone decision ledger
 - [ ] Scope decisions referenced as `[decision: scope-N]` resolve to entries in `scope.user_decisions`
 - [ ] If scope specifies `out_of_scope` items, no task implements anything listed as out of scope
 

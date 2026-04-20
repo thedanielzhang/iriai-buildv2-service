@@ -130,6 +130,73 @@ class TestBuildState:
         assert state.source_feature_name == "Checkout flow"
         assert state.project == "Project workspace: /tmp/workspace"
 
+    @pytest.mark.asyncio
+    async def test_rebuild_build_state_hydrates_feature_metadata(self):
+        class _Artifacts:
+            async def get(self, key: str, *, feature):
+                del feature
+                return {
+                    "prd": "compiled prd",
+                    "design": "compiled design",
+                }.get(key)
+
+        feature = SimpleNamespace(
+            id="feat1234",
+            metadata={
+                "planning_control": {
+                    "current_stage": "subfeature",
+                    "broad_steps": {"prd": {"status": "complete"}},
+                }
+            },
+        )
+
+        state = await rebuild_state("planning", _Artifacts(), feature)
+
+        assert isinstance(state, BuildState)
+        assert state.prd == "compiled prd"
+        assert state.design == "compiled design"
+        assert state.metadata["planning_control"]["current_stage"] == "subfeature"
+
+    @pytest.mark.asyncio
+    async def test_rebuild_build_state_ignores_draft_scope_while_scoping_gate_is_in_progress(self):
+        class _Artifacts:
+            async def get(self, key: str, *, feature):
+                del feature
+                return {
+                    "scope": "draft scope text",
+                    "scope:approved": "",
+                }.get(key, "")
+
+        feature = SimpleNamespace(
+            id="feat-scope",
+            metadata={"_db_phase": "scoping"},
+        )
+
+        state = await rebuild_state("planning", _Artifacts(), feature)
+
+        assert isinstance(state, BuildState)
+        assert state.scope == ""
+
+    @pytest.mark.asyncio
+    async def test_rebuild_build_state_hydrates_scope_when_scoping_was_approved(self):
+        class _Artifacts:
+            async def get(self, key: str, *, feature):
+                del feature
+                return {
+                    "scope": "approved scope text",
+                    "scope:approved": "approved",
+                }.get(key, "")
+
+        feature = SimpleNamespace(
+            id="feat-scope",
+            metadata={"_db_phase": "scoping"},
+        )
+
+        state = await rebuild_state("planning", _Artifacts(), feature)
+
+        assert isinstance(state, BuildState)
+        assert state.scope == "approved scope text"
+
 
 class TestBuildRunner:
     def test_codex_primary_uses_codex_for_secondary_too(

@@ -10,8 +10,9 @@ DASHBOARD_BASE_URL = os.environ.get("IRIAI_DASHBOARD_BASE_URL", "").rstrip("/")
 
 BUDGET_TIERS = {
     "sonnet": "claude-sonnet-4-6",
-    "opus": "claude-opus-4-6",
-    "opus_1m": "claude-opus-4-6[1m]",
+    "opus": "claude-opus-4-7",
+    # Opus 4.7 now ships with a native 1M context window.
+    "opus_1m": "claude-opus-4-7",
     "haiku": "claude-haiku-4-5-20251001",
 }
 

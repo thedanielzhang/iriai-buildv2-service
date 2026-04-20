@@ -549,7 +549,7 @@ class ClaudeAgentRuntime(AgentRuntime):
         options = ClaudeAgentOptions(
             system_prompt=role.prompt,
             allowed_tools=role.tools,
-            model=role.model or "claude-sonnet-4-6",
+            model=role.model or "claude-opus-4-7",
             cwd=cwd,
             permission_mode="bypassPermissions",
             effort=role.effort if role.effort is not None else "high",

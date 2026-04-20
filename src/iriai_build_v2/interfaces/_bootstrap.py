@@ -259,7 +259,18 @@ async def rebuild_state(
             "observations": "observations",
         }
 
+    state.metadata = dict(feature.metadata or {})
+    current_phase = str(state.metadata.get("_db_phase", "") or "")
+
     for artifact_key, field_name in mapping.items():
+        if (
+            workflow_name in {"planning", "develop", "full-develop"}
+            and artifact_key == "scope"
+            and current_phase == "scoping"
+        ):
+            approved = await artifacts.get("scope:approved", feature=feature)
+            if not approved:
+                continue
         val = await artifacts.get(artifact_key, feature=feature)
         if val:
             setattr(state, field_name, val)

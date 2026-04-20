@@ -98,6 +98,21 @@ class ArtifactMirror:
         )
         return manifest_path
 
+    def delete_artifact(self, feature_id: str, key: str) -> None:
+        """Delete a mirrored artifact file if it exists."""
+        rel_path = _key_to_path(key)
+        path = self.feature_dir(feature_id) / rel_path
+        path.unlink(missing_ok=True)
+
+        parent = path.parent
+        feature_root = self.feature_dir(feature_id)
+        while parent != feature_root and parent.exists():
+            try:
+                parent.rmdir()
+            except OSError:
+                break
+            parent = parent.parent
+
     def list_features(self) -> list[dict[str, Any]]:
         """Return metadata for all features with a manifest."""
         features_dir = self._base / "features"
@@ -118,12 +133,16 @@ class ArtifactMirror:
 
 _KEY_MAP = {
     "scope": "scope.md",
+    "decisions": "decisions.md",
     "prd": "prd.md",
     "design": "design-decisions.md",
     "plan": "plan.md",
     "context": "context.md",
     "mockup": "mockup.html",
     "system-design": "system-design.html",
+    # Drives the subfeatures/{slug}/test-plan.md suffix rule; per-subfeature-only
+    # scope — no top-level test-plan.md is written.
+    "test-plan": "test-plan.md",
 }
 
 
@@ -165,6 +184,8 @@ def _key_to_path(key: str) -> str:
 
     # 3. Broad-phase artifacts
     _BROAD_MAP = {
+        "decisions:broad": "broad/decisions.md",
+        "decisions:global": "global/decisions.md",
         "prd:broad": "broad/prd.md",
         "design:broad": "broad/design-system.md",
         "plan:broad": "broad/architecture.md",
@@ -188,9 +209,77 @@ def _key_to_path(key: str) -> str:
     # 5. Subfeature artifacts
     base_key = prefix.replace("-summary", "")  # prd-summary → prd
     is_summary = prefix.endswith("-summary")
+    if prefix == "decisions-summary":
+        return f"subfeatures/{slug}/decisions-summary.md"
     filename = _KEY_MAP.get(base_key, f"{base_key}.md")
     if is_summary:
         name, ext = filename.rsplit(".", 1)
         filename = f"{name}-summary.{ext}"
 
     return f"subfeatures/{slug}/{filename}"
+
+
+def _path_to_key(path: str | Path) -> str | None:
+    """Best-effort inverse of ``_key_to_path`` for mirrored artifacts."""
+    rel = Path(path).as_posix().lstrip("./")
+    if not rel or rel == "manifest.json":
+        return None
+    parts = Path(rel).parts
+    if any(part.startswith(".") for part in parts):
+        return None
+
+    top_level = {v: k for k, v in _KEY_MAP.items()}
+    if rel in top_level:
+        return top_level[rel]
+
+    broad_map = {
+        "broad/decisions.md": "decisions:broad",
+        "global/decisions.md": "decisions:global",
+        "broad/prd.md": "prd:broad",
+        "broad/design-system.md": "design:broad",
+        "broad/architecture.md": "plan:broad",
+        "broad/strategy.md": "dag:strategy",
+        "broad/design-decomp-alignment.md": "design:decomp-alignment",
+        "broad/plan-decomp-alignment.md": "plan:decomp-alignment",
+    }
+    if rel in broad_map:
+        return broad_map[rel]
+
+    if rel.startswith("reviews/"):
+        name = Path(rel).name
+        if name.endswith("-gate-review.md"):
+            return f"gate-review:{name.removesuffix('-gate-review.md')}"
+        if name.endswith("-gate-ledger.json"):
+            return f"gate-review-ledger:{name.removesuffix('-gate-ledger.json')}"
+        if name.endswith("-gate-enhancements.json"):
+            return f"gate-enhancement-backlog:{name.removesuffix('-gate-enhancements.json')}"
+        if name.endswith(".md"):
+            return f"integration-review:{name.removesuffix('.md')}"
+        return None
+
+    if len(parts) == 3 and parts[0] == "subfeatures":
+        slug, filename = parts[1], parts[2]
+        if filename == "decisions-summary.md":
+            return f"decisions-summary:{slug}"
+        if filename == "system-design-source.md":
+            return None
+        inverse = {v: k for k, v in _KEY_MAP.items()}
+        base_filename = filename
+        is_summary = False
+        if filename.endswith("-summary.md") or filename.endswith("-summary.html"):
+            is_summary = True
+            base_filename = filename.replace("-summary", "", 1)
+        base_key = inverse.get(base_filename)
+        if not base_key:
+            stem = Path(base_filename).stem
+            if stem:
+                base_key = stem
+        if not base_key:
+            return None
+        prefix = f"{base_key}-summary" if is_summary else base_key
+        return f"{prefix}:{slug}"
+
+    if len(parts) == 1 and Path(rel).suffix == ".md":
+        return Path(rel).stem
+
+    return None

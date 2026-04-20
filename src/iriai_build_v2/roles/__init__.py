@@ -25,6 +25,20 @@ Your responses use the Envelope format with these fields:
 - Do NOT describe, summarize, or present the artifact in your text response.
 """
 
+_SHADOW_STAKEHOLDER_INSTRUCTIONS = """
+
+## Shadow Stakeholder Mode
+
+You are answering planning interview questions on behalf of a human stakeholder
+when the workflow continues in the background.
+
+Rules:
+- Answer as a decisive, high-fidelity stakeholder grounded in the codebase and current artifacts
+- Make reasonable assumptions instead of asking for more human input
+- State assumptions directly in your answer when they matter
+- Do not try to write the artifact yourself unless the prompt explicitly asks you to
+"""
+
 
 class InterviewActor(AgentActor):
     """AgentActor for interview phases. Appends Envelope usage instructions to the role prompt."""
@@ -36,6 +50,15 @@ class InterviewActor(AgentActor):
         self.role = self.role.model_copy(update={
             "prompt": self.role.prompt + self._envelope_instructions,
         })
+
+
+def _shadow_role(base_role):
+    metadata = dict(base_role.metadata)
+    metadata["runtime"] = "secondary"
+    return base_role.model_copy(update={
+        "prompt": base_role.prompt + _SHADOW_STAKEHOLDER_INSTRUCTIONS,
+        "metadata": metadata,
+    })
 
 # ── Role imports ────────────────────────────────────────────────────────────
 from .pm import role as pm_role
@@ -52,6 +75,7 @@ from .database_implementer import role as database_implementer_role
 from .package_implementer import role as package_implementer_role
 from .implementer import role as implementer_role
 from .test_author import role as test_author_role
+from .test_planner import role as test_planner_role
 from .integration_tester import role as integration_tester_role
 from .regression_tester import role as regression_tester_role
 from .smoke_tester import role as smoke_tester_role
@@ -90,32 +114,32 @@ reviewer_role = code_reviewer_role
 # ── Actors ──────────────────────────────────────────────────────────────────
 scoper = InterviewActor(name="scoper", role=scoper_role, context_keys=["project"])
 pm = InterviewActor(name="pm", role=pm_role, context_keys=["project", "scope"])
-designer = InterviewActor(name="designer", role=designer_role, context_keys=["project", "prd"])
+designer = InterviewActor(name="designer", role=designer_role, context_keys=["project", "prd", "decisions"])
 architect = InterviewActor(
     name="architect",
     role=architect_role,
-    context_keys=["project", "prd", "design"],
+    context_keys=["project", "prd", "design", "decisions"],
     persistent=True,
 )
 plan_compiler = AgentActor(
     name="plan-compiler",
     role=plan_compiler_role,
-    context_keys=["plan", "prd", "design", "system-design", "mockup", "scope"],
+    context_keys=["plan", "prd", "design", "system-design", "mockup", "scope", "decisions"],
 )
 plan_completeness_reviewer = AgentActor(
     name="plan-completeness-reviewer",
     role=plan_compiler_role,
-    context_keys=["plan", "prd", "design", "system-design", "mockup", "scope"],
+    context_keys=["plan", "prd", "design", "system-design", "mockup", "scope", "decisions"],
 )
 plan_security_reviewer = AgentActor(
     name="plan-security-reviewer",
     role=plan_compiler_role,
-    context_keys=["plan", "prd", "design", "system-design", "mockup", "scope"],
+    context_keys=["plan", "prd", "design", "system-design", "mockup", "scope", "decisions"],
 )
 planning_lead = InterviewActor(
     name="planning-lead",
     role=planning_lead_role,
-    context_keys=["project", "plan", "prd", "design", "system-design", "mockup"],
+    context_keys=["project", "plan", "prd", "design", "system-design", "mockup", "decisions"],
 )
 feature_lead = AgentActor(
     name="feature-lead",
@@ -248,7 +272,7 @@ lead_pm = InterviewActor(
     name="lead-pm", role=lead_pm_role, context_keys=["project", "scope"],
 )
 lead_pm_decomposer = InterviewActor(
-    name="lead-pm-decomposer", role=lead_pm_role, context_keys=["project", "scope", "prd:broad"],
+    name="lead-pm-decomposer", role=lead_pm_role, context_keys=["project", "scope", "prd:broad", "design:broad", "plan:broad", "decisions:broad"],
 )
 lead_pm_reviewer = InterviewActor(
     name="lead-pm-reviewer", role=lead_pm_role, context_keys=["project", "scope"],
@@ -267,28 +291,34 @@ citation_reviewer = AgentActor(
 )
 
 # Lead designer actors
+lead_designer_broad = InterviewActor(
+    name="lead-designer-broad", role=lead_designer_role, context_keys=["project", "scope", "prd:broad", "decisions:broad"],
+)
 lead_designer = InterviewActor(
-    name="lead-designer", role=lead_designer_role, context_keys=["project", "scope", "prd", "decomposition"],
+    name="lead-designer", role=lead_designer_role, context_keys=["project", "scope", "prd", "decomposition", "decisions"],
 )
 lead_designer_reviewer = InterviewActor(
-    name="lead-designer-reviewer", role=lead_designer_role, context_keys=["project", "scope", "prd", "decomposition"],
+    name="lead-designer-reviewer", role=lead_designer_role, context_keys=["project", "scope"],
 )
 lead_designer_gate_reviewer = InterviewActor(
-    name="lead-designer-gate-reviewer", role=lead_designer_role, context_keys=["project", "scope", "prd", "decomposition"],
+    name="lead-designer-gate-reviewer", role=lead_designer_role, context_keys=["project", "scope"],
 )
 design_compiler = AgentActor(
     name="design-compiler", role=compiler_role, context_keys=[],
 )
 
 # Lead architect actors
+lead_architect_broad = InterviewActor(
+    name="lead-architect-broad", role=lead_architect_role, context_keys=["project", "scope", "prd:broad", "design:broad", "decisions:broad"],
+)
 lead_architect = InterviewActor(
-    name="lead-architect", role=lead_architect_role, context_keys=["project", "scope", "prd", "design", "decomposition"],
+    name="lead-architect", role=lead_architect_role, context_keys=["project", "scope", "prd", "design", "decomposition", "decisions"],
 )
 lead_architect_reviewer = InterviewActor(
-    name="lead-architect-reviewer", role=lead_architect_role, context_keys=["project", "scope", "prd", "design", "decomposition"],
+    name="lead-architect-reviewer", role=lead_architect_role, context_keys=["project", "scope"],
 )
 lead_architect_gate_reviewer = InterviewActor(
-    name="lead-architect-gate-reviewer", role=lead_architect_role, context_keys=["project", "scope", "prd", "design", "decomposition"],
+    name="lead-architect-gate-reviewer", role=lead_architect_role, context_keys=["project", "scope"],
 )
 plan_arch_compiler = AgentActor(
     name="plan-arch-compiler", role=compiler_role, context_keys=[],
@@ -297,18 +327,52 @@ sysdesign_compiler = AgentActor(
     name="sysdesign-compiler", role=compiler_role, context_keys=[],
 )
 
+# Test planner actor. Per-SF actors are constructed inline in the phase loop
+# as InterviewActor(name=f"test-planner-sf-{slug}", ...). This base actor
+# exists so callers can reference a canonical handle and import path.
+test_planner = InterviewActor(
+    name="test-planner",
+    role=test_planner_role,
+    context_keys=["project", "scope", "prd", "design", "plan", "system-design", "decomposition", "decisions"],
+)
+
+# Shadow responder used when the user chooses "Finish in background" for the
+# test-planning step — answers clarifying questions in the stakeholder's voice
+# so the agent can complete the plan unattended.
+test_planner_agent_fill_responder = AgentActor(
+    name="test-planner-agent-fill-responder",
+    role=_shadow_role(test_planner_role),
+    context_keys=["project", "scope", "prd:broad", "design:broad", "plan:broad", "decisions:broad", "decomposition"],
+)
+
+pm_agent_fill_responder = AgentActor(
+    name="pm-agent-fill-responder",
+    role=_shadow_role(lead_pm_role),
+    context_keys=["project", "scope", "prd:broad", "design:broad", "plan:broad", "decisions:broad", "decomposition"],
+)
+design_agent_fill_responder = AgentActor(
+    name="design-agent-fill-responder",
+    role=_shadow_role(lead_designer_role),
+    context_keys=["project", "scope", "prd:broad", "design:broad", "decisions:broad", "decomposition"],
+)
+architect_agent_fill_responder = AgentActor(
+    name="architect-agent-fill-responder",
+    role=_shadow_role(lead_architect_role),
+    context_keys=["project", "scope", "prd:broad", "design:broad", "plan:broad", "decisions:broad", "decomposition"],
+)
+
 # Lead task planner actors
 lead_task_planner = InterviewActor(
     name="lead-task-planner", role=lead_task_planner_role,
-    context_keys=["project", "scope", "prd", "design", "plan", "system-design", "mockup", "decomposition"],
+    context_keys=["project", "scope", "prd", "design", "plan", "system-design", "mockup", "decomposition", "decisions"],
 )
 lead_task_planner_reviewer = InterviewActor(
     name="lead-task-planner-reviewer", role=lead_task_planner_role,
-    context_keys=["project", "scope", "prd", "design", "plan", "system-design", "mockup", "decomposition"],
+    context_keys=["project", "scope"],
 )
 lead_task_planner_gate_reviewer = InterviewActor(
     name="lead-task-planner-gate-reviewer", role=lead_task_planner_role,
-    context_keys=["project", "scope", "prd", "design", "plan", "system-design", "mockup", "decomposition"],
+    context_keys=["project", "scope"],
 )
 dag_compiler = AgentActor(
     name="dag-compiler", role=compiler_role, context_keys=[],

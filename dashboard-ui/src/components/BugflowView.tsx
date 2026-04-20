@@ -333,6 +333,12 @@ function LaneDetail({
         <KV label="Last Progress" value={lane.last_progress_at ? relTime(lane.last_progress_at) : '—'} />
         <KV label="Attempt" value={`${lane.lane_attempt ?? '—'}`} />
         <KV label="Promotion" value={prettyLabel(lane.promotion_status || mode)} />
+        {lane.promotion_status === 'proof-capture-retry' && (
+          <KV
+            label="Proof Capture Attempt"
+            value={`${lane.promotion_proof_capture_attempt ?? 0}`}
+          />
+        )}
         <KVCodeList label="Lock Scope" values={lane.lock_scope || []} empty="No lock scope recorded." />
         <KVCodeList label="Repo Scope" values={lane.repo_paths || []} empty="No repo scope recorded." />
         <KVCodeList label="Modified Files" values={lane.modified_files || []} empty="No modified files recorded yet." />

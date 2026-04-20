@@ -12,7 +12,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from iriai_compose import Ask, Feature, Gate, Interview, Phase, WorkflowRunner, to_str
+from iriai_compose import Ask, Feature, Phase, WorkflowRunner, to_str
 
 from ....models.outputs import (
     BugFixAttempt,
@@ -39,6 +39,7 @@ from ....roles import (
     user,
     verifier,
 )
+from ..._common import Gate, Interview
 from ....runtimes import create_agent_runtime
 from ...develop.phases.implementation import (
     PlannedBugDispatch,
@@ -83,8 +84,13 @@ from ..models import (
     utc_now,
 )
 from ..proof import (
+    core_evidence_modes,
+    core_surfaces_for_directives,
+    directive_core_surface,
     evidence_missing_requirements,
+    normalize_evidence_directives,
     persist_proof_record,
+    proof_requirement_diagnostics,
     proof_root_for_main_root,
     required_evidence_modes,
     snapshot_proof_record,
@@ -100,6 +106,8 @@ _PROMOTION_ARTIFACT = "bugflow-promotion-queue"
 # inside one fix cycle. Bugflow lane attempts are the outer report-level budget
 # and intentionally much larger.
 _MAX_REPORT_ATTEMPTS = 50
+_MAX_PROMOTION_PROOF_CAPTURE_RETRIES = 3
+_EVIDENCE_CHECK_OK_RESULTS = frozenset({"satisfied", "not_needed", "pass"})
 _COUNTED_FAILURE_KINDS = frozenset(
     {
         "lane-verify",
@@ -423,25 +431,67 @@ class BugflowQueuePhase(Phase):
         feature: Feature,
         lanes: list[BugflowLaneSnapshot],
     ) -> None:
-        clusters = await _load_clusters(
-            runner,
-            feature,
-            await _load_queue(runner, feature),
-            await _load_reports(runner, feature),
-            lanes,
-        )
-        cluster_by_id = {cluster.cluster_id: cluster for cluster in clusters}
-        stale_lane_ids = [
-            lane.lane_id
+        seed_lane_ids = {lane.lane_id for lane in lanes if lane.lane_id}
+        seed_report_ids = {
+            report_id
             for lane in lanes
-            if lane.status in {"active_fix", "active_verify"}
-            and lane.lane_id not in self._lane_tasks
-            and not (
-                lane.source_cluster_id
-                and cluster_by_id.get(lane.source_cluster_id)
-                and cluster_by_id[lane.source_cluster_id].strategy_status in {"pending", "decided"}
+            for report_id in lane.report_ids
+            if report_id
+        }
+
+        async def _reload_recovery_context(
+            current_lanes: list[BugflowLaneSnapshot],
+        ) -> tuple[list[BugflowReportSnapshot], list[BugflowLaneSnapshot], list[BugflowClusterSnapshot]]:
+            queue = await _load_queue(runner, feature)
+            reports = await _load_reports(runner, feature)
+            report_by_id = {report.report_id: report for report in reports}
+            explicit_report_ids = set(seed_report_ids)
+            explicit_report_ids.update(
+                report_id
+                for lane in current_lanes
+                for report_id in lane.report_ids
+                if report_id
             )
-        ]
+            if explicit_report_ids:
+                report_by_id.update(
+                    await _load_reports_by_id(
+                        runner,
+                        feature,
+                        sorted(explicit_report_ids),
+                    )
+                )
+            reports = sorted(
+                report_by_id.values(),
+                key=lambda report: (report.created_at, report.report_id),
+            )
+
+            lane_by_id = {lane.lane_id: lane for lane in await _load_lanes(runner, feature)}
+            explicit_lane_ids = set(seed_lane_ids)
+            explicit_lane_ids.update(
+                lane.lane_id for lane in current_lanes if lane.lane_id
+            )
+            explicit_lane_ids.update(
+                report.lane_id for report in reports if report.lane_id
+            )
+            for lane_id in sorted(explicit_lane_ids):
+                lane = await _load_lane(runner, feature, lane_id)
+                if lane is not None:
+                    lane_by_id[lane_id] = lane
+            lanes = sorted(
+                lane_by_id.values(),
+                key=lambda lane: (lane.updated_at or "", lane.lane_id),
+                reverse=True,
+            )
+            clusters = await _load_clusters(
+                runner,
+                feature,
+                queue,
+                reports,
+                lanes,
+            )
+            return reports, lanes, clusters
+
+        reports, lanes, clusters = await _reload_recovery_context(lanes)
         stale_promoting_ids = [
             lane.lane_id
             for lane in lanes
@@ -458,27 +508,6 @@ class BugflowQueuePhase(Phase):
             if str(intent.get("status", "")).strip().lower() == "applied":
                 continue
             pending_respawn_lane_ids.append(lane.lane_id)
-
-        strategy_checkpoint_cluster_ids = [
-            cluster.cluster_id
-            for cluster in clusters
-            if cluster.strategy_status in {"pending", "decided"}
-            and cluster.lane_id
-            and cluster.lane_id not in self._lane_tasks
-        ]
-
-        if not stale_lane_ids and not stale_promoting_ids and not pending_respawn_lane_ids and not strategy_checkpoint_cluster_ids:
-            promotion = await _load_promotion_queue(runner, feature)
-            if promotion.promoting_lane_id and not any(
-                lane.lane_id == promotion.promoting_lane_id and lane.status == "promoting"
-                for lane in lanes
-            ):
-                await _refresh_promotion_queue(
-                    runner,
-                    feature,
-                    status_text="Promotion idle",
-                )
-            return
 
         for lane_id in pending_respawn_lane_ids:
             lane = await _load_lane(runner, feature, lane_id)
@@ -509,16 +538,62 @@ class BugflowQueuePhase(Phase):
             )
 
         if pending_respawn_lane_ids:
-            lanes = await _load_lanes(runner, feature)
-            reports = await _load_reports(runner, feature)
-            clusters = await _load_clusters(
-                runner,
-                feature,
-                await _load_queue(runner, feature),
-                reports,
-                lanes,
+            reports, lanes, clusters = await _reload_recovery_context(lanes)
+        clusters, normalized = await _normalize_cluster_strategy_states(
+            runner,
+            feature,
+            clusters,
+        )
+        if normalized:
+            reports, lanes, clusters = await _reload_recovery_context(lanes)
+        cluster_by_id = {cluster.cluster_id: cluster for cluster in clusters}
+        strategy_checkpoint_cluster_ids = [
+            cluster.cluster_id
+            for cluster in clusters
+            if _strategy_checkpoint_kind(cluster) in {"pending", "decided"}
+            and cluster.lane_id
+            and cluster.lane_id not in self._lane_tasks
+        ]
+        applied_notice_cluster_ids = [
+            cluster.cluster_id
+            for cluster in clusters
+            if _strategy_checkpoint_kind(cluster) == "applied"
+            and any(
+                report.cluster_id == cluster.cluster_id
+                and report.latest_strategy_notice_key != cluster.strategy_decision_key
+                for report in reports
             )
-            cluster_by_id = {cluster.cluster_id: cluster for cluster in clusters}
+        ]
+        stale_lane_ids = [
+            lane.lane_id
+            for lane in lanes
+            if lane.status in {"active_fix", "active_verify"}
+            and lane.lane_id not in self._lane_tasks
+            and not (
+                lane.source_cluster_id
+                and cluster_by_id.get(lane.source_cluster_id)
+                and _strategy_checkpoint_kind(cluster_by_id[lane.source_cluster_id]) in {"pending", "decided", "applied"}
+            )
+        ]
+
+        if (
+            not stale_lane_ids
+            and not stale_promoting_ids
+            and not pending_respawn_lane_ids
+            and not strategy_checkpoint_cluster_ids
+            and not applied_notice_cluster_ids
+        ):
+            promotion = await _load_promotion_queue(runner, feature)
+            if promotion.promoting_lane_id and not any(
+                lane.lane_id == promotion.promoting_lane_id and lane.status == "promoting"
+                for lane in lanes
+            ):
+                await _refresh_promotion_queue(
+                    runner,
+                    feature,
+                    status_text="Promotion idle",
+                )
+            return
 
         for cluster_id in strategy_checkpoint_cluster_ids:
             cluster = cluster_by_id.get(cluster_id) or await _load_cluster(runner, feature, cluster_id)
@@ -591,7 +666,7 @@ class BugflowQueuePhase(Phase):
             )
 
         for cluster in clusters:
-            if cluster.strategy_status != "applied" or not cluster.strategy_decision_key:
+            if cluster.cluster_id not in applied_notice_cluster_ids:
                 continue
             lane = await _load_lane(runner, feature, cluster.lane_id) if cluster.lane_id else None
             decision = await _load_strategy_decision_by_key(
@@ -705,7 +780,6 @@ class BugflowQueuePhase(Phase):
             if report.terminal_reason_kind in {
                 "human_attention",
                 "contradiction",
-                "proof-policy",
                 "exhausted-budget",
             }:
                 continue
@@ -719,6 +793,18 @@ class BugflowQueuePhase(Phase):
             lane = lane_by_id.get(lane_id) or await _load_lane(runner, feature, lane_id)
             if not lane or lane.status != "blocked":
                 continue
+            lane_reports = list((await _load_reports_by_id(runner, feature, lane.report_ids)).values()) or [report]
+            if report.terminal_reason_kind == "proof-policy":
+                if not _is_recoverable_proof_policy_block(report, lane):
+                    continue
+                await _recover_blocked_promotion_proof_capture(
+                    runner,
+                    feature,
+                    lane,
+                    lane_reports,
+                )
+                recovered_lane_ids.add(lane_id)
+                continue
             if "missing rca context" in (lane.wait_reason or "").lower():
                 await _respawn_lane_from_latest_main(
                     runner,
@@ -731,7 +817,6 @@ class BugflowQueuePhase(Phase):
                 )
                 recovered_lane_ids.add(lane_id)
                 continue
-            lane_reports = list((await _load_reports_by_id(runner, feature, lane.report_ids)).values()) or [report]
             if any(_normalize_strategy_mode(entry.strategy_mode) == "human_attention" for entry in lane_reports):
                 continue
             if any(
@@ -1578,9 +1663,10 @@ class BugflowQueuePhase(Phase):
                 report,
                 stage="reproduce",
                 bundle=reproduction.proof,
+                checks=reproduction.checks,
                 context_root=_proof_context_root(runner, feature),
             )
-            missing = _missing_terminal_proof_requirements(report, reproduction.proof)
+            missing = _missing_terminal_approval_requirements(report, reproduction.proof, reproduction)
             if missing:
                 await _reject_missing_terminal_proof(
                     runner,
@@ -1588,6 +1674,8 @@ class BugflowQueuePhase(Phase):
                     report,
                     stage="reproduction",
                     missing=missing,
+                    bundle=reproduction.proof,
+                    approval_source=reproduction,
                 )
                 return
             report.status = "resolved-no-repro"
@@ -1638,11 +1726,12 @@ class BugflowQueuePhase(Phase):
             report,
             stage="validate",
             bundle=verdict.proof,
+            checks=verdict.checks,
             context_root=_proof_context_root(runner, feature),
         )
         report.updated_at = utc_now()
         if verdict.approved:
-            missing = _missing_terminal_proof_requirements(report, verdict.proof)
+            missing = _missing_terminal_approval_requirements(report, verdict.proof, verdict)
             if missing:
                 await _reject_missing_terminal_proof(
                     runner,
@@ -1650,6 +1739,8 @@ class BugflowQueuePhase(Phase):
                     report,
                     stage="validation",
                     missing=missing,
+                    bundle=verdict.proof,
+                    approval_source=verdict,
                 )
                 return
             report.status = "resolved-no-repro"
@@ -2186,6 +2277,7 @@ class BugflowQueuePhase(Phase):
                 report,
                 stage="lane-verify",
                 bundle=re_verdict.proof,
+                checks=re_verdict.checks,
                 context_root=lane_root,
             )
 
@@ -2299,6 +2391,7 @@ class BugflowQueuePhase(Phase):
                     report,
                     stage="lane-verify",
                     bundle=regression.proof,
+                    checks=regression.checks,
                     context_root=lane_root,
                 )
         if regression is not None and not regression.approved:
@@ -2433,6 +2526,7 @@ class BugflowQueuePhase(Phase):
                     item,
                     stage="lane-verify",
                     bundle=verdict.proof,
+                    checks=verdict.checks,
                     context_root=lane_root,
                 )
         lane.updated_at = utc_now()
@@ -2552,6 +2646,7 @@ class BugflowQueuePhase(Phase):
                         report,
                         stage="promotion-verify",
                         bundle=promotion_verdict.proof,
+                        checks=promotion_verdict.checks,
                         context_root=promotion_root,
                     )
                 if not promotion_verdict.approved:
@@ -2569,38 +2664,28 @@ class BugflowQueuePhase(Phase):
                         status_text="Promotion idle",
                     )
                     return
-                missing_report_proof = [
-                    report.report_id
+                missing_report_proof = {
+                    report.report_id: _missing_terminal_approval_requirements(
+                        report,
+                        promotion_verdict.proof,
+                        promotion_verdict,
+                    )
                     for report in promotion_reports
-                    if _missing_terminal_proof_requirements(report, promotion_verdict.proof)
-                ]
+                }
+                missing_report_proof = {
+                    report_id: missing
+                    for report_id, missing in missing_report_proof.items()
+                    if missing
+                }
                 if missing_report_proof:
-                    lane.status = "blocked"
-                    lane.promotion_status = "blocked"
-                    lane.wait_reason = (
-                        "Promotion verification was missing required proof for "
-                        + ", ".join(missing_report_proof)
-                    )
-                    lane.updated_at = utc_now()
-                    await _save_lane(runner, feature, lane)
-                    await _mark_cluster_from_lane(
+                    await _retry_missing_promotion_proof(
                         runner,
                         feature,
                         lane,
-                        status="blocked",
-                        current_phase="blocked",
-                        wait_reason=lane.wait_reason,
-                    )
-                    await _mark_lane_reports_blocked(
-                        runner,
-                        feature,
-                        lane,
-                        (
-                            f"{lane.lane_id}: promotion verification was missing required proof for "
-                            + ", ".join(missing_report_proof)
-                        ),
-                        failure_kind="proof-policy",
-                        failure_reason=lane.wait_reason,
+                        promotion_reports,
+                        bundle=promotion_verdict.proof,
+                        missing_by_report_id=missing_report_proof,
+                        approval_source=promotion_verdict,
                     )
                     await _refresh_promotion_queue(
                         runner,
@@ -2635,6 +2720,7 @@ class BugflowQueuePhase(Phase):
                             report,
                             stage="promotion-verify",
                             bundle=promotion_regression.proof,
+                            checks=promotion_regression.checks,
                             context_root=promotion_root,
                         )
                 if promotion_regression is not None and not promotion_regression.approved:
@@ -2714,9 +2800,10 @@ class BugflowQueuePhase(Phase):
                     report,
                     stage="reproduce",
                     bundle=reproduction.proof,
+                    checks=reproduction.checks,
                     context_root=_proof_context_root(runner, feature),
                 )
-                missing = _missing_terminal_proof_requirements(report, reproduction.proof)
+                missing = _missing_terminal_approval_requirements(report, reproduction.proof, reproduction)
                 if missing:
                     await _reject_missing_terminal_proof(
                         runner,
@@ -2724,6 +2811,8 @@ class BugflowQueuePhase(Phase):
                         report,
                         stage="retriage reproduction",
                         missing=missing,
+                        bundle=reproduction.proof,
+                        approval_source=reproduction,
                     )
                     continue
                 report.status = "resolved"
@@ -2773,10 +2862,11 @@ class BugflowQueuePhase(Phase):
                     report,
                     stage="validate",
                     bundle=verdict.proof,
+                    checks=verdict.checks,
                     context_root=_proof_context_root(runner, feature),
                 )
                 if verdict.approved:
-                    missing = _missing_terminal_proof_requirements(report, verdict.proof)
+                    missing = _missing_terminal_approval_requirements(report, verdict.proof, verdict)
                     if missing:
                         await _reject_missing_terminal_proof(
                             runner,
@@ -2784,6 +2874,8 @@ class BugflowQueuePhase(Phase):
                             report,
                             stage="retriage validation",
                             missing=missing,
+                            bundle=verdict.proof,
+                            approval_source=verdict,
                         )
                         continue
                 report.status = "resolved" if verdict.approved else "queued"
@@ -2824,6 +2916,21 @@ class BugflowQueuePhase(Phase):
         lanes: list[BugflowLaneSnapshot],
         clusters: list[BugflowClusterSnapshot],
     ) -> BugflowQueueSnapshot:
+        clusters, normalized = await _normalize_cluster_strategy_states(
+            runner,
+            feature,
+            clusters,
+        )
+        if normalized:
+            reports = await _load_reports(runner, feature)
+            lanes = await _load_lanes(runner, feature)
+            clusters = await _load_clusters(
+                runner,
+                feature,
+                await _load_queue(runner, feature),
+                reports,
+                lanes,
+            )
         previous = await _load_queue(runner, feature)
         counts = compute_counts(reports)
         active_lanes = [lane for lane in lanes if lane.status in {"active_fix", "active_verify"}]
@@ -2833,10 +2940,15 @@ class BugflowQueuePhase(Phase):
         stalled_lane_ids = [
             lane.lane_id for lane in lanes if lane.execution_state == "stalled"
         ]
+        proof_capture_retry_lane_ids = [
+            lane.lane_id
+            for lane in lanes
+            if lane.promotion_status == "proof-capture-retry"
+        ]
         strategy_pending_cluster_ids = [
             cluster.cluster_id
             for cluster in clusters
-            if cluster.strategy_status in {"pending", "decided"}
+            if _strategy_checkpoint_kind(cluster) in {"pending", "decided"}
         ]
         verified_pending = [
             lane.lane_id for lane in lanes if lane.status == "verified_pending_promotion"
@@ -2871,6 +2983,8 @@ class BugflowQueuePhase(Phase):
             promotion_status_text=(
                 f"Promoting {promoting_lane.lane_id}"
                 if promoting_lane
+                else f"Recapturing promotion proof for {', '.join(proof_capture_retry_lane_ids[:3])}"
+                if proof_capture_retry_lane_ids
                 else f"{len(verified_pending)} lanes waiting for promotion"
                 if verified_pending
                 else ""
@@ -2883,6 +2997,7 @@ class BugflowQueuePhase(Phase):
             blocked_ids=blocked_ids,
             stalled_lane_ids=stalled_lane_ids,
             recovering_lane_ids=recovering_lane_ids,
+            proof_capture_retry_lane_ids=proof_capture_retry_lane_ids,
             strategy_pending_cluster_ids=strategy_pending_cluster_ids,
             report_ids=[report.report_id for report in reports],
             cluster_ids=[cluster.cluster_id for cluster in clusters],
@@ -2997,6 +3112,7 @@ async def _store_report_proof(
     *,
     stage: str,
     bundle: EvidenceBundle | None,
+    checks: list[Check] | None = None,
     context_root: Path | None = None,
 ) -> BugflowProofRecord | None:
     if bundle is None:
@@ -3010,6 +3126,7 @@ async def _store_report_proof(
         report_id=report.report_id,
         stage=stage,
         bundle=bundle,
+        checks=checks,
         context_root=context_root or main_root,
     )
     key = proof_key(report.report_id, stage)
@@ -3049,7 +3166,7 @@ async def _record_terminal_proof(
     else:
         fallback_bundle = bundle or EvidenceBundle(
             ui_involved=report.ui_involved,
-            evidence_modes=report.evidence_modes,
+            evidence_modes=_requested_terminal_evidence_for_report(report),
             summary=summary,
             steps_executed=[],
             environment_notes="Fallback terminal proof generated by bugflow.",
@@ -3249,6 +3366,57 @@ async def _load_failure_bundle_payload(
     return payload if isinstance(payload, dict) else None
 
 
+async def _normalize_cluster_strategy_state(
+    runner: WorkflowRunner,
+    feature: Feature,
+    cluster: BugflowClusterSnapshot,
+) -> tuple[BugflowClusterSnapshot, bool]:
+    current = await _load_cluster(runner, feature, cluster.cluster_id) or cluster
+    if _strategy_checkpoint_kind(current) != "invalid":
+        return current, False
+    logger.debug(
+        "Normalizing invalid strategy state for cluster %s (status=%s, decision=%s, round=%s, bundle=%s)",
+        current.cluster_id,
+        current.strategy_status,
+        current.strategy_decision_key,
+        current.strategy_round,
+        current.stable_bundle_key,
+    )
+    current = _clear_cluster_strategy_fields(current)
+    await _save_cluster(runner, feature, current)
+    reports_by_id = await _load_reports_by_id(runner, feature, current.report_ids)
+    for report in reports_by_id.values():
+        keep_bundle = False
+        bundle_key = (report.latest_failure_bundle_key or "").strip()
+        if bundle_key:
+            keep_bundle = await _load_failure_bundle_payload(runner, feature, bundle_key) is not None
+        report = _clear_report_strategy_fields(
+            report,
+            keep_failure_bundle_key=keep_bundle,
+        )
+        report.updated_at = utc_now()
+        await _save_report(runner, feature, report)
+    return current, True
+
+
+async def _normalize_cluster_strategy_states(
+    runner: WorkflowRunner,
+    feature: Feature,
+    clusters: list[BugflowClusterSnapshot],
+) -> tuple[list[BugflowClusterSnapshot], bool]:
+    normalized: list[BugflowClusterSnapshot] = []
+    changed = False
+    for cluster in clusters:
+        current, was_changed = await _normalize_cluster_strategy_state(
+            runner,
+            feature,
+            cluster,
+        )
+        normalized.append(current)
+        changed = changed or was_changed
+    return normalized, changed
+
+
 async def _set_lane_execution_state(
     runner: WorkflowRunner,
     feature: Feature,
@@ -3353,8 +3521,20 @@ async def _set_cluster_strategy_status(
     current = await _load_cluster(runner, feature, cluster.cluster_id)
     if current is None:
         return None
+    normalized_status = status if status in _STRATEGY_STATUSES else ""
+    candidate = current.model_copy(deep=True)
+    candidate.strategy_status = normalized_status
+    if normalized_status and _strategy_checkpoint_kind(candidate) == "invalid":
+        logger.debug(
+            "Refusing to persist invalid strategy status %s for cluster %s",
+            normalized_status,
+            current.cluster_id,
+        )
+        current.strategy_status = ""
+        await _save_cluster(runner, feature, current)
+        return current
     now = utc_now()
-    current.strategy_status = status if status in _STRATEGY_STATUSES else ""
+    current.strategy_status = normalized_status
     if status == "pending":
         current.strategy_started_at = now
     elif status == "decided":
@@ -3377,6 +3557,73 @@ async def _load_strategy_decision_by_key(
     if not isinstance(decision, RepairStrategyDecision):
         return None
     return decision
+
+
+def _strategy_checkpoint_kind(cluster: BugflowClusterSnapshot | None) -> str:
+    if cluster is None:
+        return "none"
+    status = (cluster.strategy_status or "").strip().lower()
+    if not status:
+        return "none"
+    if status not in _STRATEGY_STATUSES:
+        return "invalid"
+    has_lane = bool((cluster.lane_id or "").strip())
+    has_bundle = bool((cluster.stable_bundle_key or "").strip())
+    has_decision = bool((cluster.strategy_decision_key or "").strip())
+    has_round = int(cluster.strategy_round or 0) >= 1
+    if status == "pending":
+        return "pending" if has_bundle and has_lane else "invalid"
+    if status == "decided":
+        return "decided" if has_decision and has_round and has_lane else "invalid"
+    if status == "applied":
+        return "applied" if has_decision and has_round else "invalid"
+    return "invalid"
+
+
+def _clear_cluster_strategy_fields(
+    cluster: BugflowClusterSnapshot,
+) -> BugflowClusterSnapshot:
+    cluster.strategy_mode = ""
+    cluster.strategy_decision_key = ""
+    cluster.stable_bundle_key = ""
+    cluster.stable_failure_family = ""
+    cluster.strategy_round = 0
+    cluster.strategy_reason = ""
+    cluster.similar_cluster_ids = []
+    cluster.strategy_status = ""
+    cluster.strategy_started_at = ""
+    cluster.strategy_decided_at = ""
+    cluster.strategy_applied_at = ""
+    return cluster
+
+
+def _clear_report_strategy_fields(
+    report: BugflowReportSnapshot,
+    *,
+    keep_failure_bundle_key: bool,
+    clear_proof_contract: bool = True,
+) -> BugflowReportSnapshot:
+    report.strategy_mode = ""
+    report.strategy_decision_key = ""
+    report.strategy_reason = ""
+    report.strategy_round = 0
+    report.stable_failure_family = ""
+    if not keep_failure_bundle_key:
+        report.latest_failure_bundle_key = ""
+    report.latest_strategy_notice_key = ""
+    if clear_proof_contract:
+        report.strategy_required_evidence_modes = []
+    return report
+
+
+def _proof_capture_retry_in_flight(
+    lane: BugflowLaneSnapshot,
+    reports: list[BugflowReportSnapshot],
+) -> bool:
+    return lane.promotion_status == "proof-capture-retry" or any(
+        report.promotion_status == "proof-capture-retry"
+        for report in reports
+    )
 
 
 async def _set_promotion_execution_state(
@@ -3556,7 +3803,8 @@ def _classification_prompt(report: BugflowReportSnapshot) -> str:
 
 
 def _reproduction_prompt(report: BugflowReportSnapshot) -> str:
-    required_modes = ", ".join(_required_modes_for_report(report)) or "none recorded"
+    requested_directives = _requested_terminal_evidence_text(report)
+    required_modes = _required_terminal_core_surfaces_text(report)
     return (
         "Validate whether this bug still reproduces on the current bugflow branch.\n\n"
         f"Report: {report.report_id}\n"
@@ -3566,16 +3814,20 @@ def _reproduction_prompt(report: BugflowReportSnapshot) -> str:
         f"Interview context: {report.interview_output or 'No extra interview notes recorded.'}\n"
         f"Expected: {report.expected_behavior}\n"
         f"Actual: {report.actual_behavior}\n"
-        f"Required evidence modes: {required_modes}\n\n"
+        f"Requested evidence directives: {requested_directives}\n"
+        f"Required core proof surfaces: {required_modes}\n\n"
         "Use available repo, browser, API, database, and verification tools as needed.\n"
         "If UI is involved, capture explicit Playwright proof with a trace artifact and screenshot artifact.\n"
         "For backend evidence, include request/response, database, logs, or repo evidence as needed, and include an independent postcondition check for state-changing flows.\n"
-        "Return ReproductionResult.proof with concrete artifact metadata instead of prose-only claims."
+        "Return ReproductionResult.proof with concrete artifact metadata instead of prose-only claims.\n"
+        "For each requested evidence directive that is not one of ui/api/database/logs/repo, include a ReproductionResult.check entry "
+        "with criterion `evidence:<directive>`, result `satisfied` or `not-needed`, and detail naming the artifact or rationale."
     )
 
 
 def _validation_prompt(report: BugflowReportSnapshot, reproduction: ReproductionResult) -> str:
-    required_modes = ", ".join(_required_modes_for_report(report)) or "none recorded"
+    requested_directives = _requested_terminal_evidence_text(report, reproduction.proof)
+    required_modes = _required_terminal_core_surfaces_text(report, reproduction.proof)
     return (
         "Review whether this reproduced report still represents a bug that needs fixing.\n\n"
         f"Report: {report.report_id}\n"
@@ -3585,10 +3837,12 @@ def _validation_prompt(report: BugflowReportSnapshot, reproduction: Reproduction
         f"Expected: {report.expected_behavior}\n"
         f"Actual: {report.actual_behavior}\n\n"
         f"Reproduction summary:\n{to_str(reproduction)}\n\n"
-        f"Required evidence modes: {required_modes}\n\n"
+        f"Requested evidence directives: {requested_directives}\n"
+        f"Required core proof surfaces: {required_modes}\n\n"
         "Return a blocking Verdict when this needs a fix. Return approved=true only if no change is needed.\n"
         "Any terminal approval must include Verdict.proof. For UI-involved reports, that proof must include Playwright trace and screenshot artifacts.\n"
-        "For backend/stateful reports, include request/response, database, logs, or repo/static evidence as needed, plus an independent postcondition check for write flows."
+        "For backend/stateful reports, include request/response, database, logs, or repo/static evidence as needed, plus an independent postcondition check for write flows.\n"
+        "For each requested evidence directive that is not one of ui/api/database/logs/repo, include a Verdict.check entry with criterion `evidence:<directive>`, result `satisfied` or `not-needed`, and detail naming the artifact or rationale."
     )
 
 
@@ -3634,6 +3888,22 @@ def _classify_surface_flags(
     report: BugflowReportSnapshot,
     classification: Observation | None = None,
 ) -> tuple[bool, list[str]]:
+    ui_involved, inferred_modes, classifier_modes = _surface_inference_inputs(
+        report,
+        classification,
+    )
+    return ui_involved, _merge_evidence_modes(
+        report.evidence_modes,
+        classifier_modes,
+        inferred_modes,
+        ui_involved=ui_involved,
+    )
+
+
+def _surface_inference_inputs(
+    report: BugflowReportSnapshot,
+    classification: Observation | None = None,
+) -> tuple[bool, list[str], list[str]]:
     fields = [
         report.root_message_text,
         report.title,
@@ -3685,23 +3955,68 @@ def _classify_surface_flags(
         if classification and getattr(classification, "evidence_modes", None)
         else []
     )
-    return ui_involved, _merge_evidence_modes(
-        report.evidence_modes,
+    return ui_involved, inferred_modes, classifier_modes
+
+
+def _observed_modes_for_report(report: BugflowReportSnapshot) -> list[str]:
+    return required_evidence_modes(
+        ui_involved=report.ui_involved,
+        evidence_modes=report.evidence_modes,
+    )
+
+
+def _requested_terminal_evidence_for_report(
+    report: BugflowReportSnapshot,
+) -> list[str]:
+    explicit_modes = normalize_evidence_directives(
+        report.strategy_required_evidence_modes,
+        ui_involved=report.ui_involved,
+    )
+    if explicit_modes:
+        return explicit_modes
+
+    ui_involved, inferred_modes, classifier_modes = _surface_inference_inputs(report)
+    fallback_modes = normalize_evidence_directives(
         classifier_modes,
         inferred_modes,
         ui_involved=ui_involved,
     )
+    if _report_looks_state_changing(report):
+        fallback_modes = normalize_evidence_directives(
+            fallback_modes,
+            ["api", "database"],
+            ui_involved=ui_involved,
+        )
+    return fallback_modes
 
 
-def _required_modes_for_report(report: BugflowReportSnapshot) -> list[str]:
+def _required_terminal_core_surfaces_for_report(
+    report: BugflowReportSnapshot,
+    bundle: EvidenceBundle | None = None,
+) -> list[str]:
+    del bundle
     return required_evidence_modes(
         ui_involved=report.ui_involved,
-        evidence_modes=_merge_evidence_modes(
-            report.evidence_modes,
-            report.strategy_required_evidence_modes,
+        evidence_modes=core_surfaces_for_directives(
+            _requested_terminal_evidence_for_report(report),
             ui_involved=report.ui_involved,
         ),
     )
+
+
+def _requested_terminal_evidence_text(
+    report: BugflowReportSnapshot,
+    bundle: EvidenceBundle | None = None,
+) -> str:
+    del bundle
+    return ", ".join(_requested_terminal_evidence_for_report(report)) or "none recorded"
+
+
+def _required_terminal_core_surfaces_text(
+    report: BugflowReportSnapshot,
+    bundle: EvidenceBundle | None = None,
+) -> str:
+    return ", ".join(_required_terminal_core_surfaces_for_report(report, bundle)) or "none recorded"
 
 
 def _proof_context_root(
@@ -3732,16 +4047,169 @@ def _report_looks_state_changing(report: BugflowReportSnapshot) -> bool:
     return any(word in corpus for word in write_words)
 
 
+def _requested_non_core_evidence_directives(
+    report: BugflowReportSnapshot,
+) -> list[str]:
+    return [
+        directive
+        for directive in _requested_terminal_evidence_for_report(report)
+        if directive not in {"ui", "api", "database", "logs", "repo"}
+    ]
+
+
+def _evidence_check_lookup_from_checks(checks: list[Check] | None) -> dict[str, Check]:
+    if not checks:
+        return {}
+    lookup: dict[str, Check] = {}
+    for check in checks:
+        criterion = str(check.criterion or "").strip().lower()
+        if not criterion.startswith("evidence:"):
+            continue
+        directive = normalize_evidence_directives([criterion.split(":", 1)[1]])
+        if not directive:
+            continue
+        lookup[directive[0]] = check
+    return lookup
+
+
+def _evidence_check_lookup_from_result(
+    approval_source: Verdict | ReproductionResult | BugflowProofRecord | None,
+) -> dict[str, Check]:
+    if approval_source is None:
+        return {}
+    return _evidence_check_lookup_from_checks(list(getattr(approval_source, "checks", []) or []))
+
+
+def _missing_non_core_evidence_directives(
+    report: BugflowReportSnapshot,
+    approval_source: Verdict | ReproductionResult | BugflowProofRecord | None,
+) -> list[str]:
+    lookup = _evidence_check_lookup_from_result(approval_source)
+    missing: list[str] = []
+    for directive in _requested_non_core_evidence_directives(report):
+        check = lookup.get(directive)
+        if check is None:
+            missing.append(directive)
+            continue
+        result = normalize_evidence_directives([check.result or ""])
+        if not result or result[0] not in _EVIDENCE_CHECK_OK_RESULTS:
+            missing.append(directive)
+    return missing
+
+
+def _missing_terminal_approval_requirements(
+    report: BugflowReportSnapshot,
+    bundle: EvidenceBundle | None,
+    approval_source: Verdict | ReproductionResult | BugflowProofRecord | None = None,
+) -> list[str]:
+    missing = list(_missing_terminal_proof_requirements(report, bundle))
+    for directive in _missing_non_core_evidence_directives(report, approval_source):
+        missing.append(f"agent validation for evidence:{directive}")
+    return missing
+
+
+def _non_core_evidence_check_summaries(
+    report: BugflowReportSnapshot,
+    approval_source: Verdict | ReproductionResult | BugflowProofRecord | None,
+) -> list[str]:
+    lookup = _evidence_check_lookup_from_result(approval_source)
+    summaries: list[str] = []
+    for directive in _requested_non_core_evidence_directives(report):
+        check = lookup.get(directive)
+        if check is None:
+            continue
+        result = normalize_evidence_directives([check.result or ""])
+        status = result[0] if result else "unknown"
+        detail = str(check.detail or "").strip()
+        summaries.append(
+            f"{directive}={status}{f' ({detail})' if detail else ''}"
+        )
+    return summaries
+
+
 def _missing_terminal_proof_requirements(
     report: BugflowReportSnapshot,
     bundle: EvidenceBundle | None,
 ) -> list[str]:
     return evidence_missing_requirements(
-        required_modes=_required_modes_for_report(report),
+        required_modes=_required_terminal_core_surfaces_for_report(report, bundle),
         bundle=bundle,
         require_ui_proof=report.ui_involved,
         state_change=(bundle.state_change if bundle is not None else False) or _report_looks_state_changing(report),
     )
+
+
+def _proof_policy_diagnostics(
+    report: BugflowReportSnapshot,
+    bundle: EvidenceBundle | None,
+    approval_source: Verdict | ReproductionResult | BugflowProofRecord | None = None,
+) -> dict[str, object]:
+    diagnostics = proof_requirement_diagnostics(
+        required_modes=_required_terminal_core_surfaces_for_report(report, bundle),
+        bundle=bundle,
+        require_ui_proof=report.ui_involved,
+        state_change=(bundle.state_change if bundle is not None else False) or _report_looks_state_changing(report),
+    )
+    diagnostics["requested_directives"] = _requested_terminal_evidence_for_report(report)
+    diagnostics["missing_non_core_directives"] = _missing_non_core_evidence_directives(report, approval_source)
+    diagnostics["non_core_check_summaries"] = _non_core_evidence_check_summaries(report, approval_source)
+    return diagnostics
+
+
+def _proof_policy_detail_text(
+    report: BugflowReportSnapshot,
+    bundle: EvidenceBundle | None,
+    missing: list[str],
+    approval_source: Verdict | ReproductionResult | BugflowProofRecord | None = None,
+) -> str:
+    diagnostics = _proof_policy_diagnostics(report, bundle, approval_source)
+    requested_directives = diagnostics["requested_directives"]
+    required_modes = diagnostics["required_modes"]
+    provided_modes = diagnostics["provided_modes"]
+    artifact_surfaces = diagnostics["artifact_surfaces"]
+    declared_without = diagnostics["declared_without_artifacts"]
+    missing_non_core = diagnostics["missing_non_core_directives"]
+    non_core_summaries = diagnostics["non_core_check_summaries"]
+    lines = [f"Missing evidence: {', '.join(missing)}."]
+    lines.append(
+        "Requested evidence directives: "
+        + (", ".join(str(item) for item in requested_directives) or "none")
+        + "."
+    )
+    lines.append(
+        "Required core proof surfaces: "
+        + (", ".join(str(item) for item in required_modes) or "none")
+        + "."
+    )
+    lines.append(
+        "Provided proof surfaces: "
+        + (", ".join(str(item) for item in provided_modes) or "none")
+        + "."
+    )
+    lines.append(
+        "Artifact surfaces: "
+        + (", ".join(str(item) for item in artifact_surfaces) or "none")
+        + "."
+    )
+    if declared_without:
+        lines.append(
+            "Declared without matching artifacts: "
+            + ", ".join(str(item) for item in declared_without)
+            + "."
+        )
+    if missing_non_core:
+        lines.append(
+            "Non-core directives still needing explicit agent validation: "
+            + ", ".join(str(item) for item in missing_non_core)
+            + "."
+        )
+    if non_core_summaries:
+        lines.append(
+            "Non-core directive coverage: "
+            + "; ".join(str(item) for item in non_core_summaries)
+            + "."
+        )
+    return " ".join(lines)
 
 
 async def _reject_missing_terminal_proof(
@@ -3751,14 +4219,15 @@ async def _reject_missing_terminal_proof(
     *,
     stage: str,
     missing: list[str],
+    bundle: EvidenceBundle | None = None,
+    approval_source: Verdict | ReproductionResult | BugflowProofRecord | None = None,
 ) -> None:
     requirement_text = ", ".join(missing)
+    detail_text = _proof_policy_detail_text(report, bundle, missing, approval_source)
     next_step = f"Retrying {report.report_id} with required {stage} proof"
     should_notify = report.current_step != next_step
     report.current_step = next_step
-    report.validation_summary = (
-        f"Evidence bundle was missing required proof: {requirement_text}."
-    )
+    report.validation_summary = f"Evidence bundle was missing required proof: {requirement_text}. {detail_text}"
     report.updated_at = utc_now()
     await _save_report(runner, feature, report)
     if should_notify:
@@ -3769,9 +4238,108 @@ async def _reject_missing_terminal_proof(
             (
                 f"{report.report_id}: I need stronger proof before I can close this.\n\n"
                 f"Missing evidence: {requirement_text}.\n\n"
+                f"{detail_text}\n\n"
                 "I'll retry with explicit proof capture requirements."
             ),
         )
+
+
+def _promotion_proof_retry_reason(
+    reports: list[BugflowReportSnapshot],
+    bundle: EvidenceBundle | None,
+    missing_by_report_id: dict[str, list[str]],
+    approval_source: Verdict | ReproductionResult | BugflowProofRecord | None,
+) -> str:
+    details = [
+        f"{report.report_id}: {_proof_policy_detail_text(report, bundle, missing, approval_source)}"
+        for report in reports
+        if (missing := missing_by_report_id.get(report.report_id))
+    ]
+    return " ".join(details) or "Promotion verification was missing required proof."
+
+
+async def _retry_missing_promotion_proof(
+    runner: WorkflowRunner,
+    feature: Feature,
+    lane: BugflowLaneSnapshot,
+    reports: list[BugflowReportSnapshot],
+    *,
+    bundle: EvidenceBundle | None,
+    missing_by_report_id: dict[str, list[str]],
+    approval_source: Verdict | ReproductionResult | BugflowProofRecord | None = None,
+) -> bool:
+    detail_text = _promotion_proof_retry_reason(reports, bundle, missing_by_report_id, approval_source)
+    if lane.promotion_proof_capture_attempt >= _MAX_PROMOTION_PROOF_CAPTURE_RETRIES:
+        lane.status = "blocked"
+        lane.promotion_status = "blocked"
+        lane.wait_reason = (
+            "Promotion verification was missing required proof after "
+            f"{lane.promotion_proof_capture_attempt}/{_MAX_PROMOTION_PROOF_CAPTURE_RETRIES} proof-capture attempts. "
+            f"{detail_text}"
+        )
+        lane.updated_at = utc_now()
+        await _save_lane(runner, feature, lane)
+        await _mark_cluster_from_lane(
+            runner,
+            feature,
+            lane,
+            status="blocked",
+            current_phase="blocked",
+            wait_reason=lane.wait_reason,
+        )
+        await _mark_lane_reports_blocked(
+            runner,
+            feature,
+            lane,
+            (
+                f"{lane.lane_id}: promotion verification was missing required proof after "
+                f"{lane.promotion_proof_capture_attempt}/{_MAX_PROMOTION_PROOF_CAPTURE_RETRIES} proof-capture attempts.\n\n"
+                f"{detail_text}"
+            ),
+            failure_kind="proof-policy",
+            failure_reason=lane.wait_reason,
+        )
+        return False
+
+    lane.promotion_proof_capture_attempt += 1
+    lane.status = "verified_pending_promotion"
+    lane.promotion_status = "proof-capture-retry"
+    lane.wait_reason = (
+        f"Retrying promotion proof capture for {lane.lane_id} "
+        f"({lane.promotion_proof_capture_attempt}/{_MAX_PROMOTION_PROOF_CAPTURE_RETRIES}). "
+        f"{detail_text}"
+    )
+    lane.updated_at = utc_now()
+    await _save_lane(runner, feature, lane)
+    await _mark_cluster_from_lane(
+        runner,
+        feature,
+        lane,
+        status="verified_pending_promotion",
+        current_phase="promotion_pending",
+        wait_reason=lane.wait_reason,
+    )
+    for report in reports:
+        missing = missing_by_report_id.get(report.report_id)
+        if missing:
+            await _reject_missing_terminal_proof(
+                runner,
+                feature,
+                report,
+                stage="promotion verification",
+                missing=missing,
+                bundle=bundle,
+                approval_source=approval_source,
+            )
+        refreshed = await _load_report(runner, feature, report.report_id) or report
+        refreshed.status = "active_fix"
+        refreshed.promotion_status = "proof-capture-retry"
+        refreshed.last_failed_lane_id = lane.lane_id
+        refreshed.last_failure_kind = "proof-policy"
+        refreshed.last_failure_reason = detail_text
+        refreshed.updated_at = utc_now()
+        await _save_report(runner, feature, refreshed)
+    return True
 
 
 async def _post_terminal_notice(
@@ -3805,6 +4373,62 @@ async def _post_terminal_notice(
     report.terminal_notice_sent_for_key = key
     report.updated_at = utc_now()
     await _save_report(runner, feature, report)
+
+
+def _is_recoverable_proof_policy_block(
+    report: BugflowReportSnapshot,
+    lane: BugflowLaneSnapshot,
+) -> bool:
+    failure_kind = report.terminal_reason_kind or report.last_failure_kind
+    if failure_kind != "proof-policy":
+        return False
+    return int(lane.promotion_proof_capture_attempt or 0) < _MAX_PROMOTION_PROOF_CAPTURE_RETRIES
+
+
+async def _recover_blocked_promotion_proof_capture(
+    runner: WorkflowRunner,
+    feature: Feature,
+    lane: BugflowLaneSnapshot,
+    reports: list[BugflowReportSnapshot],
+) -> None:
+    lane.promotion_proof_capture_attempt = max(1, int(lane.promotion_proof_capture_attempt or 0))
+    lane.status = "verified_pending_promotion"
+    lane.promotion_status = "proof-capture-retry"
+    lane.wait_reason = (
+        f"Recovered stale proof-policy block for {lane.lane_id}; "
+        f"retrying promotion proof capture ({lane.promotion_proof_capture_attempt}/{_MAX_PROMOTION_PROOF_CAPTURE_RETRIES})."
+    )
+    lane.updated_at = utc_now()
+    await _save_lane(runner, feature, lane)
+    await _mark_cluster_from_lane(
+        runner,
+        feature,
+        lane,
+        status="verified_pending_promotion",
+        current_phase="promotion_pending",
+        wait_reason=lane.wait_reason,
+    )
+    await _refresh_promotion_queue(
+        runner,
+        feature,
+        status_text=f"Recapturing promotion proof for {lane.lane_id}",
+    )
+
+    for report in reports:
+        report.status = "active_fix"
+        report.promotion_status = "proof-capture-retry"
+        report.last_failed_lane_id = lane.lane_id
+        report.last_failure_kind = "proof-policy"
+        report.last_failure_reason = (
+            report.last_failure_reason
+            or report.terminal_reason_summary
+            or lane.wait_reason
+        )
+        report.terminal_reason_kind = ""
+        report.terminal_reason_summary = ""
+        report.current_step = f"Retrying promotion proof capture for {report.report_id}"
+        report.updated_at = utc_now()
+        await _save_report(runner, feature, report)
 
 
 def _lane_failure_message(lane: BugflowLaneSnapshot) -> str:
@@ -3912,7 +4536,7 @@ def _attempt_proof_bundle(
     )
     return EvidenceBundle(
         ui_involved=report.ui_involved,
-        evidence_modes=_required_modes_for_report(report),
+        evidence_modes=_requested_terminal_evidence_for_report(report),
         summary=summary,
         steps_executed=[f"Retry attempt {attempt.attempt_number} during {stage}"],
         environment_notes="Fallback proof generated from retry attempt metadata.",
@@ -4079,8 +4703,11 @@ def _queue_status(
 ) -> tuple[str, str, str]:
     stalled_lanes = [lane for lane in lanes if lane.execution_state == "stalled"]
     recovering_lanes = [lane for lane in lanes if lane.execution_state == "recovering"]
+    proof_capture_retry_lanes = [
+        lane for lane in lanes if lane.promotion_status == "proof-capture-retry"
+    ]
     strategy_pending_clusters = [
-        cluster for cluster in clusters if cluster.strategy_status in {"pending", "decided"}
+        cluster for cluster in clusters if _strategy_checkpoint_kind(cluster) in {"pending", "decided"}
     ]
     if stalled_lanes:
         text = ", ".join(lane.lane_id for lane in stalled_lanes[:3])
@@ -4094,6 +4721,13 @@ def _queue_status(
         return (
             f"Recovering lanes: {text}",
             f"Recovering lanes: {text}",
+            "degraded",
+        )
+    if proof_capture_retry_lanes:
+        text = ", ".join(lane.lane_id for lane in proof_capture_retry_lanes[:3])
+        return (
+            f"Recapturing promotion proof for lanes: {text}",
+            f"Recapturing promotion proof for lanes: {text}",
             "degraded",
         )
     if strategy_pending_clusters:
@@ -4619,7 +5253,8 @@ async def _post_thread_message(
     thread_ts: str,
     text: str,
 ) -> None:
-    adapter = runner.services.get("slack_adapter")
+    services = getattr(runner, "services", {}) or {}
+    adapter = services.get("slack_adapter") if isinstance(services, dict) else None
     channel_id = str(feature.metadata.get("channel_id", "") or "")
     if not adapter or not channel_id:
         return
@@ -4885,7 +5520,7 @@ def _observation_from_report(report: BugflowReportSnapshot) -> Observation:
         expected_behavior=report.expected_behavior,
         decision=report.decision.new_decision if report.decision else "",
         ui_involved=report.ui_involved,
-        evidence_modes=report.evidence_modes,
+        evidence_modes=_observed_modes_for_report(report),
     )
 
 
@@ -4991,6 +5626,23 @@ async def _promotion_verify_lane(
     )
     strategy_decision = await _load_cluster_strategy_decision(runner, feature, cluster)
     strategy_context = _strategy_context_prompt(strategy_decision)
+    requested_directives = ", ".join(
+        sorted({
+            directive
+            for report in reports
+            for directive in _requested_terminal_evidence_for_report(report)
+        })
+    ) or "none recorded"
+    required_modes = ", ".join(
+        sorted({
+            mode
+            for report in reports
+            for mode in _required_terminal_core_surfaces_for_report(report)
+        })
+    ) or "none recorded"
+    proof_retry_context = ""
+    if lane.promotion_status == "proof-capture-retry" and lane.wait_reason:
+        proof_retry_context = f"Current proof gap to close:\n{lane.wait_reason}\n\n"
     if lane.category == "bug":
         prompt = (
             f"## Promotion Candidate Verification: {lane.lane_id}\n\n"
@@ -5000,10 +5652,14 @@ async def _promotion_verify_lane(
                 for report in reports
             )
             + f"\n\nFix summary: {lane.latest_fix_summary}\n\n"
+            + f"Requested evidence directives: {requested_directives}\n"
+            + f"Required core proof surfaces: {required_modes}\n\n"
+            + proof_retry_context
             + f"{strategy_context}\n"
             "Verify the candidate on the latest main bugflow head. Approve only if this replayed lane is still correct.\n"
             "Return Verdict.proof. UI-involved reports require Playwright trace and screenshot artifacts. "
-            "State-changing backend flows require surface-specific evidence plus an independent postcondition check."
+            "State-changing backend flows require surface-specific evidence plus an independent postcondition check.\n"
+            "For each requested evidence directive that is not one of ui/api/database/logs/repo, include a Verdict.check entry with criterion `evidence:<directive>`, result `satisfied` or `not-needed`, and detail naming the artifact or rationale."
         )
         actor = _make_lane_actor(
             runner,
@@ -5024,9 +5680,13 @@ async def _promotion_verify_lane(
                 for report in reports
             )
             + f"\n\nFix summary: {lane.latest_fix_summary}\n\n"
+            + f"Requested evidence directives: {requested_directives}\n"
+            + f"Required core proof surfaces: {required_modes}\n\n"
+            + proof_retry_context
             + f"{strategy_context}\n"
             "Verify that this replayed clarification/requirement/test change is still correct on the latest main bugflow head.\n"
-            "Return Verdict.proof with the evidence needed to justify a terminal outcome."
+            "Return Verdict.proof with the evidence needed to justify a terminal outcome.\n"
+            "For each requested evidence directive that is not one of ui/api/database/logs/repo, include a Verdict.check entry with criterion `evidence:<directive>`, result `satisfied` or `not-needed`, and detail naming the artifact or rationale."
         )
         actor = _make_lane_actor(
             runner,
@@ -5148,8 +5808,8 @@ async def _create_lane_worktree_root(
     lane_root = main_root.parent / "lanes" / lane_id / "repos"
     branch_names: dict[str, str] = {}
     base_heads: dict[str, str] = {}
-    if lane_root.parent.exists() and lane_root.exists():
-        shutil.rmtree(lane_root.parent)
+    if lane_root.parent.exists():
+        await _remove_worktree_root(main_root, lane_root)
     lane_root.mkdir(parents=True, exist_ok=True)
     for repo_dir in _discover_repo_roots_under(main_root):
         rel_path = str(repo_dir.relative_to(main_root))
@@ -5158,6 +5818,7 @@ async def _create_lane_worktree_root(
         base_branch = await _run_git(repo_dir, "branch", "--show-current")
         base_heads[rel_path] = await _run_git(repo_dir, "rev-parse", "HEAD")
         dest_repo.parent.mkdir(parents=True, exist_ok=True)
+        await _prepare_ephemeral_worktree_branch(repo_dir, branch_name)
         await _run_git(
             repo_dir,
             "worktree",
@@ -5186,7 +5847,7 @@ async def _create_promotion_worktree_root(
     branch_names: dict[str, str] = {}
     base_heads: dict[str, str] = {}
     if promotion_root.parent.exists():
-        shutil.rmtree(promotion_root.parent)
+        await _remove_worktree_root(main_root, promotion_root)
     promotion_root.mkdir(parents=True, exist_ok=True)
     for repo_dir in _discover_repo_roots_under(main_root):
         rel_path = str(repo_dir.relative_to(main_root))
@@ -5195,6 +5856,7 @@ async def _create_promotion_worktree_root(
         base_branch = await _run_git(repo_dir, "branch", "--show-current")
         base_heads[rel_path] = await _run_git(repo_dir, "rev-parse", "HEAD")
         dest_repo.parent.mkdir(parents=True, exist_ok=True)
+        await _prepare_ephemeral_worktree_branch(repo_dir, branch_name)
         await _run_git(
             repo_dir,
             "worktree",
@@ -5208,17 +5870,68 @@ async def _create_promotion_worktree_root(
     return promotion_root, branch_names, base_heads
 
 
-async def _remove_worktree_root(main_root: Path, worktree_root: Path) -> None:
-    if not worktree_root.exists():
+async def _prepare_ephemeral_worktree_branch(repo_dir: Path, branch_name: str) -> None:
+    try:
+        await _run_git(repo_dir, "worktree", "prune")
+    except Exception:
+        logger.warning("Failed to prune stale worktrees in %s", repo_dir, exc_info=True)
+
+    try:
+        await _run_git(repo_dir, "rev-parse", "--verify", f"refs/heads/{branch_name}")
+    except Exception:
         return
-    for repo_dir in _discover_repo_roots_under(worktree_root):
-        rel_path = repo_dir.relative_to(worktree_root)
-        base_repo = main_root / rel_path
+
+    try:
+        await _run_git(repo_dir, "branch", "-D", branch_name)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Failed to reset stale worktree branch '{branch_name}' in {repo_dir}: {exc}"
+        ) from exc
+
+
+async def _remove_worktree_root(main_root: Path, worktree_root: Path) -> None:
+    if worktree_root.exists():
+        for repo_dir in _discover_repo_roots_under(worktree_root):
+            rel_path = repo_dir.relative_to(worktree_root)
+            base_repo = main_root / rel_path
+            try:
+                await _run_git(base_repo, "worktree", "remove", "--force", str(repo_dir))
+            except Exception:
+                logger.warning("Failed to remove worktree %s", repo_dir, exc_info=True)
+    parent_root = worktree_root.parent
+    if not parent_root.exists():
+        return
+    for attempt in range(3):
         try:
-            await _run_git(base_repo, "worktree", "remove", "--force", str(repo_dir))
-        except Exception:
-            logger.warning("Failed to remove worktree %s", repo_dir, exc_info=True)
-    shutil.rmtree(worktree_root.parent, ignore_errors=True)
+            shutil.rmtree(parent_root)
+            return
+        except FileNotFoundError:
+            return
+        except OSError:
+            if attempt == 2:
+                quarantine_root = parent_root.with_name(
+                    f"{parent_root.name}-stale-{new_short_id('tmp')}"
+                )
+                try:
+                    parent_root.rename(quarantine_root)
+                except FileNotFoundError:
+                    return
+                except Exception:
+                    logger.warning(
+                        "Failed to quarantine stale worktree root %s",
+                        parent_root,
+                        exc_info=True,
+                    )
+                    break
+                logger.warning(
+                    "Quarantined stale worktree root %s to %s after repeated cleanup failures",
+                    parent_root,
+                    quarantine_root,
+                )
+                shutil.rmtree(quarantine_root, ignore_errors=True)
+                return
+            await asyncio.sleep(0.1 * (attempt + 1))
+    shutil.rmtree(parent_root, ignore_errors=True)
 
 
 async def _lane_commit_sequences(
@@ -5347,6 +6060,7 @@ async def _finalize_promoted_lane(
     lane = await _load_lane(runner, feature, lane.lane_id) or lane
     lane.status = "promoted"
     lane.promotion_status = "pushed"
+    lane.promotion_proof_capture_attempt = 0
     lane.wait_reason = ""
     lane.updated_at = utc_now()
     await _save_lane(runner, feature, lane)
@@ -5537,6 +6251,7 @@ async def _build_cluster_failure_bundle(
         proof = await _load_proof_record(runner, feature, report.latest_proof_key)
         if proof is None:
             continue
+        diagnostics = _proof_policy_diagnostics(report, proof.bundle, proof)
         proof_records.append(
             {
                 "report_id": report.report_id,
@@ -5544,6 +6259,13 @@ async def _build_cluster_failure_bundle(
                 "storage_stage": proof.storage_stage,
                 "bundle_url": proof.bundle_url,
                 "primary_artifact_url": proof.primary_artifact_url,
+                "requested_directives": list(diagnostics["requested_directives"]),
+                "required_evidence_modes": list(diagnostics["required_modes"]),
+                "provided_evidence_modes": list(diagnostics["provided_modes"]),
+                "declared_evidence_modes": list(diagnostics["declared_modes"]),
+                "artifact_surfaces": list(diagnostics["artifact_surfaces"]),
+                "missing_non_core_directives": list(diagnostics["missing_non_core_directives"]),
+                "non_core_check_summaries": list(diagnostics["non_core_check_summaries"]),
             }
         )
     current_blockers = list(verdict.concerns) if verdict is not None and verdict.concerns else _fallback_blockers(reason, lane)
@@ -5621,9 +6343,14 @@ async def _build_cluster_failure_bundle(
         "proof_keys": [item["storage_stage"] or item["key"] for item in proof_records],
         "proof_records": proof_records,
         "required_evidence_modes": sorted({
+            directive
+            for report in reports
+            for directive in _requested_terminal_evidence_for_report(report)
+        }),
+        "required_core_evidence_modes": sorted({
             mode
             for report in reports
-            for mode in _required_modes_for_report(report)
+            for mode in _required_terminal_core_surfaces_for_report(report)
         }),
         "merge_recommendation": "none",
         "updated_at": utc_now(),
@@ -5880,6 +6607,7 @@ async def _minimize_cluster_counterexample(
             report,
             stage="strategy-minimize",
             bundle=result.proof,
+            checks=result.checks,
             context_root=context_root,
         )
         stored_any = stored_any or proof is not None
@@ -5897,10 +6625,10 @@ def _apply_cluster_strategy_state(
     reason: str,
 ) -> BugflowClusterSnapshot:
     cluster.strategy_mode = _normalize_strategy_mode(decision.strategy_mode)
-    cluster.strategy_decision_key = decision_key
-    cluster.stable_bundle_key = failure_bundle_key
+    cluster.strategy_decision_key = (decision_key or "").strip()
+    cluster.stable_bundle_key = (failure_bundle_key or "").strip()
     cluster.stable_failure_family = decision.stable_failure_family
-    cluster.strategy_round = strategy_round
+    cluster.strategy_round = max(1, int(strategy_round or 0))
     cluster.strategy_reason = decision.reasoning or decision.bundle_summary or reason
     cluster.similar_cluster_ids = list(similar_cluster_ids)
     return cluster
@@ -6185,6 +6913,7 @@ async def _respawn_lane_from_latest_main(
                     await _save_report(runner, feature, report)
             return
     reports = list((await _load_reports_by_id(runner, feature, lane.report_ids)).values())
+    proof_capture_retry = _proof_capture_retry_in_flight(lane, reports)
     prior_proofs_by_report_id = {
         report.report_id: (
             await _load_proof_record(runner, feature, report.latest_proof_key)
@@ -6261,14 +6990,17 @@ async def _respawn_lane_from_latest_main(
         update={
             "lane_id": new_lane_id,
             "lane_attempt": lane.lane_attempt + 1,
-            "status": "planned",
+            "status": "verified_pending_promotion" if proof_capture_retry else "planned",
             "workspace_root": str(lane_root),
             "branch_names_by_repo": branch_names,
             "base_main_commits_by_repo": base_heads,
             "lock_scope": lock_scope,
             "repo_paths": repo_paths,
-            "promotion_status": "",
+            "promotion_status": "proof-capture-retry" if proof_capture_retry else "",
             "promotion_attempt": 0,
+            "promotion_proof_capture_attempt": (
+                lane.promotion_proof_capture_attempt if proof_capture_retry else 0
+            ),
             "supersedes_lane_id": lane.lane_id,
             "wait_reason": reason,
             "execution_state": "",
@@ -6284,10 +7016,10 @@ async def _respawn_lane_from_latest_main(
             "latest_regression_keys": [],
             "latest_dispatch_key": respawn_dispatch_key if lane.category == "bug" else "",
             "latest_rca_summary": respawn_rca_summary if lane.category == "bug" else "",
-            "latest_fix_summary": "",
-            "latest_verify_summary": "",
+            "latest_fix_summary": lane.latest_fix_summary if proof_capture_retry else "",
+            "latest_verify_summary": lane.latest_verify_summary if proof_capture_retry else "",
             "latest_regression_summary": "",
-            "modified_files": [],
+            "modified_files": list(lane.modified_files) if proof_capture_retry else [],
             "verification_actor": lane.verification_actor if lane.category == "bug" else "",
             "observation_payload": None,
             "implementation_result": None,
@@ -6311,14 +7043,14 @@ async def _respawn_lane_from_latest_main(
         runner,
         feature,
         new_lane,
-        status="planned",
-        current_phase="planned",
+        status="verified_pending_promotion" if proof_capture_retry else "planned",
+        current_phase="promotion_pending" if proof_capture_retry else "planned",
         wait_reason=reason,
     )
     cluster = await _load_cluster_from_lane(runner, feature, new_lane)
     if cluster:
         cluster.attempt_number = current_attempt
-        if strategy_decision is not None:
+        if strategy_decision is not None and strategy_decision_key.strip():
             cluster = _apply_cluster_strategy_state(
                 cluster,
                 decision=strategy_decision,
@@ -6328,12 +7060,14 @@ async def _respawn_lane_from_latest_main(
                 similar_cluster_ids=cluster.similar_cluster_ids,
                 reason=reason,
             )
-        cluster.strategy_status = cluster.strategy_status or "decided"
+            cluster.strategy_status = cluster.strategy_status or "decided"
+        else:
+            cluster = _clear_cluster_strategy_fields(cluster)
         await _save_cluster(runner, feature, cluster)
     for report in reports:
         report.lane_id = new_lane_id
         report.status = "queued"
-        if strategy_decision is not None:
+        if strategy_decision is not None and strategy_decision_key.strip():
             report = _apply_report_strategy_state(
                 report,
                 decision=strategy_decision,
@@ -6344,6 +7078,11 @@ async def _respawn_lane_from_latest_main(
                 clear_terminal=True,
             )
         else:
+            report = _clear_report_strategy_fields(
+                report,
+                keep_failure_bundle_key=bool((report.latest_failure_bundle_key or "").strip()),
+                clear_proof_contract=not proof_capture_retry,
+            )
             report.terminal_proof_key = ""
             report.terminal_proof_summary = ""
             report.terminal_notice_sent_for_key = ""
@@ -6351,15 +7090,24 @@ async def _respawn_lane_from_latest_main(
         report.terminal_reason_summary = ""
         report.latest_proof_key = ""
         report.current_step = (
-            f"Respawned into isolated lane {new_lane_id}"
-            if failed_attempt is None
+            (
+                f"Respawned promotion proof capture into isolated lane {new_lane_id}"
+                if failed_attempt is None
+                else f"Attempt {failed_attempt}/{report.max_attempts} failed during promotion proof capture; respawned into isolated lane {new_lane_id}"
+            )
+            if proof_capture_retry
             else (
-                f"Attempt {failed_attempt}/{report.max_attempts} failed; respawned into isolated lane {new_lane_id}"
-                if strategy_decision is None
-                else f"Attempt {failed_attempt}/{report.max_attempts} failed; switching to {_strategy_mode_label(strategy_decision.strategy_mode)} in isolated lane {new_lane_id}"
+                f"Respawned into isolated lane {new_lane_id}"
+                if failed_attempt is None
+                else (
+                    f"Attempt {failed_attempt}/{report.max_attempts} failed; respawned into isolated lane {new_lane_id}"
+                    if strategy_decision is None
+                    else f"Attempt {failed_attempt}/{report.max_attempts} failed; switching to {_strategy_mode_label(strategy_decision.strategy_mode)} in isolated lane {new_lane_id}"
+                )
             )
         )
-        report.promotion_status = ""
+        report.status = "active_fix" if proof_capture_retry else "queued"
+        report.promotion_status = "proof-capture-retry" if proof_capture_retry else ""
         report.updated_at = utc_now()
         await _save_report(runner, feature, report)
         proof_record = prior_proofs_by_report_id.get(report.report_id)

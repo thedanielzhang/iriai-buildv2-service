@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from iriai_build_v2.models.outputs import ImplementationTask, RepoSpec, TaskFileScope
-from iriai_build_v2.services.workspace import WorkspaceManager
-from iriai_build_v2.workflows.develop.phases.implementation import _ensure_task_worktrees
+from iriai_build_v2.models.outputs import ScopeOutput
+from iriai_build_v2.services.workspace import DirectoryMap, RepoEntry, WorkspaceManager
+from iriai_build_v2.workflows.develop.phases.implementation import _ensure_task_worktrees, _remove_repo_path
 
 
 @pytest.mark.asyncio
@@ -127,3 +129,91 @@ async def test_ensure_task_worktrees_scaffolds_new_repo_inside_feature_sandbox(
     dest = workspace_root / ".iriai" / "features" / "feat" / "repos" / "services" / "newsvc"
     assert scaffolded == [dest]
     assert not (workspace_root / "services" / "newsvc").exists()
+
+
+def test_remove_repo_path_quarantines_busy_directory(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    repo_path = tmp_path / "repo"
+    (repo_path / "nested" / "tests").mkdir(parents=True, exist_ok=True)
+
+    original_rmtree = shutil.rmtree
+    original_rename = Path.rename
+    renamed_targets: list[Path] = []
+
+    def _fake_rmtree(path: Path | str, *args, **kwargs) -> None:
+        path = Path(path)
+        ignore_errors = bool(kwargs.get("ignore_errors", False))
+        if path == repo_path and not ignore_errors:
+            raise OSError(66, "Directory not empty")
+        return original_rmtree(path, *args, **kwargs)
+
+    def _tracking_rename(self: Path, target: Path | str) -> Path:
+        renamed_targets.append(Path(target))
+        return original_rename(self, target)
+
+    monkeypatch.setattr(
+        "iriai_build_v2.workflows.develop.phases.implementation.shutil.rmtree",
+        _fake_rmtree,
+    )
+    monkeypatch.setattr(Path, "rename", _tracking_rename)
+
+    _remove_repo_path(repo_path)
+
+    assert not repo_path.exists()
+    assert renamed_targets
+    assert renamed_targets[0].name.startswith("repo-stale-")
+
+
+@pytest.mark.asyncio
+async def test_setup_feature_workspace_skips_external_adjacent_dependencies(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    base = tmp_path / "workspace"
+    source_repo = base / "iriai-build-v2"
+    (source_repo / ".git").mkdir(parents=True)
+    compose_repo = base / "iriai-compose"
+    (compose_repo / ".git").mkdir(parents=True)
+
+    async def _fake_run_git(cwd: Path, *args: str) -> str:
+        if args and args[0] == "clone":
+            dest = Path(args[-1])
+            dest.mkdir(parents=True, exist_ok=True)
+            (dest / ".git").mkdir(exist_ok=True)
+        return ""
+
+    monkeypatch.setattr("iriai_build_v2.services.workspace._run_git", _fake_run_git)
+
+    manager = WorkspaceManager(base)
+    manager.load_directory_map = lambda: DirectoryMap(
+        repos={
+            "iriai-build-v2": RepoEntry(
+                name="iriai-build-v2",
+                path="iriai-build-v2",
+                github_url="https://github.com/thedanielzhang/iriai-build-v2",
+            ),
+            "iriai-compose": RepoEntry(
+                name="iriai-compose",
+                path="iriai-compose",
+                github_url="https://github.com/thedanielzhang/iriai-compose",
+            ),
+        },
+        dependencies={
+            "iriai-build-v2": ["iriai-compose", "asyncpg (external)"],
+        },
+        raw_content="",
+    )
+
+    feature = SimpleNamespace(slug="feat", name="Feature")
+    scope = ScopeOutput(
+        repos=[RepoSpec(name="iriai-build-v2", local_path="iriai-build-v2", action="read_only")],
+        complete=True,
+    )
+
+    project = await manager.setup_feature_workspace(feature, scope)
+
+    repo_names = [repo.name for repo in project.repos]
+    assert "iriai-build-v2" in repo_names
+    assert "asyncpg (external)" not in repo_names

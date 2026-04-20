@@ -5,11 +5,13 @@ import itertools
 import json
 import logging
 import shutil
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
+from uuid import uuid4
 
-from iriai_compose import AgentActor, Ask, Feature, Gate, Phase, Respond, WorkflowRunner, to_str
+from iriai_compose import AgentActor, Ask, Feature, Phase, WorkflowRunner, to_str
 from iriai_compose.actors import Role
 
 from ....config import BUDGET_TIERS
@@ -30,6 +32,7 @@ from ....models.outputs import (
     RepairStrategyDecision,
     ReviewOutcome,
     RootCauseAnalysis,
+    SubfeatureDecomposition,
     Verdict,
     envelope_done,
 )
@@ -48,7 +51,9 @@ from ....roles import (
     verifier,
 )
 from ....services.markdown import to_markdown
+from ..._common import Gate, Notify
 from ..._common._helpers import PROMPT_FILE_THRESHOLD, _offload_if_large
+from ..._common._autonomy import interaction_actor_for_phase
 from ..._common._tasks import HostedInterview
 
 logger = logging.getLogger(__name__)
@@ -247,8 +252,29 @@ def _remove_repo_path(path: Path) -> None:
     if path.is_symlink() or path.is_file():
         path.unlink()
         return
-    if path.exists():
-        shutil.rmtree(path)
+    if not path.exists():
+        return
+    for attempt in range(3):
+        try:
+            shutil.rmtree(path)
+            return
+        except FileNotFoundError:
+            return
+        except OSError:
+            if attempt == 2:
+                quarantine = path.with_name(f"{path.name}-stale-{uuid4().hex[:8]}")
+                try:
+                    path.rename(quarantine)
+                except FileNotFoundError:
+                    return
+                except Exception:
+                    logger.warning("Failed to quarantine stale repo path %s", path, exc_info=True)
+                    break
+                logger.warning("Quarantined stale repo path %s to %s after cleanup failures", path, quarantine)
+                shutil.rmtree(quarantine, ignore_errors=True)
+                return
+            time.sleep(0.1 * (attempt + 1))
+    shutil.rmtree(path, ignore_errors=True)
 
 
 async def _clone_repo(source_path: Path, dest: Path, *, branch: str | None) -> None:
@@ -398,6 +424,62 @@ def _make_parallel_actor(
     )
 
 
+async def _load_test_plan_section(
+    runner: WorkflowRunner, feature: Feature
+) -> str:
+    """Load per-subfeature test plans and return a ``## Test Plan`` section.
+
+    Iterates ``decomposition.subfeatures[*].slug`` directly — NOT
+    ``dag.tasks[*].subfeature_id`` — because the latter is populated by
+    agents in varied formats (slug, SF-id, name) and would silently miss
+    test plans written with the canonical slug.
+
+    Returns ``""`` when no test plans exist (pre-test_planning features or
+    missing decomposition). Callers splice the return value directly into
+    the Ask prompt; the function handles the surrounding heading and newlines
+    so an empty return produces no dangling section.
+
+    Large test-plan bodies (e.g. 14-SF feature with detailed plans) are
+    handled by the TrackedWorkflowRunner's whole-prompt offload at
+    ``workflows/_runner.py::_build_options`` — no per-section offload here,
+    since this function runs before ``_implement_dag`` clones repos and
+    ``_get_feature_root`` would return None.
+    """
+    decomp_raw = await runner.artifacts.get("decomposition", feature=feature)
+    if not decomp_raw:
+        return ""
+    try:
+        decomposition = SubfeatureDecomposition.model_validate_json(decomp_raw)
+    except Exception:
+        try:
+            decomposition = SubfeatureDecomposition.model_validate(json.loads(decomp_raw))
+        except Exception:
+            logger.warning("Could not parse decomposition for test plan context")
+            return ""
+
+    parts: list[str] = []
+    for sf in decomposition.subfeatures:
+        slug = (sf.slug or "").strip()
+        if not slug:
+            continue
+        tp = await runner.artifacts.get(f"test-plan:{slug}", feature=feature)
+        if tp:
+            # Per-SF heading is ### so it nests under the ## Test Plan wrapper.
+            # Fall back to slug if sf.name is empty to avoid " (slug)" with
+            # double-space.
+            heading = sf.name.strip() or slug
+            parts.append(f"### {heading} ({slug})\n\n{tp}")
+        else:
+            logger.debug(
+                "No test-plan artifact for subfeature %s (legacy or skipped)",
+                slug,
+            )
+    if not parts:
+        return ""
+    body = "\n\n---\n\n".join(parts)
+    return f"\n\n## Test Plan\n\n{body}"
+
+
 class ImplementationPhase(Phase):
     name = "implementation"
 
@@ -406,6 +488,15 @@ class ImplementationPhase(Phase):
     ) -> BuildState:
         dag_json = await runner.artifacts.get("dag", feature=feature)
         dag = ImplementationDAG.model_validate_json(dag_json)
+
+        # Loaded once per execute() call and spliced into 4 of 6 post-DAG gates
+        # (test author, QA, integration tester, verifier) AND into the
+        # post-fix integration regression re-run in _run_regression. Code
+        # review and security audit do NOT receive the test plan — they
+        # assess code quality / security posture, not behavior-level
+        # acceptance. Returns either a leading "\n\n## Test Plan\n\n..."
+        # section or empty string — splice directly.
+        test_plan_section = await _load_test_plan_section(runner, feature)
 
         prior_attempts = _load_prior_attempts(
             await runner.artifacts.get("bug-fix-attempts", feature=feature)
@@ -441,6 +532,7 @@ class ImplementationPhase(Phase):
                 attempts = await _diagnose_and_fix(
                     runner, feature, dag_failure, "verify",
                     qa_engineer, implementer, prior_attempts, bug_counter,
+                    test_plan_section=test_plan_section,
                 )
                 prior_attempts.extend(attempts)
                 await _store_attempts(runner, feature, prior_attempts)
@@ -660,13 +752,15 @@ class ImplementationPhase(Phase):
                             test_author, "gate", runtime=gate_runtime,
                         ),
                         prompt=(
-                            f"## Implementation Handover\n\n{handover_context}\n\n"
-                            "Write tests for this implementation. For each acceptance "
-                            "criterion in the PRD, write at least one test. For each "
-                            "counterexample, write a test that verifies the wrong thing "
-                            "does NOT happen. Use the project's existing test framework "
-                            "and patterns. Write both unit tests and integration/E2E tests "
-                            "where appropriate.\n\n"
+                            f"## Implementation Handover\n\n{handover_context}"
+                            f"{test_plan_section}\n\n"
+                            "Write tests for this implementation. When a Test Plan section is "
+                            "provided above, it is the source of truth for acceptance criteria "
+                            "and verification methods — write at least one test per AC-id, "
+                            "honoring the stated verification_method (unit / integration / e2e / "
+                            "visual). For each counterexample in the plan, write a test that "
+                            "verifies the wrong thing does NOT happen. Use the project's existing "
+                            "test framework and patterns.\n\n"
                             "For web/full-stack projects, write Playwright E2E tests that "
                             "test user journeys via real UI interactions."
                         ),
@@ -694,12 +788,15 @@ class ImplementationPhase(Phase):
                             qa_engineer, "gate", runtime=gate_runtime,
                         ),
                         prompt=(
-                            f"## Implementation Handover\n\n{handover_context}\n\n"
+                            f"## Implementation Handover\n\n{handover_context}"
+                            f"{test_plan_section}\n\n"
                             "Test the full implementation. Run the test suite, check "
                             "for runtime errors, and verify the acceptance criteria "
-                            "from the PRD and design specs are met. Cross-check "
-                            "implementation against the full upstream artifacts "
-                            "in your context."
+                            "from the PRD and design specs are met. When a Test Plan "
+                            "section is provided above, march its verification_checklist "
+                            "top-to-bottom and cite AC-ids in any failures you report. "
+                            "Cross-check implementation against the full upstream "
+                            "artifacts in your context."
                         ),
                         output_type=Verdict,
                     ),
@@ -728,6 +825,7 @@ class ImplementationPhase(Phase):
                     _make_parallel_actor(implementer, "qa-fix", runtime=fix_runtime),
                     prior_attempts, bug_counter,
                     handover_context=handover_context,
+                    test_plan_section=test_plan_section,
                 )
                 prior_attempts.extend(attempts)
                 await _store_attempts(runner, feature, prior_attempts)
@@ -745,12 +843,15 @@ class ImplementationPhase(Phase):
                             integration_tester, "gate", runtime=gate_runtime,
                         ),
                         prompt=(
-                            f"## Implementation Handover\n\n{handover_context}\n\n"
+                            f"## Implementation Handover\n\n{handover_context}"
+                            f"{test_plan_section}\n\n"
                             "Execute ALL user journeys from the PRD against the "
                             "implementation. Use Playwright for UI journeys, Bash "
                             "for API/CLI journeys. Every journey step must produce "
                             "evidence. Check happy paths, error cases, and boundary "
-                            "conditions."
+                            "conditions. When a Test Plan section is provided above, "
+                            "run through its test_scenarios and edge_cases lists; for "
+                            "any failure, cite the AC-id in your verdict."
                         ),
                         output_type=Verdict,
                     ),
@@ -783,6 +884,7 @@ class ImplementationPhase(Phase):
                     _make_parallel_actor(implementer, "int-fix", runtime=fix_runtime),
                     prior_attempts, bug_counter,
                     handover_context=handover_context,
+                    test_plan_section=test_plan_section,
                 )
                 prior_attempts.extend(attempts)
                 await _store_attempts(runner, feature, prior_attempts)
@@ -800,8 +902,12 @@ class ImplementationPhase(Phase):
                             verifier, "gate", runtime=gate_runtime,
                         ),
                         prompt=(
-                            f"## Implementation Handover\n\n{handover_context}\n\n"
-                            "Verify that ALL user journeys from the PRD work end-to-end.\n\n"
+                            f"## Implementation Handover\n\n{handover_context}"
+                            f"{test_plan_section}\n\n"
+                            "Verify that ALL user journeys from the PRD work end-to-end. "
+                            "When a Test Plan section is provided above, its "
+                            "verification_checklist and acceptance_criteria are the "
+                            "authoritative source of truth — cite AC-ids for any failures.\n\n"
                             "**For projects with a frontend/UI:**\n"
                             "- Interact with the UI via real Playwright clicks and form fills "
                             "— do not substitute API calls.\n"
@@ -848,6 +954,7 @@ class ImplementationPhase(Phase):
                     _make_parallel_actor(implementer, "vfy-fix", runtime=fix_runtime),
                     prior_attempts, bug_counter,
                     handover_context=handover_context,
+                    test_plan_section=test_plan_section,
                 )
                 prior_attempts.extend(attempts)
                 await _store_attempts(runner, feature, prior_attempts)
@@ -950,10 +1057,7 @@ class ImplementationPhase(Phase):
                     f"({len(backlog.items)} items deferred)"
                 )
             await runner.run(
-                Respond(
-                    responder=user,
-                    prompt=notification,
-                ),
+                Notify(message=notification),
                 feature,
                 phase_name=self.name,
             )
@@ -1605,9 +1709,8 @@ async def _implement_dag(
                             # Notify user via Slack that a task is struggling
                             try:
                                 await runner.run(
-                                    Respond(
-                                        responder=user,
-                                        prompt=(
+                                    Notify(
+                                        message=(
                                             f"⚠️ Task `{t.id}` ({t.name}) has crashed "
                                             f"{TASK_WARN_AT} times in group {group_idx}.\n"
                                             f"Last error: `{str(e)}`\n"
@@ -2012,9 +2115,8 @@ async def _run_enhancement_group(
                     if attempt + 1 == TASK_WARN_AT:
                         try:
                             await runner.run(
-                                Respond(
-                                    responder=user,
-                                    prompt=(
+                                Notify(
+                                    message=(
                                         f"⚠️ Enhancement task `{t.id}` ({t.name}) has crashed "
                                         f"{TASK_WARN_AT} times.\n"
                                         f"Last error: `{str(e)}`\n"
@@ -2708,6 +2810,7 @@ async def _diagnose_and_fix(
     prior_attempts: list[BugFixAttempt],
     bug_counter: itertools.count,  # type: ignore[type-arg]
     handover_context: str = "",
+    test_plan_section: str = "",
     phase_name: str = "implementation",
 ) -> list[BugFixAttempt]:
     """Structured failure handling: triage → parallel RCA → fix → re-verify.
@@ -2743,6 +2846,7 @@ async def _diagnose_and_fix(
             bug_id=f"{source.upper().replace(' ', '-')}-FAIL-{next(bug_counter)}",
             attempt_number=attempt_number,
             handover_context=handover_context,
+            test_plan_section=test_plan_section,
             phase_name=phase_name,
         )
         return [attempt]
@@ -2783,6 +2887,7 @@ async def _diagnose_and_fix(
             bug_id=f"{source.upper().replace(' ', '-')}-FAIL-{next(bug_counter)}",
             attempt_number=attempt_number,
             handover_context=handover_context,
+            test_plan_section=test_plan_section,
             phase_name=phase_name,
         )
         return [attempt]
@@ -2836,6 +2941,7 @@ async def _diagnose_and_fix(
             bug_id=f"{source.upper().replace(' ', '-')}-FAIL-{next(bug_counter)}",
             attempt_number=attempt_number,
             handover_context=handover_context,
+            test_plan_section=test_plan_section,
             phase_name=phase_name,
         )
         return [attempt]
@@ -3004,9 +3110,12 @@ async def _diagnose_and_fix(
                     f"- `{f}`"
                     for f in (fix_results[gid].files_created + fix_results[gid].files_modified)
                 )
-                + "\n\nRe-verify that the issues in this group are resolved. "
+                + f"{test_plan_section}\n\n"
+                "Re-verify that the issues in this group are resolved. "
                 "Check that the fix does not introduce new problems. "
-                "The verdict must be based on the CURRENT state of the code."
+                "The verdict must be based on the CURRENT state of the code. "
+                "When a Test Plan section is provided above, cite AC-ids in any "
+                "remaining failures you find."
             ),
             output_type=Verdict,
         )
@@ -3071,6 +3180,7 @@ async def _diagnose_and_fix(
                         bug_id=f"{source.upper()}-REGRESSION-{attempt_number}",
                         attempt_number=attempt_number,
                         handover_context=handover_context,
+                        test_plan_section=test_plan_section,
                         skip_regression=True,
                         phase_name=phase_name,
                     )
@@ -3122,6 +3232,7 @@ async def _single_rca_fix_verify(
     bug_id: str,
     attempt_number: int,
     handover_context: str = "",
+    test_plan_section: str = "",
     skip_regression: bool = False,
     phase_name: str = "implementation",
     workspace_root: Path | None = None,
@@ -3229,9 +3340,12 @@ async def _single_rca_fix_verify(
                 f"### Fix Applied\n\n{fix_result.summary}\n\n"
                 f"### Files Modified\n\n"
                 + "\n".join(f"- `{f}`" for f in (fix_result.files_created + fix_result.files_modified))
-                + "\n\nRe-verify that the original issues are resolved. "
+                + f"{test_plan_section}\n\n"
+                "Re-verify that the original issues are resolved. "
                 "Check that the fix does not introduce new problems. "
-                "The verdict must be based on the CURRENT state of the code."
+                "The verdict must be based on the CURRENT state of the code. "
+                "When a Test Plan section is provided above, cite AC-ids in any "
+                "remaining failures you find."
             ),
             output_type=Verdict,
         ),
@@ -3287,6 +3401,7 @@ async def _single_rca_fix_verify(
                     bug_id=f"{bug_id}-REGRESSION",
                     attempt_number=attempt_number,
                     handover_context=handover_context,
+                    test_plan_section=test_plan_section,
                     skip_regression=True,
                     phase_name=phase_name,
                     workspace_root=feature_root if workspace_root else None,
@@ -3331,7 +3446,12 @@ async def _escalate_contradiction(
     result = await runner.run(
         HostedInterview(
             questioner=lead_architect_gate_reviewer,
-            responder=user,
+            responder=interaction_actor_for_phase(
+                runner,
+                feature,
+                phase_name=phase_name,
+                fallback=user,
+            ),
             initial_prompt=(
                 f"## Specification Contradiction Detected\n\n"
                 f"**Source:** {source} verification\n"
@@ -3432,6 +3552,10 @@ async def _run_regression(
     deduped_files = sorted(set(modified_files))
     actor_suffix = str(abs(hash("|".join(deduped_files))))[:8]
     file_list = "\n".join(f"- `{f}`" for f in deduped_files)
+    # Load test plan once — used by both the smoke regression and the
+    # integration-regression gate below so AC-id traceability is symmetric
+    # across both post-fix checks.
+    test_plan_section = await _load_test_plan_section(runner, feature)
     regression_verdict: Verdict = await runner.run(
         Ask(
             actor=actor_builder(
@@ -3443,10 +3567,13 @@ async def _run_regression(
             prompt=(
                 f"## Regression Check After Bug Fixes\n\n"
                 f"The following files were modified during bug fix cycles:\n"
-                f"{file_list}\n\n"
+                f"{file_list}"
+                f"{test_plan_section}\n\n"
                 "Run existing tests covering these files. Then probe the "
                 "changed surfaces for regressions the test suite doesn't cover. "
-                "Focus on downstream consumers and integration points."
+                "Focus on downstream consumers and integration points. "
+                "When a Test Plan section is provided above, cite AC-ids for any "
+                "regressions you identify against specific acceptance criteria."
             ),
             output_type=Verdict,
         ),
@@ -3471,12 +3598,15 @@ async def _run_regression(
                     f"## Integration Regression Check\n\n"
                     f"The following files were modified during bug fix cycles:\n"
                     f"{file_list}\n\n"
-                    f"## Implementation Handover\n\n{handover_context}\n\n"
+                    f"## Implementation Handover\n\n{handover_context}"
+                    f"{test_plan_section}\n\n"
                     "Re-execute ONLY the user journeys from the PRD that touch "
                     "the modified files listed above. Use Playwright for UI "
                     "journeys, Bash for API/CLI journeys. This is a targeted "
                     "regression check — verify that existing journeys still "
-                    "work correctly after the bug fix changes."
+                    "work correctly after the bug fix changes. When a Test "
+                    "Plan section is provided above, cite AC-ids for any "
+                    "regressions you find."
                 ),
                 output_type=Verdict,
             ),

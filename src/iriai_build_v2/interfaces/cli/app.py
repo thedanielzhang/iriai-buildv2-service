@@ -21,9 +21,10 @@ async def _run(
     project: str = "",
     bug_report: str = "",
 ) -> None:
-    from iriai_compose.runtimes import AutoApproveRuntime, TerminalInteractionRuntime
+    from iriai_compose.runtimes import AutoApproveRuntime
 
     from ...stream import print_stream
+    from .interaction import ThreadAwareTerminalInteractionRuntime
     from .._bootstrap import (
         bootstrap,
         build_runner,
@@ -41,7 +42,7 @@ async def _run(
         if auto:
             interaction_runtime = AutoApproveRuntime()
         else:
-            interaction_runtime = TerminalInteractionRuntime()
+            interaction_runtime = ThreadAwareTerminalInteractionRuntime()
 
         runner = build_runner(
             env,
@@ -188,6 +189,11 @@ def bugfix(
     is_flag=True,
     help="Use Sonnet for implementers, Opus for verifiers.",
 )
+@click.option(
+    "--autonomous-remainder",
+    is_flag=True,
+    help="Delegate later-phase human prompts (plan-review through implementation) to an agent.",
+)
 def slack_cmd(
     channel: str,
     workspace: str | None,
@@ -195,6 +201,7 @@ def slack_cmd(
     agent_runtime: str | None,
     claude_only: bool,
     budget: bool,
+    autonomous_remainder: bool,
 ) -> None:
     """Start the Slack bridge (long-lived process)."""
     import logging as _logging
@@ -228,6 +235,7 @@ def slack_cmd(
             agent_runtime_override=agent_runtime is not None,
             single_agent_runtime=claude_only,
             budget=budget,
+            autonomous_remainder=autonomous_remainder,
         )
     )
 

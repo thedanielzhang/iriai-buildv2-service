@@ -102,6 +102,7 @@ export interface BugflowData {
   blocked_ids: string[]
   recovering_lane_ids: string[]
   stalled_lane_ids: string[]
+  proof_capture_retry_lane_ids: string[]
   strategy_pending_cluster_ids: string[]
   last_transition_at: string | null
   reports: BugflowReport[]
@@ -305,6 +306,7 @@ export interface BugflowLane {
   verification_actor?: string
   promotion_status?: string
   promotion_attempt?: number | null
+  promotion_proof_capture_attempt?: number | null
   supersedes_lane_id?: string | null
   wait_reason?: string
   execution_state?: string

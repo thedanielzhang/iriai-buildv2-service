@@ -16,9 +16,11 @@ import asyncio
 import re
 import shutil
 import subprocess
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
+from uuid import uuid4
 
 if TYPE_CHECKING:
     from iriai_compose import Feature
@@ -353,6 +355,8 @@ class WorkspaceManager:
             for adj_name in adjacent:
                 if adj_name not in scoped_names:
                     adj_entry = dir_map.repos.get(adj_name)
+                    if adj_entry is None:
+                        continue
                     local_path = (
                         str(self._base / adj_entry.path)
                         if adj_entry
@@ -446,8 +450,27 @@ class WorkspaceManager:
         if path.is_symlink() or path.is_file():
             path.unlink()
             return
-        if path.exists():
-            shutil.rmtree(path)
+        if not path.exists():
+            return
+        for attempt in range(3):
+            try:
+                shutil.rmtree(path)
+                return
+            except FileNotFoundError:
+                return
+            except OSError:
+                if attempt == 2:
+                    quarantine = path.with_name(f"{path.name}-stale-{uuid4().hex[:8]}")
+                    try:
+                        path.rename(quarantine)
+                    except FileNotFoundError:
+                        return
+                    except Exception:
+                        break
+                    shutil.rmtree(quarantine, ignore_errors=True)
+                    return
+                time.sleep(0.1 * (attempt + 1))
+        shutil.rmtree(path, ignore_errors=True)
 
     def _find_source_repo(self, spec: RepoSpec) -> Path | None:
         """Find the source git repo on disk."""
@@ -496,7 +519,7 @@ class WorkspaceManager:
         feature_root = self._base / ".iriai" / "features" / feature_slug / "repos"
         if not feature_root.exists():
             return
-        shutil.rmtree(feature_root)
+        self._remove_repo_path(feature_root)
 
 
 async def _run_git(cwd: Path, *args: str) -> str:

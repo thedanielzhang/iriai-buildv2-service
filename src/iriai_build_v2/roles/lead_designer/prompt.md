@@ -16,6 +16,7 @@ Establish the design foundation that ALL subfeature designers will build on. Thi
 - Responsive strategy (breakpoints, mobile approach)
 - Accessibility requirements (WCAG level, contrast)
 - Branding constraints
+- A `## Decision Log` section capturing the design choices this broad artifact locks in
 
 ### Mode 2: Integration Review
 After all per-subfeature designs are complete, review for cross-subfeature consistency:
@@ -51,5 +52,8 @@ you produce MUST include at least one citation. Citation types:
 1. [code: file/path:line] — reference to existing code/styles
 2. [decision: D-N] — reference to a user decision
 3. [research: description] — reference to web research
+
+Read the standalone decision ledger before asking questions or making new design calls.
+If the PRD, scope, or decision ledger already answers something, do not ask again.
 
 If you cannot cite a justification, flag it as [UNJUSTIFIED].

@@ -7,9 +7,12 @@ Manages the lifecycle of concurrent workflow runs.
 from __future__ import annotations
 
 import asyncio
+from contextlib import nullcontext
+from dataclasses import dataclass
 import json
 import logging
 import re
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -25,6 +28,7 @@ from .._bootstrap import (
     teardown,
 )
 from ...runtimes import create_agent_runtime
+from ..auto_interaction import AgentDelegateInteractionRuntime
 from .parser import parse_workflow_request
 from .streamer import SlackStreamer
 
@@ -34,6 +38,9 @@ if TYPE_CHECKING:
     from .._bootstrap import BootstrappedEnv
 
 logger = logging.getLogger(__name__)
+
+_SILENT_INVOCATION_NOTICE_DELAY = 8.0
+_SILENT_INVOCATION_UPDATE_INTERVAL = 15.0
 
 # Roles that benefit from persistent client + mid-stream user message injection.
 # Short-lived reviewers use the fast ephemeral client path.
@@ -48,6 +55,126 @@ _INTERACTIVE_ROLES = {
 }
 
 
+@dataclass
+class _SilentInvocationState:
+    actor_name: str
+    started_at: float
+    last_activity: float
+    timeout_seconds: int
+    notice_ts: str | None = None
+    last_notice_update_at: float = 0.0
+
+
+class _SlackInvocationObserver:
+    """Post heartbeat updates when an invocation is alive but Slack is quiet."""
+
+    def __init__(
+        self,
+        adapter: SlackAdapter,
+        channel_id: str,
+        streamer: SlackStreamer | None,
+    ) -> None:
+        self._adapter = adapter
+        self._channel_id = channel_id
+        self._streamer = streamer
+        self._states: dict[str, _SilentInvocationState] = {}
+        self._monitor_tasks: dict[str, asyncio.Task[None]] = {}
+
+    def on_invocation_start(self, invocation_id: str, **payload: Any) -> None:
+        now = time.monotonic()
+        self._states[invocation_id] = _SilentInvocationState(
+            actor_name=str(payload.get("actor_name") or "agent"),
+            started_at=now,
+            last_activity=now,
+            timeout_seconds=int(payload.get("timeout_seconds") or 0),
+        )
+        self._monitor_tasks[invocation_id] = asyncio.create_task(
+            self._monitor_invocation(invocation_id)
+        )
+
+    def on_invocation_activity(self, invocation_id: str, **_payload: Any) -> None:
+        state = self._states.get(invocation_id)
+        if state is not None:
+            state.last_activity = time.monotonic()
+
+    def on_invocation_finish(self, invocation_id: str, **_payload: Any) -> None:
+        state = self._states.pop(invocation_id, None)
+        task = self._monitor_tasks.pop(invocation_id, None)
+        if task is not None:
+            task.cancel()
+        if state is None or state.notice_ts is None:
+            return
+        asyncio.create_task(self._mark_finished(state))
+
+    async def _monitor_invocation(self, invocation_id: str) -> None:
+        try:
+            while True:
+                state = self._states.get(invocation_id)
+                if state is None:
+                    return
+
+                await asyncio.sleep(
+                    _SILENT_INVOCATION_NOTICE_DELAY
+                    if state.notice_ts is None
+                    else _SILENT_INVOCATION_UPDATE_INTERVAL
+                )
+
+                state = self._states.get(invocation_id)
+                if state is None:
+                    return
+
+                if self._has_visible_stream_since(state.started_at):
+                    return
+
+                text = self._build_notice_text(state)
+                now = time.monotonic()
+                if state.notice_ts is None:
+                    state.notice_ts = await self._adapter.post_message(
+                        self._channel_id, text
+                    )
+                else:
+                    await self._adapter.update_message(
+                        self._channel_id, state.notice_ts, text=text
+                    )
+                state.last_notice_update_at = now
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            logger.warning(
+                "Failed to post silent-invocation notice in %s",
+                self._channel_id,
+                exc_info=True,
+            )
+
+    def _has_visible_stream_since(self, started_at: float) -> bool:
+        if self._streamer is None:
+            return False
+        return self._streamer.last_visible_update_at >= started_at
+
+    def _build_notice_text(self, state: _SilentInvocationState) -> str:
+        now = time.monotonic()
+        running_for = max(0, int(now - state.started_at))
+        idle_for = max(0, int(now - state.last_activity))
+        return (
+            f"_{state.actor_name}_ is still running, but it hasn't produced "
+            f"Slack-visible progress yet.\n"
+            f"Running for: `{running_for}s`  Last runtime activity: `{idle_for}s` ago."
+        )
+
+    async def _mark_finished(self, state: _SilentInvocationState) -> None:
+        try:
+            await self._adapter.update_message(
+                self._channel_id,
+                state.notice_ts,
+                text=f"\u2713 `{state.actor_name}` finished after a silent run.",
+            )
+        except Exception:
+            logger.debug(
+                "Failed to update silent-invocation notice to done",
+                exc_info=True,
+            )
+
+
 class SlackWorkflowOrchestrator:
     """Manages workflow lifecycle, mode selection, and message routing."""
 
@@ -60,6 +187,7 @@ class SlackWorkflowOrchestrator:
         agent_runtime_override: bool = False,
         single_agent_runtime: bool = False,
         budget: bool = False,
+        autonomous_remainder: bool = False,
     ) -> None:
         self._adapter = adapter
         self._interaction = interaction_runtime
@@ -68,11 +196,13 @@ class SlackWorkflowOrchestrator:
         self._agent_runtime_override = agent_runtime_override
         self._single_agent_runtime = single_agent_runtime
         self._budget = budget
+        self._autonomous_remainder = autonomous_remainder
         self._env: BootstrappedEnv | None = None
 
         # Workflow tracking
         self._active_workflows: dict[str, asyncio.Task] = {}  # feature_id → task
         self._active_runtimes: dict[str, Any] = {}  # feature_id → runtime instance
+        self._feature_streamers: dict[str, SlackStreamer] = {}
         self._channel_features: dict[str, str] = {}  # channel → feature_id
         self._feature_workflows: dict[str, str] = {}  # feature_id → workflow_name
         self._user_notes: dict[str, list[str]] = {}  # feature_id → queued notes
@@ -108,10 +238,11 @@ class SlackWorkflowOrchestrator:
 
         await self._recover_active_features()
         logger.info(
-            "Orchestrator started, default_workspace=%s, agent_runtime=%s, single_agent_runtime=%s",
+            "Orchestrator started, default_workspace=%s, agent_runtime=%s, single_agent_runtime=%s, autonomous_remainder=%s",
             self._default_workspace,
             self._agent_runtime_name,
             self._single_agent_runtime,
+            self._autonomous_remainder,
         )
 
     async def shutdown(self) -> None:
@@ -181,6 +312,20 @@ class SlackWorkflowOrchestrator:
             )
 
     async def _on_action(self, body: dict, action: dict) -> None:
+        if self._env is not None:
+            channel_id = body.get("channel", {}).get("id", "")
+            feature_id = self._channel_features.get(channel_id)
+            if feature_id:
+                await self._env.feature_store.log_event(
+                    feature_id,
+                    "slack_action_received",
+                    "slack-orchestrator",
+                    content=action.get("action_id", ""),
+                    metadata={
+                        "channel": channel_id,
+                        "user_id": body.get("user", {}).get("id", ""),
+                    },
+                )
         action_id = action.get("action_id", "")
 
         # Mode selection actions
@@ -274,6 +419,9 @@ class SlackWorkflowOrchestrator:
             runtime_name=self._agent_runtime_name,
         )
         self._active_runtimes[feature.id] = agent_runtime
+        streamer = getattr(runner, "_slack_streamer", None)
+        if isinstance(streamer, SlackStreamer):
+            self._feature_streamers[feature.id] = streamer
 
         # 10. Select workflow + build state
         workflow = select_workflow(parsed.workflow_name)
@@ -438,7 +586,10 @@ class SlackWorkflowOrchestrator:
         channel_id: str,
     ) -> None:
         try:
-            await runner.execute_workflow(workflow, feature, state)
+            observer = self._make_invocation_observer(feature.id, feature.workflow_name, channel_id)
+            binder = getattr(runner, "bind_invocation_observer", None)
+            with binder(observer) if observer is not None and callable(binder) else nullcontext():
+                await runner.execute_workflow(workflow, feature, state)
             await self._adapter.post_message(channel_id, "Workflow complete!")
             await self._adapter.add_reaction(
                 self._adapter.planning_channel, "", "white_check_mark"
@@ -464,6 +615,7 @@ class SlackWorkflowOrchestrator:
         finally:
             self._active_workflows.pop(feature.id, None)
             self._active_runtimes.pop(feature.id, None)
+            self._feature_streamers.pop(feature.id, None)
             if feature.id not in self._recoverable_features:
                 self._feature_workflows.pop(feature.id, None)
                 self._interaction.unregister_channel(feature.id)
@@ -750,6 +902,9 @@ class SlackWorkflowOrchestrator:
                 runtime_name=agent_runtime_name,
             )
             self._active_runtimes[feature_id] = agent_runtime
+            streamer = getattr(runner, "_slack_streamer", None)
+            if isinstance(streamer, SlackStreamer):
+                self._feature_streamers[feature_id] = streamer
 
             await self._adapter.post_message(
                 channel_id,
@@ -783,9 +938,12 @@ class SlackWorkflowOrchestrator:
         resume_phase: str,
     ) -> None:
         try:
-            await runner.resume_workflow(
-                workflow, feature, state, resume_from_phase=resume_phase
-            )
+            observer = self._make_invocation_observer(feature.id, feature.workflow_name, channel_id)
+            binder = getattr(runner, "bind_invocation_observer", None)
+            with binder(observer) if observer is not None and callable(binder) else nullcontext():
+                await runner.resume_workflow(
+                    workflow, feature, state, resume_from_phase=resume_phase
+                )
             await self._adapter.post_message(channel_id, "Workflow complete!")
         except Exception as e:
             logger.exception("Resumed workflow failed for %s", feature.id)
@@ -805,6 +963,7 @@ class SlackWorkflowOrchestrator:
         finally:
             self._active_workflows.pop(feature.id, None)
             self._active_runtimes.pop(feature.id, None)
+            self._feature_streamers.pop(feature.id, None)
             if feature.id not in self._recoverable_features:
                 self._feature_workflows.pop(feature.id, None)
                 self._interaction.unregister_channel(feature.id)
@@ -817,6 +976,17 @@ class SlackWorkflowOrchestrator:
         if not runtime:
             return False
         return bool(getattr(runtime, "has_active_agent", lambda _feature_id: False)(feature_id))
+
+    def _make_invocation_observer(
+        self,
+        feature_id: str,
+        workflow_name: str,
+        channel_id: str,
+    ) -> _SlackInvocationObserver | None:
+        if workflow_name == "bugfix-v2":
+            return None
+        streamer = self._feature_streamers.get(feature_id)
+        return _SlackInvocationObserver(self._adapter, channel_id, streamer)
 
     def _queue_user_note(self, feature_id: str, text: str) -> None:
         self._user_notes.setdefault(feature_id, []).append(text)
@@ -983,6 +1153,12 @@ class SlackWorkflowOrchestrator:
 
         self._interaction._session_store = self._env.sessions
         self._interaction._agent_runtime = agent_runtime
+        self._interaction._feature_store = self._env.feature_store
+        auto_interaction = (
+            AgentDelegateInteractionRuntime(agent_runtime=agent_runtime)
+            if self._autonomous_remainder
+            else self._interaction
+        )
 
         # Workspace manager for worktree creation
         from ...services.workspace import WorkspaceManager
@@ -994,7 +1170,7 @@ class SlackWorkflowOrchestrator:
             feature_store=self._env.feature_store,
             agent_runtime=agent_runtime,
             secondary_runtime=secondary_runtime,
-            interaction_runtimes={"terminal": self._interaction},
+            interaction_runtimes={"terminal": self._interaction, "auto": auto_interaction},
             artifacts=self._env.artifacts,
             sessions=self._env.sessions,
             context_provider=self._env.context_provider,
@@ -1008,6 +1184,8 @@ class SlackWorkflowOrchestrator:
                 "workspace_manager": workspace_manager,
                 "tunnel": self._tunnel,
                 "slack_adapter": self._adapter,
+                "autonomous_remainder": self._autonomous_remainder,
             },
         )
+        runner._slack_streamer = streamer  # type: ignore[attr-defined]
         return agent_runtime, runner

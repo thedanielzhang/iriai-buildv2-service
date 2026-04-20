@@ -5,7 +5,7 @@ import json as _json
 import logging
 from typing import Any
 
-from iriai_compose import AgentActor, Ask, Feature, Phase, Respond, WorkflowRunner
+from iriai_compose import AgentActor, Ask, Feature, Phase, WorkflowRunner
 from iriai_compose.actors import Role
 
 from ....config import BUDGET_TIERS
@@ -15,10 +15,12 @@ from ....models.outputs import (
     Envelope,
     ReviewOutcome,
     RevisionPlan,
+    RevisionRequest,
     SubfeatureDecomposition,
     SubfeatureEdge,
     SystemDesign,
     TechnicalPlan,
+    TestPlan,
     Verdict,
     envelope_done,
 )
@@ -34,14 +36,100 @@ from ....roles import (
     pm_compiler,
     pm_role,
     sysdesign_compiler,
+    test_planner_role,
     user,
 )
+from ..._common import Notify
 from ..._common import compile_artifacts, interview_gate_review, targeted_revision
+from ..._common._autonomy import interaction_actor_for_phase
+from ..._common._helpers import generate_summary
 from ..._common._tasks import HostedInterview
+from .._decisions import (
+    GLOBAL_DECISIONS_KEY,
+    artifact_applies_to,
+    rebuild_canonical_decisions,
+    refresh_decision_ledger,
+    sync_compiled_decision_mirrors,
+)
 
 logger = logging.getLogger(__name__)
 
 WARN_AFTER_CYCLES = 3
+
+
+def _extract_discussion_json_payload(discussion_text: str) -> dict[str, Any] | None:
+    """Extract JSON payload from a discussion artifact when available."""
+    import re
+
+    text = discussion_text.strip()
+    if not text:
+        return None
+
+    match = re.search(r"```(?:json)?\s*\n(.*?)\n```", text, re.DOTALL)
+    raw = match.group(1) if match else text
+
+    try:
+        data = _json.loads(raw)
+    except (_json.JSONDecodeError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _coerce_review_outcome(outcome: Any) -> ReviewOutcome | None:
+    """Normalize a review outcome through schema validation."""
+    if outcome is None:
+        return None
+
+    try:
+        if isinstance(outcome, ReviewOutcome):
+            return ReviewOutcome.model_validate(outcome.model_dump())
+        return ReviewOutcome.model_validate(outcome)
+    except Exception:
+        logger.warning("Could not validate review outcome from discussion state")
+        return None
+
+
+def _extract_markdown_new_decisions(discussion_text: str) -> list[str]:
+    """Fallback parser for decision bullets in recovered markdown discussions."""
+    import re
+
+    decisions: list[str] = []
+    in_section = False
+    for line in discussion_text.splitlines():
+        stripped = line.strip()
+        lowered = stripped.lower().rstrip(":")
+        if stripped.startswith("#"):
+            in_section = "new decisions" in lowered
+            continue
+        if not in_section:
+            continue
+        if not stripped:
+            continue
+        bullet = re.match(r"^(?:[-*]|\d+\.)\s+(.*)$", stripped)
+        if bullet:
+            decisions.append(bullet.group(1).strip())
+            continue
+        in_section = False
+    return decisions
+
+
+def _parse_review_outcome_from_discussion(discussion_text: str) -> ReviewOutcome | None:
+    """Extract ReviewOutcome from a discussion artifact when possible."""
+    data = _extract_discussion_json_payload(discussion_text)
+    if not data:
+        return None
+
+    if "output" in data and isinstance(data["output"], dict):
+        data = data["output"]
+
+    return _coerce_review_outcome(data)
+
+
+def _build_markdown_fallback_revision_plan(
+    discussion_text: str,
+) -> RevisionPlan | None:
+    decisions = _extract_markdown_new_decisions(discussion_text)
+    return RevisionPlan(new_decisions=decisions) if decisions else None
 
 
 def _parse_revision_plan_from_discussion(discussion_text: str) -> RevisionPlan | None:
@@ -50,19 +138,9 @@ def _parse_revision_plan_from_discussion(discussion_text: str) -> RevisionPlan |
     The discussion file is typically the structured JSON output from the
     HostedInterview, wrapped in markdown code fences.
     """
-    import json
-    import re
-
-    # Strip markdown code fences if present
-    text = discussion_text.strip()
-    match = re.search(r"```(?:json)?\s*\n(.*?)\n```", text, re.DOTALL)
-    raw = match.group(1) if match else text
-
-    try:
-        data = json.loads(raw)
-    except (json.JSONDecodeError, ValueError):
-        logger.warning("Could not parse discussion JSON for revision plan")
-        return None
+    data = _extract_discussion_json_payload(discussion_text)
+    if not data:
+        return _build_markdown_fallback_revision_plan(discussion_text)
 
     # The JSON may be the full Envelope (with revision_plan nested)
     # or just the ReviewOutcome directly
@@ -73,13 +151,13 @@ def _parse_revision_plan_from_discussion(discussion_text: str) -> RevisionPlan |
         rp_data = data["output"].get("revision_plan")
 
     if not rp_data:
-        return None
+        return _build_markdown_fallback_revision_plan(discussion_text)
 
     try:
         return RevisionPlan.model_validate(rp_data)
     except Exception:
         logger.warning("Could not validate revision plan from discussion JSON")
-        return None
+        return _build_markdown_fallback_revision_plan(discussion_text)
 
 _SCOPE_PREFIX = (
     "SCOPE: Only review artifacts provided in your context. "
@@ -101,7 +179,14 @@ _COMPLETENESS_PROMPT = (
     "8. Acceptance criteria that are unverifiable given the plan's file scope\n"
     "9. Decision IDs (D-*) referenced in citations that don't resolve\n"
     "10. Code references that don't match actual file paths\n"
-    "11. Stale references to removed features or APIs\n\n"
+    "11. Stale references to removed features or APIs\n"
+    "12. Test-plan ACs citing REQ-ids, verifiable_state_ids, or journey_step_ids "
+    "that don't exist in the current PRD / design / plan\n"
+    "13. PRD REQ-ids or journeys with no matching test-plan acceptance criterion "
+    "(i.e. gaps in AC coverage — every functional REQ-* must be covered by at "
+    "least one test-plan AC-id)\n"
+    "14. Test-plan pass_condition clauses that are not mechanically checkable "
+    "against the plan's file scope or API surface\n\n"
     "Every genuine gap gets its own concern entry. Only flag issues that would cause "
     "implementation failures or specification contradictions. If the artifacts are "
     "sound, report approved=true with an empty concerns list."
@@ -202,11 +287,21 @@ async def _build_sf_review_context(
     """Build review context for one subfeature: full artifacts + other SF summaries."""
     parts: list[str] = []
 
-    # Full artifacts for this SF
-    for prefix in ("prd", "design", "plan", "system-design"):
+    # Full artifacts for this SF. Include test-plan so reviewers can catch
+    # AC-coverage drift when evaluating upstream revisions — e.g. a PRD
+    # change that removes a REQ-id referenced by a test-plan AC.
+    for prefix in ("prd", "design", "plan", "system-design", "test-plan"):
         text = await runner.artifacts.get(f"{prefix}:{slug}", feature=feature)
         if text:
             parts.append(f"## {prefix.upper()} — {slug}\n\n{text}")
+
+    decisions = await runner.artifacts.get(f"decisions:{slug}", feature=feature)
+    if decisions:
+        parts.append(f"## DECISIONS — {slug}\n\n{decisions}")
+
+    compiled_decisions = await runner.artifacts.get("decisions", feature=feature)
+    if compiled_decisions:
+        parts.append(f"## CANONICAL DECISIONS\n\n{compiled_decisions}")
 
     # Summaries of other SFs for cross-reference
     for sf in decomposition.subfeatures:
@@ -246,7 +341,86 @@ async def _build_edge_review_context(
             text = await runner.artifacts.get(f"{prefix}:{slug}", feature=feature)
             if text:
                 parts.append(f"## {prefix.upper()} — {slug}\n\n{text}")
+        decisions = await runner.artifacts.get(f"decisions:{slug}", feature=feature)
+        if decisions:
+            parts.append(f"## DECISIONS — {slug}\n\n{decisions}")
+    compiled_decisions = await runner.artifacts.get("decisions", feature=feature)
+    if compiled_decisions:
+        parts.append(f"## CANONICAL DECISIONS\n\n{compiled_decisions}")
     return "\n\n---\n\n".join(parts)
+
+
+async def _persist_plan_review_decisions(
+    runner: WorkflowRunner,
+    feature: Feature,
+    state: BuildState,
+    decomposition: SubfeatureDecomposition,
+    new_decisions: list[str],
+) -> None:
+    if not new_decisions:
+        return
+    await refresh_decision_ledger(
+        runner,
+        feature,
+        ledger_key=GLOBAL_DECISIONS_KEY,
+        label="Global Decision Ledger",
+        source_phase="plan-review",
+        artifact_kind="scope",
+        state=state,
+        statements=new_decisions,
+        applies_to=artifact_applies_to("scope"),
+    )
+    _decisions_text, state.plan, state.system_design = await rebuild_canonical_decisions(
+        runner,
+        feature,
+        phase_name=PlanReviewPhase.name,
+        decomposition=decomposition,
+        state=state,
+        plan_text=state.plan,
+        system_design_text=state.system_design,
+    )
+
+
+def _extract_markdown_approved_as_is(discussion_text: str) -> bool:
+    for line in discussion_text.splitlines():
+        normalized = line.strip().lower()
+        if normalized.startswith("**outcome:**"):
+            return "no changes needed" in normalized or "accepted artifacts as-is" in normalized
+    return False
+
+
+async def _normalize_plan_review_state(
+    runner: WorkflowRunner,
+    feature: Feature,
+    state: BuildState,
+    decomposition: SubfeatureDecomposition,
+    *,
+    discussion_text: str = "",
+    outcome: Any = None,
+) -> tuple[bool, ReviewOutcome | None, RevisionPlan | None]:
+    """Normalize review state and persist any decisions before control-flow exits."""
+    normalized_outcome = _coerce_review_outcome(outcome)
+    if normalized_outcome is None and discussion_text:
+        normalized_outcome = _parse_review_outcome_from_discussion(discussion_text)
+
+    revision_plan = normalized_outcome.revision_plan if normalized_outcome is not None else None
+    if normalized_outcome is None and discussion_text:
+        recovered_plan = _parse_revision_plan_from_discussion(discussion_text)
+        if recovered_plan is not None:
+            revision_plan = recovered_plan
+
+    approved = normalized_outcome.approved if normalized_outcome is not None else _extract_markdown_approved_as_is(discussion_text)
+    if revision_plan and (revision_plan.requests or revision_plan.new_decisions):
+        approved = False
+
+    await _persist_plan_review_decisions(
+        runner,
+        feature,
+        state,
+        decomposition,
+        revision_plan.new_decisions if revision_plan else [],
+    )
+    return approved, normalized_outcome, revision_plan
 
 
 # ── Verdict helpers ──────────────────────────────────────────────────────────
@@ -304,14 +478,6 @@ async def _load_review_discussion(
     await runner.artifacts.put(key, discussion_text, feature=feature)
     logger.info("Recovered %s from mirror file %s", key, path)
     return discussion_text
-
-
-def _discussion_approved_as_is(discussion_text: str) -> bool:
-    for line in discussion_text.splitlines():
-        normalized = line.strip().lower()
-        if normalized.startswith("**outcome:**"):
-            return "no changes needed" in normalized or "accepted artifacts as-is" in normalized
-    return False
 
 
 def _is_valid_report(report: str) -> bool:
@@ -428,6 +594,12 @@ class PlanReviewPhase(Phase):
             state.system_design = (
                 await runner.artifacts.get("system-design", feature=feature)
                 or state.system_design
+            )
+            state.plan, state.system_design = await sync_compiled_decision_mirrors(
+                runner,
+                feature,
+                plan_text=state.plan,
+                system_design_text=state.system_design,
             )
             return state
 
@@ -556,11 +728,16 @@ class PlanReviewPhase(Phase):
                     "Recovered existing discussion for cycle %d — skipping interview rerun",
                     cycle + 1,
                 )
-                if _discussion_approved_as_is(discussion_text):
+                approved, _outcome, revision_plan = await _normalize_plan_review_state(
+                    runner,
+                    feature,
+                    state,
+                    decomposition,
+                    discussion_text=discussion_text,
+                )
+                if approved:
                     logger.info("Recovered discussion accepts artifacts as-is — skipping revisions")
                     break
-                # Extract revision plan from the discussion JSON
-                revision_plan = _parse_revision_plan_from_discussion(discussion_text)
             else:
                 # Collect prior decisions for discussion context
                 prior_context = ""
@@ -578,7 +755,12 @@ class PlanReviewPhase(Phase):
                 review_envelope: Envelope[ReviewOutcome] = await runner.run(
                     HostedInterview(
                         questioner=lead_architect_gate_reviewer,
-                        responder=user,
+                        responder=interaction_actor_for_phase(
+                            runner,
+                            feature,
+                            phase_name=self.name,
+                            fallback=user,
+                        ),
                         initial_prompt=(
                             f"## Plan Review Cycle {cycle + 1} — Issues Found\n\n"
                             f"{report}\n\n"
@@ -600,10 +782,14 @@ class PlanReviewPhase(Phase):
                             "Do NOT set `complete = true` until the user has responded to all "
                             "new issues.\n\n"
                             "When the user has addressed all new concerns:\n"
-                            "- **'No changes needed'** → set approved=true, complete=true\n"
+                            "- **'No changes needed'** → set approved=true, complete=true, "
+                            "and leave revision_plan empty\n"
                             "- **'Dispatch fixes'** → set approved=false with revision_plan "
                             "containing BOTH prior-decision enforcement AND new user decisions, "
                             "complete=true\n"
+                            "- If any new decisions were made, even without code/document "
+                            "changes, set approved=false and include them in "
+                            "revision_plan.new_decisions\n"
                         ),
                         output_type=Envelope[ReviewOutcome],
                         done=envelope_done,
@@ -614,23 +800,18 @@ class PlanReviewPhase(Phase):
                     phase_name=self.name,
                 )
 
-                outcome = review_envelope.output if review_envelope else None
-                if outcome and outcome.approved:
+                discussion_text = await _load_review_discussion(runner, feature, discussion_key)
+                approved, outcome, revision_plan = await _normalize_plan_review_state(
+                    runner,
+                    feature,
+                    state,
+                    decomposition,
+                    discussion_text=discussion_text,
+                    outcome=review_envelope.output if review_envelope else None,
+                )
+                if approved:
                     logger.info("User accepted artifacts as-is — skipping revisions")
                     break
-
-                # Use revision plan directly from discussion output (opus)
-                if outcome and outcome.revision_plan and outcome.revision_plan.requests:
-                    revision_plan = outcome.revision_plan
-                else:
-                    # Fallback: parse from the written discussion file
-                    discussion_text = await _load_review_discussion(
-                        runner, feature, discussion_key,
-                    )
-                    if discussion_text:
-                        revision_plan = _parse_revision_plan_from_discussion(
-                            discussion_text,
-                        )
 
             if revision_plan and revision_plan.requests:
                 # ── Collect all prior decisions for revision context ──
@@ -768,6 +949,81 @@ class PlanReviewPhase(Phase):
                             f"{prefix}: revised ({old_size} → {new_size} bytes)"
                         )
 
+                # ── Cascade test-plan revisions (per-SF only, no compile) ─
+                # Any PRD/design/plan/system-design revision can invalidate
+                # the AC-ids that cite them. test-plan is not in
+                # _ARTIFACT_CONFIGS because it has no compiled top-level
+                # artifact — handle it as a terminal cascade here. Gate on
+                # revision_plan.requests (not revision_meta) so test-plan-only
+                # revisions still dispatch when main artifacts weren't touched.
+                if revision_plan.requests:
+                    test_plan_requests: list[RevisionRequest] = []
+                    affected_slugs_set: set[str] = set()
+                    for req in revision_plan.requests:
+                        affected_with_tp = [
+                            slug
+                            for slug in req.affected_subfeatures
+                            if await runner.artifacts.get(
+                                f"test-plan:{slug}", feature=feature,
+                            )
+                        ]
+                        if affected_with_tp:
+                            test_plan_requests.append(
+                                RevisionRequest(
+                                    description=req.description,
+                                    reasoning=req.reasoning,
+                                    affected_subfeatures=affected_with_tp,
+                                )
+                            )
+                            affected_slugs_set.update(affected_with_tp)
+                    if test_plan_requests:
+                        try:
+                            await targeted_revision(
+                                runner, feature, self.name,
+                                revision_plan=RevisionPlan(
+                                    requests=test_plan_requests,
+                                ),
+                                decomposition=decomposition,
+                                base_role=test_planner_role,
+                                output_type=TestPlan,
+                                artifact_prefix="test-plan",
+                                context_keys=["project", "scope"],
+                                checkpoint_prefix=f"cycle-{cycle + 1}",
+                                prior_decisions=prior_decisions,
+                            )
+                            # Refresh decision ledger and regenerate summaries
+                            # for every affected SF — mirrors the per-SF
+                            # post-cascade work in subfeature.py so downstream
+                            # consumers see current decisions + summaries.
+                            for slug in sorted(affected_slugs_set):
+                                revised_text = await runner.artifacts.get(
+                                    f"test-plan:{slug}", feature=feature,
+                                ) or ""
+                                await refresh_decision_ledger(
+                                    runner,
+                                    feature,
+                                    ledger_key=f"decisions:{slug}",
+                                    label=f"Decision Ledger — {slug}",
+                                    source_phase="plan-review-test-planning",
+                                    artifact_kind="test-plan",
+                                    state=state,
+                                    control=None,
+                                    subfeature_slug=slug,
+                                    source_texts=[revised_text],
+                                    summary_key=f"decisions-summary:{slug}",
+                                )
+                                await generate_summary(
+                                    runner, feature, "test-plan", slug,
+                                )
+                            revision_results.append(
+                                f"test-plan: revised ({len(test_plan_requests)} requests, {len(affected_slugs_set)} SFs)"
+                            )
+                        except Exception as exc:
+                            logger.error("test-plan cascade revision crashed: %s", exc)
+                            revision_results.append(
+                                "test-plan: FAILED (cascade revision crashed)"
+                            )
+
                 # ── Save revision summary so continue logic can advance ─
                 revision_summary = (
                     f"# Revisions Applied — Cycle {cycle + 1}\n\n"
@@ -781,9 +1037,8 @@ class PlanReviewPhase(Phase):
 
                 # Notify user of revision results
                 await runner.run(
-                    Respond(
-                        responder=user,
-                        prompt=(
+                    Notify(
+                        message=(
                             f"## Revisions Applied (Cycle {cycle + 1})\n\n"
                             + "\n".join(f"- {r}" for r in revision_results)
                             + "\n\nRe-running reviewers to verify..."
@@ -793,7 +1048,10 @@ class PlanReviewPhase(Phase):
                     phase_name=self.name,
                 )
             else:
-                logger.warning("No revision requests extracted from discussion")
+                if revision_plan and revision_plan.new_decisions:
+                    logger.info("Persisted plan-review decisions with no revision dispatch required")
+                else:
+                    logger.warning("No revision requests extracted from discussion")
 
             cycle += 1
 
@@ -919,6 +1177,12 @@ class PlanReviewPhase(Phase):
                     "plan-review-gate:system-design", "approved", feature=feature,
                 )
 
+        state.plan, state.system_design = await sync_compiled_decision_mirrors(
+            runner,
+            feature,
+            plan_text=state.plan,
+            system_design_text=state.system_design,
+        )
         return state
 
     @staticmethod

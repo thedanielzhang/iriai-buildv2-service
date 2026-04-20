@@ -61,6 +61,8 @@ class BridgeManager:
             cmd.append("--claude-only")
         if self.config.get("budget"):
             cmd.append("--budget")
+        if self.config.get("autonomous_remainder"):
+            cmd.append("--autonomous-remainder")
         return cmd
 
     def _build_env(self) -> dict[str, str]:
@@ -917,11 +919,14 @@ def _derive_bugflow_status_text(
         return explicit
     recovering_lane_ids = _string_list(queue.get("recovering_lane_ids"))
     stalled_lane_ids = _string_list(queue.get("stalled_lane_ids"))
+    proof_capture_retry_lane_ids = _string_list(queue.get("proof_capture_retry_lane_ids"))
     strategy_pending_cluster_ids = _string_list(queue.get("strategy_pending_cluster_ids"))
     if stalled_lane_ids:
         return f"Recovering stalled lanes: {', '.join(stalled_lane_ids[:3])}"
     if recovering_lane_ids:
         return f"Recovering lanes: {', '.join(recovering_lane_ids[:3])}"
+    if proof_capture_retry_lane_ids:
+        return f"Recapturing promotion proof for lanes: {', '.join(proof_capture_retry_lane_ids[:3])}"
     if strategy_pending_cluster_ids:
         return f"Strategy pending for clusters: {', '.join(strategy_pending_cluster_ids[:3])}"
     if promoting_lane:
@@ -962,7 +967,12 @@ def _derive_bugflow_health(
     if explicit:
         return explicit
 
-    if _string_list(queue.get("stalled_lane_ids")) or _string_list(queue.get("recovering_lane_ids")) or _string_list(queue.get("strategy_pending_cluster_ids")):
+    if (
+        _string_list(queue.get("stalled_lane_ids"))
+        or _string_list(queue.get("recovering_lane_ids"))
+        or _string_list(queue.get("proof_capture_retry_lane_ids"))
+        or _string_list(queue.get("strategy_pending_cluster_ids"))
+    ):
         return "degraded"
     if counts.get("blocked", 0) > 0 or _text(queue.get("active_step")).strip().lower().startswith("blocked"):
         return "blocked"
@@ -1027,6 +1037,7 @@ def _assemble_bugflow_response(
     queue.setdefault("blocked_ids", _string_list(queue.get("blocked_ids")))
     queue.setdefault("recovering_lane_ids", _string_list(queue.get("recovering_lane_ids")))
     queue.setdefault("stalled_lane_ids", _string_list(queue.get("stalled_lane_ids")))
+    queue.setdefault("proof_capture_retry_lane_ids", _string_list(queue.get("proof_capture_retry_lane_ids")))
     queue.setdefault("strategy_pending_cluster_ids", _string_list(queue.get("strategy_pending_cluster_ids")))
 
     counts = _default_bugflow_counts()
@@ -1939,6 +1950,7 @@ if __name__ == "__main__":
     parser.add_argument("--bridge-agent-runtime", default=None)
     parser.add_argument("--bridge-claude-only", action="store_true")
     parser.add_argument("--bridge-budget", action="store_true")
+    parser.add_argument("--bridge-autonomous-remainder", action="store_true")
     args = parser.parse_args()
 
     dashboard_config["port"] = args.port
@@ -1951,6 +1963,7 @@ if __name__ == "__main__":
             "agent_runtime": args.bridge_agent_runtime,
             "claude_only": args.bridge_claude_only,
             "budget": args.bridge_budget,
+            "autonomous_remainder": args.bridge_autonomous_remainder,
         })
 
     uvicorn.run(app, host="0.0.0.0", port=args.port, log_level="info")

@@ -10,6 +10,7 @@ from ..models.outputs import (
     ComponentDef,
     CrossServiceImpact,
     DataEntity,
+    DecisionLedger,
     DesignDecisions,
     FileScope,
     HandoverDoc,
@@ -22,9 +23,11 @@ from ..models.outputs import (
     Requirement,
     ScopeOutput,
     SecurityProfile,
+    SubfeatureDecomposition,
     TaskAcceptanceCriterion,
     TaskFileScope,
     TechnicalPlan,
+    TestPlan,
     VerifiableState,
 )
 
@@ -40,10 +43,16 @@ def to_markdown(model: BaseModel) -> str:
         return _render_prd(model)
     if isinstance(model, ScopeOutput):
         return _render_scope(model)
+    if isinstance(model, DecisionLedger):
+        return _render_decision_ledger(model)
     if isinstance(model, DesignDecisions):
         return _render_design(model)
     if isinstance(model, TechnicalPlan):
         return _render_plan(model)
+    if isinstance(model, TestPlan):
+        return _render_test_plan(model)
+    if isinstance(model, SubfeatureDecomposition):
+        return _render_decomposition(model)
     if isinstance(model, ImplementationDAG):
         return _render_dag(model)
     if isinstance(model, HandoverDoc):
@@ -208,6 +217,11 @@ def _render_prd(m: PRD) -> str:
         for q in m.open_questions:
             parts.append(f"- {_esc(q)}")
 
+    if m.decisions:
+        parts.append("\n## Decision Log\n")
+        for i, decision in enumerate(m.decisions, 1):
+            parts.append(f"{i}. {_esc(decision)}")
+
     # ── Out of Scope (legacy) ──
     if m.out_of_scope:
         parts.append("\n## Out of Scope\n")
@@ -289,6 +303,10 @@ def _render_design(m: DesignDecisions) -> str:
         parts.append("\n## Alternatives Considered\n")
         for a in m.alternatives:
             parts.append(f"- {_esc(a)}")
+    if m.decisions:
+        parts.append("\n## Decision Log\n")
+        for i, decision in enumerate(m.decisions, 1):
+            parts.append(f"{i}. {_esc(decision)}")
 
     return "\n".join(parts) + "\n"
 
@@ -297,6 +315,10 @@ def _render_plan(m: TechnicalPlan) -> str:
     parts: list[str] = ["# Technical Plan"]
     if m.architecture:
         parts.append(f"\n## Architecture\n\n{_esc(m.architecture)}")
+    if m.decisions:
+        parts.append("\n## Decision Log\n")
+        for i, decision in enumerate(m.decisions, 1):
+            parts.append(f"{i}. {_esc(decision)}")
 
     # ── File Manifest (structured), fall back to legacy file lists ──
     if m.file_manifest:
@@ -392,6 +414,144 @@ def _render_plan(m: TechnicalPlan) -> str:
     return "\n".join(parts) + "\n"
 
 
+def _render_test_plan(m: TestPlan) -> str:
+    parts: list[str] = ["# Test Plan"]
+    if m.overview:
+        parts.append(f"\n## Overview\n\n{_esc(m.overview)}")
+
+    if m.acceptance_criteria:
+        parts.append("\n## Acceptance Criteria\n")
+        parts.append("| ID | Description | Req | Method | Pass Condition | Verifiable State | Journey Step |")
+        parts.append("|---|---|---|---|---|---|---|")
+        for ac in m.acceptance_criteria:
+            parts.append(
+                f"| {_esc(ac.id)} | {_esc(ac.description)} | {_esc(ac.linked_requirement)} | "
+                f"{_esc(ac.verification_method)} | {_esc(ac.pass_condition)} | "
+                f"{_esc(ac.linked_verifiable_state_id)} | {_esc(ac.linked_journey_step_id)} |"
+            )
+
+    if m.test_scenarios:
+        parts.append("\n## Test Scenarios\n")
+        for ts in m.test_scenarios:
+            parts.append(f"### {_esc(ts.name)} ({_esc(ts.priority)})\n")
+            if ts.preconditions:
+                parts.append("**Preconditions:**")
+                for pc in ts.preconditions:
+                    parts.append(f"- {_esc(pc)}")
+            if ts.steps:
+                parts.append("\n**Steps:**")
+                for i, step in enumerate(ts.steps, 1):
+                    parts.append(f"{i}. {_esc(step)}")
+            if ts.expected_outcome:
+                parts.append(f"\n**Expected Outcome:** {_esc(ts.expected_outcome)}")
+            if ts.linked_acceptance:
+                parts.append(
+                    f"\n**Linked Acceptance:** {', '.join(_esc(a) for a in ts.linked_acceptance)}"
+                )
+            parts.append("")
+
+    if m.verification_checklist:
+        parts.append("\n## Verification Checklist\n")
+        for item in m.verification_checklist:
+            parts.append(f"- [ ] {_esc(item)}")
+
+    if m.edge_cases:
+        parts.append("\n## Edge Cases\n")
+        for ec in m.edge_cases:
+            parts.append(f"- {_esc(ec)}")
+
+    if m.mocking_strategy:
+        parts.append(f"\n## Mocking Strategy\n\n{_esc(m.mocking_strategy)}")
+
+    if m.test_environment:
+        parts.append("\n## Test Environment\n")
+        for env in m.test_environment:
+            parts.append(f"- {_esc(env)}")
+
+    if m.decisions:
+        parts.append("\n## Decisions\n")
+        for i, d in enumerate(m.decisions, 1):
+            parts.append(f"{i}. {_esc(d)}")
+
+    return "\n".join(parts) + "\n"
+
+
+def _render_decomposition(m: SubfeatureDecomposition) -> str:
+    parts: list[str] = ["# Subfeature Decomposition"]
+    if m.decomposition_rationale:
+        parts.append(f"\n## Rationale\n\n{_esc(m.decomposition_rationale)}")
+    if m.subfeatures:
+        parts.append("\n## Subfeatures\n")
+        parts.append("| ID | Slug | Name | Description | Requirements | Journeys |")
+        parts.append("|---|---|---|---|---|---|")
+        for sf in m.subfeatures:
+            requirement_ids = ", ".join(_esc(rid) for rid in sf.requirement_ids) if sf.requirement_ids else ""
+            journey_ids = ", ".join(_esc(jid) for jid in sf.journey_ids) if sf.journey_ids else ""
+            parts.append(
+                f"| {_esc(sf.id)} | `{_esc(sf.slug)}` | {_esc(sf.name)} | {_esc(sf.description)} | {requirement_ids} | {journey_ids} |"
+            )
+            if sf.rationale:
+                parts.append(f"|  |  |  | Rationale: {_esc(sf.rationale)} |  |  |")
+    if m.edges:
+        parts.append("\n## Dependencies\n")
+        parts.append("| From | To | Interface | Description | Owner | Contract |")
+        parts.append("|---|---|---|---|---|---|")
+        for edge in m.edges:
+            parts.append(
+                f"| `{_esc(edge.from_subfeature)}` | `{_esc(edge.to_subfeature)}` | {_esc(edge.interface_type)} | {_esc(edge.description)} | {_esc(edge.owner)} | {_esc(edge.data_contract)} |"
+            )
+    parts.append(f"\n## Complete\n\n{'Yes' if m.complete else 'No'}")
+    return "\n".join(parts) + "\n"
+
+
+def _render_decision_ledger(m: DecisionLedger) -> str:
+    parts: list[str] = [f"# {_esc(m.title)}"]
+    active = [decision for decision in m.decisions if decision.status == "active"]
+    superseded = [decision for decision in m.decisions if decision.status == "superseded"]
+
+    def _append_group(title: str, decisions: list) -> None:
+        if not decisions:
+            return
+        parts.append(f"\n## {title}\n")
+        for decision in decisions:
+            parts.append(f"### {_esc(decision.id)} [{_esc(decision.status)}]\n")
+            parts.append(f"{_esc(decision.statement)}\n")
+            if decision.rationale:
+                parts.append(f"- **Rationale:** {_esc(decision.rationale)}")
+            if decision.source_phase:
+                parts.append(f"- **Source Phase:** {_esc(decision.source_phase)}")
+            if decision.subfeature_slug:
+                parts.append(f"- **Subfeature:** `{_esc(decision.subfeature_slug)}`")
+            if decision.applies_to:
+                parts.append(
+                    f"- **Applies To:** {', '.join(_esc(item) for item in decision.applies_to)}"
+                )
+            if decision.supersedes:
+                parts.append(
+                    f"- **Supersedes:** {', '.join(_esc(item) for item in decision.supersedes)}"
+                )
+            if decision.citations:
+                parts.append("- **Citations:**")
+                for citation in decision.citations:
+                    cite = f"{citation.type}: {citation.reference}"
+                    if citation.excerpt:
+                        cite += f" — {citation.excerpt}"
+                    if citation.reasoning:
+                        cite += f" ({citation.reasoning})"
+                    parts.append(f"  - {_esc(cite)}")
+            parts.append("")
+            parts.append("```json")
+            parts.append(_esc(decision.model_dump_json(indent=2)))
+            parts.append("```")
+            parts.append("")
+
+    _append_group("Active Decisions", active)
+    _append_group("Superseded Decisions", superseded)
+    if not active and not superseded:
+        parts.append("\n_No decisions recorded yet._\n")
+    return "\n".join(parts) + "\n"
+
+
 def _render_dag(m: ImplementationDAG) -> str:
     parts: list[str] = ["# Implementation DAG"]
     parts.append(f"\n**Teams:** {m.num_teams}")
@@ -437,6 +597,8 @@ def _render_dag(m: ImplementationDAG) -> str:
                 parts.append(f"- **Steps:** {', '.join(_esc(s) for s in t.step_ids)}")
             if t.journey_ids:
                 parts.append(f"- **Journeys:** {', '.join(_esc(j) for j in t.journey_ids)}")
+            if t.verification_gates:
+                parts.append(f"- **Verification Gates:** {', '.join(_esc(g) for g in t.verification_gates)}")
 
             # ── Acceptance Criteria ──
             if t.acceptance_criteria:

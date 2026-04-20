@@ -6,7 +6,7 @@ from uuid import uuid4
 
 from pydantic import BaseModel, Field
 
-from ...models.outputs import EvidenceBundle
+from ...models.outputs import Check, EvidenceBundle
 
 
 def utc_now() -> str:
@@ -187,6 +187,7 @@ class BugflowLaneSnapshot(BaseModel):
     verification_actor: str = ""
     promotion_status: str = ""
     promotion_attempt: int = 0
+    promotion_proof_capture_attempt: int = 0
     supersedes_lane_id: str = ""
     wait_reason: str = ""
     execution_state: str = ""
@@ -209,6 +210,7 @@ class BugflowProofRecord(BaseModel):
     stage: str
     storage_stage: str = ""
     bundle: EvidenceBundle = Field(default_factory=EvidenceBundle)
+    checks: list[Check] = Field(default_factory=list)
     bundle_url: str = ""
     primary_artifact_url: str = ""
     created_at: str = Field(default_factory=utc_now)
@@ -304,6 +306,7 @@ class BugflowQueueSnapshot(BaseModel):
     blocked_ids: list[str] = Field(default_factory=list)
     stalled_lane_ids: list[str] = Field(default_factory=list)
     recovering_lane_ids: list[str] = Field(default_factory=list)
+    proof_capture_retry_lane_ids: list[str] = Field(default_factory=list)
     strategy_pending_cluster_ids: list[str] = Field(default_factory=list)
     report_ids: list[str] = Field(default_factory=list)
     cluster_ids: list[str] = Field(default_factory=list)

@@ -88,6 +88,7 @@ function humanPhase(p: string): string {
     scoping: 'Scoping',
     design: 'Design',
     architecture: 'Architecture',
+    test_planning: 'Test planning',
     plan_review: 'Plan review',
     task_planning: 'Task planning',
     implementation: 'Implementation',

@@ -9,6 +9,7 @@ overlay injection, and annotation storage.
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
 import json
 import logging
 import urllib.request
@@ -19,14 +20,17 @@ from typing import Any, TYPE_CHECKING
 from pydantic import BaseModel, ValidationError
 
 from ..models.outputs import (
+    DecisionLedger,
     DesignDecisions,
     ImplementationDAG,
     PRD,
     ScopeOutput,
+    SubfeatureDecomposition,
     SystemDesign,
     TechnicalPlan,
+    TestPlan,
 )
-from .artifacts import _key_to_path
+from .artifacts import _key_to_path, _path_to_key
 from .markdown import to_markdown
 from .system_design_html import render_system_design_html
 
@@ -37,13 +41,24 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _KEY_TO_MODEL: dict[str, type[BaseModel]] = {
+    "decisions": DecisionLedger,
     "prd": PRD,
     "design": DesignDecisions,
     "plan": TechnicalPlan,
     "scope": ScopeOutput,
+    "decomposition": SubfeatureDecomposition,
+    "test-plan": TestPlan,
 }
 
-_ARTIFACT_MODELS: list[type[BaseModel]] = [PRD, DesignDecisions, TechnicalPlan, ImplementationDAG]
+_ARTIFACT_MODELS: list[type[BaseModel]] = [
+    PRD,
+    DesignDecisions,
+    TechnicalPlan,
+    SubfeatureDecomposition,
+    DecisionLedger,
+    ImplementationDAG,
+    TestPlan,
+]
 
 _SERVE_PORT = 9000
 
@@ -106,6 +121,16 @@ class DocHostingService:
         self._mirror.write_artifact(feature_id, key, display_content)
         await self._notify_refresh(feature_id, key)
         logger.info("Updated %s (%d bytes)", key, len(display_content))
+
+    async def delete(self, feature_id: str, key: str) -> None:
+        """Remove a hosted artifact from the mirror and URL cache."""
+        delete = getattr(self._mirror, "delete_artifact", None)
+        if callable(delete):
+            delete(feature_id, key)
+        self._urls.pop(key, None)
+        self._labels.pop(key, None)
+        await self._notify_refresh(feature_id, key)
+        logger.info("Deleted hosted artifact %s for %s", key, feature_id)
 
     def get_url(self, key: str) -> str | None:
         return self._urls.get(key)
@@ -181,24 +206,49 @@ class DocHostingService:
 
         logger.info("Cleared feedback for %s", key)
 
+    async def mark_feedback_submitted(self, feature_id: str, key: str) -> None:
+        """Mark a hosted review session as submitted/closed.
+
+        This keeps the browser overlay state aligned with workflow state when
+        a gate review is approved without requiring another human submission.
+        """
+        rel_path = Path(_key_to_path(key))
+        artifact_dir = self._mirror.feature_dir(feature_id) / rel_path.parent
+        feedback_key = rel_path.stem
+
+        session_file = artifact_dir / ".feedback" / feedback_key / "session.json"
+        if not session_file.exists():
+            return
+
+        try:
+            data = json.loads(session_file.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return
+
+        data["status"] = "submitted"
+        data["submitted_at"] = datetime.now(timezone.utc).isoformat()
+        try:
+            session_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        except OSError:
+            return
+
+        logger.info("Marked feedback submitted for %s", key)
+
     async def rehost_existing(self, feature_id: str, label_prefix: str = "") -> int:
         """Register URLs for existing artifacts. No subprocess restart needed.
 
         iriai-feedback serve auto-discovers all artifacts in the directory.
         This just populates the URL cache so get_url() works after recovery.
         """
-        from .artifacts import _KEY_MAP
-
         fdir = self._mirror.feature_dir(feature_id)
         self._current_feature_id = feature_id
         hosted = 0
 
-        filename_to_key = {v: k for k, v in _KEY_MAP.items()}
-
-        for path in sorted(fdir.iterdir()):
-            if path.name == "manifest.json" or path.is_dir():
+        for path in sorted(fdir.rglob("*")):
+            if path.is_dir():
                 continue
-            key = filename_to_key.get(path.name)
+            rel_path = path.relative_to(fdir)
+            key = _path_to_key(rel_path)
             if not key:
                 continue
 
@@ -231,7 +281,7 @@ class DocHostingService:
     @staticmethod
     def _has_content(model: BaseModel) -> bool:
         """Check if a model has any non-default content worth rendering."""
-        for name, field_info in model.model_fields.items():
+        for name, field_info in type(model).model_fields.items():
             if name == "complete":
                 continue
             value = getattr(model, name)

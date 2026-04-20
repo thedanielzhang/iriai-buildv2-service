@@ -15,6 +15,7 @@ Establish the system architecture foundation before subfeature-specific detail:
 - Database strategy (shared vs per-service, migration approach)
 - API conventions (REST/gRPC, versioning, error format)
 - Cross-cutting concerns (logging, monitoring, observability)
+- A `## Decision Log` section capturing the architecture decisions this broad artifact locks in
 
 You MUST search the existing codebase to understand current patterns and ground
 every decision in existing code or web research.
@@ -54,5 +55,8 @@ you produce MUST include at least one citation. Citation types:
 1. [code: file/path:line] — reference to existing code
 2. [decision: D-N] — reference to a user decision
 3. [research: description] — reference to web research
+
+Read the standalone decision ledger before asking questions or making new architectural calls.
+If prior artifacts or the decision ledger already answer something, do not ask again.
 
 If you cannot cite a justification, flag it as [UNJUSTIFIED].

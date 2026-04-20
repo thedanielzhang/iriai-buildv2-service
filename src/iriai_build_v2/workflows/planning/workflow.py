@@ -9,11 +9,10 @@ from iriai_compose import Feature, Phase, Workflow
 from ...services.hosting import DocHostingService
 from ...services.workspace import WorkspaceManager
 from .phases import (
-    ArchitecturePhase,
-    DesignPhase,
-    PMPhase,
+    BroadPhase,
     PlanReviewPhase,
     ScopingPhase,
+    SubfeaturePhase,
     TaskPlanningPhase,
 )
 
@@ -53,4 +52,4 @@ class PlanningWorkflow(Workflow):
             await hosting.stop_all()
 
     def build_phases(self) -> list[type[Phase]]:
-        return [ScopingPhase, PMPhase, DesignPhase, ArchitecturePhase, PlanReviewPhase, TaskPlanningPhase]
+        return [ScopingPhase, BroadPhase, SubfeaturePhase, PlanReviewPhase, TaskPlanningPhase]

@@ -3,18 +3,22 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from iriai_compose.prompts import Select
 from iriai_compose.storage import AgentSession
-from iriai_compose.tasks import Ask, Select
+from iriai_compose.tasks import Ask
 
 from iriai_build_v2.interfaces.slack.interaction import (
     SlackInteractionRuntime,
     _extract_question,
+    _parse_modal_submission,
 )
+from iriai_build_v2.planning_signals import BACKGROUND_RESPONSE, GateRejection
 from iriai_build_v2.roles import user
 
 
@@ -79,6 +83,29 @@ class MockSessionStore:
         self.sessions[session.session_key] = session
 
 
+@dataclass
+class MockFeatureStore:
+    events: list[dict[str, Any]] = field(default_factory=list)
+
+    async def log_event(
+        self,
+        feature_id: str,
+        event_type: str,
+        source: str,
+        content: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        self.events.append(
+            {
+                "feature_id": feature_id,
+                "event_type": event_type,
+                "source": source,
+                "content": content,
+                "metadata": metadata or {},
+            }
+        )
+
+
 # ── Channel Registration ────────────────────────────────────────────────────
 
 
@@ -88,11 +115,72 @@ class TestChannelRegistration:
         runtime.register_channel("feat-1", "C001")
         assert not runtime.has_pending("C001")
 
+    def test_has_pending_tracks_feature_mapping_not_pending_id_shape(self):
+        runtime = SlackInteractionRuntime(MockAdapter())
+        runtime.register_channel("feat-1", "C001")
+        runtime._pending_features["uuid-like-id"] = "feat-1"
+        runtime._pending_futures["uuid-like-id"] = object()
+
+        assert runtime.has_pending("C001")
+
     def test_unregister_clears_mapping(self):
         runtime = SlackInteractionRuntime(MockAdapter())
         runtime.register_channel("feat-1", "C001")
         runtime.unregister_channel("feat-1")
         assert not runtime.has_pending("C001")
+
+
+class TestInstrumentation:
+    @pytest.mark.asyncio
+    async def test_gate_action_logs_missing_pending(self):
+        runtime = SlackInteractionRuntime(MockAdapter())
+        runtime.register_channel("feat-1", "C001")
+        feature_store = MockFeatureStore()
+        runtime._feature_store = feature_store
+
+        await runtime.handle_action(
+            {
+                "channel": {"id": "C001"},
+                "message": {"ts": "123.456"},
+                "user": {"id": "U123"},
+                "trigger_id": "trigger",
+            },
+            {"action_id": "gate_missing_reject"},
+        )
+
+        await asyncio.sleep(0)
+
+        assert [event["event_type"] for event in feature_store.events] == [
+            "slack_action_received",
+            "slack_action_missing_pending",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_view_submission_logs_missing_pending(self):
+        runtime = SlackInteractionRuntime(MockAdapter())
+        feature_store = MockFeatureStore()
+        runtime._feature_store = feature_store
+        runtime._pending_features["modal-gate"] = "feat-1"
+
+        await runtime.handle_view_submission(
+            {
+                "user": {"id": "U123"},
+                "view": {
+                    "private_metadata": json.dumps(
+                        {"pending_id": "modal-gate", "kind": "gate_reject"}
+                    ),
+                    "state": {"values": {"reply_block": {"reply_input": {"value": "Needs revision"}}}},
+                },
+            }
+        )
+
+        await asyncio.sleep(0)
+
+        assert [event["event_type"] for event in feature_store.events] == [
+            "slack_view_submission_received",
+            "slack_view_submission_missing_pending",
+            "slack_pending_missing",
+        ]
 
 
 # ── Resolve: Respond Card ───────────────────────────────────────────────────
@@ -252,6 +340,33 @@ class TestResolveApprove:
         assert result is True
         assert len(adapter.posted_blocks) == 1
 
+    @pytest.mark.asyncio
+    async def test_preserves_gate_rejection_when_future_result_is_bool_false(self):
+        adapter = MockAdapter()
+        runtime = SlackInteractionRuntime(adapter)
+        runtime.register_channel("feat-1", "C001")
+        runtime._feature_store = MockFeatureStore()
+
+        pending = FakePending(id="p2", kind="approve", prompt="Approve the PRD?")
+
+        async def reject_later():
+            await asyncio.sleep(0.01)
+            runtime._pending_values["p2"] = GateRejection("Use the reject feedback")
+            runtime._pending_futures["p2"].set_result(False)
+
+        task = asyncio.create_task(reject_later())
+        result = await runtime.resolve(pending)
+        await task
+        await asyncio.sleep(0)
+
+        assert result == GateRejection("Use the reject feedback")
+        assert any(
+            event["event_type"] == "slack_pending_result_mismatch"
+            and event["metadata"]["future_type"] == "bool"
+            and event["metadata"]["stored_type"] == "GateRejection"
+            for event in runtime._feature_store.events
+        )
+
 
 # ── Resolve: Choose Card ───────────────────────────────────────────────────
 
@@ -342,7 +457,11 @@ class TestRespondActions:
         await runtime.handle_action(body, action)
 
         assert len(adapter.opened_modals) == 1
-        assert adapter.opened_modals[0]["view"]["private_metadata"] == "abc"
+        submission = _parse_modal_submission(
+            adapter.opened_modals[0]["view"]["private_metadata"]
+        )
+        assert submission.pending_id == "abc"
+        assert submission.kind == "reply"
 
     @pytest.mark.asyncio
     async def test_dropdown_select_resolves(self):
@@ -362,6 +481,24 @@ class TestRespondActions:
 
         assert future.done()
         assert future.result() == "C"
+
+    @pytest.mark.asyncio
+    async def test_background_button_resolves_with_background_sentinel(self):
+        adapter = MockAdapter()
+        runtime = SlackInteractionRuntime(adapter)
+
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+        runtime._pending_futures["abc"] = future
+        runtime._pending_messages["abc"] = ("C001", "123.456")
+
+        body = {"trigger_id": "t1", "channel": {"id": "C001"}, "message": {"ts": "123.456"}, "user": {"id": "U001"}}
+        action = {"action_id": "respond_abc_background"}
+
+        await runtime.handle_action(body, action)
+
+        assert future.done()
+        assert future.result() == BACKGROUND_RESPONSE
 
 
 # ── Gate Action Handling ────────────────────────────────────────────────────
@@ -401,7 +538,9 @@ class TestGateActions:
 
         assert len(adapter.opened_modals) == 1
         view = adapter.opened_modals[0]["view"]
-        assert view["private_metadata"] == "abc"
+        submission = _parse_modal_submission(view["private_metadata"])
+        assert submission.pending_id == "abc"
+        assert submission.kind == "gate_reject"
         assert view["blocks"][0].get("optional") is True
 
 
@@ -522,6 +661,61 @@ class TestHandleViewSubmission:
         assert future.done()
         assert future.result() == "Please revise."
 
+    @pytest.mark.asyncio
+    async def test_gate_reject_submission_preserves_feedback_and_updates_card(self):
+        adapter = MockAdapter()
+        runtime = SlackInteractionRuntime(adapter)
+
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+        runtime._pending_futures["modal-gate"] = future
+        runtime._pending_messages["modal-gate"] = ("C001", "msg.ts")
+        runtime._pending_titles["modal-gate"] = "Approval Required"
+
+        payload = {
+            "user": {"id": "U001"},
+            "view": {
+                "private_metadata": json.dumps(
+                    {"pending_id": "modal-gate", "kind": "gate_reject"}
+                ),
+                "state": {
+                    "values": {
+                        "reply_block": {
+                            "reply_input": {"value": "Please tighten the rollout plan"}
+                        }
+                    }
+                },
+            },
+        }
+
+        await runtime.handle_view_submission(payload)
+        await asyncio.sleep(0.02)
+
+        assert future.done()
+        assert future.result() == GateRejection("Please tighten the rollout plan")
+        assert adapter.updated_messages
+        blocks = adapter.updated_messages[-1]["blocks"]
+        assert "Approval Required" in blocks[0]["text"]["text"]
+        assert "Rejected" in blocks[0]["text"]["text"]
+        assert "Please tighten the rollout plan" in blocks[0]["text"]["text"]
+
+    @pytest.mark.asyncio
+    async def test_legacy_reject_resolves_to_gate_rejection(self):
+        adapter = MockAdapter()
+        runtime = SlackInteractionRuntime(adapter)
+
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+        runtime._pending_futures["abc"] = future
+
+        body = {"trigger_id": "t1", "channel": {"id": "C001"}, "message": {"ts": "1"}, "user": {"id": "U1"}}
+        action = {"action_id": "decision_abc_reject"}
+
+        await runtime.handle_action(body, action)
+
+        assert future.done()
+        assert future.result() == GateRejection()
+
 
 # ── Card Update on Resolution ───────────────────────────────────────────────
 
@@ -546,6 +740,26 @@ class TestCardUpdateOnResolve:
         assert future.result() is True
         # Card should have been updated
         assert len(adapter.updated_messages) >= 1
+
+    @pytest.mark.asyncio
+    async def test_gate_card_uses_gate_title_when_approved(self):
+        adapter = MockAdapter()
+        runtime = SlackInteractionRuntime(adapter)
+
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+        runtime._pending_futures["gate-approve"] = future
+        runtime._pending_messages["gate-approve"] = ("C001", "msg.ts")
+        runtime._pending_titles["gate-approve"] = "Approval Required"
+
+        runtime._resolve_pending("gate-approve", True, label="Approved", user_id="U001")
+
+        await asyncio.sleep(0.02)
+
+        assert adapter.updated_messages
+        blocks = adapter.updated_messages[-1]["blocks"]
+        assert "Approval Required" in blocks[0]["text"]["text"]
+        assert "Approved" in blocks[0]["text"]["text"]
 
 
 # ── handle_message is no-op ─────────────────────────────────────────────────

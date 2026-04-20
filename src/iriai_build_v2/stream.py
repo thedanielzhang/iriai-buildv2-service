@@ -37,3 +37,40 @@ def print_stream(msg: Any) -> None:
             marker = "error" if getattr(block, "is_error", False) else "ok"
             content = getattr(block, "content", "")
             print(f"\n[result:{marker}] {content}", flush=True)
+
+
+def make_thread_stream(label: str):
+    """Return an ``on_message`` callback that prefixes streamed output with a label."""
+
+    prefix = f"[{label}] "
+
+    def _thread_stream(msg: Any) -> None:
+        if type(msg).__name__ != "AssistantMessage":
+            return
+
+        msg_id = getattr(msg, "id", None)
+        dedupe_id = f"{label}:{msg_id}" if msg_id else None
+        if dedupe_id:
+            if dedupe_id in _seen_ids:
+                return
+            _seen_ids.add(dedupe_id)
+
+        for block in msg.content:
+            typ = type(block).__name__
+            if typ == "TextBlock":
+                print(f"{prefix}{block.text}", end="", flush=True)
+            elif typ == "ThinkingBlock":
+                print(f"\n{prefix}[thinking] {block.thinking}", flush=True)
+            elif typ == "ToolUseBlock":
+                name = block.name
+                inp = block.input
+                target = ""
+                if isinstance(inp, dict):
+                    target = inp.get("file_path") or inp.get("command") or inp.get("pattern") or ""
+                print(f"\n{prefix}[tool] {name} {target}", flush=True)
+            elif typ == "ToolResultBlock":
+                marker = "error" if getattr(block, "is_error", False) else "ok"
+                content = getattr(block, "content", "")
+                print(f"\n{prefix}[result:{marker}] {content}", flush=True)
+
+    return _thread_stream

@@ -19,6 +19,28 @@ class Citation(BaseModel):
     reasoning: str = ""
 
 
+class DecisionRecord(BaseModel):
+    """A single planning decision with stable traceability."""
+
+    id: str  # D-1, D-2, ...
+    statement: str
+    rationale: str = ""
+    status: Literal["active", "superseded"] = "active"
+    supersedes: list[str] = Field(default_factory=list)
+    source_phase: str = ""
+    subfeature_slug: str = ""
+    applies_to: list[str] = Field(default_factory=list)
+    citations: list[Citation] = Field(default_factory=list)
+
+
+class DecisionLedger(BaseModel):
+    """A first-class ledger of planning decisions."""
+
+    title: str = "Decision Ledger"
+    decisions: list[DecisionRecord] = Field(default_factory=list)
+    complete: bool = False
+
+
 # ── Shared sub-models ────────────────────────────────────────────────────────
 
 
@@ -26,7 +48,7 @@ class Check(BaseModel):
     """A single criterion-level check result."""
 
     criterion: str
-    result: str  # PASS | FAIL
+    result: str  # PASS | FAIL | satisfied | not-needed
     detail: str = ""
 
 
@@ -390,11 +412,11 @@ class EdgeCheck(BaseModel):
 
 
 class IntegrationReview(BaseModel):
-    """Output of the Lead's integration review of per-subfeature artifacts."""
+    """Output of a Lead's integration review across a related artifact set."""
 
     needs_revision: bool = Field(
         default=False,
-        description="Set to true if ANY subfeature artifact needs changes. When true, revision_instructions MUST be non-empty.",
+        description="Set to true if ANY reviewed artifact needs changes. When true, revision_instructions MUST be non-empty.",
     )
     summary: str = ""
     edge_consistency: list[EdgeCheck] = Field(default_factory=list)
@@ -402,7 +424,7 @@ class IntegrationReview(BaseModel):
     contradictions: list[str] = Field(default_factory=list)
     revision_instructions: dict[str, str] = Field(
         default_factory=dict,
-        description="Map of subfeature slug to revision instruction. Keys must be exact subfeature slugs from the decomposition. Required when needs_revision is true.",
+        description="Map of revision target id to revision instruction. Keys must be exact target ids from the current review scope. Required when needs_revision is true.",
     )
     complete: bool = False
 
@@ -463,13 +485,15 @@ class ReviewOutcome(BaseModel):
 
     @model_validator(mode="after")
     def _revisions_override_approval(self) -> ReviewOutcome:
-        """If revision_plan has requests, approved must be False.
+        """If revision_plan has changes, approved must be False.
 
         Agents sometimes set approved=True after discussing changes with the
         user, conflating 'user agreed changes are needed' with 'user approves
         the artifact as-is'.  Revisions always take priority.
         """
-        if self.approved and self.revision_plan.requests:
+        if self.approved and (
+            self.revision_plan.requests or self.revision_plan.new_decisions
+        ):
             self.approved = False
         return self
 
@@ -630,6 +654,7 @@ class PRD(BaseModel):
     # Legacy
     requirements: list[str] = Field(default_factory=list)
     acceptance_criteria: list[str] = Field(default_factory=list)
+    decisions: list[str] = Field(default_factory=list)
     out_of_scope: list[str] = Field(default_factory=list)
     complete: bool = False
 
@@ -646,6 +671,7 @@ class DesignDecisions(BaseModel):
     # Legacy
     components: list[str] = Field(default_factory=list)
     alternatives: list[str] = Field(default_factory=list)
+    decisions: list[str] = Field(default_factory=list)
     rationale: str = ""
     complete: bool = False
 
@@ -658,6 +684,7 @@ class TechnicalPlan(BaseModel):
     file_manifest: list[FileScope] = Field(default_factory=list)
     architectural_risks: list[ArchitecturalRisk] = Field(default_factory=list)
     testid_registry: list[str] = Field(default_factory=list)
+    decisions: list[str] = Field(default_factory=list)
     # Legacy
     files_to_create: list[str] = Field(default_factory=list)
     files_to_modify: list[str] = Field(default_factory=list)
@@ -672,6 +699,54 @@ class ArchitectureOutput(BaseModel):
 
     plan: TechnicalPlan = Field(default_factory=TechnicalPlan)
     system_design: SystemDesign = Field(default_factory=SystemDesign)
+    complete: bool = False
+
+
+class TestAcceptanceCriterion(BaseModel):
+    """A single acceptance criterion produced by the test_planner step.
+
+    Distinct from the PRD-layer ``AcceptanceCriterion`` (L157): this one is
+    written by the test planner and carries verification-method details plus
+    cross-references into the design / plan so downstream test agents can
+    mechanically check pass conditions without duplicating source-of-truth.
+    """
+
+    id: str = ""  # AC-{slug}-{n}
+    description: str = ""
+    linked_requirement: str = ""  # PRD REQ-id
+    verification_method: str = ""  # manual | unit | integration | e2e | visual
+    pass_condition: str = ""
+    linked_verifiable_state_id: str = ""  # DesignDecisions.verifiable_states[*].component_id#state
+    linked_journey_step_id: str = ""  # TechnicalPlan.journey_verifications[*].step_id
+
+
+class TestScenario(BaseModel):
+    """A single end-to-end test scenario for a subfeature."""
+
+    name: str = ""
+    preconditions: list[str] = Field(default_factory=list)
+    steps: list[str] = Field(default_factory=list)
+    expected_outcome: str = ""
+    priority: str = "p1"  # p0 | p1 | p2
+    linked_acceptance: list[str] = Field(default_factory=list)
+
+
+class TestPlan(BaseModel):
+    """Per-subfeature test plan produced during planning.
+
+    Consumed by task decomposition (drives per-task verification_gates) and
+    by implementation-phase gates (test_author, integration_tester,
+    qa_engineer, verifier) which cite AC-ids in their verdicts.
+    """
+
+    overview: str = ""
+    acceptance_criteria: list[TestAcceptanceCriterion] = Field(default_factory=list)
+    test_scenarios: list[TestScenario] = Field(default_factory=list)
+    verification_checklist: list[str] = Field(default_factory=list)
+    edge_cases: list[str] = Field(default_factory=list)
+    mocking_strategy: str = ""
+    test_environment: list[str] = Field(default_factory=list)
+    decisions: list[str] = Field(default_factory=list)
     complete: bool = False
 
 
@@ -774,6 +849,16 @@ class ImplementationTask(BaseModel):
     counterexamples: list[str] = Field(default_factory=list)
     security_concerns: list[str] = Field(default_factory=list)
     testid_assignments: list[str] = Field(default_factory=list)
+    verification_gates: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Test-plan AC-ids (e.g. 'AC-auth-flow-3') that implementation-phase "
+            "gates must check for this task. Populated by the lead task planner "
+            "from each subfeature's test-plan acceptance_criteria; cited by "
+            "test_author, integration_tester, qa_engineer, and verifier in their "
+            "verdicts. Leave empty for tasks whose subfeature has no test plan."
+        ),
+    )
     reference_material: list[TaskReference] = Field(
         default_factory=list,
         description=(
@@ -1082,6 +1167,7 @@ class ReproductionResult(BaseModel):
     steps_executed: list[str] = Field(default_factory=list)
     observations: list[str] = Field(default_factory=list)
     error_messages: list[str] = Field(default_factory=list)
+    checks: list[Check] = Field(default_factory=list)
     summary: str
     proof: EvidenceBundle | None = None
 

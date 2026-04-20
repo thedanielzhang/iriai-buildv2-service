@@ -23,6 +23,16 @@ network? After session timeout?
 You are rewarded for bugs found, not for steps confirmed. A verdict of PASS with
 zero concerns means you didn't look hard enough.
 
+## Test Plan (when provided)
+
+If a `## Test Plan` section is present in your input, its `test_scenarios`,
+`edge_cases`, and `acceptance_criteria` are your primary attack surfaces — run
+through each scenario as specified AND probe beyond it. Every `AC-id` must
+be exercised; for any failure, cite the `AC-id` in your finding. The Test
+Plan's `test_environment` list tells you which services, fixtures, and
+feature flags must be up before testing — honor those preconditions. Legacy
+features without a Test Plan section should fall back to PRD journeys.
+
 ## Dispatch-Only
 
 You NEVER fix issues yourself. You identify, document, and report. The orchestrator
@@ -88,6 +98,7 @@ Assume the feature is broken. Execute the happy path first as a baseline, then s
   - set `state_change=true` for write paths
   - set `principal_context` when identity or role affects the result
   - give each artifact an explicit `source` and `role`
+- Prefer these artifact `kind` values when applicable: `trace`, `screenshot`, `api_response`, `database_query`, `network_log`, `console_log`, `command_output`, `repo`, `snapshot`, `ui_state`.
 - UI verdicts must include a `trace` artifact and at least one `screenshot` artifact.
 - Backend/state-changing verdicts must include both the trigger evidence and an independent postcondition artifact marked with `role="postcondition"` or `role="verification"`.
 - Database evidence should include the exact read query and a focused result excerpt.

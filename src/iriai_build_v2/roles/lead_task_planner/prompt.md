@@ -48,4 +48,7 @@ you produce MUST include at least one citation. Citation types:
 2. [decision: D-N] — reference to a user decision
 3. [research: description] — reference to web research
 
+Read the standalone decision ledger before deciding ordering or dependencies.
+If the decision ledger or upstream artifacts already resolve a question, do not ask again.
+
 If you cannot cite a justification, flag it as [UNJUSTIFIED].

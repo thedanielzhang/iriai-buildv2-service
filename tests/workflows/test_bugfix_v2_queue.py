@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import shutil
 from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
-from iriai_compose import Ask, Gate, Interview
+from iriai_compose import Ask
 
 from iriai_build_v2.models.outputs import (
     BugFixAttempt,
@@ -36,6 +37,7 @@ from iriai_build_v2.workflows.bugfix_v2.models import (
     report_key,
 )
 from iriai_build_v2.workflows.bugfix_v2.phases import queue as queue_module
+from iriai_build_v2.workflows._common import Gate, Interview
 from iriai_build_v2.workflows.develop.phases.implementation import PlannedBugDispatch, PlannedBugGroup
 
 
@@ -520,6 +522,145 @@ async def test_process_report_requires_ui_proof_before_no_repro_terminal(
 
 
 @pytest.mark.asyncio
+async def test_process_report_resolves_no_repro_with_non_core_reproduction_checks(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    feature = _feature()
+    artifacts = _Artifacts()
+    adapter = _Adapter()
+    report = _report(
+        "BR-2202B",
+        status="validation_pending",
+        category="bug",
+        summary="Command output should confirm no repro.",
+    )
+    report.ui_involved = True
+    report.strategy_required_evidence_modes = ["ui", "command_output"]
+    await artifacts.put(report_key(report.report_id), report.model_dump_json(), feature=feature)
+
+    main_root = tmp_path / "main" / "repos"
+    main_root.mkdir(parents=True, exist_ok=True)
+    trace_file = tmp_path / "trace.zip"
+    trace_file.write_text("trace", encoding="utf-8")
+    shot_file = tmp_path / "shot.png"
+    shot_file.write_text("png", encoding="utf-8")
+    log_file = tmp_path / "check.log"
+    log_file.write_text("ok", encoding="utf-8")
+
+    runner = SimpleNamespace(
+        artifacts=artifacts,
+        services={"slack_adapter": adapter},
+        interaction_runtimes={"terminal": _RootRuntime()},
+        feature_store=_FeatureStore(),
+    )
+
+    async def _fake_run(task, *_args, **_kwargs):
+        if isinstance(task, Ask) and task.output_type is ReproductionResult:
+            return ReproductionResult(
+                reproduced=False,
+                summary="Could not reproduce",
+                checks=[
+                    Check(
+                        criterion="evidence:command_output",
+                        result="satisfied",
+                        detail="Attached command log showing the flow stayed stable.",
+                    )
+                ],
+                proof=EvidenceBundle(
+                    ui_involved=True,
+                    evidence_modes=["ui", "logs"],
+                    summary="No repro with trace, screenshot, and command output.",
+                    artifacts=[
+                        EvidenceArtifact(kind="trace", label="trace.zip", local_path=str(trace_file)),
+                        EvidenceArtifact(kind="screenshot", label="after.png", local_path=str(shot_file)),
+                        EvidenceArtifact(kind="command_output", label="check.log", local_path=str(log_file)),
+                    ],
+                ),
+            )
+        raise AssertionError(f"Unexpected task: {task!r}")
+
+    runner.run = _fake_run
+    monkeypatch.setattr(queue_module, "_get_feature_root", lambda *_args, **_kwargs: main_root)
+
+    phase = queue_module.BugflowQueuePhase()
+    await phase._process_report(runner, feature, report.report_id)
+
+    saved = queue_module.parse_model(
+        artifacts.values[(feature.id, report_key(report.report_id))],
+        queue_module.BugflowReportSnapshot,
+    )
+    reproduce_record = queue_module.parse_model(
+        artifacts.values[(feature.id, queue_module.proof_key(report.report_id, "reproduce"))],
+        queue_module.BugflowProofRecord,
+    )
+    assert isinstance(saved, queue_module.BugflowReportSnapshot)
+    assert isinstance(reproduce_record, queue_module.BugflowProofRecord)
+    assert saved.status == "resolved-no-repro"
+    assert reproduce_record.checks[0].criterion == "evidence:command_output"
+    assert reproduce_record.checks[0].result == "satisfied"
+
+
+@pytest.mark.asyncio
+async def test_process_report_rejects_no_repro_without_required_non_core_coverage(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    feature = _feature()
+    artifacts = _Artifacts()
+    adapter = _Adapter()
+    report = _report(
+        "BR-2202C",
+        status="validation_pending",
+        category="bug",
+        summary="Non-core reproduction coverage is required.",
+    )
+    report.strategy_required_evidence_modes = ["command_output"]
+    await artifacts.put(report_key(report.report_id), report.model_dump_json(), feature=feature)
+
+    main_root = tmp_path / "main" / "repos"
+    main_root.mkdir(parents=True, exist_ok=True)
+    log_file = tmp_path / "check.log"
+    log_file.write_text("ok", encoding="utf-8")
+
+    runner = SimpleNamespace(
+        artifacts=artifacts,
+        services={"slack_adapter": adapter},
+        interaction_runtimes={"terminal": _RootRuntime()},
+        feature_store=_FeatureStore(),
+    )
+
+    async def _fake_run(task, *_args, **_kwargs):
+        if isinstance(task, Ask) and task.output_type is ReproductionResult:
+            return ReproductionResult(
+                reproduced=False,
+                summary="Could not reproduce.",
+                proof=EvidenceBundle(
+                    summary="No repro but structured coverage omitted.",
+                    evidence_modes=["logs"],
+                    artifacts=[
+                        EvidenceArtifact(kind="command_output", label="check.log", local_path=str(log_file)),
+                    ],
+                ),
+            )
+        raise AssertionError(f"Unexpected task: {task!r}")
+
+    runner.run = _fake_run
+    monkeypatch.setattr(queue_module, "_get_feature_root", lambda *_args, **_kwargs: main_root)
+
+    phase = queue_module.BugflowQueuePhase()
+    await phase._process_report(runner, feature, report.report_id)
+
+    saved = queue_module.parse_model(
+        artifacts.values[(feature.id, report_key(report.report_id))],
+        queue_module.BugflowReportSnapshot,
+    )
+    assert isinstance(saved, queue_module.BugflowReportSnapshot)
+    assert saved.status == "validation_pending"
+    assert "agent validation for evidence:command_output" in saved.validation_summary
+
+
+@pytest.mark.asyncio
 async def test_process_report_records_terminal_proof_for_approved_validation(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -622,6 +763,104 @@ def test_missing_terminal_proof_requires_backend_postcondition_for_state_change(
     )
 
     assert "independent postcondition evidence" in missing
+
+
+def test_requested_terminal_evidence_preserves_non_core_strategy_directives():
+    report = _report(
+        "BR-9945",
+        status="active_fix",
+        category="bug",
+        summary="Inspector callables should retain signatures and persist.",
+    )
+    report.ui_involved = True
+    report.evidence_modes = ["ui", "repo", "database", "api", "logs", "shell", "build"]
+    report.strategy_required_evidence_modes = ["command_output", "ui", "api", "database"]
+
+    bundle = EvidenceBundle(
+        ui_involved=True,
+        evidence_modes=["ui", "api", "database", "logs", "repo"],
+        summary="Promotion proof",
+        state_change=True,
+        artifacts=[
+            EvidenceArtifact(kind="trace", label="trace.zip"),
+            EvidenceArtifact(kind="screenshot", label="after.png"),
+            EvidenceArtifact(kind="api_response", role="postcondition", label="api.json"),
+            EvidenceArtifact(kind="database_query", role="verification", label="db.txt"),
+            EvidenceArtifact(kind="network_log", role="verification", label="network.txt"),
+            EvidenceArtifact(kind="command_output", role="verification", label="vitest.log"),
+            EvidenceArtifact(kind="snapshot", role="verification", label="snapshot.md"),
+            EvidenceArtifact(kind="ui_state", role="verification", label="ui.json"),
+        ],
+    )
+
+    requested = queue_module._requested_terminal_evidence_for_report(report)
+    required_core = queue_module._required_terminal_core_surfaces_for_report(report, bundle)
+    missing = queue_module._missing_terminal_proof_requirements(report, bundle)
+    detail = queue_module._proof_policy_detail_text(
+        report,
+        bundle,
+        missing,
+        Verdict(
+            approved=True,
+            summary="Looks good.",
+            checks=[
+                Check(
+                    criterion="evidence:command_output",
+                    result="satisfied",
+                    detail="Attached vitest.log command output.",
+                )
+            ],
+            concerns=[],
+            suggestions=[],
+            gaps=[],
+            proof=bundle,
+        ),
+    )
+
+    assert requested == ["ui", "command_output", "api", "database"]
+    assert required_core == ["ui", "logs", "api", "database"]
+    assert missing == []
+    assert "Requested evidence directives: ui, command_output, api, database." in detail
+    assert "Required core proof surfaces: ui, logs, api, database." in detail
+    assert "Provided proof surfaces: ui, api, database, logs." in detail
+    assert "Non-core directive coverage: command_output=satisfied (Attached vitest.log command output.)." in detail
+    assert "Declared without matching artifacts: repo." in detail
+
+
+def test_fallback_terminal_contract_can_require_logs_and_repo_without_history_drift():
+    report = _report(
+        "BR-9950",
+        status="active_fix",
+        category="bug",
+        summary="Build config changes are not applied and server logs show a timeout during deploy.",
+    )
+    report.ui_involved = False
+    report.evidence_modes = ["ui", "database", "api"]
+
+    requested = queue_module._requested_terminal_evidence_for_report(report)
+    required_core = queue_module._required_terminal_core_surfaces_for_report(report)
+
+    assert "logs" in requested
+    assert "repo" in requested
+    assert "logs" in required_core
+    assert "repo" in required_core
+
+
+def test_read_only_report_does_not_gain_state_change_requirements_from_historical_modes():
+    report = _report(
+        "BR-9951",
+        status="active_fix",
+        category="bug",
+        summary="Viewing the dependency graph page should not show a stale node.",
+    )
+    report.ui_involved = True
+    report.evidence_modes = ["api", "database", "logs", "repo"]
+
+    requested = queue_module._requested_terminal_evidence_for_report(report)
+    required_core = queue_module._required_terminal_core_surfaces_for_report(report)
+
+    assert requested == ["ui"]
+    assert required_core == ["ui"]
 
 
 @pytest.mark.asyncio
@@ -2043,6 +2282,162 @@ async def test_recover_retryable_blocked_report_skips_human_attention(
 
 
 @pytest.mark.asyncio
+async def test_recover_retryable_blocked_report_recovers_non_exhausted_proof_policy_block(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    feature = _feature()
+    artifacts = _Artifacts()
+    adapter = _Adapter()
+    main_root = tmp_path / "main" / "repos"
+    main_root.mkdir(parents=True, exist_ok=True)
+
+    report = _report("BR-proof-recover", status="blocked", category="bug", summary="Promotion proof was captured incorrectly")
+    report.current_step = "Lane blocked"
+    report.lane_id = "L-proof-recover"
+    report.cluster_id = "C-proof-recover"
+    report.terminal_reason_kind = "proof-policy"
+    report.terminal_reason_summary = "Promotion verification was missing required proof for BR-proof-recover"
+    report.last_failure_kind = "proof-policy"
+    report.last_failure_reason = report.terminal_reason_summary
+    report.strategy_required_evidence_modes = ["command_output", "ui", "api", "database"]
+    cluster = queue_module.BugflowClusterSnapshot(
+        cluster_id="C-proof-recover",
+        report_ids=[report.report_id],
+        lane_id="L-proof-recover",
+        status="blocked",
+        current_phase="blocked",
+        attempt_number=2,
+    )
+    lane = BugflowLaneSnapshot(
+        lane_id="L-proof-recover",
+        report_ids=[report.report_id],
+        category="bug",
+        source_cluster_id=cluster.cluster_id,
+        status="blocked",
+        workspace_root=str(tmp_path / "proof-recover-lane"),
+        lane_attempt=2,
+        promotion_status="blocked",
+        promotion_proof_capture_attempt=0,
+        wait_reason="Promotion verification was missing required proof for BR-proof-recover",
+    )
+
+    await artifacts.put(report_key(report.report_id), report.model_dump_json(), feature=feature)
+    await artifacts.put(lane_key(lane.lane_id), lane.model_dump_json(), feature=feature)
+    await artifacts.put(queue_module.cluster_key(cluster.cluster_id), cluster.model_dump_json(), feature=feature)
+
+    runner = SimpleNamespace(
+        artifacts=artifacts,
+        services={"slack_adapter": adapter},
+        feature_store=_FeatureStore(),
+    )
+
+    monkeypatch.setattr(queue_module, "_get_feature_root", lambda *_args, **_kwargs: main_root)
+
+    phase = queue_module.BugflowQueuePhase()
+    await phase._recover_retryable_blocked_reports(runner, feature, [report], [lane])
+
+    saved_lane = queue_module.parse_model(
+        artifacts.values[(feature.id, lane_key(lane.lane_id))],
+        queue_module.BugflowLaneSnapshot,
+    )
+    saved_report = queue_module.parse_model(
+        artifacts.values[(feature.id, report_key(report.report_id))],
+        queue_module.BugflowReportSnapshot,
+    )
+    saved_cluster = queue_module.parse_model(
+        artifacts.values[(feature.id, queue_module.cluster_key(cluster.cluster_id))],
+        queue_module.BugflowClusterSnapshot,
+    )
+
+    assert isinstance(saved_lane, queue_module.BugflowLaneSnapshot)
+    assert isinstance(saved_report, queue_module.BugflowReportSnapshot)
+    assert isinstance(saved_cluster, queue_module.BugflowClusterSnapshot)
+    assert saved_lane.status == "verified_pending_promotion"
+    assert saved_lane.promotion_status == "proof-capture-retry"
+    assert saved_lane.promotion_proof_capture_attempt == 1
+    assert saved_report.status == "active_fix"
+    assert saved_report.promotion_status == "proof-capture-retry"
+    assert saved_report.terminal_reason_kind == ""
+    assert saved_report.terminal_reason_summary == ""
+    assert saved_cluster.status == "verified_pending_promotion"
+    assert saved_cluster.current_phase == "promotion_pending"
+
+
+@pytest.mark.asyncio
+async def test_recover_retryable_blocked_report_keeps_exhausted_proof_policy_block_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    feature = _feature()
+    artifacts = _Artifacts()
+    adapter = _Adapter()
+    main_root = tmp_path / "main" / "repos"
+    main_root.mkdir(parents=True, exist_ok=True)
+
+    report = _report("BR-proof-terminal", status="blocked", category="bug", summary="Promotion proof capture exhausted")
+    report.current_step = "Lane blocked"
+    report.lane_id = "L-proof-terminal"
+    report.cluster_id = "C-proof-terminal"
+    report.terminal_reason_kind = "proof-policy"
+    report.terminal_reason_summary = "Promotion verification was missing required proof after 3/3 proof-capture attempts."
+    report.last_failure_kind = "proof-policy"
+    report.last_failure_reason = report.terminal_reason_summary
+    cluster = queue_module.BugflowClusterSnapshot(
+        cluster_id="C-proof-terminal",
+        report_ids=[report.report_id],
+        lane_id="L-proof-terminal",
+        status="blocked",
+        current_phase="blocked",
+        attempt_number=3,
+    )
+    lane = BugflowLaneSnapshot(
+        lane_id="L-proof-terminal",
+        report_ids=[report.report_id],
+        category="bug",
+        source_cluster_id=cluster.cluster_id,
+        status="blocked",
+        workspace_root=str(tmp_path / "proof-terminal-lane"),
+        lane_attempt=3,
+        promotion_status="blocked",
+        promotion_proof_capture_attempt=queue_module._MAX_PROMOTION_PROOF_CAPTURE_RETRIES,
+        wait_reason="Promotion verification was missing required proof after 3/3 proof-capture attempts.",
+    )
+
+    await artifacts.put(report_key(report.report_id), report.model_dump_json(), feature=feature)
+    await artifacts.put(lane_key(lane.lane_id), lane.model_dump_json(), feature=feature)
+    await artifacts.put(queue_module.cluster_key(cluster.cluster_id), cluster.model_dump_json(), feature=feature)
+
+    runner = SimpleNamespace(
+        artifacts=artifacts,
+        services={"slack_adapter": adapter},
+        feature_store=_FeatureStore(),
+    )
+
+    monkeypatch.setattr(queue_module, "_get_feature_root", lambda *_args, **_kwargs: main_root)
+
+    phase = queue_module.BugflowQueuePhase()
+    await phase._recover_retryable_blocked_reports(runner, feature, [report], [lane])
+
+    saved_lane = queue_module.parse_model(
+        artifacts.values[(feature.id, lane_key(lane.lane_id))],
+        queue_module.BugflowLaneSnapshot,
+    )
+    saved_report = queue_module.parse_model(
+        artifacts.values[(feature.id, report_key(report.report_id))],
+        queue_module.BugflowReportSnapshot,
+    )
+
+    assert isinstance(saved_lane, queue_module.BugflowLaneSnapshot)
+    assert isinstance(saved_report, queue_module.BugflowReportSnapshot)
+    assert saved_lane.status == "blocked"
+    assert saved_lane.promotion_status == "blocked"
+    assert saved_lane.promotion_proof_capture_attempt == queue_module._MAX_PROMOTION_PROOF_CAPTURE_RETRIES
+    assert saved_report.status == "blocked"
+    assert saved_report.terminal_reason_kind == "proof-policy"
+
+
+@pytest.mark.asyncio
 async def test_respawn_lane_applied_intent_repairs_cluster_and_report_pointers(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -2120,6 +2515,345 @@ async def test_respawn_lane_applied_intent_repairs_cluster_and_report_pointers(
     assert saved_report.lane_id == "L-new"
     assert saved_cluster.lane_id == "L-new"
     assert saved_cluster.status == "planned"
+
+
+@pytest.mark.asyncio
+async def test_set_cluster_strategy_status_rejects_invalid_decided_state():
+    feature = _feature()
+    artifacts = _Artifacts()
+    cluster = queue_module.BugflowClusterSnapshot(
+        cluster_id="C-invalid-status",
+        report_ids=["BR-invalid-status"],
+        lane_id="L-invalid-status",
+        status="active_fix",
+        current_phase="reverify",
+        strategy_status="pending",
+        stable_bundle_key="bugflow-failure-bundle:C-invalid-status:1",
+    )
+    await artifacts.put(
+        queue_module.cluster_key(cluster.cluster_id),
+        cluster.model_dump_json(),
+        feature=feature,
+    )
+
+    runner = SimpleNamespace(artifacts=artifacts)
+    await queue_module._set_cluster_strategy_status(
+        runner,
+        feature,
+        cluster,
+        status="decided",
+    )
+
+    saved_cluster = queue_module.parse_model(
+        artifacts.values[(feature.id, queue_module.cluster_key(cluster.cluster_id))],
+        queue_module.BugflowClusterSnapshot,
+    )
+    assert isinstance(saved_cluster, queue_module.BugflowClusterSnapshot)
+    assert saved_cluster.strategy_status == ""
+    assert saved_cluster.strategy_decision_key == ""
+    assert saved_cluster.strategy_round == 0
+
+
+@pytest.mark.asyncio
+async def test_respawn_lane_without_strategy_clears_strategy_ownership_on_replacement(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    feature = _feature()
+    artifacts = _Artifacts()
+    main_root = tmp_path / "main" / "repos"
+    main_root.mkdir(parents=True, exist_ok=True)
+
+    report = _report("BR-respawn-clear", status="active_fix", category="bug", summary="Respawn should clear fake strategy")
+    report.cluster_id = "C-respawn-clear"
+    report.lane_id = "L-old-clear"
+    report.strategy_mode = "ordinary_retry"
+    report.strategy_decision_key = "bugflow-strategy:C-respawn-clear:7"
+    report.strategy_reason = "Stale fake strategy state"
+    report.strategy_round = 7
+    report.stable_failure_family = "fake family"
+    report.latest_failure_bundle_key = "bugflow-failure-bundle:C-respawn-clear:7"
+    report.strategy_required_evidence_modes = ["ui"]
+
+    cluster = queue_module.BugflowClusterSnapshot(
+        cluster_id="C-respawn-clear",
+        report_ids=[report.report_id],
+        lane_id="L-old-clear",
+        status="active_fix",
+        current_phase="reverify",
+        strategy_status="decided",
+        strategy_mode="ordinary_retry",
+        strategy_decision_key="bugflow-strategy:C-respawn-clear:7",
+        stable_bundle_key="bugflow-failure-bundle:C-respawn-clear:7",
+        stable_failure_family="fake family",
+        strategy_round=7,
+        strategy_reason="Stale fake strategy state",
+        similar_cluster_ids=["C-other"],
+    )
+    old_lane = BugflowLaneSnapshot(
+        lane_id="L-old-clear",
+        report_ids=[report.report_id],
+        category="bug",
+        source_cluster_id=cluster.cluster_id,
+        status="active_fix",
+        workspace_root=str(tmp_path / "old-clear"),
+        base_main_commits_by_repo={"frontend": "abc123"},
+        lock_scope=["file:frontend/src/a.tsx"],
+        repo_paths=["frontend"],
+        lane_attempt=4,
+    )
+
+    await artifacts.put(report_key(report.report_id), report.model_dump_json(), feature=feature)
+    await artifacts.put(queue_module.cluster_key(cluster.cluster_id), cluster.model_dump_json(), feature=feature)
+    await artifacts.put(lane_key(old_lane.lane_id), old_lane.model_dump_json(), feature=feature)
+
+    async def _fake_create_lane_root(_main_root, _feature, lane_id):
+        lane_root = tmp_path / "lanes" / lane_id / "repos"
+        lane_root.mkdir(parents=True, exist_ok=True)
+        return lane_root, {"frontend": f"lane/{lane_id}"}, {"frontend": "def456"}
+
+    monkeypatch.setattr(queue_module, "_get_feature_root", lambda *_args, **_kwargs: main_root)
+    monkeypatch.setattr(queue_module, "_create_lane_worktree_root", _fake_create_lane_root)
+
+    runner = SimpleNamespace(artifacts=artifacts)
+    await queue_module._respawn_lane_from_latest_main(
+        runner,
+        feature,
+        old_lane,
+        "Bridge restarted while this isolated lane was still executing. I respawned it from the latest main bugflow head.",
+    )
+
+    saved_report = queue_module.parse_model(
+        artifacts.values[(feature.id, report_key(report.report_id))],
+        queue_module.BugflowReportSnapshot,
+    )
+    saved_cluster = queue_module.parse_model(
+        artifacts.values[(feature.id, queue_module.cluster_key(cluster.cluster_id))],
+        queue_module.BugflowClusterSnapshot,
+    )
+    assert isinstance(saved_report, queue_module.BugflowReportSnapshot)
+    assert isinstance(saved_cluster, queue_module.BugflowClusterSnapshot)
+    assert saved_report.lane_id != old_lane.lane_id
+    assert saved_cluster.lane_id != old_lane.lane_id
+    assert saved_report.strategy_mode == ""
+    assert saved_report.strategy_decision_key == ""
+    assert saved_report.strategy_round == 0
+    assert saved_report.stable_failure_family == ""
+    assert saved_report.strategy_required_evidence_modes == []
+    assert saved_cluster.strategy_status == ""
+    assert saved_cluster.strategy_mode == ""
+    assert saved_cluster.strategy_decision_key == ""
+    assert saved_cluster.stable_bundle_key == ""
+    assert saved_cluster.strategy_round == 0
+
+
+@pytest.mark.asyncio
+async def test_respawn_lane_preserves_proof_capture_contract_and_budget(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    feature = _feature()
+    artifacts = _Artifacts()
+    main_root = tmp_path / "main" / "repos"
+    main_root.mkdir(parents=True, exist_ok=True)
+
+    report = _report("BR-proof-respawn", status="active_fix", category="bug", summary="Respawn should preserve proof capture")
+    report.cluster_id = "C-proof-respawn"
+    report.lane_id = "L-old-proof"
+    report.promotion_status = "proof-capture-retry"
+    report.strategy_mode = "ordinary_retry"
+    report.strategy_decision_key = "bugflow-strategy:C-proof-respawn:7"
+    report.strategy_reason = "Stale fake strategy state"
+    report.strategy_round = 7
+    report.stable_failure_family = "fake family"
+    report.latest_failure_bundle_key = "bugflow-failure-bundle:C-proof-respawn:7"
+    report.strategy_required_evidence_modes = ["ui", "command_output"]
+
+    cluster = queue_module.BugflowClusterSnapshot(
+        cluster_id="C-proof-respawn",
+        report_ids=[report.report_id],
+        lane_id="L-old-proof",
+        status="promoting",
+        current_phase="reverify",
+        strategy_status="decided",
+        strategy_mode="ordinary_retry",
+        strategy_decision_key="bugflow-strategy:C-proof-respawn:7",
+        stable_bundle_key="bugflow-failure-bundle:C-proof-respawn:7",
+        stable_failure_family="fake family",
+        strategy_round=7,
+        strategy_reason="Stale fake strategy state",
+        similar_cluster_ids=["C-other"],
+    )
+    old_lane = BugflowLaneSnapshot(
+        lane_id="L-old-proof",
+        report_ids=[report.report_id],
+        category="bug",
+        source_cluster_id=cluster.cluster_id,
+        status="promoting",
+        promotion_status="proof-capture-retry",
+        promotion_proof_capture_attempt=2,
+        latest_fix_summary="Keep callable signatures stable.",
+        latest_verify_summary="Promotion candidate is correct but needs better proof.",
+        modified_files=["frontend/src/inspector.tsx"],
+        workspace_root=str(tmp_path / "old-proof"),
+        base_main_commits_by_repo={"frontend": "abc123"},
+        lock_scope=["file:frontend/src/inspector.tsx"],
+        repo_paths=["frontend"],
+        lane_attempt=4,
+    )
+
+    await artifacts.put(report_key(report.report_id), report.model_dump_json(), feature=feature)
+    await artifacts.put(queue_module.cluster_key(cluster.cluster_id), cluster.model_dump_json(), feature=feature)
+    await artifacts.put(lane_key(old_lane.lane_id), old_lane.model_dump_json(), feature=feature)
+
+    async def _fake_create_lane_root(_main_root, _feature, lane_id):
+        lane_root = tmp_path / "lanes" / lane_id / "repos"
+        lane_root.mkdir(parents=True, exist_ok=True)
+        return lane_root, {"frontend": f"lane/{lane_id}"}, {"frontend": "def456"}
+
+    monkeypatch.setattr(queue_module, "_get_feature_root", lambda *_args, **_kwargs: main_root)
+    monkeypatch.setattr(queue_module, "_create_lane_worktree_root", _fake_create_lane_root)
+
+    runner = SimpleNamespace(artifacts=artifacts)
+    await queue_module._respawn_lane_from_latest_main(
+        runner,
+        feature,
+        old_lane,
+        "Bridge restarted while this isolated lane was being promoted. I respawned it from the latest main bugflow head.",
+    )
+
+    saved_report = queue_module.parse_model(
+        artifacts.values[(feature.id, report_key(report.report_id))],
+        queue_module.BugflowReportSnapshot,
+    )
+    saved_old_lane = queue_module.parse_model(
+        artifacts.values[(feature.id, lane_key(old_lane.lane_id))],
+        queue_module.BugflowLaneSnapshot,
+    )
+    saved_new_lane = queue_module.parse_model(
+        artifacts.values[(feature.id, lane_key(saved_report.lane_id))],
+        queue_module.BugflowLaneSnapshot,
+    )
+    saved_cluster = queue_module.parse_model(
+        artifacts.values[(feature.id, queue_module.cluster_key(cluster.cluster_id))],
+        queue_module.BugflowClusterSnapshot,
+    )
+    assert isinstance(saved_report, queue_module.BugflowReportSnapshot)
+    assert isinstance(saved_old_lane, queue_module.BugflowLaneSnapshot)
+    assert isinstance(saved_new_lane, queue_module.BugflowLaneSnapshot)
+    assert isinstance(saved_cluster, queue_module.BugflowClusterSnapshot)
+    assert saved_new_lane.lane_id != old_lane.lane_id
+    assert saved_new_lane.status == "verified_pending_promotion"
+    assert saved_new_lane.promotion_status == "proof-capture-retry"
+    assert saved_new_lane.promotion_proof_capture_attempt == 2
+    assert saved_new_lane.latest_fix_summary == "Keep callable signatures stable."
+    assert saved_old_lane.status == "superseded"
+    assert saved_old_lane.promotion_status == "respawned"
+    assert saved_old_lane.promotion_proof_capture_attempt == 2
+    assert saved_report.status == "active_fix"
+    assert saved_report.promotion_status == "proof-capture-retry"
+    assert saved_report.strategy_required_evidence_modes == ["ui", "command_output"]
+    assert saved_report.strategy_mode == ""
+    assert saved_report.strategy_decision_key == ""
+    assert saved_cluster.status == "verified_pending_promotion"
+    assert saved_cluster.current_phase == "promotion_pending"
+    assert saved_cluster.strategy_status == ""
+
+
+@pytest.mark.asyncio
+async def test_recover_stale_active_lane_normalizes_invalid_strategy_checkpoint_then_respawns(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    feature = _feature()
+    artifacts = _Artifacts()
+    adapter = _Adapter()
+    report = _report("BR-self-heal", status="active_fix", category="bug", summary="Self-heal invalid strategy checkpoint")
+    report.cluster_id = "C-self-heal"
+    report.lane_id = "L-self-heal"
+    report.strategy_mode = "ordinary_retry"
+    report.strategy_decision_key = "bugflow-strategy:C-self-heal:0"
+    report.strategy_reason = "Invalid stale state"
+    report.strategy_round = 0
+    report.stable_failure_family = "fake family"
+    report.latest_failure_bundle_key = "bugflow-failure-bundle:C-self-heal:1"
+    report.strategy_required_evidence_modes = ["ui"]
+
+    cluster = queue_module.BugflowClusterSnapshot(
+        cluster_id="C-self-heal",
+        report_ids=[report.report_id],
+        lane_id="L-self-heal",
+        status="active_fix",
+        current_phase="reverify",
+        strategy_status="decided",
+        strategy_mode="ordinary_retry",
+        strategy_decision_key="",
+        stable_bundle_key="",
+        stable_failure_family="fake family",
+        strategy_round=0,
+        strategy_reason="Invalid stale state",
+    )
+    stale_lane = BugflowLaneSnapshot(
+        lane_id="L-self-heal",
+        report_ids=[report.report_id],
+        category="bug",
+        source_cluster_id=cluster.cluster_id,
+        status="active_verify",
+        current_phase="fixing",
+        workspace_root=str(tmp_path / "self-heal-lane"),
+        base_main_commits_by_repo={"frontend": "abc123"},
+    )
+
+    await artifacts.put(report_key(report.report_id), report.model_dump_json(), feature=feature)
+    await artifacts.put(queue_module.cluster_key(cluster.cluster_id), cluster.model_dump_json(), feature=feature)
+    await artifacts.put(lane_key(stale_lane.lane_id), stale_lane.model_dump_json(), feature=feature)
+    await artifacts.put(
+        report.latest_failure_bundle_key,
+        json.dumps({"cluster_id": cluster.cluster_id, "strategy_round": 1}),
+        feature=feature,
+    )
+
+    async def _fake_create_lane_root(_main_root, _feature, lane_id):
+        lane_root = tmp_path / "lanes" / lane_id / "repos"
+        lane_root.mkdir(parents=True, exist_ok=True)
+        return lane_root, {"frontend": f"lane/{lane_id}"}, {"frontend": "def456"}
+
+    monkeypatch.setattr(queue_module, "_get_feature_root", lambda *_args, **_kwargs: tmp_path / "main" / "repos")
+    monkeypatch.setattr(queue_module, "_create_lane_worktree_root", _fake_create_lane_root)
+
+    runner = SimpleNamespace(
+        artifacts=artifacts,
+        services={"slack_adapter": adapter},
+        feature_store=_FeatureStore(),
+    )
+
+    phase = queue_module.BugflowQueuePhase()
+    await phase._recover_stale_execution_state(runner, feature, [stale_lane])
+
+    saved_report = queue_module.parse_model(
+        artifacts.values[(feature.id, report_key(report.report_id))],
+        queue_module.BugflowReportSnapshot,
+    )
+    saved_cluster = queue_module.parse_model(
+        artifacts.values[(feature.id, queue_module.cluster_key(cluster.cluster_id))],
+        queue_module.BugflowClusterSnapshot,
+    )
+    saved_old_lane = queue_module.parse_model(
+        artifacts.values[(feature.id, lane_key(stale_lane.lane_id))],
+        queue_module.BugflowLaneSnapshot,
+    )
+    assert isinstance(saved_report, queue_module.BugflowReportSnapshot)
+    assert isinstance(saved_cluster, queue_module.BugflowClusterSnapshot)
+    assert isinstance(saved_old_lane, queue_module.BugflowLaneSnapshot)
+    assert saved_old_lane.status == "superseded"
+    assert saved_report.status == "queued"
+    assert saved_report.lane_id != stale_lane.lane_id
+    assert saved_report.strategy_mode == ""
+    assert saved_report.strategy_decision_key == ""
+    assert saved_report.latest_failure_bundle_key == "bugflow-failure-bundle:C-self-heal:1"
+    assert saved_cluster.strategy_status == ""
+    assert saved_cluster.strategy_decision_key == ""
+    assert saved_cluster.strategy_round == 0
 
 
 @pytest.mark.asyncio
@@ -2702,6 +3436,546 @@ async def test_promote_lane_respawns_on_verification_failure_when_budget_remains
     assert saved_cluster.attempt_number == 2
     assert any("attempt 1/50 failed in promotion verification" in message[1].lower() for message in adapter.messages)
     assert any("switching to ordinary retry mode" in message[1].lower() for message in adapter.messages)
+
+
+@pytest.mark.asyncio
+async def test_promote_lane_retries_proof_capture_when_promotion_verdict_is_approved(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    feature = _feature()
+    artifacts = _Artifacts()
+    adapter = _Adapter()
+    main_root = tmp_path / "main" / "repos"
+    main_root.mkdir(parents=True, exist_ok=True)
+    lane_root = tmp_path / "lane-proof"
+    lane_root.mkdir(parents=True, exist_ok=True)
+    promotion_root = tmp_path / "promotion-proof"
+    promotion_root.mkdir(parents=True, exist_ok=True)
+
+    report = _report("BR-8003", status="active_fix", category="bug", summary="Callable inspector state regresses")
+    report.ui_involved = True
+    report.lane_id = "L-proof-retry"
+    report.cluster_id = "C-proof-retry"
+    report.strategy_required_evidence_modes = ["ui", "api", "command_output"]
+    cluster = queue_module.BugflowClusterSnapshot(
+        cluster_id="C-proof-retry",
+        report_ids=[report.report_id],
+        lane_id="L-proof-retry",
+        status="verified_pending_promotion",
+        current_phase="reverify",
+        attempt_number=1,
+    )
+    lane = BugflowLaneSnapshot(
+        lane_id="L-proof-retry",
+        report_ids=[report.report_id],
+        category="bug",
+        source_cluster_id=cluster.cluster_id,
+        status="verified_pending_promotion",
+        promotion_status="queued",
+        workspace_root=str(lane_root),
+        base_main_commits_by_repo={"frontend": "abc123"},
+    )
+
+    await artifacts.put(report_key(report.report_id), report.model_dump_json(), feature=feature)
+    await artifacts.put(lane_key(lane.lane_id), lane.model_dump_json(), feature=feature)
+    await artifacts.put(queue_module.cluster_key(cluster.cluster_id), cluster.model_dump_json(), feature=feature)
+
+    runner = SimpleNamespace(
+        artifacts=artifacts,
+        services={"slack_adapter": adapter},
+        feature_store=_FeatureStore(),
+    )
+    runner.run = AsyncMock(side_effect=AssertionError("No strategy decision should run for proof-capture retry"))
+
+    async def _fake_create_promotion_root(_main_root, _feature, _lane):
+        return promotion_root, {}, {}
+
+    async def _fake_verify(*_args, **_kwargs):
+        return Verdict(
+            approved=True,
+            summary="Promotion candidate is correct but proof is incomplete.",
+            concerns=[],
+            suggestions=[],
+            checks=[],
+            gaps=[],
+            proof=EvidenceBundle(
+                ui_involved=True,
+                evidence_modes=["ui", "api"],
+                summary="Captured screenshots but missed API postcondition proof.",
+                state_change=True,
+                artifacts=[
+                    EvidenceArtifact(kind="trace", label="trace.zip"),
+                    EvidenceArtifact(kind="screenshot", label="after.png"),
+                ],
+            ),
+        )
+
+    monkeypatch.setattr(queue_module, "_get_feature_root", lambda *_args, **_kwargs: main_root)
+    monkeypatch.setattr(queue_module, "_create_promotion_worktree_root", _fake_create_promotion_root)
+    monkeypatch.setattr(queue_module, "_lane_commit_sequences", lambda *_args, **_kwargs: asyncio.sleep(0, result={"frontend": ["abc"]}))
+    monkeypatch.setattr(queue_module, "_cherry_pick_lane_commits", lambda *_args, **_kwargs: asyncio.sleep(0))
+    monkeypatch.setattr(queue_module, "_promotion_verify_lane", _fake_verify)
+
+    phase = queue_module.BugflowQueuePhase()
+    await phase._promote_lane(runner, feature, lane.lane_id)
+
+    saved_lane = queue_module.parse_model(
+        artifacts.values[(feature.id, lane_key(lane.lane_id))],
+        queue_module.BugflowLaneSnapshot,
+    )
+    saved_report = queue_module.parse_model(
+        artifacts.values[(feature.id, report_key(report.report_id))],
+        queue_module.BugflowReportSnapshot,
+    )
+    saved_cluster = queue_module.parse_model(
+        artifacts.values[(feature.id, queue_module.cluster_key(cluster.cluster_id))],
+        queue_module.BugflowClusterSnapshot,
+    )
+
+    assert isinstance(saved_lane, queue_module.BugflowLaneSnapshot)
+    assert isinstance(saved_report, queue_module.BugflowReportSnapshot)
+    assert isinstance(saved_cluster, queue_module.BugflowClusterSnapshot)
+    assert saved_lane.status == "verified_pending_promotion"
+    assert saved_lane.promotion_status == "proof-capture-retry"
+    assert saved_lane.promotion_proof_capture_attempt == 1
+    assert saved_report.status == "active_fix"
+    assert saved_report.promotion_status == "proof-capture-retry"
+    assert saved_report.attempts_used == 0
+    assert saved_report.last_failure_kind == "proof-policy"
+    assert saved_cluster.status == "verified_pending_promotion"
+    assert saved_cluster.current_phase == "promotion_pending"
+    assert "required proof" in saved_report.validation_summary.lower()
+    assert "evidence:command_output" in saved_report.validation_summary
+    assert any("i need stronger proof" in message[1].lower() for message in adapter.messages)
+
+
+@pytest.mark.asyncio
+async def test_promote_lane_blocks_when_proof_capture_retry_budget_is_exhausted(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    feature = _feature()
+    artifacts = _Artifacts()
+    adapter = _Adapter()
+    main_root = tmp_path / "main" / "repos"
+    main_root.mkdir(parents=True, exist_ok=True)
+    lane_root = tmp_path / "lane-proof-blocked"
+    lane_root.mkdir(parents=True, exist_ok=True)
+    promotion_root = tmp_path / "promotion-proof-blocked"
+    promotion_root.mkdir(parents=True, exist_ok=True)
+
+    report = _report("BR-8004", status="active_fix", category="bug", summary="Callable inspector state regresses")
+    report.ui_involved = True
+    report.lane_id = "L-proof-blocked"
+    report.cluster_id = "C-proof-blocked"
+    report.strategy_required_evidence_modes = ["ui", "api"]
+    cluster = queue_module.BugflowClusterSnapshot(
+        cluster_id="C-proof-blocked",
+        report_ids=[report.report_id],
+        lane_id="L-proof-blocked",
+        status="verified_pending_promotion",
+        current_phase="reverify",
+        attempt_number=1,
+    )
+    lane = BugflowLaneSnapshot(
+        lane_id="L-proof-blocked",
+        report_ids=[report.report_id],
+        category="bug",
+        source_cluster_id=cluster.cluster_id,
+        status="verified_pending_promotion",
+        promotion_status="queued",
+        promotion_proof_capture_attempt=queue_module._MAX_PROMOTION_PROOF_CAPTURE_RETRIES,
+        workspace_root=str(lane_root),
+        base_main_commits_by_repo={"frontend": "abc123"},
+    )
+
+    await artifacts.put(report_key(report.report_id), report.model_dump_json(), feature=feature)
+    await artifacts.put(lane_key(lane.lane_id), lane.model_dump_json(), feature=feature)
+    await artifacts.put(queue_module.cluster_key(cluster.cluster_id), cluster.model_dump_json(), feature=feature)
+
+    runner = SimpleNamespace(
+        artifacts=artifacts,
+        services={"slack_adapter": adapter},
+        feature_store=_FeatureStore(),
+    )
+    runner.run = AsyncMock(side_effect=AssertionError("No strategy decision should run for proof-policy terminal block"))
+
+    async def _fake_create_promotion_root(_main_root, _feature, _lane):
+        return promotion_root, {}, {}
+
+    async def _fake_verify(*_args, **_kwargs):
+        return Verdict(
+            approved=True,
+            summary="Promotion candidate is correct but proof is incomplete.",
+            concerns=[],
+            suggestions=[],
+            checks=[],
+            gaps=[],
+            proof=EvidenceBundle(
+                ui_involved=True,
+                evidence_modes=["ui", "api"],
+                summary="Still missing API evidence.",
+                state_change=True,
+                artifacts=[
+                    EvidenceArtifact(kind="trace", label="trace.zip"),
+                    EvidenceArtifact(kind="screenshot", label="after.png"),
+                ],
+            ),
+        )
+
+    monkeypatch.setattr(queue_module, "_get_feature_root", lambda *_args, **_kwargs: main_root)
+    monkeypatch.setattr(queue_module, "_create_promotion_worktree_root", _fake_create_promotion_root)
+    monkeypatch.setattr(queue_module, "_lane_commit_sequences", lambda *_args, **_kwargs: asyncio.sleep(0, result={"frontend": ["abc"]}))
+    monkeypatch.setattr(queue_module, "_cherry_pick_lane_commits", lambda *_args, **_kwargs: asyncio.sleep(0))
+    monkeypatch.setattr(queue_module, "_promotion_verify_lane", _fake_verify)
+
+    phase = queue_module.BugflowQueuePhase()
+    await phase._promote_lane(runner, feature, lane.lane_id)
+
+    saved_lane = queue_module.parse_model(
+        artifacts.values[(feature.id, lane_key(lane.lane_id))],
+        queue_module.BugflowLaneSnapshot,
+    )
+    saved_report = queue_module.parse_model(
+        artifacts.values[(feature.id, report_key(report.report_id))],
+        queue_module.BugflowReportSnapshot,
+    )
+
+    assert isinstance(saved_lane, queue_module.BugflowLaneSnapshot)
+    assert isinstance(saved_report, queue_module.BugflowReportSnapshot)
+    assert saved_lane.status == "blocked"
+    assert saved_report.status == "blocked"
+    assert saved_report.terminal_reason_kind == "proof-policy"
+
+
+@pytest.mark.asyncio
+async def test_promote_lane_proof_capture_budget_is_independent_from_normal_promotion_attempts(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    feature = _feature()
+    artifacts = _Artifacts()
+    adapter = _Adapter()
+    main_root = tmp_path / "main" / "repos"
+    main_root.mkdir(parents=True, exist_ok=True)
+    lane_root = tmp_path / "lane-proof-independent"
+    lane_root.mkdir(parents=True, exist_ok=True)
+    promotion_root = tmp_path / "promotion-proof-independent"
+    promotion_root.mkdir(parents=True, exist_ok=True)
+
+    report = _report("BR-8005", status="active_fix", category="bug", summary="Callable inspector state regresses")
+    report.ui_involved = True
+    report.lane_id = "L-proof-independent"
+    report.cluster_id = "C-proof-independent"
+    report.strategy_required_evidence_modes = ["ui", "api", "command_output"]
+    cluster = queue_module.BugflowClusterSnapshot(
+        cluster_id="C-proof-independent",
+        report_ids=[report.report_id],
+        lane_id="L-proof-independent",
+        status="verified_pending_promotion",
+        current_phase="reverify",
+        attempt_number=1,
+    )
+    lane = BugflowLaneSnapshot(
+        lane_id="L-proof-independent",
+        report_ids=[report.report_id],
+        category="bug",
+        source_cluster_id=cluster.cluster_id,
+        status="verified_pending_promotion",
+        promotion_status="queued",
+        promotion_attempt=5,
+        promotion_proof_capture_attempt=0,
+        workspace_root=str(lane_root),
+        base_main_commits_by_repo={"frontend": "abc123"},
+    )
+
+    await artifacts.put(report_key(report.report_id), report.model_dump_json(), feature=feature)
+    await artifacts.put(lane_key(lane.lane_id), lane.model_dump_json(), feature=feature)
+    await artifacts.put(queue_module.cluster_key(cluster.cluster_id), cluster.model_dump_json(), feature=feature)
+
+    runner = SimpleNamespace(
+        artifacts=artifacts,
+        services={"slack_adapter": adapter},
+        feature_store=_FeatureStore(),
+    )
+    runner.run = AsyncMock(side_effect=AssertionError("No strategy decision should run for proof-capture retry"))
+
+    async def _fake_create_promotion_root(_main_root, _feature, _lane):
+        return promotion_root, {}, {}
+
+    async def _fake_verify(*_args, **_kwargs):
+        return Verdict(
+            approved=True,
+            summary="Promotion candidate is correct but proof is incomplete.",
+            concerns=[],
+            suggestions=[],
+            checks=[],
+            gaps=[],
+            proof=EvidenceBundle(
+                ui_involved=True,
+                evidence_modes=["ui", "api"],
+                summary="Still missing directive coverage.",
+                state_change=True,
+                artifacts=[
+                    EvidenceArtifact(kind="trace", label="trace.zip"),
+                    EvidenceArtifact(kind="screenshot", label="after.png"),
+                    EvidenceArtifact(kind="api_response", role="postcondition", label="api.json"),
+                ],
+            ),
+        )
+
+    monkeypatch.setattr(queue_module, "_get_feature_root", lambda *_args, **_kwargs: main_root)
+    monkeypatch.setattr(queue_module, "_create_promotion_worktree_root", _fake_create_promotion_root)
+    monkeypatch.setattr(queue_module, "_lane_commit_sequences", lambda *_args, **_kwargs: asyncio.sleep(0, result={"frontend": ["abc"]}))
+    monkeypatch.setattr(queue_module, "_cherry_pick_lane_commits", lambda *_args, **_kwargs: asyncio.sleep(0))
+    monkeypatch.setattr(queue_module, "_promotion_verify_lane", _fake_verify)
+
+    phase = queue_module.BugflowQueuePhase()
+    await phase._promote_lane(runner, feature, lane.lane_id)
+
+    saved_lane = queue_module.parse_model(
+        artifacts.values[(feature.id, lane_key(lane.lane_id))],
+        queue_module.BugflowLaneSnapshot,
+    )
+
+    assert isinstance(saved_lane, queue_module.BugflowLaneSnapshot)
+    assert saved_lane.status == "verified_pending_promotion"
+    assert saved_lane.promotion_status == "proof-capture-retry"
+    assert saved_lane.promotion_attempt == 6
+    assert saved_lane.promotion_proof_capture_attempt == 1
+
+
+@pytest.mark.asyncio
+async def test_retry_missing_promotion_proof_saves_lane_state_before_report_updates(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    feature = _feature()
+    artifacts = _Artifacts()
+    report = _report("BR-proof-order", status="active_fix", category="bug", summary="Crash ordering should preserve degraded state")
+    report.thread_ts = "ts-proof-order"
+    report.strategy_required_evidence_modes = ["command_output"]
+    cluster = queue_module.BugflowClusterSnapshot(
+        cluster_id="C-proof-order",
+        report_ids=[report.report_id],
+        lane_id="L-proof-order",
+        status="promoting",
+        current_phase="promotion",
+    )
+    lane = BugflowLaneSnapshot(
+        lane_id="L-proof-order",
+        report_ids=[report.report_id],
+        category="bug",
+        source_cluster_id=cluster.cluster_id,
+        status="promoting",
+        promotion_status="promoting",
+        promotion_proof_capture_attempt=0,
+        workspace_root=str(tmp_path / "lane-proof-order"),
+        base_main_commits_by_repo={"frontend": "abc123"},
+    )
+
+    await artifacts.put(report_key(report.report_id), report.model_dump_json(), feature=feature)
+    await artifacts.put(lane_key(lane.lane_id), lane.model_dump_json(), feature=feature)
+    await artifacts.put(queue_module.cluster_key(cluster.cluster_id), cluster.model_dump_json(), feature=feature)
+
+    runner = SimpleNamespace(artifacts=artifacts)
+
+    async def _boom(*_args, **_kwargs):
+        raise RuntimeError("simulated crash after lane save")
+
+    monkeypatch.setattr(queue_module, "_reject_missing_terminal_proof", _boom)
+
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        await queue_module._retry_missing_promotion_proof(
+            runner,
+            feature,
+            lane,
+            [report],
+            bundle=EvidenceBundle(
+                summary="Missing command-output directive coverage.",
+                evidence_modes=["logs"],
+                artifacts=[EvidenceArtifact(kind="command_output", label="check.log")],
+            ),
+            missing_by_report_id={report.report_id: ["agent validation for evidence:command_output"]},
+        )
+
+    saved_lane = queue_module.parse_model(
+        artifacts.values[(feature.id, lane_key(lane.lane_id))],
+        queue_module.BugflowLaneSnapshot,
+    )
+    saved_report = queue_module.parse_model(
+        artifacts.values[(feature.id, report_key(report.report_id))],
+        queue_module.BugflowReportSnapshot,
+    )
+    saved_cluster = queue_module.parse_model(
+        artifacts.values[(feature.id, queue_module.cluster_key(cluster.cluster_id))],
+        queue_module.BugflowClusterSnapshot,
+    )
+    phase = queue_module.BugflowQueuePhase()
+    queue = await phase._write_queue_snapshot(
+        runner,
+        feature,
+        [saved_report],
+        [saved_lane],
+        [saved_cluster],
+    )
+
+    assert isinstance(saved_lane, queue_module.BugflowLaneSnapshot)
+    assert isinstance(saved_report, queue_module.BugflowReportSnapshot)
+    assert isinstance(saved_cluster, queue_module.BugflowClusterSnapshot)
+    assert saved_lane.promotion_status == "proof-capture-retry"
+    assert saved_lane.promotion_proof_capture_attempt == 1
+    assert queue.health == "degraded"
+    assert queue.proof_capture_retry_lane_ids == [lane.lane_id]
+
+
+@pytest.mark.asyncio
+async def test_build_cluster_failure_bundle_reuses_persisted_non_core_proof_checks():
+    feature = _feature()
+    artifacts = _Artifacts()
+    report = _report("BR-proof-bundle", status="active_fix", category="bug", summary="Need replay-safe proof diagnostics")
+    report.lane_id = "L-proof-bundle"
+    report.cluster_id = "C-proof-bundle"
+    report.latest_proof_key = queue_module.proof_key(report.report_id, "promotion-verify")
+    report.strategy_required_evidence_modes = ["ui", "command_output"]
+    cluster = queue_module.BugflowClusterSnapshot(
+        cluster_id="C-proof-bundle",
+        report_ids=[report.report_id],
+        lane_id="L-proof-bundle",
+        status="active_fix",
+        current_phase="reverify",
+    )
+    lane = BugflowLaneSnapshot(
+        lane_id="L-proof-bundle",
+        report_ids=[report.report_id],
+        category="bug",
+        source_cluster_id=cluster.cluster_id,
+        status="active_verify",
+    )
+    proof_record = queue_module.BugflowProofRecord(
+        report_id=report.report_id,
+        stage="promotion-verify",
+        storage_stage="promotion-verify-live",
+        bundle=EvidenceBundle(
+            ui_involved=False,
+            evidence_modes=["ui", "logs"],
+            summary="Promotion replay proof",
+            artifacts=[
+                EvidenceArtifact(kind="trace", label="trace.zip"),
+                EvidenceArtifact(kind="screenshot", label="after.png"),
+                EvidenceArtifact(kind="command_output", label="check.log"),
+            ],
+        ),
+        checks=[
+            Check(
+                criterion="evidence:command_output",
+                result="satisfied",
+                detail="check.log captured the command output evidence.",
+            )
+        ],
+        bundle_url="https://example.test/proof",
+        primary_artifact_url="https://example.test/proof/check.log",
+    )
+
+    await artifacts.put(report.latest_proof_key, proof_record.model_dump_json(), feature=feature)
+
+    runner = SimpleNamespace(
+        artifacts=artifacts,
+        feature_store=_FeatureStore(),
+    )
+
+    _bundle_key, payload = await queue_module._build_cluster_failure_bundle(
+        runner,
+        feature,
+        cluster,
+        lane,
+        [report],
+        reason="Promotion verification still needs replay context",
+        failure_kind="proof-policy",
+        current_verdict=Verdict(
+            approved=False,
+            summary="Promotion proof replay still needs context.",
+            concerns=[],
+            suggestions=[],
+            checks=[],
+            gaps=[],
+        ),
+    )
+
+    record = payload["proof_records"][0]
+    assert record["requested_directives"] == ["ui", "command_output"]
+    assert record["missing_non_core_directives"] == []
+    assert record["non_core_check_summaries"] == [
+        "command_output=satisfied (check.log captured the command output evidence.)"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_build_cluster_failure_bundle_flags_missing_persisted_non_core_proof_checks():
+    feature = _feature()
+    artifacts = _Artifacts()
+    report = _report("BR-proof-bundle-missing", status="active_fix", category="bug", summary="Need replay-safe proof diagnostics")
+    report.lane_id = "L-proof-bundle-missing"
+    report.cluster_id = "C-proof-bundle-missing"
+    report.latest_proof_key = queue_module.proof_key(report.report_id, "promotion-verify")
+    report.strategy_required_evidence_modes = ["command_output"]
+    cluster = queue_module.BugflowClusterSnapshot(
+        cluster_id="C-proof-bundle-missing",
+        report_ids=[report.report_id],
+        lane_id="L-proof-bundle-missing",
+        status="active_fix",
+        current_phase="reverify",
+    )
+    lane = BugflowLaneSnapshot(
+        lane_id="L-proof-bundle-missing",
+        report_ids=[report.report_id],
+        category="bug",
+        source_cluster_id=cluster.cluster_id,
+        status="active_verify",
+    )
+    proof_record = queue_module.BugflowProofRecord(
+        report_id=report.report_id,
+        stage="promotion-verify",
+        storage_stage="promotion-verify-live",
+        bundle=EvidenceBundle(
+            evidence_modes=["logs"],
+            summary="Promotion replay proof without structured coverage",
+            artifacts=[EvidenceArtifact(kind="command_output", label="check.log")],
+        ),
+        bundle_url="https://example.test/proof",
+        primary_artifact_url="https://example.test/proof/check.log",
+    )
+
+    await artifacts.put(report.latest_proof_key, proof_record.model_dump_json(), feature=feature)
+
+    runner = SimpleNamespace(
+        artifacts=artifacts,
+        feature_store=_FeatureStore(),
+    )
+
+    _bundle_key, payload = await queue_module._build_cluster_failure_bundle(
+        runner,
+        feature,
+        cluster,
+        lane,
+        [report],
+        reason="Promotion verification still needs replay context",
+        failure_kind="proof-policy",
+        current_verdict=Verdict(
+            approved=False,
+            summary="Promotion proof replay still needs context.",
+            concerns=[],
+            suggestions=[],
+            checks=[],
+            gaps=[],
+        ),
+    )
+
+    record = payload["proof_records"][0]
+    assert record["requested_directives"] == ["command_output"]
+    assert record["missing_non_core_directives"] == ["command_output"]
+    assert record["non_core_check_summaries"] == []
 
 
 @pytest.mark.asyncio
@@ -3513,3 +4787,225 @@ async def test_write_queue_snapshot_tracks_active_and_promoting_lanes():
     assert queue.verified_pending_promotion_ids == ["L-2"]
     assert queue.promoting_lane_id == "L-3"
     assert queue.promotion_status_text == "Promoting L-3"
+
+
+@pytest.mark.asyncio
+async def test_write_queue_snapshot_tracks_proof_capture_retry_lanes_as_degraded():
+    feature = _feature()
+    artifacts = _Artifacts()
+    runner = SimpleNamespace(artifacts=artifacts)
+    reports = [
+        _report("BR-1", status="active_fix", category="bug", summary="Checkout remains flaky"),
+    ]
+    lanes = [
+        BugflowLaneSnapshot(
+            lane_id="L-proof",
+            report_ids=["BR-1"],
+            status="verified_pending_promotion",
+            promotion_status="proof-capture-retry",
+            promotion_proof_capture_attempt=2,
+            lock_scope=["file:frontend/src/checkout.tsx"],
+            workspace_root="/tmp/L-proof",
+        ),
+    ]
+    clusters = []
+
+    phase = queue_module.BugflowQueuePhase()
+    queue = await phase._write_queue_snapshot(runner, feature, reports, lanes, clusters)
+
+    assert queue.health == "degraded"
+    assert queue.proof_capture_retry_lane_ids == ["L-proof"]
+    assert queue.promotion_status_text == "Recapturing promotion proof for L-proof"
+
+
+@pytest.mark.asyncio
+async def test_create_lane_worktree_root_uses_safe_cleanup_for_existing_parent(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    feature = _feature()
+    main_root = tmp_path / "main" / "repos"
+    repo_root = main_root / "frontend"
+    (repo_root / ".git").mkdir(parents=True, exist_ok=True)
+
+    stale_lane_root = main_root.parent / "lanes" / "L-safe" / "repos"
+    (stale_lane_root / "frontend" / "tests").mkdir(parents=True, exist_ok=True)
+
+    cleanup_calls: list[Path] = []
+
+    async def _fake_remove_worktree_root(_main_root: Path, worktree_root: Path) -> None:
+        cleanup_calls.append(worktree_root)
+        shutil.rmtree(worktree_root.parent, ignore_errors=True)
+
+    async def _fake_run_git(repo_dir: Path, *args: str) -> str:
+        if args == ("branch", "--show-current"):
+            return "main"
+        if args == ("rev-parse", "HEAD"):
+            return "abc123"
+        if args[:3] == ("worktree", "add", "-b"):
+            dest_repo = Path(args[4])
+            (dest_repo / ".git").mkdir(parents=True, exist_ok=True)
+            return ""
+        raise AssertionError(f"Unexpected git args: {args}")
+
+    monkeypatch.setattr(queue_module, "_remove_worktree_root", _fake_remove_worktree_root)
+    monkeypatch.setattr(queue_module, "_run_git", _fake_run_git)
+
+    lane_root, branch_names, base_heads = await queue_module._create_lane_worktree_root(
+        main_root,
+        feature,
+        "L-safe",
+    )
+
+    assert cleanup_calls == [stale_lane_root]
+    assert lane_root == stale_lane_root
+    assert lane_root.exists()
+    assert branch_names == {"frontend": f"lane/{feature.slug}/L-safe/frontend"}
+    assert base_heads == {"frontend": "abc123"}
+
+
+@pytest.mark.asyncio
+async def test_create_lane_worktree_root_resets_stale_branch_before_add(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    feature = _feature()
+    main_root = tmp_path / "main" / "repos"
+    repo_root = main_root / "frontend"
+    (repo_root / ".git").mkdir(parents=True, exist_ok=True)
+
+    git_calls: list[tuple[Path, tuple[str, ...]]] = []
+
+    async def _fake_run_git(repo_dir: Path, *args: str) -> str:
+        git_calls.append((repo_dir, args))
+        if args == ("branch", "--show-current"):
+            return "main"
+        if args == ("rev-parse", "HEAD"):
+            return "abc123"
+        if args == ("worktree", "prune"):
+            return ""
+        if args == ("rev-parse", "--verify", f"refs/heads/lane/{feature.slug}/L-reset/frontend"):
+            return "deadbeef"
+        if args == ("branch", "-D", f"lane/{feature.slug}/L-reset/frontend"):
+            return ""
+        if args[:3] == ("worktree", "add", "-b"):
+            dest_repo = Path(args[4])
+            (dest_repo / ".git").mkdir(parents=True, exist_ok=True)
+            return ""
+        raise AssertionError(f"Unexpected git args: {args}")
+
+    monkeypatch.setattr(queue_module, "_run_git", _fake_run_git)
+
+    lane_root, branch_names, base_heads = await queue_module._create_lane_worktree_root(
+        main_root,
+        feature,
+        "L-reset",
+    )
+
+    assert lane_root.exists()
+    assert branch_names == {"frontend": f"lane/{feature.slug}/L-reset/frontend"}
+    assert base_heads == {"frontend": "abc123"}
+    assert (repo_root, ("worktree", "prune")) in git_calls
+    assert (
+        repo_root,
+        ("branch", "-D", f"lane/{feature.slug}/L-reset/frontend"),
+    ) in git_calls
+
+
+@pytest.mark.asyncio
+async def test_create_promotion_worktree_root_resets_stale_branch_before_add(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    feature = _feature()
+    main_root = tmp_path / "main" / "repos"
+    repo_root = main_root / "frontend"
+    (repo_root / ".git").mkdir(parents=True, exist_ok=True)
+    lane = BugflowLaneSnapshot(
+        lane_id="L-promote-reset",
+        report_ids=["BR-1"],
+        status="verified_pending_promotion",
+        promotion_attempt=2,
+    )
+
+    git_calls: list[tuple[Path, tuple[str, ...]]] = []
+
+    async def _fake_run_git(repo_dir: Path, *args: str) -> str:
+        git_calls.append((repo_dir, args))
+        if args == ("branch", "--show-current"):
+            return "main"
+        if args == ("rev-parse", "HEAD"):
+            return "abc123"
+        if args == ("worktree", "prune"):
+            return ""
+        if args == (
+            "rev-parse",
+            "--verify",
+            f"refs/heads/promote/{feature.slug}/{lane.lane_id}/{lane.promotion_attempt}/{repo_root.name}",
+        ):
+            return "deadbeef"
+        if args == (
+            "branch",
+            "-D",
+            f"promote/{feature.slug}/{lane.lane_id}/{lane.promotion_attempt}/{repo_root.name}",
+        ):
+            return ""
+        if args[:3] == ("worktree", "add", "-b"):
+            dest_repo = Path(args[4])
+            (dest_repo / ".git").mkdir(parents=True, exist_ok=True)
+            return ""
+        raise AssertionError(f"Unexpected git args: {args}")
+
+    monkeypatch.setattr(queue_module, "_run_git", _fake_run_git)
+
+    promotion_root, branch_names, base_heads = await queue_module._create_promotion_worktree_root(
+        main_root,
+        feature,
+        lane,
+    )
+
+    assert promotion_root.exists()
+    assert branch_names == {
+        "frontend": f"promote/{feature.slug}/{lane.lane_id}/{lane.promotion_attempt}/frontend"
+    }
+    assert base_heads == {"frontend": "abc123"}
+    assert (repo_root, ("worktree", "prune")) in git_calls
+    assert (
+        repo_root,
+        ("branch", "-D", f"promote/{feature.slug}/{lane.lane_id}/{lane.promotion_attempt}/frontend"),
+    ) in git_calls
+
+
+@pytest.mark.asyncio
+async def test_remove_worktree_root_quarantines_directory_not_empty_cleanup_race(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    main_root = tmp_path / "main" / "repos"
+    main_root.mkdir(parents=True, exist_ok=True)
+    worktree_root = tmp_path / "lanes" / "L-race" / "repos"
+    (worktree_root / "frontend" / "tests").mkdir(parents=True, exist_ok=True)
+
+    original_rmtree = queue_module.shutil.rmtree
+    original_rename = Path.rename
+    renamed_targets: list[Path] = []
+
+    def _fake_rmtree(path: Path | str, *args, **kwargs) -> None:
+        path = Path(path)
+        ignore_errors = bool(kwargs.get("ignore_errors", False))
+        if path == worktree_root.parent and not ignore_errors:
+            raise OSError(66, "Directory not empty")
+        return original_rmtree(path, *args, **kwargs)
+
+    def _tracking_rename(self: Path, target: Path | str) -> Path:
+        renamed_targets.append(Path(target))
+        return original_rename(self, target)
+
+    monkeypatch.setattr(queue_module.shutil, "rmtree", _fake_rmtree)
+    monkeypatch.setattr(Path, "rename", _tracking_rename)
+
+    await queue_module._remove_worktree_root(main_root, worktree_root)
+
+    assert not worktree_root.parent.exists()
+    assert renamed_targets
+    assert renamed_targets[0].name.startswith("L-race-stale-")

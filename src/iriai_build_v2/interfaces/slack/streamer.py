@@ -117,6 +117,7 @@ class SlackStreamer:
         self._pending: bool = False
         self._seen_ids: set[str] = set()
         self._last_flush_time: float = 0.0
+        self._last_visible_update_at: float = 0.0
         self._actor_name: str = ""
 
     @property
@@ -126,6 +127,10 @@ class SlackStreamer:
     @actor_name.setter
     def actor_name(self, value: str) -> None:
         self._actor_name = value
+
+    @property
+    def last_visible_update_at(self) -> float:
+        return self._last_visible_update_at
 
     def on_message(self, msg: Any) -> None:
         """Synchronous callback for ClaudeAgentRuntime. Schedules async updates."""
@@ -210,6 +215,7 @@ class SlackStreamer:
                     self._channel, self._message_ts, text=text
                 )
             self._last_flush_time = time.monotonic()
+            self._last_visible_update_at = self._last_flush_time
         except Exception:
             logger.exception("Failed to flush streamer to Slack")
         finally:
@@ -240,6 +246,7 @@ class SlackStreamer:
                     await self._adapter.update_message(
                         self._channel, progress_ts, text="\u2713 Done"
                     )
+                    self._last_visible_update_at = time.monotonic()
                 except Exception:
                     logger.debug(
                         "Failed to update progress message to done", exc_info=True
@@ -258,6 +265,7 @@ class SlackStreamer:
                 await self._adapter.post_message(
                     self._channel, chunk, thread_ts=self._thread_ts
                 )
+                self._last_visible_update_at = time.monotonic()
         except Exception:
             logger.exception("Failed completion flush to Slack")
 

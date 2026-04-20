@@ -7,6 +7,7 @@ import logging
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 from uuid import uuid4
@@ -17,8 +18,10 @@ from iriai_compose import (
     Workflow,
 )
 from iriai_compose.actors import AgentActor, InteractionActor
-from iriai_compose.tasks import Ask, Select
+from iriai_compose.pending import Pending
 from pydantic import BaseModel
+from iriai_compose.prompts import Select
+from iriai_compose.tasks import Ask
 
 if TYPE_CHECKING:
     from iriai_compose.runner import AgentRuntime
@@ -229,15 +232,29 @@ class TrackedWorkflowRunner(DefaultWorkflowRunner):
 
         if isinstance(actor, InteractionActor):
             runtime = self._resolve_runtime(actor.resolver)
-            return await runtime.ask(
-                task,
-                **{
-                    **runtime_kwargs,
-                    "context": context,
-                    "feature_id": feature.id,
-                    "phase_name": _phase_name_var.get(),
-                },
+            ask = getattr(runtime, "ask", None)
+            if callable(ask):
+                return await ask(
+                    task,
+                    **{
+                        **runtime_kwargs,
+                        "context": context,
+                        "feature_id": feature.id,
+                        "phase_name": _phase_name_var.get(),
+                        "kind": kind,
+                        "options": options,
+                    },
+                )
+            pending = Pending(
+                id=str(uuid4()),
+                feature_id=feature.id,
+                phase_name=_phase_name_var.get(),
+                kind=kind or "respond",
+                prompt=task.prompt,
+                options=options,
+                created_at=datetime.now(),
             )
+            return await runtime.resolve(pending)
 
         # ── Workspace resolution ─────────────────────────────────────
         # Priority:
@@ -390,13 +407,21 @@ class TrackedWorkflowRunner(DefaultWorkflowRunner):
                     activity_callback=lambda: self._record_invocation_activity(invocation_id),
                 )
                 try:
-                    return await self._resolve_with_runtime(
+                    result = await self._resolve_with_runtime(
                         target_runtime,
                         task,
                         runtime_kwargs=runtime_call_kwargs,
                         tracker=tracker,
                         invocation_id=invocation_id,
                     )
+                    await self.feature_store.log_event(
+                        feature.id,
+                        "agent_done",
+                        actor.name,
+                        content=runtime_name,
+                        metadata={"phase_name": _phase_name_var.get()},
+                    )
+                    return result
                 finally:
                     self._record_invocation_finished(invocation_id)
 
@@ -439,6 +464,13 @@ class TrackedWorkflowRunner(DefaultWorkflowRunner):
                         actor_name=actor_name,
                         liveness_timeout=effective_timeout,
                     )
+                    await self.feature_store.log_event(
+                        feature.id,
+                        "agent_done",
+                        actor.name,
+                        content=runtime_name,
+                        metadata={"phase_name": _phase_name_var.get()},
+                    )
                     return result
                 except AgentStalled as exc:
                     last_err = exc
@@ -459,6 +491,18 @@ class TrackedWorkflowRunner(DefaultWorkflowRunner):
                 f"{actor_name} stalled {RESOLVE_MAX_RETRIES + 1} times "
                 f"({effective_timeout}s inactivity each) — giving up"
             ) from last_err
+        except Exception as exc:
+            await self.feature_store.log_event(
+                feature.id,
+                "agent_error",
+                actor.name,
+                content=str(exc)[:1000],
+                metadata={
+                    "phase_name": _phase_name_var.get(),
+                    "error_type": type(exc).__name__,
+                },
+            )
+            raise
         finally:
             # Clear the per-coroutine workspace override
             _workspace_override_var.set(None)

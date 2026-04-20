@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import logging
 
-from iriai_compose import Feature, Interview, Phase, WorkflowRunner
+from iriai_compose import Feature, Phase, WorkflowRunner
 
 from ....models.outputs import BugReport, Envelope, envelope_done
 from ....models.state import BugFixState
 from ....roles import bug_interviewer, user
-from ..._common import gate_and_revise
+from ..._common import Interview, gate_and_revise
 
 logger = logging.getLogger(__name__)
 

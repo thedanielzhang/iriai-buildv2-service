@@ -47,6 +47,7 @@ class RespondCard:
     phase_name: str
     question: str
     options: list[str] = field(default_factory=list)
+    allow_background: bool = False
 
     def build_blocks(self) -> list[dict[str, Any]]:
         blocks: list[dict[str, Any]] = [self._question_section()]
@@ -119,15 +120,24 @@ class RespondCard:
     def _reply_block(self) -> dict[str, Any]:
         """Single Reply button that opens a modal for free-form text input."""
         pid = self.pending_id
+        elements: list[dict[str, Any]] = [
+            {
+                "type": "button",
+                "text": {"type": "plain_text", "text": "Reply", "emoji": True},
+                "action_id": f"respond_{pid}_reply",
+                "style": "primary",
+            },
+        ]
+        if self.allow_background:
+            elements.append(
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "Finish In Background", "emoji": True},
+                    "action_id": f"respond_{pid}_background",
+                }
+            )
         return {
             "type": "actions",
             "block_id": f"respond_input_{pid}",
-            "elements": [
-                {
-                    "type": "button",
-                    "text": {"type": "plain_text", "text": "Reply", "emoji": True},
-                    "action_id": f"respond_{pid}_reply",
-                    "style": "primary",
-                },
-            ],
+            "elements": elements,
         }

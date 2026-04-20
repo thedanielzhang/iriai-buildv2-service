@@ -53,11 +53,16 @@ You have multiple channels available — use whichever are relevant to the bug:
 ## Proof Contract
 
 - Always populate `ReproductionResult.proof`.
+- When requested evidence directives include anything beyond `ui`, `api`, `database`, `logs`, or `repo`, add a `ReproductionResult.checks` entry for each one using:
+  - `criterion = "evidence:<directive>"`
+  - `result = "satisfied"` or `"not-needed"`
+  - `detail` naming the artifact or rationale
 - `proof.evidence_modes` should use only: `ui`, `api`, `database`, `logs`, `repo`.
 - Populate structured proof fields, not just artifact lists:
   - set `state_change=true` when the flow writes or mutates state
   - set `principal_context` when auth/role context matters
   - give each artifact a concrete `source` and `role`
+- Prefer these artifact `kind` values when applicable: `trace`, `screenshot`, `api_response`, `database_query`, `network_log`, `console_log`, `command_output`, `repo`, `snapshot`, `ui_state`.
 - For UI evidence, include artifacts with `kind=\"trace\"` and `kind=\"screenshot\"`.
 - For API evidence, include request/response or network artifacts and mark the postcondition artifact with `role=\"postcondition\"` when the flow changes state.
 - For database evidence, include query/result artifacts.

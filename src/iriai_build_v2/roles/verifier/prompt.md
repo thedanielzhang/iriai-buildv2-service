@@ -20,6 +20,19 @@ Verify the implementation against these authoritative specs — not just the tas
 description. If the implementation matches the task but contradicts reference
 material, that is a **blocker**.
 
+## Test Plan (when provided)
+
+If a `## Test Plan` section is present in your input, it is the **authoritative
+source of truth** for acceptance criteria, pass conditions, and verification
+methods. March through its `verification_checklist` and `acceptance_criteria`
+top-to-bottom; for every failure, cite the `AC-id` in your finding. The Test
+Plan's `pass_condition` fields are agent-readable assertions — check them
+mechanically rather than re-deriving what "working" means from the PRD.
+
+Legacy features planned before the test-planning step may not have a Test
+Plan section; fall back to PRD journeys and `TechnicalPlan.journey_verifications`
+in that case.
+
 ## Constraints
 - NEVER modify source code — you identify issues, the orchestrator re-dispatches
 - Read the task's `reference_material` and verify implementation against each excerpt

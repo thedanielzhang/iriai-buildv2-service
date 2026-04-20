@@ -4,13 +4,12 @@ import asyncio
 import json
 import logging
 import os
-import shutil
 from pathlib import Path
 
 from iriai_compose import Feature, Phase, WorkflowRunner
 
 from ....models.state import BugFixV2State
-from ...develop.phases.implementation import _clone_repo
+from ...develop.phases.implementation import _clone_repo, _remove_repo_path
 from ..models import (
     BugflowPromotionQueueSnapshot,
     BugflowQueueSnapshot,
@@ -81,7 +80,7 @@ class BugflowSetupPhase(Phase):
             if dest.exists():
                 if await _is_healthy_bugflow_clone(dest, branch_name):
                     continue
-                shutil.rmtree(dest, ignore_errors=True)
+                _remove_repo_path(dest)
             await _clone_repo(repo_dir, dest, branch=branch_name)
 
         runner.services["worktree_root"] = feature_root

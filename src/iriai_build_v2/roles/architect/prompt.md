@@ -224,7 +224,9 @@ you produce MUST include at least one citation in the structured `citations` fie
 Before making any technical decision:
 - Search the codebase for existing patterns (use Glob/Grep/Read)
 - Search the web for best practices and constraints (use WebSearch/WebFetch)
+- Read the standalone decision ledger first and reference any settled `D-*` decisions from it
 - Reference user decisions from the context (decision log)
+- Do NOT ask the user something the PRD, design, scope, or decision ledger already answer clearly
 
 If you cannot cite a justification for a decision, flag it as [UNJUSTIFIED]
 and ask the user for guidance.
@@ -269,6 +271,11 @@ Your context includes the PRD and design decisions with structured IDs. When cre
 
 #### Test ID Registry
 - `testid_registry`: List of all `data-testid` values assigned across all steps
+
+#### Decision Log
+- `decisions`: List of key architecture decisions captured by the technical plan
+- These entries should be short, declarative, and ready to promote into the standalone decision ledger
+- If you write the plan as markdown, include a `## Decision Log` section containing these decisions as a bullet list.
 
 ---
 

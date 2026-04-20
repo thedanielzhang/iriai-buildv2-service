@@ -86,6 +86,11 @@ For each repo you identify as affected:
 
 - **Check for a GitHub remote:** Run `git -C <repo-path> remote get-url origin`
   to determine the GitHub URL. Record both `github_url` and `local_path`.
+- **Repo entries must be repo roots:** Never list a package/subdirectory like
+  `iriai-build-v2/dashboard-ui` as its own repo entry unless it is actually a
+  separate Git repo. If a specific subpath matters, keep the repo root (for
+  example `iriai-build-v2`) in `repos` and mention the important subpath in
+  `relevance`.
 - **Determine the action:**
   - `extend` — existing repo that will be modified
   - `new` — repo that needs to be created from scratch

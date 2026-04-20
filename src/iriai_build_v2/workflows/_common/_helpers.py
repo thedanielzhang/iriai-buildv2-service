@@ -7,8 +7,11 @@ from typing import TYPE_CHECKING, Any, TypeVar
 
 from pydantic import BaseModel
 
-from iriai_compose import AgentActor, Ask, Gate, Interview, to_str
+from iriai_compose import AgentActor, Ask, to_str
 from iriai_compose.actors import Actor, Role
+from ...planning_signals import GateRejection
+from ._autonomy import interaction_actor_for_phase
+from ._tasks import Gate, Interview
 
 if TYPE_CHECKING:
     from iriai_compose import Feature, WorkflowRunner
@@ -43,14 +46,27 @@ def _offload_if_large(
     file_name = f"{label}.md"
     file_path = context_dir / file_name
     file_path.write_text(prompt, encoding="utf-8")
-    rel_path = f".iriai-context/{file_name}"
+    display_path = str(file_path.resolve())
     logger.info(
-        "Prompt offloaded to %s (%d chars)", rel_path, len(prompt),
+        "Prompt offloaded to %s (%d chars)", display_path, len(prompt),
     )
     return (
-        f"Your full task prompt is in `{rel_path}` ({len(prompt)} chars).\n"
+        f"Your full task prompt is in `{display_path}` ({len(prompt)} chars).\n"
         f"**Read that file** before proceeding."
     )
+
+
+def _gate_review_is_approved(review_text: str) -> bool:
+    """Return True when a persisted gate-review artifact records approval."""
+    for raw_line in review_text.splitlines():
+        line = raw_line.strip().lower().replace("*", "")
+        if not line:
+            continue
+        if "outcome:" in line and "approved" in line:
+            return True
+        if "status:" in line and "approved" in line and "revisions required" not in line:
+            return True
+    return False
 
 
 async def get_existing_artifact(
@@ -75,15 +91,147 @@ async def get_existing_artifact(
     if not mirror:
         return None
 
-    from ...services.artifacts import _key_to_path
-
-    rel_path = _key_to_path(artifact_key)
-    path = mirror.feature_dir(feature.id) / rel_path
-    if not path.exists():
+    _, path = _artifact_paths(runner, feature, artifact_key)
+    if path is None or not path.exists():
         return None
 
     content = path.read_text(encoding="utf-8").strip()
     return content if content else None
+
+
+def _canonical_artifact_rel_path(artifact_key: str) -> Path:
+    from ...services.artifacts import _key_to_path, _sd_source_path
+
+    source_rel = _sd_source_path(artifact_key)
+    if source_rel:
+        return Path(source_rel)
+    return Path(_key_to_path(artifact_key))
+
+
+def _artifact_paths(
+    runner: WorkflowRunner,
+    feature: Feature,
+    artifact_key: str,
+) -> tuple[Path | None, Path | None]:
+    mirror = runner.services.get("artifact_mirror")
+    if not mirror:
+        return None, None
+
+    rel_path = _canonical_artifact_rel_path(artifact_key)
+    feature_dir = Path(mirror.feature_dir(feature.id))
+    final_path = feature_dir / rel_path
+    staging_path = feature_dir / ".staging" / rel_path
+    return staging_path, final_path
+
+
+def _read_artifact_path(path: Path | None) -> str | None:
+    if path is None or not path.exists():
+        return None
+    content = path.read_text(encoding="utf-8").strip()
+    return content if content else None
+
+
+async def get_resumable_artifact(
+    runner: WorkflowRunner,
+    feature: Feature,
+    artifact_key: str,
+) -> str | None:
+    """Prefer the newest local draft for interrupted resume paths.
+
+    Lookup order is scoped for resume flows only:
+    1. `.staging/<artifact>` when it exists and is newer than the final mirror,
+       or when no final mirror exists
+    2. final mirrored artifact
+    3. DB artifact store
+    """
+    staging_path, final_path = _artifact_paths(runner, feature, artifact_key)
+    final_exists = final_path is not None and final_path.exists()
+    staging_exists = staging_path is not None and staging_path.exists()
+
+    if staging_exists:
+        use_staging = not final_exists
+        if final_exists:
+            assert staging_path is not None
+            assert final_path is not None
+            use_staging = staging_path.stat().st_mtime_ns > final_path.stat().st_mtime_ns
+        if use_staging:
+            staging_text = _read_artifact_path(staging_path)
+            if staging_text:
+                return staging_text
+
+    final_text = _read_artifact_path(final_path)
+    if final_text:
+        return final_text
+
+    text = await runner.artifacts.get(artifact_key, feature=feature)
+    return text or None
+
+
+async def get_gate_resume_artifact(
+    runner: WorkflowRunner,
+    feature: Feature,
+    artifact_key: str,
+) -> str | None:
+    """Prefer the approved DB artifact when re-entering a gated step.
+
+    This is narrower than ``get_resumable_artifact()``: it is for resume paths
+    that are reopening a gate after approval may already have completed.
+    """
+    text = await runner.artifacts.get(artifact_key, feature=feature)
+    if text:
+        return text
+    return await get_resumable_artifact(runner, feature, artifact_key)
+
+
+async def get_gate_approved_artifact(
+    runner: WorkflowRunner,
+    feature: Feature,
+    *,
+    artifact_prefix: str,
+    compiled_key: str,
+) -> str | None:
+    """Return the compiled artifact when its gate review is already approved.
+
+    This is used by compiled global-tail resume paths to skip recompiling and
+    re-reviewing artifacts that have already completed their gate.
+    """
+    compiled_text = await get_gate_resume_artifact(runner, feature, compiled_key)
+    if not compiled_text:
+        return None
+
+    review_text = await get_resumable_artifact(
+        runner,
+        feature,
+        f"gate-review:{artifact_prefix}",
+    )
+    if not review_text or not _gate_review_is_approved(review_text):
+        return None
+
+    hosting = runner.services.get("hosting")
+    if hosting and hasattr(hosting, "mark_feedback_submitted"):
+        await hosting.mark_feedback_submitted(feature.id, compiled_key)
+
+    return compiled_text
+
+
+def gate_feedback_text(
+    approved: Any,
+    *,
+    fallback: str = "Please revise.",
+) -> str:
+    """Convert a gate rejection result into prompt-ready feedback text."""
+    if isinstance(approved, str):
+        return approved.strip() or fallback
+    if isinstance(approved, GateRejection):
+        return approved.feedback.strip() or fallback
+    if isinstance(approved, dict):
+        feedback = approved.get("feedback")
+        if isinstance(feedback, str):
+            return feedback.strip() or fallback
+    feedback = getattr(approved, "feedback", None)
+    if isinstance(feedback, str):
+        return feedback.strip() or fallback
+    return fallback
 
 
 async def gate_and_revise(
@@ -99,6 +247,8 @@ async def gate_and_revise(
     artifact_key: str | None = None,
     annotation_keys: list[str] | None = None,
     post_update: Callable[[str, str], Awaitable[None]] | None = None,
+    hosted_revision: bool = False,
+    prefer_structured_output: bool = False,
 ) -> tuple[T | BaseModel | str, str]:
     """Approve/revise loop. Returns ``(artifact, artifact_text)``.
 
@@ -108,6 +258,30 @@ async def gate_and_revise(
     """
     artifact_text = to_str(artifact) if isinstance(artifact, BaseModel) else artifact
     artifact_name = label.split("\n", 1)[0]
+
+    async def _log_gate_event(
+        event_type: str,
+        *,
+        content: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        feature_store = getattr(runner, "feature_store", None)
+        if feature_store is None:
+            return
+        try:
+            await feature_store.log_event(
+                feature.id,
+                event_type,
+                phase_name,
+                content=content,
+                metadata={
+                    "artifact_key": artifact_key,
+                    "label": artifact_name,
+                    **(metadata or {}),
+                },
+            )
+        except Exception:
+            logger.debug("Failed to log gate event %s for %s", event_type, artifact_key, exc_info=True)
 
     # Strip pre-embedded URLs so we can rebuild them fresh each iteration
     clean_label = "\n".join(
@@ -119,6 +293,7 @@ async def gate_and_revise(
     url_keys = annotation_keys or ([artifact_key] if artifact_key else [])
 
     while True:
+        await _log_gate_event("gate_presented", content=artifact_key or artifact_name)
         # Rebuild review URLs from hosting each iteration (ports may change after update)
         gate_label = clean_label
         hosting = runner.services.get("hosting")
@@ -134,9 +309,18 @@ async def gate_and_revise(
             phase_name=phase_name,
         )
         if approved is True:
+            await _log_gate_event("gate_approved", content=artifact_key or artifact_name)
             break
 
-        feedback = str(approved) if isinstance(approved, str) else "Please revise."
+        feedback = gate_feedback_text(approved)
+        await _log_gate_event(
+            "gate_rejected",
+            content=artifact_key or artifact_name,
+            metadata={
+                "feedback": feedback[:1000],
+                "approved_type": f"{type(approved).__module__}.{type(approved).__name__}",
+            },
+        )
 
         # Collect browser annotations AFTER rejection — the user annotates
         # while reviewing, then clicks reject.
@@ -192,17 +376,33 @@ async def gate_and_revise(
                 f"Then set `complete = true` in the structured output."
             )
 
-        envelope = await runner.run(
-            Interview(
+        if hosted_revision and artifact_key:
+            from .._common import HostedInterview
+
+            revision_task = HostedInterview(
                 questioner=actor,
                 responder=approver,
                 initial_prompt=revision_prompt,
                 output_type=Envelope[output_type],
                 done=envelope_done,
-            ),
+                artifact_key=artifact_key,
+                artifact_label=artifact_name,
+            )
+        else:
+            revision_task = Interview(
+                questioner=actor,
+                responder=approver,
+                initial_prompt=revision_prompt,
+                output_type=Envelope[output_type],
+                done=envelope_done,
+            )
+
+        envelope = await runner.run(
+            revision_task,
             feature,
             phase_name=phase_name,
         )
+        await _log_gate_event("gate_revision_returned", content=artifact_key or artifact_name)
 
         artifact = envelope.output if isinstance(envelope, Envelope) and envelope.output else envelope
 
@@ -210,7 +410,7 @@ async def gate_and_revise(
         artifact_text = to_str(artifact)
         if artifact_path and artifact_path.exists():
             file_text = artifact_path.read_text(encoding="utf-8").strip()
-            if file_text:
+            if file_text and not (prefer_structured_output and isinstance(artifact, BaseModel)):
                 artifact_text = file_text
                 artifact = file_text
 
@@ -226,6 +426,26 @@ async def gate_and_revise(
 
 
 # ── Subfeature decomposition helpers ─────────────────────────────────────────
+
+
+def _build_gate_label_with_review_urls(
+    runner: WorkflowRunner,
+    *,
+    label: str,
+    artifact_keys: list[str],
+) -> str:
+    clean_label = "\n".join(
+        line for line in label.splitlines()
+        if "Review in browser:" not in line
+    ).strip()
+    hosting = runner.services.get("hosting")
+    if not hosting or not artifact_keys:
+        return clean_label
+    urls = [hosting.get_url(key) for key in artifact_keys]
+    urls = [url for url in urls if url]
+    if not urls:
+        return clean_label
+    return clean_label + "\nReview in browser: " + " | ".join(urls)
 
 
 async def broad_interview(
@@ -296,7 +516,13 @@ async def decompose_and_gate(
     if existing:
         logger.info("Decomposition exists — skipping")
         import json as _json
-        return SubfeatureDecomposition.model_validate(_json.loads(existing))
+        try:
+            return SubfeatureDecomposition.model_validate(_json.loads(existing))
+        except Exception:
+            logger.warning(
+                "Ignoring non-JSON decomposition artifact during resume for %s",
+                feature.id,
+            )
 
     envelope = await runner.run(
         HostedInterview(
@@ -311,22 +537,32 @@ async def decompose_and_gate(
             done=envelope_done,
             artifact_key="decomposition",
             artifact_label="Subfeature Decomposition",
+            prefer_structured_output=True,
         ),
         feature,
         phase_name=phase_name,
     )
     decomposition = envelope.output
+    decomp_text = to_str(decomposition)
+    await runner.artifacts.put("decomposition", decomp_text, feature=feature)
 
     # Gate the decomposition
-    decomp_text = to_str(decomposition)
+    gate_label = _build_gate_label_with_review_urls(
+        runner,
+        label="Subfeature Decomposition",
+        artifact_keys=["decomposition"],
+    )
     approved = await runner.run(
-        Gate(approver=approver, prompt=f"Subfeature Decomposition:\n\n{decomp_text}\n\nApprove this decomposition?"),
+        Gate(
+            approver=approver,
+            prompt=f"{gate_label}:\n\n{decomp_text}\n\nApprove this decomposition?",
+        ),
         feature,
         phase_name=phase_name,
     )
     if approved is not True:
         # Re-run with feedback
-        feedback = str(approved) if isinstance(approved, str) else "Please revise."
+        feedback = gate_feedback_text(approved)
         envelope = await runner.run(
             HostedInterview(
                 questioner=lead_actor,
@@ -336,14 +572,25 @@ async def decompose_and_gate(
                 done=envelope_done,
                 artifact_key="decomposition",
                 artifact_label="Subfeature Decomposition",
+                prefer_structured_output=True,
             ),
             feature,
             phase_name=phase_name,
         )
         decomposition = envelope.output
+        decomp_text = to_str(decomposition)
+        await runner.artifacts.put("decomposition", decomp_text, feature=feature)
 
     decomp_text = to_str(decomposition)
     await runner.artifacts.put("decomposition", decomp_text, feature=feature)
+    hosting = runner.services.get("hosting")
+    if hosting and hasattr(hosting, "push"):
+        await hosting.push(
+            feature.id,
+            "decomposition",
+            decomp_text,
+            f"Subfeature Decomposition — {feature.name}",
+        )
     return decomposition
 
 
@@ -414,6 +661,7 @@ async def generate_summary(
                 "- Title and overview (1-2 sentences)\n"
                 "- All requirement IDs (REQ-*) with one-line descriptions\n"
                 "- All journey IDs (J-*) with one-line descriptions\n"
+                "- All active decision IDs (D-*) with one-line descriptions\n"
                 "- All edge/interface descriptions to other subfeatures\n"
                 "- All data entity names and key fields\n"
                 "Do NOT include full text of requirements, journeys, or acceptance criteria.\n\n"
@@ -423,6 +671,20 @@ async def generate_summary(
         feature,
     )
     summary_text = to_str(summary)
+    decisions_text = await runner.artifacts.get(f"decisions:{sf_slug}", feature=feature) or ""
+    if decisions_text:
+        from ..planning._decisions import parse_decision_ledger
+
+        ledger = parse_decision_ledger(decisions_text)
+        active = [
+            f"- {decision.id}: {decision.statement}"
+            for decision in sorted(
+                (decision for decision in ledger.decisions if decision.status == "active"),
+                key=lambda item: item.id,
+            )
+        ]
+        if active:
+            summary_text = summary_text.rstrip() + "\n\n## Active Decisions\n\n" + "\n".join(active) + "\n"
     await runner.artifacts.put(f"{artifact_prefix}-summary:{sf_slug}", summary_text, feature=feature)
     return summary_text
 
@@ -586,7 +848,13 @@ async def integration_review(
     lead_actor: Actor,
     decomposition: SubfeatureDecomposition,
     artifact_prefix: str,
-    broad_key: str,
+    broad_key: str | None = None,
+    review_key_suffix: str | None = None,
+    artifact_keys_by_target: dict[str, str] | None = None,
+    target_label: str = "subfeature slugs",
+    use_cached_review: bool = True,
+    responder: Actor | None = None,
+    prefer_local_artifacts: bool = False,
 ) -> IntegrationReview:
     """Run lead's integration review interview.
 
@@ -594,16 +862,45 @@ async def integration_review(
     consistency, edge contracts, gaps, and contradictions.
 
     Guarantees: when ``needs_revision`` is True, ``revision_instructions``
-    is a non-empty dict with valid subfeature slugs.  If the agent's structured
+    is a non-empty dict with valid target ids. If the agent's structured
     output is incomplete, a follow-up extraction call fills in the gap.
     """
     from ...models.outputs import Envelope, IntegrationReview, envelope_done
     from .._common import HostedInterview
 
-    review_key = f"integration-review:{phase_name}"
-    sf_slugs = [sf.slug for sf in decomposition.subfeatures]
+    review_key = f"integration-review:{review_key_suffix or phase_name}"
+    legacy_review_key = (
+        f"integration-review:{phase_name}"
+        if review_key_suffix and review_key_suffix != phase_name
+        else ""
+    )
+    if artifact_keys_by_target:
+        valid_targets = list(artifact_keys_by_target)
+        allow_sf_ordinals = False
+    else:
+        valid_targets = [sf.slug for sf in decomposition.subfeatures]
+        allow_sf_ordinals = True
 
-    existing = await get_existing_artifact(runner, feature, review_key)
+    async def _load_review_artifact(key: str) -> str | None:
+        if prefer_local_artifacts:
+            return await get_resumable_artifact(runner, feature, key)
+        return await get_existing_artifact(runner, feature, key)
+
+    async def _load_context_artifact(key: str) -> str | None:
+        if prefer_local_artifacts:
+            return await get_resumable_artifact(runner, feature, key)
+        return await runner.artifacts.get(key, feature=feature)
+
+    async def _load_review_file_text(key: str) -> str | None:
+        if prefer_local_artifacts:
+            return await get_resumable_artifact(runner, feature, key)
+        return _read_artifact_file(runner, feature, key)
+
+    existing = ""
+    if use_cached_review:
+        existing = await _load_review_artifact(review_key) or ""
+        if not existing and legacy_review_key:
+            existing = await _load_review_artifact(legacy_review_key) or ""
     if existing:
         logger.info("Integration review %s exists — checking cached data", review_key)
         import json as _json
@@ -619,7 +916,11 @@ async def integration_review(
             review = None
 
         if review is not None:
-            _normalize_review_slugs(review, sf_slugs)
+            _normalize_review_targets(
+                review,
+                valid_targets,
+                allow_sf_ordinals=allow_sf_ordinals,
+            )
             needs_extraction = (
                 review.needs_revision
                 and not review.revision_instructions
@@ -629,16 +930,22 @@ async def integration_review(
                     "integration_review: cached review needs revision "
                     "but has no usable revision_instructions — extracting"
                 )
-                review_file_text = _read_artifact_file(runner, feature, review_key)
+                review_file_text = await _load_review_file_text(review_key)
                 if review_file_text:
                     extracted = await _extract_review_fields(
-                        runner, feature, phase_name, review_file_text, sf_slugs,
+                        runner,
+                        feature,
+                        phase_name,
+                        review_file_text,
+                        valid_targets,
+                        target_label=target_label,
+                        allow_sf_ordinals=allow_sf_ordinals,
                     )
                     if extracted.revision_instructions:
                         review.revision_instructions = extracted.revision_instructions
                         logger.info(
                             "integration_review: extracted revision_instructions "
-                            "for %d subfeatures from cached review",
+                            "for %d targets from cached review",
                             len(review.revision_instructions),
                         )
                 # Persist the normalized/updated review
@@ -648,18 +955,28 @@ async def integration_review(
                 )
             return review
 
-    # Build context: broad + decomposition + all subfeature artifacts
+    # Build context: broad + decomposition + all subfeature artifacts, or
+    # explicit target-artifact mappings for broad reconciliation.
     context_parts = []
-    broad_text = await runner.artifacts.get(broad_key, feature=feature)
-    if broad_text:
-        context_parts.append(f"## Broad Artifact\n\n{broad_text}")
-    decomp_text = await runner.artifacts.get("decomposition", feature=feature)
-    if decomp_text:
-        context_parts.append(f"## Decomposition\n\n{decomp_text}")
-    for sf in decomposition.subfeatures:
-        sf_text = await runner.artifacts.get(f"{artifact_prefix}:{sf.slug}", feature=feature)
-        if sf_text:
-            context_parts.append(f"## {artifact_prefix}:{sf.slug}\n\n{sf_text}")
+    if artifact_keys_by_target:
+        for target, artifact_key in artifact_keys_by_target.items():
+            artifact_text = await _load_context_artifact(artifact_key)
+            if artifact_text:
+                context_parts.append(f"## {target} ({artifact_key})\n\n{artifact_text}")
+    else:
+        if broad_key:
+            broad_text = await _load_context_artifact(broad_key)
+        else:
+            broad_text = ""
+        if broad_text:
+            context_parts.append(f"## Broad Artifact\n\n{broad_text}")
+        decomp_text = await _load_context_artifact("decomposition")
+        if decomp_text:
+            context_parts.append(f"## Decomposition\n\n{decomp_text}")
+        for sf in decomposition.subfeatures:
+            sf_text = await _load_context_artifact(f"{artifact_prefix}:{sf.slug}")
+            if sf_text:
+                context_parts.append(f"## {artifact_prefix}:{sf.slug}\n\n{sf_text}")
 
     context = "\n\n---\n\n".join(context_parts)
 
@@ -668,24 +985,35 @@ async def integration_review(
     from pathlib import Path
 
     mirror = runner.services.get("artifact_mirror")
+    context_slug = review_key_suffix or artifact_prefix or phase_name
     if mirror:
-        context_path = Path(mirror.feature_dir(feature.id)) / f"integration-review-sources-{artifact_prefix}.md"
+        context_path = Path(mirror.feature_dir(feature.id)) / f"integration-review-sources-{context_slug}.md"
     else:
         import tempfile
-        context_path = Path(tempfile.mkdtemp()) / f"integration-review-sources-{artifact_prefix}.md"
+        context_path = Path(tempfile.mkdtemp()) / f"integration-review-sources-{context_slug}.md"
     context_path.parent.mkdir(parents=True, exist_ok=True)
     context_path.write_text(context, encoding="utf-8")
+
+    # Integration reviews are fresh synthesis passes over an artifact set.
+    # Clear any prior reviewer session so resumes do not drag old turns or
+    # oversized injected context into a new review attempt.
+    await _clear_agent_session(runner, lead_actor, feature)
 
     envelope = await runner.run(
         HostedInterview(
             questioner=lead_actor,
-            responder=_get_user(),
+            responder=responder or interaction_actor_for_phase(
+                runner,
+                feature,
+                phase_name=phase_name,
+                fallback=_get_user(),
+            ),
             initial_prompt=(
-                f"I've reviewed all {len(decomposition.subfeatures)} subfeature artifacts. "
-                "Let me walk through the cross-subfeature integration points and check for "
+                f"I've reviewed all {len(valid_targets)} artifacts in this integration set. "
+                "Let me walk through the integration points and check for "
                 "consistency. I may have some questions.\n\n"
-                f"Available subfeature slugs for revision_instructions: "
-                f"{', '.join(sf_slugs)}\n\n"
+                f"Available {target_label} for revision_instructions: "
+                f"{', '.join(valid_targets)}\n\n"
                 f"**Read the full context from:** `{context_path}`"
             ),
             output_type=Envelope[IntegrationReview],
@@ -704,7 +1032,7 @@ async def integration_review(
     # When the agent writes a rich review file but leaves the structured
     # IntegrationReview empty, we extract fields from the file.
 
-    review_file_text = _read_artifact_file(runner, feature, review_key)
+    review_file_text = await _load_review_file_text(review_key)
 
     if review is None:
         logger.warning(
@@ -713,7 +1041,13 @@ async def integration_review(
         )
         if review_file_text:
             review = await _extract_review_fields(
-                runner, feature, phase_name, review_file_text, sf_slugs,
+                runner,
+                feature,
+                phase_name,
+                review_file_text,
+                valid_targets,
+                target_label=target_label,
+                allow_sf_ordinals=allow_sf_ordinals,
             )
         else:
             logger.error(
@@ -722,7 +1056,11 @@ async def integration_review(
             )
             review = IntegrationReview(needs_revision=False)
 
-    _normalize_review_slugs(review, sf_slugs)
+    _normalize_review_targets(
+        review,
+        valid_targets,
+        allow_sf_ordinals=allow_sf_ordinals,
+    )
 
     if review.needs_revision and not review.revision_instructions:
         logger.warning(
@@ -731,13 +1069,23 @@ async def integration_review(
         )
         if review_file_text:
             extracted = await _extract_review_fields(
-                runner, feature, phase_name, review_file_text, sf_slugs,
+                runner,
+                feature,
+                phase_name,
+                review_file_text,
+                valid_targets,
+                target_label=target_label,
+                allow_sf_ordinals=allow_sf_ordinals,
             )
             if extracted.revision_instructions:
-                _normalize_review(extracted, sf_slugs)
+                _normalize_review_targets(
+                    extracted,
+                    valid_targets,
+                    allow_sf_ordinals=allow_sf_ordinals,
+                )
                 review.revision_instructions = extracted.revision_instructions
                 logger.info(
-                    "integration_review: extracted revision_instructions for %d subfeatures",
+                    "integration_review: extracted revision_instructions for %d targets",
                     len(review.revision_instructions),
                 )
             else:
@@ -751,15 +1099,17 @@ async def integration_review(
     return review
 
 
-def _normalize_review_slugs(
+def _normalize_review_targets(
     review: IntegrationReview,
-    sf_slugs: list[str],
+    valid_targets: list[str],
+    *,
+    allow_sf_ordinals: bool,
 ) -> None:
-    """Normalize revision_instructions keys to valid subfeature slugs.
+    """Normalize revision_instructions keys to valid revision targets.
 
     Agents sometimes use labels like 'SF-1', 'SF-2' instead of actual slugs.
-    This maps ordinal labels to slugs by position, and removes any keys that
-    don't match valid slugs.
+    For subfeature callers, this maps ordinal labels to slugs by position.
+    For generic callers, it removes any keys that don't match valid targets.
 
     Also fixes backward compat: if revision_instructions has content but
     needs_revision is False (old ``verdict`` field missing from new schema),
@@ -768,36 +1118,38 @@ def _normalize_review_slugs(
     if not review.revision_instructions:
         return
 
-    valid = set(sf_slugs)
+    valid = set(valid_targets)
     normalized: dict[str, str] = {}
     removed: list[str] = []
 
     for key, instruction in review.revision_instructions.items():
         if key in valid:
             normalized[key] = instruction
-        else:
-            # Try ordinal mapping: SF-1 → sf_slugs[0], SF-2 → sf_slugs[1], etc.
+        elif allow_sf_ordinals:
+            # Try ordinal mapping: SF-1 → valid_targets[0], SF-2 → valid_targets[1], etc.
             mapped = False
             for prefix in ("SF-", "sf-", "sf", "SF"):
                 if key.startswith(prefix):
                     try:
                         idx = int(key[len(prefix):]) - 1  # 1-based → 0-based
-                        if 0 <= idx < len(sf_slugs):
-                            normalized[sf_slugs[idx]] = instruction
+                        if 0 <= idx < len(valid_targets):
+                            normalized[valid_targets[idx]] = instruction
                             mapped = True
                     except ValueError:
                         pass
                     break
             if not mapped:
                 removed.append(key)
+        else:
+            removed.append(key)
 
     if removed:
         logger.warning(
-            "_normalize_review_slugs: removed unmapped keys: %s", removed,
+            "_normalize_review_targets: removed unmapped keys: %s", removed,
         )
     if normalized != review.revision_instructions:
         logger.info(
-            "_normalize_review_slugs: remapped keys → %s",
+            "_normalize_review_targets: remapped keys → %s",
             list(normalized.keys()),
         )
 
@@ -808,7 +1160,7 @@ def _normalize_review_slugs(
     # the old data had a non-empty verdict that got dropped during parsing.
     if normalized and not review.needs_revision:
         logger.info(
-            "_normalize_review_slugs: revision_instructions non-empty but "
+            "_normalize_review_targets: revision_instructions non-empty but "
             "needs_revision=False — setting to True (backward compat)"
         )
         review.needs_revision = True
@@ -818,18 +1170,8 @@ def _read_artifact_file(
     runner: WorkflowRunner, feature: Feature, artifact_key: str,
 ) -> str | None:
     """Read artifact content from the filesystem mirror, if available."""
-    from pathlib import Path
-
-    from ...services.artifacts import _key_to_path
-
-    mirror = runner.services.get("artifact_mirror")
-    if not mirror:
-        return None
-    path = Path(mirror.feature_dir(feature.id)) / _key_to_path(artifact_key)
-    if path.exists():
-        text = path.read_text(encoding="utf-8").strip()
-        return text if text else None
-    return None
+    _, final_path = _artifact_paths(runner, feature, artifact_key)
+    return _read_artifact_path(final_path)
 
 
 async def _extract_review_fields(
@@ -837,7 +1179,10 @@ async def _extract_review_fields(
     feature: Feature,
     phase_name: str,
     review_text: str,
-    sf_slugs: list[str],
+    valid_targets: list[str],
+    *,
+    target_label: str,
+    allow_sf_ordinals: bool,
 ) -> IntegrationReview:
     """Extract structured IntegrationReview fields from review prose.
 
@@ -852,7 +1197,7 @@ async def _extract_review_fields(
         prompt=(
             "You extract structured fields from integration review prose. "
             "Read the review and produce an IntegrationReview with needs_revision (bool), "
-            "revision_instructions (dict mapping subfeature slugs to instructions), "
+            "revision_instructions (dict mapping revision targets to instructions), "
             "contradictions, gaps, and edge_consistency."
         ),
         tools=[],
@@ -865,10 +1210,10 @@ async def _extract_review_fields(
             actor=AgentActor(name="review-extractor", role=extractor_role),
             prompt=(
                 f"Extract structured review fields from this integration review.\n\n"
-                f"Available subfeature slugs: {', '.join(sf_slugs)}\n\n"
-                f"For revision_instructions: map each subfeature slug that needs "
+                f"Available {target_label}: {', '.join(valid_targets)}\n\n"
+                f"For revision_instructions: map each target that needs "
                 f"changes to a specific instruction describing what to change. "
-                f"Only use slugs from the list above.\n\n"
+                f"Only use target ids from the list above.\n\n"
                 f"If the review identifies contradictions or issues that require "
                 f"changes, set needs_revision to true and populate "
                 f"revision_instructions.\n\n"
@@ -880,6 +1225,11 @@ async def _extract_review_fields(
         phase_name=phase_name,
     )
 
+    _normalize_review_targets(
+        result,
+        valid_targets,
+        allow_sf_ordinals=allow_sf_ordinals,
+    )
     return result
 
 
@@ -1338,6 +1688,7 @@ async def interview_gate_review(
     context_keys: list[str] | None = None,
     additional_urls: dict[str, str] | None = None,
     post_compile: Callable[[], Awaitable[None]] | None = None,
+    revision_observer: Callable[[Any], Awaitable[None]] | None = None,
     warn_after_cycles: int = 3,
 ) -> str:
     """Interview-based gate review. Replaces gate_and_revise for compiled artifacts.
@@ -1355,6 +1706,14 @@ async def interview_gate_review(
     - Prior revision context injected into reviewer prompt
     """
     from ...models.outputs import Envelope, ReviewOutcome, envelope_done
+    from ..planning._decisions import (
+        GLOBAL_DECISIONS_KEY,
+        artifact_applies_to,
+        parse_decision_ledger,
+        rebuild_canonical_decisions,
+        refresh_decision_ledger,
+        render_active_decision_log,
+    )
 
     from .._common import HostedInterview
 
@@ -1366,19 +1725,33 @@ async def interview_gate_review(
     gate_review_key = f"gate-review:{artifact_prefix}"
     mirror = runner.services.get("artifact_mirror")
 
-    # Load prior gate review from disk (survives bridge restarts)
-    prior_review_text = ""
-    gate_review_path = None
-    if mirror:
-        from ...services.artifacts import _key_to_path
-
-        gate_review_path = Path(mirror.feature_dir(feature.id)) / _key_to_path(gate_review_key)
-        if gate_review_path.exists():
-            prior_review_text = gate_review_path.read_text(encoding="utf-8").strip()
+    # Load prior gate review from resumable storage (survives bridge restarts
+    # and catches in-flight .staging reviews that have not been mirrored yet).
+    prior_review_text = await get_resumable_artifact(runner, feature, gate_review_key) or ""
+    staging_gate_review_path, gate_review_path = _artifact_paths(runner, feature, gate_review_key)
 
     # ── Initialize convergence tracking ──
     gate_ledger = await _load_gate_ledger(runner, feature, artifact_prefix)
     review_cycle = gate_ledger.cycle
+
+    # ── Fast-path: prior gate review already approved ──
+    if prior_review_text and compiled_text and _gate_review_is_approved(prior_review_text):
+        logger.info(
+            "interview_gate_review: found prior approved gate review for %s — "
+            "skipping new gate interview",
+            artifact_prefix,
+        )
+        await runner.artifacts.put(compiled_key, compiled_text, feature=feature)
+        for f in gate_ledger.findings:
+            if f.status in ("open", "fix_attempted"):
+                f.status = "resolved"
+                f.cycle_resolved = max(review_cycle, 1)
+        gate_ledger.cycle = max(review_cycle, 1)
+        await _save_gate_ledger(runner, feature, gate_ledger, artifact_prefix)
+        hosting = runner.services.get("hosting")
+        if hosting and hasattr(hosting, "mark_feedback_submitted"):
+            await hosting.mark_feedback_submitted(feature.id, compiled_key)
+        return compiled_text
 
     # ── Auto-execute prior agreed revisions ──
     if prior_review_text:
@@ -1392,10 +1765,33 @@ async def interview_gate_review(
             decomposition=decomposition,
         )
         if extracted_plan.requests:
+            if revision_observer:
+                await revision_observer(extracted_plan)
+            if extracted_plan.new_decisions:
+                await refresh_decision_ledger(
+                    runner,
+                    feature,
+                    ledger_key=GLOBAL_DECISIONS_KEY,
+                    label="Global Decision Ledger",
+                    source_phase="plan-review",
+                    artifact_kind=artifact_prefix,
+                    statements=extracted_plan.new_decisions,
+                    applies_to=artifact_applies_to(artifact_prefix),
+                )
+                await rebuild_canonical_decisions(
+                    runner,
+                    feature,
+                    phase_name=phase_name,
+                    decomposition=decomposition,
+                )
+                if compiled_key in {"plan", "system-design"}:
+                    compiled_text = await runner.artifacts.get(compiled_key, feature=feature) or compiled_text
             logger.info(
                 "interview_gate_review: executing %d prior revision requests",
                 len(extracted_plan.requests),
             )
+            decision_text = await runner.artifacts.get("decisions", feature=feature) or ""
+            prior_decisions = render_active_decision_log(parse_decision_ledger(decision_text), heading="## Mandatory Decisions")
             await targeted_revision(
                 runner, feature, phase_name,
                 revision_plan=extracted_plan,
@@ -1406,6 +1802,7 @@ async def interview_gate_review(
                 post_update=post_update,
                 context_keys=context_keys,
                 checkpoint_prefix=f"gate-{review_cycle}",
+                prior_decisions=prior_decisions,
             )
             # Track auto-executed revisions in the ledger
             review_cycle += 1
@@ -1427,9 +1824,10 @@ async def interview_gate_review(
             if post_compile:
                 await post_compile()
             # Clear the prior review file — revisions have been applied
-            if gate_review_path and gate_review_path.exists():
-                gate_review_path.unlink()
-                prior_review_text = ""
+            for path in (gate_review_path, staging_gate_review_path):
+                if path and path.exists():
+                    path.unlink()
+            prior_review_text = ""
         else:
             logger.warning(
                 "interview_gate_review: prior gate review exists but "
@@ -1460,6 +1858,13 @@ async def interview_gate_review(
                 f"- **{label}**: {url}" for label, url in additional_urls.items()
             )
             extra_links = f"\n\nAdditional resources for review:\n{links}"
+        decision_text = await runner.artifacts.get("decisions", feature=feature) or ""
+        decision_context = ""
+        if decision_text:
+            decision_context = (
+                "\n\nCurrent active decision ledger:\n"
+                f"{render_active_decision_log(parse_decision_ledger(decision_text), heading='## Active Decisions')}"
+            )
 
         # ── Build prior revision context for the reviewer ──
         context_base = Path(mirror.feature_dir(feature.id)) if mirror else None
@@ -1468,7 +1873,12 @@ async def interview_gate_review(
         envelope = await runner.run(
             HostedInterview(
                 questioner=lead_actor,
-                responder=_get_user(),
+                responder=interaction_actor_for_phase(
+                    runner,
+                    feature,
+                    phase_name=phase_name,
+                    fallback=_get_user(),
+                ),
                 initial_prompt=(
                     f"**[MODE: Gate Review]** You are in Gate Review mode. "
                     f"Review the compiled **{artifact_prefix}** artifact below and discuss "
@@ -1478,6 +1888,7 @@ async def interview_gate_review(
                     f"Please review it and let me know if there is anything you'd like changed.{url_note}"
                     f"{extra_links}\n\n"
                     f"Compiled artifact for review:\n{compiled_text}"
+                    f"{decision_context}"
                     f"{prior_context}"
                 ),
                 output_type=Envelope[ReviewOutcome],
@@ -1537,6 +1948,27 @@ async def interview_gate_review(
 
         # ── Convergence: dedup + partition ──
         if outcome.revision_plan.requests:
+            if revision_observer:
+                await revision_observer(outcome.revision_plan)
+            if outcome.revision_plan.new_decisions:
+                await refresh_decision_ledger(
+                    runner,
+                    feature,
+                    ledger_key=GLOBAL_DECISIONS_KEY,
+                    label="Global Decision Ledger",
+                    source_phase="plan-review",
+                    artifact_kind=artifact_prefix,
+                    statements=outcome.revision_plan.new_decisions,
+                    applies_to=artifact_applies_to(artifact_prefix),
+                )
+                await rebuild_canonical_decisions(
+                    runner,
+                    feature,
+                    phase_name=phase_name,
+                    decomposition=decomposition,
+                )
+                if compiled_key in {"plan", "system-design"}:
+                    compiled_text = await runner.artifacts.get(compiled_key, feature=feature) or compiled_text
             # Classify severity if missing
             if any(not r.severity for r in outcome.revision_plan.requests):
                 outcome.revision_plan = await _classify_revision_severity(
@@ -1580,6 +2012,11 @@ async def interview_gate_review(
             prior_review_text = updated_review
 
         # Execute targeted revisions
+        decision_text = await runner.artifacts.get("decisions", feature=feature) or ""
+        prior_decisions = render_active_decision_log(
+            parse_decision_ledger(decision_text),
+            heading="## Mandatory Decisions",
+        )
         await targeted_revision(
             runner, feature, phase_name,
             revision_plan=outcome.revision_plan,
@@ -1590,6 +2027,7 @@ async def interview_gate_review(
             post_update=post_update,
             context_keys=context_keys,
             checkpoint_prefix=f"gate-{review_cycle}",
+            prior_decisions=prior_decisions,
         )
 
         # ── Update ledger after revisions ──
@@ -1627,6 +2065,9 @@ async def interview_gate_review(
             f.cycle_resolved = review_cycle
     gate_ledger.cycle = review_cycle
     await _save_gate_ledger(runner, feature, gate_ledger, artifact_prefix)
+    hosting = runner.services.get("hosting")
+    if hosting and hasattr(hosting, "mark_feedback_submitted"):
+        await hosting.mark_feedback_submitted(feature.id, compiled_key)
 
     return compiled_text
 
@@ -1745,9 +2186,12 @@ def _apply_patches(text: str, patches: list) -> str:
     target_usage: dict[str, int] = {}
 
     for patch in patches:
+        raw_operation = str(getattr(patch, "operation", "") or "").strip().lower()
+
         # FULL_DOCUMENT: replace entire artifact content
         if patch.target.strip().upper() == "FULL_DOCUMENT":
-            if patch.operation == "replace":
+            normalized_full = raw_operation if raw_operation != "set" else "replace"
+            if normalized_full in {"replace", "replace_section", "revise"}:
                 text = patch.content.rstrip("\n") + "\n"
             continue
 
@@ -1757,6 +2201,7 @@ def _apply_patches(text: str, patches: list) -> str:
 
         sections = _parse_markdown_sections(text)
         match = _find_section(sections, patch.target, occurrence=occurrence)
+        operation = _normalize_patch_operation(raw_operation, match_found=bool(match))
 
         # If the nth occurrence doesn't exist, try the first (for non-duplicate targets)
         if not match and occurrence > 1:
@@ -1766,7 +2211,7 @@ def _apply_patches(text: str, patches: list) -> str:
             )
             continue
 
-        if patch.operation == "replace":
+        if operation == "replace":
             if not match:
                 logger.warning(
                     "Patch target not found for replace: %r — skipping",
@@ -1784,7 +2229,7 @@ def _apply_patches(text: str, patches: list) -> str:
             content = patch.content.rstrip("\n") + "\n\n"
             text = text[:start] + content + text[replace_end:]
 
-        elif patch.operation == "insert_after":
+        elif operation == "insert_after":
             if not match:
                 logger.warning(
                     "Patch target not found for insert_after: %r — appending to end",
@@ -1796,7 +2241,7 @@ def _apply_patches(text: str, patches: list) -> str:
             content = patch.content.rstrip("\n") + "\n\n"
             text = text[:end] + content + text[end:]
 
-        elif patch.operation == "delete":
+        elif operation == "delete":
             if not match:
                 logger.warning(
                     "Patch target not found for delete: %r — skipping",
@@ -1806,7 +2251,7 @@ def _apply_patches(text: str, patches: list) -> str:
             _, _, start, end = match
             text = text[:start] + text[end:]
 
-        elif patch.operation == "find_replace":
+        elif operation == "find_replace":
             if not match:
                 logger.warning(
                     "Patch target not found for find_replace: %r — skipping",
@@ -1828,6 +2273,68 @@ def _apply_patches(text: str, patches: list) -> str:
             logger.warning("Unknown patch operation: %r — skipping", patch.operation)
 
     return text
+
+
+def _normalize_patch_operation(operation: str, *, match_found: bool) -> str:
+    op = (operation or "").strip().lower()
+    if not op:
+        return ""
+    if op in {"replace", "insert_after", "delete", "find_replace"}:
+        return op
+    if op in {"set", "replace_section", "revise"}:
+        return "replace"
+    if op in {"append", "add", "add_section", "create"}:
+        return "insert_after"
+    if op in {"replace_or_append", "upsert"}:
+        return "replace" if match_found else "insert_after"
+    return op
+
+
+def _write_revision_source_manifest(
+    runner: WorkflowRunner,
+    feature: Feature,
+    *,
+    artifact_key: str,
+    artifact_prefix: str,
+    sf_slug: str,
+) -> str:
+    mirror = runner.services.get("artifact_mirror")
+    if not mirror:
+        return ""
+
+    feature_dir = Path(mirror.feature_dir(feature.id))
+    context_dir = feature_dir / ".iriai-context"
+    context_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = context_dir / f"revision-sources-{artifact_prefix}-{sf_slug}.md"
+
+    staging_path, final_path = _artifact_paths(runner, feature, artifact_key)
+    lines = [
+        "# Revision Source Manifest",
+        "",
+        f"- Artifact key: `{artifact_key}`",
+    ]
+
+    if final_path and final_path.exists():
+        lines.append(f"- Current artifact file: `{final_path}`")
+    if staging_path and staging_path.exists():
+        lines.append(f"- Staging artifact draft: `{staging_path}`")
+
+    decisions_path = feature_dir / "decisions.md"
+    if decisions_path.exists():
+        lines.append(f"- Feature decision ledger: `{decisions_path}`")
+
+    review_dir = feature_dir / "reviews"
+    if review_dir.exists():
+        for review_path in sorted(review_dir.glob("*.md")):
+            lines.append(f"- Review artifact: `{review_path}`")
+
+    for review_path in sorted(feature_dir.glob("plan-review-cycle-*.md")):
+        lines.append(f"- Plan review cycle: `{review_path}`")
+    for discussion_path in sorted(feature_dir.glob("plan-review-discussion-*.md")):
+        lines.append(f"- Plan review discussion: `{discussion_path}`")
+
+    manifest_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return str(manifest_path)
 
 
 async def targeted_revision(
@@ -1961,6 +2468,28 @@ async def targeted_revision(
                     f"{prior_decisions}\n\n"
                 )
 
+            manifest_path = _write_revision_source_manifest(
+                runner,
+                feature,
+                artifact_key=sf_key,
+                artifact_prefix=artifact_prefix,
+                sf_slug=sf_slug,
+            )
+            _, final_artifact_path = _artifact_paths(runner, feature, sf_key)
+            artifact_instruction = (
+                f"Read the current artifact from: `{final_artifact_path}`\n"
+                if final_artifact_path and final_artifact_path.exists()
+                else f"Current artifact:\n{existing}"
+            )
+            manifest_instruction = (
+                f"\nRevision source manifest: `{manifest_path}`\n"
+                "Use the manifest to open the current artifact, decision ledger, "
+                "and prior review files directly. Do NOT ask the user for file "
+                "access when those paths are present.\n"
+                if manifest_path
+                else ""
+            )
+
             # Build combined change instructions from ALL requests for this SF
             changes_parts = []
             for i, req in enumerate(requests, 1):
@@ -2012,7 +2541,8 @@ async def targeted_revision(
                         f"your questions in the summary field. You will get a chance to "
                         f"discuss with the user and then produce patches. Only do this "
                         f"for genuine ambiguities — not for optional improvements.\n\n"
-                        f"Current artifact:\n{existing}"
+                        f"{artifact_instruction}"
+                        f"{manifest_instruction}"
                     ),
                     output_type=ArtifactPatchSet,
                 ),
@@ -2029,15 +2559,46 @@ async def targeted_revision(
                 from ...models.outputs import Envelope, envelope_done
                 from .._common import HostedInterview
 
+                clarification_role = Role(
+                    name=f"{base_role.name}-revision-clarifier",
+                    prompt=(
+                        "You are collecting clarification for a revision to an existing "
+                        "artifact within an already-scoped feature workflow.\n\n"
+                        "Rules:\n"
+                        "- The feature, subfeature, artifact type, and requested changes "
+                        "are already fixed by the task prompt.\n"
+                        "- NEVER ask which feature is being worked on.\n"
+                        "- NEVER ask where to write the artifact or for artifact paths.\n"
+                        "- NEVER restart a generic broad/design/architecture interview.\n"
+                        "- Only ask the minimum clarification questions needed to unblock "
+                        "the requested revision.\n"
+                        "- If the user responds with a generic approval like 'proceed', "
+                        "'delegate', or equivalent without answering specifics, treat that "
+                        "as permission to make reasonable assumptions from the existing "
+                        "artifact and revision request. In that case, write a short markdown "
+                        "note saying no extra clarification was provided and assumptions are "
+                        "delegated, then mark the interview complete.\n"
+                        "- When enough information is available, write a short markdown "
+                        "summary of the clarification answers to the provided artifact path "
+                        "and mark complete=true."
+                    ),
+                    tools=[],
+                    model=BUDGET_TIERS["opus"],
+                )
                 interview_actor = AgentActor(
                     name=f"{artifact_prefix}-sf-{sf_slug}-rev-q",
-                    role=revision_role,
+                    role=clarification_role,
                     context_keys=_keys,
                 )
                 await runner.run(
                     HostedInterview(
                         questioner=interview_actor,
-                        responder=_get_user(),
+                        responder=interaction_actor_for_phase(
+                            runner,
+                            feature,
+                            phase_name=phase_name,
+                            fallback=_get_user(),
+                        ),
                         initial_prompt=(
                             f"I need clarification before revising {artifact_prefix} "
                             f"for subfeature '{sf_slug}':\n\n"
@@ -2077,7 +2638,8 @@ async def targeted_revision(
                             f"{decisions_block}\n"
                             f"**Clarification from user:**\n{answers}\n\n"
                             f"Now produce the patches.\n\n"
-                            f"Current artifact:\n{existing}"
+                            f"{artifact_instruction}"
+                            f"{manifest_instruction}"
                         ),
                         output_type=ArtifactPatchSet,
                     ),
@@ -2177,9 +2739,19 @@ async def _clear_agent_session(
     contamination when the same actor is used for sequential gate reviews.
     """
     session_key = f"{actor.name}:{feature.id}"
+    stores: list[Any] = []
     if hasattr(runner, "sessions") and runner.sessions:
-        await runner.sessions.delete(session_key)
-    runtime = getattr(runner, "agent_runtime", None)
+        stores.append(runner.sessions)
+    runtime = actor.role.metadata.get("runtime_instance")
+    if runtime is None:
+        runtime = getattr(runner, "agent_runtime", None)
+    runtime_store = getattr(runtime, "session_store", None) if runtime is not None else None
+    if runtime_store is not None and runtime_store not in stores:
+        stores.append(runtime_store)
+    for store in stores:
+        delete = getattr(store, "delete", None)
+        if callable(delete):
+            await delete(session_key)
     if runtime:
         msgs = getattr(runtime, "_session_messages", None)
         if isinstance(msgs, dict):
@@ -2187,3 +2759,6 @@ async def _clear_agent_session(
         ctx = getattr(runtime, "_session_context", None)
         if isinstance(ctx, dict):
             ctx.pop(session_key, None)
+        sizes = getattr(runtime, "_session_sizes", None)
+        if isinstance(sizes, dict):
+            sizes.pop(session_key, None)

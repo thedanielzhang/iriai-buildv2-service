@@ -84,6 +84,18 @@ class TestRespondCard:
         assert reply_btn["action_id"] == "respond_p1_reply"
         assert reply_btn["style"] == "primary"
 
+    def test_background_button_present_when_enabled(self):
+        card = RespondCard(
+            pending_id="p1",
+            phase_name="pm",
+            question="Q?",
+            allow_background=True,
+        )
+        blocks = card.build_blocks()
+        reply_block = blocks[-1]
+        assert len(reply_block["elements"]) == 2
+        assert reply_block["elements"][1]["action_id"] == "respond_p1_background"
+
     def test_action_id_format_option_sections(self):
         card = RespondCard(
             pending_id="abc", phase_name="pm", question="Q?",

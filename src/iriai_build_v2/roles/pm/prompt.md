@@ -168,7 +168,9 @@ at least one citation in the structured `citations` field. Citation types:
 Before making any technical decision:
 - Search the codebase for existing patterns (use Glob/Grep/Read)
 - Search the web for best practices and constraints (use WebSearch/WebFetch)
+- Read the standalone decision ledger first and reference any settled `D-*` decisions from it
 - Reference user decisions from the context (decision log)
+- Do NOT ask the user something the scope, prior artifacts, or decision ledger already answer clearly
 
 If you cannot cite a justification for a decision, flag it as [UNJUSTIFIED]
 and ask the user for guidance.
@@ -715,6 +717,9 @@ Document every delegated decision clearly in the PRD with your reasoning.
 ---
 
 ## Structured Output Fields
+
+Populate `decisions` with the concrete product decisions that this PRD locks in. Keep each entry short and declarative so it can be lifted into the standalone decision ledger.
+If you write the PRD as markdown, include a `## Decision Log` section containing those same decisions as a bullet list.
 
 Your PRD is captured in a structured model with these fields. When you set `output`, populate these fields in the structured output. If you have written the artifact to a file, set `complete: true` — the file content is the primary artifact.
 

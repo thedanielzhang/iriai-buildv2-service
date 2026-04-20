@@ -7,6 +7,7 @@ from pydantic import BaseModel
 
 from iriai_compose import AgentActor, Feature, Phase, WorkflowRunner, to_str
 
+from ....config import BUDGET_TIERS
 from ....models.outputs import (
     ArchitectureOutput,
     Envelope,
@@ -480,18 +481,17 @@ class ArchitecturePhase(Phase):
         sd_key: str,
         sf_name: str,
         plan_text: str,
-    ) -> None:
-        """Re-host both plan and SD after a plan revision.
+    ) -> str:
+        """Re-host both plan and regenerate SD after a plan revision.
 
         Uses ``hosting.push`` (not ``update``) to ensure URLs are registered
         in the hosting service's URL map — ``update`` only writes to disk
         without registering the URL, which causes gate cards to drop the link.
         """
         hosting = runner.services.get("hosting")
-        if not hosting:
-            return
-        await hosting.push(feature.id, plan_key, plan_text, f"Technical Plan — {sf_name}")
-        await self._convert_and_host_sd(runner, feature, sd_key, plan_text, sf_name)
+        if hosting:
+            await hosting.push(feature.id, plan_key, plan_text, f"Technical Plan — {sf_name}")
+        return await self._convert_and_host_sd(runner, feature, sd_key, plan_text, sf_name)
 
     async def _convert_and_host_sd(
         self,
@@ -555,7 +555,7 @@ class ArchitecturePhase(Phase):
                 "becomes a ServiceNode, every public function becomes an APIEndpoint."
             ),
             tools=[],
-            model="claude-sonnet-4-6",
+            model=BUDGET_TIERS["opus_1m"],
         )
 
         try:

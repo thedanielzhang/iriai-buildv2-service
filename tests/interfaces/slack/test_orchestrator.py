@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+import asyncio
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from iriai_build_v2.interfaces.slack.orchestrator import SlackWorkflowOrchestrator
+from iriai_build_v2.interfaces.slack.orchestrator import (
+    SlackWorkflowOrchestrator,
+    _SlackInvocationObserver,
+)
 from iriai_build_v2.interfaces.slack.parser import ParsedRequest
+from iriai_build_v2.interfaces.slack.streamer import SlackStreamer
 
 
 class _QueuedRuntime:
@@ -20,13 +26,17 @@ class _QueuedRuntime:
 class _RecoveringAdapter:
     def __init__(self) -> None:
         self.messages: list[tuple[str, str]] = []
+        self.updated_messages: list[tuple[str, str, str | None]] = []
         self.modes: list[tuple[str, str]] = []
         self.reactions: list[tuple[str, str, str]] = []
         self.created_channels: list[str] = []
 
     async def post_message(self, channel: str, text: str, **kwargs) -> str:
         self.messages.append((channel, text))
-        return "1234.5678"
+        return f"{len(self.messages):04d}.5678"
+
+    async def update_message(self, channel: str, ts: str, *, text=None, blocks=None) -> None:
+        self.updated_messages.append((channel, ts, text))
 
     def set_channel_mode(self, channel: str, mode: str) -> None:
         self.modes.append((channel, mode))
@@ -59,6 +69,53 @@ class _RecoveringInteraction:
 
     def has_pending(self, channel: str) -> bool:
         return False
+
+
+@pytest.mark.asyncio
+async def test_silent_invocation_observer_posts_heartbeat(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(
+        "iriai_build_v2.interfaces.slack.orchestrator._SILENT_INVOCATION_NOTICE_DELAY",
+        0.01,
+    )
+    monkeypatch.setattr(
+        "iriai_build_v2.interfaces.slack.orchestrator._SILENT_INVOCATION_UPDATE_INTERVAL",
+        0.01,
+    )
+    adapter = _RecoveringAdapter()
+    streamer = SlackStreamer(adapter, "C123")
+    observer = _SlackInvocationObserver(adapter, "C123", streamer)
+
+    observer.on_invocation_start(
+        "inv-1",
+        actor_name="scoper",
+        timeout_seconds=600,
+    )
+    await asyncio.sleep(0.03)
+
+    assert adapter.messages
+    assert "scoper" in adapter.messages[0][1]
+    assert "hasn't produced Slack-visible progress yet" in adapter.messages[0][1]
+
+
+@pytest.mark.asyncio
+async def test_silent_invocation_observer_skips_when_streamer_is_visible(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(
+        "iriai_build_v2.interfaces.slack.orchestrator._SILENT_INVOCATION_NOTICE_DELAY",
+        0.01,
+    )
+    adapter = _RecoveringAdapter()
+    streamer = SlackStreamer(adapter, "C123")
+    observer = _SlackInvocationObserver(adapter, "C123", streamer)
+
+    observer.on_invocation_start(
+        "inv-1",
+        actor_name="scoper",
+        timeout_seconds=600,
+    )
+    streamer._last_visible_update_at = time.monotonic()
+    await asyncio.sleep(0.03)
+
+    assert adapter.messages == []
 
 
 def test_queue_user_note_forwards_to_active_runtime():

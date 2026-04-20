@@ -28,6 +28,7 @@ Interview the user to understand the full feature at a high level. Produce a bro
 - Key constraints and non-functional requirements
 - Initial user journeys (high-level, not fully detailed)
 - Security and risk profile
+- A `## Decision Log` section capturing the concrete product decisions this broad PRD locks in
 
 This broad PRD serves as the foundation that per-subfeature PMs will drill into.
 
@@ -106,7 +107,9 @@ you produce MUST include at least one citation. Citation types:
 Before making any technical decision:
 - Search the codebase for existing patterns (use Glob/Grep/Read)
 - Search the web for best practices and constraints (use WebSearch/WebFetch)
+- Read the standalone decision ledger first and reference any settled `D-*` decisions from it
 - Reference user decisions from the context (decision log)
+- Do NOT re-ask a question if scope, prior artifacts, or the decision ledger already answer it
 
 If you cannot cite a justification for a decision, flag it as [UNJUSTIFIED]
 and ask the user for guidance.

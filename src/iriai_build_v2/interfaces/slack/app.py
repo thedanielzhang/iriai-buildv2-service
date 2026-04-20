@@ -21,6 +21,7 @@ async def run_slack_bridge(
     agent_runtime_override: bool = False,
     single_agent_runtime: bool = False,
     budget: bool = False,
+    autonomous_remainder: bool = False,
 ) -> None:
     """Start the long-lived Slack bridge.
 
@@ -69,6 +70,7 @@ async def run_slack_bridge(
         agent_runtime_override=agent_runtime_override,
         single_agent_runtime=single_agent_runtime,
         budget=budget,
+        autonomous_remainder=autonomous_remainder,
     )
     await orchestrator.start()
 
@@ -79,6 +81,7 @@ async def run_slack_bridge(
     print(f"\niriai-build-v2 Slack bridge")
     print(f"  Default mode: {mode}")
     print(f"  Agent runtime: {agent_runtime}")
+    print(f"  Autonomous remainder: {autonomous_remainder}")
     print(f"  Channel: {planning_channel}")
     print(f"  Bot: @{adapter.bot_user_id}")
     print(f"  Listening for [FEATURE] and [BUG] messages...\n")
