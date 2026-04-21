@@ -205,6 +205,14 @@ def _key_to_path(key: str) -> str:
         return f"reviews/{slug}-gate-ledger.json"
     if prefix == "gate-enhancement-backlog":
         return f"reviews/{slug}-gate-enhancements.json"
+    if prefix == "dag-slices":
+        return f"subfeatures/{slug}/dag-slices.json"
+    if prefix == "dag-fragment":
+        sf_slug, slice_id = slug.split(":", 1)
+        return f"subfeatures/{sf_slug}/dag-fragments/{slice_id}.json"
+    if prefix == "dag-fragment-attempt":
+        sf_slug, attempt_id = slug.split(":", 1)
+        return f"subfeatures/{sf_slug}/dag-fragment-attempts/{attempt_id}.md"
 
     # 5. Subfeature artifacts
     base_key = prefix.replace("-summary", "")  # prd-summary → prd

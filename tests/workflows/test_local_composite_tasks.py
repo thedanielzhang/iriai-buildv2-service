@@ -38,6 +38,10 @@ from iriai_build_v2.models.outputs import (
 from iriai_build_v2.models.state import BuildState
 from iriai_build_v2.planning_signals import GateRejection
 from iriai_build_v2.workflows._common import Choose, Gate, Interview, Notify, Respond
+from iriai_build_v2.workflows._common._helpers import (
+    TargetedRevisionFailure,
+    TargetedRevisionResult,
+)
 from iriai_build_v2.workflows._runner import TrackedWorkflowRunner
 from iriai_build_v2.workflows.planning.phases import plan_review as plan_review_module
 from iriai_build_v2.workflows.planning.phases.plan_review import PlanReviewPhase
@@ -408,7 +412,10 @@ async def test_plan_review_revision_summary_uses_notify(monkeypatch):
 
     async def _noop_revision(*args, **kwargs):
         del args, kwargs
-        return ["plan: revised (13 \u2192 22 bytes)"]
+        return TargetedRevisionResult(
+            artifact_prefix="plan",
+            revised_slugs=["payments"],
+        )
 
     async def _compile(*args, **kwargs):
         del args, kwargs
@@ -431,3 +438,97 @@ async def test_plan_review_revision_summary_uses_notify(monkeypatch):
         "- plan: revised (13 → 22 bytes)\n\n"
         "Re-running reviewers to verify..."
     ]
+
+
+@pytest.mark.asyncio
+async def test_plan_review_blocks_when_required_revision_batch_fails(monkeypatch):
+    feature = SimpleNamespace(id="feat-plan-review-blocked", metadata={})
+    decomposition = SubfeatureDecomposition(
+        subfeatures=[
+            Subfeature(id="SF-1", slug="payments", name="Payments", description="Payments"),
+        ],
+        complete=True,
+    )
+    state = BuildState(
+        metadata={},
+        decomposition=decomposition.model_dump_json(indent=2),
+        system_design="existing system design",
+    )
+    artifacts = _Artifacts(
+        {
+            "system-design": "existing system design",
+            "system-design:payments": "existing subfeature system design",
+        }
+    )
+    runner = _PlanReviewRunner(
+        artifacts=artifacts,
+        run_results=[
+            Verdict(approved=False, summary="Needs changes"),
+            Verdict(approved=False, summary="Needs changes"),
+            Envelope[ReviewOutcome](
+                output=ReviewOutcome(
+                    approved=False,
+                    revision_plan=RevisionPlan(
+                        requests=[
+                            RevisionRequest(
+                                description="Revise the system design.",
+                                reasoning="The review found a missing contract.",
+                                affected_subfeatures=["payments"],
+                                affected_artifact_types=["system-design"],
+                            )
+                        ],
+                    ),
+                    complete=True,
+                ),
+                complete=True,
+            ),
+        ],
+    )
+
+    async def _normalize(*args, **kwargs):
+        del args, kwargs
+        return (
+            False,
+            None,
+            RevisionPlan(
+                requests=[
+                    RevisionRequest(
+                        description="Revise the system design.",
+                        reasoning="The review found a missing contract.",
+                        affected_subfeatures=["payments"],
+                        affected_artifact_types=["system-design"],
+                    )
+                ]
+            ),
+        )
+
+    async def _failed_revision(*args, **kwargs):
+        del args, kwargs
+        return TargetedRevisionResult(
+            artifact_prefix="system-design",
+            failed=[
+                TargetedRevisionFailure(
+                    artifact_prefix="system-design",
+                    slug="payments",
+                    reason="batch 0 failed: prompt too long",
+                )
+            ],
+        )
+
+    compile_calls: list[str] = []
+
+    async def _compile(*args, **kwargs):
+        compile_calls.append(kwargs.get("artifact_prefix", ""))
+        return "updated system design"
+
+    monkeypatch.setattr(plan_review_module, "_normalize_plan_review_state", _normalize)
+    monkeypatch.setattr(plan_review_module, "targeted_revision", _failed_revision)
+    monkeypatch.setattr(plan_review_module, "compile_artifacts", _compile)
+
+    with pytest.raises(_StopAfterNotify):
+        await PlanReviewPhase().execute(runner, feature, state)
+
+    assert compile_calls == []
+    assert len(runner.notifications) == 1
+    assert "## Plan Review Blocked (Cycle 1)" in runner.notifications[0]
+    assert "system-design:payments — batch 0 failed: prompt too long" in runner.notifications[0]

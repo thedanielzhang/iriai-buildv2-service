@@ -52,7 +52,13 @@ from ....roles import (
 )
 from ....services.markdown import to_markdown
 from ..._common import Gate, Notify
-from ..._common._helpers import PROMPT_FILE_THRESHOLD, _offload_if_large
+from ..._common._helpers import (
+    PROMPT_FILE_THRESHOLD,
+    ContextPackage,
+    ContextPackageItem,
+    _offload_if_large,
+    build_context_package,
+)
 from ..._common._autonomy import interaction_actor_for_phase
 from ..._common._tasks import HostedInterview
 
@@ -609,11 +615,19 @@ class ImplementationPhase(Phase):
                         + "\n"
                     )
 
-            # Offload handover context to file if too large for inline prompts
-            handover_context = _offload_if_large(
-                handover_context,
-                _get_feature_root(runner, feature),
-                "post-dag-handover",
+            post_dag_context = await _build_prompt_context_package(
+                runner,
+                feature,
+                title="Post-DAG Gates",
+                file_stem="post-dag-gates",
+                intro_lines=[
+                    "Use the implementation handover and test plan files as the source of truth for post-DAG review and verification.",
+                    "Cross-check implementation outputs against the referenced planning artifacts and evidence files.",
+                ],
+                sections=[
+                    ("handover", "Implementation Handover", handover_context),
+                    ("test-plan", "Test Plan", test_plan_section),
+                ],
             )
 
             # ── Adversarial runtime routing for post-DAG gates ──────────
@@ -641,7 +655,8 @@ class ImplementationPhase(Phase):
                             reviewer, "gate", runtime=gate_runtime,
                         ),
                         prompt=(
-                            f"## Implementation Handover\n\n{handover_context}\n\n"
+                            _context_package_prompt(post_dag_context)
+                            +
                             "Review the implementation for code quality, adherence to "
                             "the technical plan, design decisions, and system design. "
                             "Cross-check against the full upstream artifacts in your context."
@@ -695,7 +710,8 @@ class ImplementationPhase(Phase):
                             security_auditor, "gate", runtime=gate_runtime,
                         ),
                         prompt=(
-                            f"## Implementation Handover\n\n{handover_context}\n\n"
+                            _context_package_prompt(post_dag_context)
+                            +
                             "Audit the implementation for security vulnerabilities. "
                             "Check OWASP Top 10, auth on every endpoint, secrets in "
                             "code, input validation, and data exposure. Cross-check "
@@ -752,8 +768,8 @@ class ImplementationPhase(Phase):
                             test_author, "gate", runtime=gate_runtime,
                         ),
                         prompt=(
-                            f"## Implementation Handover\n\n{handover_context}"
-                            f"{test_plan_section}\n\n"
+                            _context_package_prompt(post_dag_context)
+                            +
                             "Write tests for this implementation. When a Test Plan section is "
                             "provided above, it is the source of truth for acceptance criteria "
                             "and verification methods — write at least one test per AC-id, "
@@ -788,8 +804,8 @@ class ImplementationPhase(Phase):
                             qa_engineer, "gate", runtime=gate_runtime,
                         ),
                         prompt=(
-                            f"## Implementation Handover\n\n{handover_context}"
-                            f"{test_plan_section}\n\n"
+                            _context_package_prompt(post_dag_context)
+                            +
                             "Test the full implementation. Run the test suite, check "
                             "for runtime errors, and verify the acceptance criteria "
                             "from the PRD and design specs are met. When a Test Plan "
@@ -843,8 +859,8 @@ class ImplementationPhase(Phase):
                             integration_tester, "gate", runtime=gate_runtime,
                         ),
                         prompt=(
-                            f"## Implementation Handover\n\n{handover_context}"
-                            f"{test_plan_section}\n\n"
+                            _context_package_prompt(post_dag_context)
+                            +
                             "Execute ALL user journeys from the PRD against the "
                             "implementation. Use Playwright for UI journeys, Bash "
                             "for API/CLI journeys. Every journey step must produce "
@@ -902,8 +918,8 @@ class ImplementationPhase(Phase):
                             verifier, "gate", runtime=gate_runtime,
                         ),
                         prompt=(
-                            f"## Implementation Handover\n\n{handover_context}"
-                            f"{test_plan_section}\n\n"
+                            _context_package_prompt(post_dag_context)
+                            +
                             "Verify that ALL user journeys from the PRD work end-to-end. "
                             "When a Test Plan section is provided above, its "
                             "verification_checklist and acceptance_criteria are the "
@@ -1330,18 +1346,28 @@ async def _verify_and_fix_group(
                 "from each flagged file to the actual root cause."
             )
 
-        rca_prompt = _offload_if_large(
+        rca_context = await _build_prompt_context_package(
+            runner,
+            feature,
+            title=f"DAG Verify RCA — Group {group_idx} Retry {retry + 1}",
+            file_stem=f"g{group_idx}-rca-{retry}",
+            intro_lines=[
+                "Investigate the root cause of the verifier's findings for this DAG group.",
+                "Use the verifier feedback, specific findings, and prior-attempt history from the referenced files.",
+            ],
+            sections=[
+                ("feedback", "Verifier Feedback", feedback),
+                ("issues", "Verifier Specific Findings", verifier_issues_section),
+                ("prior-attempt", "Prior Verify Attempt", prior_ctx),
+                ("workspace", "Workspace", workspace_hint),
+            ],
+        )
+        rca_prompt = (
             f"## DAG Verify Failed (group {group_idx}, attempt {retry + 1})\n\n"
-            f"{feedback}"
-            f"{verifier_issues_section}\n\n"
+            f"{_context_package_prompt(rca_context)}"
             "Investigate the root cause of the specific issues listed above. "
-            "Read each flagged file and check git history for "
-            "oscillating changes. Check if the issue is a spec "
-            "contradiction (task reference_material says X but "
-            "a D-GR decision says Y)."
-            f"{prior_ctx}{workspace_hint}",
-            feature_root,
-            f"g{group_idx}-rca-{retry}",
+            "Read each flagged file and check git history for oscillating changes. "
+            "Check if the issue is a spec contradiction (task reference_material says X but a D-GR decision says Y)."
         )
         rca_result: RootCauseAnalysis | None = None
         try:
@@ -1422,18 +1448,31 @@ async def _verify_and_fix_group(
                 f"other copies of the same repo.\n"
             )
 
+        fix_context_package = await _build_prompt_context_package(
+            runner,
+            feature,
+            title=f"DAG Verify Fix — Group {group_idx} Retry {retry + 1}",
+            file_stem=f"g{group_idx}-fix-{retry}",
+            intro_lines=[
+                "Fix the verifier findings for this DAG group using the referenced RCA and feedback files.",
+            ],
+            sections=[
+                ("feedback", "Verifier Feedback", feedback),
+                ("rca-guidance", "RCA Guidance", rca_guidance),
+                ("user-direction", "User Decision", fix_direction),
+                ("fix-context", "Original Enhancement Items", fix_context),
+                ("workspace", "Workspace", workspace_ctx),
+            ],
+        )
         fix_prompt = (
             f"Verification failed (attempt {retry + 1}/{VERIFY_RETRIES}). "
-            f"Read the issues below carefully, then fix them.\n\n"
-            f"{feedback}{rca_guidance}{fix_direction}{fix_context}{workspace_ctx}\n\n"
+            "Read the referenced context carefully, then fix the issues.\n\n"
+            f"{_context_package_prompt(fix_context_package)}"
             "## Instructions\n"
             "1. Read each affected file listed above\n"
             "2. Identify the root cause of each issue\n"
             "3. Apply targeted fixes — do NOT rewrite files unnecessarily\n"
             "4. Verify your fix addresses the specific concern/gap described"
-        )
-        fix_prompt = _offload_if_large(
-            fix_prompt, feature_root, f"g{group_idx}-fix-{retry}",
         )
         fix_result = await runner.run(
             Ask(
@@ -2353,20 +2392,31 @@ async def _verify(
 
     verifier = _make_parallel_actor(qa_engineer, "verify", runtime=runtime)
 
+    verify_context = await _build_prompt_context_package(
+        runner,
+        feature,
+        title="Group Verification",
+        file_stem="verify",
+        intro_lines=[
+            "Verify this implementation group against the implementation results, upstream specs, and deferred issue ledger.",
+        ],
+        sections=[
+            ("results", "Implementation Results", results_summary),
+            ("reference-material", "Upstream Specs", ref_context),
+            ("known-issues", "Deferred Issues and User Decisions", known_issues),
+        ],
+    )
+
     verify_prompt = (
-        f"Verify this implementation group:\n\n{results_summary}\n\n"
+        f"{_context_package_prompt(verify_context)}"
+        "Verify this implementation group.\n\n"
         "For each result, confirm:\n"
         f"1. All claimed files exist on disk: {file_list}\n"
         "2. Files listed as modified were actually changed\n"
         "3. The changes align with the described summary\n"
-        "4. The code compiles, imports correctly, and passes "
-        "any existing tests for these files\n"
-        "5. Implementation matches the upstream specs in Reference Material"
-        f"{ref_context}{known_issues}\n\n"
+        "4. The code compiles, imports correctly, and passes any existing tests for these files\n"
+        "5. Implementation matches the upstream specs in the referenced context files\n\n"
         "This is a per-group verification, not a full QA pass."
-    )
-    verify_prompt = _offload_if_large(
-        verify_prompt, _get_feature_root(runner, feature), "verify",
     )
 
     return await runner.run(
@@ -2411,17 +2461,24 @@ async def _verify_enhancements(
         )
     enh_spec = "\n".join(enh_spec_lines)
 
-    enh_spec_section = _offload_if_large(
-        f"### Enhancement Items (the spec)\n\n"
-        f"Each item below should have been addressed or confirmed as "
-        f"already resolved by prior work. Check each one:\n\n{enh_spec}",
-        feature_root,
-        "enh-verify-spec",
-    )
-    results_section = _offload_if_large(
-        f"### Implementation Results\n\n{results_summary}",
-        feature_root,
-        "enh-verify-results",
+    verify_context = await _build_prompt_context_package(
+        runner,
+        feature,
+        title="Enhancement Verification",
+        file_stem="enhancement-verify",
+        intro_lines=[
+            "Verify enhancement fixes against the referenced implementation results and enhancement spec.",
+        ],
+        sections=[
+            ("results", "Implementation Results", results_summary),
+            (
+                "spec",
+                "Enhancement Spec",
+                "### Enhancement Items (the spec)\n\n"
+                "Each item below should have been addressed or confirmed as already resolved by prior work. "
+                f"Check each one:\n\n{enh_spec}",
+            ),
+        ],
     )
 
     verifier = _make_parallel_actor(qa_engineer, "verify-enh", runtime=runtime)
@@ -2431,10 +2488,9 @@ async def _verify_enhancements(
             actor=verifier,
             prompt=(
                 f"## Enhancement Group Verification\n\n"
+                f"{_context_package_prompt(verify_context)}"
                 f"An implementer was tasked with fixing {len(enhancement_items)} "
                 f"deferred non-blocking issues. Verify their work.\n\n"
-                f"{results_section}\n\n"
-                f"{enh_spec_section}\n\n"
                 f"### Verification Checklist\n\n"
                 f"For each file in [{file_list}]:\n"
                 f"1. The file exists and the changes compile/import correctly\n"
@@ -2551,6 +2607,45 @@ def _get_feature_root(runner: WorkflowRunner, feature: Feature) -> Path | None:
         return None
     root = Path(workspace_mgr._base) / ".iriai" / "features" / feature.slug / "repos"
     return root if root.exists() else None
+
+
+async def _build_prompt_context_package(
+    runner: WorkflowRunner,
+    feature: Feature,
+    *,
+    title: str,
+    file_stem: str,
+    intro_lines: list[str],
+    sections: list[tuple[str, str, str]],
+) -> ContextPackage | None:
+    return await build_context_package(
+        runner,
+        feature,
+        title=title,
+        file_stem=file_stem,
+        intro_lines=intro_lines,
+        items=[
+            ContextPackageItem(
+                key=key,
+                label=label,
+                group="Prompt Context",
+                content=content,
+                file_name=f"{file_stem}-{key}.md",
+            )
+            for key, label, content in sections
+            if content.strip()
+        ],
+    )
+
+
+def _context_package_prompt(package: ContextPackage | None) -> str:
+    if package is None:
+        return ""
+    return (
+        f"Read the context index first: `{package.index_path}`\n"
+        f"Then read the context manifest: `{package.manifest_path}`\n"
+        "Open the referenced files selectively instead of loading everything eagerly.\n\n"
+    )
 
 
 def _discover_repo_roots_under(repos_root: Path) -> list[Path]:
@@ -3586,6 +3681,20 @@ async def _run_regression(
 
     # ── Integration regression: re-run affected user journeys ─────────
     if handover_context:
+        regression_context = await _build_prompt_context_package(
+            runner,
+            feature,
+            title="Integration Regression",
+            file_stem=f"integration-regression-{actor_suffix}",
+            intro_lines=[
+                "Re-run the affected user journeys after the bug-fix changes.",
+                "Use the implementation handover and test plan files as the source of truth for affected journeys.",
+            ],
+            sections=[
+                ("handover", "Implementation Handover", handover_context),
+                ("test-plan", "Test Plan", test_plan_section),
+            ],
+        )
         integration_verdict: Verdict = await runner.run(
             Ask(
                 actor=actor_builder(
@@ -3598,8 +3707,7 @@ async def _run_regression(
                     f"## Integration Regression Check\n\n"
                     f"The following files were modified during bug fix cycles:\n"
                     f"{file_list}\n\n"
-                    f"## Implementation Handover\n\n{handover_context}"
-                    f"{test_plan_section}\n\n"
+                    f"{_context_package_prompt(regression_context)}"
                     "Re-execute ONLY the user journeys from the PRD that touch "
                     "the modified files listed above. Use Playwright for UI "
                     "journeys, Bash for API/CLI journeys. This is a targeted "

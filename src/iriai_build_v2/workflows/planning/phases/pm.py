@@ -145,7 +145,7 @@ class PMPhase(Phase):
                     )
                     for sf_slug, instruction in review.revision_instructions.items()
                 ])
-                await targeted_revision(
+                revision_result = await targeted_revision(
                     runner, feature, self.name,
                     revision_plan=plan,
                     decomposition=decomposition,
@@ -153,6 +153,15 @@ class PMPhase(Phase):
                     output_type=PRD,
                     artifact_prefix="prd",
                 )
+                if not revision_result.ok:
+                    failure_text = "; ".join(
+                        f"{failure.artifact_prefix}:{failure.slug} — {failure.reason}"
+                        for failure in revision_result.failed
+                    )
+                    raise RuntimeError(
+                        "PM integration review targeted revision failed: "
+                        + failure_text
+                    )
 
         # ── Step 6: Compilation ──
         compiled_text = await compile_artifacts(

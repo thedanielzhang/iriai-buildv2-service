@@ -42,7 +42,12 @@ from ....roles import (
 from ..._common import Notify
 from ..._common import compile_artifacts, interview_gate_review, targeted_revision
 from ..._common._autonomy import interaction_actor_for_phase
-from ..._common._helpers import generate_summary
+from ..._common._helpers import (
+    ContextPackage,
+    ContextPackageItem,
+    build_context_package,
+    generate_summary,
+)
 from ..._common._tasks import HostedInterview
 from .._decisions import (
     GLOBAL_DECISIONS_KEY,
@@ -350,6 +355,174 @@ async def _build_edge_review_context(
     return "\n\n---\n\n".join(parts)
 
 
+async def _build_sf_review_context_package(
+    runner: WorkflowRunner,
+    feature: Feature,
+    slug: str,
+    decomposition: SubfeatureDecomposition,
+) -> ContextPackage | None:
+    peer_summary_sections: list[str] = []
+    for sf in decomposition.subfeatures:
+        if sf.slug == slug:
+            continue
+        blocks: list[str] = [f"### {sf.name} ({sf.slug})", ""]
+        for prefix, label in (
+            ("prd-summary", "PRD Summary"),
+            ("design-summary", "Design Summary"),
+            ("plan-summary", "Plan Summary"),
+        ):
+            summary = await runner.artifacts.get(f"{prefix}:{sf.slug}", feature=feature)
+            if summary:
+                blocks.extend([f"#### {label}", "", summary, ""])
+        if len(blocks) > 2:
+            peer_summary_sections.append("\n".join(blocks).strip())
+
+    return await build_context_package(
+        runner,
+        feature,
+        title=f"Plan Review — {slug}",
+        file_stem=f"plan-review-{slug}",
+        intro_lines=[
+            f"Review the full artifact set for subfeature `{slug}`.",
+            "Use peer summaries only for cross-subfeature consistency checks.",
+            "Flag every genuine contradiction, coverage gap, and security issue.",
+        ],
+        items=[
+            ContextPackageItem(
+                key="prd",
+                label="PRD",
+                group="Target Artifacts",
+                artifact_key=f"prd:{slug}",
+            ),
+            ContextPackageItem(
+                key="design",
+                label="Design",
+                group="Target Artifacts",
+                artifact_key=f"design:{slug}",
+            ),
+            ContextPackageItem(
+                key="plan",
+                label="Technical Plan",
+                group="Target Artifacts",
+                artifact_key=f"plan:{slug}",
+            ),
+            ContextPackageItem(
+                key="system-design",
+                label="System Design",
+                group="Target Artifacts",
+                artifact_key=f"system-design:{slug}",
+            ),
+            ContextPackageItem(
+                key="test-plan",
+                label="Test Plan",
+                group="Target Artifacts",
+                artifact_key=f"test-plan:{slug}",
+            ),
+            ContextPackageItem(
+                key="subfeature-decisions",
+                label="Subfeature Decisions",
+                group="Target Artifacts",
+                artifact_key=f"decisions:{slug}",
+            ),
+            ContextPackageItem(
+                key="canonical-decisions",
+                label="Canonical Decision Ledger",
+                group="Supporting Context",
+                artifact_key="decisions",
+            ),
+            ContextPackageItem(
+                key="peer-summaries",
+                label="Peer Summaries",
+                group="Supporting Context",
+                content="\n\n".join(peer_summary_sections),
+                file_name=f"plan-review-{slug}-peer-summaries.md",
+            ),
+        ],
+    )
+
+
+async def _build_edge_review_context_package(
+    runner: WorkflowRunner,
+    feature: Feature,
+    edge: SubfeatureEdge,
+    decomposition: SubfeatureDecomposition | None = None,
+) -> ContextPackage | None:
+    id_to_slug: dict[str, str] = {}
+    if decomposition:
+        for sf in decomposition.subfeatures:
+            id_to_slug[sf.id] = sf.slug
+            id_to_slug[sf.slug] = sf.slug
+
+    edge_details = "\n".join(
+        [
+            "## Edge Metadata",
+            "",
+            f"- From: {edge.from_subfeature}",
+            f"- To: {edge.to_subfeature}",
+            f"- Interface type: {edge.interface_type}",
+            f"- Description: {edge.description}",
+            f"- Data contract: {edge.data_contract or 'n/a'}",
+            f"- Owner: {edge.owner or 'n/a'}",
+        ]
+    )
+    items: list[ContextPackageItem] = [
+        ContextPackageItem(
+            key="edge-details",
+            label="Edge Metadata",
+            group="Edge Context",
+            content=edge_details,
+            file_name=(
+                f"plan-review-edge-"
+                f"{id_to_slug.get(edge.from_subfeature, edge.from_subfeature)}-"
+                f"{id_to_slug.get(edge.to_subfeature, edge.to_subfeature)}-details.md"
+            ),
+        ),
+        ContextPackageItem(
+            key="canonical-decisions",
+            label="Canonical Decision Ledger",
+            group="Supporting Context",
+            artifact_key="decisions",
+        ),
+    ]
+    for sf_ref in (edge.from_subfeature, edge.to_subfeature):
+        slug = id_to_slug.get(sf_ref, sf_ref)
+        for prefix, label in (
+            ("prd", "PRD"),
+            ("design", "Design"),
+            ("plan", "Technical Plan"),
+            ("system-design", "System Design"),
+            ("decisions", "Decisions"),
+        ):
+            items.append(
+                ContextPackageItem(
+                    key=f"{prefix}-{slug}",
+                    label=f"{label} — {slug}",
+                    group=f"Subfeature {slug}",
+                    artifact_key=f"{prefix}:{slug}",
+                )
+            )
+
+    return await build_context_package(
+        runner,
+        feature,
+        title=(
+            "Plan Review Edge — "
+            f"{id_to_slug.get(edge.from_subfeature, edge.from_subfeature)}-"
+            f"{id_to_slug.get(edge.to_subfeature, edge.to_subfeature)}"
+        ),
+        file_stem=(
+            "plan-review-edge-"
+            f"{id_to_slug.get(edge.from_subfeature, edge.from_subfeature)}-"
+            f"{id_to_slug.get(edge.to_subfeature, edge.to_subfeature)}"
+        ),
+        intro_lines=[
+            "Review the interface contract between the two referenced subfeatures.",
+            "Verify producer and consumer assumptions against the full artifact sets.",
+        ],
+        items=items,
+    )
+
+
 async def _persist_plan_review_decisions(
     runner: WorkflowRunner,
     feature: Feature,
@@ -636,15 +809,26 @@ class PlanReviewPhase(Phase):
                     context = await _build_sf_review_context(
                         runner, feature, sf.slug, decomposition,
                     )
+                    context_package = await _build_sf_review_context_package(
+                        runner, feature, sf.slug, decomposition,
+                    )
+                    prompt_body = (
+                        f"{_SCOPE_PREFIX}"
+                        f"Read the context index first: `{context_package.index_path}`\n"
+                        f"Then read the context manifest: `{context_package.manifest_path}`\n"
+                        "Open the referenced files selectively instead of loading everything eagerly.\n\n"
+                        if context_package is not None
+                        else f"{_SCOPE_PREFIX}{context}\n\n"
+                    )
                     all_tasks.append(Ask(
                         actor=_make_parallel_actor(_sf_reviewer, f"comp-{sf.slug}"),
-                        prompt=f"{_SCOPE_PREFIX}{context}\n\n{_COMPLETENESS_PROMPT}",
+                        prompt=f"{prompt_body}{_COMPLETENESS_PROMPT}",
                         output_type=Verdict,
                     ))
                     task_labels.append(("sf", sf.slug, "completeness"))
                     all_tasks.append(Ask(
                         actor=_make_parallel_actor(_sf_reviewer, f"sec-{sf.slug}"),
-                        prompt=f"{_SCOPE_PREFIX}{context}\n\n{_SECURITY_PROMPT}",
+                        prompt=f"{prompt_body}{_SECURITY_PROMPT}",
                         output_type=Verdict,
                     ))
                     task_labels.append(("sf", sf.slug, "security"))
@@ -652,12 +836,23 @@ class PlanReviewPhase(Phase):
                 unique_edges = _deduplicate_edges(decomposition.edges)
                 for edge in unique_edges:
                     ctx = await _build_edge_review_context(runner, feature, edge, decomposition)
+                    context_package = await _build_edge_review_context_package(
+                        runner, feature, edge, decomposition,
+                    )
+                    prompt_body = (
+                        f"{_SCOPE_PREFIX}"
+                        f"Read the context index first: `{context_package.index_path}`\n"
+                        f"Then read the context manifest: `{context_package.manifest_path}`\n"
+                        "Open the referenced files selectively instead of loading everything eagerly.\n\n"
+                        if context_package is not None
+                        else f"{_SCOPE_PREFIX}{ctx}\n\n"
+                    )
                     all_tasks.append(Ask(
                         actor=_make_parallel_actor(
                             _edge_reviewer,
                             f"edge-{edge.from_subfeature}-{edge.to_subfeature}",
                         ),
-                        prompt=f"{_SCOPE_PREFIX}{ctx}\n\n{_EDGE_PROMPT}",
+                        prompt=f"{prompt_body}{_EDGE_PROMPT}",
                         output_type=Verdict,
                     ))
                     task_labels.append(("edge", edge.from_subfeature, edge.to_subfeature))
@@ -752,6 +947,33 @@ class PlanReviewPhase(Phase):
                             f"{prior_disc}\n"
                         )
 
+                discussion_package = await build_context_package(
+                    runner,
+                    feature,
+                    title=f"Plan Review Discussion — Cycle {cycle + 1}",
+                    file_stem=f"plan-review-discussion-{cycle + 1}",
+                    intro_lines=[
+                        f"Review cycle {cycle + 1} findings and decide whether the artifacts are approved or need revisions.",
+                        "Use the full report and prior-cycle decisions from the referenced files.",
+                    ],
+                    items=[
+                        ContextPackageItem(
+                            key="report",
+                            label="Plan Review Report",
+                            group="Review Inputs",
+                            content=report,
+                            file_name=f"plan-review-cycle-{cycle + 1}-report.md",
+                        ),
+                        ContextPackageItem(
+                            key="prior-decisions",
+                            label="Prior Cycle Decisions",
+                            group="Review Inputs",
+                            content=prior_context,
+                            file_name=f"plan-review-cycle-{cycle + 1}-prior-decisions.md",
+                        ),
+                    ],
+                )
+
                 review_envelope: Envelope[ReviewOutcome] = await runner.run(
                     HostedInterview(
                         questioner=lead_architect_gate_reviewer,
@@ -763,16 +985,16 @@ class PlanReviewPhase(Phase):
                         ),
                         initial_prompt=(
                             f"## Plan Review Cycle {cycle + 1} — Issues Found\n\n"
-                            f"{report}\n\n"
-                            + (f"**[View Full Report]({report_url})**\n\n" if report_url else "")
                             + (
-                                f"## Prior Decisions (MANDATORY)\n"
-                                f"The following decisions from prior cycles are already approved "
-                                f"and MUST be enforced. Do NOT re-negotiate them. Only raise "
-                                f"issues that are NEW or that prior decisions failed to address.\n"
-                                f"{prior_context}\n\n"
-                                if prior_context else ""
+                                f"Read the context index first: `{discussion_package.index_path}`\n"
+                                f"Then read the context manifest: `{discussion_package.manifest_path}`\n\n"
+                                if discussion_package is not None
+                                else (
+                                    f"{report}\n\n"
+                                    + (f"{prior_context}\n\n" if prior_context else "")
+                                )
                             )
+                            + (f"**[View Full Report]({report_url})**\n\n" if report_url else "")
                             + "IMPORTANT: Your revision_plan MUST include ALL findings, not "
                             "just new issues. For findings covered by prior D-GR decisions, "
                             "include them as revision requests that reference the applicable "
@@ -864,7 +1086,10 @@ class PlanReviewPhase(Phase):
                     if not affected_requests:
                         continue
 
-                    filtered_plan = RevisionPlan(requests=affected_requests)
+                    filtered_plan = RevisionPlan(
+                        requests=affected_requests,
+                        new_decisions=list(revision_plan.new_decisions),
+                    )
                     revision_coros.append(
                         targeted_revision(
                             runner, feature, self.name,
@@ -887,46 +1112,76 @@ class PlanReviewPhase(Phase):
                 rev_results = await asyncio.gather(
                     *revision_coros, return_exceptions=True,
                 )
+                blocked_failures: list[str] = []
                 for i, res in enumerate(rev_results):
                     if isinstance(res, BaseException):
                         logger.error(
                             "Revision for %s crashed: %s",
                             revision_meta[i][0], res,
                         )
+                        blocked_failures.append(
+                            f"{revision_meta[i][0]}: revision dispatch crashed ({res})"
+                        )
 
                 # ── Phase 2: Recompile all affected types in parallel ─
                 old_texts: dict[str, str] = {}
+                compile_targets: list[tuple[str, Any, str, str]] = []
                 for prefix, _ca, _bk, _fk in revision_meta:
                     old_texts[prefix] = (
                         await runner.artifacts.get(prefix, feature=feature) or ""
                     )
-
-                compile_results = await asyncio.gather(
-                    *[
-                        compile_artifacts(
-                            runner, feature, self.name,
-                            compiler_actor=ca,
-                            decomposition=decomposition,
-                            artifact_prefix=prefix,
-                            broad_key=bk,
-                            final_key=fk,
+                for i, meta in enumerate(revision_meta):
+                    prefix = meta[0]
+                    res = rev_results[i]
+                    if isinstance(res, BaseException):
+                        continue
+                    if not res.ok:
+                        blocked_failures.extend(
+                            f"{prefix}:{failure.slug} — {failure.reason}"
+                            for failure in res.failed
                         )
-                        for prefix, ca, bk, fk in revision_meta
-                    ],
-                    return_exceptions=True,
-                )
+                        continue
+                    compile_targets.append(meta)
+
+                compile_results_by_prefix: dict[str, str | BaseException] = {}
+                if compile_targets:
+                    compile_results = await asyncio.gather(
+                        *[
+                            compile_artifacts(
+                                runner, feature, self.name,
+                                compiler_actor=ca,
+                                decomposition=decomposition,
+                                artifact_prefix=prefix,
+                                broad_key=bk,
+                                final_key=fk,
+                            )
+                            for prefix, ca, bk, fk in compile_targets
+                        ],
+                        return_exceptions=True,
+                    )
+                    for meta, compile_result in zip(compile_targets, compile_results, strict=False):
+                        compile_results_by_prefix[meta[0]] = compile_result
 
                 # ── Phase 3: Size guard + store ───────────────────────
                 revision_results: list[str] = []
                 for i, (prefix, _ca, _bk, _fk) in enumerate(revision_meta):
-                    if isinstance(rev_results[i], BaseException):
+                    revision_result = rev_results[i]
+                    if isinstance(revision_result, BaseException):
                         revision_results.append(f"{prefix}: FAILED (revision crashed)")
                         continue
-                    if isinstance(compile_results[i], BaseException):
+                    if not revision_result.ok:
+                        revision_results.append(
+                            f"{prefix}: FAILED (revision batches failed for {len(revision_result.failed)} subfeatures)"
+                        )
+                        continue
+
+                    compile_result = compile_results_by_prefix.get(prefix)
+                    if isinstance(compile_result, BaseException):
+                        blocked_failures.append(f"{prefix}: compile crashed ({compile_result})")
                         revision_results.append(f"{prefix}: FAILED (compile crashed)")
                         continue
 
-                    new_text = compile_results[i]
+                    new_text = compile_result
                     old_text = old_texts[prefix]
                     old_size = len(old_text)
                     new_size = len(new_text) if new_text else 0
@@ -948,6 +1203,44 @@ class PlanReviewPhase(Phase):
                         revision_results.append(
                             f"{prefix}: revised ({old_size} → {new_size} bytes)"
                         )
+
+                if blocked_failures:
+                    blocked_report = (
+                        f"# Plan Review Blocked — Cycle {cycle + 1}\n\n"
+                        "The revision wave did not complete cleanly, so plan review "
+                        "stopped before downstream verification and task planning.\n\n"
+                        "## Failures\n\n"
+                        + "\n".join(f"- {failure}" for failure in blocked_failures)
+                    )
+                    blocked_key = f"plan-review-cycle-{cycle + 1}-blocked"
+                    await runner.artifacts.put(blocked_key, blocked_report, feature=feature)
+                    mirror = runner.services.get("artifact_mirror")
+                    if mirror:
+                        mirror.write_artifact(feature.id, blocked_key, blocked_report)
+                    await runner.artifacts.put(
+                        f"plan-review-cycle-{cycle + 1}-revised",
+                        (
+                            f"# Revisions Applied — Cycle {cycle + 1}\n\n"
+                            + "\n".join(f"- {r}" for r in revision_results)
+                        ),
+                        feature=feature,
+                    )
+                    await runner.run(
+                        Notify(
+                            message=(
+                                f"## Plan Review Blocked (Cycle {cycle + 1})\n\n"
+                                "Revision batches failed, so the workflow stopped before "
+                                "re-running reviewers or generating downstream planning outputs.\n\n"
+                                + "\n".join(f"- {failure}" for failure in blocked_failures)
+                            ),
+                        ),
+                        feature,
+                        phase_name=self.name,
+                    )
+                    raise RuntimeError(
+                        f"Plan-review revisions failed in cycle {cycle + 1}. "
+                        f"See `{blocked_key}`."
+                    )
 
                 # ── Cascade test-plan revisions (per-SF only, no compile) ─
                 # Any PRD/design/plan/system-design revision can invalidate
@@ -978,10 +1271,11 @@ class PlanReviewPhase(Phase):
                             affected_slugs_set.update(affected_with_tp)
                     if test_plan_requests:
                         try:
-                            await targeted_revision(
+                            test_plan_result = await targeted_revision(
                                 runner, feature, self.name,
                                 revision_plan=RevisionPlan(
                                     requests=test_plan_requests,
+                                    new_decisions=list(revision_plan.new_decisions),
                                 ),
                                 decomposition=decomposition,
                                 base_role=test_planner_role,
@@ -991,6 +1285,15 @@ class PlanReviewPhase(Phase):
                                 checkpoint_prefix=f"cycle-{cycle + 1}",
                                 prior_decisions=prior_decisions,
                             )
+                            if not test_plan_result.ok:
+                                blocked_failures.extend(
+                                    f"test-plan:{failure.slug} — {failure.reason}"
+                                    for failure in test_plan_result.failed
+                                )
+                                revision_results.append(
+                                    f"test-plan: FAILED (revision batches failed for {len(test_plan_result.failed)} subfeatures)"
+                                )
+                                raise RuntimeError("test-plan targeted revision failed")
                             # Refresh decision ledger and regenerate summaries
                             # for every affected SF — mirrors the per-SF
                             # post-cascade work in subfeature.py so downstream
@@ -1023,6 +1326,48 @@ class PlanReviewPhase(Phase):
                             revision_results.append(
                                 "test-plan: FAILED (cascade revision crashed)"
                             )
+                            if not blocked_failures:
+                                blocked_failures.append(
+                                    f"test-plan: cascade revision crashed ({exc})"
+                                )
+
+                if blocked_failures:
+                    blocked_report = (
+                        f"# Plan Review Blocked — Cycle {cycle + 1}\n\n"
+                        "The revision wave did not complete cleanly, so plan review "
+                        "stopped before downstream verification and task planning.\n\n"
+                        "## Failures\n\n"
+                        + "\n".join(f"- {failure}" for failure in blocked_failures)
+                    )
+                    blocked_key = f"plan-review-cycle-{cycle + 1}-blocked"
+                    await runner.artifacts.put(blocked_key, blocked_report, feature=feature)
+                    mirror = runner.services.get("artifact_mirror")
+                    if mirror:
+                        mirror.write_artifact(feature.id, blocked_key, blocked_report)
+                    await runner.artifacts.put(
+                        f"plan-review-cycle-{cycle + 1}-revised",
+                        (
+                            f"# Revisions Applied — Cycle {cycle + 1}\n\n"
+                            + "\n".join(f"- {r}" for r in revision_results)
+                        ),
+                        feature=feature,
+                    )
+                    await runner.run(
+                        Notify(
+                            message=(
+                                f"## Plan Review Blocked (Cycle {cycle + 1})\n\n"
+                                "Revision batches failed, so the workflow stopped before "
+                                "re-running reviewers or generating downstream planning outputs.\n\n"
+                                + "\n".join(f"- {failure}" for failure in blocked_failures)
+                            ),
+                        ),
+                        feature,
+                        phase_name=self.name,
+                    )
+                    raise RuntimeError(
+                        f"Plan-review revisions failed in cycle {cycle + 1}. "
+                        f"See `plan-review-cycle-{cycle + 1}-blocked`."
+                    )
 
                 # ── Save revision summary so continue logic can advance ─
                 revision_summary = (

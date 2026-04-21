@@ -137,7 +137,7 @@ class ArchitecturePhase(Phase):
                     )
                     for sf_slug, instruction in review.revision_instructions.items()
                 ])
-                await targeted_revision(
+                revision_result = await targeted_revision(
                     runner, feature, self.name,
                     revision_plan=plan,
                     decomposition=decomposition,
@@ -146,6 +146,15 @@ class ArchitecturePhase(Phase):
                     artifact_prefix="plan",
                     context_keys=["project", "scope", "prd", "design"],
                 )
+                if not revision_result.ok:
+                    failure_text = "; ".join(
+                        f"{failure.artifact_prefix}:{failure.slug} — {failure.reason}"
+                        for failure in revision_result.failed
+                    )
+                    raise RuntimeError(
+                        "Architecture integration review targeted revision failed: "
+                        + failure_text
+                    )
 
         # ── Step 5: Dual Compilation ──
         # 5a: Technical Plan compilation

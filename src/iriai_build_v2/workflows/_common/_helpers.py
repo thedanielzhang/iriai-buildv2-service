@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import logging
+import re
+import tempfile
+from dataclasses import dataclass, field
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeVar
@@ -24,6 +27,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 T = TypeVar("T", bound=BaseModel)
+REVISION_PROMPT_BUDGET = 8_000
+SYSTEM_DESIGN_BATCH_SIZE = 1
+MAX_BATCH_REQUESTS = 4
 
 # ── Prompt offloading ────────────────────────────────────────────────────────
 
@@ -122,6 +128,157 @@ def _artifact_paths(
     final_path = feature_dir / rel_path
     staging_path = feature_dir / ".staging" / rel_path
     return staging_path, final_path
+
+
+@dataclass(slots=True)
+class ContextPackageItem:
+    key: str
+    label: str
+    group: str
+    artifact_key: str | None = None
+    path: str | None = None
+    content: str | None = None
+    file_name: str | None = None
+
+
+@dataclass(slots=True)
+class ContextPackage:
+    index_path: str
+    manifest_path: str
+    item_paths: dict[str, str] = field(default_factory=dict)
+
+
+def _context_dir(
+    runner: WorkflowRunner,
+    feature: Feature,
+) -> Path | None:
+    mirror = runner.services.get("artifact_mirror")
+    if mirror:
+        context_dir = Path(mirror.feature_dir(feature.id)) / ".iriai-context"
+    else:
+        context_dir = (
+            Path(tempfile.gettempdir())
+            / "iriai-build-v2"
+            / "context-packages"
+            / _sanitize_context_stem(feature.id)
+        )
+    context_dir.mkdir(parents=True, exist_ok=True)
+    return context_dir
+
+
+def _sanitize_context_stem(text: str) -> str:
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "-", text.strip()).strip("-")
+    return stem or "context"
+
+
+def _context_item_path(
+    context_dir: Path,
+    *,
+    file_stem: str,
+    item: ContextPackageItem,
+) -> Path:
+    file_name = item.file_name or f"{file_stem}-{_sanitize_context_stem(item.key)}.md"
+    return context_dir / file_name
+
+
+async def build_context_package(
+    runner: WorkflowRunner,
+    feature: Feature,
+    *,
+    title: str,
+    file_stem: str,
+    intro_lines: list[str],
+    items: list[ContextPackageItem],
+) -> ContextPackage | None:
+    context_dir = _context_dir(runner, feature)
+    if context_dir is None:
+        return None
+
+    grouped_entries: dict[str, list[tuple[str, str]]] = {}
+    item_paths: dict[str, str] = {}
+
+    for item in items:
+        path = item.path
+        if path is None and item.artifact_key:
+            _staging_path, final_path = _artifact_paths(runner, feature, item.artifact_key)
+            if final_path and final_path.exists():
+                path = str(final_path)
+            else:
+                text = await runner.artifacts.get(item.artifact_key, feature=feature)
+                if text:
+                    item_path = _context_item_path(
+                        context_dir,
+                        file_stem=file_stem,
+                        item=item,
+                    )
+                    item_path.write_text(text.rstrip() + "\n", encoding="utf-8")
+                    path = str(item_path)
+        elif path is None and item.content:
+            item_path = _context_item_path(
+                context_dir,
+                file_stem=file_stem,
+                item=item,
+            )
+            item_path.write_text(item.content.rstrip() + "\n", encoding="utf-8")
+            path = str(item_path)
+
+        if not path:
+            continue
+        grouped_entries.setdefault(item.group, []).append((item.label, path))
+        item_paths[item.key] = path
+
+    manifest_path = context_dir / f"{file_stem}-context-manifest.md"
+    manifest_sections: list[str] = [f"# {title} Context Manifest"]
+    for group, entries in grouped_entries.items():
+        lines = [f"## {group}"]
+        for label, path in entries:
+            lines.append(f"- **{label}**: `{path}`")
+        manifest_sections.append("\n".join(lines))
+    manifest_path.write_text("\n\n".join(manifest_sections).rstrip() + "\n", encoding="utf-8")
+
+    index_lines = [f"# {title} Context Index", "", *intro_lines, ""]
+    index_lines.extend(
+        [
+            f"Read the context manifest first: `{manifest_path}`",
+            "Open the referenced files selectively instead of loading everything eagerly.",
+        ]
+    )
+    index_path = context_dir / f"{file_stem}-context-index.md"
+    index_path.write_text("\n".join(index_lines).rstrip() + "\n", encoding="utf-8")
+
+    return ContextPackage(
+        index_path=str(index_path),
+        manifest_path=str(manifest_path),
+        item_paths=item_paths,
+    )
+
+
+@dataclass(slots=True)
+class TargetedRevisionFailure:
+    artifact_prefix: str
+    slug: str
+    reason: str
+
+
+@dataclass(slots=True)
+class TargetedRevisionResult:
+    artifact_prefix: str
+    revised_slugs: list[str] = field(default_factory=list)
+    skipped_slugs: list[str] = field(default_factory=list)
+    failed: list[TargetedRevisionFailure] = field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        return not self.failed
+
+
+def _format_targeted_revision_failures(result: TargetedRevisionResult) -> str:
+    if result.ok:
+        return ""
+    return "; ".join(
+        f"{failure.artifact_prefix}:{failure.slug} — {failure.reason}"
+        for failure in result.failed
+    )
 
 
 def _read_artifact_path(path: Path | None) -> str | None:
@@ -1792,7 +1949,7 @@ async def interview_gate_review(
             )
             decision_text = await runner.artifacts.get("decisions", feature=feature) or ""
             prior_decisions = render_active_decision_log(parse_decision_ledger(decision_text), heading="## Mandatory Decisions")
-            await targeted_revision(
+            revision_result = await targeted_revision(
                 runner, feature, phase_name,
                 revision_plan=extracted_plan,
                 decomposition=decomposition,
@@ -1804,6 +1961,11 @@ async def interview_gate_review(
                 checkpoint_prefix=f"gate-{review_cycle}",
                 prior_decisions=prior_decisions,
             )
+            if not revision_result.ok:
+                raise RuntimeError(
+                    "Gate review targeted revision failed: "
+                    + _format_targeted_revision_failures(revision_result)
+                )
             # Track auto-executed revisions in the ledger
             review_cycle += 1
             gate_ledger = _update_gate_ledger(
@@ -2017,7 +2179,7 @@ async def interview_gate_review(
             parse_decision_ledger(decision_text),
             heading="## Mandatory Decisions",
         )
-        await targeted_revision(
+        revision_result = await targeted_revision(
             runner, feature, phase_name,
             revision_plan=outcome.revision_plan,
             decomposition=decomposition,
@@ -2029,6 +2191,11 @@ async def interview_gate_review(
             checkpoint_prefix=f"gate-{review_cycle}",
             prior_decisions=prior_decisions,
         )
+        if not revision_result.ok:
+            raise RuntimeError(
+                "Gate review targeted revision failed: "
+                + _format_targeted_revision_failures(revision_result)
+            )
 
         # ── Update ledger after revisions ──
         gate_ledger = _update_gate_ledger(
@@ -2337,6 +2504,326 @@ def _write_revision_source_manifest(
     return str(manifest_path)
 
 
+def _estimate_revision_request_size(request: Any) -> int:
+    return (
+        len(getattr(request, "description", "") or "")
+        + len(getattr(request, "reasoning", "") or "")
+        + 200
+    )
+
+
+def _build_revision_batches(
+    artifact_prefix: str,
+    indexed_requests: list[tuple[int, Any]],
+) -> list[list[tuple[int, Any]]]:
+    if not indexed_requests:
+        return []
+    if artifact_prefix == "system-design":
+        return [[item] for item in indexed_requests]
+
+    batches: list[list[tuple[int, Any]]] = []
+    current: list[tuple[int, Any]] = []
+    current_size = 0
+    for entry in indexed_requests:
+        request_size = _estimate_revision_request_size(entry[1])
+        if current and (
+            len(current) >= MAX_BATCH_REQUESTS
+            or current_size + request_size > REVISION_PROMPT_BUDGET
+        ):
+            batches.append(current)
+            current = []
+            current_size = 0
+        current.append(entry)
+        current_size += request_size
+    if current:
+        batches.append(current)
+    return batches
+
+
+def _revision_request_done_key(
+    checkpoint_prefix: str,
+    artifact_prefix: str,
+    sf_slug: str,
+    request_index: int,
+) -> str:
+    if checkpoint_prefix:
+        return (
+            f"revision-request-done:{checkpoint_prefix}:"
+            f"{artifact_prefix}:{sf_slug}:{request_index}"
+        )
+    return f"revision-request-done:{artifact_prefix}:{sf_slug}:{request_index}"
+
+
+def _revision_batch_suffix(batch_entries: list[tuple[int, Any]], *, minimal: bool) -> str:
+    indices = [idx for idx, _req in batch_entries]
+    if not indices:
+        suffix = "empty"
+    elif len(indices) == 1:
+        suffix = str(indices[0])
+    else:
+        suffix = f"{indices[0]}-{indices[-1]}"
+    return f"{suffix}-minimal" if minimal else suffix
+
+
+def _revision_batch_patch_key(
+    checkpoint_prefix: str,
+    artifact_prefix: str,
+    sf_slug: str,
+    batch_entries: list[tuple[int, Any]],
+    *,
+    minimal: bool,
+) -> str:
+    suffix = _revision_batch_suffix(batch_entries, minimal=minimal)
+    if checkpoint_prefix:
+        return f"patches:{checkpoint_prefix}:{artifact_prefix}:{sf_slug}:batch-{suffix}"
+    return f"patches:{artifact_prefix}:{sf_slug}:batch-{suffix}"
+
+
+def _revision_batch_applied_key(
+    checkpoint_prefix: str,
+    artifact_prefix: str,
+    sf_slug: str,
+    batch_entries: list[tuple[int, Any]],
+    *,
+    minimal: bool,
+) -> str:
+    suffix = _revision_batch_suffix(batch_entries, minimal=minimal)
+    if checkpoint_prefix:
+        return (
+            f"patches-applied:{checkpoint_prefix}:{artifact_prefix}:{sf_slug}:"
+            f"batch-{suffix}"
+        )
+    return f"patches-applied:{artifact_prefix}:{sf_slug}:batch-{suffix}"
+
+
+def _is_model_boundary_failure(exc: BaseException) -> bool:
+    markers = (
+        "structured_output is none",
+        "prompt too long",
+        "input too long",
+        "context window",
+        "output token maximum",
+        "32000 output token maximum",
+    )
+
+    seen: set[int] = set()
+    stack: list[BaseException] = [exc]
+    while stack:
+        current = stack.pop()
+        ident = id(current)
+        if ident in seen:
+            continue
+        seen.add(ident)
+
+        text = str(current).lower()
+        if any(marker in text for marker in markers):
+            return True
+
+        cause = getattr(current, "__cause__", None)
+        if isinstance(cause, BaseException):
+            stack.append(cause)
+
+        context = getattr(current, "__context__", None)
+        if isinstance(context, BaseException):
+            stack.append(context)
+
+        nested = getattr(current, "exceptions", None)
+        if isinstance(nested, tuple):
+            stack.extend(item for item in nested if isinstance(item, BaseException))
+
+    return False
+
+
+async def _write_revision_batch_requests(
+    runner: WorkflowRunner,
+    feature: Feature,
+    *,
+    artifact_prefix: str,
+    sf_slug: str,
+    batch_entries: list[tuple[int, Any]],
+    minimal: bool,
+) -> str:
+    mirror = runner.services.get("artifact_mirror")
+    if not mirror:
+        return ""
+
+    feature_dir = Path(mirror.feature_dir(feature.id))
+    context_dir = feature_dir / ".iriai-context"
+    context_dir.mkdir(parents=True, exist_ok=True)
+    suffix = _revision_batch_suffix(batch_entries, minimal=minimal)
+    batch_path = context_dir / f"revision-batch-{artifact_prefix}-{sf_slug}-{suffix}.md"
+    lines = ["# Revision Batch Requests", ""]
+    for idx, req in batch_entries:
+        lines.extend(
+            [
+                f"## Request {idx + 1}",
+                "",
+                f"- Description: {req.description}",
+                f"- Reasoning: {req.reasoning}",
+            ]
+        )
+        requirement_ids = getattr(req, "affected_requirement_ids", None) or []
+        if requirement_ids:
+            lines.append("- Requirement IDs: " + ", ".join(requirement_ids))
+        lines.append("")
+    batch_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+    return str(batch_path)
+
+
+async def _write_revision_decision_context(
+    runner: WorkflowRunner,
+    feature: Feature,
+    *,
+    artifact_prefix: str,
+    sf_slug: str,
+    revision_plan: Any,
+    prior_decisions: str,
+    batch_entries: list[tuple[int, Any]],
+    minimal: bool,
+) -> str:
+    mirror = runner.services.get("artifact_mirror")
+    if not mirror:
+        return ""
+
+    feature_dir = Path(mirror.feature_dir(feature.id))
+    context_dir = feature_dir / ".iriai-context"
+    context_dir.mkdir(parents=True, exist_ok=True)
+    suffix = _revision_batch_suffix(batch_entries, minimal=minimal)
+    context_path = context_dir / f"revision-decisions-{artifact_prefix}-{sf_slug}-{suffix}.md"
+
+    lines = ["# Revision Decision Context", ""]
+    new_decisions = list(getattr(revision_plan, "new_decisions", []) or [])
+    if new_decisions:
+        lines.extend(["## Current Cycle Decisions", ""])
+        lines.extend(f"- {decision}" for decision in new_decisions)
+        lines.append("")
+
+    summary_text = await get_existing_artifact(
+        runner, feature, f"decisions-summary:{sf_slug}",
+    )
+    if summary_text:
+        lines.extend(["## Subfeature Decision Summary", "", summary_text.strip(), ""])
+    else:
+        lines.extend(
+            [
+                "## Subfeature Decision Summary",
+                "",
+                "_No decision summary artifact was found for this subfeature._",
+                "",
+            ]
+        )
+        if not minimal:
+            ledger_text = await get_existing_artifact(
+                runner, feature, f"decisions:{sf_slug}",
+            )
+            if ledger_text:
+                lines.extend(
+                    [
+                        "## Fallback Decision Ledger",
+                        "",
+                        ledger_text.strip(),
+                        "",
+                    ]
+                )
+            elif prior_decisions:
+                prior_path = (
+                    context_dir
+                    / f"revision-prior-decisions-{artifact_prefix}-{sf_slug}-{suffix}.md"
+                )
+                prior_path.write_text(prior_decisions.rstrip() + "\n", encoding="utf-8")
+                lines.extend(
+                    [
+                        "## Fallback Prior Decisions",
+                        "",
+                        "No summary or subfeature decision ledger was found. "
+                        "Read the full prior decisions from:",
+                        "",
+                        f"`{prior_path}`",
+                        "",
+                    ]
+                )
+
+    context_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+    return str(context_path)
+
+
+def _build_revision_batch_prompt(
+    *,
+    artifact_prefix: str,
+    sf_slug: str,
+    batch_entries: list[tuple[int, Any]],
+    artifact_instruction: str,
+    manifest_path: str,
+    decision_context_path: str,
+    batch_requests_path: str,
+    clarification: str = "",
+) -> str:
+    batch_count = len(batch_entries)
+    request_instruction = (
+        f"Revision batch request file: `{batch_requests_path}`\n"
+        "Read that file and address every request in this batch.\n"
+        if batch_requests_path
+        else ""
+    )
+    manifest_instruction = (
+        f"Revision source manifest: `{manifest_path}`\n"
+        "Use the manifest to open the current artifact, decision ledger, "
+        "and prior review files directly. Do NOT ask the user for file "
+        "access when those paths are present.\n"
+        if manifest_path
+        else ""
+    )
+    decision_instruction = (
+        f"Revision decision context: `{decision_context_path}`\n"
+        "Read that file for the current cycle decisions and subfeature-specific "
+        "decision context.\n"
+        if decision_context_path
+        else ""
+    )
+    clarification_block = (
+        f"Clarification answers:\n{clarification.strip()}\n\n"
+        if clarification.strip()
+        else ""
+    )
+    targeting_rules = (
+        f"- Target individual steps by unique header "
+        f"(e.g. '### STEP-5:', '## Architecture', '## File Manifest').\n"
+        f"- Each STEP has a unique ID — use it as the target.\n\n"
+        if artifact_prefix == "plan"
+        else f"- For system-designs (HTML): target unique section headers "
+        f"like 'Overview', 'Services', 'CP-14', 'ENT-30'.\n\n"
+        if artifact_prefix == "system-design"
+        else f"- This artifact may have non-unique subsection headers. "
+        f"Produce a SINGLE patch with target 'FULL_DOCUMENT' to "
+        f"replace the entire artifact content. Include all sections.\n\n"
+    )
+    return (
+        f"Revise the {artifact_prefix} for subfeature '{sf_slug}' by producing a list of PATCHES.\n\n"
+        f"{request_instruction}"
+        f"Address ALL {batch_count} change(s) in this batch.\n\n"
+        f"{clarification_block}"
+        f"IMPORTANT: Do NOT rewrite the entire document. Produce targeted patches only for sections that need to change.\n\n"
+        f"{artifact_instruction}\n"
+        f"{manifest_instruction}"
+        f"{decision_instruction}\n"
+        f"TARGETING RULES for {artifact_prefix}:\n"
+        f"{targeting_rules}"
+        f"For each patch specify:\n"
+        f"- target: the header text of the section to modify (or 'FULL_DOCUMENT' for complete replacement)\n"
+        f"- operation: 'replace' (replace section intro, children preserved), 'insert_after' (add new section after target), 'delete', or 'find_replace' (surgical text swap within a section)\n"
+        f"- content: the replacement content (for replace/insert_after/find_replace)\n"
+        f"- find: the exact text to find within the section (for find_replace only)\n"
+        f"- reasoning: brief explanation\n\n"
+        f"Use 'find_replace' for small targeted changes within a section (fixing field names, changing specific values). "
+        f"Use 'replace' only when the entire section intro needs rewriting.\n\n"
+        f"Unchanged sections are preserved automatically.\n\n"
+        f"If you have questions that MUST be answered before you can produce correct patches, "
+        f"return an empty patches list and put your questions in the summary field. "
+        f"You will get a chance to discuss with the user and then produce patches. "
+        f"Only do this for genuine ambiguities — not for optional improvements.\n"
+    )
+
+
 async def targeted_revision(
     runner: WorkflowRunner,
     feature: Feature,
@@ -2351,12 +2838,13 @@ async def targeted_revision(
     context_keys: list[str] | None = None,
     checkpoint_prefix: str = "",
     prior_decisions: str = "",
-) -> None:
+) -> TargetedRevisionResult:
     """Execute revisions on specific subfeatures per the RevisionPlan.
 
     Re-runs affected subfeature agents with revision instructions.
-    Updates subfeature artifacts in store. One-shot Ask per SF (no multi-turn).
-    Summaries are NOT regenerated here — caller should batch them if needed.
+    Updates subfeature artifacts in store using sequential batches per
+    subfeature. Summaries are NOT regenerated here — caller should batch them
+    if needed.
 
     If checkpoint_prefix is set, completed revisions are marked in the artifact
     store. On restart, already-completed revisions are skipped.
@@ -2385,172 +2873,146 @@ async def targeted_revision(
     revision_tasks: list[tuple[list[Any], str]] = [
         (reqs, slug) for slug, reqs in sf_requests.items()
     ]
+    result = TargetedRevisionResult(artifact_prefix=artifact_prefix)
 
-    # Skip already-completed revisions (checkpoint)
-    if checkpoint_prefix:
-        filtered: list[tuple[list[Any], str]] = []
-        for reqs, slug in revision_tasks:
-            marker = await runner.artifacts.get(
-                f"revision-done:{checkpoint_prefix}:{artifact_prefix}:{slug}",
-                feature=feature,
-            )
-            if marker:
-                logger.info(
-                    "targeted_revision: %s:%s already revised — skipping",
-                    artifact_prefix, slug,
-                )
-            else:
-                filtered.append((reqs, slug))
-        revision_tasks = filtered
-
-    async def _revise_one(requests: list[Any], sf_slug: str) -> None:
-        request = requests[0]  # Primary request (for checkpoint compat)
+    async def _revise_one(requests: list[Any], sf_slug: str) -> tuple[str, str | None]:
         import json as _json
 
         from ...models.outputs import ArtifactPatchSet
 
         sf_key = f"{artifact_prefix}:{sf_slug}"
+        if checkpoint_prefix:
+            marker = await runner.artifacts.get(
+                f"revision-done:{checkpoint_prefix}:{artifact_prefix}:{sf_slug}",
+                feature=feature,
+            )
+            if marker:
+                logger.info(
+                    "targeted_revision: %s:%s already revised — skipping",
+                    artifact_prefix, sf_slug,
+                )
+                return "skipped", None
+
         existing = await runner.artifacts.get(sf_key, feature=feature) or ""
         if not existing:
             logger.warning(
                 "targeted_revision: no existing artifact for %s — "
                 "revision agent will have no context to revise", sf_key,
             )
-
-        # ── Two-phase checkpoint ──────────────────────────────────
-        # Phase 1: patches saved to DB (can resume without API call)
-        # Phase 2: revision-done marker (patches applied successfully)
-        patch_key = (
-            f"patches:{checkpoint_prefix}:{artifact_prefix}:{sf_slug}"
-            if checkpoint_prefix
-            else f"patches:{artifact_prefix}:{sf_slug}"
+        revision_role = Role(
+            name=base_role.name,
+            prompt=base_role.prompt,
+            tools=[],
+            model=BUDGET_TIERS["opus"],
+        )
+        revision_actor = AgentActor(
+            name=f"{artifact_prefix}-sf-{sf_slug}-rev",
+            role=revision_role,
+            context_keys=_keys,
         )
 
-        patch_set: ArtifactPatchSet | None = None
+        manifest_path = _write_revision_source_manifest(
+            runner,
+            feature,
+            artifact_key=sf_key,
+            artifact_prefix=artifact_prefix,
+            sf_slug=sf_slug,
+        )
 
-        # Try loading saved patches from a prior run
-        saved_json = await runner.artifacts.get(patch_key, feature=feature)
-        if saved_json:
-            try:
-                patch_set = ArtifactPatchSet.model_validate(_json.loads(saved_json))
-                logger.info(
-                    "targeted_revision: loaded %d saved patches for %s — skipping API call",
-                    len(patch_set.patches), sf_key,
-                )
-            except Exception:
-                logger.warning(
-                    "targeted_revision: failed to parse saved patches for %s — regenerating",
-                    sf_key,
-                )
-                patch_set = None
-
-        if patch_set is None:
-            # Generate patches via API
-            # Use opus model name directly; Codex runtime will use its own
-            # default model (the model string is a hint, not a hard requirement)
-            revision_role = Role(
-                name=base_role.name,
-                prompt=base_role.prompt,
-                tools=[],
-                model=BUDGET_TIERS["opus"],
-            )
-            revision_actor = AgentActor(
-                name=f"{artifact_prefix}-sf-{sf_slug}-rev",
-                role=revision_role,
-                context_keys=_keys,
-            )
-
-            decisions_block = ""
-            if prior_decisions:
-                decisions_block = (
-                    f"\n\n## Mandatory Decisions (all prior cycles)\n"
-                    f"Apply ALL of these decisions. They are hard requirements.\n\n"
-                    f"{prior_decisions}\n\n"
+        async def _mark_batch_done(batch_entries: list[tuple[int, Any]]) -> None:
+            for request_index, _req in batch_entries:
+                await runner.artifacts.put(
+                    _revision_request_done_key(
+                        checkpoint_prefix, artifact_prefix, sf_slug, request_index,
+                    ),
+                    "done",
+                    feature=feature,
                 )
 
-            manifest_path = _write_revision_source_manifest(
-                runner,
-                feature,
-                artifact_key=sf_key,
-                artifact_prefix=artifact_prefix,
-                sf_slug=sf_slug,
+        async def _run_batch(
+            batch_entries: list[tuple[int, Any]],
+            *,
+            minimal: bool,
+        ) -> ArtifactPatchSet:
+            patch_key = _revision_batch_patch_key(
+                checkpoint_prefix,
+                artifact_prefix,
+                sf_slug,
+                batch_entries,
+                minimal=minimal,
             )
+            applied_key = _revision_batch_applied_key(
+                checkpoint_prefix,
+                artifact_prefix,
+                sf_slug,
+                batch_entries,
+                minimal=minimal,
+            )
+            applied_marker = await runner.artifacts.get(applied_key, feature=feature)
+            if applied_marker:
+                await _mark_batch_done(batch_entries)
+                return ArtifactPatchSet(patches=[], summary="")
+
+            saved_json = await runner.artifacts.get(patch_key, feature=feature)
+            if saved_json:
+                try:
+                    patch_set = ArtifactPatchSet.model_validate(_json.loads(saved_json))
+                    logger.info(
+                        "targeted_revision: loaded saved batch patches for %s (%s)",
+                        sf_key,
+                        _revision_batch_suffix(batch_entries, minimal=minimal),
+                    )
+                    return patch_set
+                except Exception:
+                    logger.warning(
+                        "targeted_revision: failed to parse saved batch patches for %s — regenerating",
+                        sf_key,
+                    )
+
             _, final_artifact_path = _artifact_paths(runner, feature, sf_key)
+            await _clear_agent_session(runner, revision_actor, feature)
             artifact_instruction = (
                 f"Read the current artifact from: `{final_artifact_path}`\n"
                 if final_artifact_path and final_artifact_path.exists()
                 else f"Current artifact:\n{existing}"
             )
-            manifest_instruction = (
-                f"\nRevision source manifest: `{manifest_path}`\n"
-                "Use the manifest to open the current artifact, decision ledger, "
-                "and prior review files directly. Do NOT ask the user for file "
-                "access when those paths are present.\n"
-                if manifest_path
-                else ""
+            batch_requests_path = await _write_revision_batch_requests(
+                runner,
+                feature,
+                artifact_prefix=artifact_prefix,
+                sf_slug=sf_slug,
+                batch_entries=batch_entries,
+                minimal=minimal,
             )
-
-            # Build combined change instructions from ALL requests for this SF
-            changes_parts = []
-            for i, req in enumerate(requests, 1):
-                changes_parts.append(
-                    f"**Change {i}:** {req.description}\n"
-                    f"**Reasoning:** {req.reasoning}"
-                )
-            changes_block = "\n\n".join(changes_parts)
-
+            decision_context_path = await _write_revision_decision_context(
+                runner,
+                feature,
+                artifact_prefix=artifact_prefix,
+                sf_slug=sf_slug,
+                revision_plan=revision_plan,
+                prior_decisions=prior_decisions,
+                batch_entries=batch_entries,
+                minimal=minimal,
+            )
+            prompt = _build_revision_batch_prompt(
+                artifact_prefix=artifact_prefix,
+                sf_slug=sf_slug,
+                batch_entries=batch_entries,
+                artifact_instruction=artifact_instruction,
+                manifest_path=manifest_path,
+                decision_context_path=decision_context_path,
+                batch_requests_path=batch_requests_path,
+            )
             patch_set = await runner.run(
                 Ask(
                     actor=revision_actor,
-                    prompt=(
-                        f"Revise the {artifact_prefix} for subfeature '{sf_slug}' "
-                        f"by producing a list of PATCHES.\n\n"
-                        f"{changes_block}\n\n"
-                        f"Address ALL {len(requests)} change(s) in a single patch set.\n"
-                        f"{decisions_block}\n"
-                        f"IMPORTANT: Do NOT rewrite the entire document. Produce targeted "
-                        f"patches only for sections that need to change.\n\n"
-                        f"TARGETING RULES for {artifact_prefix}:\n"
-                        + (
-                            f"- Target individual steps by unique header "
-                            f"(e.g. '### STEP-5:', '## Architecture', '## File Manifest').\n"
-                            f"- Each STEP has a unique ID — use it as the target.\n\n"
-                            if artifact_prefix == "plan" else
-                            f"- For system-designs (HTML): target unique section headers "
-                            f"like 'Overview', 'Services', 'CP-14', 'ENT-30'.\n\n"
-                            if artifact_prefix == "system-design" else
-                            f"- This artifact may have non-unique subsection headers. "
-                            f"Produce a SINGLE patch with target 'FULL_DOCUMENT' to "
-                            f"replace the entire artifact content. Include all sections.\n\n"
-                        )
-                        + f"For each patch specify:\n"
-                        f"- target: the header text of the section to modify "
-                        f"(or 'FULL_DOCUMENT' for complete replacement)\n"
-                        f"- operation: 'replace' (replace section intro, children preserved), "
-                        f"'insert_after' (add new section after target), 'delete', or "
-                        f"'find_replace' (surgical text swap within a section)\n"
-                        f"- content: the replacement content (for replace/insert_after/find_replace)\n"
-                        f"- find: the exact text to find within the section (for find_replace only)\n"
-                        f"- reasoning: brief explanation\n\n"
-                        f"Use 'find_replace' for small targeted changes within a section "
-                        f"(fixing field names, changing specific values). "
-                        f"Use 'replace' only when the entire section intro needs rewriting.\n\n"
-                        f"Unchanged sections are preserved automatically.\n\n"
-                        f"If you have questions that MUST be answered before you can "
-                        f"produce correct patches, return an empty patches list and put "
-                        f"your questions in the summary field. You will get a chance to "
-                        f"discuss with the user and then produce patches. Only do this "
-                        f"for genuine ambiguities — not for optional improvements.\n\n"
-                        f"{artifact_instruction}"
-                        f"{manifest_instruction}"
-                    ),
+                    prompt=prompt,
                     output_type=ArtifactPatchSet,
                 ),
                 feature,
                 phase_name=phase_name,
             )
 
-            # If agent returned questions instead of patches, escalate to interview
             if not patch_set.patches and patch_set.summary:
                 logger.info(
                     "targeted_revision: agent has questions for %s — escalating to interview",
@@ -2614,11 +3076,11 @@ async def targeted_revision(
                     phase_name=phase_name,
                 )
 
-                # Load the answers from the discussion file
                 answers = ""
                 q_mirror = runner.services.get("artifact_mirror")
                 if q_mirror:
                     from ...services.artifacts import _key_to_path
+
                     q_path = (
                         q_mirror.feature_dir(feature.id)
                         / _key_to_path(f"revision-questions:{artifact_prefix}:{sf_slug}")
@@ -2626,86 +3088,159 @@ async def targeted_revision(
                     if q_path.exists():
                         answers = q_path.read_text(encoding="utf-8").strip()
 
-                # Second Ask with the answers
+                prompt = _build_revision_batch_prompt(
+                    artifact_prefix=artifact_prefix,
+                    sf_slug=sf_slug,
+                    batch_entries=batch_entries,
+                    artifact_instruction=artifact_instruction,
+                    manifest_path=manifest_path,
+                    decision_context_path=decision_context_path,
+                    batch_requests_path=batch_requests_path,
+                    clarification=answers,
+                )
                 patch_set = await runner.run(
                     Ask(
                         actor=revision_actor,
-                        prompt=(
-                            f"Revise the {artifact_prefix} for subfeature '{sf_slug}' "
-                            f"by producing a list of PATCHES.\n\n"
-                            f"**Change requested:** {request.description}\n"
-                            f"**Reasoning:** {request.reasoning}\n"
-                            f"{decisions_block}\n"
-                            f"**Clarification from user:**\n{answers}\n\n"
-                            f"Now produce the patches.\n\n"
-                            f"{artifact_instruction}"
-                            f"{manifest_instruction}"
-                        ),
+                        prompt=prompt,
                         output_type=ArtifactPatchSet,
                     ),
                     feature,
                     phase_name=phase_name,
                 )
 
-            # Phase 1 checkpoint: save patches immediately
             await runner.artifacts.put(
                 patch_key, patch_set.model_dump_json(indent=2), feature=feature,
             )
             logger.info(
-                "targeted_revision: saved %d patches for %s",
+                "targeted_revision: saved %d batch patches for %s (%s)",
+                len(patch_set.patches),
+                sf_key,
+                _revision_batch_suffix(batch_entries, minimal=minimal),
+            )
+            return patch_set
+
+        pending_entries = []
+        for idx, req in enumerate(requests):
+            marker = await runner.artifacts.get(
+                _revision_request_done_key(
+                    checkpoint_prefix, artifact_prefix, sf_slug, idx,
+                ),
+                feature=feature,
+            )
+            if not marker:
+                pending_entries.append((idx, req))
+
+        if not pending_entries:
+            if checkpoint_prefix:
+                await runner.artifacts.put(
+                    f"revision-done:{checkpoint_prefix}:{artifact_prefix}:{sf_slug}",
+                    "done",
+                    feature=feature,
+                )
+            return "skipped", None
+
+        batch_queue = _build_revision_batches(artifact_prefix, pending_entries)
+        revised = False
+        while batch_queue:
+            batch_entries = batch_queue.pop(0)
+            used_minimal = False
+            try:
+                patch_set = await _run_batch(batch_entries, minimal=False)
+            except Exception as exc:
+                if _is_model_boundary_failure(exc):
+                    if len(batch_entries) > 1:
+                        split_point = max(1, len(batch_entries) // 2)
+                        batch_queue = (
+                            [batch_entries[:split_point], batch_entries[split_point:]]
+                            + batch_queue
+                        )
+                        logger.warning(
+                            "targeted_revision: rebatching %s (%s) after model-boundary failure",
+                            sf_key,
+                            _revision_batch_suffix(batch_entries, minimal=False),
+                        )
+                        continue
+                    try:
+                        used_minimal = True
+                        patch_set = await _run_batch(batch_entries, minimal=True)
+                    except Exception as minimal_exc:
+                        return (
+                            "failed",
+                            f"batch {_revision_batch_suffix(batch_entries, minimal=True)} failed: {minimal_exc}",
+                        )
+                else:
+                    return (
+                        "failed",
+                        f"batch {_revision_batch_suffix(batch_entries, minimal=False)} failed: {exc}",
+                    )
+
+            if not patch_set.patches:
+                await runner.artifacts.put(
+                    _revision_batch_applied_key(
+                        checkpoint_prefix,
+                        artifact_prefix,
+                        sf_slug,
+                        batch_entries,
+                        minimal=used_minimal,
+                    ),
+                    "done",
+                    feature=feature,
+                )
+                await _mark_batch_done(batch_entries)
+                continue
+
+            logger.info(
+                "targeted_revision: applying %d batch patches to %s",
                 len(patch_set.patches), sf_key,
             )
+            revised_text = _apply_patches(existing, patch_set.patches)
 
-        if not patch_set.patches:
-            logger.info(
-                "targeted_revision: no patches produced for %s — skipping",
-                sf_key,
+            existing_size = len(existing)
+            revised_size = len(revised_text)
+            if existing_size > 0 and revised_size < existing_size * 0.5:
+                return (
+                    "failed",
+                    f"batch {_revision_batch_suffix(batch_entries, minimal=False)} rejected by size guard ({existing_size} → {revised_size})",
+                )
+
+            await runner.artifacts.put(sf_key, revised_text, feature=feature)
+
+            mirror = runner.services.get("artifact_mirror")
+            if mirror:
+                from ...services.artifacts import _key_to_path
+
+                path = mirror.feature_dir(feature.id) / _key_to_path(sf_key)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(revised_text, encoding="utf-8")
+
+            hosting = runner.services.get("hosting")
+            if hosting:
+                await hosting.update(feature.id, sf_key, revised_text)
+            if post_update:
+                await post_update(sf_key, revised_text)
+
+            existing = revised_text
+            revised = True
+            await runner.artifacts.put(
+                _revision_batch_applied_key(
+                    checkpoint_prefix,
+                    artifact_prefix,
+                    sf_slug,
+                    batch_entries,
+                    minimal=used_minimal,
+                ),
+                "done",
+                feature=feature,
             )
-            return
+            await _mark_batch_done(batch_entries)
 
-        logger.info(
-            "targeted_revision: applying %d patches to %s",
-            len(patch_set.patches), sf_key,
-        )
-        revised_text = _apply_patches(existing, patch_set.patches)
-
-        # Size guard: reject revisions that shrink the artifact by >50%.
-        # Protects against sonnet producing meta-descriptions or truncated output.
-        existing_size = len(existing)
-        revised_size = len(revised_text)
-        if existing_size > 0 and revised_size < existing_size * 0.5:
-            logger.error(
-                "targeted_revision: rejecting %s — revision too small "
-                "(%d → %d bytes, %.0f%% shrink)",
-                sf_key, existing_size, revised_size,
-                (1 - revised_size / existing_size) * 100,
-            )
-            return
-
-        await runner.artifacts.put(sf_key, revised_text, feature=feature)
-
-        # Write to disk via artifact mirror
-        mirror = runner.services.get("artifact_mirror")
-        if mirror:
-            from ...services.artifacts import _key_to_path
-            path = mirror.feature_dir(feature.id) / _key_to_path(sf_key)
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(revised_text, encoding="utf-8")
-
-        # Update the hosted doc so the browser shows the revised version
-        hosting = runner.services.get("hosting")
-        if hosting:
-            await hosting.update(feature.id, sf_key, revised_text)
-        if post_update:
-            await post_update(sf_key, revised_text)
-
-        # Checkpoint: mark this revision as done so restarts skip it
         if checkpoint_prefix:
             await runner.artifacts.put(
                 f"revision-done:{checkpoint_prefix}:{artifact_prefix}:{sf_slug}",
                 "done",
                 feature=feature,
             )
+        return ("revised" if revised else "skipped"), None
 
     logger.info(
         "targeted_revision: dispatching %d SF revisions in parallel for %s",
@@ -2717,10 +3252,39 @@ async def targeted_revision(
     )
     for i, res in enumerate(results):
         if isinstance(res, BaseException):
+            slug = revision_tasks[i][1]
             logger.error(
                 "targeted_revision: %s:%s crashed: %s",
-                artifact_prefix, revision_tasks[i][1], res,
+                artifact_prefix, slug, res,
             )
+            result.failed.append(
+                TargetedRevisionFailure(
+                    artifact_prefix=artifact_prefix,
+                    slug=slug,
+                    reason=str(res),
+                )
+            )
+            continue
+        status, reason = res
+        slug = revision_tasks[i][1]
+        if status == "revised":
+            result.revised_slugs.append(slug)
+        elif status == "skipped":
+            result.skipped_slugs.append(slug)
+        elif status == "failed":
+            logger.error(
+                "targeted_revision: %s:%s failed: %s",
+                artifact_prefix, slug, reason,
+            )
+            result.failed.append(
+                TargetedRevisionFailure(
+                    artifact_prefix=artifact_prefix,
+                    slug=slug,
+                    reason=reason or "unknown revision failure",
+                )
+            )
+
+    return result
 
 
 def _get_user() -> Actor:

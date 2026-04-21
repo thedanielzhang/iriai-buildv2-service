@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import re
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -13,7 +14,11 @@ from iriai_build_v2.services.markdown import to_markdown
 from iriai_build_v2.models.outputs import (
     ArchitectureOutput,
     ArtifactPatchSet,
+    DecisionLedger,
+    DecisionRecord,
     Envelope,
+    ImplementationDAG,
+    ImplementationTask,
     IntegrationReview,
     PRD,
     ProjectContext,
@@ -26,8 +31,12 @@ from iriai_build_v2.models.outputs import (
     SubfeatureDecomposition,
     SubfeatureEdge,
     SystemDesign,
+    TaskAcceptanceCriterion,
+    TaskReference,
     TechnicalPlan,
     Verdict,
+    Workstream,
+    WorkstreamDecomposition,
     envelope_done,
 )
 from iriai_build_v2.models.state import BuildState
@@ -78,8 +87,10 @@ from iriai_build_v2.workflows.planning.phases.subfeature import (
 )
 from iriai_build_v2.workflows._common._helpers import (
     _apply_patches,
+    _write_revision_decision_context,
     _clear_agent_session,
     _build_subfeature_context,
+    _is_model_boundary_failure,
     _offload_if_large,
     decompose_and_gate,
     get_existing_artifact,
@@ -91,12 +102,14 @@ from iriai_build_v2.workflows._common._helpers import (
 )
 from iriai_build_v2.workflows._common._autonomy import interaction_actor_for_phase
 from iriai_build_v2.workflows._common._tasks import HostedInterview
+from iriai_build_v2.workflows.planning.phases import task_planning as task_planning_module
 from iriai_build_v2.workflows.planning._stage_helpers import (
     planning_index_artifact_key,
     prepare_subfeature_context_artifacts,
 )
 from iriai_build_v2.workflows.planning.workflow import PlanningWorkflow
 from iriai_build_v2.workflows.develop.phases import ImplementationPhase, PostTestObservationPhase
+from iriai_build_v2.workflows.develop.phases import implementation as implementation_module
 from iriai_build_v2.roles import (
     lead_architect_gate_reviewer,
     lead_architect_reviewer,
@@ -124,6 +137,61 @@ def _decomposition() -> SubfeatureDecomposition:
             )
         ],
         complete=True,
+    )
+
+
+def _decision_ledger_text(*decisions: DecisionRecord) -> str:
+    return to_markdown(
+        DecisionLedger(
+            decisions=list(decisions),
+            complete=bool(decisions),
+        )
+    )
+
+
+def _valid_task(
+    *,
+    task_id: str,
+    slug: str,
+    verification_gates: list[str] | None = None,
+    dependencies: list[str] | None = None,
+) -> ImplementationTask:
+    return ImplementationTask(
+        id=task_id,
+        name=f"Implement {slug}",
+        description=f"{slug} task",
+        subfeature_id=slug,
+        step_ids=["STEP-1"],
+        requirement_ids=[f"REQ-{slug}"],
+        acceptance_criteria=[
+            TaskAcceptanceCriterion(description=f"{slug} acceptance criterion"),
+        ],
+        reference_material=[
+            TaskReference(source="Plan STEP-1", content=f"{slug} reference material"),
+        ],
+        verification_gates=verification_gates or [f"AC-{slug}-1"],
+        dependencies=dependencies or [],
+    )
+
+
+def _slice_manifest_with_current_digests(
+    *,
+    slug: str,
+    plan_text: str,
+    test_plan_text: str,
+    slices: list[task_planning_module.TaskPlanningSlice],
+    statuses: list[task_planning_module.SlicePlanningStatus] | None = None,
+) -> task_planning_module.TaskPlanningSliceManifest:
+    normalized_plan = TaskPlanningPhase._normalize_artifact_markdown(plan_text, f"plan:{slug}")
+    normalized_test_plan = TaskPlanningPhase._normalize_artifact_markdown(test_plan_text, "test-plan")
+    return task_planning_module.TaskPlanningSliceManifest(
+        slug=slug,
+        slices=slices,
+        statuses=statuses
+        or [task_planning_module.SlicePlanningStatus(slice_id=slice_info.slice_id) for slice_info in slices],
+        derivation_version=task_planning_module._SLICE_MANIFEST_DERIVATION_VERSION,
+        plan_digest=TaskPlanningPhase._content_digest(normalized_plan),
+        test_plan_digest=TaskPlanningPhase._content_digest(normalized_test_plan),
     )
 
 
@@ -361,6 +429,257 @@ async def test_targeted_revision_uses_dedicated_clarifier_for_follow_up_question
     assert "NEVER ask which feature is being worked on." in clarifier_prompt
     assert "NEVER ask where to write the artifact" in clarifier_prompt
     assert "proceed', 'delegate'" in clarifier_prompt
+
+
+@pytest.mark.asyncio
+async def test_targeted_revision_batches_system_design_requests_one_at_a_time(tmp_path):
+    feature = SimpleNamespace(id="feat-sd-batch", metadata={})
+    decomposition = SubfeatureDecomposition(
+        subfeatures=[
+            Subfeature(
+                id="SF-1",
+                slug="bridge-protocol",
+                name="Bridge Protocol",
+                description="Bridge",
+            )
+        ],
+        complete=True,
+    )
+    mirror = _TestMirror(tmp_path / "features")
+    _write_mirror_artifact(
+        mirror,
+        feature_id=feature.id,
+        artifact_key="system-design:bridge-protocol",
+        text="<h2>Overview</h2>\n<p>Current body</p>\n",
+    )
+    _write_mirror_artifact(
+        mirror,
+        feature_id=feature.id,
+        artifact_key="decisions-summary:bridge-protocol",
+        text="# Decision Summary\n\n- Keep the bridge simple.\n",
+    )
+
+    class _Artifacts:
+        def __init__(self) -> None:
+            self.store = {
+                "system-design:bridge-protocol": "<h2>Overview</h2>\n<p>Current body</p>\n",
+                "decisions-summary:bridge-protocol": "# Decision Summary\n\n- Keep the bridge simple.\n",
+            }
+
+        async def get(self, key: str, *, feature):
+            del feature
+            return self.store.get(key)
+
+        async def put(self, key: str, value: str, *, feature):
+            del feature
+            self.store[key] = value
+
+    class _Runner:
+        def __init__(self) -> None:
+            self.artifacts = _Artifacts()
+            self.services = {"artifact_mirror": mirror}
+            self.prompts: list[str] = []
+            self.ask_count = 0
+
+        async def run(self, task, feature, phase_name):
+            del feature, phase_name
+            if isinstance(task, Ask):
+                self.prompts.append(task.prompt)
+                self.ask_count += 1
+                return ArtifactPatchSet(
+                    patches=[
+                        {
+                            "target": "FULL_DOCUMENT",
+                            "operation": "replace",
+                            "content": f"<h2>Overview</h2>\n<p>Batch {self.ask_count}</p>\n",
+                            "find": "",
+                            "reasoning": "batch update",
+                        }
+                    ],
+                    summary="",
+                )
+            raise AssertionError(f"unexpected task type: {type(task).__name__}")
+
+    runner = _Runner()
+
+    result = await targeted_revision(
+        runner,
+        feature,
+        "plan-review",
+        revision_plan=RevisionPlan(
+            requests=[
+                RevisionRequest(
+                    description="Clarify the bridge schema surface.",
+                    reasoning="Need explicit command contracts.",
+                    affected_subfeatures=["bridge-protocol"],
+                ),
+                RevisionRequest(
+                    description="Document telemetry events.",
+                    reasoning="Need explicit observability hooks.",
+                    affected_subfeatures=["bridge-protocol"],
+                ),
+            ],
+            new_decisions=["Add telemetry timeline support."],
+        ),
+        decomposition=decomposition,
+        base_role=lead_architect_gate_reviewer.role,
+        output_type=SystemDesign,
+        artifact_prefix="system-design",
+        checkpoint_prefix="cycle-1",
+    )
+
+    assert result.ok is True
+    assert result.revised_slugs == ["bridge-protocol"]
+    assert len(runner.prompts) == 2
+    assert all("Revision batch request file:" in prompt for prompt in runner.prompts)
+    assert all("Revision decision context:" in prompt for prompt in runner.prompts)
+    assert all("## Mandatory Decisions" not in prompt for prompt in runner.prompts)
+
+
+@pytest.mark.asyncio
+async def test_targeted_revision_rebatches_after_model_boundary_failure(tmp_path):
+    feature = SimpleNamespace(id="feat-plan-rebatch", metadata={})
+    decomposition = _decomposition()
+    mirror = _TestMirror(tmp_path / "features")
+    _write_mirror_artifact(
+        mirror,
+        feature_id=feature.id,
+        artifact_key="plan:accounts",
+        text="## Overview\nold\n",
+    )
+
+    class _Artifacts:
+        def __init__(self) -> None:
+            self.store = {"plan:accounts": "## Overview\nold\n"}
+
+        async def get(self, key: str, *, feature):
+            del feature
+            return self.store.get(key)
+
+        async def put(self, key: str, value: str, *, feature):
+            del feature
+            self.store[key] = value
+
+    class _Runner:
+        def __init__(self) -> None:
+            self.artifacts = _Artifacts()
+            self.services = {"artifact_mirror": mirror}
+            self.ask_count = 0
+
+        async def run(self, task, feature, phase_name):
+            del feature, phase_name
+            if isinstance(task, Ask):
+                self.ask_count += 1
+                if self.ask_count == 1:
+                    raise RuntimeError("prompt too long")
+                return ArtifactPatchSet(
+                    patches=[
+                        {
+                            "target": "FULL_DOCUMENT",
+                            "operation": "replace",
+                            "content": f"## Overview\nbatch {self.ask_count}\n",
+                            "find": "",
+                            "reasoning": "rebatched",
+                        }
+                    ],
+                    summary="",
+                )
+            raise AssertionError(f"unexpected task type: {type(task).__name__}")
+
+    runner = _Runner()
+    result = await targeted_revision(
+        runner,
+        feature,
+        "plan-review",
+        revision_plan=RevisionPlan(
+            requests=[
+                RevisionRequest(
+                    description="Change the architecture section.",
+                    reasoning="Need more detail.",
+                    affected_subfeatures=["accounts"],
+                ),
+                RevisionRequest(
+                    description="Add a file manifest note.",
+                    reasoning="Review requested more scope detail.",
+                    affected_subfeatures=["accounts"],
+                ),
+            ]
+        ),
+        decomposition=decomposition,
+        base_role=lead_task_planner_gate_reviewer.role,
+        output_type=TechnicalPlan,
+        artifact_prefix="plan",
+        checkpoint_prefix="cycle-2",
+    )
+
+    assert result.ok is True
+    assert runner.ask_count == 3
+
+
+@pytest.mark.asyncio
+async def test_targeted_revision_marks_failure_after_exhausting_single_request_retry(tmp_path):
+    feature = SimpleNamespace(id="feat-plan-fail", metadata={})
+    decomposition = _decomposition()
+    mirror = _TestMirror(tmp_path / "features")
+    _write_mirror_artifact(
+        mirror,
+        feature_id=feature.id,
+        artifact_key="plan:accounts",
+        text="## Overview\nold\n",
+    )
+
+    class _Artifacts:
+        def __init__(self) -> None:
+            self.store = {"plan:accounts": "## Overview\nold\n"}
+
+        async def get(self, key: str, *, feature):
+            del feature
+            return self.store.get(key)
+
+        async def put(self, key: str, value: str, *, feature):
+            del feature
+            self.store[key] = value
+
+    class _Runner:
+        def __init__(self) -> None:
+            self.artifacts = _Artifacts()
+            self.services = {"artifact_mirror": mirror}
+            self.ask_count = 0
+
+        async def run(self, task, feature, phase_name):
+            del feature, phase_name
+            if isinstance(task, Ask):
+                self.ask_count += 1
+                if self.ask_count == 1:
+                    raise RuntimeError("structured_output is None for ArtifactPatchSet")
+                raise RuntimeError("prompt too long")
+            raise AssertionError(f"unexpected task type: {type(task).__name__}")
+
+    runner = _Runner()
+    result = await targeted_revision(
+        runner,
+        feature,
+        "plan-review",
+        revision_plan=RevisionPlan(
+            requests=[
+                RevisionRequest(
+                    description="Rewrite the overview.",
+                    reasoning="Need a clearer framing.",
+                    affected_subfeatures=["accounts"],
+                )
+            ]
+        ),
+        decomposition=decomposition,
+        base_role=lead_task_planner_gate_reviewer.role,
+        output_type=TechnicalPlan,
+        artifact_prefix="plan",
+        checkpoint_prefix="cycle-3",
+    )
+
+    assert result.ok is False
+    assert len(result.failed) == 1
+    assert "prompt too long" in result.failed[0].reason
+    assert runner.ask_count == 2
 
 
 def test_offload_if_large_returns_absolute_prompt_path(tmp_path):
@@ -1414,6 +1733,1964 @@ async def test_task_planning_phase_resumes_compiled_artifact_at_gate_review(tmp_
 
     result = await TaskPlanningPhase().execute(runner, feature, state)
     assert result.dag == "approved dag"
+
+
+@pytest.mark.asyncio
+async def test_task_planning_decomposes_pending_subfeatures_one_at_a_time_and_retries_with_direct_peers(tmp_path):
+    feature = SimpleNamespace(id="feat-task-plan-per-sf", metadata={})
+    mirror = _TestMirror(tmp_path / "features")
+    decomposition = SubfeatureDecomposition(
+        subfeatures=[
+            Subfeature(id="SF-1", slug="accounts", name="Accounts", description="Accounts core"),
+            Subfeature(id="SF-2", slug="billing", name="Billing", description="Billing flows"),
+            Subfeature(id="SF-3", slug="reports", name="Reports", description="Reporting views"),
+        ],
+        edges=[
+            SubfeatureEdge(
+                from_subfeature="accounts",
+                to_subfeature="billing",
+                interface_type="api_call",
+                description="Billing reads account identities",
+            )
+        ],
+        complete=True,
+    )
+    workstream = Workstream(
+        id="WS-1",
+        name="Runtime",
+        subfeature_slugs=["accounts", "billing", "reports"],
+        rationale="Shared runtime context",
+        depends_on=[],
+    )
+    sf_upstream = {
+        "accounts": {
+            "plan": "Accounts plan",
+            "prd": "Accounts prd",
+            "design": "Accounts design",
+            "system-design": "Accounts system design",
+            "test-plan": "## Acceptance Criteria\n\n- AC-accounts-1\n",
+        },
+        "billing": {
+            "plan": "Billing plan",
+            "prd": "Billing prd",
+            "design": "Billing design",
+            "system-design": "Billing system design",
+            "test-plan": "## Acceptance Criteria\n\n- AC-billing-1\n",
+        },
+        "reports": {
+            "plan": "Reports plan",
+            "prd": "Reports prd",
+            "design": "Reports design",
+            "system-design": "Reports system design",
+            "test-plan": "## Acceptance Criteria\n\n- AC-reports-1\n",
+        },
+    }
+
+    class _Artifacts:
+        def __init__(self) -> None:
+            self.store = {
+                "decisions": "Global decisions",
+                "prd-summary:billing": "Billing summary",
+                "prd-summary:reports": "Reports summary",
+                "decisions-summary:billing": "Billing decision summary",
+                "decisions-summary:reports": "Reports decision summary",
+                "test-plan:accounts": sf_upstream["accounts"]["test-plan"],
+                "test-plan:billing": sf_upstream["billing"]["test-plan"],
+                "test-plan:reports": sf_upstream["reports"]["test-plan"],
+            }
+
+        async def get(self, key: str, *, feature):
+            del feature
+            return self.store.get(key, "")
+
+        async def put(self, key: str, value: str, *, feature):
+            del feature
+            self.store[key] = value
+
+    class _Runner:
+        def __init__(self) -> None:
+            self.artifacts = _Artifacts()
+            self.services = {"artifact_mirror": mirror}
+            self.prompts: list[tuple[str, str]] = []
+            self.calls: dict[str, int] = {}
+
+        async def run(self, task, feature, phase_name):
+            del feature, phase_name
+            if not isinstance(task, Ask):
+                raise AssertionError(f"unexpected task type: {type(task).__name__}")
+            actor_name = task.actor.name
+            self.prompts.append((actor_name, task.prompt))
+            count = self.calls.get(actor_name, 0) + 1
+            self.calls[actor_name] = count
+            if actor_name.endswith("accounts-slice-1-all-workstream-peers") and count == 1:
+                raise RuntimeError("prompt too long")
+            slug = actor_name.split("-slice-", 1)[0].rsplit("-", 1)[-1]
+            return ImplementationDAG(
+                tasks=[
+                    _valid_task(
+                        task_id=f"T-{slug}-1",
+                        slug=slug,
+                        verification_gates=[f"AC-{slug}-1"],
+                    )
+                ],
+                execution_order=[[f"T-{slug}-1"]],
+                requirement_coverage={f"REQ-{slug}": [f"T-{slug}-1"]},
+                complete=True,
+            )
+
+    runner = _Runner()
+
+    failures = await TaskPlanningPhase()._decompose_workstream(
+        runner,
+        feature,
+        decomposition,
+        workstream,
+        sf_upstream,
+    )
+
+    assert failures == []
+    assert runner.calls == {
+        "dag-ws-WS-1-accounts-slice-1-all-workstream-peers": 1,
+        "dag-ws-WS-1-accounts-slice-1-direct-peers-only": 1,
+        "dag-ws-WS-1-billing-slice-1-all-workstream-peers": 1,
+        "dag-ws-WS-1-reports-slice-1-all-workstream-peers": 1,
+    }
+    accounts_prompts = [
+        prompt
+        for actor_name, prompt in runner.prompts
+        if actor_name.startswith("dag-ws-WS-1-accounts-slice-1-")
+    ]
+    assert len(accounts_prompts) == 2
+    assert all("Read the context index first:" in prompt for prompt in accounts_prompts)
+    assert all("Reports (reports)" not in prompt for prompt in accounts_prompts)
+    first_index = Path(re.search(r"`([^`]+context-index\.md)`", accounts_prompts[0]).group(1))
+    second_index = Path(re.search(r"`([^`]+context-index\.md)`", accounts_prompts[1]).group(1))
+    assert first_index != second_index
+    first_manifest = Path(re.search(r"`([^`]+context-manifest\.md)`", accounts_prompts[0]).group(1))
+    second_manifest = Path(re.search(r"`([^`]+context-manifest\.md)`", accounts_prompts[1]).group(1))
+    assert "all-workstream-peers" in first_index.name
+    assert "direct-peers-only" in second_index.name
+    assert "dag-ws-WS-1-accounts-slice-1-all-workstream-peers-peer-context.md" in first_manifest.read_text(encoding="utf-8")
+    assert "dag-ws-WS-1-accounts-slice-1-direct-peers-only-peer-context.md" in second_manifest.read_text(encoding="utf-8")
+    first_peer_text = (
+        first_manifest.parent / "dag-ws-WS-1-accounts-slice-1-all-workstream-peers-peer-context.md"
+    ).read_text(encoding="utf-8")
+    second_peer_text = (
+        second_manifest.parent / "dag-ws-WS-1-accounts-slice-1-direct-peers-only-peer-context.md"
+    ).read_text(encoding="utf-8")
+    assert "Reports (reports)" in first_peer_text
+    assert "Reports (reports)" not in second_peer_text
+    assert "Billing (billing)" in second_peer_text
+    assert "dag-slices:accounts" in runner.artifacts.store
+    assert "dag-fragment:accounts:slice-1" in runner.artifacts.store
+    assert "dag:accounts" in runner.artifacts.store
+    assert "dag:billing" in runner.artifacts.store
+    assert "dag:reports" in runner.artifacts.store
+
+
+@pytest.mark.asyncio
+async def test_task_planning_context_builds_scoped_decision_pack_from_citations(tmp_path):
+    feature = SimpleNamespace(id="feat-task-plan-context", metadata={})
+    mirror = _TestMirror(tmp_path / "features")
+    decomposition = _decomposition()
+    workstream = SimpleNamespace(
+        id="WS-1",
+        name="Accounts",
+        rationale="Shared backend work",
+        subfeature_slugs=["accounts", "billing"],
+        depends_on=[],
+    )
+    accounts = next(sf for sf in decomposition.subfeatures if sf.slug == "accounts")
+
+    store = {
+        "prd:accounts": "Accounts PRD [decision: D-2]",
+        "design:accounts": "Accounts design",
+        "plan:accounts": "Accounts plan [decision: D-3]",
+        "system-design:accounts": "Accounts system design",
+        "test-plan:accounts": "Accounts test plan",
+        "decisions:accounts": _decision_ledger_text(
+            DecisionRecord(id="D-2", statement="Use account decision", source_phase="subfeature", subfeature_slug="accounts"),
+        ),
+        "prd-summary:billing": "billing prd summary",
+        "design-summary:billing": "billing design summary",
+        "plan-summary:billing": "billing plan summary",
+        "decisions-summary:billing": "# Decision Ledger — billing\n\n- D-4: Billing peer decision\n",
+        "decisions:broad": _decision_ledger_text(
+            DecisionRecord(id="D-1", statement="Use broad decision", source_phase="broad"),
+            DecisionRecord(id="D-77", statement="Uncited broad decision", source_phase="broad"),
+        ),
+        "decisions:global": _decision_ledger_text(
+            DecisionRecord(id="D-3", statement="Use global decision", source_phase="plan-review"),
+            DecisionRecord(id="D-88", statement="Uncited global decision", source_phase="plan-review"),
+        ),
+        "decisions": _decision_ledger_text(
+            DecisionRecord(id="D-1", statement="Use broad decision", source_phase="broad"),
+            DecisionRecord(id="D-77", statement="Uncited broad decision", source_phase="broad"),
+            DecisionRecord(id="D-2", statement="Use account decision", source_phase="subfeature", subfeature_slug="accounts"),
+            DecisionRecord(id="D-3", statement="Use global decision", source_phase="plan-review"),
+            DecisionRecord(id="D-88", statement="Uncited global decision", source_phase="plan-review"),
+            DecisionRecord(id="D-4", statement="Billing peer decision", source_phase="subfeature", subfeature_slug="billing"),
+            DecisionRecord(id="D-99", statement="Unrelated reports decision", source_phase="subfeature", subfeature_slug="reports"),
+        ),
+    }
+
+    class _Artifacts:
+        async def get(self, key: str, *, feature):
+            del feature
+            return store.get(key, "")
+
+    runner = SimpleNamespace(
+        artifacts=_Artifacts(),
+        services={"artifact_mirror": mirror},
+    )
+
+    package = await TaskPlanningPhase()._build_subfeature_task_context_package(
+        runner,
+        feature,
+        decomposition,
+        workstream,
+        accounts,
+        mode_label="all-workstream-peers",
+        direct_peer_only=False,
+    )
+
+    assert package is not None
+    assert "decision-pack" in package.item_paths
+
+    manifest_text = Path(package.manifest_path).read_text(encoding="utf-8")
+    assert "Scoped Decision Pack" in manifest_text
+
+    decision_pack_text = Path(package.item_paths["decision-pack"]).read_text(encoding="utf-8")
+    assert "D-2" in decision_pack_text
+    assert "D-3" in decision_pack_text
+    assert "D-4" in decision_pack_text
+    assert "D-1" not in decision_pack_text
+    assert "D-77" not in decision_pack_text
+    assert "D-88" not in decision_pack_text
+    assert "D-99" not in decision_pack_text
+    assert "`D-2`" in decision_pack_text
+    assert "`D-3`" in decision_pack_text
+    assert "`decisions-summary:billing`" in decision_pack_text
+
+    peer_text = Path(package.item_paths["peer-context"]).read_text(encoding="utf-8")
+    assert "PRD Summary" in peer_text
+    assert "Design Summary" in peer_text
+    assert "Plan Summary" in peer_text
+    assert "Decision Summary" in peer_text
+    assert "Billing peer decision" in peer_text
+
+
+@pytest.mark.asyncio
+async def test_task_planning_scoped_decision_pack_narrows_with_direct_peer_mode(tmp_path):
+    feature = SimpleNamespace(id="feat-task-plan-scope-mode", metadata={})
+    mirror = _TestMirror(tmp_path / "features")
+    decomposition = SubfeatureDecomposition(
+        subfeatures=[
+            Subfeature(id="SF-1", slug="accounts", name="Accounts", description="Accounts"),
+            Subfeature(id="SF-2", slug="billing", name="Billing", description="Billing"),
+            Subfeature(id="SF-3", slug="reports", name="Reports", description="Reports"),
+        ],
+        edges=[
+            SubfeatureEdge(
+                from_subfeature="accounts",
+                to_subfeature="billing",
+                interface_type="api_call",
+                description="Billing depends on accounts",
+            )
+        ],
+        complete=True,
+    )
+    workstream = SimpleNamespace(
+        id="WS-1",
+        name="Accounts",
+        rationale="Shared backend work",
+        subfeature_slugs=["accounts", "billing", "reports"],
+        depends_on=[],
+    )
+    accounts = next(sf for sf in decomposition.subfeatures if sf.slug == "accounts")
+    store = {
+        "prd:accounts": "Accounts PRD",
+        "design:accounts": "Accounts design",
+        "plan:accounts": "Accounts plan",
+        "system-design:accounts": "Accounts system design",
+        "test-plan:accounts": "Accounts test plan",
+        "decisions:accounts": _decision_ledger_text(
+            DecisionRecord(id="D-2", statement="Use account decision", source_phase="subfeature", subfeature_slug="accounts"),
+        ),
+        "prd-summary:billing": "billing prd summary",
+        "design-summary:billing": "billing design summary",
+        "plan-summary:billing": "billing plan summary",
+        "prd-summary:reports": "reports prd summary",
+        "design-summary:reports": "reports design summary",
+        "plan-summary:reports": "reports plan summary",
+        "decisions-summary:billing": "# Decision Ledger — billing\n\n- D-4: Billing peer decision\n",
+        "decisions-summary:reports": "# Decision Ledger — reports\n\n- D-5: Reports peer decision\n",
+        "decisions:broad": _decision_ledger_text(
+            DecisionRecord(id="D-1", statement="Use broad decision", source_phase="broad"),
+        ),
+        "decisions:global": _decision_ledger_text(
+            DecisionRecord(id="D-3", statement="Use global decision", source_phase="plan-review"),
+        ),
+        "decisions": _decision_ledger_text(
+            DecisionRecord(id="D-1", statement="Use broad decision", source_phase="broad"),
+            DecisionRecord(id="D-2", statement="Use account decision", source_phase="subfeature", subfeature_slug="accounts"),
+            DecisionRecord(id="D-3", statement="Use global decision", source_phase="plan-review"),
+            DecisionRecord(id="D-4", statement="Billing peer decision", source_phase="subfeature", subfeature_slug="billing"),
+            DecisionRecord(id="D-5", statement="Reports peer decision", source_phase="subfeature", subfeature_slug="reports"),
+        ),
+    }
+
+    class _Artifacts:
+        async def get(self, key: str, *, feature):
+            del feature
+            return store.get(key, "")
+
+    runner = SimpleNamespace(
+        artifacts=_Artifacts(),
+        services={"artifact_mirror": mirror},
+    )
+
+    all_peers = await TaskPlanningPhase()._build_subfeature_task_context_package(
+        runner,
+        feature,
+        decomposition,
+        workstream,
+        accounts,
+        mode_label="all-workstream-peers",
+        direct_peer_only=False,
+    )
+    direct_peers = await TaskPlanningPhase()._build_subfeature_task_context_package(
+        runner,
+        feature,
+        decomposition,
+        workstream,
+        accounts,
+        mode_label="direct-peers-only",
+        direct_peer_only=True,
+    )
+
+    assert all_peers is not None
+    assert direct_peers is not None
+    all_text = Path(all_peers.item_paths["decision-pack"]).read_text(encoding="utf-8")
+    direct_text = Path(direct_peers.item_paths["decision-pack"]).read_text(encoding="utf-8")
+
+    assert "D-4" in all_text
+    assert "D-5" in all_text
+    assert "D-4" in direct_text
+    assert "D-5" not in direct_text
+
+
+@pytest.mark.asyncio
+async def test_task_planning_marks_slug_failed_after_repeated_model_boundary_errors(tmp_path):
+    feature = SimpleNamespace(id="feat-task-plan-boundary", metadata={})
+    mirror = _TestMirror(tmp_path / "features")
+    decomposition = _decomposition()
+    workstream = Workstream(
+        id="WS-1",
+        name="Accounts",
+        subfeature_slugs=["accounts", "billing"],
+        rationale="Shared planning context",
+        depends_on=[],
+    )
+    sf_upstream = {
+        "accounts": {
+            "plan": "Accounts plan",
+            "prd": "Accounts prd",
+            "design": "Accounts design",
+            "system-design": "Accounts system design",
+            "test-plan": "## Acceptance Criteria\n\n- AC-accounts-1\n",
+        },
+        "billing": {
+            "plan": "Billing plan",
+            "prd": "Billing prd",
+            "design": "Billing design",
+            "system-design": "Billing system design",
+            "test-plan": "## Acceptance Criteria\n\n- AC-billing-1\n",
+        },
+    }
+
+    class _Artifacts:
+        def __init__(self) -> None:
+            self.store = {
+                "decisions": "Global decisions",
+                "test-plan:accounts": sf_upstream["accounts"]["test-plan"],
+                "test-plan:billing": sf_upstream["billing"]["test-plan"],
+            }
+
+        async def get(self, key: str, *, feature):
+            del feature
+            return self.store.get(key, "")
+
+        async def put(self, key: str, value: str, *, feature):
+            del feature
+            self.store[key] = value
+
+    class _Runner:
+        def __init__(self) -> None:
+            self.artifacts = _Artifacts()
+            self.services = {"artifact_mirror": mirror}
+            self.calls: list[str] = []
+
+        async def run(self, task, feature, phase_name):
+            del feature, phase_name
+            if not isinstance(task, Ask):
+                raise AssertionError(f"unexpected task type: {type(task).__name__}")
+            self.calls.append(task.actor.name)
+            if "billing" in task.actor.name:
+                raise AssertionError("workstream should stop after accounts fails")
+            if task.actor.name.endswith("all-workstream-peers"):
+                raise RuntimeError("structured_output is None for ImplementationDAG")
+            if task.actor.name.endswith("direct-peers-only"):
+                raise RuntimeError("structured_output is None for ImplementationDAG")
+            raise RuntimeError("prompt too long")
+
+    runner = _Runner()
+    failures = await TaskPlanningPhase()._decompose_workstream(
+        runner,
+        feature,
+        decomposition,
+        workstream,
+        sf_upstream,
+        )
+
+    assert len(failures) == 1
+    assert failures[0].slug == "accounts"
+    assert "prompt too long" in failures[0].reason
+    assert runner.calls == [
+        "dag-ws-WS-1-accounts-slice-1-all-workstream-peers",
+        "dag-ws-WS-1-accounts-slice-1-direct-peers-only",
+        "dag-ws-WS-1-accounts-slice-1-target-only",
+    ]
+    assert "dag:accounts" not in runner.artifacts.store
+    assert "dag:billing" not in runner.artifacts.store
+
+
+@pytest.mark.asyncio
+async def test_task_planning_retries_wrapped_model_boundary_failures(tmp_path):
+    feature = SimpleNamespace(id="feat-task-plan-wrapped-boundary", metadata={})
+    mirror = _TestMirror(tmp_path / "features")
+    decomposition = SubfeatureDecomposition(
+        subfeatures=[
+            Subfeature(id="SF-1", slug="accounts", name="Accounts", description="Accounts"),
+        ],
+        complete=True,
+    )
+    workstream = Workstream(
+        id="WS-1",
+        name="Accounts",
+        subfeature_slugs=["accounts"],
+        rationale="Shared planning context",
+        depends_on=[],
+    )
+    sf_upstream = {
+        "accounts": {
+            "plan": "Accounts plan",
+            "prd": "Accounts prd",
+            "design": "Accounts design",
+            "system-design": "Accounts system design",
+            "test-plan": "## Acceptance Criteria\n\n- AC-accounts-1\n",
+        },
+    }
+
+    class _Artifacts:
+        def __init__(self) -> None:
+            self.store = {
+                "decisions": "Global decisions",
+                "test-plan:accounts": sf_upstream["accounts"]["test-plan"],
+            }
+
+        async def get(self, key: str, *, feature):
+            del feature
+            return self.store.get(key, "")
+
+        async def put(self, key: str, value: str, *, feature):
+            del feature
+            self.store[key] = value
+
+    class _Runner:
+        def __init__(self) -> None:
+            self.artifacts = _Artifacts()
+            self.services = {"artifact_mirror": mirror}
+            self.calls: list[str] = []
+
+        async def run(self, task, feature, phase_name):
+            del feature, phase_name
+            if not isinstance(task, Ask):
+                raise AssertionError(f"unexpected task type: {type(task).__name__}")
+            self.calls.append(task.actor.name)
+            if task.actor.name.endswith("all-workstream-peers"):
+                outer = RuntimeError("Task Ask failed in phase 'task-planning'")
+                outer.__cause__ = RuntimeError(
+                    "structured_output is None for ImplementationDAG after retry"
+                )
+                raise outer
+            return ImplementationDAG(
+                tasks=[
+                    _valid_task(
+                        task_id="T-accounts-1",
+                        slug="accounts",
+                        verification_gates=["AC-accounts-1"],
+                    )
+                ],
+                execution_order=[["T-accounts-1"]],
+                requirement_coverage={"REQ-accounts": ["T-accounts-1"]},
+                complete=True,
+            )
+
+    runner = _Runner()
+    failures = await TaskPlanningPhase()._decompose_workstream(
+        runner,
+        feature,
+        decomposition,
+        workstream,
+        sf_upstream,
+    )
+
+    assert failures == []
+    assert runner.calls == [
+        "dag-ws-WS-1-accounts-slice-1-all-workstream-peers",
+        "dag-ws-WS-1-accounts-slice-1-direct-peers-only",
+    ]
+    assert "dag-slices:accounts" in runner.artifacts.store
+    assert "dag-fragment:accounts:slice-1" in runner.artifacts.store
+    assert "dag:accounts" in runner.artifacts.store
+
+
+def test_is_model_boundary_failure_detects_wrapped_cause():
+    outer = RuntimeError("Task Ask failed in phase 'task-planning'")
+    outer.__cause__ = RuntimeError(
+        "structured_output is None for ImplementationDAG after retry"
+    )
+
+    assert _is_model_boundary_failure(outer) is True
+
+
+@pytest.mark.asyncio
+async def test_task_planning_blocks_invalid_verification_coverage_before_persisting_dag(tmp_path):
+    feature = SimpleNamespace(id="feat-task-plan-coverage", metadata={})
+    mirror = _TestMirror(tmp_path / "features")
+    decomposition = SubfeatureDecomposition(
+        subfeatures=[
+            Subfeature(id="SF-1", slug="bridge-protocol", name="Bridge Protocol", description="Bridge"),
+        ],
+        complete=True,
+    )
+    workstream = Workstream(
+        id="WS-3",
+        name="Bridge",
+        subfeature_slugs=["bridge-protocol"],
+        rationale="Bridge scope",
+        depends_on=[],
+    )
+    sf_upstream = {
+        "bridge-protocol": {
+            "plan": "Bridge plan",
+            "prd": "Bridge prd",
+            "design": "Bridge design",
+            "system-design": "Bridge system design",
+            "test-plan": "## Acceptance Criteria\n\n- AC-bridge-protocol-1\n- AC-bridge-protocol-2\n",
+        }
+    }
+
+    class _Artifacts:
+        def __init__(self) -> None:
+            self.store = {
+                "decisions": "Global decisions",
+                "test-plan:bridge-protocol": sf_upstream["bridge-protocol"]["test-plan"],
+            }
+
+        async def get(self, key: str, *, feature):
+            del feature
+            return self.store.get(key, "")
+
+        async def put(self, key: str, value: str, *, feature):
+            del feature
+            self.store[key] = value
+
+    class _Runner:
+        def __init__(self) -> None:
+            self.artifacts = _Artifacts()
+            self.services = {"artifact_mirror": mirror}
+
+        async def run(self, task, feature, phase_name):
+            del feature, phase_name
+            if not isinstance(task, Ask):
+                raise AssertionError(f"unexpected task type: {type(task).__name__}")
+            return ImplementationDAG(
+                tasks=[
+                    _valid_task(
+                        task_id="T-bridge-1",
+                        slug="bridge-protocol",
+                        verification_gates=["AC-1"],
+                    )
+                ],
+                execution_order=[["T-bridge-1"]],
+                requirement_coverage={"REQ-bridge": ["T-bridge-1"]},
+                complete=True,
+            )
+
+    runner = _Runner()
+    failures = await TaskPlanningPhase()._decompose_workstream(
+        runner,
+        feature,
+        decomposition,
+        workstream,
+        sf_upstream,
+    )
+
+    assert len(failures) == 1
+    assert "verification_gate" in failures[0].reason
+    assert "AC-1" in failures[0].reason
+    assert "acceptance criteria that no task cites" in failures[0].reason
+    assert "dag:bridge-protocol" not in runner.artifacts.store
+
+
+@pytest.mark.asyncio
+async def test_task_planning_autonomous_coverage_repair_persists_corrected_dag(tmp_path):
+    feature = SimpleNamespace(id="feat-task-plan-autorepair", metadata={})
+    mirror = _TestMirror(tmp_path / "features")
+    decomposition = SubfeatureDecomposition(
+        subfeatures=[
+            Subfeature(id="SF-1", slug="bridge-protocol", name="Bridge Protocol", description="Bridge"),
+        ],
+        complete=True,
+    )
+    workstream = Workstream(
+        id="WS-3",
+        name="Bridge",
+        subfeature_slugs=["bridge-protocol"],
+        rationale="Bridge scope",
+        depends_on=[],
+    )
+    sf_upstream = {
+        "bridge-protocol": {
+            "plan": "Bridge plan",
+            "prd": "Bridge prd",
+            "design": "Bridge design",
+            "system-design": "Bridge system design",
+            "test-plan": "## Acceptance Criteria\n\n- AC-bridge-protocol-1\n- AC-bridge-protocol-2\n",
+        }
+    }
+
+    class _Artifacts:
+        def __init__(self) -> None:
+            self.store = {
+                "decisions": "Global decisions",
+                "test-plan:bridge-protocol": sf_upstream["bridge-protocol"]["test-plan"],
+                "plan:bridge-protocol": sf_upstream["bridge-protocol"]["plan"],
+            }
+
+        async def get(self, key: str, *, feature):
+            del feature
+            return self.store.get(key, "")
+
+        async def put(self, key: str, value: str, *, feature):
+            del feature
+            self.store[key] = value
+
+    class _Runner:
+        def __init__(self) -> None:
+            self.artifacts = _Artifacts()
+            self.services = {
+                "artifact_mirror": mirror,
+                "autonomous_remainder": True,
+            }
+            self.calls: list[str] = []
+
+        async def run(self, task, feature, phase_name):
+            del feature, phase_name
+            if not isinstance(task, Ask):
+                raise AssertionError(f"unexpected task type: {type(task).__name__}")
+            self.calls.append(task.actor.name)
+            if task.actor.name == "dag-ws-WS-3-bridge-protocol-slice-1-all-workstream-peers":
+                return ImplementationDAG(
+                    tasks=[
+                        _valid_task(
+                            task_id="T-bridge-1",
+                            slug="bridge-protocol",
+                            verification_gates=["AC-bridge-protocol-1"],
+                        )
+                    ],
+                    execution_order=[["T-bridge-1"]],
+                    requirement_coverage={"REQ-bridge": ["T-bridge-1"]},
+                    complete=True,
+                )
+            if task.actor.name == "dag-ws-WS-3-bridge-protocol-slice-1-repair-all-workstream-peers":
+                return ImplementationDAG(
+                    tasks=[
+                        _valid_task(
+                            task_id="T-bridge-1",
+                            slug="bridge-protocol",
+                            verification_gates=[
+                                "AC-bridge-protocol-1",
+                                "AC-bridge-protocol-2",
+                            ],
+                        )
+                    ],
+                    execution_order=[["T-bridge-1"]],
+                    requirement_coverage={"REQ-bridge": ["T-bridge-1"]},
+                    complete=True,
+                )
+            raise AssertionError(f"unexpected actor: {task.actor.name}")
+
+    runner = _Runner()
+    failures = await TaskPlanningPhase()._decompose_workstream(
+        runner,
+        feature,
+        decomposition,
+        workstream,
+        sf_upstream,
+    )
+
+    assert failures == []
+    assert runner.calls == [
+        "dag-ws-WS-3-bridge-protocol-slice-1-all-workstream-peers",
+        "dag-ws-WS-3-bridge-protocol-slice-1-repair-all-workstream-peers",
+    ]
+    assert "dag-fragment:bridge-protocol:slice-1" in runner.artifacts.store
+    persisted = json.loads(runner.artifacts.store["dag:bridge-protocol"])
+    assert persisted["tasks"][0]["verification_gates"] == [
+        "AC-bridge-protocol-1",
+        "AC-bridge-protocol-2",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_task_planning_normalizes_same_wave_dependency_edges_before_persisting_dag(tmp_path):
+    feature = SimpleNamespace(id="feat-task-plan-order-fix", metadata={})
+    mirror = _TestMirror(tmp_path / "features")
+    decomposition = SubfeatureDecomposition(
+        subfeatures=[
+            Subfeature(id="SF-1", slug="bridge-protocol", name="Bridge Protocol", description="Bridge"),
+        ],
+        complete=True,
+    )
+    workstream = Workstream(
+        id="WS-3",
+        name="Bridge",
+        subfeature_slugs=["bridge-protocol"],
+        rationale="Bridge scope",
+        depends_on=[],
+    )
+    sf_upstream = {
+        "bridge-protocol": {
+            "plan": "Bridge plan",
+            "prd": "Bridge prd",
+            "design": "Bridge design",
+            "system-design": "Bridge system design",
+            "test-plan": "## Acceptance Criteria\n\n- AC-bridge-protocol-1\n",
+        }
+    }
+
+    class _Artifacts:
+        def __init__(self) -> None:
+            self.store = {
+                "decisions": "Global decisions",
+                "test-plan:bridge-protocol": sf_upstream["bridge-protocol"]["test-plan"],
+            }
+
+        async def get(self, key: str, *, feature):
+            del feature
+            return self.store.get(key, "")
+
+        async def put(self, key: str, value: str, *, feature):
+            del feature
+            self.store[key] = value
+
+    class _Runner:
+        def __init__(self) -> None:
+            self.artifacts = _Artifacts()
+            self.services = {"artifact_mirror": mirror}
+
+        async def run(self, task, feature, phase_name):
+            del feature, phase_name
+            if not isinstance(task, Ask):
+                raise AssertionError(f"unexpected task type: {type(task).__name__}")
+            return ImplementationDAG(
+                tasks=[
+                    _valid_task(
+                        task_id="T-bridge-1",
+                        slug="bridge-protocol",
+                        verification_gates=["AC-bridge-protocol-1"],
+                    ),
+                    _valid_task(
+                        task_id="T-bridge-2",
+                        slug="bridge-protocol",
+                        verification_gates=["AC-bridge-protocol-1"],
+                        dependencies=["T-bridge-1"],
+                    ),
+                ],
+                execution_order=[["T-bridge-1", "T-bridge-2"]],
+                requirement_coverage={
+                    "REQ-bridge": ["T-bridge-1", "T-bridge-2"],
+                },
+                complete=True,
+            )
+
+    runner = _Runner()
+    failures = await TaskPlanningPhase()._decompose_workstream(
+        runner,
+        feature,
+        decomposition,
+        workstream,
+        sf_upstream,
+    )
+
+    assert failures == []
+    persisted = json.loads(runner.artifacts.store["dag:bridge-protocol"])
+    assert persisted["execution_order"] == [["T-bridge-1"], ["T-bridge-2"]]
+
+
+def test_task_planning_preserves_intentionally_serialized_waves():
+    dag = ImplementationDAG(
+        tasks=[
+            _valid_task(task_id="T-bridge-1", slug="bridge-protocol"),
+            _valid_task(task_id="T-bridge-2", slug="bridge-protocol"),
+        ],
+        execution_order=[["T-bridge-1"], ["T-bridge-2"]],
+        complete=True,
+    )
+
+    normalized, changed = TaskPlanningPhase._normalize_subfeature_execution_order(dag)
+
+    assert changed is False
+    assert normalized.execution_order == [["T-bridge-1"], ["T-bridge-2"]]
+
+
+def test_task_planning_pushes_backward_dependencies_later_without_merging():
+    dag = ImplementationDAG(
+        tasks=[
+            _valid_task(task_id="T-bridge-1", slug="bridge-protocol"),
+            _valid_task(
+                task_id="T-bridge-2",
+                slug="bridge-protocol",
+                dependencies=["T-bridge-1"],
+            ),
+        ],
+        execution_order=[["T-bridge-2"], ["T-bridge-1"]],
+        complete=True,
+    )
+
+    normalized, changed = TaskPlanningPhase._normalize_subfeature_execution_order(dag)
+
+    assert changed is True
+    assert normalized.execution_order == [["T-bridge-1"], ["T-bridge-2"]]
+
+
+def test_task_planning_rejects_cyclic_dependency_graphs():
+    dag = ImplementationDAG(
+        tasks=[
+            ImplementationTask(
+                id="T-bridge-1",
+                name="Task 1",
+                description="Task 1",
+                subfeature_id="bridge-protocol",
+                dependencies=["T-bridge-2"],
+            ),
+            ImplementationTask(
+                id="T-bridge-2",
+                name="Task 2",
+                description="Task 2",
+                subfeature_id="bridge-protocol",
+                dependencies=["T-bridge-1"],
+            ),
+        ],
+        execution_order=[["T-bridge-1"], ["T-bridge-2"]],
+        complete=True,
+    )
+
+    with pytest.raises(ValueError, match="cyclic or unsatisfied dependencies"):
+        TaskPlanningPhase._normalize_subfeature_execution_order(dag)
+
+
+@pytest.mark.asyncio
+async def test_task_planning_without_autonomous_remainder_blocks_on_coverage_drift(tmp_path):
+    feature = SimpleNamespace(id="feat-task-plan-no-autorepair", metadata={})
+    mirror = _TestMirror(tmp_path / "features")
+    decomposition = SubfeatureDecomposition(
+        subfeatures=[
+            Subfeature(id="SF-1", slug="bridge-protocol", name="Bridge Protocol", description="Bridge"),
+        ],
+        complete=True,
+    )
+    workstream = Workstream(
+        id="WS-3",
+        name="Bridge",
+        subfeature_slugs=["bridge-protocol"],
+        rationale="Bridge scope",
+        depends_on=[],
+    )
+    sf_upstream = {
+        "bridge-protocol": {
+            "plan": "Bridge plan",
+            "prd": "Bridge prd",
+            "design": "Bridge design",
+            "system-design": "Bridge system design",
+            "test-plan": "## Acceptance Criteria\n\n- AC-bridge-protocol-1\n- AC-bridge-protocol-2\n",
+        }
+    }
+
+    class _Artifacts:
+        def __init__(self) -> None:
+            self.store = {
+                "decisions": "Global decisions",
+                "test-plan:bridge-protocol": sf_upstream["bridge-protocol"]["test-plan"],
+                "plan:bridge-protocol": sf_upstream["bridge-protocol"]["plan"],
+            }
+
+        async def get(self, key: str, *, feature):
+            del feature
+            return self.store.get(key, "")
+
+        async def put(self, key: str, value: str, *, feature):
+            del feature
+            self.store[key] = value
+
+    class _Runner:
+        def __init__(self) -> None:
+            self.artifacts = _Artifacts()
+            self.services = {"artifact_mirror": mirror}
+            self.calls: list[str] = []
+
+        async def run(self, task, feature, phase_name):
+            del feature, phase_name
+            if not isinstance(task, Ask):
+                raise AssertionError(f"unexpected task type: {type(task).__name__}")
+            self.calls.append(task.actor.name)
+            return ImplementationDAG(
+                tasks=[
+                    _valid_task(
+                        task_id="T-bridge-1",
+                        slug="bridge-protocol",
+                        verification_gates=["AC-bridge-protocol-1"],
+                    )
+                ],
+                execution_order=[["T-bridge-1"]],
+                requirement_coverage={"REQ-bridge": ["T-bridge-1"]},
+                complete=True,
+            )
+
+    runner = _Runner()
+    failures = await TaskPlanningPhase()._decompose_workstream(
+        runner,
+        feature,
+        decomposition,
+        workstream,
+        sf_upstream,
+    )
+
+    assert len(failures) == 1
+    assert "AC-bridge-protocol-2" in failures[0].reason
+    assert runner.calls == ["dag-ws-WS-3-bridge-protocol-slice-1-all-workstream-peers"]
+    assert "dag:bridge-protocol" not in runner.artifacts.store
+
+
+@pytest.mark.asyncio
+async def test_task_planning_resume_reuses_completed_slice_fragments(tmp_path):
+    feature = SimpleNamespace(id="feat-task-plan-resume", metadata={})
+    mirror = _TestMirror(tmp_path / "features")
+    decomposition = SubfeatureDecomposition(
+        subfeatures=[
+            Subfeature(id="SF-1", slug="accounts", name="Accounts", description="Accounts"),
+        ],
+        complete=True,
+    )
+    workstream = Workstream(
+        id="WS-1",
+        name="Accounts",
+        subfeature_slugs=["accounts"],
+        rationale="Accounts scope",
+        depends_on=[],
+    )
+    sf_upstream = {
+        "accounts": {
+            "plan": "## Implementation Steps\n\n### STEP-1: Bootstrap\n\n**Instructions:**\n\nBootstrap\n\n### STEP-2: Finalize\n\n**Instructions:**\n\nFinalize\n",
+            "prd": "Accounts prd",
+            "design": "Accounts design",
+            "system-design": "Accounts system design",
+            "test-plan": "## Acceptance Criteria\n\n- AC-accounts-1\n- AC-accounts-2\n",
+        },
+    }
+    manifest = _slice_manifest_with_current_digests(
+        slug="accounts",
+        plan_text=sf_upstream["accounts"]["plan"],
+        test_plan_text=sf_upstream["accounts"]["test-plan"],
+        slices=[
+            task_planning_module.TaskPlanningSlice(
+                slice_id="slice-1",
+                title="Bootstrap",
+                acceptance_criterion_ids=["AC-accounts-1"],
+            ),
+            task_planning_module.TaskPlanningSlice(
+                slice_id="slice-2",
+                title="Finalize",
+                acceptance_criterion_ids=["AC-accounts-2"],
+            ),
+        ],
+        statuses=[
+            task_planning_module.SlicePlanningStatus(
+                slice_id="slice-1",
+                status="completed",
+                fragment_key="dag-fragment:accounts:slice-1",
+            ),
+            task_planning_module.SlicePlanningStatus(slice_id="slice-2"),
+        ],
+    )
+    completed_fragment = ImplementationDAG(
+        tasks=[_valid_task(task_id="T-accounts-1", slug="accounts", verification_gates=["AC-accounts-1"])],
+        execution_order=[["T-accounts-1"]],
+        requirement_coverage={"REQ-accounts": ["T-accounts-1"]},
+        complete=True,
+    )
+
+    class _Artifacts:
+        def __init__(self) -> None:
+            self.store = {
+                "dag-slices:accounts": manifest.model_dump_json(indent=2),
+                "dag-fragment:accounts:slice-1": completed_fragment.model_dump_json(indent=2),
+                "test-plan:accounts": sf_upstream["accounts"]["test-plan"],
+                "plan:accounts": sf_upstream["accounts"]["plan"],
+                "decisions": "Global decisions",
+            }
+
+        async def get(self, key: str, *, feature):
+            del feature
+            return self.store.get(key, "")
+
+        async def put(self, key: str, value: str, *, feature):
+            del feature
+            self.store[key] = value
+
+        async def delete(self, key: str, *, feature):
+            del feature
+            self.store.pop(key, None)
+
+    class _Runner:
+        def __init__(self) -> None:
+            self.artifacts = _Artifacts()
+            self.services = {"artifact_mirror": mirror}
+            self.calls: list[str] = []
+
+        async def run(self, task, feature, phase_name):
+            del feature, phase_name
+            if not isinstance(task, Ask):
+                raise AssertionError(f"unexpected task type: {type(task).__name__}")
+            self.calls.append(task.actor.name)
+            assert task.actor.name == "dag-ws-WS-1-accounts-slice-2-all-workstream-peers"
+            return ImplementationDAG(
+                tasks=[
+                    _valid_task(
+                        task_id="T-accounts-2",
+                        slug="accounts",
+                        verification_gates=["AC-accounts-2"],
+                    )
+                ],
+                execution_order=[["T-accounts-2"]],
+                requirement_coverage={"REQ-accounts": ["T-accounts-2"]},
+                complete=True,
+            )
+
+    runner = _Runner()
+    failures = await TaskPlanningPhase()._decompose_workstream(
+        runner,
+        feature,
+        decomposition,
+        workstream,
+        sf_upstream,
+    )
+
+    assert failures == []
+    assert runner.calls == ["dag-ws-WS-1-accounts-slice-2-all-workstream-peers"]
+    persisted = json.loads(runner.artifacts.store["dag:accounts"])
+    assert [task["id"] for task in persisted["tasks"]] == ["T-accounts-1", "T-accounts-2"]
+
+
+@pytest.mark.asyncio
+async def test_task_planning_resume_deletes_invalid_completed_fragment_and_replans(tmp_path):
+    feature = SimpleNamespace(id="feat-task-plan-invalid-fragment", metadata={})
+    mirror = _TestMirror(tmp_path / "features")
+    decomposition = SubfeatureDecomposition(
+        subfeatures=[
+            Subfeature(id="SF-1", slug="accounts", name="Accounts", description="Accounts"),
+        ],
+        complete=True,
+    )
+    workstream = Workstream(
+        id="WS-1",
+        name="Accounts",
+        subfeature_slugs=["accounts"],
+        rationale="Accounts scope",
+        depends_on=[],
+    )
+    sf_upstream = {
+        "accounts": {
+            "plan": "## Implementation Steps\n\n### STEP-1: Bootstrap\n\n**Instructions:**\n\nBootstrap\n",
+            "prd": "Accounts prd",
+            "design": "Accounts design",
+            "system-design": "Accounts system design",
+            "test-plan": "## Acceptance Criteria\n\n- AC-accounts-1\n",
+        },
+    }
+    manifest = _slice_manifest_with_current_digests(
+        slug="accounts",
+        plan_text=sf_upstream["accounts"]["plan"],
+        test_plan_text=sf_upstream["accounts"]["test-plan"],
+        slices=[
+            task_planning_module.TaskPlanningSlice(
+                slice_id="slice-1",
+                title="Bootstrap",
+                step_ids=["STEP-1"],
+                acceptance_criterion_ids=["AC-accounts-1"],
+            ),
+        ],
+        statuses=[
+            task_planning_module.SlicePlanningStatus(
+                slice_id="slice-1",
+                status="completed",
+                fragment_key="dag-fragment:accounts:slice-1",
+            ),
+        ],
+    )
+    invalid_fragment = ImplementationDAG(
+        tasks=[
+            ImplementationTask(
+                id="T-accounts-1",
+                name="Accounts",
+                description="Accounts task",
+                subfeature_id="accounts",
+                verification_gates=["AC-accounts-1"],
+            )
+        ],
+        execution_order=[["T-accounts-1"]],
+        requirement_coverage={"REQ-accounts": ["T-accounts-1"]},
+        complete=True,
+    )
+
+    class _Artifacts:
+        def __init__(self) -> None:
+            self.store = {
+                "dag-slices:accounts": manifest.model_dump_json(indent=2),
+                "dag-fragment:accounts:slice-1": invalid_fragment.model_dump_json(indent=2),
+                "test-plan:accounts": sf_upstream["accounts"]["test-plan"],
+                "plan:accounts": sf_upstream["accounts"]["plan"],
+                "decisions": "Global decisions",
+            }
+            self.deleted: list[str] = []
+
+        async def get(self, key: str, *, feature):
+            del feature
+            return self.store.get(key, "")
+
+        async def put(self, key: str, value: str, *, feature):
+            del feature
+            self.store[key] = value
+
+        async def delete(self, key: str, *, feature):
+            del feature
+            self.deleted.append(key)
+            self.store.pop(key, None)
+
+    class _Runner:
+        def __init__(self) -> None:
+            self.artifacts = _Artifacts()
+            self.services = {"artifact_mirror": mirror}
+            self.calls: list[str] = []
+
+        async def run(self, task, feature, phase_name):
+            del feature, phase_name
+            if not isinstance(task, Ask):
+                raise AssertionError(f"unexpected task type: {type(task).__name__}")
+            self.calls.append(task.actor.name)
+            return ImplementationDAG(
+                tasks=[_valid_task(task_id="T-accounts-1", slug="accounts", verification_gates=["AC-accounts-1"])],
+                execution_order=[["T-accounts-1"]],
+                requirement_coverage={"REQ-accounts": ["T-accounts-1"]},
+                complete=True,
+            )
+
+    runner = _Runner()
+    mirror.write_artifact(feature.id, "dag-fragment:accounts:slice-1", invalid_fragment.model_dump_json(indent=2))
+
+    failures = await TaskPlanningPhase()._decompose_workstream(
+        runner,
+        feature,
+        decomposition,
+        workstream,
+        sf_upstream,
+    )
+
+    assert failures == []
+    assert runner.artifacts.deleted == ["dag-fragment:accounts:slice-1"]
+    assert runner.calls == ["dag-ws-WS-1-accounts-slice-1-all-workstream-peers"]
+    persisted_fragment = json.loads(runner.artifacts.store["dag-fragment:accounts:slice-1"])
+    assert persisted_fragment["tasks"][0]["step_ids"] == ["STEP-1"]
+
+
+@pytest.mark.asyncio
+async def test_task_planning_resume_rewrites_normalizable_fragment_without_replanning(tmp_path):
+    feature = SimpleNamespace(id="feat-task-plan-normalize-fragment", metadata={})
+    mirror = _TestMirror(tmp_path / "features")
+    decomposition = SubfeatureDecomposition(
+        subfeatures=[
+            Subfeature(id="SF-1", slug="bridge-protocol", name="Bridge Protocol", description="Bridge"),
+        ],
+        complete=True,
+    )
+    workstream = Workstream(
+        id="WS-3",
+        name="Bridge",
+        subfeature_slugs=["bridge-protocol"],
+        rationale="Bridge scope",
+        depends_on=[],
+    )
+    sf_upstream = {
+        "bridge-protocol": {
+            "plan": "## Implementation Steps\n\n### STEP-1: Bootstrap\n\n**Instructions:**\n\nBootstrap\n",
+            "prd": "Bridge prd",
+            "design": "Bridge design",
+            "system-design": "Bridge system design",
+            "test-plan": "## Acceptance Criteria\n\n- AC-bridge-protocol-1\n",
+        },
+    }
+    manifest = _slice_manifest_with_current_digests(
+        slug="bridge-protocol",
+        plan_text=sf_upstream["bridge-protocol"]["plan"],
+        test_plan_text=sf_upstream["bridge-protocol"]["test-plan"],
+        slices=[
+            task_planning_module.TaskPlanningSlice(
+                slice_id="slice-1",
+                title="Bootstrap",
+                step_ids=["STEP-1"],
+                acceptance_criterion_ids=["AC-bridge-protocol-1"],
+            ),
+        ],
+        statuses=[
+            task_planning_module.SlicePlanningStatus(
+                slice_id="slice-1",
+                status="completed",
+                fragment_key="dag-fragment:bridge-protocol:slice-1",
+            ),
+        ],
+    )
+    fragment = ImplementationDAG(
+        tasks=[
+            _valid_task(task_id="T-bridge-1", slug="bridge-protocol", verification_gates=["AC-bridge-protocol-1"]),
+            _valid_task(
+                task_id="T-bridge-2",
+                slug="bridge-protocol",
+                verification_gates=["AC-bridge-protocol-1"],
+                dependencies=["T-bridge-1"],
+            ),
+        ],
+        execution_order=[["T-bridge-1", "T-bridge-2"]],
+        requirement_coverage={"REQ-bridge-protocol": ["T-bridge-1", "T-bridge-2"]},
+        complete=True,
+    )
+
+    class _Artifacts:
+        def __init__(self) -> None:
+            self.store = {
+                "dag-slices:bridge-protocol": manifest.model_dump_json(indent=2),
+                "dag-fragment:bridge-protocol:slice-1": fragment.model_dump_json(indent=2),
+                "test-plan:bridge-protocol": sf_upstream["bridge-protocol"]["test-plan"],
+                "plan:bridge-protocol": sf_upstream["bridge-protocol"]["plan"],
+                "decisions": "Global decisions",
+            }
+
+        async def get(self, key: str, *, feature):
+            del feature
+            return self.store.get(key, "")
+
+        async def put(self, key: str, value: str, *, feature):
+            del feature
+            self.store[key] = value
+
+        async def delete(self, key: str, *, feature):
+            del feature
+            self.store.pop(key, None)
+
+    class _Runner:
+        def __init__(self) -> None:
+            self.artifacts = _Artifacts()
+            self.services = {"artifact_mirror": mirror}
+            self.calls: list[str] = []
+
+        async def run(self, task, feature, phase_name):
+            del task, feature, phase_name
+            self.calls.append("unexpected")
+            raise AssertionError("planner should not rerun for a normalizable fragment")
+
+    runner = _Runner()
+
+    failures = await TaskPlanningPhase()._decompose_workstream(
+        runner,
+        feature,
+        decomposition,
+        workstream,
+        sf_upstream,
+    )
+
+    assert failures == []
+    assert runner.calls == []
+    persisted_fragment = json.loads(runner.artifacts.store["dag-fragment:bridge-protocol:slice-1"])
+    assert persisted_fragment["execution_order"] == [["T-bridge-1"], ["T-bridge-2"]]
+    persisted_dag = json.loads(runner.artifacts.store["dag:bridge-protocol"])
+    assert persisted_dag["execution_order"] == [["T-bridge-1"], ["T-bridge-2"]]
+
+
+@pytest.mark.asyncio
+async def test_task_planning_reuses_matching_slice_manifest(tmp_path):
+    feature = SimpleNamespace(id="feat-task-plan-manifest-reuse", metadata={})
+    mirror = _TestMirror(tmp_path / "features")
+    subfeature = Subfeature(id="SF-1", slug="accounts", name="Accounts", description="Accounts")
+    plan_text = "## Implementation Steps\n\n### STEP-1: Bootstrap\n\nBootstrap\n"
+    test_plan_text = "## Acceptance Criteria\n\n- AC-accounts-1\n"
+    manifest = _slice_manifest_with_current_digests(
+        slug="accounts",
+        plan_text=plan_text,
+        test_plan_text=test_plan_text,
+        slices=[
+            task_planning_module.TaskPlanningSlice(
+                slice_id="slice-1",
+                title="Bootstrap",
+                step_ids=["STEP-1"],
+                acceptance_criterion_ids=["AC-accounts-1"],
+            ),
+        ],
+    )
+
+    class _Artifacts:
+        def __init__(self) -> None:
+            self.store = {
+                "dag-slices:accounts": manifest.model_dump_json(indent=2),
+                "plan:accounts": plan_text,
+                "test-plan:accounts": test_plan_text,
+            }
+
+        async def get(self, key: str, *, feature):
+            del feature
+            return self.store.get(key, "")
+
+        async def put(self, key: str, value: str, *, feature):
+            del feature
+            self.store[key] = value
+
+        async def delete(self, key: str, *, feature):
+            del feature
+            self.store.pop(key, None)
+
+    runner = SimpleNamespace(artifacts=_Artifacts(), services={"artifact_mirror": mirror})
+
+    derived = await TaskPlanningPhase._derive_slice_manifest(runner, feature, subfeature)
+
+    assert derived.model_dump() == manifest.model_dump()
+
+
+@pytest.mark.asyncio
+async def test_task_planning_invalidates_slice_manifest_when_plan_changes(tmp_path):
+    feature = SimpleNamespace(id="feat-task-plan-plan-change", metadata={})
+    mirror = _TestMirror(tmp_path / "features")
+    subfeature = Subfeature(id="SF-1", slug="accounts", name="Accounts", description="Accounts")
+    old_plan_text = "## Implementation Steps\n\n### STEP-1: Bootstrap\n\nBootstrap\n"
+    new_plan_text = (
+        "## Implementation Steps\n\n### STEP-1: Bootstrap\n\nBootstrap\n\n"
+        "### STEP-2: Finalize\n\nFinalize\n"
+    )
+    test_plan_text = "## Acceptance Criteria\n\n- AC-accounts-1\n- AC-accounts-2\n"
+    stale_manifest = _slice_manifest_with_current_digests(
+        slug="accounts",
+        plan_text=old_plan_text,
+        test_plan_text=test_plan_text,
+        slices=[
+            task_planning_module.TaskPlanningSlice(
+                slice_id="slice-1",
+                title="Bootstrap",
+                step_ids=["STEP-1"],
+                acceptance_criterion_ids=["AC-accounts-1"],
+            ),
+        ],
+    )
+    stale_fragment = ImplementationDAG(
+        tasks=[_valid_task(task_id="T-accounts-1", slug="accounts", verification_gates=["AC-accounts-1"])],
+        execution_order=[["T-accounts-1"]],
+        requirement_coverage={"REQ-accounts": ["T-accounts-1"]},
+        complete=True,
+    )
+
+    class _Artifacts:
+        def __init__(self) -> None:
+            self.store = {
+                "dag-slices:accounts": stale_manifest.model_dump_json(indent=2),
+                "dag-fragment:accounts:slice-1": stale_fragment.model_dump_json(indent=2),
+                "plan:accounts": new_plan_text,
+                "test-plan:accounts": test_plan_text,
+            }
+            self.deleted: list[str] = []
+
+        async def get(self, key: str, *, feature):
+            del feature
+            return self.store.get(key, "")
+
+        async def put(self, key: str, value: str, *, feature):
+            del feature
+            self.store[key] = value
+
+        async def delete(self, key: str, *, feature):
+            del feature
+            self.deleted.append(key)
+            self.store.pop(key, None)
+
+    runner = SimpleNamespace(artifacts=_Artifacts(), services={"artifact_mirror": mirror})
+    mirror.write_artifact(feature.id, "dag-fragment:accounts:slice-1", stale_fragment.model_dump_json(indent=2))
+
+    derived = await TaskPlanningPhase._derive_slice_manifest(runner, feature, subfeature)
+
+    assert runner.artifacts.deleted == ["dag-fragment:accounts:slice-1"]
+    assert derived.plan_digest != stale_manifest.plan_digest
+    assert derived.test_plan_digest == stale_manifest.test_plan_digest
+    assert [slice_info.step_ids for slice_info in derived.slices] == [["STEP-1", "STEP-2"]]
+    assert "dag-fragment:accounts:slice-1" not in runner.artifacts.store
+
+
+@pytest.mark.asyncio
+async def test_task_planning_invalidates_slice_manifest_when_test_plan_changes(tmp_path):
+    feature = SimpleNamespace(id="feat-task-plan-test-plan-change", metadata={})
+    mirror = _TestMirror(tmp_path / "features")
+    subfeature = Subfeature(id="SF-1", slug="accounts", name="Accounts", description="Accounts")
+    plan_text = "## Implementation Steps\n\n### STEP-1: Bootstrap\n\nBootstrap\n"
+    old_test_plan_text = "## Acceptance Criteria\n\n- AC-accounts-1\n"
+    new_test_plan_text = "## Acceptance Criteria\n\n- AC-accounts-1\n- AC-accounts-2\n"
+    stale_manifest = _slice_manifest_with_current_digests(
+        slug="accounts",
+        plan_text=plan_text,
+        test_plan_text=old_test_plan_text,
+        slices=[
+            task_planning_module.TaskPlanningSlice(
+                slice_id="slice-1",
+                title="Bootstrap",
+                step_ids=["STEP-1"],
+                acceptance_criterion_ids=["AC-accounts-1"],
+            ),
+        ],
+    )
+    stale_fragment = ImplementationDAG(
+        tasks=[_valid_task(task_id="T-accounts-1", slug="accounts", verification_gates=["AC-accounts-1"])],
+        execution_order=[["T-accounts-1"]],
+        requirement_coverage={"REQ-accounts": ["T-accounts-1"]},
+        complete=True,
+    )
+
+    class _Artifacts:
+        def __init__(self) -> None:
+            self.store = {
+                "dag-slices:accounts": stale_manifest.model_dump_json(indent=2),
+                "dag-fragment:accounts:slice-1": stale_fragment.model_dump_json(indent=2),
+                "plan:accounts": plan_text,
+                "test-plan:accounts": new_test_plan_text,
+            }
+            self.deleted: list[str] = []
+
+        async def get(self, key: str, *, feature):
+            del feature
+            return self.store.get(key, "")
+
+        async def put(self, key: str, value: str, *, feature):
+            del feature
+            self.store[key] = value
+
+        async def delete(self, key: str, *, feature):
+            del feature
+            self.deleted.append(key)
+            self.store.pop(key, None)
+
+    runner = SimpleNamespace(artifacts=_Artifacts(), services={"artifact_mirror": mirror})
+    mirror.write_artifact(feature.id, "dag-fragment:accounts:slice-1", stale_fragment.model_dump_json(indent=2))
+
+    derived = await TaskPlanningPhase._derive_slice_manifest(runner, feature, subfeature)
+
+    assert runner.artifacts.deleted == ["dag-fragment:accounts:slice-1"]
+    assert derived.plan_digest == stale_manifest.plan_digest
+    assert derived.test_plan_digest != stale_manifest.test_plan_digest
+    assert derived.slices[0].acceptance_criterion_ids == ["AC-accounts-1", "AC-accounts-2"]
+    assert "dag-fragment:accounts:slice-1" not in runner.artifacts.store
+
+
+@pytest.mark.asyncio
+async def test_implementation_prompt_context_materializes_without_artifact_mirror():
+    feature = SimpleNamespace(id="feat-non-mirror-context", metadata={})
+
+    class _Artifacts:
+        async def get(self, key: str, *, feature):
+            del key, feature
+            return ""
+
+    runner = SimpleNamespace(artifacts=_Artifacts(), services={})
+    package = await implementation_module._build_prompt_context_package(
+        runner,
+        feature,
+        title="Verification Context",
+        file_stem="verify",
+        intro_lines=["Use these files."],
+        sections=[
+            ("handover", "Implementation Handover", "handover details"),
+            ("test-plan", "Test Plan", "test plan details"),
+        ],
+    )
+
+    assert package is not None
+    assert Path(package.index_path).exists()
+    assert Path(package.manifest_path).exists()
+    assert "handover details" in Path(package.item_paths["handover"]).read_text(encoding="utf-8")
+    prompt = implementation_module._context_package_prompt(package)
+    assert "Read the context index first" in prompt
+
+
+@pytest.mark.asyncio
+async def test_workstream_planner_prompt_uses_file_backed_context(tmp_path):
+    feature = SimpleNamespace(id="feat-workstream-context", metadata={})
+    mirror = _TestMirror(tmp_path / "features")
+    decomposition = _decomposition()
+
+    class _Artifacts:
+        def __init__(self) -> None:
+            self.store = {
+                "plan": "Global technical plan",
+                "decisions": "Global decisions",
+                "prd-summary:accounts": "Accounts summary",
+                "prd-summary:billing": "Billing summary",
+                "prd-summary:reports": "Reports summary",
+            }
+
+        async def get(self, key: str, *, feature):
+            del feature
+            return self.store.get(key, "")
+
+        async def put(self, key: str, value: str, *, feature):
+            del feature
+            self.store[key] = value
+
+    class _Runner:
+        def __init__(self) -> None:
+            self.artifacts = _Artifacts()
+            self.services = {"artifact_mirror": mirror}
+            self.prompts: list[str] = []
+
+        async def run(self, task, feature, phase_name):
+            del feature, phase_name
+            self.prompts.append(task.prompt)
+            return WorkstreamDecomposition(
+                workstreams=[
+                    Workstream(
+                        id="WS-1",
+                        name="Accounts",
+                        subfeature_slugs=["accounts"],
+                        rationale="Accounts scope",
+                    )
+                ],
+                execution_order=[["WS-1"]],
+                complete=True,
+            )
+
+    runner = _Runner()
+    await TaskPlanningPhase()._get_or_create_workstreams(runner, feature, decomposition)
+
+    assert len(runner.prompts) == 1
+    prompt = runner.prompts[0]
+    assert "Read the context index first:" in prompt
+    assert "## Technical Plan" not in prompt
+    manifest_path = Path(re.search(r"`([^`]+context-manifest\.md)`", prompt).group(1))
+    manifest_text = manifest_path.read_text(encoding="utf-8")
+    assert "Technical Plan" in manifest_text
+    assert "Decision Ledger" in manifest_text
+    assert "PRD Summaries" in manifest_text
+    assert "Subfeature Decomposition" in manifest_text
+
+
+@pytest.mark.asyncio
+async def test_task_planning_phase_preserves_round_parallelism(monkeypatch):
+    feature = SimpleNamespace(id="feat-task-plan-rounds", metadata={})
+    state = BuildState(metadata={}, decomposition=_decomposition().model_dump_json(indent=2))
+    decomposition = _decomposition()
+    ws_decomp = WorkstreamDecomposition(
+        workstreams=[
+            Workstream(id="WS-1", name="Accounts", subfeature_slugs=["accounts"], rationale="Accounts"),
+            Workstream(id="WS-2", name="Billing", subfeature_slugs=["billing"], rationale="Billing"),
+        ],
+        execution_order=[["WS-1", "WS-2"]],
+        complete=True,
+    )
+
+    class _Artifacts:
+        async def get(self, key: str, *, feature):
+            del feature
+            return ""
+
+        async def put(self, key: str, value: str, *, feature):
+            del key, value, feature
+
+    runner = SimpleNamespace(
+        artifacts=_Artifacts(),
+        services={},
+    )
+
+    async def _fake_load_decomposition(*args, **kwargs):
+        return decomposition
+
+    async def _fake_get_workstreams(*args, **kwargs):
+        return ws_decomp
+
+    async def _fake_load_upstream(*args, **kwargs):
+        return {}
+
+    active = 0
+    max_active = 0
+
+    async def _fake_decompose(*args, **kwargs):
+        nonlocal active, max_active
+        active += 1
+        max_active = max(max_active, active)
+        await asyncio.sleep(0.01)
+        active -= 1
+        return []
+
+    async def _fake_review(*args, **kwargs):
+        return IntegrationReview(needs_revision=False, complete=True)
+
+    async def _fake_compile(*args, **kwargs):
+        return "compiled dag"
+
+    async def _fake_gate(*args, **kwargs):
+        return "approved dag"
+
+    monkeypatch.setattr(TaskPlanningPhase, "_load_decomposition", _fake_load_decomposition)
+    monkeypatch.setattr(TaskPlanningPhase, "_get_or_create_workstreams", _fake_get_workstreams)
+    monkeypatch.setattr(TaskPlanningPhase, "_load_sf_upstream", _fake_load_upstream)
+    monkeypatch.setattr(TaskPlanningPhase, "_decompose_workstream", _fake_decompose)
+    monkeypatch.setattr(
+        "iriai_build_v2.workflows.planning.phases.task_planning.integration_review",
+        _fake_review,
+    )
+    monkeypatch.setattr(
+        "iriai_build_v2.workflows.planning.phases.task_planning.compile_artifacts",
+        _fake_compile,
+    )
+    monkeypatch.setattr(
+        "iriai_build_v2.workflows.planning.phases.task_planning.interview_gate_review",
+        _fake_gate,
+    )
+
+    result = await TaskPlanningPhase().execute(runner, feature, state)
+
+    assert max_active == 2
+    assert result.dag == "approved dag"
+
+
+@pytest.mark.asyncio
+async def test_task_planning_clears_stale_blocked_artifact_before_successful_retry(monkeypatch, tmp_path):
+    feature = SimpleNamespace(id="feat-task-plan-retry-cleanup", metadata={})
+    mirror = _TestMirror(tmp_path / "features")
+    decomposition = _decomposition()
+    ws_decomp = WorkstreamDecomposition(
+        workstreams=[
+            Workstream(id="WS-1", name="Accounts", subfeature_slugs=["accounts"], rationale="Accounts"),
+        ],
+        execution_order=[["WS-1"]],
+        complete=True,
+    )
+    _write_mirror_artifact(
+        mirror,
+        feature_id=feature.id,
+        artifact_key="task-planning-blocked",
+        text="old blocked report",
+    )
+    _write_mirror_artifact(
+        mirror,
+        feature_id=feature.id,
+        artifact_key="dag:strategy",
+        text=ws_decomp.model_dump_json(indent=2),
+    )
+    state = BuildState(metadata={}, decomposition=decomposition.model_dump_json(indent=2))
+
+    class _Artifacts:
+        def __init__(self) -> None:
+            self.store: dict[str, str] = {
+                "task-planning-blocked": "old blocked report",
+                "dag:strategy": ws_decomp.model_dump_json(indent=2),
+            }
+
+        async def get(self, key: str, *, feature):
+            del feature
+            return self.store.get(key, "")
+
+        async def put(self, key: str, value: str, *, feature):
+            del feature
+            self.store[key] = value
+
+        async def delete(self, key: str, *, feature):
+            del feature
+            self.store.pop(key, None)
+
+    class _Runner:
+        def __init__(self) -> None:
+            self.artifacts = _Artifacts()
+            self.services = {"artifact_mirror": mirror}
+
+        async def run(self, task, feature, phase_name=None):
+            del task, feature, phase_name
+            raise AssertionError("unexpected runner.run call")
+
+    runner = _Runner()
+
+    async def _fake_load_decomposition(*args, **kwargs):
+        return decomposition
+
+    async def _fake_load_upstream(*args, **kwargs):
+        return {}
+
+    async def _fake_decompose(*args, **kwargs):
+        assert "task-planning-blocked" not in runner.artifacts.store
+        return []
+
+    async def _fake_review(*args, **kwargs):
+        return IntegrationReview(needs_revision=False, complete=True)
+
+    async def _fake_compile(*args, **kwargs):
+        return "compiled dag"
+
+    async def _fake_gate(*args, **kwargs):
+        return "approved dag"
+
+    monkeypatch.setattr(TaskPlanningPhase, "_load_decomposition", _fake_load_decomposition)
+    monkeypatch.setattr(TaskPlanningPhase, "_load_sf_upstream", _fake_load_upstream)
+    monkeypatch.setattr(TaskPlanningPhase, "_decompose_workstream", _fake_decompose)
+    monkeypatch.setattr(
+        "iriai_build_v2.workflows.planning.phases.task_planning.integration_review",
+        _fake_review,
+    )
+    monkeypatch.setattr(
+        "iriai_build_v2.workflows.planning.phases.task_planning.compile_artifacts",
+        _fake_compile,
+    )
+    monkeypatch.setattr(
+        "iriai_build_v2.workflows.planning.phases.task_planning.interview_gate_review",
+        _fake_gate,
+    )
+
+    result = await TaskPlanningPhase().execute(runner, feature, state)
+
+    assert result.dag == "approved dag"
+    assert "task-planning-blocked" not in runner.artifacts.store
+    assert not (
+        Path(mirror.feature_dir(feature.id)) / "task-planning-blocked.md"
+    ).exists()
+
+
+@pytest.mark.asyncio
+async def test_task_planning_phase_blocks_and_skips_downstream_on_failed_workstream(monkeypatch, tmp_path):
+    feature = SimpleNamespace(id="feat-task-plan-blocked", metadata={})
+    mirror = _TestMirror(tmp_path / "features")
+    state = BuildState(metadata={}, decomposition=_decomposition().model_dump_json(indent=2))
+    decomposition = _decomposition()
+    ws_decomp = WorkstreamDecomposition(
+        workstreams=[
+            Workstream(id="WS-1", name="Accounts", subfeature_slugs=["accounts"], rationale="Accounts"),
+        ],
+        execution_order=[["WS-1"]],
+        complete=True,
+    )
+
+    class _Artifacts:
+        def __init__(self) -> None:
+            self.store: dict[str, str] = {}
+
+        async def get(self, key: str, *, feature):
+            del feature
+            return self.store.get(key, "")
+
+        async def put(self, key: str, value: str, *, feature):
+            del feature
+            self.store[key] = value
+
+    class _Runner:
+        def __init__(self) -> None:
+            self.artifacts = _Artifacts()
+            self.services = {"artifact_mirror": mirror}
+            self.notifications: list[str] = []
+
+        async def run(self, task, feature, phase_name=None):
+            del feature, phase_name
+            message = getattr(task, "message", None)
+            if message is not None:
+                self.notifications.append(message)
+                return None
+            raise AssertionError(f"unexpected task type: {type(task).__name__}")
+
+    runner = _Runner()
+
+    async def _fake_load_decomposition(*args, **kwargs):
+        return decomposition
+
+    async def _fake_get_workstreams(*args, **kwargs):
+        return ws_decomp
+
+    async def _fake_load_upstream(*args, **kwargs):
+        return {}
+
+    async def _fake_decompose(*args, **kwargs):
+        return [
+            task_planning_module.TaskPlanningFailure(
+                workstream_id="WS-1",
+                slug="accounts",
+                reason="prompt too long",
+            )
+        ]
+
+    async def _boom(*args, **kwargs):
+        raise AssertionError("downstream DAG review/compile should be skipped when task planning blocks")
+
+    monkeypatch.setattr(TaskPlanningPhase, "_load_decomposition", _fake_load_decomposition)
+    monkeypatch.setattr(TaskPlanningPhase, "_get_or_create_workstreams", _fake_get_workstreams)
+    monkeypatch.setattr(TaskPlanningPhase, "_load_sf_upstream", _fake_load_upstream)
+    monkeypatch.setattr(TaskPlanningPhase, "_decompose_workstream", _fake_decompose)
+    monkeypatch.setattr(
+        "iriai_build_v2.workflows.planning.phases.task_planning.integration_review",
+        _boom,
+    )
+    monkeypatch.setattr(
+        "iriai_build_v2.workflows.planning.phases.task_planning.compile_artifacts",
+        _boom,
+    )
+    monkeypatch.setattr(
+        "iriai_build_v2.workflows.planning.phases.task_planning.interview_gate_review",
+        _boom,
+    )
+
+    with pytest.raises(RuntimeError, match="Task planning blocked"):
+        await TaskPlanningPhase().execute(runner, feature, state)
+
+    assert "task-planning-blocked" in runner.artifacts.store
+    assert runner.notifications
+    assert "## Task Planning Blocked" in runner.notifications[0]
+    assert "WS-1/accounts: prompt too long" in runner.notifications[0]
+
+
+@pytest.mark.asyncio
+async def test_write_revision_decision_context_preserves_full_prior_decisions_in_companion_file(tmp_path):
+    feature = SimpleNamespace(id="feat-full-prior-decisions", metadata={})
+    mirror = _TestMirror(tmp_path / "features")
+    full_prior_decisions = "Decision line\n" * 2000 + "FINAL-TAIL-MARKER\n"
+
+    class _Artifacts:
+        async def get(self, key: str, *, feature):
+            del key, feature
+            return ""
+
+    runner = SimpleNamespace(
+        artifacts=_Artifacts(),
+        services={"artifact_mirror": mirror},
+    )
+
+    context_path = await _write_revision_decision_context(
+        runner,
+        feature,
+        artifact_prefix="plan",
+        sf_slug="accounts",
+        revision_plan=RevisionPlan(),
+        prior_decisions=full_prior_decisions,
+        batch_entries=[(0, RevisionRequest(description="Revise", reasoning="Because"))],
+        minimal=False,
+    )
+
+    context_text = Path(context_path).read_text(encoding="utf-8")
+    assert "Fallback Prior Decisions" in context_text
+    assert "FINAL-TAIL-MARKER" not in context_text
+    match = re.search(r"`([^`]+revision-prior-decisions-[^`]+\.md)`", context_text)
+    assert match is not None
+    prior_path = Path(match.group(1))
+    assert prior_path.read_text(encoding="utf-8") == full_prior_decisions
+    assert "FINAL-TAIL-MARKER" in prior_path.read_text(encoding="utf-8")
+
+
+@pytest.mark.asyncio
+async def test_plan_review_reviewer_prompts_use_file_backed_context(monkeypatch, tmp_path):
+    feature = SimpleNamespace(id="feat-plan-review-context", metadata={})
+    mirror = _TestMirror(tmp_path / "features")
+    decomposition = _decomposition()
+    state = BuildState(
+        metadata={},
+        decomposition=decomposition.model_dump_json(indent=2),
+        plan="compiled plan",
+        system_design="compiled system design",
+    )
+
+    class _Artifacts:
+        def __init__(self) -> None:
+            self.store = {
+                "prd:accounts": "Accounts prd",
+                "design:accounts": "Accounts design",
+                "plan:accounts": "Accounts plan",
+                "system-design:accounts": "Accounts system design",
+                "test-plan:accounts": "## Acceptance Criteria\n\n- AC-accounts-1\n",
+                "decisions:accounts": "Accounts decisions",
+                "prd:billing": "Billing prd",
+                "design:billing": "Billing design",
+                "plan:billing": "Billing plan",
+                "system-design:billing": "Billing system design",
+                "test-plan:billing": "## Acceptance Criteria\n\n- AC-billing-1\n",
+                "decisions:billing": "Billing decisions",
+                "decisions": "Canonical decisions",
+                "prd-summary:billing": "Billing summary",
+                "design-summary:billing": "Billing design summary",
+                "plan-summary:billing": "Billing plan summary",
+                "prd-summary:accounts": "Accounts summary",
+                "design-summary:accounts": "Accounts design summary",
+                "plan-summary:accounts": "Accounts plan summary",
+            }
+
+        async def get(self, key: str, *, feature):
+            del feature
+            return self.store.get(key, "")
+
+        async def put(self, key: str, value: str, *, feature):
+            del feature
+            self.store[key] = value
+
+    class _Runner:
+        def __init__(self) -> None:
+            self.artifacts = _Artifacts()
+            self.services = {"artifact_mirror": mirror}
+            self.feature_store = None
+            self.prompts: list[str] = []
+
+        async def run(self, task, feature, phase_name=""):
+            del feature, phase_name
+            if isinstance(task, Ask):
+                self.prompts.append(task.prompt)
+                return Verdict(approved=True, summary="ok")
+            raise AssertionError(f"unexpected task type: {type(task).__name__}")
+
+    async def _skip_gates(self, runner_arg, feature_arg, state_arg, decomposition_arg):
+        del self, runner_arg, feature_arg, decomposition_arg
+        state_arg.metadata["ran_gates"] = True
+        return state_arg
+
+    monkeypatch.setattr(
+        "iriai_build_v2.workflows.planning.phases.plan_review.PlanReviewPhase._run_gates",
+        _skip_gates,
+    )
+
+    runner = _Runner()
+    result = await PlanReviewPhase().execute(runner, feature, state)
+
+    assert result.metadata["ran_gates"] is True
+    assert runner.prompts
+    assert all("Read the context index first:" in prompt for prompt in runner.prompts)
+    assert all("## PRD — accounts" not in prompt for prompt in runner.prompts)
+    manifest_path = Path(re.search(r"`([^`]+context-manifest\.md)`", runner.prompts[0]).group(1))
+    manifest_text = manifest_path.read_text(encoding="utf-8")
+    assert "Accounts prd" not in runner.prompts[0]
+    assert "PRD" in manifest_text
+    assert "Canonical Decision Ledger" in manifest_text
 
 
 def test_planning_workflow_uses_broad_then_subfeature_phases():
