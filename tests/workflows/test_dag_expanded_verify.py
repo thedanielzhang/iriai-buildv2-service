@@ -2572,6 +2572,126 @@ async def test_parallel_dag_repair_routes_existing_forbidden_dag_task_to_product
 
 
 @pytest.mark.asyncio
+async def test_parallel_dag_repair_synthesizes_artifact_route_when_triage_empty(
+    tmp_path,
+):
+    feature = SimpleNamespace(id="feat-empty-triage", slug="empty-triage", metadata={})
+    feature_root = tmp_path / "repos"
+    repo = feature_root / "iriai-studio"
+    (repo / ".git").mkdir(parents=True)
+    config_path = repo / "scripts/verify-file-scope.expected-files.json"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(
+        json.dumps({
+            "forbidden_files": [
+                {
+                    "path": (
+                        "src/vs/workbench/contrib/studioWorkflow/browser/"
+                        "workflowTab/chat"
+                    ),
+                    "source": "retired chat tree",
+                }
+            ]
+        }),
+        encoding="utf-8",
+    )
+    artifact_root = tmp_path / ".iriai" / "artifacts" / "features" / feature.id
+    snapshot = artifact_root / ".iriai-context/g30-expanded-verify-r1-task-specs.md"
+    snapshot.parent.mkdir(parents=True, exist_ok=True)
+    stale_path = (
+        "iriai-studio/src/vs/workbench/contrib/studioWorkflow/browser/"
+        "workflowTab/chat/index.ts"
+    )
+    snapshot.write_text(stale_path, encoding="utf-8")
+
+    class _Artifacts:
+        def __init__(self) -> None:
+            self.store: dict[str, str] = {}
+
+        async def get(self, key: str, *, feature):
+            del key, feature
+            return ""
+
+        async def put(self, key: str, value: str, *, feature):
+            del feature
+            self.store[key] = value
+
+    class _Runner:
+        def __init__(self) -> None:
+            self.artifacts = _Artifacts()
+            self.services = {"artifact_mirror": _Mirror(artifact_root)}
+            self.output_types: list[object] = []
+
+        async def run(self, task, feature, phase_name=""):
+            del feature, phase_name
+            self.output_types.append(task.output_type)
+            if task.output_type is BugTriage:
+                return BugTriage(groups=[], rationale="missed deterministic metadata drift")
+            if task.output_type is ArtifactRepairResult:
+                return ArtifactRepairResult(
+                    task_id="ARTIFACT-SNAPSHOT-DELETE",
+                    group_id="dag-task-spec-projection-drift",
+                    summary="deleted stale generated snapshot",
+                    artifacts_deleted=[
+                        ".iriai-context/g30-expanded-verify-r1-task-specs.md"
+                    ],
+                )
+            raise AssertionError(f"unexpected output type {task.output_type}")
+
+        async def parallel(self, tasks, feature):
+            return [await self.run(task, feature) for task in tasks]
+
+    task_id = "chat-sidepane-shell-slice-1-T-sf11-s1-003"
+    runner = _Runner()
+    results = await implementation_module._attempt_parallel_dag_repair(
+        runner,
+        feature,
+        30,
+        1,
+        Verdict(
+            approved=False,
+            summary="Programmatic DAG preflight failed",
+            concerns=[
+                Issue(
+                    severity="major",
+                    description=(
+                        f"{task_id} task spec file_scope[0].path references a "
+                        "manifest-forbidden/stale path; source artifacts: "
+                        f"dag-task:{task_id}, dag-fragment:chat-sidepane-shell:slice-1; "
+                        "repair the DAG/source artifact instead of recreating "
+                        f"this path: {stale_path}"
+                    ),
+                    file=stale_path,
+                ),
+                Issue(severity="major", description="second issue keeps DAG repair path"),
+            ],
+        ),
+        [
+            ImplementationTask(
+                id=task_id,
+                name="Task",
+                description="Task",
+                subfeature_id="chat-sidepane-shell",
+            )
+        ],
+        feature_root=feature_root,
+        impl_runtime="primary",
+        rca_runtime="primary",
+        feedback="preflight failed",
+    )
+
+    assert results is not None
+    assert [result.task_id for result in results] == ["ARTIFACT-SNAPSHOT-DELETE"]
+    assert ArtifactRepairResult in runner.output_types
+    assert ImplementationResult not in runner.output_types
+    assert not snapshot.exists()
+    dispatch = json.loads(runner.artifacts.store["dag-repair-dispatch:g30:retry-1"])
+    assert dispatch["group_count"] == 1
+    assert dispatch["metadata_artifact_repair_group_count"] == 1
+    assert dispatch["schedule"] == []
+
+
+@pytest.mark.asyncio
 async def test_parallel_dag_repair_runs_source_artifact_followup_after_product_cleanup(
     monkeypatch,
     tmp_path,
@@ -3282,6 +3402,15 @@ class _RecordingArtifacts:
         self.next_id += 1
 
 
+class _Mirror:
+    def __init__(self, artifact_root):
+        self.artifact_root = artifact_root
+
+    def feature_dir(self, feature_id: str):
+        del feature_id
+        return self.artifact_root
+
+
 @pytest.mark.asyncio
 async def test_dag_task_reconciler_appends_full_id_row_from_expected_files(tmp_path):
     feature = SimpleNamespace(id="feat-reconcile-g29", slug="reconcile-g29", metadata={})
@@ -3357,6 +3486,208 @@ async def test_dag_task_reconciler_appends_full_id_row_from_expected_files(tmp_p
         "retry-2",
         [task],
         outcome.verify_results_context,
+        feature_root=feature_root,
+    )
+    assert preflight is None
+
+
+@pytest.mark.asyncio
+async def test_dag_task_spec_reconciler_rehydrates_canonical_fragment_and_deletes_snapshots(
+    tmp_path,
+):
+    feature = SimpleNamespace(id="feat-spec-reconcile", slug="spec-reconcile", metadata={})
+    feature_root = tmp_path / "repos"
+    repo = feature_root / "iriai-studio"
+    (repo / ".git").mkdir(parents=True)
+    stale_path = (
+        "iriai-studio/src/vs/workbench/contrib/studioWorkflow/browser/"
+        "workflowTab/chat/index.ts"
+    )
+    canonical_path = "iriai-studio/src/webviews/projectSurface/src/chat/index.ts"
+    canonical_file = repo / "src/webviews/projectSurface/src/chat/index.ts"
+    canonical_file.parent.mkdir(parents=True, exist_ok=True)
+    canonical_file.write_text("ok", encoding="utf-8")
+    config_path = repo / "scripts/verify-file-scope.expected-files.json"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(
+        json.dumps({
+            "expected_files": [
+                {"path": "src/webviews/projectSurface/src/chat/index.ts", "source": "TASK-SH1 canonical"}
+            ],
+            "forbidden_files": [
+                {
+                    "path": (
+                        "src/vs/workbench/contrib/studioWorkflow/browser/"
+                        "workflowTab/chat"
+                    ),
+                    "source": "retired chat tree",
+                }
+            ],
+        }),
+        encoding="utf-8",
+    )
+    artifact_root = tmp_path / ".iriai" / "artifacts" / "features" / feature.id
+    fragment = artifact_root / "subfeatures/chat-sidepane-shell/dag-fragments/slice-1.json"
+    fragment.parent.mkdir(parents=True, exist_ok=True)
+    task_id = "chat-sidepane-shell-slice-1-T-sf11-s1-003"
+    fragment.write_text(
+        json.dumps({
+            "tasks": [
+                {
+                    "id": task_id,
+                    "name": "Chat barrel",
+                    "description": "Canonical chat barrel",
+                    "subfeature_id": "chat-sidepane-shell",
+                    "repo_path": "iriai-studio",
+                    "file_scope": [{"path": canonical_path, "action": "create"}],
+                    "files": [canonical_path],
+                }
+            ],
+            "execution_order": [[task_id]],
+        }),
+        encoding="utf-8",
+    )
+    snapshot = artifact_root / ".iriai-context/g30-expanded-verify-r1-task-specs.md"
+    snapshot.parent.mkdir(parents=True, exist_ok=True)
+    snapshot.write_text(f"stale task spec {stale_path}", encoding="utf-8")
+
+    artifacts = _RecordingArtifacts()
+    runner = SimpleNamespace(
+        artifacts=artifacts,
+        services={"artifact_mirror": _Mirror(artifact_root)},
+    )
+    stale_task = ImplementationTask(
+        id=task_id,
+        name="Chat barrel",
+        description="Stale projection",
+        subfeature_id="chat-sidepane-shell",
+        repo_path="iriai-studio",
+        file_scope=[{"path": stale_path, "action": "create"}],
+        files=[stale_path],
+    )
+
+    outcome = await implementation_module._reconcile_dag_task_specs(
+        runner,
+        feature,
+        30,
+        "retry-1",
+        [stale_task],
+        feature_root=feature_root,
+    )
+
+    assert outcome.tasks[0].file_scope[0].path == canonical_path
+    assert outcome.tasks[0].files == [canonical_path]
+    assert outcome.report["applied"][0]["action"] == "rehydrated_from_source_fragment"
+    assert not snapshot.exists()
+    assert outcome.report["deleted_generated_snapshots"][0]["relative_path"] == (
+        ".iriai-context/g30-expanded-verify-r1-task-specs.md"
+    )
+
+    preflight = await implementation_module._run_dag_group_preflight(
+        runner,
+        feature,
+        30,
+        "retry-2",
+        outcome.tasks,
+        [],
+        feature_root=feature_root,
+    )
+    assert preflight is None
+
+
+@pytest.mark.asyncio
+async def test_dag_task_spec_reconciler_retired_fragment_task_clears_stale_scope(
+    tmp_path,
+):
+    feature = SimpleNamespace(id="feat-spec-retired", slug="spec-retired", metadata={})
+    feature_root = tmp_path / "repos"
+    repo = feature_root / "iriai-studio"
+    (repo / ".git").mkdir(parents=True)
+    canonical = repo / "src/webviews/projectSurface/src/chat/stores/EventDeduplicator.ts"
+    canonical.parent.mkdir(parents=True, exist_ok=True)
+    canonical.write_text("ok", encoding="utf-8")
+    config_path = repo / "scripts/verify-file-scope.expected-files.json"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(
+        json.dumps({
+            "forbidden_files": [
+                {
+                    "path": (
+                        "src/vs/workbench/contrib/studioWorkflow/browser/"
+                        "workflowTab/chat"
+                    ),
+                    "source": "retired chat tree",
+                }
+            ]
+        }),
+        encoding="utf-8",
+    )
+    artifact_root = tmp_path / ".iriai" / "artifacts" / "features" / feature.id
+    fragment = artifact_root / "subfeatures/chat-sidepane-shell/dag-fragments/slice-3.json"
+    fragment.parent.mkdir(parents=True, exist_ok=True)
+    task_id = "chat-sidepane-shell-slice-3-TASK-chat-util-dedup"
+    fragment.write_text(
+        json.dumps({
+            "tasks": [],
+            "_retired_tasks": [
+                {
+                    "id": task_id,
+                    "retired_reason": "Duplicate of slice-2 TASK-SH2-1.",
+                    "canonical_paths": [
+                        "iriai-studio/src/webviews/projectSurface/src/chat/stores/EventDeduplicator.ts"
+                    ],
+                }
+            ],
+        }),
+        encoding="utf-8",
+    )
+    stale_task = ImplementationTask(
+        id=task_id,
+        name="Dedup",
+        description="Stale retired task",
+        subfeature_id="chat-sidepane-shell",
+        file_scope=[
+            {
+                "path": (
+                    "iriai-studio/src/vs/workbench/contrib/studioWorkflow/"
+                    "browser/workflowTab/chat/util/eventDeduplicator.ts"
+                ),
+                "action": "create",
+            }
+        ],
+        files=[
+            (
+                "iriai-studio/src/vs/workbench/contrib/studioWorkflow/"
+                "browser/workflowTab/chat/util/eventDeduplicator.ts"
+            )
+        ],
+    )
+    artifacts = _RecordingArtifacts()
+    runner = SimpleNamespace(
+        artifacts=artifacts,
+        services={"artifact_mirror": _Mirror(artifact_root)},
+    )
+
+    outcome = await implementation_module._reconcile_dag_task_specs(
+        runner,
+        feature,
+        30,
+        "retry-1",
+        [stale_task],
+        feature_root=feature_root,
+    )
+
+    assert outcome.tasks[0].file_scope == []
+    assert outcome.tasks[0].files == []
+    assert "Retired task projection" in outcome.tasks[0].description
+    assert outcome.report["applied"][0]["action"] == "retired_task_projection"
+    preflight = await implementation_module._run_dag_group_preflight(
+        runner,
+        feature,
+        30,
+        "retry-2",
+        outcome.tasks,
+        [],
         feature_root=feature_root,
     )
     assert preflight is None

@@ -1580,6 +1580,15 @@ async def _verify_and_fix_group(
         results = reconcile.results
         verify_results_context = reconcile.verify_results_context
         all_results[:] = reconcile.all_results
+        spec_reconcile = await _reconcile_dag_task_specs(
+            runner,
+            feature,
+            group_idx,
+            "initial",
+            group_tasks,
+            feature_root=feature_root,
+        )
+        group_tasks[:] = spec_reconcile.tasks
     group_files = _collect_files(verify_results_context)
     logger.info(
         "DAG group verify starting group=%d attempt=initial runtime=%s rca_runtime=%s "
@@ -1779,6 +1788,15 @@ async def _verify_and_fix_group(
                 results = reconcile.results
                 verify_results_context = reconcile.verify_results_context
                 all_results[:] = reconcile.all_results
+                spec_reconcile = await _reconcile_dag_task_specs(
+                    runner,
+                    feature,
+                    group_idx,
+                    str(retry),
+                    group_tasks,
+                    feature_root=feature_root,
+                )
+                group_tasks[:] = spec_reconcile.tasks
                 created_files = sorted({
                     path
                     for result in parallel_fix_results
@@ -2097,6 +2115,15 @@ async def _verify_and_fix_group(
         results = reconcile.results
         verify_results_context = reconcile.verify_results_context
         all_results[:] = reconcile.all_results
+        spec_reconcile = await _reconcile_dag_task_specs(
+            runner,
+            feature,
+            group_idx,
+            str(retry),
+            group_tasks,
+            feature_root=feature_root,
+        )
+        group_tasks[:] = spec_reconcile.tasks
         group_files = _collect_files(verify_results_context)
         logger.info(
             "DAG group verify starting group=%d attempt=retry-%d runtime=%s rca_runtime=%s "
@@ -3903,7 +3930,9 @@ def _dag_artifact_repair_paths_safe(planned: PlannedBugGroup) -> bool:
         if str(path).strip() and not str(path).strip().startswith("(")
     ]
     return bool(concrete_paths) and all(
-        _is_dag_artifact_repair_path(str(path)) for path in concrete_paths
+        _is_dag_artifact_repair_key(_normalize_dag_artifact_repair_ref(str(path)))
+        or _is_dag_artifact_repair_path(str(path))
+        for path in concrete_paths
     )
 
 
@@ -4403,6 +4432,7 @@ _DAG_CLOSURE_BLOCKING_REASONS = {
     "forbidden",
     "forbidden_task_result",
     "forbidden_task_spec",
+    "forbidden_task_spec_source_artifact",
     "forbidden_workspace_path",
     "manifest_forbidden_workspace_path",
 }
@@ -6436,6 +6466,513 @@ def _dag_task_spec_path_problems(
     return problems
 
 
+def _dag_task_spec_source_ref(task: ImplementationTask) -> str:
+    source_ref = _dag_fragment_artifact_ref_for_task(task)
+    if source_ref:
+        return source_ref
+    inferred_subfeature, inferred_slice = _dag_closure_task_ref_parts(task.id)
+    if inferred_subfeature and inferred_slice:
+        return f"dag-fragment:{inferred_subfeature}:slice-{inferred_slice}"
+    return ""
+
+
+def _dag_fragment_ref_parts(source_ref: str) -> tuple[str, str] | None:
+    match = re.match(r"^dag-fragment:([^:]+):slice-(\d+)$", source_ref.strip())
+    if not match:
+        return None
+    return match.group(1), match.group(2)
+
+
+def _dag_fragment_path_for_ref(
+    runner: WorkflowRunner,
+    feature: Feature,
+    source_ref: str,
+) -> Path | None:
+    parts = _dag_fragment_ref_parts(source_ref)
+    artifact_root = _dag_artifact_feature_dir(runner, feature)
+    if parts is None or artifact_root is None:
+        return None
+    subfeature, slice_num = parts
+    return (
+        artifact_root
+        / "subfeatures"
+        / subfeature
+        / "dag-fragments"
+        / f"slice-{slice_num}.json"
+    )
+
+
+async def _dag_fragment_payload_for_ref(
+    runner: WorkflowRunner,
+    feature: Feature,
+    source_ref: str,
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    record: dict[str, Any] = {
+        "source_ref": source_ref,
+        "source_kind": "",
+        "path": "",
+        "sha256": "",
+    }
+    path = _dag_fragment_path_for_ref(runner, feature, source_ref)
+    raw = ""
+    if path is not None and path.exists() and path.is_file():
+        try:
+            raw = path.read_text(encoding="utf-8")
+            record.update({
+                "source_kind": "artifact_mirror_file",
+                "path": str(path),
+            })
+        except Exception:
+            logger.debug("Failed to read DAG fragment %s", path, exc_info=True)
+            raw = ""
+    if not raw:
+        getter = getattr(getattr(runner, "artifacts", None), "get", None)
+        if getter is not None:
+            try:
+                raw = await getter(source_ref, feature=feature)
+                if raw:
+                    record["source_kind"] = "artifact_store_key"
+            except Exception:
+                logger.debug(
+                    "Failed to read DAG fragment artifact %s", source_ref,
+                    exc_info=True,
+                )
+                raw = ""
+    if not raw:
+        return None, record
+    record["sha256"] = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    try:
+        payload = json.loads(raw)
+    except Exception:
+        record["parse_error"] = "invalid_json"
+        return None, record
+    if not isinstance(payload, dict):
+        record["parse_error"] = "not_object"
+        return None, record
+    return payload, record
+
+
+def _dag_fragment_tasks_from_payload(
+    payload: dict[str, Any],
+) -> tuple[list[ImplementationTask], list[dict[str, Any]]]:
+    tasks: list[ImplementationTask] = []
+    raw_tasks = payload.get("tasks", [])
+    if isinstance(raw_tasks, list):
+        for raw_task in raw_tasks:
+            if not isinstance(raw_task, dict):
+                continue
+            try:
+                tasks.append(ImplementationTask.model_validate(raw_task))
+            except Exception:
+                logger.debug(
+                    "Failed to validate task from DAG fragment",
+                    exc_info=True,
+                )
+    retired = [
+        item for item in payload.get("_retired_tasks", [])
+        if isinstance(item, dict)
+    ]
+    return tasks, retired
+
+
+def _dag_retired_task_replacement(
+    task: ImplementationTask,
+    retired_record: dict[str, Any],
+) -> ImplementationTask:
+    retired_reason = str(
+        retired_record.get("retired_reason")
+        or retired_record.get("reason")
+        or "Retired by canonical DAG fragment."
+    ).strip()
+    canonical_paths = [
+        str(path).strip()
+        for path in retired_record.get("canonical_paths", []) or []
+        if str(path).strip()
+    ]
+    note_lines = [retired_reason]
+    if canonical_paths:
+        note_lines.append(
+            "Canonical replacement paths: "
+            + ", ".join(f"`{path}`" for path in canonical_paths)
+        )
+    return task.model_copy(update={
+        "description": f"{task.description}\n\nRetired task projection: {' '.join(note_lines)}",
+        "file_scope": [],
+        "files": [],
+    })
+
+
+def _dag_task_spec_path_signature(task: ImplementationTask) -> tuple[Any, ...]:
+    return (
+        tuple((scope.path, scope.action) for scope in task.file_scope),
+        tuple(task.files),
+    )
+
+
+def _dag_generated_snapshot_paths(
+    runner: WorkflowRunner,
+    feature: Feature,
+    group_idx: int,
+) -> list[Path]:
+    artifact_root = _dag_artifact_feature_dir(runner, feature)
+    if artifact_root is None:
+        return []
+    context_dir = artifact_root / ".iriai-context"
+    if not context_dir.exists():
+        return []
+    patterns = [
+        f"g{group_idx}-expanded-verify-*-task-specs.md",
+        f"g{group_idx}-expanded-verify-*-changed-files.md",
+    ]
+    paths: list[Path] = []
+    for pattern in patterns:
+        paths.extend(sorted(context_dir.glob(pattern)))
+    return paths
+
+
+def _dag_delete_stale_generated_snapshots(
+    runner: WorkflowRunner,
+    feature: Feature,
+    group_idx: int,
+    stale_path_problems: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    signature_records = _dag_closure_signature_records_from_path_problems(
+        stale_path_problems
+    )
+    signatures = _dag_closure_blocking_signatures(signature_records)
+    if not signatures:
+        return []
+    artifact_root = _dag_artifact_feature_dir(runner, feature)
+    deleted: list[dict[str, Any]] = []
+    for path in _dag_generated_snapshot_paths(runner, feature, group_idx):
+        try:
+            text = path.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            continue
+        matched = [signature for signature in signatures if signature in text]
+        if not matched:
+            continue
+        try:
+            path.unlink()
+        except OSError:
+            logger.debug(
+                "Failed to delete stale generated DAG snapshot %s",
+                path,
+                exc_info=True,
+            )
+            continue
+        deleted.append({
+            "path": str(path),
+            "relative_path": (
+                _dag_closure_relative_path(path, artifact_root)
+                if artifact_root is not None else path.as_posix()
+            ),
+            "matched_signatures": matched,
+            "reason": "stale_generated_projection_invalidated",
+        })
+    return deleted
+
+
+def _dag_task_bearing_source_artifact_path_problems(
+    runner: WorkflowRunner,
+    feature: Feature,
+    group_idx: int,
+    group_tasks: list[ImplementationTask],
+    roots: list[Path],
+    forbidden_entries: list[dict[str, str]],
+    expected_entries: list[dict[str, str]] | None = None,
+) -> list[dict[str, Any]]:
+    del group_idx
+    artifact_root = _dag_artifact_feature_dir(runner, feature)
+    if artifact_root is None or not artifact_root.exists():
+        return []
+    subfeatures = _dedupe_preserving_order([
+        value for task in group_tasks
+        for value in [
+            task.subfeature_id,
+            _dag_closure_task_ref_parts(task.id)[0],
+        ]
+        if value
+    ])
+    if not subfeatures:
+        return []
+
+    problems: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str, str]] = set()
+
+    def _append_problem(
+        *,
+        source_path: Path,
+        task_id: str,
+        field: str,
+        path: str,
+        source_ref: str,
+    ) -> None:
+        forbidden = _dag_forbidden_match(path, forbidden_entries)
+        if forbidden is None:
+            return
+        key = (str(source_path), task_id, field, path)
+        if key in seen:
+            return
+        seen.add(key)
+        exists = _dag_reported_file_exists(path, roots)
+        tracked_or_staged = _dag_path_tracked_or_staged(path, roots)
+        problems.append({
+            "task_id": task_id,
+            "artifact_key": f"dag-task:{task_id}" if task_id else "",
+            "path": path,
+            "field": field,
+            "reason": "forbidden_task_spec_source_artifact",
+            "exists": str(bool(exists)).lower(),
+            "exists_on_disk": bool(exists),
+            "tracked_or_staged": tracked_or_staged,
+            "repair_route": (
+                "product_cleanup_required"
+                if exists or tracked_or_staged
+                else "artifact_only"
+            ),
+            "forbidden_rule": forbidden.get("path", ""),
+            "forbidden_path": forbidden.get("path", ""),
+            "forbidden_source": forbidden.get("source", ""),
+            "candidate_evidence": (
+                _dag_candidate_evidence_for_task_id(
+                    task_id,
+                    expected_entries or [],
+                    roots,
+                )
+                if task_id else []
+            ),
+            "source_artifact_ref": source_ref,
+            "source_artifact_path": str(source_path),
+        })
+
+    for subfeature in subfeatures:
+        fragment_dir = (
+            artifact_root
+            / "subfeatures"
+            / subfeature
+            / "dag-fragments"
+        )
+        if not fragment_dir.exists():
+            continue
+        for source_path in sorted(fragment_dir.glob("slice-*.json")):
+            try:
+                payload = json.loads(source_path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if not isinstance(payload, dict):
+                continue
+            slice_match = re.search(r"slice-(\d+)\.json$", source_path.name)
+            source_ref = (
+                f"dag-fragment:{subfeature}:slice-{slice_match.group(1)}"
+                if slice_match else ""
+            )
+            tasks, retired = _dag_fragment_tasks_from_payload(payload)
+            for task in tasks:
+                for idx, scope in enumerate(task.file_scope):
+                    if scope.path:
+                        _append_problem(
+                            source_path=source_path,
+                            task_id=task.id,
+                            field=f"file_scope[{idx}].path",
+                            path=scope.path,
+                            source_ref=source_ref,
+                        )
+                for idx, path in enumerate(task.files):
+                    if path:
+                        _append_problem(
+                            source_path=source_path,
+                            task_id=task.id,
+                            field=f"files[{idx}]",
+                            path=path,
+                            source_ref=source_ref,
+                        )
+            for retired_idx, item in enumerate(retired):
+                task_id = str(item.get("id", "") or "")
+                for path_idx, path in enumerate(item.get("canonical_paths", []) or []):
+                    if str(path).strip():
+                        _append_problem(
+                            source_path=source_path,
+                            task_id=task_id,
+                            field=(
+                                f"_retired_tasks[{retired_idx}]"
+                                f".canonical_paths[{path_idx}]"
+                            ),
+                            path=str(path),
+                            source_ref=source_ref,
+                        )
+    return problems
+
+
+async def _reconcile_dag_task_specs(
+    runner: WorkflowRunner,
+    feature: Feature,
+    group_idx: int,
+    retry_label: str,
+    group_tasks: list[ImplementationTask],
+    *,
+    feature_root: Path | None,
+) -> DagTaskSpecReconcileOutcome:
+    roots = _dag_candidate_file_roots(feature_root)
+    report: dict[str, Any] = {
+        "group_idx": group_idx,
+        "retry": retry_label,
+        "applied": [],
+        "skipped": [],
+        "blockers": [],
+        "deleted_generated_snapshots": [],
+        "source_path_blockers": [],
+    }
+    if not roots or not group_tasks:
+        report["skipped"].append({"reason": "missing_roots_or_tasks"})
+        await runner.artifacts.put(
+            f"dag-task-spec-reconcile:g{group_idx}:retry-{retry_label}",
+            json.dumps(report, indent=2),
+            feature=feature,
+        )
+        return DagTaskSpecReconcileOutcome(group_tasks, report)
+
+    manifest_entries = _dag_manifest_path_entries(roots)
+    expected_entries = manifest_entries.get("expected_files", [])
+    forbidden_entries = manifest_entries.get("forbidden_files", [])
+    updated_tasks = list(group_tasks)
+    stale_projection_problems: list[dict[str, Any]] = []
+
+    for index, task in enumerate(group_tasks):
+        current_problems = _dag_task_spec_path_problems(
+            task,
+            roots,
+            forbidden_entries,
+            expected_entries,
+        )
+        if not current_problems:
+            continue
+        stale_projection_problems.extend(current_problems)
+        source_ref = _dag_task_spec_source_ref(task)
+        if not source_ref:
+            report["skipped"].append({
+                "task_id": task.id,
+                "reason": "missing_source_artifact_ref",
+                "stale_paths": current_problems,
+            })
+            continue
+
+        payload, source_record = await _dag_fragment_payload_for_ref(
+            runner,
+            feature,
+            source_ref,
+        )
+        if payload is None:
+            report["skipped"].append({
+                "task_id": task.id,
+                "source_ref": source_ref,
+                "reason": "source_fragment_unavailable",
+                "source": source_record,
+                "stale_paths": current_problems,
+            })
+            continue
+        source_tasks, retired_tasks = _dag_fragment_tasks_from_payload(payload)
+        source_task = next(
+            (
+                candidate for candidate in source_tasks
+                if _dag_task_id_matches_or_alias(task.id, candidate.id)
+            ),
+            None,
+        )
+        retired_record = next(
+            (
+                item for item in retired_tasks
+                if _dag_task_id_matches_or_alias(task.id, str(item.get("id", "")))
+            ),
+            None,
+        )
+        if source_task is None and retired_record is None:
+            report["skipped"].append({
+                "task_id": task.id,
+                "source_ref": source_ref,
+                "reason": "task_not_found_in_source_fragment",
+                "source": source_record,
+                "stale_paths": current_problems,
+            })
+            continue
+
+        replacement = (
+            source_task if source_task is not None
+            else _dag_retired_task_replacement(task, retired_record or {})
+        )
+        replacement = replacement.model_copy(update={"id": task.id})
+        replacement_problems = _dag_task_spec_path_problems(
+            replacement,
+            roots,
+            forbidden_entries,
+            expected_entries,
+        )
+        if replacement_problems:
+            report["blockers"].append({
+                "task_id": task.id,
+                "source_ref": source_ref,
+                "reason": "source_fragment_still_forbidden",
+                "source": source_record,
+                "source_path_problems": replacement_problems,
+                "stale_paths": current_problems,
+            })
+            continue
+        if _dag_task_spec_path_signature(task) == _dag_task_spec_path_signature(
+            replacement
+        ):
+            report["applied"].append({
+                "task_id": task.id,
+                "source_ref": source_ref,
+                "action": "already_current",
+                "source": source_record,
+            })
+            continue
+
+        updated_tasks[index] = replacement
+        report["applied"].append({
+            "task_id": task.id,
+            "source_ref": source_ref,
+            "action": (
+                "retired_task_projection"
+                if source_task is None else "rehydrated_from_source_fragment"
+            ),
+            "source": source_record,
+            "before_paths": [
+                problem.get("path", "") for problem in current_problems
+            ],
+            "after_file_scope": [
+                scope.model_dump(mode="json")
+                for scope in replacement.file_scope
+            ],
+            "after_files": list(replacement.files),
+        })
+
+    source_path_blockers = _dag_task_bearing_source_artifact_path_problems(
+        runner,
+        feature,
+        group_idx,
+        updated_tasks,
+        roots,
+        forbidden_entries,
+        expected_entries,
+    )
+    report["source_path_blockers"] = source_path_blockers
+    if stale_projection_problems and report["applied"]:
+        report["deleted_generated_snapshots"] = _dag_delete_stale_generated_snapshots(
+            runner,
+            feature,
+            group_idx,
+            stale_projection_problems,
+        )
+
+    await runner.artifacts.put(
+        f"dag-task-spec-reconcile:g{group_idx}:retry-{retry_label}",
+        json.dumps(report, indent=2),
+        feature=feature,
+    )
+    return DagTaskSpecReconcileOutcome(updated_tasks, report)
+
+
 def _dag_forbidden_workspace_path_problems(
     roots: list[Path],
     forbidden_entries: list[dict[str, str]],
@@ -6861,6 +7398,12 @@ class DagTaskReconcileOutcome:
     results: list[object]
     verify_results_context: list[object]
     all_results: list[object]
+    report: dict[str, Any]
+
+
+@dataclass(slots=True)
+class DagTaskSpecReconcileOutcome:
+    tasks: list[ImplementationTask]
     report: dict[str, Any]
 
 
@@ -7793,6 +8336,32 @@ async def _run_dag_group_preflight(
                     ),
                     file=path,
                 ))
+        source_artifact_problems = _dag_task_bearing_source_artifact_path_problems(
+            runner,
+            feature,
+            group_idx,
+            group_tasks,
+            roots,
+            forbidden_entries,
+            expected_entries,
+        )
+        path_problems.extend(source_artifact_problems)
+        for problem in source_artifact_problems:
+            path = str(problem.get("path", ""))
+            source_ref = str(problem.get("source_artifact_ref", ""))
+            source_path = str(problem.get("source_artifact_path", ""))
+            field = str(problem.get("field", "file_scope"))
+            concerns.append(Issue(
+                severity="major",
+                description=(
+                    "DAG source artifact task spec metadata references a "
+                    "manifest-forbidden/stale path; source artifact: "
+                    f"{source_ref or source_path}; field {field}; repair the "
+                    "DAG/source artifact instead of recreating this path: "
+                    f"{path}"
+                ),
+                file=path,
+            ))
         for result in results:
             if not isinstance(result, ImplementationResult):
                 continue
@@ -7961,6 +8530,145 @@ def _dag_path_problems_from_verdict(
             "verdict_description": description,
         })
     return problems
+
+
+def _dag_deterministic_artifact_only_path_problems(
+    problems: list[dict[str, Any]],
+    feature_root: Path | None,
+) -> list[dict[str, Any]]:
+    roots = _dag_candidate_file_roots(feature_root)
+    deterministic_reasons = {
+        "forbidden",
+        "forbidden_task_result",
+        "forbidden_task_spec",
+        "forbidden_task_spec_source_artifact",
+    }
+    artifact_only: list[dict[str, Any]] = []
+    for problem in problems:
+        reason = str(problem.get("reason", "") or "")
+        if reason not in deterministic_reasons:
+            continue
+        path = str(problem.get("path", "") or problem.get("file", "") or "")
+        exists = bool(problem.get("exists_on_disk"))
+        tracked_or_staged = bool(problem.get("tracked_or_staged"))
+        if path and roots:
+            exists = exists or _dag_reported_file_exists(path, roots)
+            tracked_or_staged = tracked_or_staged or _dag_path_tracked_or_staged(
+                path,
+                roots,
+            )
+        if exists or tracked_or_staged:
+            return []
+        artifact_only.append({
+            **problem,
+            "exists_on_disk": False,
+            "tracked_or_staged": False,
+            "repair_route": "artifact_only",
+        })
+    return artifact_only
+
+
+def _deterministic_dag_artifact_repair_group(
+    group_idx: int,
+    retry: int,
+    verdict: Verdict,
+    group_tasks: list[ImplementationTask],
+    verifier_path_problems: list[dict[str, Any]],
+    feature_root: Path | None,
+) -> PlannedBugGroup | None:
+    artifact_only = _dag_deterministic_artifact_only_path_problems(
+        verifier_path_problems,
+        feature_root,
+    )
+    if not artifact_only:
+        return None
+
+    task_ids = _dedupe_preserving_order([
+        str(problem.get("task_id", "") or "")
+        for problem in artifact_only
+        if str(problem.get("task_id", "") or "").strip()
+    ])
+    artifact_refs = _dedupe_preserving_order([
+        ref for problem in artifact_only
+        for ref in [
+            str(problem.get("artifact_key", "") or ""),
+            str(problem.get("source_artifact_ref", "") or ""),
+        ]
+        if ref.strip()
+    ])
+    tasks_by_id = {task.id: task for task in group_tasks}
+    for task_id in task_ids:
+        task = tasks_by_id.get(task_id)
+        if task is None:
+            continue
+        source_ref = _dag_task_spec_source_ref(task)
+        if source_ref:
+            artifact_refs.append(source_ref)
+    artifact_refs = _dedupe_preserving_order([
+        *artifact_refs,
+        f".iriai-context/g{group_idx}-expanded-verify-r{retry}-task-specs.md",
+        f".iriai-context/g{group_idx}-expanded-verify-r{retry}-changed-files.md",
+    ])
+
+    issue_indices = [
+        idx for idx, issue in enumerate(verdict.concerns)
+        if any(
+            str(problem.get("path", "") or "")
+            and str(problem.get("path", "") or "") in issue.description
+            for problem in artifact_only
+        )
+    ] or list(range(len(verdict.concerns)))
+    group_id = (
+        "dag-task-spec-projection-drift"
+        if any(
+            str(problem.get("reason", "") or "") in {
+                "forbidden_task_spec",
+                "forbidden_task_spec_source_artifact",
+            }
+            for problem in artifact_only
+        )
+        else "dag-task-result-metadata-drift"
+    )
+    issue_text = "\n".join([
+        f"- {problem.get('reason')}: task={problem.get('task_id') or '(unknown)'} "
+        f"path={problem.get('path') or problem.get('file') or '(none)'} "
+        f"artifact={problem.get('artifact_key') or '(none)'} "
+        f"source={problem.get('source_artifact_ref') or '(none)'}"
+        for problem in artifact_only
+    ])
+    rca = RootCauseAnalysis(
+        hypothesis=(
+            "Deterministic preflight found artifact-only stale DAG metadata or "
+            "generated task-spec projection drift; no forbidden product file is "
+            "present on disk or in the git index."
+        ),
+        evidence=[
+            "Host preflight path problems are all deterministic stale/forbidden DAG metadata.",
+            "Product cleanup is not required because the flagged retired paths are absent from disk/index.",
+            *artifact_refs[:8],
+        ],
+        affected_files=artifact_refs,
+        proposed_approach=(
+            "Use the artifact repair/projection reconciliation path. Rehydrate "
+            "task specs from canonical DAG fragments when possible, repair stale "
+            "source DAG artifacts when they still contain retired path fields, "
+            "and invalidate generated expanded-verify task-spec/changed-files "
+            "snapshots instead of sending a product-code implementer."
+        ),
+        confidence="high",
+    )
+    return PlannedBugGroup(
+        group=BugGroup(
+            group_id=group_id,
+            likely_root_cause=rca.hypothesis,
+            issue_indices=issue_indices,
+            severity="blocker",
+            affected_files_hint=artifact_refs,
+        ),
+        rca=rca,
+        issue_text=issue_text,
+        rca_key=f"host-deterministic:dag-repair:g{group_idx}:retry-{retry}:{group_id}",
+    )
 
 
 def _prefix_lens_issue(spec: DagVerifyLensSpec, issue: Issue) -> Issue:
@@ -8596,6 +9304,24 @@ async def _attempt_parallel_dag_repair(
     quarantined_contradiction_groups: list[PlannedBugGroup] = []
     auto_resolve = False
     verifier_path_problems = _dag_path_problems_from_verdict(verdict, group_tasks)
+    deterministic_artifact_group = _deterministic_dag_artifact_repair_group(
+        group_idx,
+        retry,
+        verdict,
+        group_tasks,
+        verifier_path_problems,
+        feature_root,
+    )
+    if deterministic_artifact_group is not None and not any(
+        _planned_needs_dag_task_artifact_repair(planned)
+        or _planned_needs_source_artifact_repair(planned)
+        or _dag_metadata_only_repair_candidate(planned)
+        for planned in dispatch.groups
+    ):
+        dispatch.groups.append(deterministic_artifact_group)
+        dispatch.fixable_groups.append(deterministic_artifact_group)
+        dispatch.triage.groups.append(deterministic_artifact_group.group)
+        fixable_groups.append(deterministic_artifact_group)
     dag_task_artifact_candidate_groups = [
         planned for planned in fixable_groups
         if _planned_needs_dag_task_artifact_repair(planned)
