@@ -19,6 +19,56 @@ class Citation(BaseModel):
     reasoning: str = ""
 
 
+class StructuredArtifactEnvelope(BaseModel):
+    """Metadata wrapper for canonical machine-readable artifact sidecars."""
+
+    schema_version: str = "v1"
+    artifact_family: str
+    artifact_key: str
+    scope_kind: Literal["root", "broad", "global", "subfeature"]
+    scope_slug: str = ""
+    source_hash: str = ""
+    content_digest: str = ""
+    generated_from: Literal[
+        "approved_object",
+        "markdown_backfill",
+        "markdown_revision",
+    ] = "approved_object"
+
+
+class StructuredArtifact(BaseModel, Generic[T]):
+    """Canonical sidecar wrapper for a source artifact."""
+
+    meta: StructuredArtifactEnvelope
+    content: T
+
+
+class ChunkMeta(BaseModel):
+    """Stable metadata for a planner-visible logical chunk."""
+
+    chunk_id: str = ""
+    chunk_type: str = ""
+    order: int = 0
+    content_digest: str = ""
+    source_heading: str = ""
+    source_line_start: int = 0
+    source_line_end: int = 0
+
+
+class TraceRefs(BaseModel):
+    """Typed traceability references for structured planning artifacts."""
+
+    requirement_ids: list[str] = Field(default_factory=list)
+    journey_ids: list[str] = Field(default_factory=list)
+    journey_step_ids: list[str] = Field(default_factory=list)
+    decision_ids: list[str] = Field(default_factory=list)
+    decision_aliases: list[str] = Field(default_factory=list)
+    nfr_ids: list[str] = Field(default_factory=list)
+    verifiable_state_ids: list[str] = Field(default_factory=list)
+    acceptance_criterion_ids: list[str] = Field(default_factory=list)
+    notes: list[str] = Field(default_factory=list)
+
+
 class DecisionRecord(BaseModel):
     """A single planning decision with stable traceability."""
 
@@ -30,6 +80,8 @@ class DecisionRecord(BaseModel):
     source_phase: str = ""
     subfeature_slug: str = ""
     applies_to: list[str] = Field(default_factory=list)
+    aliases: list[str] = Field(default_factory=list)
+    chunk: ChunkMeta = Field(default_factory=ChunkMeta)
     citations: list[Citation] = Field(default_factory=list)
 
 
@@ -151,6 +203,7 @@ class Requirement(BaseModel):
     category: str  # functional | non-functional | security | performance
     description: str
     priority: str = "must"  # must | should | could
+    chunk: ChunkMeta = Field(default_factory=ChunkMeta)
     citations: list[Citation] = Field(default_factory=list)
 
 
@@ -162,16 +215,19 @@ class AcceptanceCriterion(BaseModel):
     expected_observation: str
     not_criteria: str = ""
     requirement_ids: list[str] = Field(default_factory=list)
+    chunk: ChunkMeta = Field(default_factory=ChunkMeta)
     citations: list[Citation] = Field(default_factory=list)
 
 
 class JourneyStep(BaseModel):
     """A single step in a user journey."""
 
+    id: str = ""
     step_number: int
     action: str
     observes: str
     not_criteria: str = ""
+    chunk: ChunkMeta = Field(default_factory=ChunkMeta)
     citations: list[Citation] = Field(default_factory=list)
 
 
@@ -188,6 +244,7 @@ class Journey(BaseModel):
     outcome: str
     related_journey_id: str = ""
     requirement_ids: list[str] = Field(default_factory=list)
+    chunk: ChunkMeta = Field(default_factory=ChunkMeta)
 
 
 class SecurityProfile(BaseModel):
@@ -271,15 +328,18 @@ class ComponentDef(BaseModel):
     description: str = ""
     props_variants: str = ""
     states: list[str] = Field(default_factory=list)
+    chunk: ChunkMeta = Field(default_factory=ChunkMeta)
     citations: list[Citation] = Field(default_factory=list)
 
 
 class VerifiableState(BaseModel):
     """A visually/semantically distinguishable state for a component."""
 
+    id: str = ""
     component_id: str
     state_name: str
     visual_description: str
+    chunk: ChunkMeta = Field(default_factory=ChunkMeta)
 
 
 class JourneyUXAnnotation(BaseModel):
@@ -290,6 +350,7 @@ class JourneyUXAnnotation(BaseModel):
     error_path_ux: str = ""
     empty_state_ux: str = ""
     not_criteria: list[str] = Field(default_factory=list)
+    chunk: ChunkMeta = Field(default_factory=ChunkMeta)
 
 
 # ── Architecture sub-models ──────────────────────────────────────────────────
@@ -306,6 +367,7 @@ class ImplementationStep(BaseModel):
     """A structured implementation step from the architect."""
 
     id: str  # STEP-1, STEP-2, ...
+    title: str = ""
     objective: str
     scope: list[FileScope] = Field(default_factory=list)
     instructions: str
@@ -313,6 +375,9 @@ class ImplementationStep(BaseModel):
     counterexamples: list[str] = Field(default_factory=list)
     requirement_ids: list[str] = Field(default_factory=list)
     journey_ids: list[str] = Field(default_factory=list)
+    refs: TraceRefs = Field(default_factory=TraceRefs)
+    owned_acceptance_criterion_ids: list[str] = Field(default_factory=list)
+    chunk: ChunkMeta = Field(default_factory=ChunkMeta)
     citations: list[Citation] = Field(default_factory=list)
 
 
@@ -326,9 +391,11 @@ class VerifyBlock(BaseModel):
 class JourneyVerifyStep(BaseModel):
     """A journey step with technical verification."""
 
+    id: str = ""
     step_number: int
     verify_blocks: list[VerifyBlock] = Field(default_factory=list)
     data_testids: list[str] = Field(default_factory=list)
+    chunk: ChunkMeta = Field(default_factory=ChunkMeta)
 
 
 class JourneyVerification(BaseModel):
@@ -336,6 +403,7 @@ class JourneyVerification(BaseModel):
 
     journey_id: str
     steps: list[JourneyVerifyStep] = Field(default_factory=list)
+    chunk: ChunkMeta = Field(default_factory=ChunkMeta)
 
 
 class ArchitecturalRisk(BaseModel):
@@ -346,6 +414,7 @@ class ArchitecturalRisk(BaseModel):
     severity: str  # high | medium | low
     mitigation: str = ""
     affected_step_ids: list[str] = Field(default_factory=list)
+    chunk: ChunkMeta = Field(default_factory=ChunkMeta)
 
 
 # ── Task planning sub-models ─────────────────────────────────────────────────
@@ -377,6 +446,7 @@ class SubfeatureEdge(BaseModel):
     description: str  # what crosses the boundary
     data_contract: str = ""  # shape/schema of what's exchanged
     owner: str = ""  # which subfeature owns the contract
+    chunk: ChunkMeta = Field(default_factory=ChunkMeta)
     citations: list[Citation] = Field(default_factory=list)
 
 
@@ -390,6 +460,7 @@ class Subfeature(BaseModel):
     rationale: str = ""
     requirement_ids: list[str] = Field(default_factory=list)
     journey_ids: list[str] = Field(default_factory=list)
+    chunk: ChunkMeta = Field(default_factory=ChunkMeta)
 
 
 class SubfeatureDecomposition(BaseModel):
@@ -518,6 +589,7 @@ class Workstream(BaseModel):
     subfeature_slugs: list[str]  # SFs in this workstream
     rationale: str  # why these are grouped
     depends_on: list[str] = Field(default_factory=list)  # workstream IDs that must complete first
+    chunk: ChunkMeta = Field(default_factory=ChunkMeta)
 
 
 class WorkstreamDecomposition(BaseModel):
@@ -544,6 +616,7 @@ class ServiceNode(BaseModel):
     technology: str = ""
     port: str = ""
     journeys: list[str] = Field(default_factory=list)
+    chunk: ChunkMeta = Field(default_factory=ChunkMeta)
 
 
 class ServiceConnection(BaseModel):
@@ -554,6 +627,7 @@ class ServiceConnection(BaseModel):
     label: str
     protocol: str = ""  # REST | gRPC | WebSocket | AMQP | SQL | Redis
     journeys: list[str] = Field(default_factory=list)
+    chunk: ChunkMeta = Field(default_factory=ChunkMeta)
 
 
 class APIEndpoint(BaseModel):
@@ -566,6 +640,7 @@ class APIEndpoint(BaseModel):
     request_body: str = ""
     response_body: str = ""
     auth: str = ""
+    chunk: ChunkMeta = Field(default_factory=ChunkMeta)
 
 
 class APICallStep(BaseModel):
@@ -577,6 +652,7 @@ class APICallStep(BaseModel):
     action: str
     description: str
     returns: str = ""
+    chunk: ChunkMeta = Field(default_factory=ChunkMeta)
 
 
 class APICallPath(BaseModel):
@@ -587,6 +663,7 @@ class APICallPath(BaseModel):
     description: str
     journey_id: str = ""
     steps: list[APICallStep] = Field(default_factory=list)
+    chunk: ChunkMeta = Field(default_factory=ChunkMeta)
 
 
 class EntityField(BaseModel):
@@ -596,6 +673,7 @@ class EntityField(BaseModel):
     type: str
     constraints: str = ""
     description: str = ""
+    chunk: ChunkMeta = Field(default_factory=ChunkMeta)
 
 
 class Entity(BaseModel):
@@ -606,6 +684,7 @@ class Entity(BaseModel):
     service_id: str
     fields: list[EntityField] = Field(default_factory=list)
     journeys: list[str] = Field(default_factory=list)
+    chunk: ChunkMeta = Field(default_factory=ChunkMeta)
 
 
 class EntityRelation(BaseModel):
@@ -615,6 +694,7 @@ class EntityRelation(BaseModel):
     to_entity: str
     kind: str  # one-to-many | many-to-many | one-to-one
     label: str = ""
+    chunk: ChunkMeta = Field(default_factory=ChunkMeta)
 
 
 class SystemDesign(BaseModel):
@@ -718,17 +798,40 @@ class TestAcceptanceCriterion(BaseModel):
     pass_condition: str = ""
     linked_verifiable_state_id: str = ""  # DesignDecisions.verifiable_states[*].component_id#state
     linked_journey_step_id: str = ""  # TechnicalPlan.journey_verifications[*].step_id
+    refs: TraceRefs = Field(default_factory=TraceRefs)
+    chunk: ChunkMeta = Field(default_factory=ChunkMeta)
 
 
 class TestScenario(BaseModel):
     """A single end-to-end test scenario for a subfeature."""
 
+    id: str = ""
     name: str = ""
     preconditions: list[str] = Field(default_factory=list)
     steps: list[str] = Field(default_factory=list)
     expected_outcome: str = ""
     priority: str = "p1"  # p0 | p1 | p2
     linked_acceptance: list[str] = Field(default_factory=list)
+    refs: TraceRefs = Field(default_factory=TraceRefs)
+    chunk: ChunkMeta = Field(default_factory=ChunkMeta)
+
+
+class ChecklistItem(BaseModel):
+    """A structured verification checklist item."""
+
+    id: str = ""
+    text: str = ""
+    refs: TraceRefs = Field(default_factory=TraceRefs)
+    chunk: ChunkMeta = Field(default_factory=ChunkMeta)
+
+
+class EdgeCaseItem(BaseModel):
+    """A structured edge-case item."""
+
+    id: str = ""
+    text: str = ""
+    refs: TraceRefs = Field(default_factory=TraceRefs)
+    chunk: ChunkMeta = Field(default_factory=ChunkMeta)
 
 
 class TestPlan(BaseModel):
@@ -742,6 +845,8 @@ class TestPlan(BaseModel):
     overview: str = ""
     acceptance_criteria: list[TestAcceptanceCriterion] = Field(default_factory=list)
     test_scenarios: list[TestScenario] = Field(default_factory=list)
+    checklist_items: list[ChecklistItem] = Field(default_factory=list)
+    edge_case_items: list[EdgeCaseItem] = Field(default_factory=list)
     verification_checklist: list[str] = Field(default_factory=list)
     edge_cases: list[str] = Field(default_factory=list)
     mocking_strategy: str = ""
@@ -895,6 +1000,33 @@ class ImplementationResult(BaseModel):
     files_created: list[str] = Field(default_factory=list)
     files_modified: list[str] = Field(default_factory=list)
     commit_hash: str = ""  # git commit hash for this task's changes
+    notes: str = ""
+    deviations: list[Deviation] = Field(default_factory=list)
+    self_reported_risks: list[Risk] = Field(default_factory=list)
+
+
+class ArtifactRepairUpdate(BaseModel):
+    """Full replacement for a feature-scoped workflow artifact."""
+
+    artifact_key: str = ""
+    target_ref: str = ""
+    content: str
+    summary: str = ""
+
+
+class ArtifactRepairResult(BaseModel):
+    """Structured output for DAG artifact/context repair work."""
+
+    task_id: str = ""
+    group_id: str = ""
+    summary: str
+    status: str = "completed"  # completed | blocked | partial
+    artifacts_created: list[str] = Field(default_factory=list)
+    artifacts_modified: list[str] = Field(default_factory=list)
+    artifacts_deleted: list[str] = Field(default_factory=list)
+    artifact_updates: list[ArtifactRepairUpdate] = Field(default_factory=list)
+    decisions_applied: list[str] = Field(default_factory=list)
+    validation: list[str] = Field(default_factory=list)
     notes: str = ""
     deviations: list[Deviation] = Field(default_factory=list)
     self_reported_risks: list[Risk] = Field(default_factory=list)
@@ -1129,6 +1261,137 @@ class HandoverDoc(BaseModel):
             summary=summary,
             failure_reason=failure_reason,
         ))
+
+
+class PlanningChunkNode(BaseModel):
+    """A chunk node in the derived planning index."""
+
+    chunk_id: str
+    chunk_type: str
+    artifact_key: str
+    title: str = ""
+    order: int = 0
+    content_digest: str = ""
+    refs: TraceRefs = Field(default_factory=TraceRefs)
+
+
+class PlanningChunkEdge(BaseModel):
+    """A typed relationship between planning chunks."""
+
+    from_chunk_id: str
+    to_chunk_id: str
+    edge_type: Literal[
+        "contains",
+        "explicit_ac_owner",
+        "traces_requirement",
+        "traces_journey",
+        "traces_journey_step",
+        "traces_decision",
+        "traces_decision_alias",
+        "traces_nfr",
+        "traces_verifiable_state",
+        "scenario_covers_ac",
+        "checklist_covers_ac",
+        "edge_case_covers_ac",
+    ]
+
+
+class SliceInputChunkSet(BaseModel):
+    """Derived slice-ready chunk selection for task planning."""
+
+    slice_id: str
+    step_chunk_ids: list[str] = Field(default_factory=list)
+    overlay_chunk_ids: list[str] = Field(default_factory=list)
+    requirement_ids: list[str] = Field(default_factory=list)
+    journey_ids: list[str] = Field(default_factory=list)
+    owned_acceptance_criterion_ids: list[str] = Field(default_factory=list)
+    supporting_acceptance_criterion_ids: list[str] = Field(default_factory=list)
+    global_obligation_ac_ids: list[str] = Field(default_factory=list)
+    required_reference_sources: list[str] = Field(default_factory=list)
+    content_digest: str = ""
+
+
+class SubfeaturePlanningIndex(BaseModel):
+    """Derived cross-artifact planning index for one subfeature."""
+
+    slug: str
+    source_digests: dict[str, str] = Field(default_factory=dict)
+    index_digest: str = ""
+    nodes: list[PlanningChunkNode] = Field(default_factory=list)
+    edges: list[PlanningChunkEdge] = Field(default_factory=list)
+    step_order: list[str] = Field(default_factory=list)
+    slice_inputs: list[SliceInputChunkSet] = Field(default_factory=list)
+
+
+class SharedPlanningIndex(BaseModel):
+    """Derived shared planning index for broad/global planning artifacts."""
+
+    source_digests: dict[str, str] = Field(default_factory=dict)
+    index_digest: str = ""
+    requirement_ids: list[str] = Field(default_factory=list)
+    journey_ids: list[str] = Field(default_factory=list)
+    decision_ids: list[str] = Field(default_factory=list)
+    decision_alias_map: dict[str, str] = Field(default_factory=dict)
+    subfeature_slugs: list[str] = Field(default_factory=list)
+    edge_descriptions: list[str] = Field(default_factory=list)
+
+
+class ArtifactAuditIssue(BaseModel):
+    """A normalized planning-artifact audit issue."""
+
+    classification: Literal[
+        "normalizer_bug",
+        "alias_resolution_gap",
+        "artifact_ambiguity",
+        "true_missing_canonical_ref",
+        "parity_failed",
+    ]
+    artifact_family: str
+    artifact_key: str
+    path: str = ""
+    line_start: int = 0
+    line_end: int = 0
+    message: str
+    extracted_value: str = ""
+    suggested_fix: str = ""
+
+
+class ArtifactAuditReport(BaseModel):
+    """Per-subfeature audit report produced during sidecar backfill."""
+
+    slug: str
+    source_hashes: dict[str, str] = Field(default_factory=dict)
+    generated_sidecars: list[str] = Field(default_factory=list)
+    issues: list[ArtifactAuditIssue] = Field(default_factory=list)
+    complete: bool = False
+
+
+class ArtifactBackfillArtifactStatus(BaseModel):
+    """Status for a single artifact family during sidecar backfill."""
+
+    status: Literal["not_started", "backfilled", "parity_failed", "migrated"] = "not_started"
+    source_hash: str = ""
+    sidecar_key: str = ""
+    sidecar_digest: str = ""
+    parity_messages: list[str] = Field(default_factory=list)
+
+
+class ArtifactBackfillSubfeatureStatus(BaseModel):
+    """Aggregated backfill status for one subfeature."""
+
+    slug: str
+    migration_state: Literal["not_started", "backfilled", "parity_failed", "migrated"] = "not_started"
+    artifact_statuses: dict[str, ArtifactBackfillArtifactStatus] = Field(default_factory=dict)
+    join_complete: bool = False
+    planning_index_digest: str = ""
+
+
+class ArtifactBackfillStatus(BaseModel):
+    """Feature-level checkpoint for sidecar backfill and migration."""
+
+    normalizer_version: str = ""
+    shared_statuses: dict[str, ArtifactBackfillArtifactStatus] = Field(default_factory=dict)
+    subfeatures: dict[str, ArtifactBackfillSubfeatureStatus] = Field(default_factory=dict)
 
 
 # ── Orchestration output models ──────────────────────────────────────────────

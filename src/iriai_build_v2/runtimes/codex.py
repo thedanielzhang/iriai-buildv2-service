@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import contextvars
+import hashlib
 import json
 import logging
 import os
@@ -12,6 +13,7 @@ import tomllib
 import uuid
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -28,6 +30,16 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 _STDOUT_READ_CHUNK = 64 * 1024
+_TRACE_HEARTBEAT_SECONDS = int(
+    os.environ.get("IRIAI_CODEX_TRACE_HEARTBEAT_SECONDS", "60") or "60"
+)
+_PRE_WORK_STALL_SECONDS = int(
+    os.environ.get("IRIAI_CODEX_PRE_WORK_STALL_SECONDS", "300") or "300"
+)
+_PRE_WORK_STALL_RETRIES = int(
+    os.environ.get("IRIAI_CODEX_PRE_WORK_STALL_RETRIES", "1") or "1"
+)
+_TRACE_TEXT_LIMIT = 1_000
 _current_invocation_var: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "codex_runtime_invocation_id", default=None,
 )
@@ -64,6 +76,30 @@ _ENV_FILE_NAMES = (
     ".env.test",
     ".env.example",
 )
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(UTC).isoformat()
+
+
+def _truncate_trace_text(value: Any, limit: int = _TRACE_TEXT_LIMIT) -> str:
+    text = "" if value is None else str(value)
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}...<truncated {len(text) - limit} chars>"
+
+
+def _file_size(path: str | None) -> int | None:
+    if not path:
+        return None
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return None
+
+
+class _CodexPreWorkStalled(RuntimeError):
+    """Codex reached turn.started but produced no observable work."""
 
 
 def _serialize_toml(config: dict[str, Any]) -> str:
@@ -204,6 +240,48 @@ class CodexAgentRuntime(AgentRuntime):
         self._global_codex_config = _read_global_codex_config()
         self._invocation_activity: dict[str, Any] = {}
         self._invocation_processes: dict[str, asyncio.subprocess.Process] = {}
+
+    def _trace_dir(self, workspace: Workspace | None) -> Path:
+        temp_dir = self._runtime_temp_dir(workspace)
+        base = Path(temp_dir) if temp_dir else Path(tempfile.gettempdir()) / "iriai-codex"
+        trace_dir = base / "traces"
+        trace_dir.mkdir(parents=True, exist_ok=True)
+        return trace_dir
+
+    def _new_trace_path(
+        self,
+        *,
+        workspace: Workspace | None,
+        role: Role,
+        session_key: str | None,
+    ) -> Path:
+        actor_name = self._actor_name(session_key) or role.name
+        safe_actor = "".join(
+            ch if ch.isalnum() or ch in {"-", "_"} else "_"
+            for ch in actor_name
+        )[:80]
+        stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S.%fZ")
+        return self._trace_dir(workspace) / f"{stamp}-{safe_actor}-{uuid.uuid4().hex[:8]}.jsonl"
+
+    def _write_trace(
+        self,
+        trace_path: Path | None,
+        event: str,
+        **fields: Any,
+    ) -> None:
+        if trace_path is None:
+            return
+        payload = {
+            "ts": _utc_now_iso(),
+            "event": event,
+            **fields,
+        }
+        try:
+            with trace_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(payload, sort_keys=True, default=str))
+                f.write("\n")
+        except Exception:
+            logger.debug("Failed to write Codex trace event %s", event, exc_info=True)
 
     @asynccontextmanager
     async def bind_invocation(self, invocation_id: str, activity_sink: Any | None):
@@ -574,14 +652,32 @@ class CodexAgentRuntime(AgentRuntime):
         schema_path: str | None = None
         output_path: str | None = None
         codex_home: str | None = None
+        trace_path: Path | None = None
+        prompt_snapshot_path: Path | None = None
+        schema_snapshot_path: Path | None = None
+        succeeded = False
         temp_dir = self._runtime_temp_dir(workspace)
         try:
+            trace_path = self._new_trace_path(
+                workspace=workspace,
+                role=role,
+                session_key=session_key,
+            )
+            prompt_snapshot_path = trace_path.with_suffix(".prompt.md")
+            prompt_snapshot_path.write_text(prompt, encoding="utf-8")
+            prompt_digest = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
             if output_type:
+                prepared_schema = _prepare_schema(output_type.model_json_schema())
                 with tempfile.NamedTemporaryFile(
                     mode="w", encoding="utf-8", suffix=".json", dir=temp_dir, delete=False
                 ) as schema_file:
-                    json.dump(_prepare_schema(output_type.model_json_schema()), schema_file)
+                    json.dump(prepared_schema, schema_file)
                     schema_path = schema_file.name
+                schema_snapshot_path = trace_path.with_suffix(".schema.json")
+                schema_snapshot_path.write_text(
+                    json.dumps(prepared_schema, indent=2, sort_keys=True),
+                    encoding="utf-8",
+                )
 
             with tempfile.NamedTemporaryFile(
                 mode="w", encoding="utf-8", suffix=".txt", dir=temp_dir, delete=False
@@ -599,6 +695,14 @@ class CodexAgentRuntime(AgentRuntime):
             )
 
             # Isolate CODEX_HOME so only the role's MCP servers are loaded
+            mcp_server_names = sorted(
+                self._effective_mcp_servers(
+                    role,
+                    workspace=workspace,
+                    feature_id=feature_id,
+                    session_key=session_key,
+                ).keys()
+            )
             codex_home = self._prepare_codex_home(
                 role,
                 workspace,
@@ -607,25 +711,131 @@ class CodexAgentRuntime(AgentRuntime):
             )
             env = {**os.environ, "CODEX_HOME": codex_home}
 
-            final_text, thread_id, stderr_text = await self._run_process(
-                command, prompt, output_type, env=env,
+            self._write_trace(
+                trace_path,
+                "invocation.prepared",
+                role=role.name,
+                actor=self._actor_name(session_key),
+                session_key=session_key,
+                feature_id=feature_id,
+                workspace=str(workspace.path) if workspace and workspace.path else None,
+                output_type=output_type.__name__ if output_type else None,
+                prompt_chars=len(prompt),
+                prompt_bytes=len(prompt.encode("utf-8")),
+                prompt_sha256=prompt_digest,
+                prompt_snapshot_path=str(prompt_snapshot_path),
+                command=command,
+                codex_home=codex_home,
+                mcp_servers=mcp_server_names,
+                output_path=output_path,
+                output_schema_path=schema_path,
+                output_schema_snapshot_path=str(schema_snapshot_path) if schema_snapshot_path else None,
+                output_file_size=_file_size(output_path),
+                pre_work_stall_seconds=_PRE_WORK_STALL_SECONDS,
+                pre_work_stall_retries=_PRE_WORK_STALL_RETRIES,
             )
+            logger.info(
+                "Codex invocation prepared role=%s actor=%s feature=%s trace=%s "
+                "prompt_chars=%d mcp=%s output=%s schema=%s",
+                role.name,
+                self._actor_name(session_key) or "<unknown>",
+                feature_id or "<unknown>",
+                trace_path,
+                len(prompt),
+                ",".join(mcp_server_names) or "<none>",
+                output_path,
+                schema_path,
+            )
+
+            final_text = ""
+            thread_id: str | None = None
+            stderr_text = ""
+            for process_attempt in range(_PRE_WORK_STALL_RETRIES + 1):
+                if process_attempt > 0 and output_path:
+                    Path(output_path).write_text("", encoding="utf-8")
+                    self._write_trace(
+                        trace_path,
+                        "invocation.pre_work_retry",
+                        process_attempt=process_attempt,
+                        max_retries=_PRE_WORK_STALL_RETRIES,
+                    )
+                    logger.warning(
+                        "Retrying Codex invocation after pre-work startup stall "
+                        "attempt=%d/%d trace=%s",
+                        process_attempt + 1,
+                        _PRE_WORK_STALL_RETRIES + 1,
+                        trace_path,
+                    )
+                try:
+                    final_text, thread_id, stderr_text = await self._run_process(
+                        command,
+                        prompt,
+                        output_type,
+                        env=env,
+                        trace_path=trace_path,
+                        output_path=output_path,
+                        process_attempt=process_attempt,
+                    )
+                    break
+                except _CodexPreWorkStalled:
+                    if process_attempt >= _PRE_WORK_STALL_RETRIES:
+                        self._write_trace(
+                            trace_path,
+                            "invocation.pre_work_retries_exhausted",
+                            process_attempt=process_attempt,
+                            max_retries=_PRE_WORK_STALL_RETRIES,
+                        )
+                        raise
+                    continue
 
             if not final_text and output_path:
                 final_text = Path(output_path).read_text(encoding="utf-8").strip()
 
             if not final_text:
                 details = stderr_text.strip() or "empty response"
+                self._write_trace(
+                    trace_path,
+                    "invocation.empty_response",
+                    stderr=_truncate_trace_text(stderr_text),
+                    output_file_size=_file_size(output_path),
+                )
                 raise RuntimeError(f"Codex returned no final message: {details}")
 
+            succeeded = True
+            self._write_trace(
+                trace_path,
+                "invocation.completed",
+                thread_id=thread_id,
+                final_text_chars=len(final_text),
+                output_file_size=_file_size(output_path),
+            )
             return final_text, thread_id
         finally:
-            for path in (schema_path, output_path):
-                if path and os.path.exists(path):
-                    try:
-                        os.unlink(path)
-                    except OSError:
-                        logger.debug("Failed to remove temporary file %s", path, exc_info=True)
+            if succeeded:
+                for path in (schema_path, output_path):
+                    if path and os.path.exists(path):
+                        try:
+                            os.unlink(path)
+                        except OSError:
+                            logger.debug("Failed to remove temporary file %s", path, exc_info=True)
+            else:
+                self._write_trace(
+                    trace_path,
+                    "invocation.diagnostics_preserved",
+                    output_path=output_path if output_path and os.path.exists(output_path) else None,
+                    output_file_size=_file_size(output_path),
+                    output_schema_path=schema_path if schema_path and os.path.exists(schema_path) else None,
+                    output_schema_snapshot_path=str(schema_snapshot_path) if schema_snapshot_path else None,
+                    prompt_snapshot_path=str(prompt_snapshot_path) if prompt_snapshot_path else None,
+                    trace_file=str(trace_path) if trace_path else None,
+                )
+                logger.warning(
+                    "Codex invocation did not complete cleanly; diagnostics preserved "
+                    "trace=%s output=%s schema=%s",
+                    trace_path,
+                    output_path if output_path and os.path.exists(output_path) else None,
+                    schema_path if schema_path and os.path.exists(schema_path) else None,
+                )
             if codex_home:
                 shutil.rmtree(codex_home, ignore_errors=True)
 
@@ -636,7 +846,16 @@ class CodexAgentRuntime(AgentRuntime):
         output_type: type[BaseModel] | None,
         *,
         env: dict[str, str] | None = None,
+        trace_path: Path | None = None,
+        output_path: str | None = None,
+        process_attempt: int = 0,
     ) -> tuple[str, str | None, str]:
+        self._write_trace(
+            trace_path,
+            "process.launching",
+            command=command,
+            process_attempt=process_attempt,
+        )
         try:
             proc = await asyncio.create_subprocess_exec(
                 *command,
@@ -646,69 +865,195 @@ class CodexAgentRuntime(AgentRuntime):
                 env=env,
             )
         except FileNotFoundError as exc:
+            self._write_trace(
+                trace_path,
+                "process.launch_failed",
+                error="codex command not found",
+                process_attempt=process_attempt,
+            )
             raise RuntimeError(
                 "Could not start the Codex CLI. Ensure `codex` is installed and on PATH."
             ) from exc
+        except Exception as exc:
+            self._write_trace(
+                trace_path,
+                "process.launch_failed",
+                error=repr(exc),
+                process_attempt=process_attempt,
+            )
+            raise
 
         invocation_id = _current_invocation_var.get()
         if invocation_id:
             self._invocation_processes[invocation_id] = proc
+        proc_pid = getattr(proc, "pid", None)
+        self._write_trace(
+            trace_path,
+            "process.started",
+            pid=proc_pid,
+            invocation_id=invocation_id,
+            process_attempt=process_attempt,
+            output_file_size=_file_size(output_path),
+        )
+        logger.info(
+            "Codex process started pid=%s invocation=%s trace=%s",
+            proc_pid,
+            invocation_id or "<none>",
+            trace_path,
+        )
 
         assert proc.stdin is not None
         assert proc.stdout is not None
         assert proc.stderr is not None
 
+        self._write_trace(
+            trace_path,
+            "stdin.write_started",
+            prompt_bytes=len(prompt.encode("utf-8")),
+            process_attempt=process_attempt,
+        )
         proc.stdin.write(prompt.encode("utf-8"))
         await proc.stdin.drain()
         proc.stdin.close()
+        self._write_trace(trace_path, "stdin.closed")
 
         state: dict[str, Any] = {
             "thread_id": None,
             "last_agent_message": "",
             "last_error": "",
+            "stdout_lines": 0,
+            "stderr_lines": 0,
+            "stdout_events": 0,
+            "last_event_type": "",
+            "last_item_type": "",
+            "last_command": "",
+            "turn_started_monotonic": None,
+            "turn_started_at": None,
+            "substantive_event_seen": False,
+            "pre_work_stall": False,
         }
 
         stdout_task = asyncio.create_task(
-            self._read_stdout(proc.stdout, state=state, output_type=output_type)
+            self._read_stdout(
+                proc.stdout,
+                state=state,
+                output_type=output_type,
+                trace_path=trace_path,
+            )
         )
-        stderr_task = asyncio.create_task(self._read_stderr(proc.stderr))
+        stderr_task = asyncio.create_task(
+            self._read_stderr(proc.stderr, state=state, trace_path=trace_path)
+        )
         wait_task = asyncio.create_task(proc.wait())
+        monitor_task = asyncio.create_task(
+            self._monitor_process(
+                proc,
+                state=state,
+                trace_path=trace_path,
+                output_path=output_path,
+                process_attempt=process_attempt,
+            )
+        )
 
         stderr_text = ""
         return_code: int | None = None
+        active_tasks: set[asyncio.Task[Any]] = {stdout_task, stderr_task, wait_task}
 
         try:
             while return_code is None:
                 done, _pending = await asyncio.wait(
-                    {stdout_task, stderr_task, wait_task},
+                    active_tasks,
                     return_when=asyncio.FIRST_COMPLETED,
                 )
                 if stdout_task in done:
+                    active_tasks.discard(stdout_task)
                     exc = stdout_task.exception()
                     if exc is not None:
-                        await self._abort_process(proc, wait_task, stderr_task)
+                        self._write_trace(
+                            trace_path,
+                            "stdout.reader_failed",
+                            error=repr(exc),
+                        )
+                        await self._abort_process(proc, wait_task, stderr_task, monitor_task)
                         raise RuntimeError(
                             "Codex stdout reader failed before process exit"
                         ) from exc
                 if stderr_task in done:
+                    active_tasks.discard(stderr_task)
                     exc = stderr_task.exception()
                     if exc is not None:
-                        await self._abort_process(proc, wait_task, stdout_task)
+                        self._write_trace(
+                            trace_path,
+                            "stderr.reader_failed",
+                            error=repr(exc),
+                        )
+                        await self._abort_process(proc, wait_task, stdout_task, monitor_task)
                         raise RuntimeError(
                             "Codex stderr reader failed before process exit"
                         ) from exc
                     stderr_text = stderr_task.result()
                 if wait_task in done:
+                    active_tasks.discard(wait_task)
                     return_code = wait_task.result()
         except asyncio.CancelledError:
-            logger.warning("Codex invocation cancelled — killing subprocess %s", proc.pid)
-            await self._abort_process(proc, wait_task, stdout_task, stderr_task)
+            logger.warning("Codex invocation cancelled — killing subprocess %s", proc_pid)
+            self._write_trace(
+                trace_path,
+                "process.cancelled",
+                pid=proc_pid,
+                output_file_size=_file_size(output_path),
+                process_attempt=process_attempt,
+                **{key: state.get(key) for key in (
+                    "stdout_lines",
+                    "stderr_lines",
+                    "stdout_events",
+                    "last_event_type",
+                    "last_item_type",
+                    "last_command",
+                    "turn_started_at",
+                    "substantive_event_seen",
+                    "pre_work_stall",
+                )},
+            )
+            await self._abort_process(proc, wait_task, stdout_task, stderr_task, monitor_task)
             raise
 
         if not stderr_task.done():
             stderr_text = await stderr_task
         if not stdout_task.done():
             await stdout_task
+        if not monitor_task.done():
+            monitor_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await monitor_task
+
+        self._write_trace(
+            trace_path,
+            "process.exited",
+            pid=proc_pid,
+            return_code=return_code,
+            output_file_size=_file_size(output_path),
+            stderr_chars=len(stderr_text),
+            process_attempt=process_attempt,
+            **{key: state.get(key) for key in (
+                "stdout_lines",
+                "stderr_lines",
+                "stdout_events",
+                "last_event_type",
+                "last_item_type",
+                "last_command",
+                "turn_started_at",
+                "substantive_event_seen",
+                "pre_work_stall",
+            )},
+        )
+
+        if state.get("pre_work_stall"):
+            raise _CodexPreWorkStalled(
+                "Codex reached turn.started but emitted no reasoning, "
+                "tool use, agent message, stderr, or output before the "
+                f"{_PRE_WORK_STALL_SECONDS}s pre-work guard fired"
+            )
 
         if return_code != 0:
             details = (
@@ -719,6 +1064,13 @@ class CodexAgentRuntime(AgentRuntime):
             )
             if "login" in details.lower():
                 details += " Run `codex login` and sign in with ChatGPT or an API key."
+            self._write_trace(
+                trace_path,
+                "process.failed",
+                return_code=return_code,
+                details=_truncate_trace_text(details),
+                process_attempt=process_attempt,
+            )
             raise RuntimeError(f"Codex CLI failed with exit code {return_code}: {details}")
 
         if self.on_message is not None:
@@ -749,12 +1101,108 @@ class CodexAgentRuntime(AgentRuntime):
         if reader_tasks:
             await asyncio.gather(*reader_tasks, return_exceptions=True)
 
+    async def _monitor_process(
+        self,
+        proc: asyncio.subprocess.Process,
+        *,
+        state: dict[str, Any],
+        trace_path: Path | None,
+        output_path: str | None,
+        process_attempt: int = 0,
+    ) -> None:
+        interval = _TRACE_HEARTBEAT_SECONDS
+        if interval <= 0 and _PRE_WORK_STALL_SECONDS > 0:
+            interval = min(60, max(1, _PRE_WORK_STALL_SECONDS))
+        if interval <= 0:
+            return
+
+        started = asyncio.get_running_loop().time()
+        while proc.returncode is None:
+            await asyncio.sleep(interval)
+            if proc.returncode is not None:
+                break
+            elapsed = asyncio.get_running_loop().time() - started
+            heartbeat = {
+                "pid": proc.pid,
+                "elapsed_seconds": round(elapsed, 1),
+                "output_file_size": _file_size(output_path),
+                "return_code": proc.returncode,
+                "stdout_lines": state.get("stdout_lines", 0),
+                "stderr_lines": state.get("stderr_lines", 0),
+                "stdout_events": state.get("stdout_events", 0),
+                "last_event_type": state.get("last_event_type", ""),
+                "last_item_type": state.get("last_item_type", ""),
+                "last_command": _truncate_trace_text(state.get("last_command", ""), 300),
+                "turn_started_at": state.get("turn_started_at"),
+                "substantive_event_seen": state.get("substantive_event_seen", False),
+                "pre_work_stall_seconds": _PRE_WORK_STALL_SECONDS,
+                "process_attempt": process_attempt,
+            }
+            if _TRACE_HEARTBEAT_SECONDS > 0:
+                self._write_trace(trace_path, "process.heartbeat", **heartbeat)
+                logger.info(
+                    "Codex heartbeat pid=%s elapsed=%.0fs trace=%s stdout_events=%s "
+                    "stderr_lines=%s output_bytes=%s last_event=%s last_item=%s",
+                    proc.pid,
+                    elapsed,
+                    trace_path,
+                    heartbeat["stdout_events"],
+                    heartbeat["stderr_lines"],
+                    heartbeat["output_file_size"],
+                    heartbeat["last_event_type"] or "<none>",
+                    heartbeat["last_item_type"] or "<none>",
+                )
+
+            turn_started = state.get("turn_started_monotonic")
+            if (
+                _PRE_WORK_STALL_SECONDS > 0
+                and turn_started is not None
+                and not state.get("substantive_event_seen", False)
+                and not state.get("pre_work_stall", False)
+            ):
+                pre_work_elapsed = asyncio.get_running_loop().time() - float(turn_started)
+                if pre_work_elapsed >= _PRE_WORK_STALL_SECONDS:
+                    state["pre_work_stall"] = True
+                    state["last_error"] = (
+                        "pre-work startup stall: turn.started emitted but no "
+                        "reasoning/tool/message event followed"
+                    )
+                    self._write_trace(
+                        trace_path,
+                        "process.pre_work_stall",
+                        pid=proc.pid,
+                        process_attempt=process_attempt,
+                        pre_work_elapsed_seconds=round(pre_work_elapsed, 1),
+                        timeout_seconds=_PRE_WORK_STALL_SECONDS,
+                        output_file_size=_file_size(output_path),
+                        stdout_events=state.get("stdout_events", 0),
+                        stderr_lines=state.get("stderr_lines", 0),
+                        last_event_type=state.get("last_event_type", ""),
+                        last_item_type=state.get("last_item_type", ""),
+                    )
+                    logger.warning(
+                        "Codex pre-work startup stall pid=%s attempt=%d "
+                        "elapsed=%.0fs trace=%s",
+                        proc.pid,
+                        process_attempt,
+                        pre_work_elapsed,
+                        trace_path,
+                    )
+                    with suppress(ProcessLookupError):
+                        proc.terminate()
+                    await asyncio.sleep(5)
+                    if proc.returncode is None:
+                        with suppress(ProcessLookupError):
+                            proc.kill()
+                    return
+
     async def _read_stdout(
         self,
         stdout: asyncio.StreamReader,
         *,
         state: dict[str, Any],
         output_type: type[BaseModel] | None,
+        trace_path: Path | None = None,
     ) -> None:
         buffer = ""
         while True:
@@ -772,6 +1220,7 @@ class CodexAgentRuntime(AgentRuntime):
                     line,
                     state=state,
                     output_type=output_type,
+                    trace_path=trace_path,
                 )
 
         if buffer.strip():
@@ -779,7 +1228,16 @@ class CodexAgentRuntime(AgentRuntime):
                 buffer,
                 state=state,
                 output_type=output_type,
+                trace_path=trace_path,
             )
+        self._write_trace(
+            trace_path,
+            "stdout.reader_done",
+            stdout_lines=state.get("stdout_lines", 0),
+            stdout_events=state.get("stdout_events", 0),
+            last_event_type=state.get("last_event_type", ""),
+            last_item_type=state.get("last_item_type", ""),
+        )
 
     def _handle_stdout_line(
         self,
@@ -787,39 +1245,93 @@ class CodexAgentRuntime(AgentRuntime):
         *,
         state: dict[str, Any],
         output_type: type[BaseModel] | None,
+        trace_path: Path | None,
     ) -> None:
         del output_type  # reserved for future event-specific handling
 
         text = line.strip()
         if not text:
             return
+        state["stdout_lines"] = int(state.get("stdout_lines", 0) or 0) + 1
         try:
             event = json.loads(text)
         except json.JSONDecodeError:
             logger.debug("Ignoring non-JSON Codex stdout line: %s", text)
+            self._write_trace(
+                trace_path,
+                "stdout.non_json",
+                line=_truncate_trace_text(text),
+            )
             return
+
+        event_type = str(event.get("type") or "")
+        state["stdout_events"] = int(state.get("stdout_events", 0) or 0) + 1
+        state["last_event_type"] = event_type
 
         if event.get("type") == "thread.started":
             state["thread_id"] = event.get("thread_id")
+            self._write_trace(
+                trace_path,
+                "stdout.thread_started",
+                thread_id=state["thread_id"],
+            )
+            return
+
+        if event.get("type") == "turn.started":
+            state["turn_started_monotonic"] = asyncio.get_running_loop().time()
+            state["turn_started_at"] = _utc_now_iso()
+            self._write_trace(
+                trace_path,
+                "stdout.turn_started",
+                turn_started_at=state["turn_started_at"],
+            )
             return
 
         if event.get("type") == "error":
             state["last_error"] = event.get("message", "")
+            state["substantive_event_seen"] = True
+            self._write_trace(
+                trace_path,
+                "stdout.error",
+                message=_truncate_trace_text(state["last_error"]),
+            )
             return
 
         if event.get("type") == "turn.failed":
             error = event.get("error") or {}
             state["last_error"] = error.get("message", "") or state["last_error"]
+            state["substantive_event_seen"] = True
+            self._write_trace(
+                trace_path,
+                "stdout.turn_failed",
+                message=_truncate_trace_text(state["last_error"]),
+            )
             return
 
         item = event.get("item") or {}
         item_type = item.get("type")
         item_id = item.get("id")
+        state["last_item_type"] = item_type or ""
 
         if item_type == "reasoning" and event.get("type") == "item.completed":
+            state["substantive_event_seen"] = True
+            self._write_trace(
+                trace_path,
+                "stdout.reasoning_completed",
+                item_id=item_id,
+                text_chars=len(str(item.get("text", ""))),
+            )
             self._emit(AssistantMessage([ThinkingBlock(item.get("text", ""))], id=item_id))
         elif item_type == "command_execution":
             if event.get("type") == "item.started":
+                state["substantive_event_seen"] = True
+                state["last_command"] = item.get("command", "") or ""
+                self._write_trace(
+                    trace_path,
+                    "stdout.command_started",
+                    item_id=item_id,
+                    command=_truncate_trace_text(state["last_command"]),
+                )
                 self._emit(
                     AssistantMessage(
                         [
@@ -832,6 +1344,15 @@ class CodexAgentRuntime(AgentRuntime):
                     )
                 )
             elif event.get("type") == "item.completed":
+                state["substantive_event_seen"] = True
+                self._write_trace(
+                    trace_path,
+                    "stdout.command_completed",
+                    item_id=item_id,
+                    exit_code=item.get("exit_code"),
+                    output_chars=len(str(item.get("aggregated_output", ""))),
+                    is_error=(item.get("exit_code") or 0) != 0,
+                )
                 self._emit(
                     AssistantMessage(
                         [
@@ -846,9 +1367,32 @@ class CodexAgentRuntime(AgentRuntime):
         elif item_type == "agent_message" and event.get("type") == "item.completed":
             message = item.get("text", "")
             state["last_agent_message"] = message
+            state["substantive_event_seen"] = True
+            self._write_trace(
+                trace_path,
+                "stdout.agent_message_completed",
+                item_id=item_id,
+                text_chars=len(message),
+            )
             self._emit(AssistantMessage([TextBlock(message)], id=item_id))
+        else:
+            if item_type:
+                state["substantive_event_seen"] = True
+            self._write_trace(
+                trace_path,
+                "stdout.event",
+                event_type=event_type,
+                item_type=item_type,
+                item_id=item_id,
+            )
 
-    async def _read_stderr(self, stderr: asyncio.StreamReader) -> str:
+    async def _read_stderr(
+        self,
+        stderr: asyncio.StreamReader,
+        *,
+        state: dict[str, Any],
+        trace_path: Path | None,
+    ) -> str:
         lines: list[str] = []
         while True:
             line = await stderr.readline()
@@ -857,6 +1401,18 @@ class CodexAgentRuntime(AgentRuntime):
             text = line.decode("utf-8", errors="replace").rstrip()
             if text:
                 lines.append(text)
+                state["stderr_lines"] = int(state.get("stderr_lines", 0) or 0) + 1
+                self._write_trace(
+                    trace_path,
+                    "stderr.line",
+                    line=_truncate_trace_text(text),
+                    stderr_lines=state["stderr_lines"],
+                )
+        self._write_trace(
+            trace_path,
+            "stderr.reader_done",
+            stderr_lines=state.get("stderr_lines", 0),
+        )
         return "\n".join(lines)
 
     def _emit(self, message: Any) -> None:

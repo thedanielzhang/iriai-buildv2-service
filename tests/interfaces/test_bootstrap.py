@@ -305,3 +305,57 @@ class TestBuildRunner:
         assert created == ["claude", "claude"]
         assert runner.kwargs["agent_runtime"].name == "claude"
         assert runner.kwargs["secondary_runtime"].name == "claude"
+
+    def test_claude_pool_primary_uses_codex_secondary_by_default(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        created: list[str | None] = []
+
+        def _fake_create_agent_runtime(
+            name: str | None,
+            *,
+            session_store=None,
+            on_message=None,
+            interactive_roles=None,
+        ):
+            del session_store, on_message, interactive_roles
+            created.append(name)
+            return SimpleNamespace(name=name)
+
+        class _FakeRunner:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+        monkeypatch.setattr(
+            "iriai_build_v2.runtimes.create_agent_runtime",
+            _fake_create_agent_runtime,
+        )
+        monkeypatch.setattr(
+            "iriai_build_v2.workflows.TrackedWorkflowRunner",
+            _FakeRunner,
+        )
+
+        env = SimpleNamespace(
+            sessions=object(),
+            feature_store=object(),
+            artifacts=object(),
+            context_provider=object(),
+            workspace=object(),
+            feedback_service=object(),
+            preview_service=object(),
+            playwright_service=object(),
+            artifact_mirror=object(),
+            workspace_manager=object(),
+        )
+
+        runner = build_runner(
+            env,
+            interaction_runtimes={"terminal": object()},
+            agent_runtime_name="claude_pool",
+        )
+
+        assert created == ["claude_pool", "codex"]
+        assert runner.kwargs["agent_runtime"].name == "claude_pool"
+        assert runner.kwargs["secondary_runtime"].name == "codex"
+        assert runner.kwargs["services"]["runtime_policy"] == "alternating"

@@ -1,5 +1,7 @@
 from .state import BuildState
 from .outputs import (
+    ArtifactRepairResult,
+    ArtifactRepairUpdate,
     PRD,
     BugFixResult,
     Check,
@@ -24,6 +26,8 @@ from .outputs import (
 
 __all__ = [
     "BuildState",
+    "ArtifactRepairResult",
+    "ArtifactRepairUpdate",
     "PRD",
     "BugFixResult",
     "Check",

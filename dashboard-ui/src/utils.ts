@@ -23,6 +23,8 @@ export function phaseColor(p: string): string {
   if (p === 'implementation') return 'var(--amber)'
   if (p === 'complete') return 'var(--green)'
   if (p === 'failed') return 'var(--red)'
+  if (p === 'task-planning' || p === 'task_planning') return 'var(--cyan)'
+  if (p === 'bugflow-queue' || p === 'diagnosis-fix') return 'var(--amber)'
   return 'var(--brand)'
 }
 
@@ -30,6 +32,7 @@ export function phaseCls(p: string): string {
   if (p === 'implementation') return 'impl'
   if (p === 'complete') return 'done'
   if (p === 'failed') return 'fail'
+  if (p === 'bugflow-queue' || p === 'diagnosis-fix') return 'impl'
   return 'other'
 }
 
@@ -82,20 +85,45 @@ export function getActiveStatus(data: { dag: any; groups: any[]; phase: string; 
   return humanPhase(phase)
 }
 
-function humanPhase(p: string): string {
+export function humanPhase(p: string): string {
   const map: Record<string, string> = {
     pm: 'Product management',
     scoping: 'Scoping',
+    broad: 'Broad planning',
     design: 'Design',
     architecture: 'Architecture',
+    subfeature: 'Subfeature planning',
     test_planning: 'Test planning',
+    'test-planning': 'Test planning',
     plan_review: 'Plan review',
+    'plan-review': 'Plan review',
     task_planning: 'Task planning',
+    'task-planning': 'Task planning',
     implementation: 'Implementation',
+    'post-test-observation': 'Post-test observation',
+    'bug-intake': 'Bug intake',
+    'env-setup': 'Environment setup',
+    'bug-reproduction': 'Bug reproduction',
+    baseline: 'Baseline',
+    'diagnosis-fix': 'Diagnosis and fix',
+    regression: 'Regression',
+    approval: 'Approval',
+    cleanup: 'Cleanup',
+    'bugflow-setup': 'Bugflow setup',
+    'bugflow-queue': 'Bugflow queue',
+    planned: 'Planned',
+    fixing: 'Fixing',
+    reverify: 'Reverify',
+    blocked: 'Blocked',
+    stalled: 'Stalled',
+    recovering: 'Recovering',
+    promotion_pending: 'Promotion pending',
+    promoting: 'Promoting',
+    resolved: 'Resolved',
     complete: 'Complete',
     failed: 'Failed',
   }
-  return map[p] || p
+  return map[p] || p.replace(/[-_]/g, ' ').replace(/\b\w/g, c => c.toUpperCase())
 }
 
 // Stuck threshold: 3 min before backend's 10 min watchdog kill
@@ -107,7 +135,7 @@ export function getHealthState(d: FeatureData): HealthState {
   }
 
   if (d.phase === 'complete') return 'complete'
-  if (d.phase === 'failed') return 'complete' // terminal — not stuck, just done
+  if (d.phase === 'failed') return 'blocked'
 
   // Best timestamp for "last known activity"
   const lastActive = d.last_activity_at || d.updated_at

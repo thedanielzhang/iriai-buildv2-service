@@ -1,19 +1,16 @@
 import { useMemo } from 'react'
 import { useStore } from '../store/useStore'
 import { relTime, phaseCls, getActiveStatus, getHealthState, getPhaseMode, healthCls } from '../utils'
-import { CurrentStatus } from './CurrentStatus'
-import { Workstreams } from './Workstreams'
-import { DagFlow } from './DagFlow'
-import { TaskList } from './TaskList'
-import { Gates } from './Gates'
-import { Timeline } from './Timeline'
-import { EventLog } from './EventLog'
-import { CollapsibleSection } from './CollapsibleSection'
 import { BugflowView } from './BugflowView'
+import { FeatureExhibitDashboard } from './XPCommandCenterMockup'
+import { PublicExhibitView } from './PublicExhibitView'
 
 export function WorkstreamView() {
+  const view = useStore(s => s.view)
   const d = useStore(s => s.data[s.view])
   const setView = useStore(s => s.setView)
+  const searchParams = typeof window !== 'undefined' ? new URLSearchParams(window.location.search) : new URLSearchParams()
+  const legacyView = searchParams.get('legacy') === '1' || searchParams.get('view') === 'legacy'
 
   const derived = useMemo(() => {
     if (!d) return null
@@ -34,6 +31,9 @@ export function WorkstreamView() {
   }, [d])
 
   if (!d || !derived) {
+    if (!legacyView) {
+      return <FeatureExhibitDashboard data={null} featureId={view} loading onHome={() => setView('overview')} />
+    }
     return <div className="loading"><div className="spinner" />Loading...</div>
   }
 
@@ -43,19 +43,9 @@ export function WorkstreamView() {
 
   const { health, phaseMode, status, activeGroup, completedGroups, totalGroups, completedTasks, totalTasks, passedGates, totalGates, activeTasks } = derived
 
-  // Phase-aware section visibility
-  const showDag = phaseMode !== 'planning'
-  const showTaskList = phaseMode === 'implementing' || phaseMode === 'fix-loop'
-  const showGates = phaseMode === 'gates' || phaseMode === 'complete'
-  const showTimeline = phaseMode !== 'planning'
-  const showEventLog = true // always visible
-
-  // Phase-aware defaultOpen
-  const dagDefaultOpen = phaseMode === 'implementing' || phaseMode === 'fix-loop'
-  const taskListDefaultOpen = phaseMode === 'implementing' && !!activeGroup && activeGroup.tasks.length > 0
-  const gatesDefaultOpen = phaseMode === 'gates'
-  const timelineDefaultOpen = phaseMode === 'fix-loop'
-  const eventLogDefaultOpen = phaseMode === 'planning'
+  if (!legacyView) {
+    return <FeatureExhibitDashboard data={d} featureId={d.id} onHome={() => setView('overview')} />
+  }
 
   return (
     <>
@@ -91,66 +81,17 @@ export function WorkstreamView() {
         )}
       </div>
 
-      {/* Detail sections from CurrentStatus (no summary row) */}
-      <CurrentStatus />
-
-      {d.workstreams?.length > 0 && (
-        <Workstreams workstreams={d.workstreams} />
-      )}
-
-      {showDag && (
-        d.dag && d.groups.length > 0 ? (
-          <CollapsibleSection
-            title={`DAG — ${completedGroups}/${totalGroups} groups`}
-            defaultOpen={dagDefaultOpen}
-          >
-            <DagFlow groups={d.groups} totalTasks={d.dag.total_tasks} totalGroups={d.dag.total_groups} />
-          </CollapsibleSection>
-        ) : (
-          <div className="section">
-            <div className="section-title">Implementation</div>
-            <div className="dag-flow" style={{ textAlign: 'center', color: 'var(--text-2)', padding: 40 }}>
-              No DAG yet — feature is in <strong>{d.phase}</strong> phase
-            </div>
-          </div>
-        )
-      )}
-
-      {showTaskList && activeGroup && activeGroup.tasks.length > 0 && (
-        <CollapsibleSection
-          title={`Group ${activeGroup.index} Tasks — ${activeGroup.completed_count}/${activeGroup.task_count}`}
-          defaultOpen={taskListDefaultOpen}
-        >
-          <TaskList tasks={activeGroup.tasks} groupIndex={activeGroup.index} />
-        </CollapsibleSection>
-      )}
-
-      {showGates && (
-        <CollapsibleSection
-          title={`Post-DAG Gates — ${passedGates}/${totalGates}`}
-          defaultOpen={gatesDefaultOpen}
-        >
-          <Gates gates={d.gates} />
-        </CollapsibleSection>
-      )}
-
-      {showTimeline && (
-        <CollapsibleSection
-          title={`Verify / Fix Timeline — ${d.timeline.length} entries`}
-          defaultOpen={timelineDefaultOpen}
-        >
-          <Timeline entries={d.timeline} />
-        </CollapsibleSection>
-      )}
-
-      {showEventLog && (
-        <CollapsibleSection
-          title={`Event Log — ${d.events.length} events`}
-          defaultOpen={eventLogDefaultOpen}
-        >
-          <EventLog events={d.events} />
-        </CollapsibleSection>
-      )}
+      <PublicExhibitView
+        data={d}
+        phaseMode={phaseMode}
+        activeGroup={activeGroup}
+        completedGroups={completedGroups}
+        totalGroups={totalGroups}
+        completedTasks={completedTasks}
+        totalTasks={totalTasks}
+        passedGates={passedGates}
+        totalGates={totalGates}
+      />
     </>
   )
 }

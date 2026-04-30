@@ -145,6 +145,44 @@ _KEY_MAP = {
     "test-plan": "test-plan.md",
 }
 
+_STRUCTURED_FAMILY_BASE_KEY = {
+    "decomposition-structured": "decomposition",
+    "prd-structured": "prd",
+    "design-structured": "design",
+    "plan-structured": "plan",
+    "system-design-structured": "system-design",
+    "test-plan-structured": "test-plan",
+    "decisions-structured": "decisions",
+}
+
+
+def structured_artifact_key(key: str) -> str:
+    """Return the canonical structured sidecar key for a source artifact key."""
+    if key == "decomposition":
+        return "decomposition-structured"
+    if ":" in key:
+        prefix, slug = key.split(":", 1)
+        return f"{prefix}-structured:{slug}"
+    return f"{key}-structured"
+
+
+def _structured_base_key(key: str) -> str | None:
+    if key == "decomposition-structured":
+        return "decomposition"
+    if ":" in key:
+        prefix, slug = key.split(":", 1)
+        base = _STRUCTURED_FAMILY_BASE_KEY.get(prefix)
+        if base is None:
+            return None
+        return f"{base}:{slug}"
+    return _STRUCTURED_FAMILY_BASE_KEY.get(key)
+
+
+def _replace_suffix(path: str, old: str, new: str) -> str:
+    if not path.endswith(old):
+        return path
+    return path[: -len(old)] + new
+
 
 def _sd_source_path(key: str) -> str | None:
     """Return the source markdown path for a system-design key, or None.
@@ -172,6 +210,20 @@ def _key_to_path(key: str) -> str:
       integration-review:pm       → reviews/pm.md
       mockup:visual-workflow      → subfeatures/visual-workflow/mockup.html
     """
+    structured_base = _structured_base_key(key)
+    if structured_base is not None:
+        base_path = _key_to_path(structured_base)
+        if base_path.endswith(".html"):
+            return _replace_suffix(base_path, ".html", ".json")
+        if base_path.endswith(".md"):
+            return _replace_suffix(base_path, ".md", ".json")
+        return f"{base_path}.json"
+
+    if key == "artifact-audit-summary":
+        return "artifact-audit-summary.json"
+    if key == "artifact-backfill-status":
+        return "artifact-backfill-status.json"
+
     # 1. Exact matches for standard compiled artifacts
     if key in _KEY_MAP:
         return _KEY_MAP[key]
@@ -205,6 +257,12 @@ def _key_to_path(key: str) -> str:
         return f"reviews/{slug}-gate-ledger.json"
     if prefix == "gate-enhancement-backlog":
         return f"reviews/{slug}-gate-enhancements.json"
+    if prefix == "artifact-audit":
+        return f"subfeatures/{slug}/artifact-audit.json"
+    if prefix == "planning-index":
+        if slug == "shared":
+            return "planning-index-shared.json"
+        return f"subfeatures/{slug}/planning-index.json"
     if prefix == "dag-slices":
         return f"subfeatures/{slug}/dag-slices.json"
     if prefix == "dag-fragment":
@@ -240,6 +298,15 @@ def _path_to_key(path: str | Path) -> str | None:
     if rel in top_level:
         return top_level[rel]
 
+    structured_top_level = {
+        "decomposition.json": "decomposition-structured",
+        "artifact-audit-summary.json": "artifact-audit-summary",
+        "artifact-backfill-status.json": "artifact-backfill-status",
+        "planning-index-shared.json": "planning-index:shared",
+    }
+    if rel in structured_top_level:
+        return structured_top_level[rel]
+
     broad_map = {
         "broad/decisions.md": "decisions:broad",
         "global/decisions.md": "decisions:global",
@@ -249,6 +316,11 @@ def _path_to_key(path: str | Path) -> str | None:
         "broad/strategy.md": "dag:strategy",
         "broad/design-decomp-alignment.md": "design:decomp-alignment",
         "broad/plan-decomp-alignment.md": "plan:decomp-alignment",
+        "broad/decisions.json": "decisions-structured:broad",
+        "global/decisions.json": "decisions-structured:global",
+        "broad/prd.json": "prd-structured:broad",
+        "broad/design-system.json": "design-structured:broad",
+        "broad/architecture.json": "plan-structured:broad",
     }
     if rel in broad_map:
         return broad_map[rel]
@@ -267,6 +339,10 @@ def _path_to_key(path: str | Path) -> str | None:
 
     if len(parts) == 3 and parts[0] == "subfeatures":
         slug, filename = parts[1], parts[2]
+        if filename == "artifact-audit.json":
+            return f"artifact-audit:{slug}"
+        if filename == "planning-index.json":
+            return f"planning-index:{slug}"
         if filename == "decisions-summary.md":
             return f"decisions-summary:{slug}"
         if filename == "system-design-source.md":
@@ -277,6 +353,13 @@ def _path_to_key(path: str | Path) -> str | None:
         if filename.endswith("-summary.md") or filename.endswith("-summary.html"):
             is_summary = True
             base_filename = filename.replace("-summary", "", 1)
+        elif filename.endswith(".json"):
+            for base_key, base_rel in _KEY_MAP.items():
+                candidate = base_rel.replace(".md", ".json").replace(".html", ".json")
+                if filename == candidate:
+                    return f"{base_key}-structured:{slug}"
+            if filename == "system-design.json":
+                return f"system-design-structured:{slug}"
         base_key = inverse.get(base_filename)
         if not base_key:
             stem = Path(base_filename).stem
@@ -289,5 +372,13 @@ def _path_to_key(path: str | Path) -> str | None:
 
     if len(parts) == 1 and Path(rel).suffix == ".md":
         return Path(rel).stem
+    if len(parts) == 1 and Path(rel).suffix == ".json":
+        stem = Path(rel).stem
+        if stem == "decomposition":
+            return "decomposition-structured"
+        if stem == "artifact-audit-summary":
+            return "artifact-audit-summary"
+        if stem == "artifact-backfill-status":
+            return "artifact-backfill-status"
 
     return None

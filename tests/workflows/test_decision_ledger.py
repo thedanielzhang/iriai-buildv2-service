@@ -256,6 +256,8 @@ async def test_compile_decision_ledger_merges_global_and_migrates_legacy_compile
     assert [decision.id for decision in global_ledger.decisions] == ["D-3"]
     assert [decision.id for decision in compiled_ledger.decisions] == ["D-1", "D-2", "D-3"]
     assert rebuilt_text == artifacts.values["decisions"]
+    assert "decisions-structured" not in artifacts.values
+    assert "decisions-structured:global" in artifacts.values
 
 
 @pytest.mark.asyncio

@@ -373,6 +373,16 @@ async def _store_decision_text(
     refresh_only: bool = False,
 ) -> None:
     await runner.artifacts.put(key, text, feature=feature)
+    if key.startswith("decisions:"):
+        from ._sidecars import refresh_sidecar_for_source_artifact
+
+        await refresh_sidecar_for_source_artifact(
+            runner,
+            feature,
+            key,
+            text,
+            generated_from="approved_object",
+        )
     mirror = runner.services.get("artifact_mirror")
     if mirror:
         mirror.write_artifact(feature.id, key, text)

@@ -8,14 +8,21 @@ if TYPE_CHECKING:
     from iriai_compose.runner import AgentRuntime
     from iriai_compose.storage import SessionStore
 
-AgentRuntimeName = Literal["claude", "codex"]
-SUPPORTED_AGENT_RUNTIMES: tuple[AgentRuntimeName, ...] = ("claude", "codex")
+AgentRuntimeName = Literal["claude", "codex", "claude_pool"]
+SUPPORTED_AGENT_RUNTIMES: tuple[AgentRuntimeName, ...] = (
+    "claude",
+    "codex",
+    "claude_pool",
+)
 
 _RUNTIME_ALIASES = {
     "anthropic": "claude",
     "claude": "claude",
+    "claude-pool": "claude_pool",
+    "claude_pool": "claude_pool",
     "openai": "codex",
     "codex": "codex",
+    "pool": "claude_pool",
 }
 
 
@@ -44,7 +51,7 @@ def secondary_agent_runtime_name(
     primary = normalize_agent_runtime(name)
     if single_runtime:
         return primary
-    return "codex" if primary == "claude" else primary
+    return "codex" if primary in {"claude", "claude_pool"} else primary
 
 
 def create_agent_runtime(
@@ -59,6 +66,15 @@ def create_agent_runtime(
         from .claude import ClaudeAgentRuntime
 
         return ClaudeAgentRuntime(
+            session_store=session_store,
+            on_message=on_message,
+            interactive_roles=interactive_roles,
+        )
+
+    if runtime_name == "claude_pool":
+        from .claude_pool import ClaudePoolRuntime
+
+        return ClaudePoolRuntime(
             session_store=session_store,
             on_message=on_message,
             interactive_roles=interactive_roles,

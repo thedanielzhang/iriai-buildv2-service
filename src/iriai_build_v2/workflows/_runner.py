@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import contextvars
+import hashlib
 import logging
 import time
 from contextlib import contextmanager
@@ -56,6 +57,17 @@ RESOLVE_RETRY_BACKOFF = 15  # seconds between retries
 
 class AgentStalled(RuntimeError):
     """Raised when an agent invocation produces no output for too long."""
+
+
+def _prompt_observability(prompt: str) -> dict[str, Any]:
+    preview = " ".join(prompt.strip().split())
+    if len(preview) > 800:
+        preview = preview[:797].rstrip() + "..."
+    return {
+        "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+        "prompt_preview": preview,
+        "prompt_length": len(prompt),
+    }
 
 
 @dataclass
@@ -323,7 +335,18 @@ class TrackedWorkflowRunner(DefaultWorkflowRunner):
                 logger.info("Budget mode: downgraded %s to sonnet", actor.name)
 
             await self.feature_store.log_event(
-                feature.id, "agent_start", actor.name,
+                feature.id,
+                "agent_start",
+                actor.name,
+                metadata={
+                    "phase_name": _phase_name_var.get(),
+                    "role_name": actor.role.name,
+                    "runtime_hint": actor.role.metadata.get("runtime"),
+                    "runtime_instance": getattr(actor.role.metadata.get("runtime_instance"), "name", None),
+                    "tools": list(actor.role.tools or []),
+                    "output_type": getattr(getattr(task, "output_type", None), "__name__", str(getattr(task, "output_type", "") or "")),
+                    **_prompt_observability(prompt),
+                },
             )
 
             # ── Pick the runtime this invocation will use ──────────
@@ -396,6 +419,19 @@ class TrackedWorkflowRunner(DefaultWorkflowRunner):
                     actor_name,
                 )
                 invocation_id = uuid4().hex
+                await self.feature_store.log_event(
+                    feature.id,
+                    "agent_invocation_start",
+                    actor.name,
+                    content=runtime_name,
+                    metadata={
+                        "phase_name": _phase_name_var.get(),
+                        "invocation_id": invocation_id,
+                        "runtime_name": runtime_name,
+                        "attempt": 0,
+                        "liveness_timeout_seconds": 0,
+                    },
+                )
                 self._record_invocation_started(
                     invocation_id,
                     runtime=target_runtime,
@@ -419,7 +455,11 @@ class TrackedWorkflowRunner(DefaultWorkflowRunner):
                         "agent_done",
                         actor.name,
                         content=runtime_name,
-                        metadata={"phase_name": _phase_name_var.get()},
+                        metadata={
+                            "phase_name": _phase_name_var.get(),
+                            "invocation_id": invocation_id,
+                            "runtime_name": runtime_name,
+                        },
                     )
                     return result
                 finally:
@@ -433,6 +473,19 @@ class TrackedWorkflowRunner(DefaultWorkflowRunner):
 
             for attempt in range(RESOLVE_MAX_RETRIES + 1):
                 invocation_id = uuid4().hex
+                await self.feature_store.log_event(
+                    feature.id,
+                    "agent_invocation_start",
+                    actor.name,
+                    content=runtime_name,
+                    metadata={
+                        "phase_name": _phase_name_var.get(),
+                        "invocation_id": invocation_id,
+                        "runtime_name": runtime_name,
+                        "attempt": attempt,
+                        "liveness_timeout_seconds": effective_timeout,
+                    },
+                )
                 self._record_invocation_started(
                     invocation_id,
                     runtime=target_runtime,
@@ -448,6 +501,13 @@ class TrackedWorkflowRunner(DefaultWorkflowRunner):
                     await self.feature_store.log_event(
                         feature.id, "agent_start", actor.name,
                         content=f"retry {attempt} after stall",
+                        metadata={
+                            "phase_name": _phase_name_var.get(),
+                            "invocation_id": invocation_id,
+                            "runtime_name": runtime_name,
+                            "attempt": attempt,
+                            "retry_reason": "stall",
+                        },
                     )
 
                 tracker = _LivenessTracker(
@@ -469,7 +529,12 @@ class TrackedWorkflowRunner(DefaultWorkflowRunner):
                         "agent_done",
                         actor.name,
                         content=runtime_name,
-                        metadata={"phase_name": _phase_name_var.get()},
+                        metadata={
+                            "phase_name": _phase_name_var.get(),
+                            "invocation_id": invocation_id,
+                            "runtime_name": runtime_name,
+                            "attempt": attempt,
+                        },
                     )
                     return result
                 except AgentStalled as exc:
@@ -666,17 +731,61 @@ class TrackedWorkflowRunner(DefaultWorkflowRunner):
     ) -> BaseModel:
         await workflow.on_start(self, feature, state)
         try:
+            from .public_exhibit import (
+                enqueue_public_exhibit_refresh,
+                ensure_public_summary_fallback,
+            )
+
+            await ensure_public_summary_fallback(
+                self,
+                feature,
+                reason="workflow-start-missing-public-summary",
+            )
+            await enqueue_public_exhibit_refresh(
+                self,
+                feature,
+                reason="workflow-start",
+                priority=10,
+            )
+        except Exception:
+            logger.warning("Failed to ensure public summary for %s", feature.id, exc_info=True)
+        try:
             for phase_cls in workflow.build_phases():
                 phase = phase_cls()
                 _phase_name_var.set(phase.name)
                 await self.feature_store.transition_phase(feature.id, phase.name)
                 await phase.on_start(self, feature, state)
+                await self.feature_store.log_event(
+                    feature.id,
+                    "phase_execute_start",
+                    "workflow",
+                    phase.name,
+                    metadata={"workflow": workflow.__class__.__name__},
+                )
                 try:
                     state = await phase.execute(self, feature, state)
-                except Exception:
+                except Exception as exc:
+                    await self.feature_store.log_event(
+                        feature.id,
+                        "phase_execute_error",
+                        "workflow",
+                        phase.name,
+                        metadata={
+                            "workflow": workflow.__class__.__name__,
+                            "error_type": type(exc).__name__,
+                            "error": str(exc)[:1000],
+                        },
+                    )
                     await phase.on_done(self, feature, state)
                     raise
                 await phase.on_done(self, feature, state)
+                await self.feature_store.log_event(
+                    feature.id,
+                    "phase_execute_done",
+                    "workflow",
+                    phase.name,
+                    metadata={"workflow": workflow.__class__.__name__},
+                )
             await self.feature_store.transition_phase(feature.id, "complete")
         except Exception:
             await workflow.on_done(self, feature, state)
@@ -705,6 +814,25 @@ class TrackedWorkflowRunner(DefaultWorkflowRunner):
         resume_idx = phase_names.index(resume_from_phase)
 
         await workflow.on_start(self, feature, state)
+        try:
+            from .public_exhibit import (
+                enqueue_public_exhibit_refresh,
+                ensure_public_summary_fallback,
+            )
+
+            await ensure_public_summary_fallback(
+                self,
+                feature,
+                reason="workflow-resume-missing-public-summary",
+            )
+            await enqueue_public_exhibit_refresh(
+                self,
+                feature,
+                reason="workflow-resume",
+                priority=10,
+            )
+        except Exception:
+            logger.warning("Failed to ensure public summary for %s", feature.id, exc_info=True)
 
         # Re-host artifacts from prior phases so browser review URLs work
         hosting = self.services.get("hosting")
@@ -734,12 +862,37 @@ class TrackedWorkflowRunner(DefaultWorkflowRunner):
                 _phase_name_var.set(phase.name)
                 await self.feature_store.transition_phase(feature.id, phase.name)
                 await phase.on_start(self, feature, state)
+                await self.feature_store.log_event(
+                    feature.id,
+                    "phase_execute_start",
+                    "resume",
+                    phase.name,
+                    metadata={"workflow": workflow.__class__.__name__},
+                )
                 try:
                     state = await phase.execute(self, feature, state)
-                except Exception:
+                except Exception as exc:
+                    await self.feature_store.log_event(
+                        feature.id,
+                        "phase_execute_error",
+                        "resume",
+                        phase.name,
+                        metadata={
+                            "workflow": workflow.__class__.__name__,
+                            "error_type": type(exc).__name__,
+                            "error": str(exc)[:1000],
+                        },
+                    )
                     await phase.on_done(self, feature, state)
                     raise
                 await phase.on_done(self, feature, state)
+                await self.feature_store.log_event(
+                    feature.id,
+                    "phase_execute_done",
+                    "resume",
+                    phase.name,
+                    metadata={"workflow": workflow.__class__.__name__},
+                )
             await self.feature_store.transition_phase(feature.id, "complete")
         except Exception:
             await workflow.on_done(self, feature, state)

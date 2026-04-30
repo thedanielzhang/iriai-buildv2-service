@@ -1,0 +1,1672 @@
+from __future__ import annotations
+
+import asyncio
+import contextvars
+import json
+import logging
+import math
+import os
+import plistlib
+import pwd
+import shlex
+import shutil
+import sys
+import time
+import uuid
+from contextlib import asynccontextmanager, suppress
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+from pydantic import BaseModel
+
+from iriai_compose.runner import AgentRuntime
+from iriai_compose.storage import AgentSession, SessionStore
+
+from .claude import _inline_defs
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from iriai_compose.actors import Role
+    from iriai_compose.workflow import Workspace
+
+logger = logging.getLogger(__name__)
+
+DEFAULT_POOL_ROOT = Path(
+    os.environ.get("IRIAI_CLAUDE_POOL_ROOT", "/Users/Shared/iriai/claude-pool")
+)
+DEFAULT_PROFILE_NAMES = ("iriai-claude-1", "iriai-claude-2", "iriai-claude-3")
+DEFAULT_PROFILE_WEIGHTS = {
+    "iriai-claude-1": 5.0,
+    "iriai-claude-2": 1.0,
+    "iriai-claude-3": 9.0,
+}
+LEGACY_DEFAULT_PROFILE_WEIGHTS = {
+    "iriai-claude-1": 5.0,
+    "iriai-claude-2": 1.0,
+    "iriai-claude-3": 12.0,
+}
+DEFAULT_CLAUDE_COMMAND = os.environ.get("IRIAI_CLAUDE_COMMAND", "/opt/homebrew/bin/claude")
+DEFAULT_POLL_INTERVAL_SECONDS = float(
+    os.environ.get("IRIAI_CLAUDE_POOL_POLL_INTERVAL_SECONDS", "1") or "1"
+)
+DEFAULT_HEARTBEAT_SECONDS = float(
+    os.environ.get("IRIAI_CLAUDE_POOL_HEARTBEAT_SECONDS", "10") or "10"
+)
+DEFAULT_HEARTBEAT_TIMEOUT_SECONDS = float(
+    os.environ.get("IRIAI_CLAUDE_POOL_HEARTBEAT_TIMEOUT_SECONDS", "180") or "180"
+)
+DEFAULT_HEALTH_TIMEOUT_SECONDS = float(
+    os.environ.get("IRIAI_CLAUDE_POOL_HEALTH_TIMEOUT_SECONDS", "60") or "60"
+)
+DEFAULT_RUNNER_UMASK = os.environ.get("IRIAI_CLAUDE_POOL_RUNNER_UMASK", "0002")
+DEFAULT_LIMIT_PROBE_AFTER_SECONDS = float(
+    os.environ.get("IRIAI_CLAUDE_POOL_LIMIT_PROBE_AFTER_SECONDS", "60") or "60"
+)
+DEFAULT_OVERLOAD_PROBE_AFTER_SECONDS = float(
+    os.environ.get("IRIAI_CLAUDE_POOL_OVERLOAD_PROBE_AFTER_SECONDS", "30") or "30"
+)
+DEFAULT_AUTH_PROBE_AFTER_SECONDS = float(
+    os.environ.get("IRIAI_CLAUDE_POOL_AUTH_PROBE_AFTER_SECONDS", "300") or "300"
+)
+DEFAULT_PROBE_FAILED_AFTER_SECONDS = float(
+    os.environ.get("IRIAI_CLAUDE_POOL_PROBE_FAILED_AFTER_SECONDS", "60") or "60"
+)
+DEFAULT_RECENT_USAGE_WINDOW_SECONDS = float(
+    os.environ.get("IRIAI_CLAUDE_POOL_RECENT_USAGE_WINDOW_SECONDS", "21600") or "21600"
+)
+DEFAULT_AVAILABILITY_TIMEOUT_SECONDS = float(
+    os.environ.get("IRIAI_CLAUDE_POOL_AVAILABILITY_TIMEOUT_SECONDS", "45") or "45"
+)
+DEFAULT_AVAILABILITY_PROBE_MODEL = os.environ.get(
+    "IRIAI_CLAUDE_POOL_PROBE_MODEL",
+    "claude-haiku-4-5-20251001",
+)
+DEFAULT_AVAILABILITY_PROBE_PROMPT = os.environ.get(
+    "IRIAI_CLAUDE_POOL_PROBE_PROMPT",
+    "Reply with exactly OK.",
+)
+
+_current_invocation_var: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "claude_pool_runtime_invocation_id", default=None,
+)
+
+
+@dataclass(frozen=True)
+class ClaudePoolProfile:
+    name: str
+    user: str
+    claude_command: str = DEFAULT_CLAUDE_COMMAND
+    weight: float = 1.0
+
+
+@dataclass
+class TextBlock:
+    text: str
+
+
+@dataclass
+class AssistantMessage:
+    content: list[Any]
+    id: str | None = None
+
+
+@dataclass
+class ResultMessage:
+    structured_output: Any = None
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(UTC).isoformat()
+
+
+def _parse_iso(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def _jsonable(value: Any) -> Any:
+    try:
+        json.dumps(value)
+        return value
+    except TypeError:
+        return str(value)
+
+
+def _safe_name(value: str) -> str:
+    cleaned = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "-" for ch in value)
+    return cleaned.strip("-") or "default"
+
+
+def _read_json(path: Path, default: Any) -> Any:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return default
+    except json.JSONDecodeError:
+        logger.warning("Ignoring invalid JSON in %s", path)
+        return default
+
+
+def _write_json_atomic(path: Path, payload: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    with suppress(OSError):
+        os.chmod(tmp, 0o664)
+    os.replace(tmp, path)
+
+
+def _ensure_dir(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    with suppress(OSError):
+        os.chmod(path, 0o775)
+
+
+def _apply_runner_umask(raw_umask: str = DEFAULT_RUNNER_UMASK) -> int:
+    """Make files created by Claude child processes group-writable.
+
+    Claude pool jobs run as different macOS users inside one shared feature
+    worktree. A default shell-style umask of 022 creates 755 directories, which
+    blocks sibling Claude accounts from writing follow-up files in the same
+    tree. Setting the runner process umask to 0002 makes child-created
+    directories 775 and files 664 while still avoiding world-writable output.
+    """
+    try:
+        umask = int(str(raw_umask), 8)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"Invalid IRIAI_CLAUDE_POOL_RUNNER_UMASK={raw_umask!r}; expected octal like 0002"
+        ) from exc
+    os.umask(umask)
+    return umask
+
+
+def _profile_entries_from_env() -> list[str]:
+    raw = os.environ.get("IRIAI_CLAUDE_POOL_PROFILES", "")
+    if raw.strip():
+        return [item.strip() for item in raw.split(",") if item.strip()]
+    return list(DEFAULT_PROFILE_NAMES)
+
+
+def _default_profile_weight(name: str) -> float:
+    return DEFAULT_PROFILE_WEIGHTS.get(name, 1.0)
+
+
+def _coerce_profile_weight(raw: Any, *, name: str) -> float:
+    if raw is None or raw == "":
+        return _default_profile_weight(name)
+    try:
+        weight = float(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid Claude pool weight for {name}: {raw!r}") from exc
+    if not math.isfinite(weight) or weight <= 0:
+        raise ValueError(f"Invalid Claude pool weight for {name}: {raw!r}")
+    return weight
+
+
+def _coerce_profile(entry: Any) -> ClaudePoolProfile:
+    if isinstance(entry, str):
+        return ClaudePoolProfile(name=entry, user=entry, weight=_default_profile_weight(entry))
+    if isinstance(entry, dict):
+        name = str(entry.get("name") or entry.get("user") or "").strip()
+        if not name:
+            raise ValueError(f"Invalid Claude pool profile entry: {entry!r}")
+        return ClaudePoolProfile(
+            name=name,
+            user=str(entry.get("user") or name),
+            claude_command=str(entry.get("claude_command") or DEFAULT_CLAUDE_COMMAND),
+            weight=_coerce_profile_weight(entry.get("weight"), name=name),
+        )
+    raise ValueError(f"Invalid Claude pool profile entry: {entry!r}")
+
+
+def _profile_entry_name(entry: Any) -> str:
+    if isinstance(entry, str):
+        return entry
+    if isinstance(entry, dict):
+        return str(entry.get("name") or entry.get("user") or "").strip()
+    return ""
+
+
+def _profile_entry_weight(entry: Any) -> float | None:
+    if not isinstance(entry, dict):
+        return None
+    raw = entry.get("weight")
+    if raw is None or raw == "":
+        return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def _migrate_legacy_default_profile_weights(entries: Any) -> tuple[Any, bool]:
+    """Move generated 5/1/12 profile configs to the current 5/1/9 default.
+
+    A pool generated before the 60% rebalance has explicit weights in
+    profiles.json, so changing only DEFAULT_PROFILE_WEIGHTS would not affect
+    existing installs. Only the exact known legacy default set is rewritten;
+    custom profile weights continue to win.
+    """
+    if not isinstance(entries, list):
+        return entries, False
+
+    by_name = {_profile_entry_name(entry): entry for entry in entries}
+    for name, legacy_weight in LEGACY_DEFAULT_PROFILE_WEIGHTS.items():
+        entry = by_name.get(name)
+        if entry is None:
+            return entries, False
+        weight = _profile_entry_weight(entry)
+        if weight is None or not math.isclose(weight, legacy_weight):
+            return entries, False
+
+    migrated: list[Any] = []
+    changed = False
+    for entry in entries:
+        name = _profile_entry_name(entry)
+        if name in DEFAULT_PROFILE_WEIGHTS and isinstance(entry, dict):
+            replacement = dict(entry)
+            replacement["weight"] = DEFAULT_PROFILE_WEIGHTS[name]
+            migrated.append(replacement)
+            changed = changed or not math.isclose(
+                float(entry.get("weight")),
+                DEFAULT_PROFILE_WEIGHTS[name],
+            )
+        else:
+            migrated.append(entry)
+    return migrated, changed
+
+
+def load_profiles(root: Path = DEFAULT_POOL_ROOT) -> list[ClaudePoolProfile]:
+    config_path = root / "profiles.json"
+    loaded_config = config_path.exists()
+    if config_path.exists():
+        data = _read_json(config_path, {})
+        entries = data.get("profiles", data) if isinstance(data, dict) else data
+    else:
+        entries = _profile_entries_from_env()
+    entries, migrated_defaults = _migrate_legacy_default_profile_weights(entries)
+    profiles = [_coerce_profile(entry) for entry in entries]
+    if not profiles:
+        raise RuntimeError("Claude pool has no configured profiles")
+    if loaded_config and migrated_defaults:
+        _write_json_atomic(
+            config_path,
+            {
+                "profiles": [
+                    {
+                        "name": profile.name,
+                        "user": profile.user,
+                        "claude_command": profile.claude_command,
+                        "weight": profile.weight,
+                    }
+                    for profile in profiles
+                ]
+            },
+        )
+    return profiles
+
+
+def ensure_pool_layout(
+    root: Path = DEFAULT_POOL_ROOT,
+    profiles: list[ClaudePoolProfile] | None = None,
+) -> list[ClaudePoolProfile]:
+    profiles = profiles or load_profiles(root)
+    _ensure_dir(root)
+    for relative in ("jobs", "payloads", "heartbeats", "logs", "launchagents"):
+        _ensure_dir(root / relative)
+    for profile in profiles:
+        for state in ("queued", "running", "done", "failed"):
+            _ensure_dir(root / "jobs" / state / profile.name)
+    profiles_path = root / "profiles.json"
+    if not profiles_path.exists():
+        _write_json_atomic(
+            profiles_path,
+            {
+                "profiles": [
+                    {
+                        "name": profile.name,
+                        "user": profile.user,
+                        "claude_command": profile.claude_command,
+                        "weight": profile.weight,
+                    }
+                    for profile in profiles
+                ]
+            },
+        )
+    return profiles
+
+
+def _job_filename(job_id: str) -> str:
+    return f"{job_id}.json"
+
+
+def _job_state_path(root: Path, state: str, profile: str, job_id: str) -> Path:
+    return root / "jobs" / state / profile / _job_filename(job_id)
+
+
+def _profile_state_path(root: Path) -> Path:
+    return root / "profile_state.json"
+
+
+def _payload_dir(root: Path, job_id: str) -> Path:
+    return root / "payloads" / job_id[:2] / job_id
+
+
+def _classify_claude_pool_error(error: str) -> str | None:
+    lowered = error.lower()
+    if "overloaded_error" in lowered or '"message":"overloaded"' in lowered or "overloaded" in lowered:
+        return "overloaded"
+    if (
+        "monthly usage limit" in lowered
+        or "usage limit" in lowered
+        or "out of extra usage" in lowered
+        or "rate_limit_error" in lowered
+        or "api_error_status=429" in lowered
+        or '"api_error_status":429' in lowered
+        or "api_error_status': 429" in lowered
+    ):
+        return "usage_limited"
+    if "login" in lowered or "not logged" in lowered or "auth" in lowered:
+        return "auth_failed"
+    return None
+
+
+def _probe_delay_seconds_for_error(kind: str) -> float:
+    if kind == "overloaded":
+        return DEFAULT_OVERLOAD_PROBE_AFTER_SECONDS
+    if kind == "auth_failed":
+        return DEFAULT_AUTH_PROBE_AFTER_SECONDS
+    if kind == "probe_failed":
+        return DEFAULT_PROBE_FAILED_AFTER_SECONDS
+    return DEFAULT_LIMIT_PROBE_AFTER_SECONDS
+
+
+def _profile_probe_after(record: dict[str, Any]) -> datetime | None:
+    # Accept the old cooldown field so live state from previous bridge attempts
+    # is treated as unavailable until it is probed and cleared.
+    return _parse_iso(str(record.get("probe_after") or record.get("cooldown_until") or ""))
+
+
+def _profile_unavailable_active(record: dict[str, Any], *, now: datetime | None = None) -> bool:
+    if str(record.get("status") or "") not in {"cooldown", "unavailable", "limited"}:
+        return False
+    until = _profile_probe_after(record)
+    if until is None:
+        return False
+    return until > (now or datetime.now(UTC))
+
+
+def _profile_probe_due(record: dict[str, Any], *, now: datetime | None = None) -> bool:
+    if str(record.get("status") or "") not in {"cooldown", "unavailable", "limited"}:
+        return False
+    until = _profile_probe_after(record)
+    if until is None:
+        return True
+    return until <= (now or datetime.now(UTC))
+
+
+def _extract_cost_and_tokens(result: dict[str, Any]) -> tuple[float, int]:
+    raw = result.get("raw")
+    payload = raw if isinstance(raw, dict) else result
+    cost = 0.0
+    tokens = 0
+    try:
+        cost = float(payload.get("total_cost_usd") or result.get("cost_usd") or 0.0)
+    except (TypeError, ValueError):
+        cost = 0.0
+    usage = payload.get("usage") if isinstance(payload, dict) else None
+    if isinstance(usage, dict):
+        for key in (
+            "input_tokens",
+            "output_tokens",
+            "cache_creation_input_tokens",
+            "cache_read_input_tokens",
+        ):
+            try:
+                tokens += int(usage.get(key) or 0)
+            except (TypeError, ValueError):
+                pass
+    model_usage = payload.get("modelUsage") if isinstance(payload, dict) else None
+    if isinstance(model_usage, dict):
+        for item in model_usage.values():
+            if not isinstance(item, dict):
+                continue
+            if not cost:
+                try:
+                    cost += float(item.get("costUSD") or 0.0)
+                except (TypeError, ValueError):
+                    pass
+            for key in (
+                "inputTokens",
+                "outputTokens",
+                "cacheCreationInputTokens",
+                "cacheReadInputTokens",
+            ):
+                try:
+                    tokens += int(item.get(key) or 0)
+                except (TypeError, ValueError):
+                    pass
+    return cost, tokens
+
+
+def _extract_result_text(raw: Any) -> str:
+    if isinstance(raw, dict):
+        for key in ("result", "text", "message", "content"):
+            value = raw.get(key)
+            if isinstance(value, str):
+                return value
+            if isinstance(value, list):
+                parts: list[str] = []
+                for item in value:
+                    if isinstance(item, dict) and isinstance(item.get("text"), str):
+                        parts.append(item["text"])
+                    elif isinstance(item, str):
+                        parts.append(item)
+                if parts:
+                    return "\n".join(parts)
+        if raw:
+            return json.dumps(raw)
+    if isinstance(raw, str):
+        return raw
+    return "" if raw is None else str(raw)
+
+
+def _extract_structured_output(raw: Any, result_text: str) -> Any:
+    if isinstance(raw, dict):
+        for key in ("structured_output", "output", "json"):
+            value = raw.get(key)
+            if value is not None:
+                return value
+        result = raw.get("result")
+        if isinstance(result, dict):
+            return result
+    try:
+        parsed = json.loads(result_text)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    return parsed
+
+
+def _looks_logged_in(text: str) -> bool:
+    lowered = text.lower()
+    if "loggedin" in lowered and "true" in lowered:
+        return True
+    if "logged in" in lowered and "not logged" not in lowered:
+        return True
+    return False
+
+
+class ClaudePoolRuntime(AgentRuntime):
+    """Claude CLI runtime that dispatches jobs to per-user GUI-session runners."""
+
+    name = "claude_pool"
+
+    def __init__(
+        self,
+        session_store: SessionStore | None = None,
+        on_message: Callable[[Any], None] | None = None,
+        *,
+        interactive_roles: set[str] | None = None,
+        root: Path | str | None = None,
+        profiles: list[ClaudePoolProfile] | None = None,
+        poll_interval: float = DEFAULT_POLL_INTERVAL_SECONDS,
+        heartbeat_timeout: float = DEFAULT_HEARTBEAT_TIMEOUT_SECONDS,
+    ) -> None:
+        self.root = Path(root) if root else DEFAULT_POOL_ROOT
+        self.profiles = ensure_pool_layout(self.root, profiles)
+        self.session_store = session_store
+        self.on_message = on_message
+        self._interactive_roles = interactive_roles or set()
+        self._poll_interval = poll_interval
+        self._heartbeat_timeout = heartbeat_timeout
+        self._affinity_lock = asyncio.Lock()
+        self._invocation_jobs: dict[str, set[str]] = {}
+        self._feature_sessions: dict[str, str] = {}
+        self._queued_user_notes: dict[str, list[str]] = {}
+
+    @asynccontextmanager
+    async def bind_invocation(self, invocation_id: str, activity_sink: Any | None):
+        del activity_sink
+        token = _current_invocation_var.set(invocation_id)
+        self._invocation_jobs.setdefault(invocation_id, set())
+        try:
+            yield
+        finally:
+            _current_invocation_var.reset(token)
+            self._invocation_jobs.pop(invocation_id, None)
+
+    def invocation_has_live_work(self, invocation_id: str) -> bool:
+        job_ids = self._invocation_jobs.get(invocation_id, set())
+        return any(self._job_is_live(job_id) for job_id in job_ids)
+
+    def _job_is_live(self, job_id: str) -> bool:
+        for profile in self.profiles:
+            queued = _job_state_path(self.root, "queued", profile.name, job_id)
+            if queued.exists():
+                return True
+            running = _job_state_path(self.root, "running", profile.name, job_id)
+            if running.exists():
+                manifest = _read_json(running, {})
+                heartbeat = _parse_iso(manifest.get("heartbeat_at") or manifest.get("updated_at"))
+                if heartbeat is None:
+                    return True
+                age = (datetime.now(UTC) - heartbeat).total_seconds()
+                return age <= self._heartbeat_timeout
+        return False
+
+    async def invoke(
+        self,
+        role: Role,
+        prompt: str,
+        *,
+        output_type: type[BaseModel] | None = None,
+        workspace: Workspace | None = None,
+        session_key: str | None = None,
+    ) -> str | BaseModel:
+        feature_id = session_key.rsplit(":", 1)[-1] if session_key else None
+        max_chars = int(role.metadata.get("max_session_chars", 0) or 0)
+        persistent = bool(session_key and max_chars)
+
+        if feature_id and session_key and (persistent or role.name in self._interactive_roles):
+            self._feature_sessions[feature_id] = session_key
+
+        session: AgentSession | None = None
+        if session_key and self.session_store:
+            if not persistent:
+                await self.session_store.delete(session_key)
+            else:
+                session = await self.session_store.load(session_key)
+
+        profile = await self._select_profile(session_key=session_key, persistent=persistent)
+        effective_prompt = self._compose_prompt(
+            role,
+            prompt,
+            feature_id=feature_id,
+            session=session,
+            output_type=output_type,
+        )
+
+        if not output_type:
+            final_text, structured_output, raw = await self._submit_and_wait_with_failover(
+                role,
+                effective_prompt,
+                output_type=None,
+                workspace=workspace,
+                session_key=session_key,
+                profile=profile,
+                persistent=persistent,
+            )
+            await self._save_session_turn(session_key, session, final_text)
+            self._emit_completion(final_text, structured_output)
+            return final_text
+
+        final_text = ""
+        structured_output: Any = None
+        raw: Any = None
+        last_error: Exception | None = None
+        attempt_prompt = effective_prompt
+        for attempt in range(3):
+            final_text, structured_output, raw = await self._submit_and_wait_with_failover(
+                role,
+                attempt_prompt,
+                output_type=output_type,
+                workspace=workspace,
+                session_key=session_key,
+                profile=profile,
+                persistent=persistent,
+            )
+            try:
+                payload = structured_output
+                if payload is None:
+                    payload = json.loads(final_text)
+                result = output_type.model_validate(payload)
+                await self._save_session_turn(session_key, session, final_text)
+                self._emit_completion(final_text, payload)
+                return result
+            except Exception as exc:
+                last_error = exc
+                if attempt >= 2:
+                    break
+                attempt_prompt = (
+                    f"Your previous response was not valid JSON for {output_type.__name__}. "
+                    f"Error: {exc}\n\n"
+                    "Please output ONLY valid JSON matching the schema.\n\n"
+                    f"Previous response:\n{final_text}"
+                )
+
+        await self._save_session_turn(session_key, session, final_text)
+        self._emit_completion(final_text, structured_output)
+        fallback = self._structured_fallback(output_type, session_key, final_text, last_error)
+        if fallback is not None:
+            return fallback
+        raise RuntimeError(
+            f"Claude pool failed to return valid JSON for {output_type.__name__} "
+            f"after 3 attempts: {last_error}"
+        )
+
+    def _compose_prompt(
+        self,
+        role: Role,
+        prompt: str,
+        *,
+        feature_id: str | None,
+        session: AgentSession | None,
+        output_type: type[BaseModel] | None,
+    ) -> str:
+        sections = [
+            "You are running as an agent inside the iriai-build-v2 workflow engine.",
+        ]
+        notes = self._consume_user_notes(feature_id)
+        if notes:
+            sections.append(
+                "## User Notes Since The Last Agent Turn\n"
+                + "\n".join(f"- {note}" for note in notes)
+            )
+        prior = self._fallback_session_context(role, session)
+        if prior:
+            sections.append(prior)
+        if output_type:
+            sections.append(
+                f"## Output Contract\nReturn JSON matching the {output_type.__name__} schema."
+            )
+        sections.append(f"## Current Task\n{prompt}")
+        return "\n\n".join(section for section in sections if section.strip())
+
+    def _fallback_session_context(self, role: Role, session: AgentSession | None) -> str:
+        if not session:
+            return ""
+        turns = session.metadata.get("turns", [])
+        if not turns:
+            return ""
+        keep_recent = max(int(role.metadata.get("keep_recent_messages", 6) or 6) * 2, 8)
+        rendered: list[str] = []
+        for turn in turns[-keep_recent:]:
+            who = str(turn.get("role", "assistant")).title()
+            text = str(turn.get("text", "")).strip()
+            if text:
+                rendered.append(f"{who}: {text}")
+        if not rendered:
+            return ""
+        return "## Prior Conversation\n" + "\n\n".join(rendered)
+
+    def _consume_user_notes(self, feature_id: str | None) -> list[str]:
+        if not feature_id:
+            return []
+        return self._queued_user_notes.pop(feature_id, [])
+
+    async def _select_profile(self, *, session_key: str | None, persistent: bool) -> ClaudePoolProfile:
+        async with self._affinity_lock:
+            path = self.root / "affinity.json"
+            data = _read_json(path, {"next_index": 0, "session_profiles": {}})
+            self._sync_affinity_weights(data)
+            session_profiles = data.setdefault("session_profiles", {})
+            names = [profile.name for profile in self.profiles]
+            state = _read_json(_profile_state_path(self.root), {})
+
+            if persistent and session_key:
+                existing = session_profiles.get(session_key)
+                if existing in names:
+                    state = await self._refresh_due_profile_state(state, [existing])
+                if existing in names and not self._profile_is_unavailable(existing, state):
+                    profile = self._profile_by_name(existing)
+                    self._record_profile_dispatch(data, profile)
+                    _write_json_atomic(path, data)
+                    return profile
+
+            state = await self._refresh_due_profile_state(state, names)
+            profile = await self._select_best_available_profile(data, state)
+            selected_index = names.index(profile.name)
+            data["next_index"] = (selected_index + 1) % len(self.profiles)
+            if persistent and session_key:
+                session_profiles[session_key] = profile.name
+            self._record_profile_dispatch(data, profile)
+            _write_json_atomic(path, data)
+            return profile
+
+    def _sync_affinity_weights(self, affinity_data: dict[str, Any]) -> None:
+        weights = {profile.name: profile.weight for profile in self.profiles}
+        if affinity_data.get("profile_weights") != weights:
+            affinity_data["profile_weights"] = weights
+            affinity_data["profile_dispatch_counts"] = {}
+
+    def _record_profile_dispatch(
+        self,
+        affinity_data: dict[str, Any],
+        profile: ClaudePoolProfile,
+    ) -> None:
+        counts = affinity_data.setdefault("profile_dispatch_counts", {})
+        if not isinstance(counts, dict):
+            counts = {}
+            affinity_data["profile_dispatch_counts"] = counts
+        try:
+            current = int(counts.get(profile.name) or 0)
+        except (TypeError, ValueError):
+            current = 0
+        counts[profile.name] = current + 1
+
+    def _profile_by_name(self, name: str) -> ClaudePoolProfile:
+        for profile in self.profiles:
+            if profile.name == name:
+                return profile
+        raise KeyError(name)
+
+    def _profile_is_unavailable(self, profile_name: str, state: dict[str, Any] | None = None) -> bool:
+        state = state if state is not None else _read_json(_profile_state_path(self.root), {})
+        record = (state.get("profiles") or {}).get(profile_name)
+        return isinstance(record, dict) and _profile_unavailable_active(record)
+
+    async def _select_best_available_profile(
+        self,
+        affinity_data: dict[str, Any],
+        state: dict[str, Any],
+    ) -> ClaudePoolProfile:
+        names = [profile.name for profile in self.profiles]
+        next_index = int(affinity_data.get("next_index", 0) or 0)
+        profile_state = state.get("profiles") if isinstance(state, dict) else {}
+        now = datetime.now(UTC)
+        available: list[ClaudePoolProfile] = []
+        unavailable: list[tuple[datetime, ClaudePoolProfile]] = []
+        for profile in self.profiles:
+            record = profile_state.get(profile.name) if isinstance(profile_state, dict) else None
+            if isinstance(record, dict) and _profile_unavailable_active(record, now=now):
+                until = _profile_probe_after(record) or now
+                unavailable.append((until, profile))
+            else:
+                available.append(profile)
+
+        if not available and unavailable:
+            # If every account is currently marked limited, cycle cheap probes
+            # before burning a real implementation/verification request.
+            for _until, profile in sorted(unavailable, key=lambda item: item[0]):
+                if await self._probe_profile_available(profile):
+                    state = _read_json(_profile_state_path(self.root), {})
+                    profile_state = state.get("profiles") if isinstance(state, dict) else {}
+                    record = (
+                        profile_state.get(profile.name)
+                        if isinstance(profile_state, dict) else None
+                    )
+                    if not (isinstance(record, dict) and _profile_unavailable_active(record)):
+                        available.append(profile)
+                        break
+
+        if not available:
+            next_probe = min((until for until, _profile in unavailable), default=now)
+            raise RuntimeError(
+                "No Claude pool profile is currently available; "
+                f"next readiness probe after {next_probe.isoformat()}"
+            )
+
+        def _tie_index(profile: ClaudePoolProfile) -> int:
+            idx = names.index(profile.name)
+            return (idx - next_index) % len(names)
+
+        counts = affinity_data.get("profile_dispatch_counts")
+        dispatch_counts = counts if isinstance(counts, dict) else {}
+
+        def _weighted_score(profile: ClaudePoolProfile) -> float:
+            try:
+                dispatch_count = float(dispatch_counts.get(profile.name) or 0.0)
+            except (TypeError, ValueError):
+                dispatch_count = 0.0
+            return (self._profile_load_score(profile.name) + dispatch_count) / profile.weight
+
+        return min(available, key=lambda profile: (_weighted_score(profile), _tie_index(profile)))
+
+    async def _refresh_due_profile_state(
+        self,
+        state: dict[str, Any],
+        profile_names: list[str],
+    ) -> dict[str, Any]:
+        profile_state = state.get("profiles") if isinstance(state, dict) else {}
+        if not isinstance(profile_state, dict):
+            return state
+        now = datetime.now(UTC)
+        for profile_name in profile_names:
+            record = profile_state.get(profile_name)
+            if not isinstance(record, dict) or not _profile_probe_due(record, now=now):
+                continue
+            try:
+                await self._probe_profile_available(self._profile_by_name(profile_name))
+            finally:
+                state = _read_json(_profile_state_path(self.root), {})
+                profile_state = state.get("profiles") if isinstance(state, dict) else {}
+                if not isinstance(profile_state, dict):
+                    break
+        return state
+
+    async def _probe_profile_available(self, profile: ClaudePoolProfile) -> bool:
+        try:
+            result = await submit_availability_check(
+                root=self.root,
+                profile=profile,
+                timeout=DEFAULT_AVAILABILITY_TIMEOUT_SECONDS,
+            )
+        except Exception as exc:
+            kind = _classify_claude_pool_error(str(exc)) or "probe_failed"
+            self._mark_profile_unavailable(profile, kind, str(exc))
+            logger.info("Claude pool profile %s readiness probe failed: %s", profile.name, exc)
+            return False
+        if result.get("ok", False):
+            self._clear_profile_unavailable(profile.name)
+            logger.info("Claude pool profile %s readiness probe succeeded", profile.name)
+            return True
+        error = str(result.get("error") or result)
+        self._mark_profile_failure(profile, error)
+        return False
+
+    def _profile_load_score(self, profile_name: str) -> float:
+        active = 0
+        for state_name in ("queued", "running"):
+            active += len(list((self.root / "jobs" / state_name / profile_name).glob("*.json")))
+
+        recent_cost = 0.0
+        recent_tokens = 0
+        cutoff = time.time() - DEFAULT_RECENT_USAGE_WINDOW_SECONDS
+        for state_name in ("done", "failed"):
+            for job_path in (self.root / "jobs" / state_name / profile_name).glob("*.json"):
+                try:
+                    if job_path.stat().st_mtime < cutoff:
+                        continue
+                except OSError:
+                    continue
+                manifest = _read_json(job_path, {})
+                result_path = ((manifest.get("paths") or {}).get("result"))
+                if not result_path:
+                    continue
+                result = _read_json(Path(result_path), {})
+                if not isinstance(result, dict):
+                    continue
+                cost, tokens = _extract_cost_and_tokens(result)
+                recent_cost += cost
+                recent_tokens += tokens
+        return (active * 1000.0) + (recent_cost * 100.0) + (recent_tokens / 100_000.0)
+
+    def _clear_profile_unavailable(self, profile_name: str) -> None:
+        state_path = _profile_state_path(self.root)
+        state = _read_json(state_path, {})
+        profiles = state.get("profiles")
+        if isinstance(profiles, dict) and profile_name in profiles:
+            profiles.pop(profile_name, None)
+            _write_json_atomic(state_path, state)
+
+    def _mark_profile_unavailable(
+        self,
+        profile: ClaudePoolProfile,
+        kind: str,
+        error: str,
+    ) -> None:
+        probe_delay_seconds = _probe_delay_seconds_for_error(kind)
+        now = datetime.now(UTC)
+        state_path = _profile_state_path(self.root)
+        state = _read_json(state_path, {})
+        profiles = state.setdefault("profiles", {})
+        previous = profiles.get(profile.name) if isinstance(profiles, dict) else {}
+        failure_count = 0
+        if isinstance(previous, dict):
+            try:
+                failure_count = int(previous.get("failure_count") or 0)
+            except (TypeError, ValueError):
+                failure_count = 0
+        profiles[profile.name] = {
+            "status": "unavailable",
+            "reason": kind,
+            "probe_after": (now + timedelta(seconds=probe_delay_seconds)).isoformat(),
+            "last_error": error[-2000:],
+            "updated_at": now.isoformat(),
+            "failure_count": failure_count + 1,
+        }
+        _write_json_atomic(state_path, state)
+        logger.warning(
+            "Marked Claude pool profile %s unavailable after %s; next readiness probe in %.0fs",
+            profile.name,
+            kind,
+            probe_delay_seconds,
+        )
+
+    def _mark_profile_failure(self, profile: ClaudePoolProfile, error: str) -> None:
+        kind = _classify_claude_pool_error(error)
+        if not kind:
+            return
+        self._mark_profile_unavailable(profile, kind, error)
+
+    async def _submit_and_wait_with_failover(
+        self,
+        role: Role,
+        prompt: str,
+        *,
+        output_type: type[BaseModel] | None,
+        workspace: Workspace | None,
+        session_key: str | None,
+        profile: ClaudePoolProfile,
+        persistent: bool,
+    ) -> tuple[str, Any, Any]:
+        attempted: set[str] = set()
+        last_kind: str | None = None
+        last_error: RuntimeError | None = None
+
+        for _ in range(max(len(self.profiles), 1)):
+            if self._profile_is_unavailable(profile.name):
+                profile = await self._select_profile(session_key=session_key, persistent=persistent)
+            attempted.add(profile.name)
+            try:
+                return await self._submit_and_wait(
+                    role,
+                    prompt,
+                    output_type=output_type,
+                    workspace=workspace,
+                    session_key=session_key,
+                    profile=profile,
+                )
+            except RuntimeError as exc:
+                kind = _classify_claude_pool_error(str(exc))
+                if not kind:
+                    raise
+                last_kind = kind
+                last_error = exc
+                self._mark_profile_unavailable(profile, kind, str(exc))
+                logger.warning(
+                    "Claude pool profile %s hit %s; retrying on another available profile",
+                    profile.name,
+                    kind,
+                )
+                try:
+                    next_profile = await self._select_profile(
+                        session_key=session_key,
+                        persistent=persistent,
+                    )
+                except RuntimeError as select_exc:
+                    raise RuntimeError(
+                        f"Claude pool exhausted after {kind} on {profile.name}: {select_exc}"
+                    ) from exc
+                if next_profile.name in attempted:
+                    break
+                profile = next_profile
+
+        detail = f" after {last_kind}" if last_kind else ""
+        attempted_text = ", ".join(sorted(attempted)) or "none"
+        raise RuntimeError(
+            f"Claude pool exhausted{detail}; attempted profiles: {attempted_text}"
+        ) from last_error
+
+    async def _submit_and_wait(
+        self,
+        role: Role,
+        prompt: str,
+        *,
+        output_type: type[BaseModel] | None,
+        workspace: Workspace | None,
+        session_key: str | None,
+        profile: ClaudePoolProfile,
+    ) -> tuple[str, Any, Any]:
+        job_id = uuid.uuid4().hex
+        invocation_id = _current_invocation_var.get()
+        if invocation_id:
+            self._invocation_jobs.setdefault(invocation_id, set()).add(job_id)
+        payload_dir = _payload_dir(self.root, job_id)
+        _ensure_dir(payload_dir)
+
+        prompt_path = payload_dir / "prompt.md"
+        system_prompt_path = payload_dir / "system_prompt.md"
+        schema_path = payload_dir / "schema.json"
+        result_path = payload_dir / "result.json"
+        stdout_path = payload_dir / "stdout.json"
+        stderr_path = payload_dir / "stderr.log"
+
+        prompt_path.write_text(prompt, encoding="utf-8")
+        system_prompt_path.write_text(role.prompt or "", encoding="utf-8")
+        if output_type:
+            schema = _inline_defs(output_type.model_json_schema())
+            schema_path.write_text(json.dumps(schema, indent=2, sort_keys=True), encoding="utf-8")
+
+        manifest = {
+            "id": job_id,
+            "kind": "claude",
+            "profile": profile.name,
+            "status": "queued",
+            "created_at": _utc_now_iso(),
+            "updated_at": _utc_now_iso(),
+            "session_key": session_key,
+            "feature_id": session_key.rsplit(":", 1)[-1] if session_key and ":" in session_key else None,
+            "cwd": str(workspace.path) if workspace and workspace.path else None,
+            "role": {
+                "name": role.name,
+                "model": str(role.model or "claude-opus-4-7"),
+                "effort": str(role.effort) if role.effort is not None else "high",
+                "tools": [str(tool) for tool in (role.tools or [])],
+                "metadata": {str(k): _jsonable(v) for k, v in (role.metadata or {}).items()},
+            },
+            "paths": {
+                "prompt": str(prompt_path),
+                "system_prompt": str(system_prompt_path),
+                "schema": str(schema_path) if output_type else None,
+                "result": str(result_path),
+                "stdout": str(stdout_path),
+                "stderr": str(stderr_path),
+            },
+            "claude": {
+                "command": profile.claude_command,
+                "permission_mode": "bypassPermissions",
+                "add_dirs": [os.path.expanduser("~/.npm")],
+            },
+        }
+        queued_path = _job_state_path(self.root, "queued", profile.name, job_id)
+        _write_json_atomic(queued_path, manifest)
+        logger.info("Queued Claude pool job %s on profile %s", job_id, profile.name)
+
+        done_path = _job_state_path(self.root, "done", profile.name, job_id)
+        failed_path = _job_state_path(self.root, "failed", profile.name, job_id)
+        while True:
+            if done_path.exists():
+                result = _read_json(result_path, {})
+                if not result.get("ok", False):
+                    error = result.get("error") or f"Claude pool job {job_id} failed"
+                    raise RuntimeError(error)
+                return (
+                    str(result.get("result_text") or ""),
+                    result.get("structured_output"),
+                    result.get("raw"),
+                )
+            if failed_path.exists():
+                result = _read_json(result_path, {})
+                error = result.get("error") or _read_json(failed_path, {}).get("error")
+                raise RuntimeError(error or f"Claude pool job {job_id} failed")
+            await asyncio.sleep(self._poll_interval)
+
+    async def _save_session_turn(
+        self,
+        session_key: str | None,
+        existing: AgentSession | None,
+        final_text: str,
+    ) -> None:
+        if not session_key or not self.session_store:
+            return
+        current = existing or await self.session_store.load(session_key)
+        if current is None:
+            current = AgentSession(session_key=session_key)
+        current.session_id = None
+        turns = current.metadata.get("turns", [])
+        turns.append({"role": "assistant", "text": final_text, "turn": len(turns) + 1})
+        current.metadata["turns"] = turns
+        await self.session_store.save(current)
+
+    def _emit_completion(self, final_text: str, structured_output: Any) -> None:
+        if self.on_message is None:
+            return
+        if final_text:
+            self.on_message(AssistantMessage(content=[TextBlock(text=final_text)]))
+        self.on_message(ResultMessage(structured_output=structured_output))
+
+    def _structured_fallback(
+        self,
+        output_type: type[BaseModel],
+        session_key: str | None,
+        final_text: str,
+        error: Exception | None,
+    ) -> BaseModel | None:
+        from ..models.outputs import ImplementationResult, Issue, Verdict
+
+        if output_type is ImplementationResult:
+            return ImplementationResult(
+                task_id=session_key.split(":")[0] if session_key else "unknown",
+                summary=final_text or "Agent completed work but could not produce structured summary",
+            )
+        if output_type is Verdict:
+            return Verdict(
+                approved=False,
+                summary="Verdict could not be produced (structured output failed)",
+                concerns=[
+                    Issue(
+                        severity="blocker",
+                        description=(
+                            "Agent failed to produce structured Verdict. "
+                            f"Error: {error}. Last result: {final_text or 'empty'}"
+                        ),
+                    )
+                ],
+            )
+        return None
+
+    async def inject_user_message(self, feature_id: str, text: str) -> bool:
+        del feature_id, text
+        return False
+
+    def has_active_agent(self, feature_id: str) -> bool:
+        del feature_id
+        return False
+
+    def get_active_session_key(self, feature_id: str) -> str | None:
+        return self._feature_sessions.get(feature_id)
+
+    def queue_user_note(self, feature_id: str, text: str) -> None:
+        self._queued_user_notes.setdefault(feature_id, []).append(text)
+
+
+class ClaudePoolRunner:
+    """Per-profile runner intended to run as the matching macOS user."""
+
+    def __init__(
+        self,
+        *,
+        profile: str,
+        root: Path | str = DEFAULT_POOL_ROOT,
+        poll_interval: float = DEFAULT_POLL_INTERVAL_SECONDS,
+        heartbeat_interval: float = DEFAULT_HEARTBEAT_SECONDS,
+    ) -> None:
+        self.root = Path(root)
+        self.profile = profile
+        self.poll_interval = poll_interval
+        self.heartbeat_interval = heartbeat_interval
+        self.profiles = ensure_pool_layout(self.root)
+        self.profile_config = next((item for item in self.profiles if item.name == profile), None)
+        if self.profile_config is None:
+            raise RuntimeError(f"Unknown Claude pool profile: {profile}")
+        self._active: dict[str, asyncio.Task[None]] = {}
+
+    async def run_forever(self) -> None:
+        logger.info("Claude pool runner started for profile %s", self.profile)
+        while True:
+            self._reap_active()
+            await self.run_once(wait=False)
+            self._write_profile_heartbeat()
+            await asyncio.sleep(self.poll_interval)
+
+    async def run_once(self, *, wait: bool = True) -> None:
+        for queued_path in sorted((self.root / "jobs" / "queued" / self.profile).glob("*.json")):
+            claimed = self._claim(queued_path)
+            if claimed is None:
+                continue
+            manifest = _read_json(claimed, {})
+            job_id = str(manifest.get("id") or claimed.stem)
+            self._active[job_id] = asyncio.create_task(self._execute_claimed(claimed))
+        if wait and self._active:
+            await asyncio.gather(*list(self._active.values()))
+            self._reap_active()
+
+    def _reap_active(self) -> None:
+        for job_id, task in list(self._active.items()):
+            if task.done():
+                self._active.pop(job_id, None)
+
+    def _write_profile_heartbeat(self) -> None:
+        _write_json_atomic(
+            self.root / "heartbeats" / f"{self.profile}.json",
+            {
+                "profile": self.profile,
+                "pid": os.getpid(),
+                "updated_at": _utc_now_iso(),
+                "active_jobs": sorted(self._active),
+            },
+        )
+
+    def _claim(self, queued_path: Path) -> Path | None:
+        running_path = self.root / "jobs" / "running" / self.profile / queued_path.name
+        try:
+            os.replace(queued_path, running_path)
+        except FileNotFoundError:
+            return None
+        manifest = _read_json(running_path, {})
+        manifest.update({
+            "status": "running",
+            "runner_pid": os.getpid(),
+            "claimed_at": _utc_now_iso(),
+            "updated_at": _utc_now_iso(),
+            "heartbeat_at": _utc_now_iso(),
+        })
+        _write_json_atomic(running_path, manifest)
+        return running_path
+
+    async def _execute_claimed(self, running_path: Path) -> None:
+        manifest = _read_json(running_path, {})
+        job_id = str(manifest.get("id") or running_path.stem)
+        heartbeat_task = asyncio.create_task(self._heartbeat_job(running_path))
+        try:
+            if manifest.get("kind") == "health":
+                await self._execute_health(manifest)
+            elif manifest.get("kind") == "availability":
+                await self._execute_availability(manifest)
+            else:
+                await self._execute_claude(manifest)
+            status = "done"
+            error = None
+        except Exception as exc:
+            logger.warning("Claude pool job %s failed", job_id, exc_info=True)
+            status = "failed"
+            error = repr(exc)
+            self._write_result(manifest, {"ok": False, "error": error})
+        finally:
+            heartbeat_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await heartbeat_task
+            latest = _read_json(running_path, manifest)
+            latest.update({
+                "status": status,
+                "updated_at": _utc_now_iso(),
+                "finished_at": _utc_now_iso(),
+            })
+            if error:
+                latest["error"] = error
+            destination = self.root / "jobs" / status / self.profile / running_path.name
+            _write_json_atomic(running_path, latest)
+            os.replace(running_path, destination)
+
+    async def _heartbeat_job(self, running_path: Path) -> None:
+        while True:
+            manifest = _read_json(running_path, {})
+            manifest.update({"heartbeat_at": _utc_now_iso(), "updated_at": _utc_now_iso()})
+            _write_json_atomic(running_path, manifest)
+            self._write_profile_heartbeat()
+            await asyncio.sleep(self.heartbeat_interval)
+
+    async def _execute_health(self, manifest: dict[str, Any]) -> None:
+        username, _ = await self._run_small_command(["/usr/bin/whoami"], timeout=10)
+        auth_stdout, auth_stderr = await self._run_small_command(
+            [self.profile_config.claude_command, "auth", "status"],
+            timeout=20,
+        )
+        combined_auth = f"{auth_stdout}\n{auth_stderr}".strip()
+        self._write_result(
+            manifest,
+            {
+                "ok": True,
+                "kind": "health",
+                "username": username.strip(),
+                "claude_auth_stdout": auth_stdout,
+                "claude_auth_stderr": auth_stderr,
+                "claude_auth_logged_in": _looks_logged_in(combined_auth),
+                "result_text": username.strip(),
+                "structured_output": {
+                    "username": username.strip(),
+                    "claude_auth_logged_in": _looks_logged_in(combined_auth),
+                },
+            },
+        )
+
+    async def _execute_availability(self, manifest: dict[str, Any]) -> None:
+        paths = manifest.get("paths") or {}
+        prompt = Path(paths["prompt"]).read_text(encoding="utf-8")
+        command = [
+            str(self.profile_config.claude_command),
+            "-p",
+            "--input-format",
+            "text",
+            "--output-format",
+            "json",
+            "--permission-mode",
+            "bypassPermissions",
+            "--no-session-persistence",
+        ]
+        model = str(manifest.get("model") or DEFAULT_AVAILABILITY_PROBE_MODEL or "").strip()
+        if model:
+            command.extend(["--model", model])
+        effort = str(manifest.get("effort") or "low").strip()
+        if effort:
+            command.extend(["--effort", effort])
+
+        proc = await asyncio.create_subprocess_exec(
+            *command,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(prompt.encode("utf-8")),
+                timeout=float(manifest.get("timeout") or DEFAULT_AVAILABILITY_TIMEOUT_SECONDS),
+            )
+        except asyncio.TimeoutError:
+            with suppress(ProcessLookupError):
+                proc.kill()
+            raise
+
+        stdout_text = stdout.decode("utf-8", errors="replace").strip()
+        stderr_text = stderr.decode("utf-8", errors="replace").strip()
+        Path(paths["stderr"]).write_text(stderr_text, encoding="utf-8")
+        try:
+            raw: Any = json.loads(stdout_text) if stdout_text else {}
+        except json.JSONDecodeError:
+            raw = {"result": stdout_text}
+        Path(paths["stdout"]).write_text(json.dumps(raw, indent=2, sort_keys=True), encoding="utf-8")
+        if proc.returncode != 0:
+            details = stderr_text or stdout_text or "unknown error"
+            raise RuntimeError(f"Claude availability probe failed with exit code {proc.returncode}: {details}")
+        self._write_result(
+            manifest,
+            {
+                "ok": True,
+                "kind": "availability",
+                "return_code": proc.returncode,
+                "result_text": _extract_result_text(raw),
+                "raw": raw,
+            },
+        )
+
+    async def _run_small_command(self, command: list[str], *, timeout: float) -> tuple[str, str]:
+        proc = await asyncio.create_subprocess_exec(
+            *command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        except asyncio.TimeoutError:
+            with suppress(ProcessLookupError):
+                proc.kill()
+            raise
+        return stdout.decode("utf-8", errors="replace"), stderr.decode("utf-8", errors="replace")
+
+    async def _execute_claude(self, manifest: dict[str, Any]) -> None:
+        paths = manifest.get("paths") or {}
+        prompt = Path(paths["prompt"]).read_text(encoding="utf-8")
+        system_prompt = Path(paths["system_prompt"]).read_text(encoding="utf-8")
+        schema_path = paths.get("schema")
+        schema = None
+        if schema_path:
+            schema = json.loads(Path(schema_path).read_text(encoding="utf-8"))
+
+        command = self._build_claude_command(manifest, system_prompt=system_prompt, schema=schema)
+        cwd = manifest.get("cwd") or None
+        proc = await asyncio.create_subprocess_exec(
+            *command,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=cwd,
+        )
+        stdout, stderr = await proc.communicate(prompt.encode("utf-8"))
+        stdout_text = stdout.decode("utf-8", errors="replace").strip()
+        stderr_text = stderr.decode("utf-8", errors="replace").strip()
+
+        stdout_path = Path(paths["stdout"])
+        stderr_path = Path(paths["stderr"])
+        stderr_path.write_text(stderr_text, encoding="utf-8")
+
+        try:
+            raw: Any = json.loads(stdout_text) if stdout_text else {}
+        except json.JSONDecodeError:
+            raw = {"result": stdout_text}
+        stdout_path.write_text(json.dumps(raw, indent=2, sort_keys=True), encoding="utf-8")
+
+        if proc.returncode != 0:
+            details = stderr_text or stdout_text or "unknown error"
+            if "login" in details.lower() or "auth" in details.lower():
+                details += " Ensure the Claude GUI user is logged in and the LaunchAgent runs in that user session."
+            raise RuntimeError(f"Claude CLI failed with exit code {proc.returncode}: {details}")
+
+        result_text = _extract_result_text(raw)
+        structured_output = _extract_structured_output(raw, result_text) if schema else None
+        self._write_result(
+            manifest,
+            {
+                "ok": True,
+                "kind": "claude",
+                "return_code": proc.returncode,
+                "result_text": result_text,
+                "structured_output": structured_output,
+                "raw": raw,
+                "session_id": raw.get("session_id") if isinstance(raw, dict) else None,
+            },
+        )
+
+    def _build_claude_command(
+        self,
+        manifest: dict[str, Any],
+        *,
+        system_prompt: str,
+        schema: dict[str, Any] | None,
+    ) -> list[str]:
+        role = manifest.get("role") or {}
+        claude = manifest.get("claude") or {}
+        command = [
+            str(claude.get("command") or self.profile_config.claude_command),
+            "-p",
+            "--input-format",
+            "text",
+            "--output-format",
+            "json",
+            "--permission-mode",
+            str(claude.get("permission_mode") or "bypassPermissions"),
+            "--no-session-persistence",
+        ]
+        if schema is not None:
+            command.extend(["--json-schema", json.dumps(schema, sort_keys=True)])
+        if system_prompt.strip():
+            command.extend(["--system-prompt", system_prompt])
+        model = role.get("model")
+        if model:
+            command.extend(["--model", str(model)])
+        effort = role.get("effort")
+        if effort:
+            command.extend(["--effort", str(effort)])
+        tools = role.get("tools") or []
+        if tools:
+            command.extend(["--allowedTools", ",".join(str(tool) for tool in tools)])
+        for add_dir in claude.get("add_dirs") or []:
+            command.extend(["--add-dir", os.path.expanduser(str(add_dir))])
+        return command
+
+    def _write_result(self, manifest: dict[str, Any], result: dict[str, Any]) -> None:
+        result_path = Path((manifest.get("paths") or {})["result"])
+        result.update({"job_id": manifest.get("id"), "profile": self.profile, "updated_at": _utc_now_iso()})
+        _write_json_atomic(result_path, result)
+
+
+async def submit_health_check(
+    *,
+    root: Path,
+    profile: ClaudePoolProfile,
+    timeout: float = DEFAULT_HEALTH_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
+    ensure_pool_layout(root)
+    job_id = uuid.uuid4().hex
+    payload_dir = _payload_dir(root, job_id)
+    _ensure_dir(payload_dir)
+    result_path = payload_dir / "result.json"
+    manifest = {
+        "id": job_id,
+        "kind": "health",
+        "profile": profile.name,
+        "status": "queued",
+        "created_at": _utc_now_iso(),
+        "updated_at": _utc_now_iso(),
+        "paths": {"result": str(result_path)},
+    }
+    _write_json_atomic(_job_state_path(root, "queued", profile.name, job_id), manifest)
+
+    done_path = _job_state_path(root, "done", profile.name, job_id)
+    failed_path = _job_state_path(root, "failed", profile.name, job_id)
+    deadline = asyncio.get_running_loop().time() + timeout
+    while asyncio.get_running_loop().time() < deadline:
+        if done_path.exists():
+            return _read_json(result_path, {})
+        if failed_path.exists():
+            result = _read_json(result_path, {})
+            raise RuntimeError(result.get("error") or f"Health check failed for {profile.name}")
+        await asyncio.sleep(1)
+    raise TimeoutError(f"Timed out waiting for Claude pool health check on {profile.name}")
+
+
+async def submit_availability_check(
+    *,
+    root: Path,
+    profile: ClaudePoolProfile,
+    timeout: float = DEFAULT_AVAILABILITY_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
+    """Queue a tiny real Claude turn for one profile.
+
+    ``claude auth status`` only proves login state. This probe proves the
+    account can currently accept a model request, which is what session-limit
+    recovery needs.
+    """
+    ensure_pool_layout(root)
+    job_id = uuid.uuid4().hex
+    payload_dir = _payload_dir(root, job_id)
+    _ensure_dir(payload_dir)
+    prompt_path = payload_dir / "prompt.md"
+    result_path = payload_dir / "result.json"
+    stdout_path = payload_dir / "stdout.json"
+    stderr_path = payload_dir / "stderr.log"
+    prompt_path.write_text(DEFAULT_AVAILABILITY_PROBE_PROMPT, encoding="utf-8")
+    manifest = {
+        "id": job_id,
+        "kind": "availability",
+        "profile": profile.name,
+        "status": "queued",
+        "created_at": _utc_now_iso(),
+        "updated_at": _utc_now_iso(),
+        "model": DEFAULT_AVAILABILITY_PROBE_MODEL,
+        "effort": "low",
+        "timeout": timeout,
+        "paths": {
+            "prompt": str(prompt_path),
+            "result": str(result_path),
+            "stdout": str(stdout_path),
+            "stderr": str(stderr_path),
+        },
+    }
+    _write_json_atomic(_job_state_path(root, "queued", profile.name, job_id), manifest)
+
+    done_path = _job_state_path(root, "done", profile.name, job_id)
+    failed_path = _job_state_path(root, "failed", profile.name, job_id)
+    deadline = asyncio.get_running_loop().time() + timeout
+    while asyncio.get_running_loop().time() < deadline:
+        if done_path.exists():
+            return _read_json(result_path, {})
+        if failed_path.exists():
+            result = _read_json(result_path, {})
+            raise RuntimeError(
+                result.get("error") or f"Availability probe failed for {profile.name}"
+            )
+        await asyncio.sleep(1)
+    raise TimeoutError(f"Timed out waiting for Claude pool availability probe on {profile.name}")
+
+
+async def doctor(
+    *,
+    root: Path = DEFAULT_POOL_ROOT,
+    run_health_checks: bool = True,
+    timeout: float = DEFAULT_HEALTH_TIMEOUT_SECONDS,
+) -> list[str]:
+    profiles = ensure_pool_layout(root)
+    lines: list[str] = [f"Claude pool root: {root}"]
+    for profile in profiles:
+        heartbeat_path = root / "heartbeats" / f"{profile.name}.json"
+        heartbeat = _read_json(heartbeat_path, {})
+        updated_at = _parse_iso(heartbeat.get("updated_at"))
+        if updated_at:
+            age = (datetime.now(UTC) - updated_at).total_seconds()
+            lines.append(f"{profile.name}: heartbeat age {age:.1f}s")
+        else:
+            lines.append(f"{profile.name}: no heartbeat found")
+
+        if run_health_checks:
+            try:
+                result = await submit_health_check(root=root, profile=profile, timeout=timeout)
+                username = str(result.get("username") or "").strip()
+                auth = "logged in" if result.get("claude_auth_logged_in") else "auth unknown/not logged in"
+                status = "ok" if username == profile.user else f"wrong user {username!r}"
+                lines.append(f"{profile.name}: health {status}; claude {auth}")
+            except Exception as exc:
+                lines.append(f"{profile.name}: health failed: {exc}")
+    return lines
+
+
+def install_launchagent_templates(
+    *,
+    root: Path = DEFAULT_POOL_ROOT,
+    runner_command: str | None = None,
+) -> list[str]:
+    profiles = ensure_pool_layout(root)
+    runner_command = runner_command or _default_runner_command()
+    command_parts = shlex.split(runner_command)
+    if not command_parts:
+        command_parts = ["claude-pool-runner"]
+
+    output_lines: list[str] = []
+    template_dir = root / "launchagents"
+    _ensure_dir(template_dir)
+
+    for profile in profiles:
+        label = f"com.iriai.claude-pool.{profile.name}"
+        plist_path = template_dir / f"{label}.plist"
+        program_args = [
+            *command_parts,
+            "--profile",
+            profile.name,
+            "--root",
+            str(root),
+        ]
+        plist = {
+            "Label": label,
+            "ProgramArguments": program_args,
+            "RunAtLoad": True,
+            "KeepAlive": True,
+            "StandardOutPath": str(root / "logs" / f"{profile.name}.out.log"),
+            "StandardErrorPath": str(root / "logs" / f"{profile.name}.err.log"),
+            "WorkingDirectory": str(root),
+            "EnvironmentVariables": {
+                "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+            },
+        }
+        plist_path.write_bytes(plistlib.dumps(plist, sort_keys=True))
+        with suppress(OSError):
+            os.chmod(plist_path, 0o664)
+
+        try:
+            uid = pwd.getpwnam(profile.user).pw_uid
+        except KeyError:
+            uid = "<uid>"
+        user_plist = f"/Users/{profile.user}/Library/LaunchAgents/{label}.plist"
+        output_lines.extend(
+            [
+                f"Wrote {plist_path}",
+                f"Install for {profile.user}:",
+                f"  sudo mkdir -p /Users/{profile.user}/Library/LaunchAgents",
+                f"  sudo cp {plist_path} {user_plist}",
+                f"  sudo chown {profile.user}:staff {user_plist}",
+                f"  launchctl bootstrap gui/{uid} {user_plist}",
+                f"  launchctl kickstart -k gui/{uid}/{label}",
+            ]
+        )
+    return output_lines
+
+
+def _default_runner_command() -> str:
+    found = shutil.which("claude-pool-runner")
+    if found:
+        return found
+    shared = Path("/Users/Shared/iriai/.venv/bin/claude-pool-runner")
+    if shared.exists():
+        return str(shared)
+    return f"{sys.executable} -m iriai_build_v2.runtimes.claude_pool_runner"
+
+
+def runner_main(argv: list[str] | None = None) -> None:
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Run a Claude pool profile worker")
+    parser.add_argument("--profile", required=True, help="Claude pool profile name")
+    parser.add_argument("--root", default=str(DEFAULT_POOL_ROOT), help="Claude pool root directory")
+    parser.add_argument("--once", action="store_true", help="Claim and run queued jobs once, then exit")
+    parser.add_argument("--log-level", default="INFO", help="Python logging level")
+    args = parser.parse_args(argv)
+
+    logging.basicConfig(
+        level=getattr(logging, args.log_level.upper(), logging.INFO),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    umask = _apply_runner_umask()
+    logger.info("Claude pool runner using umask %04o", umask)
+
+    runner = ClaudePoolRunner(profile=args.profile, root=Path(args.root))
+    if args.once:
+        asyncio.run(runner.run_once(wait=True))
+    else:
+        asyncio.run(runner.run_forever())

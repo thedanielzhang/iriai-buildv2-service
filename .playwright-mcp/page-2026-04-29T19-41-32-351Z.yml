@@ -1,0 +1,143 @@
+- generic [ref=e3]:
+  - banner [ref=e4]:
+    - generic [ref=e5]:
+      - generic [ref=e6]: ir
+      - generic [ref=e7]:
+        - strong [ref=e8]: iriai build exhibit
+        - generic [ref=e9]: multi-agent delivery, public-safe view
+    - navigation "Dashboard mockup sections" [ref=e10]:
+      - button "Overview" [ref=e11] [cursor=pointer]
+      - button "Live Work" [ref=e12] [cursor=pointer]
+      - button "DAG Map" [ref=e13] [cursor=pointer]
+      - button "Agent Floor" [ref=e14] [cursor=pointer]
+      - button "Artifact Trail" [ref=e15] [cursor=pointer]
+      - button "Workstreams" [ref=e16] [cursor=pointer]
+      - button "Milestones" [ref=e17] [cursor=pointer]
+      - button "Operations" [ref=e18] [cursor=pointer]
+    - generic [ref=e19]: Live
+  - main [ref=e21]:
+    - generic [ref=e22]:
+      - generic [ref=e23]: Overview
+      - paragraph [ref=e24]: What is this and where are we?
+    - generic [ref=e25]:
+      - generic [ref=e26]:
+        - generic [ref=e27]:
+          - generic [ref=e28]:
+            - generic [ref=e29]: running
+            - generic [ref=e30]: DAG execution in progress
+            - generic [ref=e31]: demo data
+          - heading "Visual Studio Code frontend for project and workflow manager" [level=1] [ref=e32]
+          - paragraph [ref=e33]: A live public exhibit of multi-agent software delivery.
+          - generic [ref=e34]:
+            - generic [ref=e35]: Right now
+            - strong [ref=e36]: Repairing the current DAG checkpoint before final verification.
+        - generic [ref=e37]:
+          - strong [ref=e38]: 35%
+          - generic [ref=e39]: checkpoint progress
+      - generic [ref=e40]:
+        - generic [ref=e41]:
+          - generic [ref=e42]:
+            - generic [ref=e43]: Live orchestration
+            - heading "Agents, tasks, verifier, proof." [level=2] [ref=e44]
+          - application [ref=e46]:
+            - generic [ref=e48]:
+              - generic:
+                - generic:
+                  - img
+                - generic:
+                  - group:
+                    - generic:
+                      - generic: Claude / running
+                      - strong: Implementer
+                  - group:
+                    - generic:
+                      - generic: Codex / complete
+                      - strong: Protocol lens
+                  - group:
+                    - generic:
+                      - generic: Claude / complete
+                      - strong: RCA
+                  - group:
+                    - generic:
+                      - generic: Codex / complete
+                      - strong: Contradiction resolver
+                  - group:
+                    - generic:
+                      - generic: iriai-studio-backend
+                      - strong: Bridge state publisher
+                  - group:
+                    - generic:
+                      - generic: iriai-studio
+                      - strong: Project create contract
+                  - group:
+                    - generic:
+                      - generic: iriai-studio-backend
+                      - strong: Diagnostics bundle contract
+                  - group:
+                    - generic:
+                      - generic: all repos
+                      - strong: Final aggregate verifier
+                  - group:
+                    - generic:
+                      - generic: checkpoint authority
+                      - strong: Final verifier
+                  - group:
+                    - generic:
+                      - generic: planning
+                      - strong: Root DAG
+                  - group:
+                    - generic:
+                      - generic: verification
+                      - strong: Repair RCA
+                  - group:
+                    - generic:
+                      - generic: decision
+                      - strong: Decision Ledger
+            - img
+        - complementary [ref=e50]:
+          - generic [ref=e51]:
+            - generic [ref=e52]: Feature
+            - strong [ref=e53]: demo
+            - text: Implementation
+          - generic [ref=e54]:
+            - generic [ref=e55]:
+              - generic [ref=e56]: "1"
+              - strong [ref=e57]: Intake
+            - generic [ref=e58]:
+              - generic [ref=e59]: "2"
+              - strong [ref=e60]: Planning
+            - generic [ref=e61]:
+              - generic [ref=e62]: "3"
+              - strong [ref=e63]: DAG
+            - generic [ref=e64]:
+              - generic [ref=e65]: "4"
+              - strong [ref=e66]: Implementation
+            - generic [ref=e67]:
+              - generic [ref=e68]: "5"
+              - strong [ref=e69]: Gates
+            - generic [ref=e70]:
+              - generic [ref=e71]: "6"
+              - strong [ref=e72]: Handover
+          - generic [ref=e74]:
+            - generic [ref=e75]: DAG groups
+            - strong [ref=e76]: 35%
+          - generic [ref=e80]:
+            - generic [ref=e81]: Implementation tasks
+            - strong [ref=e82]: 34%
+          - generic [ref=e85]:
+            - generic [ref=e86]:
+              - generic [ref=e87]: RCA groups
+              - strong [ref=e88]: "0"
+              - text: current retry
+            - generic [ref=e89]:
+              - generic [ref=e90]: Fixable
+              - strong [ref=e91]: "0"
+              - text: repair groups
+            - generic [ref=e92]:
+              - generic [ref=e93]: Verify lenses
+              - strong [ref=e94]: "0"
+              - text: expanded runs
+          - generic [ref=e95]:
+            - generic [ref=e96]: Next checkpoint
+            - strong [ref=e97]: Group verifier approval and checkpoint.
+            - paragraph [ref=e98]: Only final verification can advance the checkpoint.

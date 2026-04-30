@@ -1,0 +1,1 @@
+# stale markdown decomposition

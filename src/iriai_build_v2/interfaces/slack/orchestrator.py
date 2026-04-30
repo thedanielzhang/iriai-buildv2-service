@@ -17,6 +17,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from ...config import DASHBOARD_BASE_URL
+from ...runtime_policy import (
+    DEFAULT_RUNTIME_POLICY,
+    RuntimePolicy,
+    normalize_runtime_policy,
+)
 from ...workflows.bugfix_v2.models import BugflowReportSnapshot, new_short_id, report_key, utc_now
 from .._bootstrap import (
     bootstrap,
@@ -185,6 +190,8 @@ class SlackWorkflowOrchestrator:
         workspace_path: Path | None = None,
         agent_runtime_name: str = "claude",
         agent_runtime_override: bool = False,
+        runtime_policy: RuntimePolicy = DEFAULT_RUNTIME_POLICY,
+        runtime_policy_override: bool = False,
         single_agent_runtime: bool = False,
         budget: bool = False,
         autonomous_remainder: bool = False,
@@ -194,6 +201,8 @@ class SlackWorkflowOrchestrator:
         self._default_workspace = workspace_path  # suggestion, not binding
         self._agent_runtime_name = agent_runtime_name
         self._agent_runtime_override = agent_runtime_override
+        self._runtime_policy = normalize_runtime_policy(runtime_policy)
+        self._runtime_policy_override = runtime_policy_override
         self._single_agent_runtime = single_agent_runtime
         self._budget = budget
         self._autonomous_remainder = autonomous_remainder
@@ -406,6 +415,7 @@ class SlackWorkflowOrchestrator:
             "workspace_path": str(workspace_path),
             "mode": mode,
             "agent_runtime": self._agent_runtime_name,
+            "runtime_policy": self._runtime_policy,
         })
         feature = await self._env.feature_store.get_feature(feature.id) or feature
 
@@ -417,6 +427,7 @@ class SlackWorkflowOrchestrator:
             workspace_path=workspace_path,
             channel_id=channel_id,
             runtime_name=self._agent_runtime_name,
+            runtime_policy=self._runtime_policy,
         )
         self._active_runtimes[feature.id] = agent_runtime
         streamer = getattr(runner, "_slack_streamer", None)
@@ -505,6 +516,7 @@ class SlackWorkflowOrchestrator:
                     "workspace_path": source_workspace,
                     "mode": "singleplayer",
                     "agent_runtime": self._agent_runtime_name,
+                    "runtime_policy": self._runtime_policy,
                     "source_feature_id": source_feature.id,
                     "source_feature_name": source_feature.name,
                     "source_channel_id": source_feature.metadata.get("channel_id", ""),
@@ -525,6 +537,7 @@ class SlackWorkflowOrchestrator:
                 workspace_path=Path(source_workspace),
                 channel_id=channel_id,
                 runtime_name=self._agent_runtime_name,
+                runtime_policy=self._runtime_policy,
             )
             self._active_runtimes[feature.id] = agent_runtime
 
@@ -789,6 +802,24 @@ class SlackWorkflowOrchestrator:
                 if self._agent_runtime_override
                 else saved_agent_runtime or self._agent_runtime_name
             )
+            saved_runtime_policy = meta.get("runtime_policy")
+            try:
+                recovered_runtime_policy = normalize_runtime_policy(
+                    saved_runtime_policy,
+                )
+            except ValueError:
+                logger.warning(
+                    "Feature %s has unsupported runtime_policy=%r; using %s",
+                    feature.id,
+                    saved_runtime_policy,
+                    DEFAULT_RUNTIME_POLICY,
+                )
+                recovered_runtime_policy = DEFAULT_RUNTIME_POLICY
+            runtime_policy = (
+                self._runtime_policy
+                if self._runtime_policy_override
+                else recovered_runtime_policy
+            )
 
             if not channel_id or not workspace_path:
                 logger.warning(
@@ -810,6 +841,7 @@ class SlackWorkflowOrchestrator:
                 "mode": mode,
                 "phase": phase,
                 "agent_runtime": agent_runtime,
+                "runtime_policy": runtime_policy,
             }
 
             try:
@@ -866,6 +898,7 @@ class SlackWorkflowOrchestrator:
         mode = recovery_info["mode"]
         resume_phase = recovery_info["phase"]
         agent_runtime_name = recovery_info["agent_runtime"]
+        runtime_policy = recovery_info.get("runtime_policy", DEFAULT_RUNTIME_POLICY)
 
         # Fail fast: workspace must still exist
         if not workspace_path.is_dir():
@@ -900,6 +933,7 @@ class SlackWorkflowOrchestrator:
                 workspace_path=workspace_path,
                 channel_id=channel_id,
                 runtime_name=agent_runtime_name,
+                runtime_policy=runtime_policy,
             )
             self._active_runtimes[feature_id] = agent_runtime
             streamer = getattr(runner, "_slack_streamer", None)
@@ -1121,8 +1155,10 @@ class SlackWorkflowOrchestrator:
         workspace_path: Path,
         channel_id: str,
         runtime_name: str,
+        runtime_policy: str | None = None,
     ) -> tuple[Any, Any]:
         assert self._env is not None
+        resolved_runtime_policy = normalize_runtime_policy(runtime_policy)
 
         streamer = SlackStreamer(self._adapter, channel_id)
 
@@ -1185,6 +1221,7 @@ class SlackWorkflowOrchestrator:
                 "tunnel": self._tunnel,
                 "slack_adapter": self._adapter,
                 "autonomous_remainder": self._autonomous_remainder,
+                "runtime_policy": resolved_runtime_policy,
             },
         )
         runner._slack_streamer = streamer  # type: ignore[attr-defined]

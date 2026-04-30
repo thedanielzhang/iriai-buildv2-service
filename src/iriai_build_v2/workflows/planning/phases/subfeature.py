@@ -87,6 +87,7 @@ from .._decisions import (
     refresh_decision_ledger,
     sync_compiled_decision_mirrors,
 )
+from .._sidecars import refresh_sidecar_for_source_artifact
 from .._stage_helpers import (
     _artifact_source_path,
     build_related_decision_sections,
@@ -423,6 +424,14 @@ async def _complete_single_artifact_step(
         )
     final_text = to_str(artifact_obj) if isinstance(artifact_obj, BaseModel) else artifact_text
     await runner.artifacts.put(artifact_key, final_text, feature=feature)
+    sidecar_source_text = artifact_text if isinstance(artifact_text, str) and artifact_text.strip() else final_text
+    await refresh_sidecar_for_source_artifact(
+        runner,
+        feature,
+        artifact_key,
+        sidecar_source_text,
+        generated_from="approved_object",
+    )
     return final_text
 
 
@@ -1233,6 +1242,20 @@ async def _run_architecture_step(
         sd_text = to_str(sd_obj) if isinstance(sd_obj, BaseModel) else sd_text
         await runner.artifacts.put(plan_key, plan_text, feature=feature)
         await runner.artifacts.put(sd_key, sd_text, feature=feature)
+        await refresh_sidecar_for_source_artifact(
+            runner,
+            feature,
+            plan_key,
+            plan_text,
+            generated_from="approved_object",
+        )
+        await refresh_sidecar_for_source_artifact(
+            runner,
+            feature,
+            sd_key,
+            sd_text,
+            generated_from="approved_object",
+        )
         final_plan_text = plan_text
         provenance = step_record.get("provenance") or "human"
     else:
@@ -1367,6 +1390,20 @@ async def _run_architecture_step(
         sd_text = to_str(sd_obj) if isinstance(sd_obj, BaseModel) else sd_text
         await runner.artifacts.put(plan_key, plan_text, feature=feature)
         await runner.artifacts.put(sd_key, sd_text, feature=feature)
+        await refresh_sidecar_for_source_artifact(
+            runner,
+            feature,
+            plan_key,
+            plan_text,
+            generated_from="approved_object",
+        )
+        await refresh_sidecar_for_source_artifact(
+            runner,
+            feature,
+            sd_key,
+            sd_text,
+            generated_from="approved_object",
+        )
         final_plan_text = plan_text
 
     final_sd_text = await runner.artifacts.get(sd_key, feature=feature) or ""

@@ -24,6 +24,8 @@ export interface FeatureData {
   active_gate_steps: TimelineEntry[]
   timeline: TimelineEntry[]
   workstreams: Workstream[]
+  dag_repair?: DagRepairMetrics | null
+  public_exhibit?: PublicExhibit | null
   events: EventEntry[]
   active_agent: string | null
   source_feature_id?: string | null
@@ -58,6 +60,7 @@ export interface Task {
   repo_path: string
   file_scope: FileScope[]
   acceptance_criteria: string[]
+  dependencies?: string[]
 }
 
 export interface FileScope {
@@ -68,7 +71,7 @@ export interface FileScope {
 export interface VerifyStep {
   key: string
   type: string
-  passed: boolean
+  passed: boolean | null
   summary: string
   created_at: string
 }
@@ -79,6 +82,211 @@ export interface TimelineEntry {
   passed: boolean | null
   summary: string
   created_at: string
+}
+
+export interface DagRepairMetrics {
+  active_group_index: number | null
+  latest_checkpoint_group: number | null
+  current_cycle: DagRepairCycle | null
+  cycles: DagRepairCycle[]
+  summary: {
+    completed_groups: number
+    total_groups: number
+    active_group_elapsed_seconds: number | null
+    retry_count_for_active_group: number
+    expanded_verify_runs: number
+    fix_groups_scheduled: number
+    fix_groups_applied: number
+    final_preflight_failures: number
+    sanitizer_ignored_paths: number
+    sanitizer_rewritten_paths: number
+    sanitizer_invalid_paths: number
+  }
+}
+
+export interface DagRepairCycle {
+  group_idx: number
+  retry: string
+  started_at: string | null
+  ended_at: string | null
+  duration_seconds: number | null
+  status: 'running' | 'passed' | 'failed' | 'waiting'
+  stage_durations: Record<string, number>
+  lens_count: number
+  rca_group_count: number
+  fixable_group_count: number
+  scheduled_round_count: number
+  applied_fix_count: number
+  contradiction_count: number
+  rejected_contradiction_count: number
+  final_blocker_summary: string
+}
+
+export interface PublicExhibit {
+  public_summary: PublicSummary | null
+  dag_exhibit: DagExhibit | null
+  agent_exhibit: AgentExhibit | null
+  current_work?: CurrentWork | null
+  artifact_exhibit: ArtifactExhibit | null
+  workstream_exhibit: WorkstreamExhibit | null
+  milestone_feed: PublicMilestone[]
+  operations?: OperationsSnapshot | null
+}
+
+export interface PublicSummary {
+  title: string
+  tagline: string
+  description: string
+  phase_label: string
+  status_label: string
+  progress_narrative: string
+  current_focus: string
+  next_checkpoint: string
+  health: string
+  percent_complete: number
+  completed_groups: number
+  total_groups: number
+  completed_tasks: number
+  total_tasks: number
+  updated_at: string | null
+  source: string
+  provenance?: Record<string, unknown>
+}
+
+export interface DagExhibit {
+  narrative: string
+  total_groups: number
+  total_tasks: number
+  completed_groups: number
+  active_group: {
+    index: number
+    task_count: number
+    completed_count: number
+    status: string
+  } | null
+  next_groups: Array<{
+    index: number
+    task_count: number
+    status: string
+  }>
+  repair?: DagRepairMetrics | null
+  source: string
+}
+
+export interface AgentActivity {
+  name: string
+  role: string
+  runtime: string
+  status: string
+  started_at?: string | null
+  ended_at?: string | null
+  summary?: string
+  task_id?: string | null
+  group_idx?: number | null
+  duration_seconds?: number | null
+  prompt_preview?: string
+  output_preview?: string
+  related_artifact_keys?: string[]
+  related_files?: string[]
+}
+
+export interface AgentExhibit {
+  headline: string
+  active_agents: AgentActivity[]
+  recent_agents: AgentActivity[]
+  round_summaries: Array<{
+    key: string
+    created_at: string
+    summary: string
+  }>
+  current_repair_cycle?: DagRepairCycle | null
+}
+
+export interface ArtifactCard {
+  artifact_id?: string
+  key: string
+  title: string
+  family: string
+  summary: string
+  created_at: string
+  status: string
+  public_safe: boolean
+  source: string
+  content_url?: string
+  render_mode?: 'markdown' | 'text' | 'html' | 'json' | 'image' | 'video' | string
+  sha256?: string
+  safety_status?: string
+  url?: string
+  href?: string
+  review_url?: string
+  provenance?: Record<string, unknown>
+}
+
+export interface ArtifactExhibit {
+  cards: ArtifactCard[]
+  total_count: number
+  generated: boolean
+}
+
+export interface CurrentWork {
+  active_group: {
+    index: number
+    task_count: number
+    completed_count: number
+    status: string
+  } | null
+  active_tasks: Array<{
+    id: string
+    name: string
+    status: string
+    summary: string
+    repo_path: string
+    subfeature_id: string
+    acceptance_criteria: string[]
+    file_scope: FileScope[]
+    dependencies?: string[]
+  }>
+  active_agents: AgentActivity[]
+  recent_outcomes: Array<{
+    key: string
+    type: string
+    passed: boolean | null
+    summary: string
+    created_at: string
+  }>
+  next_checkpoint: string
+}
+
+export interface WorkstreamExhibit {
+  summary: string
+  source: string
+  workstreams: Array<{
+    id: string
+    name: string
+    summary: string
+    status: string
+    completed_tasks: number
+    total_tasks: number
+    subfeature_slugs: string[]
+    depends_on: string[]
+  }>
+}
+
+export interface PublicMilestone {
+  title: string
+  summary: string
+  kind: string
+  created_at: string
+  source: string
+}
+
+export interface OperationsSnapshot {
+  dag_repair?: DagRepairMetrics | null
+  gates: Record<string, boolean>
+  active_gate: string | null
+  timeline_count: number
+  event_count: number
+  artifact_count: number
 }
 
 export interface BugflowData {

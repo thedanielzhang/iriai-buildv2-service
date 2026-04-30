@@ -1,0 +1,1 @@
+Global technical plan

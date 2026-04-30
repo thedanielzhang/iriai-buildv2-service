@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json as _json
 import logging
+import re
 from typing import Any
 
 from iriai_compose import AgentActor, Ask, Feature, Phase, WorkflowRunner
@@ -52,6 +53,7 @@ from ..._common._tasks import HostedInterview
 from .._decisions import (
     GLOBAL_DECISIONS_KEY,
     artifact_applies_to,
+    parse_decision_ledger,
     rebuild_canonical_decisions,
     refresh_decision_ledger,
     sync_compiled_decision_mirrors,
@@ -361,21 +363,52 @@ async def _build_sf_review_context_package(
     slug: str,
     decomposition: SubfeatureDecomposition,
 ) -> ContextPackage | None:
+    connected_peers = {
+        edge.to_subfeature if edge.from_subfeature == slug else edge.from_subfeature
+        for edge in decomposition.edges
+        if slug in (edge.from_subfeature, edge.to_subfeature)
+    }
     peer_summary_sections: list[str] = []
     for sf in decomposition.subfeatures:
-        if sf.slug == slug:
+        if sf.slug == slug or sf.slug not in connected_peers:
             continue
         blocks: list[str] = [f"### {sf.name} ({sf.slug})", ""]
+        relevant_edges = [
+            edge
+            for edge in decomposition.edges
+            if {edge.from_subfeature, edge.to_subfeature} == {slug, sf.slug}
+        ]
+        if relevant_edges:
+            blocks.extend(["#### Relevant Edge Contracts", ""])
+            for edge in relevant_edges:
+                blocks.append(
+                    f"- {edge.from_subfeature} → {edge.to_subfeature} ({edge.interface_type}): {edge.description}"
+                )
+            blocks.append("")
         for prefix, label in (
             ("prd-summary", "PRD Summary"),
             ("design-summary", "Design Summary"),
             ("plan-summary", "Plan Summary"),
+            ("test-plan-summary", "Test Plan Summary"),
         ):
             summary = await runner.artifacts.get(f"{prefix}:{sf.slug}", feature=feature)
             if summary:
                 blocks.extend([f"#### {label}", "", summary, ""])
         if len(blocks) > 2:
             peer_summary_sections.append("\n".join(blocks).strip())
+
+    decision_pack = await _build_review_decision_pack(
+        runner,
+        feature,
+        target_keys=[
+            f"prd:{slug}",
+            f"design:{slug}",
+            f"plan:{slug}",
+            f"system-design:{slug}",
+            f"test-plan:{slug}",
+        ],
+        excluded_ledger_keys=[f"decisions:{slug}"],
+    )
 
     return await build_context_package(
         runner,
@@ -425,14 +458,15 @@ async def _build_sf_review_context_package(
                 artifact_key=f"decisions:{slug}",
             ),
             ContextPackageItem(
-                key="canonical-decisions",
-                label="Canonical Decision Ledger",
+                key="decision-pack",
+                label="Referenced Decisions",
                 group="Supporting Context",
-                artifact_key="decisions",
+                content=decision_pack,
+                file_name=f"plan-review-{slug}-decision-pack.md",
             ),
             ContextPackageItem(
                 key="peer-summaries",
-                label="Peer Summaries",
+                label="Direct Peer Context",
                 group="Supporting Context",
                 content="\n\n".join(peer_summary_sections),
                 file_name=f"plan-review-{slug}-peer-summaries.md",
@@ -477,13 +511,8 @@ async def _build_edge_review_context_package(
                 f"{id_to_slug.get(edge.to_subfeature, edge.to_subfeature)}-details.md"
             ),
         ),
-        ContextPackageItem(
-            key="canonical-decisions",
-            label="Canonical Decision Ledger",
-            group="Supporting Context",
-            artifact_key="decisions",
-        ),
     ]
+    endpoint_decision_keys: list[str] = []
     for sf_ref in (edge.from_subfeature, edge.to_subfeature):
         slug = id_to_slug.get(sf_ref, sf_ref)
         for prefix, label in (
@@ -493,14 +522,47 @@ async def _build_edge_review_context_package(
             ("system-design", "System Design"),
             ("decisions", "Decisions"),
         ):
+            artifact_key = f"{prefix}:{slug}"
             items.append(
                 ContextPackageItem(
                     key=f"{prefix}-{slug}",
                     label=f"{label} — {slug}",
                     group=f"Subfeature {slug}",
-                    artifact_key=f"{prefix}:{slug}",
+                    artifact_key=artifact_key,
                 )
             )
+            if prefix == "decisions":
+                endpoint_decision_keys.append(artifact_key)
+
+    decision_pack = await _build_review_decision_pack(
+        runner,
+        feature,
+        target_keys=[
+            f"prd:{id_to_slug.get(edge.from_subfeature, edge.from_subfeature)}",
+            f"design:{id_to_slug.get(edge.from_subfeature, edge.from_subfeature)}",
+            f"plan:{id_to_slug.get(edge.from_subfeature, edge.from_subfeature)}",
+            f"system-design:{id_to_slug.get(edge.from_subfeature, edge.from_subfeature)}",
+            f"prd:{id_to_slug.get(edge.to_subfeature, edge.to_subfeature)}",
+            f"design:{id_to_slug.get(edge.to_subfeature, edge.to_subfeature)}",
+            f"plan:{id_to_slug.get(edge.to_subfeature, edge.to_subfeature)}",
+            f"system-design:{id_to_slug.get(edge.to_subfeature, edge.to_subfeature)}",
+        ],
+        supporting_texts=[edge_details],
+        excluded_ledger_keys=endpoint_decision_keys,
+    )
+    items.append(
+        ContextPackageItem(
+            key="decision-pack",
+            label="Referenced Decisions",
+            group="Supporting Context",
+            content=decision_pack,
+            file_name=(
+                "plan-review-edge-"
+                f"{id_to_slug.get(edge.from_subfeature, edge.from_subfeature)}-"
+                f"{id_to_slug.get(edge.to_subfeature, edge.to_subfeature)}-decision-pack.md"
+            ),
+        )
+    )
 
     return await build_context_package(
         runner,
@@ -521,6 +583,53 @@ async def _build_edge_review_context_package(
         ],
         items=items,
     )
+
+
+async def _build_review_decision_pack(
+    runner: WorkflowRunner,
+    feature: Feature,
+    *,
+    target_keys: list[str],
+    supporting_texts: list[str] | None = None,
+    excluded_ledger_keys: list[str] | None = None,
+) -> str:
+    compiled_text = await runner.artifacts.get("decisions", feature=feature) or ""
+    global_text = await runner.artifacts.get(GLOBAL_DECISIONS_KEY, feature=feature) or ""
+    candidate_ids: set[str] = set()
+
+    for artifact_key in target_keys:
+        artifact_text = await runner.artifacts.get(artifact_key, feature=feature) or ""
+        candidate_ids.update(re.findall(r"\bD-\d+\b", artifact_text))
+    for text in supporting_texts or []:
+        candidate_ids.update(re.findall(r"\bD-\d+\b", text))
+
+    excluded_ids: set[str] = set()
+    for ledger_key in excluded_ledger_keys or []:
+        ledger_text = await runner.artifacts.get(ledger_key, feature=feature) or ""
+        excluded_ids.update(re.findall(r"\bD-\d+\b", ledger_text))
+    candidate_ids.difference_update(excluded_ids)
+
+    selected: list[str] = []
+    if candidate_ids:
+        for ledger_text in (compiled_text, global_text):
+            if not ledger_text:
+                continue
+            ledger = parse_decision_ledger(ledger_text)
+            for decision in ledger.decisions:
+                if decision.id in candidate_ids:
+                    selected.append(f"- {decision.id}: {decision.statement}")
+                    candidate_ids.discard(decision.id)
+            if not candidate_ids:
+                break
+
+    lines = ["# Referenced Decisions", ""]
+    if selected:
+        lines.extend(selected)
+    else:
+        lines.append("_No additional non-target decisions were explicitly referenced._")
+    if candidate_ids:
+        lines.extend(["", "## Missing Decision IDs", "", *[f"- {decision_id}" for decision_id in sorted(candidate_ids)]])
+    return "\n".join(lines).rstrip() + "\n"
 
 
 async def _persist_plan_review_decisions(

@@ -9,10 +9,18 @@ import asyncpg
 
 from iriai_compose import Feature
 
+from ..public_dashboard import PublicDashboardOutbox
+
 
 class PostgresFeatureStore:
-    def __init__(self, pool: asyncpg.Pool) -> None:
+    def __init__(
+        self,
+        pool: asyncpg.Pool,
+        *,
+        public_dashboard: PublicDashboardOutbox | None = None,
+    ) -> None:
         self._pool = pool
+        self._public_dashboard = public_dashboard
 
     async def create(self, feature: Feature, phase: str = "pm") -> None:
         metadata_json = json.dumps(feature.metadata)
@@ -48,10 +56,11 @@ class PostgresFeatureStore:
         metadata: dict[str, Any] | None = None,
     ) -> None:
         metadata_json = json.dumps(metadata or {})
-        await self._pool.execute(
+        event_id = await self._pool.fetchval(
             """
             INSERT INTO events (feature_id, event_type, source, content, metadata)
             VALUES ($1, $2, $3, $4, $5::jsonb)
+            RETURNING id
             """,
             feature_id,
             event_type,
@@ -59,6 +68,15 @@ class PostgresFeatureStore:
             content,
             metadata_json,
         )
+        if self._public_dashboard is not None:
+            await self._public_dashboard.mirror_private_event(
+                source_event_id=event_id,
+                feature_id=feature_id,
+                event_type=event_type,
+                source=source,
+                content=content,
+                metadata=metadata or {},
+            )
 
     async def get_feature(self, feature_id: str) -> Feature | None:
         """Load a single feature by ID, or None if not found."""

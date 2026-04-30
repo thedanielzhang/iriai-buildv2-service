@@ -16,11 +16,13 @@ if TYPE_CHECKING:
     from ..services.artifacts import ArtifactMirror
     from ..services.reviews import ReviewSessionManager
     from ..services.workspace import WorkspaceManager
+    from ..public_dashboard import PublicDashboardOutbox
     from ..storage import PostgresArtifactStore, PostgresFeatureStore, PostgresSessionStore
     from ..tasks.feedback import FeedbackService
     from ..tasks.playwright import PlaywrightService
     from ..tasks.preview import PreviewService
-    from ..workflows import TrackedWorkflowRunner
+from ..workflows import TrackedWorkflowRunner
+from ..runtime_policy import DEFAULT_RUNTIME_POLICY, RuntimePolicy, normalize_runtime_policy
 
 
 def slugify(name: str) -> str:
@@ -40,6 +42,7 @@ class BootstrappedEnv:
     preview_service: PreviewService
     playwright_service: PlaywrightService
     artifact_mirror: ArtifactMirror
+    public_dashboard: PublicDashboardOutbox
     workspace: Workspace | None
     workspace_path: Path | None
     workspace_manager: WorkspaceManager | None
@@ -59,6 +62,7 @@ async def bootstrap(workspace_path: Path | None = None) -> BootstrappedEnv:
 
     from ..config import DATABASE_URL
     from ..db import create_pool, ensure_schema
+    from ..public_dashboard import PublicDashboardOutbox
     from ..services.artifacts import ArtifactMirror
     from ..services.reviews import ReviewSessionManager
     from ..storage import PostgresArtifactStore, PostgresFeatureStore, PostgresSessionStore
@@ -69,9 +73,10 @@ async def bootstrap(workspace_path: Path | None = None) -> BootstrappedEnv:
     pool = await create_pool(DATABASE_URL)
     await ensure_schema(pool)
 
-    artifacts = PostgresArtifactStore(pool)
+    public_dashboard = PublicDashboardOutbox(pool)
+    artifacts = PostgresArtifactStore(pool, public_dashboard=public_dashboard)
     sessions = PostgresSessionStore(pool)
-    feature_store = PostgresFeatureStore(pool)
+    feature_store = PostgresFeatureStore(pool, public_dashboard=public_dashboard)
     context_provider = DefaultContextProvider(artifacts=artifacts)
 
     ws = Workspace(id="main", path=workspace_path) if workspace_path else None
@@ -109,6 +114,7 @@ async def bootstrap(workspace_path: Path | None = None) -> BootstrappedEnv:
         preview_service=preview_service,
         playwright_service=playwright_service,
         artifact_mirror=artifact_mirror,
+        public_dashboard=public_dashboard,
         workspace=ws,
         workspace_path=workspace_path,
         workspace_manager=workspace_manager,
@@ -129,6 +135,7 @@ def build_runner(
     interaction_runtimes: dict[str, Any],
     on_message: Callable[..., Any] | None = None,
     agent_runtime_name: str = "claude",
+    runtime_policy: RuntimePolicy = DEFAULT_RUNTIME_POLICY,
     single_agent_runtime: bool = False,
 ) -> TrackedWorkflowRunner:
     """Construct a TrackedWorkflowRunner with the given interaction runtimes.
@@ -159,6 +166,7 @@ def build_runner(
         session_store=env.sessions,
         on_message=on_message,
     )
+    resolved_runtime_policy = normalize_runtime_policy(runtime_policy)
 
     return TrackedWorkflowRunner(
         feature_store=env.feature_store,
@@ -174,7 +182,9 @@ def build_runner(
             "preview": env.preview_service,
             "playwright": env.playwright_service,
             "artifact_mirror": env.artifact_mirror,
+            "public_dashboard": env.public_dashboard,
             "workspace_manager": env.workspace_manager,
+            "runtime_policy": resolved_runtime_policy,
         },
     )
 

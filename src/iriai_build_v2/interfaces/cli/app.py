@@ -8,6 +8,13 @@ from pathlib import Path
 import click
 from dotenv import load_dotenv
 
+from ...runtime_policy import (
+    DEFAULT_RUNTIME_POLICY,
+    PRIMARY_IMPL_SECONDARY_REVIEW_POLICY,
+    SUPPORTED_RUNTIME_POLICIES,
+    normalize_runtime_policy,
+)
+
 load_dotenv()
 
 
@@ -17,6 +24,7 @@ async def _run(
     workspace: str,
     auto: bool,
     *,
+    agent_runtime: str = "claude",
     repos: list[str] | None = None,
     project: str = "",
     bug_report: str = "",
@@ -48,6 +56,7 @@ async def _run(
             env,
             interaction_runtimes={"terminal": interaction_runtime, "auto": interaction_runtime},
             on_message=print_stream,
+            agent_runtime_name=agent_runtime,
         )
 
         # Feature
@@ -122,9 +131,35 @@ def cli() -> None:
 @click.option("--workspace", default=".", help="Project workspace path")
 @click.option("--repo", multiple=True, help="GitHub repo (org/repo) or local path. Repeatable.")
 @click.option("--auto", is_flag=True, help="Auto-approve all gates")
-def plan(name: str, workspace: str, repo: tuple[str, ...], auto: bool) -> None:
+@click.option(
+    "--agent-runtime",
+    default=None,
+    help="Agent runtime to use for workflow agents (claude, claude_pool, or codex).",
+)
+def plan(
+    name: str,
+    workspace: str,
+    repo: tuple[str, ...],
+    auto: bool,
+    agent_runtime: str | None,
+) -> None:
     """Run the planning workflow (Scoping → PM → Design → Architecture → Plan Review)."""
-    asyncio.run(_run("planning", name, workspace, auto, repos=list(repo) or None))
+    from ...runtimes import normalize_agent_runtime
+
+    try:
+        resolved_runtime = normalize_agent_runtime(agent_runtime)
+    except ValueError as exc:
+        raise click.BadParameter(str(exc), param_hint="--agent-runtime") from exc
+    asyncio.run(
+        _run(
+            "planning",
+            name,
+            workspace,
+            auto,
+            agent_runtime=resolved_runtime,
+            repos=list(repo) or None,
+        )
+    )
 
 
 @cli.command()
@@ -132,9 +167,35 @@ def plan(name: str, workspace: str, repo: tuple[str, ...], auto: bool) -> None:
 @click.option("--workspace", default=".", help="Project workspace path")
 @click.option("--repo", multiple=True, help="GitHub repo (org/repo) or local path. Repeatable.")
 @click.option("--auto", is_flag=True, help="Auto-approve all gates")
-def develop(name: str, workspace: str, repo: tuple[str, ...], auto: bool) -> None:
+@click.option(
+    "--agent-runtime",
+    default=None,
+    help="Agent runtime to use for workflow agents (claude, claude_pool, or codex).",
+)
+def develop(
+    name: str,
+    workspace: str,
+    repo: tuple[str, ...],
+    auto: bool,
+    agent_runtime: str | None,
+) -> None:
     """Run the full develop workflow (Planning + Implementation)."""
-    asyncio.run(_run("full-develop", name, workspace, auto, repos=list(repo) or None))
+    from ...runtimes import normalize_agent_runtime
+
+    try:
+        resolved_runtime = normalize_agent_runtime(agent_runtime)
+    except ValueError as exc:
+        raise click.BadParameter(str(exc), param_hint="--agent-runtime") from exc
+    asyncio.run(
+        _run(
+            "full-develop",
+            name,
+            workspace,
+            auto,
+            agent_runtime=resolved_runtime,
+            repos=list(repo) or None,
+        )
+    )
 
 
 @cli.command()
@@ -149,15 +210,39 @@ def develop(name: str, workspace: str, repo: tuple[str, ...], auto: bool) -> Non
     type=click.Path(exists=True),
     help="Path to bug report JSON (skips intake interview)",
 )
+@click.option(
+    "--agent-runtime",
+    default=None,
+    help="Agent runtime to use for workflow agents (claude, claude_pool, or codex).",
+)
 def bugfix(
-    name: str, project: str, workspace: str, auto: bool, bug_report_path: str | None
+    name: str,
+    project: str,
+    workspace: str,
+    auto: bool,
+    bug_report_path: str | None,
+    agent_runtime: str | None,
 ) -> None:
     """Run the bug fix workflow (Intake → Reproduce → Diagnose → Fix → Verify)."""
+    from ...runtimes import normalize_agent_runtime
+
+    try:
+        resolved_runtime = normalize_agent_runtime(agent_runtime)
+    except ValueError as exc:
+        raise click.BadParameter(str(exc), param_hint="--agent-runtime") from exc
     bug_report = ""
     if bug_report_path:
         bug_report = Path(bug_report_path).read_text()
     asyncio.run(
-        _run("bugfix", name, workspace, auto, project=project, bug_report=bug_report)
+        _run(
+            "bugfix",
+            name,
+            workspace,
+            auto,
+            agent_runtime=resolved_runtime,
+            project=project,
+            bug_report=bug_report,
+        )
     )
 
 
@@ -177,7 +262,21 @@ def bugfix(
 @click.option(
     "--agent-runtime",
     default=None,
-    help="Agent runtime to use for workflow agents (claude or codex).",
+    help="Agent runtime to use for workflow agents (claude, claude_pool, or codex).",
+)
+@click.option(
+    "--runtime-policy",
+    type=click.Choice(list(SUPPORTED_RUNTIME_POLICIES)),
+    default=DEFAULT_RUNTIME_POLICY,
+    help="Runtime routing policy for workflow roles.",
+)
+@click.option(
+    "--claude-pool-codex-review",
+    is_flag=True,
+    help=(
+        "Use claude_pool primary plus Codex secondary for "
+        "review/verification roles."
+    ),
 )
 @click.option(
     "--claude-only",
@@ -199,6 +298,8 @@ def slack_cmd(
     workspace: str | None,
     mode: str,
     agent_runtime: str | None,
+    runtime_policy: str,
+    claude_pool_codex_review: bool,
     claude_only: bool,
     budget: bool,
     autonomous_remainder: bool,
@@ -212,9 +313,26 @@ def slack_cmd(
         resolved_runtime = normalize_agent_runtime(agent_runtime)
     except ValueError as exc:
         raise click.BadParameter(str(exc), param_hint="--agent-runtime") from exc
-    if claude_only and resolved_runtime != "claude":
+    try:
+        resolved_runtime_policy = normalize_runtime_policy(runtime_policy)
+    except ValueError as exc:
+        raise click.BadParameter(str(exc), param_hint="--runtime-policy") from exc
+
+    runtime_policy_override = resolved_runtime_policy != DEFAULT_RUNTIME_POLICY
+    if claude_pool_codex_review:
+        if agent_runtime is not None and resolved_runtime != "claude_pool":
+            raise click.BadParameter(
+                "--claude-pool-codex-review cannot be combined with a "
+                "non-Claude-pool --agent-runtime.",
+                param_hint="--claude-pool-codex-review",
+            )
+        resolved_runtime = "claude_pool"
+        resolved_runtime_policy = PRIMARY_IMPL_SECONDARY_REVIEW_POLICY
+        runtime_policy_override = True
+
+    if claude_only and resolved_runtime not in {"claude", "claude_pool"}:
         raise click.BadParameter(
-            "--claude-only can only be used with Claude as the primary runtime.",
+            "--claude-only can only be used with Claude or Claude pool as the primary runtime.",
             param_hint="--claude-only",
         )
 
@@ -232,12 +350,68 @@ def slack_cmd(
             workspace=workspace,
             mode=mode,
             agent_runtime=resolved_runtime,
-            agent_runtime_override=agent_runtime is not None,
+            agent_runtime_override=agent_runtime is not None or claude_pool_codex_review,
+            runtime_policy=resolved_runtime_policy,
+            runtime_policy_override=runtime_policy_override,
             single_agent_runtime=claude_only,
             budget=budget,
             autonomous_remainder=autonomous_remainder,
         )
     )
+
+
+@cli.group("claude-pool")
+def claude_pool_cmd() -> None:
+    """Manage the local Claude account pool runtime."""
+    pass
+
+
+@claude_pool_cmd.command("doctor")
+@click.option(
+    "--root",
+    default=None,
+    help="Claude pool root directory (defaults to /Users/Shared/iriai/claude-pool).",
+)
+@click.option(
+    "--skip-health-checks",
+    is_flag=True,
+    help="Only inspect config and heartbeats; do not submit runner health jobs.",
+)
+@click.option("--timeout", default=60.0, help="Seconds to wait for each health-check job.")
+def claude_pool_doctor(root: str | None, skip_health_checks: bool, timeout: float) -> None:
+    """Check shared spool, runner heartbeats, and per-profile user context."""
+    from ...runtimes.claude_pool import DEFAULT_POOL_ROOT, doctor
+
+    root_path = Path(root) if root else DEFAULT_POOL_ROOT
+    lines = asyncio.run(
+        doctor(
+            root=root_path,
+            run_health_checks=not skip_health_checks,
+            timeout=timeout,
+        )
+    )
+    for line in lines:
+        click.echo(line)
+
+
+@claude_pool_cmd.command("install-launchagents")
+@click.option(
+    "--root",
+    default=None,
+    help="Claude pool root directory (defaults to /Users/Shared/iriai/claude-pool).",
+)
+@click.option(
+    "--runner-command",
+    default=None,
+    help="Command used by LaunchAgents to start claude-pool-runner.",
+)
+def claude_pool_install_launchagents(root: str | None, runner_command: str | None) -> None:
+    """Write LaunchAgent plist templates and print install commands."""
+    from ...runtimes.claude_pool import DEFAULT_POOL_ROOT, install_launchagent_templates
+
+    root_path = Path(root) if root else DEFAULT_POOL_ROOT
+    for line in install_launchagent_templates(root=root_path, runner_command=runner_command):
+        click.echo(line)
 
 
 def main() -> None:

@@ -1,0 +1,90 @@
+{
+  "tasks": [
+    {
+      "id": "T-accounts-1",
+      "name": "Implement accounts",
+      "description": "accounts task",
+      "file_scope": [],
+      "requirement_ids": [
+        "REQ-accounts"
+      ],
+      "step_ids": [
+        "STEP-1"
+      ],
+      "journey_ids": [],
+      "acceptance_criteria": [
+        {
+          "description": "accounts acceptance criterion",
+          "not_criteria": ""
+        }
+      ],
+      "counterexamples": [],
+      "security_concerns": [],
+      "testid_assignments": [],
+      "verification_gates": [
+        "AC-accounts-1"
+      ],
+      "reference_material": [
+        {
+          "source": "Plan STEP-1",
+          "content": "accounts reference material"
+        }
+      ],
+      "subfeature_id": "accounts",
+      "repo_path": "",
+      "files": [],
+      "dependencies": [],
+      "team": 0
+    },
+    {
+      "id": "T-accounts-2",
+      "name": "Implement accounts",
+      "description": "accounts task",
+      "file_scope": [],
+      "requirement_ids": [
+        "REQ-accounts"
+      ],
+      "step_ids": [
+        "STEP-1"
+      ],
+      "journey_ids": [],
+      "acceptance_criteria": [
+        {
+          "description": "accounts acceptance criterion",
+          "not_criteria": ""
+        }
+      ],
+      "counterexamples": [],
+      "security_concerns": [],
+      "testid_assignments": [],
+      "verification_gates": [
+        "AC-accounts-2"
+      ],
+      "reference_material": [
+        {
+          "source": "Plan STEP-1",
+          "content": "accounts reference material"
+        }
+      ],
+      "subfeature_id": "accounts",
+      "repo_path": "",
+      "files": [],
+      "dependencies": [],
+      "team": 0
+    }
+  ],
+  "num_teams": 0,
+  "execution_order": [
+    [
+      "T-accounts-1",
+      "T-accounts-2"
+    ]
+  ],
+  "requirement_coverage": {
+    "REQ-accounts": [
+      "T-accounts-1",
+      "T-accounts-2"
+    ]
+  },
+  "complete": true
+}

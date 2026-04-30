@@ -89,6 +89,15 @@ const FeatureCard = memo(function FeatureCard({ id, d, onSelect }: FeatureCardPr
     return null
   }, [health, d.last_activity_at, status])
 
+  const dagRepairLine = useMemo(() => {
+    const repair = d.dag_repair
+    if (!repair || repair.active_group_index == null) return null
+    const elapsed = repair.summary.active_group_elapsed_seconds
+    const mins = elapsed == null ? '?' : `${Math.floor(elapsed / 60)}m`
+    const stage = repair.current_cycle?.status || 'waiting'
+    return `G${repair.active_group_index} · ${repair.summary.retry_count_for_active_group} retries · ${stage} · ${mins}`
+  }, [d.dag_repair])
+
   return (
     <div
       className="feature-card"
@@ -122,6 +131,22 @@ const FeatureCard = memo(function FeatureCard({ id, d, onSelect }: FeatureCardPr
           }}
         >
           {healthLine.text}
+        </div>
+      )}
+
+      {dagRepairLine && (
+        <div
+          className="fc-health-line"
+          style={{
+            fontFamily: 'var(--mono)',
+            fontSize: 11,
+            color: 'var(--cyan)',
+            marginTop: 2,
+            marginBottom: 4,
+            lineHeight: '16px',
+          }}
+        >
+          {dagRepairLine}
         </div>
       )}
 

@@ -1,0 +1,4 @@
+# Subfeature Context Manifest
+
+## Broad Artifacts
+- **Broad PRD**: `/Users/danielzhang/src/iriai/iriai-build-v2/.tmp/pytest-of-danielzhang/pytest-10/test_prepare_subfeature_contex0/features/feat-context/broad/prd.md`

@@ -1,0 +1,49 @@
+{
+  "slug": "bridge-protocol",
+  "slices": [
+    {
+      "slice_id": "slice-1",
+      "title": "Whole subfeature",
+      "step_ids": [],
+      "requirement_ids": [],
+      "journey_ids": [],
+      "acceptance_criterion_ids": [
+        "AC-bridge-protocol-1",
+        "AC-bridge-protocol-2"
+      ],
+      "strict_acceptance_criteria": false,
+      "step_titles": [],
+      "source_budget_chars": 35000,
+      "mandatory_source_chars": 11
+    }
+  ],
+  "statuses": [
+    {
+      "slice_id": "slice-1",
+      "status": "completed",
+      "retry_mode": "all-workstream-peers",
+      "context_paths": [
+        "/Users/danielzhang/src/iriai/iriai-build-v2/.tmp/pytest-of-danielzhang/pytest-11/test_task_planning_without_aut0/features/feat-task-plan-no-autorepair/.iriai-context/dag-ws-WS-3-bridge-protocol-slice-1-all-workstream-peers-context-index.md",
+        "/Users/danielzhang/src/iriai/iriai-build-v2/.tmp/pytest-of-danielzhang/pytest-11/test_task_planning_without_aut0/features/feat-task-plan-no-autorepair/.iriai-context/dag-ws-WS-3-bridge-protocol-slice-1-all-workstream-peers-context-manifest.md"
+      ],
+      "last_error": "",
+      "fragment_key": "dag-fragment:bridge-protocol:slice-1"
+    }
+  ],
+  "attempts": [
+    {
+      "slice_id": "slice-1",
+      "mode": "all-workstream-peers",
+      "attempt": 1,
+      "status": "succeeded",
+      "actor_name": "dag-ws-WS-3-bridge-protocol-slice-1-all-workstream-peers",
+      "context_paths": [
+        "/Users/danielzhang/src/iriai/iriai-build-v2/.tmp/pytest-of-danielzhang/pytest-11/test_task_planning_without_aut0/features/feat-task-plan-no-autorepair/.iriai-context/dag-ws-WS-3-bridge-protocol-slice-1-all-workstream-peers-context-index.md",
+        "/Users/danielzhang/src/iriai/iriai-build-v2/.tmp/pytest-of-danielzhang/pytest-11/test_task_planning_without_aut0/features/feat-task-plan-no-autorepair/.iriai-context/dag-ws-WS-3-bridge-protocol-slice-1-all-workstream-peers-context-manifest.md"
+      ],
+      "attempt_key": "dag-fragment-attempt:bridge-protocol:slice-1:all-workstream-peers:1",
+      "error": ""
+    }
+  ],
+  "complete": false
+}

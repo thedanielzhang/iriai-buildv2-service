@@ -52,6 +52,7 @@ from .._control import (
     sync_subfeature_threads,
 )
 from .._decisions import refresh_decision_ledger
+from .._sidecars import refresh_sidecar_for_source_artifact
 from .._stage_helpers import (
     continue_threaded_interview_in_background,
     outcome_background_requested,
@@ -383,6 +384,13 @@ async def _revise_broad_artifact_from_reconciliation(
         handle=handle,
     )
     await runner.artifacts.put(artifact_key, revised_text, feature=feature)
+    await refresh_sidecar_for_source_artifact(
+        runner,
+        feature,
+        artifact_key,
+        revised_text,
+        generated_from="approved_object",
+    )
     set_step_status(
         control,
         step=step,
@@ -447,6 +455,20 @@ async def _revise_decomposition_from_reconciliation(
         handle=handle,
     )
     await runner.artifacts.put("decomposition", decomp_text, feature=feature)
+    await refresh_sidecar_for_source_artifact(
+        runner,
+        feature,
+        "decomposition",
+        decomp_text,
+        generated_from="approved_object",
+    )
+    await refresh_sidecar_for_source_artifact(
+        runner,
+        feature,
+        "decomposition",
+        decomp_text,
+        generated_from="approved_object",
+    )
     set_step_status(
         control,
         step=step,
@@ -779,6 +801,13 @@ async def _run_broad_artifact_stage(
         provenance = _merge_provenance(provenance, revised_provenance)
 
     await runner.artifacts.put(artifact_key, draft_text, feature=feature)
+    await refresh_sidecar_for_source_artifact(
+        runner,
+        feature,
+        artifact_key,
+        draft_text,
+        generated_from="approved_object",
+    )
     set_step_status(control, step=step, status=STEP_COMPLETE, provenance=provenance)
     await persist_planning_control(runner, feature, state, control)
     return draft_text

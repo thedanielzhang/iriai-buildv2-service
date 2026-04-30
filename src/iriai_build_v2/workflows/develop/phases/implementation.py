@@ -1,21 +1,34 @@
 from __future__ import annotations
 
 import asyncio as _asyncio
+import collections
+import hashlib
 import itertools
 import json
 import logging
+import os
+import re
 import shutil
+import subprocess
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 from uuid import uuid4
 
 from iriai_compose import AgentActor, Ask, Feature, Phase, WorkflowRunner, to_str
 from iriai_compose.actors import Role
+from pydantic import BaseModel, Field
 
 from ....config import BUDGET_TIERS
+from ....runtime_policy import (
+    DEFAULT_RUNTIME_POLICY,
+    PRIMARY_IMPL_SECONDARY_REVIEW_POLICY,
+    RuntimePolicy,
+    normalize_runtime_policy,
+)
 from ....models.outputs import (
+    ArtifactRepairResult,
     BugFixAttempt,
     BugGroup,
     BugTriage,
@@ -25,10 +38,12 @@ from ....models.outputs import (
     Envelope,
     FindingLedger,
     FindingRecord,
+    Gap,
     HandoverDoc,
     ImplementationDAG,
     ImplementationResult,
     ImplementationTask,
+    Issue,
     RepairStrategyDecision,
     ReviewOutcome,
     RootCauseAnalysis,
@@ -59,7 +74,15 @@ from ..._common._helpers import (
     _offload_if_large,
     build_context_package,
 )
-from ..._common._autonomy import interaction_actor_for_phase
+from ..._common._dag_paths import (
+    canonicalize_dag_path,
+    canonicalize_implementation_tasks,
+    dag_path_canonicalization_enabled,
+    dag_path_rewrites_to_records,
+    find_retired_backend_path_references,
+)
+from ..._common._autonomy import autonomous_remainder_enabled, interaction_actor_for_phase
+from ...public_exhibit import enqueue_public_exhibit_refresh
 from ..._common._tasks import HostedInterview
 
 logger = logging.getLogger(__name__)
@@ -67,6 +90,136 @@ logger = logging.getLogger(__name__)
 VERIFY_RETRIES = 2
 WARN_AFTER_CYCLES = 3
 BLOCKING_SEVERITIES = frozenset({"blocker", "major"})
+DAG_EXPANDED_VERIFY_ENV = "IRIAI_DAG_EXPANDED_VERIFY"
+DAG_PARALLEL_REPAIR_ENV = "IRIAI_DAG_PARALLEL_REPAIR"
+DAG_PREFLIGHT_REPAIR_ENV = "IRIAI_DAG_PREFLIGHT_REPAIR"
+DAG_AUTO_RESOLVE_CONTRADICTIONS_ENV = "IRIAI_DAG_AUTO_RESOLVE_CONTRADICTIONS"
+CONTRADICTION_DECISIONS_KEY = "contradiction-decisions"
+
+DAG_REPAIR_ROLE_RUNTIMES: dict[str, str] = {
+    # Under --bridge-claude-pool-codex-review, primary=Claude pool and
+    # secondary=Codex. Keep this intentionally static so runtime balance is
+    # role-based rather than a fragile per-run counter.
+    "dag-normal-verify": "secondary",
+    "dag-final-verify": "secondary",
+    "dag-triage": "primary",
+    "dag-rca": "primary",
+    "dag-fix": "primary",
+    "dag-focused-reverify": "primary",
+    "dag-contradiction-resolve": "secondary",
+    "lens:acceptance-coverage": "secondary",
+    "lens:contract-protocol": "secondary",
+    "lens:build-dependency": "primary",
+    "lens:runtime-composition": "primary",
+    "lens:security-boundary": "primary",
+    "lens:regression-downstream": "primary",
+}
+
+
+def _env_flag_enabled(name: str, *, default: bool = True) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _dag_parallel_repair_enabled() -> bool:
+    return _env_flag_enabled(DAG_PARALLEL_REPAIR_ENV, default=True)
+
+
+def _dag_preflight_repair_enabled() -> bool:
+    return _env_flag_enabled(DAG_PREFLIGHT_REPAIR_ENV, default=True)
+
+
+def _dag_auto_resolve_contradictions_enabled() -> bool:
+    return _env_flag_enabled(DAG_AUTO_RESOLVE_CONTRADICTIONS_ENV, default=True)
+
+
+def _dag_repair_runtime_for(
+    role_or_lens: str,
+    fallback: str | None = None,
+) -> str | None:
+    return DAG_REPAIR_ROLE_RUNTIMES.get(role_or_lens, fallback)
+
+
+async def _log_feature_event(
+    runner: WorkflowRunner,
+    feature_id: str,
+    event_type: str,
+    phase: str,
+    *,
+    content: str = "",
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    feature_store = getattr(runner, "feature_store", None)
+    log_event = getattr(feature_store, "log_event", None)
+    if not callable(log_event):
+        return
+    try:
+        await log_event(
+            feature_id,
+            event_type,
+            phase,
+            content=content,
+            metadata=metadata or {},
+        )
+    except Exception:
+        logger.warning(
+            "Feature event logging failed for feature=%s event=%s phase=%s",
+            feature_id,
+            event_type,
+            phase,
+            exc_info=True,
+        )
+
+
+def _runner_runtime_policy(runner: WorkflowRunner) -> RuntimePolicy:
+    services = getattr(runner, "services", {}) or {}
+    try:
+        return normalize_runtime_policy(services.get("runtime_policy"))
+    except ValueError:
+        logger.warning(
+            "Unsupported runtime_policy=%r; falling back to %s",
+            services.get("runtime_policy"),
+            DEFAULT_RUNTIME_POLICY,
+        )
+        return DEFAULT_RUNTIME_POLICY
+
+
+def _dag_group_runtime_pair(
+    group_idx: int,
+    runtime_policy: RuntimePolicy,
+) -> tuple[str, str]:
+    """Return ``(implementation_runtime, review_runtime)`` for a DAG group."""
+    if runtime_policy == PRIMARY_IMPL_SECONDARY_REVIEW_POLICY:
+        return "primary", "secondary"
+    return (
+        ("primary", "secondary")
+        if group_idx % 2 == 0
+        else ("secondary", "primary")
+    )
+
+
+def _post_dag_runtime_pair(
+    last_group_idx: int,
+    runtime_policy: RuntimePolicy,
+) -> tuple[str, str]:
+    """Return ``(gate_runtime, fix_runtime)`` for post-DAG gates."""
+    if runtime_policy == PRIMARY_IMPL_SECONDARY_REVIEW_POLICY:
+        return "secondary", "primary"
+    return (
+        ("secondary", "primary")
+        if last_group_idx % 2 == 0
+        else ("primary", "secondary")
+    )
+
+
+def _diagnostic_runtime_for_policy(runtime_policy: RuntimePolicy) -> str | None:
+    """Return the runtime for RCA/triage/regression analysis under a policy."""
+    if runtime_policy == PRIMARY_IMPL_SECONDARY_REVIEW_POLICY:
+        return "secondary"
+    return None
+
 
 # ── Inline triage role (lightweight, no tools) ───────────────────────────────
 
@@ -107,6 +260,75 @@ class PlannedBugDispatch:
     required_files: list[str] = field(default_factory=list)
     stable_blocker_summary: str = ""
     similar_cluster_hints: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class DagTaskDriftRoute:
+    task_id: str
+    artifact_key: str
+    route: str
+    reason: str
+    path_problems: list[dict[str, Any]] = field(default_factory=list)
+    forbidden_workspace_paths: list[dict[str, Any]] = field(default_factory=list)
+    candidate_evidence: list[dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class DagArtifactClosureScan:
+    stale_signatures: list[str] = field(default_factory=list)
+    signature_records: list[dict[str, Any]] = field(default_factory=list)
+    affected_task_ids: list[str] = field(default_factory=list)
+    affected_subfeatures: list[str] = field(default_factory=list)
+    affected_slices: list[str] = field(default_factory=list)
+    source_refs: list[str] = field(default_factory=list)
+    blocking_targets: list[dict[str, Any]] = field(default_factory=list)
+    advisory_residuals: list[dict[str, Any]] = field(default_factory=list)
+    ignored_matches: list[dict[str, Any]] = field(default_factory=list)
+    scanned_paths: list[str] = field(default_factory=list)
+    suggested_scan_roots: list[str] = field(default_factory=list)
+
+    def target_refs(self) -> list[str]:
+        return _dedupe_preserving_order([
+            str(item.get("target_ref", ""))
+            for item in self.blocking_targets
+            if str(item.get("target_ref", "")).strip()
+        ])
+
+    def to_record(self) -> dict[str, Any]:
+        return {
+            "stale_signatures": self.stale_signatures,
+            "signature_records": self.signature_records,
+            "affected_task_ids": self.affected_task_ids,
+            "affected_subfeatures": self.affected_subfeatures,
+            "affected_slices": self.affected_slices,
+            "source_refs": self.source_refs,
+            "blocking_targets": self.blocking_targets,
+            "advisory_residuals": self.advisory_residuals,
+            "ignored_matches": self.ignored_matches,
+            "scanned_paths": self.scanned_paths,
+            "suggested_scan_roots": self.suggested_scan_roots,
+        }
+
+
+class DagContradictionResolution(BaseModel):
+    """Autonomous adjudication of a DAG repair spec contradiction."""
+
+    resolution: str
+    resolution_kind: str = "decision_only"
+    authoritative_sources: list[str] = Field(default_factory=list)
+    artifact_paths: list[str] = Field(default_factory=list)
+    superseded_expectation: str = ""
+    implementation_direction: str = ""
+    requires_code_change: bool = False
+    needs_human: bool = False
+    confidence: str = "medium"  # high | medium | low
+    rationale: str = ""
+
+
+@dataclass(slots=True)
+class DagContradictionResolutionValidation:
+    resolution: DagContradictionResolution | None
+    rejection_reasons: list[str] = field(default_factory=list)
 
 
 # ── Worktree management ─────────────────────────────────────────────────────
@@ -530,15 +752,48 @@ class ImplementationPhase(Phase):
 
             await runner.artifacts.put("implementation", impl_text, feature=feature)
             await runner.artifacts.put("handover", to_str(handover), feature=feature)
+            await enqueue_public_exhibit_refresh(
+                runner,
+                feature,
+                reason="implementation-handover-refresh",
+                job_types=(
+                    "public-summary",
+                    "public-current-implementation",
+                    "public-artifact-gallery",
+                ),
+            )
             state.implementation = impl_text
             state.handover = to_str(handover)
 
             # If the DAG stopped early on a verify failure, go through RCA
             if dag_failure:
+                runtime_policy = _runner_runtime_policy(runner)
+                diagnostic_runtime = _dag_repair_runtime_for(
+                    "dag-rca",
+                    _diagnostic_runtime_for_policy(runtime_policy),
+                )
+                diagnostic_reviewer = (
+                    _make_parallel_actor(
+                        qa_engineer,
+                        "dag-failure-recheck",
+                        runtime=_dag_repair_runtime_for(
+                            "dag-focused-reverify",
+                            diagnostic_runtime,
+                        ),
+                    )
+                    if diagnostic_runtime
+                    else qa_engineer
+                )
+                diagnostic_fixer = _make_parallel_actor(
+                    implementer,
+                    "dag-failure-fix",
+                    runtime=_dag_repair_runtime_for("dag-fix", "primary"),
+                )
                 attempts = await _diagnose_and_fix(
                     runner, feature, dag_failure, "verify",
-                    qa_engineer, implementer, prior_attempts, bug_counter,
+                    diagnostic_reviewer, diagnostic_fixer, prior_attempts, bug_counter,
                     test_plan_section=test_plan_section,
+                    rca_runtime=diagnostic_runtime,
                 )
                 prior_attempts.extend(attempts)
                 await _store_attempts(runner, feature, prior_attempts)
@@ -571,49 +826,11 @@ class ImplementationPhase(Phase):
                 except Exception:
                     pass
 
-            # Append resolved contradiction decisions so all gates
-            # respect user overrides (e.g., "use Nixpacks, not Dockerfile").
-            contradiction_keys = []
-            for f_record in (await _load_ledger(runner, feature)).findings:
-                if f_record.status == "contradiction":
-                    contradiction_keys.append(f_record.id)
-            # Also scan artifacts directly for contradiction resolutions
-            ledger = await _load_ledger(runner, feature)
-            contradiction_artifacts = []
-            for key_prefix in ("contradiction:verify:", "contradiction:regression:"):
-                for suffix in [
-                    f"dag-g{g}-r{r}" for g in range(10) for r in range(5)
-                ]:
-                    raw = await runner.artifacts.get(
-                        f"{key_prefix}{suffix}", feature=feature,
-                    )
-                    if raw:
-                        contradiction_artifacts.append(raw)
-            if contradiction_artifacts:
-                decisions_parts = []
-                for raw in contradiction_artifacts:
-                    try:
-                        import json as _json
-                        data = _json.loads(raw) if isinstance(raw, str) else raw
-                        reqs = (
-                            data.get("revision_plan", {}).get("requests", [])
-                            if isinstance(data, dict) else []
-                        )
-                        for req in reqs:
-                            desc = req.get("description", "")
-                            if desc:
-                                decisions_parts.append(f"- {desc}")
-                    except Exception:
-                        pass
-                if decisions_parts:
-                    handover_context += (
-                        f"\n\n## User Contradiction Decisions (AUTHORITATIVE)\n"
-                        f"The user resolved the following spec contradictions. "
-                        f"These decisions override any conflicting task spec or "
-                        f"reference material. Do NOT revert these.\n\n"
-                        + "\n".join(decisions_parts)
-                        + "\n"
-                    )
+            contradiction_decisions = await _format_contradiction_decisions_context(
+                runner, feature,
+            )
+            if contradiction_decisions:
+                handover_context += "\n\n" + contradiction_decisions
 
             post_dag_context = await _build_prompt_context_package(
                 runner,
@@ -631,17 +848,21 @@ class ImplementationPhase(Phase):
             )
 
             # ── Adversarial runtime routing for post-DAG gates ──────────
-            # The last implementation group used impl_runtime based on its
-            # index parity.  Post-DAG gates (review, security, QA,
-            # integration, verifier) use the opposite runtime so a
-            # different model audits the work.  Fixes go back to the
-            # implementation runtime.
+            # The default policy preserves the existing parity-based
+            # adversarial routing.  Other policies can pin implementation
+            # and review work to fixed primary/secondary runtimes.
             last_group_idx = len(dag.execution_order) - 1
-            gate_runtime = "secondary" if last_group_idx % 2 == 0 else "primary"
-            fix_runtime = "primary" if last_group_idx % 2 == 0 else "secondary"
+            runtime_policy = _runner_runtime_policy(runner)
+            gate_runtime, fix_runtime = _post_dag_runtime_pair(
+                last_group_idx,
+                runtime_policy,
+            )
+            diagnostic_runtime = _diagnostic_runtime_for_policy(runtime_policy)
             logger.info(
-                "Post-DAG gates: gate_runtime=%s, fix_runtime=%s (last_group=%d)",
-                gate_runtime, fix_runtime, last_group_idx,
+                "Post-DAG gates: gate_runtime=%s, fix_runtime=%s, rca_runtime=%s "
+                "(last_group=%d, runtime_policy=%s)",
+                gate_runtime, fix_runtime, diagnostic_runtime,
+                last_group_idx, runtime_policy,
             )
 
             # ── Step 2: Code Review (static) ─────────────────────────────
@@ -693,6 +914,7 @@ class ImplementationPhase(Phase):
                     _make_parallel_actor(implementer, "cr-fix", runtime=fix_runtime),
                     prior_attempts, bug_counter,
                     handover_context=handover_context,
+                    rca_runtime=diagnostic_runtime,
                 )
                 prior_attempts.extend(attempts)
                 await _store_attempts(runner, feature, prior_attempts)
@@ -748,6 +970,7 @@ class ImplementationPhase(Phase):
                     _make_parallel_actor(implementer, "sec-fix", runtime=fix_runtime),
                     prior_attempts, bug_counter,
                     handover_context=handover_context,
+                    rca_runtime=diagnostic_runtime,
                 )
                 prior_attempts.extend(attempts)
                 await _store_attempts(runner, feature, prior_attempts)
@@ -842,6 +1065,7 @@ class ImplementationPhase(Phase):
                     prior_attempts, bug_counter,
                     handover_context=handover_context,
                     test_plan_section=test_plan_section,
+                    rca_runtime=diagnostic_runtime,
                 )
                 prior_attempts.extend(attempts)
                 await _store_attempts(runner, feature, prior_attempts)
@@ -901,6 +1125,7 @@ class ImplementationPhase(Phase):
                     prior_attempts, bug_counter,
                     handover_context=handover_context,
                     test_plan_section=test_plan_section,
+                    rca_runtime=diagnostic_runtime,
                 )
                 prior_attempts.extend(attempts)
                 await _store_attempts(runner, feature, prior_attempts)
@@ -971,6 +1196,7 @@ class ImplementationPhase(Phase):
                     prior_attempts, bug_counter,
                     handover_context=handover_context,
                     test_plan_section=test_plan_section,
+                    rca_runtime=diagnostic_runtime,
                 )
                 prior_attempts.extend(attempts)
                 await _store_attempts(runner, feature, prior_attempts)
@@ -1134,6 +1360,31 @@ async def _push_clones_to_source_root(repos_root: Path) -> None:
 # ── DAG execution ────────────────────────────────────────────────────────────
 
 
+async def _record_dag_path_canonicalization(
+    runner: WorkflowRunner,
+    feature: Feature,
+    group_idx: int,
+    rewrites: list[Any],
+    *,
+    context_label: str,
+) -> None:
+    if not rewrites:
+        return
+    records = dag_path_rewrites_to_records(rewrites)
+    counts = collections.Counter(record["rule"] for record in records)
+    await runner.artifacts.put(
+        f"dag-path-canonicalization:g{group_idx}",
+        json.dumps({
+            "group_idx": group_idx,
+            "context_label": context_label,
+            "rewrite_count": len(records),
+            "counts": dict(sorted(counts.items())),
+            "paths": records,
+        }, indent=2),
+        feature=feature,
+    )
+
+
 def _build_task_prompt(
     task: ImplementationTask,
     *,
@@ -1263,9 +1514,11 @@ async def _verify_and_fix_group(
     feature_root: Path | None,
     impl_runtime: str,
     review_runtime: str,
+    rca_runtime: str | None = None,
     *,
     verify_fn: Any | None = None,
     fix_context: str = "",
+    known_task_ids: set[str] | None = None,
 ) -> tuple[bool, str]:
     """Verify a group's implementation and fix issues via RCA → fix → re-verify.
 
@@ -1283,19 +1536,116 @@ async def _verify_and_fix_group(
     import json as _json
 
     _do_verify = verify_fn or _verify
+    dag_review_runtime = (
+        _dag_repair_runtime_for("dag-normal-verify", review_runtime)
+        if verify_fn is None else review_runtime
+    )
+    dag_final_review_runtime = (
+        _dag_repair_runtime_for("dag-final-verify", dag_review_runtime)
+        if verify_fn is None else dag_review_runtime
+    )
+    dag_impl_runtime = (
+        _dag_repair_runtime_for("dag-fix", impl_runtime)
+        if verify_fn is None else impl_runtime
+    )
+    dag_rca_runtime = (
+        _dag_repair_runtime_for("dag-rca", rca_runtime)
+        if verify_fn is None else rca_runtime
+    )
 
     # ── Initial verify ────────────────────────────────────────────────
-    group_files = _collect_files(results)
-    verdict = await _do_verify(
-        runner, feature, results, group_files, group_tasks,
-        runtime=review_runtime,
+    verify_results_context = list(results)
+    if verify_fn is None:
+        verify_results_context = await _sanitize_dag_repair_results(
+            runner,
+            feature,
+            group_idx,
+            -1,
+            verify_results_context,
+            feature_root,
+            context_label="initial-preflight",
+        )
+        reconcile = await _reconcile_dag_task_results(
+            runner,
+            feature,
+            group_idx,
+            "initial",
+            group_tasks,
+            results=results,
+            verify_results_context=verify_results_context,
+            all_results=all_results,
+            repair_results=[],
+            feature_root=feature_root,
+        )
+        results = reconcile.results
+        verify_results_context = reconcile.verify_results_context
+        all_results[:] = reconcile.all_results
+    group_files = _collect_files(verify_results_context)
+    logger.info(
+        "DAG group verify starting group=%d attempt=initial runtime=%s rca_runtime=%s "
+        "tasks=%s files=%d results=%d",
+        group_idx,
+        dag_review_runtime or "<default>",
+        dag_rca_runtime or "<default>",
+        [task.id for task in group_tasks],
+        len(group_files),
+        len(results),
+    )
+    await _log_feature_event(
+        runner,
+        feature.id,
+        "dag_verify_start",
+        "implementation",
+        content=f"g{group_idx}:initial",
+        metadata={
+            "group_idx": group_idx,
+            "retry": "initial",
+            "runtime": dag_review_runtime,
+            "task_ids": [task.id for task in group_tasks],
+            "file_count": len(group_files),
+            "result_count": len(results),
+        },
+    )
+    verdict: object | None = None
+    if verify_fn is None:
+        verdict = await _run_dag_group_preflight(
+            runner,
+            feature,
+            group_idx,
+            "initial",
+            group_tasks,
+            verify_results_context,
+            feature_root=feature_root,
+            known_task_ids=known_task_ids,
+        )
+    if verdict is None:
+        verdict = await _do_verify(
+            runner, feature, verify_results_context, group_files, group_tasks,
+            runtime=dag_review_runtime,
+        )
+    logger.info(
+        "DAG group verify finished group=%d attempt=initial approved=%s",
+        group_idx,
+        _is_approved(verdict),
+    )
+    await _log_feature_event(
+        runner,
+        feature.id,
+        "dag_verify_finish",
+        "implementation",
+        content=f"g{group_idx}:initial",
+        metadata={
+            "group_idx": group_idx,
+            "retry": "initial",
+            "approved": _is_approved(verdict),
+            "runtime": dag_review_runtime,
+        },
     )
     await runner.artifacts.put(
         f"dag-verify:g{group_idx}:initial",
         to_str(verdict),
         feature=feature,
     )
-
     # Ledger dedup + severity partition
     if isinstance(verdict, Verdict):
         ledger = await _load_ledger(runner, feature)
@@ -1311,6 +1661,35 @@ async def _verify_and_fix_group(
     for retry in range(VERIFY_RETRIES):
         if _is_approved(verdict):
             break
+
+        await _log_feature_event(
+            runner,
+            feature.id,
+            "dag_repair_cycle_start",
+            "implementation",
+            content=f"g{group_idx}:retry-{retry}",
+            metadata={
+                "group_idx": group_idx,
+                "retry": retry,
+                "runtime": dag_impl_runtime,
+                "rca_runtime": dag_rca_runtime,
+                "final_review_runtime": dag_final_review_runtime,
+            },
+        )
+
+        if verify_fn is None and isinstance(verdict, Verdict):
+            verdict = await _run_expanded_dag_verify_lenses(
+                runner,
+                feature,
+                group_idx,
+                retry,
+                verdict,
+                verify_results_context,
+                group_files,
+                group_tasks,
+                runtime=dag_final_review_runtime,
+                feature_root=feature_root,
+            )
 
         feedback = _format_feedback("Verify", verdict)
 
@@ -1346,6 +1725,182 @@ async def _verify_and_fix_group(
                 "from each flagged file to the actual root cause."
             )
 
+        if verify_fn is None and isinstance(verdict, Verdict):
+            parallel_fix_results = await _attempt_parallel_dag_repair(
+                runner,
+                feature,
+                group_idx,
+                retry,
+                verdict,
+                group_tasks,
+                feature_root=feature_root,
+                impl_runtime=dag_impl_runtime,
+                rca_runtime=dag_rca_runtime,
+                feedback=feedback,
+                fix_context=fix_context,
+            )
+            if parallel_fix_results:
+                all_results.extend(parallel_fix_results)
+                parallel_fix_task_ids = {result.task_id for result in parallel_fix_results}
+                verify_results_context = [
+                    *verify_results_context,
+                    *parallel_fix_results,
+                ]
+                verify_results_context = await _sanitize_dag_repair_results(
+                    runner,
+                    feature,
+                    group_idx,
+                    retry,
+                    verify_results_context,
+                    feature_root,
+                    context_label="parallel-final-preflight",
+                )
+                sanitized_by_task_id = {
+                    result.task_id: result
+                    for result in verify_results_context
+                    if result.task_id in parallel_fix_task_ids
+                }
+                parallel_fix_results = [
+                    sanitized_by_task_id.get(result.task_id, result)
+                    for result in parallel_fix_results
+                ]
+                reconcile = await _reconcile_dag_task_results(
+                    runner,
+                    feature,
+                    group_idx,
+                    str(retry),
+                    group_tasks,
+                    results=results,
+                    verify_results_context=verify_results_context,
+                    all_results=all_results,
+                    repair_results=parallel_fix_results,
+                    feature_root=feature_root,
+                )
+                results = reconcile.results
+                verify_results_context = reconcile.verify_results_context
+                all_results[:] = reconcile.all_results
+                created_files = sorted({
+                    path
+                    for result in parallel_fix_results
+                    for path in result.files_created
+                })
+                modified_files = sorted({
+                    path
+                    for result in parallel_fix_results
+                    for path in result.files_modified
+                })
+                aggregate_fix = ImplementationResult(
+                    task_id=f"g{group_idx}-parallel-fix-{retry}",
+                    summary=(
+                        f"Parallel DAG repair applied {len(parallel_fix_results)} "
+                        "root-cause-group fix(es); final aggregate verifier still required."
+                    ),
+                    status=(
+                        "completed"
+                        if all(result.status == "completed" for result in parallel_fix_results)
+                        else "partial"
+                    ),
+                    files_created=created_files,
+                    files_modified=modified_files,
+                )
+                await runner.artifacts.put(
+                    f"dag-fix:g{group_idx}:retry-{retry}",
+                    aggregate_fix.model_dump_json(),
+                    feature=feature,
+                )
+                group_files = _collect_files(verify_results_context)
+                logger.info(
+                    "DAG group verify starting group=%d attempt=retry-%d runtime=%s rca_runtime=%s "
+                    "tasks=%s files=%d results=%d parallel_repair=true",
+                    group_idx,
+                    retry,
+                    dag_final_review_runtime or "<default>",
+                    dag_rca_runtime or "<default>",
+                    [task.id for task in group_tasks],
+                    len(group_files),
+                    len(verify_results_context),
+                )
+                await _log_feature_event(
+                    runner,
+                    feature.id,
+                    "dag_verify_start",
+                    "implementation",
+                    content=f"g{group_idx}:retry-{retry}",
+                    metadata={
+                        "group_idx": group_idx,
+                        "retry": retry,
+                        "runtime": dag_final_review_runtime,
+                        "task_ids": [task.id for task in group_tasks],
+                        "file_count": len(group_files),
+                        "result_count": len(verify_results_context),
+                        "parallel_repair": True,
+                    },
+                )
+                preflight_verdict = await _run_dag_group_preflight(
+                    runner,
+                    feature,
+                    group_idx,
+                    str(retry),
+                    group_tasks,
+                    verify_results_context,
+                    feature_root=feature_root,
+                    known_task_ids=known_task_ids,
+                )
+                if preflight_verdict is not None:
+                    verdict = preflight_verdict
+                else:
+                    verdict = await _do_verify(
+                        runner,
+                        feature,
+                        verify_results_context,
+                        group_files,
+                        group_tasks,
+                        runtime=dag_final_review_runtime,
+                    )
+                logger.info(
+                    "DAG group verify finished group=%d attempt=retry-%d approved=%s",
+                    group_idx,
+                    retry,
+                    _is_approved(verdict),
+                )
+                await _log_feature_event(
+                    runner,
+                    feature.id,
+                    "dag_verify_finish",
+                    "implementation",
+                    content=f"g{group_idx}:retry-{retry}",
+                    metadata={
+                        "group_idx": group_idx,
+                        "retry": retry,
+                        "approved": _is_approved(verdict),
+                        "runtime": dag_final_review_runtime,
+                        "parallel_repair": True,
+                    },
+                )
+                await runner.artifacts.put(
+                    f"dag-verify:g{group_idx}:retry-{retry}",
+                    to_str(verdict),
+                    feature=feature,
+                )
+                if isinstance(verdict, Verdict):
+                    ledger = await _load_ledger(runner, feature)
+                    verdict, _suppressed = _dedup_findings(verdict, ledger, "verify")
+                    if _suppressed:
+                        logger.info(
+                            "Suppressed %d duplicate findings from verify retry (group %d)",
+                            len(_suppressed),
+                            group_idx,
+                        )
+                    verdict, _enhancements = _partition_verdict(
+                        verdict,
+                        "verify",
+                        f"group-{group_idx}-retry-{retry}",
+                    )
+                    await _append_enhancements(runner, feature, _enhancements)
+                    ledger = _update_ledger(ledger, verdict, "verify", 0)
+                    await _save_ledger(runner, feature, ledger)
+                continue
+
         rca_context = await _build_prompt_context_package(
             runner,
             feature,
@@ -1375,6 +1930,7 @@ async def _verify_and_fix_group(
                 Ask(
                     actor=_make_parallel_actor(
                         root_cause_analyst, f"dag-rca-g{group_idx}-r{retry}",
+                        runtime=dag_rca_runtime,
                         workspace_path=str(feature_root) if feature_root else None,
                     ),
                     prompt=rca_prompt,
@@ -1435,7 +1991,7 @@ async def _verify_and_fix_group(
 
         fix_actor = _make_parallel_actor(
             implementer, f"g{group_idx}-fix-{retry}",
-            runtime=impl_runtime,
+            runtime=dag_impl_runtime,
             workspace_path=fix_ws_path,
         )
         workspace_ctx = ""
@@ -1447,6 +2003,9 @@ async def _verify_and_fix_group(
                 f"Do NOT use absolute paths from search results that point to "
                 f"other copies of the same repo.\n"
             )
+        contradiction_context = await _format_contradiction_decisions_context(
+            runner, feature,
+        )
 
         fix_context_package = await _build_prompt_context_package(
             runner,
@@ -1460,6 +2019,11 @@ async def _verify_and_fix_group(
                 ("feedback", "Verifier Feedback", feedback),
                 ("rca-guidance", "RCA Guidance", rca_guidance),
                 ("user-direction", "User Decision", fix_direction),
+                (
+                    "contradiction-decisions",
+                    "Resolved Contradiction Decisions",
+                    contradiction_context,
+                ),
                 ("fix-context", "Original Enhancement Items", fix_context),
                 ("workspace", "Workspace", workspace_ctx),
             ],
@@ -1483,21 +2047,122 @@ async def _verify_and_fix_group(
             feature,
             phase_name="implementation",
         )
-        all_results.append(fix_result)
         if isinstance(fix_result, ImplementationResult):
+            sanitized = await _sanitize_dag_repair_results(
+                runner,
+                feature,
+                group_idx,
+                retry,
+                [fix_result],
+                feature_root,
+                context_label="single-fix",
+            )
+            fix_result = sanitized[0]
             await runner.artifacts.put(
                 f"dag-fix:g{group_idx}:retry-{retry}",
                 fix_result.model_dump_json(),
                 feature=feature,
             )
+        all_results.append(fix_result)
+        verify_results_context = [*verify_results_context, fix_result]
+        verify_results_context = await _sanitize_dag_repair_results(
+            runner,
+            feature,
+            group_idx,
+            retry,
+            verify_results_context,
+            feature_root,
+            context_label="single-final-preflight",
+        )
         await _commit_repos(
             runner, feature,
             f"fix: group {group_idx} verify retry {retry + 1}",
         )
-        group_files = list(set(group_files + _collect_files([fix_result])))
-        verdict = await _do_verify(
-            runner, feature, [*results, fix_result], group_files, group_tasks,
-            runtime=review_runtime,
+        reconcile = await _reconcile_dag_task_results(
+            runner,
+            feature,
+            group_idx,
+            str(retry),
+            group_tasks,
+            results=results,
+            verify_results_context=verify_results_context,
+            all_results=all_results,
+            repair_results=(
+                [fix_result]
+                if isinstance(fix_result, ImplementationResult)
+                else []
+            ),
+            feature_root=feature_root,
+        )
+        results = reconcile.results
+        verify_results_context = reconcile.verify_results_context
+        all_results[:] = reconcile.all_results
+        group_files = _collect_files(verify_results_context)
+        logger.info(
+            "DAG group verify starting group=%d attempt=retry-%d runtime=%s rca_runtime=%s "
+            "tasks=%s files=%d results=%d",
+            group_idx,
+            retry,
+            dag_final_review_runtime or "<default>",
+            dag_rca_runtime or "<default>",
+            [task.id for task in group_tasks],
+            len(group_files),
+            len(verify_results_context),
+        )
+        await _log_feature_event(
+            runner,
+            feature.id,
+            "dag_verify_start",
+            "implementation",
+            content=f"g{group_idx}:retry-{retry}",
+            metadata={
+                "group_idx": group_idx,
+                "retry": retry,
+                "runtime": dag_final_review_runtime,
+                "task_ids": [task.id for task in group_tasks],
+                "file_count": len(group_files),
+                "result_count": len(verify_results_context),
+                "parallel_repair": False,
+            },
+        )
+        preflight_verdict = None
+        if verify_fn is None:
+            preflight_verdict = await _run_dag_group_preflight(
+                runner,
+                feature,
+                group_idx,
+                str(retry),
+                group_tasks,
+                verify_results_context,
+                feature_root=feature_root,
+                known_task_ids=known_task_ids,
+            )
+        if preflight_verdict is not None:
+            verdict = preflight_verdict
+        else:
+            verdict = await _do_verify(
+                runner, feature, verify_results_context, group_files, group_tasks,
+                runtime=dag_final_review_runtime,
+            )
+        logger.info(
+            "DAG group verify finished group=%d attempt=retry-%d approved=%s",
+            group_idx,
+            retry,
+            _is_approved(verdict),
+        )
+        await _log_feature_event(
+            runner,
+            feature.id,
+            "dag_verify_finish",
+            "implementation",
+            content=f"g{group_idx}:retry-{retry}",
+            metadata={
+                "group_idx": group_idx,
+                "retry": retry,
+                "approved": _is_approved(verdict),
+                "runtime": dag_final_review_runtime,
+                "parallel_repair": False,
+            },
         )
         await runner.artifacts.put(
             f"dag-verify:g{group_idx}:retry-{retry}",
@@ -1539,6 +2204,26 @@ async def _verify_and_fix_group(
             f"dag-group:{group_idx}",
             _json.dumps(checkpoint),
             feature=feature,
+        )
+        await _log_feature_event(
+            runner,
+            feature.id,
+            "dag_group_checkpoint",
+            "implementation",
+            content=f"group {group_idx}",
+            metadata={
+                "group_idx": group_idx,
+                "task_ids": [t.id for t in group_tasks],
+                "commit_hash": commit_hash,
+                "result_count": len(checkpoint["results"]),
+            },
+        )
+        await enqueue_public_exhibit_refresh(
+            runner,
+            feature,
+            reason=f"dag-group-{group_idx}-checkpoint",
+            group_idx=group_idx,
+            priority=20,
         )
         logger.info(
             "Group %d checkpointed (commit %s)", group_idx, commit_hash,
@@ -1604,16 +2289,34 @@ async def _implement_dag(
             continue
 
         group_tasks = [tasks_by_id[tid] for tid in group]
+        if dag_path_canonicalization_enabled():
+            group_tasks, path_rewrites = canonicalize_implementation_tasks(group_tasks)
+            await _record_dag_path_canonicalization(
+                runner,
+                feature,
+                group_idx,
+                path_rewrites,
+                context_label="implementation-runtime",
+            )
+        group_tasks_by_id = {task.id: task for task in group_tasks}
 
         # Ensure worktrees exist for all repos this group touches
         await _ensure_task_worktrees(runner, feature, group_tasks)
 
-        # Adversarial runtime alternation
-        impl_runtime = "primary" if group_idx % 2 == 0 else "secondary"
-        review_runtime = "secondary" if group_idx % 2 == 0 else "primary"
+        # Adversarial runtime routing.
+        runtime_policy = _runner_runtime_policy(runner)
+        impl_runtime, review_runtime = _dag_group_runtime_pair(
+            group_idx,
+            runtime_policy,
+        )
+        diagnostic_runtime = _dag_repair_runtime_for(
+            "dag-rca",
+            _diagnostic_runtime_for_policy(runtime_policy),
+        )
         logger.info(
-            "Group %d: implement=%s, review=%s",
-            group_idx, impl_runtime, review_runtime,
+            "Group %d: implement=%s, review=%s, rca=%s (runtime_policy=%s)",
+            group_idx, impl_runtime, review_runtime, diagnostic_runtime,
+            runtime_policy,
         )
 
         # Build prompts with handover context from prior groups
@@ -1642,7 +2345,7 @@ async def _implement_dag(
                     )
                 except Exception:
                     pass
-            pending_tasks.append(tasks_by_id[tid])
+            pending_tasks.append(group_tasks_by_id[tid])
 
         # ── Resolve worktree paths for each task ────────────────────
         workspace_mgr = runner.services.get("workspace_manager")
@@ -1657,6 +2360,20 @@ async def _implement_dag(
         TASK_WARN_AT = 3  # Send Slack notification at this attempt
         new_results: list[object] = []
         if pending_tasks:
+            await _log_feature_event(
+                runner,
+                feature.id,
+                "dag_task_dispatch",
+                "implementation",
+                content=f"group {group_idx}",
+                metadata={
+                    "group_idx": group_idx,
+                    "task_ids": [task.id for task in pending_tasks],
+                    "skipped_completed_task_ids": [result.task_id for result in completed_results],
+                    "runtime": impl_runtime,
+                    "dispatch_kind": "implementation",
+                },
+            )
 
             async def _run_task(task_idx: int, t: ImplementationTask) -> ImplementationResult:
                 """Run a single implementation task with retry on crash."""
@@ -1702,6 +2419,21 @@ async def _implement_dag(
 
                 for attempt in range(TASK_MAX_RETRIES + 1):
                     try:
+                        await _log_feature_event(
+                            runner,
+                            feature.id,
+                            "dag_task_start",
+                            "implementation",
+                            content=t.id,
+                            metadata={
+                                "group_idx": group_idx,
+                                "task_id": t.id,
+                                "task_name": t.name,
+                                "repo_path": t.repo_path,
+                                "attempt": attempt,
+                                "runtime": impl_runtime,
+                            },
+                        )
                         result = await runner.run(
                             Ask(
                                 actor=_make_parallel_actor(
@@ -1726,8 +2458,41 @@ async def _implement_dag(
                             # Enrich fallback results that have empty file metadata
                             if not result.files_created and not result.files_modified:
                                 await _enrich_fallback_result(result, ws_path, t)
+                            await _log_feature_event(
+                                runner,
+                                feature.id,
+                                "dag_task_finish",
+                                "implementation",
+                                content=t.id,
+                                metadata={
+                                    "group_idx": group_idx,
+                                    "task_id": t.id,
+                                    "task_name": t.name,
+                                    "status": result.status,
+                                    "attempt": attempt,
+                                    "runtime": impl_runtime,
+                                    "files_created": result.files_created,
+                                    "files_modified": result.files_modified,
+                                },
+                            )
                         return result
                     except Exception as e:
+                        await _log_feature_event(
+                            runner,
+                            feature.id,
+                            "dag_task_error",
+                            "implementation",
+                            content=t.id,
+                            metadata={
+                                "group_idx": group_idx,
+                                "task_id": t.id,
+                                "task_name": t.name,
+                                "attempt": attempt,
+                                "runtime": impl_runtime,
+                                "error_type": type(e).__name__,
+                                "error": str(e)[:1000],
+                            },
+                        )
                         logger.warning(
                             "Task %s crashed (attempt %d/%d): %s",
                             t.id, attempt + 1, TASK_MAX_RETRIES + 1, e,
@@ -1804,7 +2569,8 @@ async def _implement_dag(
         approved, failure = await _verify_and_fix_group(
             runner, feature, group_idx, group_tasks,
             results, all_results, handover, feature_root,
-            impl_runtime, review_runtime,
+            impl_runtime, review_runtime, diagnostic_runtime,
+            known_task_ids=set(tasks_by_id),
         )
         if not approved:
             remaining = dag.execution_order[group_idx + 1 :]
@@ -2035,9 +2801,13 @@ async def _run_enhancement_group(
     # ── Ensure worktrees ──────────────────────────────────────────
     await _ensure_task_worktrees(runner, feature, enhancement_tasks)
 
-    # ── Runtime alternation (continue from last DAG group) ────────
-    impl_runtime = "primary" if enhancement_group_idx % 2 == 0 else "secondary"
-    review_runtime = "secondary" if enhancement_group_idx % 2 == 0 else "primary"
+    # ── Runtime routing (continue from last DAG group by default) ─
+    runtime_policy = _runner_runtime_policy(runner)
+    impl_runtime, review_runtime = _dag_group_runtime_pair(
+        enhancement_group_idx,
+        runtime_policy,
+    )
+    diagnostic_runtime = _diagnostic_runtime_for_policy(runtime_policy)
 
     # ── Build handover context ────────────────────────────────────
     handover_context = ""
@@ -2231,6 +3001,7 @@ async def _run_enhancement_group(
         runner, feature, enhancement_group_idx, enhancement_tasks,
         results, all_results, handover, feature_root,
         impl_runtime, review_runtime,
+        diagnostic_runtime,
         verify_fn=_enh_verify,
         fix_context=enh_fix_context,
     )
@@ -2369,26 +3140,11 @@ async def _verify(
         except Exception:
             pass
 
-    # Load user contradiction decisions
-    user_decisions = ""
-    for suffix in [f"dag-g{g}-r{r}" for g in range(10) for r in range(5)]:
-        for prefix in ("contradiction:verify:", "contradiction:regression:"):
-            raw = await runner.artifacts.get(f"{prefix}{suffix}", feature=feature)
-            if raw:
-                try:
-                    import json as _json
-                    data = _json.loads(raw) if isinstance(raw, str) else raw
-                    reqs = data.get("revision_plan", {}).get("requests", []) if isinstance(data, dict) else []
-                    parts = [r.get("description", "") for r in reqs if r.get("description")]
-                    if parts:
-                        user_decisions += "\n".join(f"- {p}" for p in parts) + "\n"
-                except Exception:
-                    pass
-    if user_decisions:
-        known_issues += (
-            f"\n\n## User Contradiction Decisions (AUTHORITATIVE)\n"
-            f"These decisions override any conflicting spec.\n\n{user_decisions}"
-        )
+    contradiction_decisions = await _format_contradiction_decisions_context(
+        runner, feature,
+    )
+    if contradiction_decisions:
+        known_issues += "\n\n" + contradiction_decisions
 
     verifier = _make_parallel_actor(qa_engineer, "verify", runtime=runtime)
 
@@ -2648,6 +3404,4852 @@ def _context_package_prompt(package: ContextPackage | None) -> str:
     )
 
 
+@dataclass(frozen=True)
+class DagVerifyLensSpec:
+    slug: str
+    label: str
+    actor: AgentActor
+    focus: str
+
+
+def _dag_expanded_verify_enabled() -> bool:
+    return _env_flag_enabled(DAG_EXPANDED_VERIFY_ENV, default=True)
+
+
+def _dag_verify_lens_specs() -> list[DagVerifyLensSpec]:
+    return [
+        DagVerifyLensSpec(
+            slug="build-dependency",
+            label="Build & Dependency",
+            actor=verifier,
+            focus=(
+                "Inspect clean install/build/typecheck/test dependency availability, "
+                "package scripts, gulp/vite/playwright/pytest entrypoints, and import graph risks."
+            ),
+        ),
+        DagVerifyLensSpec(
+            slug="runtime-composition",
+            label="Runtime Composition",
+            actor=verifier,
+            focus=(
+                "Inspect DI, contribution registration, app factory wiring, router/preload/webview/"
+                "sidebar lifecycle, and production consumption paths touched by this group."
+            ),
+        ),
+        DagVerifyLensSpec(
+            slug="contract-protocol",
+            label="Contract & Protocol",
+            actor=verifier,
+            focus=(
+                "Inspect REST/wire/event/API shapes, bridge ack preservation, fixture parity, "
+                "and exception/status mapping for changed surfaces."
+            ),
+        ),
+        DagVerifyLensSpec(
+            slug="acceptance-coverage",
+            label="Acceptance Coverage",
+            actor=verifier,
+            focus=(
+                "Inspect owned acceptance criteria, task reference material, pass conditions, "
+                "and current group verification gates for missing or weak coverage."
+            ),
+        ),
+        DagVerifyLensSpec(
+            slug="security-boundary",
+            label="Security & Boundary",
+            actor=security_auditor,
+            focus=(
+                "Inspect validation taxonomy, symlink/path traversal defenses, redaction, auth/"
+                "nonce checks, markdown/image sanitizer handling, and secret leakage."
+            ),
+        ),
+        DagVerifyLensSpec(
+            slug="regression-downstream",
+            label="Regression/Downstream",
+            actor=regression_tester,
+            focus=(
+                "Inspect downstream consumers and must-not-break behavior around the surfaces "
+                "changed by this group."
+            ),
+        ),
+    ]
+
+
+def _format_dag_group_task_specs(tasks: list[ImplementationTask]) -> str:
+    if not tasks:
+        return "_No task specs supplied._"
+    parts: list[str] = []
+    for task in tasks:
+        parts.append(
+            f"## {task.id} — {task.name}\n\n"
+            "```json\n"
+            f"{json.dumps(task.model_dump(mode='json'), indent=2, sort_keys=True)}\n"
+            "```"
+        )
+    return "\n\n".join(parts)
+
+
+def _safe_context_stem(text: str) -> str:
+    stem = "".join(ch if ch.isalnum() or ch in "._-" else "-" for ch in text)
+    stem = "-".join(part for part in stem.split("-") if part)
+    return stem or "item"
+
+
+async def _dag_legacy_contradiction_group_limit(
+    runner: WorkflowRunner,
+    feature: Feature,
+) -> int:
+    raw = await runner.artifacts.get("dag", feature=feature)
+    if raw:
+        try:
+            dag = ImplementationDAG.model_validate_json(raw)
+            return max(len(dag.execution_order) + 1, 10)
+        except Exception:
+            pass
+    return 128
+
+
+def _legacy_contradiction_record(
+    artifact_key: str,
+    raw: str,
+) -> dict[str, Any] | None:
+    text = raw.strip()
+    if not text:
+        return None
+    record: dict[str, Any] = {
+        "artifact_key": artifact_key,
+        "source": "legacy",
+        "resolution": text,
+        "authoritative_sources": [],
+        "superseded_expectation": "",
+        "implementation_direction": text,
+        "requires_code_change": False,
+        "confidence": "manual",
+        "rationale": "",
+    }
+    try:
+        data = json.loads(text)
+    except Exception:
+        return record
+    if not isinstance(data, dict):
+        return record
+    revision_plan = data.get("revision_plan")
+    requests = (
+        revision_plan.get("requests", [])
+        if isinstance(revision_plan, dict)
+        else []
+    )
+    request_lines = [
+        str(req.get("description", "")).strip()
+        for req in requests
+        if isinstance(req, dict) and str(req.get("description", "")).strip()
+    ]
+    new_decisions = (
+        revision_plan.get("new_decisions", [])
+        if isinstance(revision_plan, dict)
+        else []
+    )
+    decision_lines = [
+        str(item).strip()
+        for item in new_decisions
+        if str(item).strip()
+    ]
+    parts: list[str] = []
+    if decision_lines:
+        parts.append("New decisions:\n" + "\n".join(f"- {line}" for line in decision_lines))
+    if request_lines:
+        parts.append("Revision directions:\n" + "\n".join(f"- {line}" for line in request_lines))
+    if parts:
+        record["resolution"] = "\n\n".join(parts)
+        record["implementation_direction"] = record["resolution"]
+    return record
+
+
+async def _load_contradiction_decision_records(
+    runner: WorkflowRunner,
+    feature: Feature,
+) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    seen_keys: set[str] = set()
+
+    manifest_raw = await runner.artifacts.get(CONTRADICTION_DECISIONS_KEY, feature=feature)
+    if manifest_raw:
+        try:
+            manifest = json.loads(manifest_raw)
+            for item in manifest.get("decisions", []):
+                if not isinstance(item, dict):
+                    continue
+                artifact_key = str(item.get("artifact_key", "") or "")
+                if artifact_key and artifact_key in seen_keys:
+                    continue
+                if artifact_key:
+                    seen_keys.add(artifact_key)
+                records.append(item)
+        except Exception:
+            logger.debug("Failed to parse %s", CONTRADICTION_DECISIONS_KEY, exc_info=True)
+
+    group_limit = await _dag_legacy_contradiction_group_limit(runner, feature)
+    retry_limit = max(VERIFY_RETRIES + 3, 5)
+    for group_idx in range(group_limit):
+        for retry in range(retry_limit):
+            suffix = f"dag-g{group_idx}-r{retry}"
+            for prefix in ("contradiction:verify:", "contradiction:regression:"):
+                artifact_key = f"{prefix}{suffix}"
+                if artifact_key in seen_keys:
+                    continue
+                raw = await runner.artifacts.get(artifact_key, feature=feature)
+                if not raw:
+                    continue
+                record = _legacy_contradiction_record(artifact_key, raw)
+                if record is None:
+                    continue
+                seen_keys.add(artifact_key)
+                records.append(record)
+
+    return records
+
+
+async def _format_contradiction_decisions_context(
+    runner: WorkflowRunner,
+    feature: Feature,
+) -> str:
+    records = await _load_contradiction_decision_records(runner, feature)
+    if not records:
+        return ""
+    sections = [
+        "## Resolved Contradiction Decisions (AUTHORITATIVE)",
+        (
+            "The following decisions resolve prior spec contradictions. They "
+            "override conflicting task prose, reference material, and stale tests."
+        ),
+    ]
+    for idx, record in enumerate(records, 1):
+        artifact_key = str(record.get("artifact_key", "") or f"decision-{idx}")
+        source = str(record.get("source", "") or "unknown")
+        resolution = str(record.get("resolution", "") or "").strip()
+        resolution_kind = str(record.get("resolution_kind", "") or "").strip()
+        implementation_direction = str(
+            record.get("implementation_direction", "") or ""
+        ).strip()
+        superseded = str(record.get("superseded_expectation", "") or "").strip()
+        authoritative_sources = [
+            str(item).strip()
+            for item in record.get("authoritative_sources", []) or []
+            if str(item).strip()
+        ]
+        lines = [f"### {idx}. `{artifact_key}`", f"- **Source:** {source}"]
+        if resolution_kind:
+            lines.append(f"- **Resolution kind:** {resolution_kind}")
+        if resolution:
+            lines.append(f"- **Resolution:** {resolution}")
+        if implementation_direction and implementation_direction != resolution:
+            lines.append(f"- **Implementation direction:** {implementation_direction}")
+        if superseded:
+            lines.append(f"- **Superseded expectation:** {superseded}")
+        if authoritative_sources:
+            lines.append(
+                "- **Authoritative sources:** "
+                + "; ".join(authoritative_sources)
+            )
+        sections.append("\n".join(lines))
+    return "\n\n".join(sections).rstrip() + "\n"
+
+
+def _dag_contradiction_resolution_usable(
+    resolution: DagContradictionResolution,
+) -> bool:
+    return _validate_dag_contradiction_resolution(resolution).resolution is not None
+
+
+_DAG_ARTIFACT_REPAIR_REF_RE = re.compile(
+    r"`([^`]+)`|\"([^\"]+)\"|'([^']+)'|([A-Za-z0-9._~@:/\\-]+)"
+)
+_DAG_RESULT_REPORTED_FILE_RE = re.compile(
+    r"\b([A-Za-z0-9][A-Za-z0-9_.-]*)\s+reports changed file\b"
+)
+
+
+def _is_dag_artifact_repair_path(path: str) -> bool:
+    normalized = path.strip().replace("\\", "/")
+    if not normalized:
+        return True
+    if normalized in {"dag.md"}:
+        return True
+    if normalized.startswith("(") and normalized.endswith(")"):
+        return True
+    artifact_markers = (
+        "/.iriai/artifacts/features/",
+        "/.iriai-context/",
+        "/.staging/",
+        "/dag/",
+        "/dag-fragments/",
+        "/outputs/dag-ws-",
+        "/subfeatures/",
+    )
+    if any(marker in normalized for marker in artifact_markers):
+        return True
+    return normalized.startswith((
+        ".iriai/",
+        ".iriai-context/",
+        ".staging/",
+        "compile-",
+        "dag/",
+        "subfeatures/",
+        "dag-fragments/",
+        "dag-ws-",
+        "outputs/dag-ws-",
+    ))
+
+
+def _normalize_dag_artifact_repair_ref(ref: str) -> str:
+    normalized = ref.strip().replace("\\", "/")
+    normalized = normalized.strip("`'\"")
+    normalized = normalized.strip("[](){}<>")
+    normalized = normalized.rstrip(".,;:")
+    line_ref = re.match(r"^(.+\.[A-Za-z0-9]+):\d+(?::\d+)?$", normalized)
+    if line_ref:
+        normalized = line_ref.group(1)
+    return normalized
+
+
+def _is_dag_artifact_repair_key(ref: str) -> bool:
+    normalized = ref.strip()
+    if not normalized or "/" in normalized or "\\" in normalized:
+        return False
+    if _is_dag_task_artifact_key(normalized):
+        return True
+    top_level = {
+        "artifact-audit-summary",
+        "artifact-backfill-status",
+        "context",
+        "contradiction-decisions",
+        "decisions",
+        "decomposition",
+        "decomposition-structured",
+        "design",
+        "dag",
+        "plan",
+        "prd",
+        "scope",
+        "system-design",
+        "test-plan",
+    }
+    if normalized in top_level:
+        return True
+    if ":" not in normalized:
+        return False
+    prefix, slug = normalized.split(":", 1)
+    if not slug:
+        return False
+    return prefix in {
+        "artifact-audit",
+        "dag",
+        "dag-fragment",
+        "dag-fragment-attempt",
+        "dag-slices",
+        "decisions",
+        "decisions-structured",
+        "design",
+        "design-structured",
+        "gate-enhancement-backlog",
+        "gate-review-ledger",
+        "planning-index",
+        "plan",
+        "plan-structured",
+        "prd",
+        "prd-structured",
+        "system-design",
+        "system-design-structured",
+        "test-plan",
+        "test-plan-structured",
+    }
+
+
+def _is_dag_task_artifact_key(ref: str) -> bool:
+    normalized = ref.strip()
+    if "/" in normalized or "\\" in normalized:
+        return False
+    return normalized.startswith("dag-task:") and bool(
+        normalized.removeprefix("dag-task:").strip()
+    )
+
+
+def _dag_task_artifact_refs_from_reported_result_text(text: str) -> list[str]:
+    refs: list[str] = []
+    if not text:
+        return refs
+    for match in _DAG_RESULT_REPORTED_FILE_RE.finditer(text):
+        task_id = match.group(1).strip("`'\"")
+        ref = f"dag-task:{task_id}"
+        if _is_dag_task_artifact_key(ref):
+            refs.append(ref)
+    return _dedupe_preserving_order(refs)
+
+
+def _planned_non_dag_artifact_refs(
+    planned: PlannedBugGroup,
+) -> list[str]:
+    return _dedupe_preserving_order([
+        ref for ref in _dag_artifact_repair_refs_from_planned(planned)
+        if not _is_dag_task_artifact_key(ref)
+    ])
+
+
+def _planned_needs_source_artifact_repair(
+    planned: PlannedBugGroup,
+) -> bool:
+    refs = _planned_non_dag_artifact_refs(planned)
+    if not refs:
+        return False
+    text = "\n".join([
+        planned.group.likely_root_cause,
+        planned.issue_text,
+        planned.rca.hypothesis,
+        planned.rca.proposed_approach,
+        planned.rca.prior_attempt_analysis,
+        planned.rca.contradiction_detail,
+        "\n".join(planned.rca.evidence or []),
+        "\n".join(planned.rca.alternative_hypotheses or []),
+    ]).lower()
+    source_markers = (
+        "dag-fragment",
+        "dag fragment",
+        "compiled dag",
+        "source artifact",
+        "task spec",
+        "task-spec",
+        "file_scope",
+        "files array",
+        "workflow artifact",
+        "orchestration metadata",
+        "artifact/context",
+        "outside workspace",
+        "outside the workspace",
+        "outside the write boundary",
+        "regenerate",
+        "recreate",
+        "resurrect",
+    )
+    return any(marker in text for marker in source_markers) or (
+        _dag_metadata_only_repair_candidate(planned)
+        and _dag_artifact_repair_paths_safe(planned)
+    )
+
+
+def _dag_artifact_repair_refs_from_text(text: str) -> list[str]:
+    refs: list[str] = []
+    if not text:
+        return refs
+    for match in _DAG_ARTIFACT_REPAIR_REF_RE.findall(text):
+        token = next((part for part in match if part), "")
+        normalized = _normalize_dag_artifact_repair_ref(token)
+        if not normalized:
+            continue
+        if _is_dag_artifact_repair_key(normalized):
+            refs.append(normalized)
+        elif _is_dag_artifact_repair_path(normalized):
+            refs.append(normalized)
+    return _dedupe_preserving_order(refs)
+
+
+def _dag_artifact_repair_target_refs(
+    resolution: DagContradictionResolution,
+    *,
+    planned: PlannedBugGroup | None = None,
+) -> list[str]:
+    refs: list[str] = []
+    for ref in resolution.artifact_paths:
+        normalized = _normalize_dag_artifact_repair_ref(ref)
+        if normalized:
+            refs.append(normalized)
+    refs.extend(
+        _dag_artifact_repair_refs_from_text(resolution.implementation_direction)
+    )
+    refs.extend(_dag_artifact_repair_refs_from_text(resolution.resolution))
+
+    safe_refs = [
+        ref for ref in refs
+        if _is_dag_artifact_repair_key(ref) or _is_dag_artifact_repair_path(ref)
+    ]
+    if not safe_refs and planned is not None:
+        planned_refs = [
+            _normalize_dag_artifact_repair_ref(str(path))
+            for path in [
+                *(planned.rca.affected_files or []),
+                *(getattr(planned.group, "affected_files_hint", []) or []),
+            ]
+        ]
+        safe_planned_refs = [
+            ref for ref in planned_refs
+            if ref and (
+                _is_dag_artifact_repair_key(ref)
+                or _is_dag_artifact_repair_path(ref)
+            )
+        ]
+        non_empty_planned_refs = [ref for ref in planned_refs if ref]
+        if (
+            safe_planned_refs
+            and len(safe_planned_refs) == len(non_empty_planned_refs)
+        ):
+            safe_refs.extend(safe_planned_refs)
+    return _dedupe_preserving_order(safe_refs)
+
+
+def _dag_artifact_repair_paths_safe(planned: PlannedBugGroup) -> bool:
+    paths = list(planned.rca.affected_files or [])
+    paths.extend(getattr(planned.group, "affected_files_hint", []) or [])
+    concrete_paths = [
+        path for path in paths
+        if str(path).strip() and not str(path).strip().startswith("(")
+    ]
+    return bool(concrete_paths) and all(
+        _is_dag_artifact_repair_path(str(path)) for path in concrete_paths
+    )
+
+
+def _dag_affected_file_set(planned: PlannedBugGroup) -> set[str]:
+    paths = list(planned.rca.affected_files or [])
+    paths.extend(getattr(planned.group, "affected_files_hint", []) or [])
+    return {
+        str(path).strip().replace("\\", "/")
+        for path in paths
+        if str(path).strip() and not str(path).strip().startswith("(")
+    }
+
+
+def _dag_artifact_repair_refs_from_planned(
+    planned: PlannedBugGroup,
+) -> list[str]:
+    refs: list[str] = []
+    for path in [
+        *(planned.rca.affected_files or []),
+        *(getattr(planned.group, "affected_files_hint", []) or []),
+    ]:
+        normalized = _normalize_dag_artifact_repair_ref(str(path))
+        if normalized and (
+            _is_dag_artifact_repair_key(normalized)
+            or _is_dag_artifact_repair_path(normalized)
+        ):
+            refs.append(normalized)
+
+    text_parts = [
+        planned.group.likely_root_cause,
+        planned.issue_text,
+        planned.rca.hypothesis,
+        planned.rca.proposed_approach,
+        planned.rca.prior_attempt_analysis,
+        planned.rca.contradiction_detail,
+        "\n".join(planned.rca.evidence or []),
+        "\n".join(planned.rca.alternative_hypotheses or []),
+    ]
+    for text in text_parts:
+        refs.extend(_dag_artifact_repair_refs_from_text(text or ""))
+        refs.extend(_dag_task_artifact_refs_from_reported_result_text(text or ""))
+    return _dedupe_preserving_order(refs)
+
+
+def _dag_task_artifact_refs_from_planned(planned: PlannedBugGroup) -> list[str]:
+    return _dedupe_preserving_order(
+        [
+            ref for ref in _dag_artifact_repair_refs_from_planned(planned)
+            if _is_dag_task_artifact_key(ref)
+        ]
+    )
+
+
+def _safe_dag_task_artifact_refs(refs: list[str]) -> list[str]:
+    return _dedupe_preserving_order(
+        [
+            ref for ref in refs
+            if _is_dag_task_artifact_key(ref)
+        ]
+    )
+
+
+def _planned_needs_dag_task_artifact_repair(
+    planned: PlannedBugGroup,
+) -> bool:
+    refs = _dag_task_artifact_refs_from_planned(planned)
+    if not refs:
+        return False
+    text = "\n".join([
+        planned.group.likely_root_cause,
+        planned.issue_text,
+        planned.rca.hypothesis,
+        planned.rca.proposed_approach,
+        planned.rca.prior_attempt_analysis,
+        planned.rca.contradiction_detail,
+        "\n".join(planned.rca.evidence or []),
+        "\n".join(planned.rca.alternative_hypotheses or []),
+    ]).lower()
+    return any(marker in text for marker in (
+        "stale",
+        "persisted",
+        "postgres",
+        "db-backed",
+        "database",
+        "artifact row",
+        "implementationresult",
+        "files_created",
+        "files_modified",
+        "forbidden/stale",
+    ))
+
+
+def _dag_metadata_only_repair_candidate(planned: PlannedBugGroup) -> bool:
+    """Return true when a fixable RCA should be artifact-repair routed."""
+    refs = _dag_artifact_repair_refs_from_planned(planned)
+    if not refs:
+        return False
+    text = "\n".join([
+        planned.group.likely_root_cause,
+        planned.issue_text,
+        planned.rca.hypothesis,
+        planned.rca.proposed_approach,
+        planned.rca.prior_attempt_analysis,
+        planned.rca.contradiction_detail,
+        "\n".join(planned.rca.evidence or []),
+    ]).lower()
+    metadata_signal = any(marker in text for marker in (
+        "metadata-only",
+        "metadata only",
+        "orchestration metadata",
+        "orchestration-artifact",
+        "workflow artifact",
+        "artifact/context",
+        "artifact repair",
+        "manifest drift",
+        "task spec",
+        "task-spec",
+        "changed-files",
+        "implementation-results",
+        "self_reported_risks",
+        "stale risk",
+    ))
+    no_product_signal = any(marker in text for marker in (
+        "not a code defect",
+        "no code defect",
+        "no source-tree edit",
+        "no product-code",
+        "no product code",
+        "do not touch source",
+        "do not modify production source",
+        "do not modify product source",
+        "do not touch any source code",
+        "no source code",
+        "not product code",
+    ))
+    boundary_signal = any(marker in text for marker in (
+        "outside the write boundary",
+        "outside workspace",
+        "outside the workspace",
+        "permission denied",
+        "read-only for the agent",
+        "meta layer",
+        "orchestrator/meta",
+        "orchestrator-layer",
+        "host process",
+    ))
+    return metadata_signal and (
+        no_product_signal
+        or boundary_signal
+        or _dag_artifact_repair_paths_safe(planned)
+    )
+
+
+def _dag_artifact_repair_resolution_from_planned(
+    planned: PlannedBugGroup,
+    *,
+    reason: str,
+    blocked_result: ImplementationResult | None = None,
+) -> DagContradictionResolution:
+    refs = _dag_artifact_repair_refs_from_planned(planned)
+    notes = (
+        f"\n\nBlocked implementer result:\n{to_str(blocked_result)}"
+        if blocked_result is not None else ""
+    )
+    return DagContradictionResolution(
+        resolution=(
+            "Route this metadata-only DAG repair through the host-applied "
+            f"artifact repair lane ({reason})."
+        ),
+        resolution_kind="artifact_repair",
+        authoritative_sources=[
+            planned.rca_key,
+            *[item for item in planned.rca.evidence[:6] if item],
+        ],
+        artifact_paths=refs,
+        implementation_direction=(
+            f"{planned.rca.proposed_approach}{notes}"
+        ).strip(),
+        requires_code_change=False,
+        needs_human=False,
+        confidence=(
+            planned.rca.confidence
+            if planned.rca.confidence in {"high", "medium"}
+            else "medium"
+        ),
+        rationale=(
+            "The RCA identifies artifact/context metadata as the actionable "
+            "target. Product files, when mentioned, are evidence only."
+        ),
+    )
+
+
+def _dag_blocked_result_should_reroute_to_artifact_repair(
+    planned: PlannedBugGroup,
+    result: ImplementationResult,
+) -> bool:
+    if result.status != "blocked":
+        return False
+    if not _dag_artifact_repair_refs_from_planned(planned):
+        return False
+    text = "\n".join([
+        result.summary,
+        result.notes,
+        "\n".join(r.description for r in result.self_reported_risks),
+        planned.rca.hypothesis,
+        planned.rca.proposed_approach,
+        planned.rca.prior_attempt_analysis,
+    ]).lower()
+    return any(marker in text for marker in (
+        "outside workspace",
+        "outside the workspace",
+        "outside the write boundary",
+        "outside write boundary",
+        "permission denied",
+        "read-only",
+        "artifact",
+        "metadata",
+        ".iriai-context",
+        ".iriai/artifacts",
+        "orchestrator",
+    ))
+
+
+def _validate_dag_contradiction_resolution(
+    resolution: DagContradictionResolution | None,
+    *,
+    planned: PlannedBugGroup | None = None,
+) -> DagContradictionResolutionValidation:
+    if resolution is None:
+        return DagContradictionResolutionValidation(
+            resolution=None,
+            rejection_reasons=["resolver_returned_no_resolution"],
+        )
+
+    rejection_reasons: list[str] = []
+    resolution_text = resolution.resolution.strip()
+    sources = [
+        item.strip() for item in resolution.authoritative_sources if item.strip()
+    ]
+    confidence = resolution.confidence.strip().lower()
+    kind = resolution.resolution_kind.strip().lower()
+    valid_kinds = {
+        "decision_only",
+        "requires_code_change",
+        "artifact_repair",
+        "stale_not_reproducing",
+        "needs_human",
+    }
+    if not kind:
+        kind = (
+            "requires_code_change"
+            if resolution.requires_code_change
+            else "decision_only"
+        )
+    if resolution.needs_human:
+        kind = "needs_human"
+    elif resolution.requires_code_change and kind == "decision_only":
+        kind = "requires_code_change"
+    if kind not in valid_kinds:
+        rejection_reasons.append(f"unknown_resolution_kind:{kind}")
+    if resolution.needs_human or kind == "needs_human":
+        rejection_reasons.append("needs_human")
+    if not resolution_text:
+        rejection_reasons.append("missing_resolution")
+    if not sources:
+        rejection_reasons.append("missing_authoritative_sources")
+    if confidence == "contradiction":
+        confidence = "medium"
+    elif confidence not in {"high", "medium", "low"}:
+        rejection_reasons.append(f"unknown_confidence:{confidence}")
+    if confidence == "low":
+        rejection_reasons.append("low_confidence")
+    if kind == "artifact_repair" and planned is not None:
+        artifact_refs = _dag_artifact_repair_target_refs(resolution, planned=planned)
+        unsafe_structured_refs = [
+            _normalize_dag_artifact_repair_ref(ref)
+            for ref in resolution.artifact_paths
+            if ref.strip()
+            and not (
+                _is_dag_artifact_repair_key(
+                    _normalize_dag_artifact_repair_ref(ref)
+                )
+                or _is_dag_artifact_repair_path(
+                    _normalize_dag_artifact_repair_ref(ref)
+                )
+            )
+        ]
+        if not artifact_refs or unsafe_structured_refs:
+            rejection_reasons.append("artifact_repair_has_non_artifact_paths")
+    else:
+        artifact_refs = [
+            _normalize_dag_artifact_repair_ref(ref)
+            for ref in resolution.artifact_paths
+            if ref.strip()
+        ]
+
+    if rejection_reasons:
+        return DagContradictionResolutionValidation(
+            resolution=None,
+            rejection_reasons=_dedupe_preserving_order(rejection_reasons),
+        )
+
+    normalized = resolution.model_copy(update={
+        "resolution_kind": kind,
+        "authoritative_sources": sources,
+        "artifact_paths": artifact_refs,
+        "confidence": confidence,
+        "needs_human": False,
+        "requires_code_change": kind == "requires_code_change",
+    })
+    return DagContradictionResolutionValidation(
+        resolution=normalized,
+        rejection_reasons=[],
+    )
+
+
+def _dag_contradiction_groups_overlap(
+    planned: PlannedBugGroup,
+    quarantined_groups: list[PlannedBugGroup],
+) -> bool:
+    planned_paths = _dag_affected_file_set(planned)
+    if not planned_paths:
+        return False
+    for quarantined in quarantined_groups:
+        quarantined_paths = _dag_affected_file_set(quarantined)
+        if quarantined_paths and planned_paths & quarantined_paths:
+            return True
+    return False
+
+
+async def _persist_dag_contradiction_rejection(
+    runner: WorkflowRunner,
+    feature: Feature,
+    group_idx: int,
+    retry: int,
+    planned: PlannedBugGroup,
+    resolution: DagContradictionResolution | None,
+    rejection_reasons: list[str],
+) -> dict[str, Any]:
+    safe_group = _safe_context_stem(planned.group.group_id)
+    artifact_key = (
+        f"contradiction-rejected:dag-repair:g{group_idx}:retry-{retry}:{safe_group}"
+    )
+    record = {
+        "artifact_key": artifact_key,
+        "source": "dag-repair",
+        "group_idx": group_idx,
+        "retry": retry,
+        "group_id": planned.group.group_id,
+        "rca_key": planned.rca_key,
+        "rejection_reasons": list(rejection_reasons),
+        "raw_resolution": (
+            resolution.model_dump(mode="json") if resolution is not None else None
+        ),
+        "created_at": time.time(),
+    }
+    await runner.artifacts.put(
+        artifact_key,
+        json.dumps(record, indent=2),
+        feature=feature,
+    )
+    return record
+
+
+def _dag_contradiction_needs_fix(resolution: DagContradictionResolution) -> bool:
+    return _dag_contradiction_needs_product_fix(resolution)
+
+
+def _dag_contradiction_needs_product_fix(
+    resolution: DagContradictionResolution,
+) -> bool:
+    return resolution.resolution_kind == "requires_code_change"
+
+
+def _dag_contradiction_needs_artifact_repair(
+    resolution: DagContradictionResolution,
+) -> bool:
+    return resolution.resolution_kind == "artifact_repair"
+
+
+def _dag_contradiction_synthetic_result(
+    group_idx: int,
+    retry: int,
+    planned: PlannedBugGroup,
+    resolution: DagContradictionResolution,
+    record: dict[str, Any],
+) -> ImplementationResult:
+    return ImplementationResult(
+        task_id=(
+            f"CONTRADICTION-g{group_idx}-r{retry}-"
+            f"{_safe_context_stem(planned.group.group_id)}"
+        ),
+        summary=(
+            "Autonomous contradiction decision applied "
+            f"({resolution.resolution_kind}): {resolution.resolution}"
+        ),
+        files_modified=[],
+        notes=json.dumps(record, indent=2),
+    )
+
+
+def _dag_contradiction_fix_guidance(
+    resolution: DagContradictionResolution,
+) -> str:
+    return (
+        f"{resolution.implementation_direction or resolution.resolution}\n\n"
+        "Authoritative contradiction resolution:\n"
+        f"{resolution.resolution}\n\n"
+        f"Resolution kind: {resolution.resolution_kind}\n\n"
+        "Superseded expectation:\n"
+        f"{resolution.superseded_expectation or 'not specified'}"
+    )
+
+
+def _dag_artifact_repair_workspace(
+    runner: WorkflowRunner,
+    feature: Feature,
+    feature_root: Path | None,
+) -> str | None:
+    mirror = (getattr(runner, "services", {}) or {}).get("artifact_mirror")
+    if mirror is not None:
+        try:
+            return str(Path(mirror.feature_dir(feature.id)))
+        except Exception:
+            logger.debug(
+                "Failed to resolve artifact mirror repair workspace",
+                exc_info=True,
+            )
+    return str(feature_root) if feature_root is not None else None
+
+
+def _dag_artifact_key_for_repair_file(
+    runner: WorkflowRunner,
+    feature: Feature,
+    reported_path: str,
+) -> tuple[str | None, Path | None]:
+    mirror = (getattr(runner, "services", {}) or {}).get("artifact_mirror")
+    if mirror is None:
+        return None, None
+    try:
+        feature_dir = Path(mirror.feature_dir(feature.id)).resolve()
+    except Exception:
+        return None, None
+
+    normalized = _normalize_dag_artifact_repair_ref(reported_path)
+    if not normalized or _is_artifact_context_path(normalized):
+        return None, None
+    candidate = Path(normalized)
+    try:
+        if candidate.is_absolute():
+            absolute = candidate.resolve()
+            relative = absolute.relative_to(feature_dir)
+        else:
+            parts = candidate.parts
+            feature_parts = (".iriai", "artifacts", "features", feature.id)
+            if parts[:4] == feature_parts:
+                relative = Path(*parts[4:])
+                absolute = feature_dir / relative
+            else:
+                relative = candidate
+                absolute = feature_dir / relative
+    except Exception:
+        return None, None
+    if not absolute.exists() or not absolute.is_file():
+        return None, absolute
+    try:
+        from ....services.artifacts import _path_to_key
+
+        artifact_key = _path_to_key(relative)
+    except Exception:
+        artifact_key = None
+    if artifact_key and _is_dag_artifact_repair_key(artifact_key):
+        return artifact_key, absolute
+    return None, absolute
+
+
+def _path_relative_to(path: Path, root: Path) -> Path | None:
+    try:
+        return path.resolve().relative_to(root.resolve())
+    except Exception:
+        return None
+
+
+_DAG_CLOSURE_TEXT_SUFFIXES = {
+    ".json",
+    ".md",
+    ".markdown",
+    ".txt",
+    ".html",
+    ".htm",
+    ".yaml",
+    ".yml",
+}
+_DAG_CLOSURE_MAX_SCAN_BYTES = 3_000_000
+_DAG_CLOSURE_MAX_IGNORED_MATCHES = 250
+_DAG_CLOSURE_BLOCKING_REASONS = {
+    "forbidden",
+    "forbidden_task_result",
+    "forbidden_task_spec",
+    "forbidden_workspace_path",
+    "manifest_forbidden_workspace_path",
+}
+
+
+def _dag_artifact_feature_dir(
+    runner: WorkflowRunner,
+    feature: Feature,
+) -> Path | None:
+    mirror = (getattr(runner, "services", {}) or {}).get("artifact_mirror")
+    if mirror is None:
+        return None
+    try:
+        return Path(mirror.feature_dir(feature.id)).resolve()
+    except Exception:
+        logger.debug(
+            "Failed to resolve DAG artifact closure feature dir",
+            exc_info=True,
+        )
+        return None
+
+
+def _dag_closure_normalize_path(value: str) -> str:
+    normalized = str(value or "").strip().replace("\\", "/")
+    normalized = normalized.strip("`'\"")
+    normalized = normalized.strip("[](){}<>")
+    normalized = normalized.rstrip(".,;:")
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    return normalized.strip("/")
+
+
+def _dag_closure_signature_variants(value: str) -> list[str]:
+    normalized = _dag_closure_normalize_path(value)
+    if not normalized:
+        return []
+    variants = {normalized}
+    if "/.iriai/artifacts/features/" in normalized:
+        marker = "/.iriai/artifacts/features/"
+        suffix = normalized.split(marker, 1)[1]
+        parts = suffix.split("/", 1)
+        if len(parts) == 2 and parts[1]:
+            variants.add(parts[1])
+    parts = normalized.split("/")
+    if "src" in parts:
+        src_index = parts.index("src")
+        src_relative = "/".join(parts[src_index:])
+        if src_relative:
+            variants.add(src_relative)
+            variants.add(f"iriai-studio/{src_relative}")
+    if normalized.startswith("iriai-studio/"):
+        variants.add(normalized.removeprefix("iriai-studio/"))
+    if normalized.startswith("iriai-studio-backend/"):
+        variants.add(normalized.removeprefix("iriai-studio-backend/"))
+    canonical, rule = canonicalize_dag_path(normalized)
+    if rule and canonical != normalized:
+        variants.add(normalized)
+    return sorted(variant for variant in variants if variant)
+
+
+def _dag_closure_problem_is_blocking(problem: dict[str, Any]) -> bool:
+    reason = str(problem.get("reason", "") or "").strip()
+    if reason not in _DAG_CLOSURE_BLOCKING_REASONS:
+        return False
+    if reason == "forbidden" and not (
+        str(problem.get("forbidden_rule", "") or "").strip()
+        or str(problem.get("forbidden_path", "") or "").strip()
+    ):
+        return False
+    return True
+
+
+def _dag_closure_record_kind(field: str, *, blocking: bool) -> str:
+    if not blocking:
+        return (
+            "candidate_evidence"
+            if field == "candidate_evidence"
+            else "diagnostic_path"
+        )
+    if field in {"forbidden_path", "forbidden_rule"}:
+        return "forbidden_prefix"
+    return "retired_path"
+
+
+def _dag_closure_signature_records_from_path_problems(
+    path_problems: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str, str, bool]] = set()
+
+    def _add_records(
+        *,
+        value: str,
+        field: str,
+        problem: dict[str, Any],
+        blocking: bool,
+    ) -> None:
+        for signature in _dag_closure_signature_variants(value):
+            if not signature.strip():
+                continue
+            key = (
+                signature,
+                field,
+                str(problem.get("reason", "") or ""),
+                str(problem.get("artifact_key", "") or ""),
+                blocking,
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            records.append({
+                "signature": signature,
+                "kind": _dag_closure_record_kind(field, blocking=blocking),
+                "source_field": field,
+                "source_reason": str(problem.get("reason", "") or ""),
+                "source_task_id": str(problem.get("task_id", "") or ""),
+                "source_artifact_key": str(problem.get("artifact_key", "") or ""),
+                "source_artifact_ref": str(
+                    problem.get("source_artifact_ref", "") or ""
+                ),
+                "blocking": blocking,
+            })
+
+    for problem in path_problems or []:
+        blocking = _dag_closure_problem_is_blocking(problem)
+        fields = (
+            ("path", str(problem.get("path", "") or "")),
+            ("forbidden_path", str(problem.get("forbidden_path", "") or "")),
+            ("forbidden_rule", str(problem.get("forbidden_rule", "") or "")),
+        )
+        for field, value in fields:
+            _add_records(
+                value=value,
+                field=field,
+                problem=problem,
+                blocking=blocking,
+            )
+        for candidate in problem.get("candidate_evidence") or []:
+            if isinstance(candidate, dict):
+                _add_records(
+                    value=str(candidate.get("path", "") or ""),
+                    field="candidate_evidence",
+                    problem=problem,
+                    blocking=False,
+                )
+    return records
+
+
+def _dag_closure_blocking_signatures(
+    signature_records: list[dict[str, Any]],
+) -> list[str]:
+    return _dedupe_preserving_order([
+        str(record.get("signature", "") or "")
+        for record in signature_records
+        if record.get("blocking") and str(record.get("signature", "") or "").strip()
+    ])
+
+
+def _dag_closure_task_ref_parts(
+    task_id: str,
+) -> tuple[str, str]:
+    match = re.search(r"^(.+?)-slice-(\d+)\b", task_id)
+    if not match:
+        return "", ""
+    return match.group(1), match.group(2)
+
+
+def _dag_closure_affected_context(
+    group_tasks: list[ImplementationTask],
+    path_problems: list[dict[str, Any]] | None,
+) -> tuple[list[str], list[str], list[str], list[str]]:
+    task_ids: list[str] = []
+    subfeatures: list[str] = []
+    slices: list[str] = []
+    source_refs: list[str] = []
+    tasks_by_id = {task.id: task for task in group_tasks}
+    for problem in path_problems or []:
+        for key in ("artifact_key", "source_artifact_ref"):
+            ref = str(problem.get(key, "") or "").strip()
+            if ref:
+                source_refs.append(ref)
+        task_id = str(problem.get("task_id", "") or "").strip()
+        if not task_id:
+            artifact_key = str(problem.get("artifact_key", "") or "")
+            if artifact_key.startswith("dag-task:"):
+                task_id = artifact_key.removeprefix("dag-task:")
+        if task_id:
+            task_ids.append(task_id)
+            task = tasks_by_id.get(task_id)
+            if task is not None and task.subfeature_id:
+                subfeatures.append(task.subfeature_id)
+            inferred_subfeature, inferred_slice = _dag_closure_task_ref_parts(task_id)
+            if inferred_subfeature:
+                subfeatures.append(inferred_subfeature)
+            if inferred_slice:
+                slices.append(f"slice-{inferred_slice}")
+        source_ref = str(problem.get("source_artifact_ref", "") or "")
+        match = re.search(r"dag-fragment:([^:]+):slice-(\d+)", source_ref)
+        if match:
+            subfeatures.append(match.group(1))
+            slices.append(f"slice-{match.group(2)}")
+
+    if not task_ids:
+        for task in group_tasks:
+            task_ids.append(task.id)
+            if task.subfeature_id:
+                subfeatures.append(task.subfeature_id)
+            inferred_subfeature, inferred_slice = _dag_closure_task_ref_parts(task.id)
+            if inferred_subfeature:
+                subfeatures.append(inferred_subfeature)
+            if inferred_slice:
+                slices.append(f"slice-{inferred_slice}")
+            source_ref = _dag_fragment_artifact_ref_for_task(task)
+            if source_ref:
+                source_refs.append(source_ref)
+
+    return (
+        _dedupe_preserving_order(task_ids),
+        _dedupe_preserving_order(subfeatures),
+        _dedupe_preserving_order(slices),
+        _dedupe_preserving_order(source_refs),
+    )
+
+
+def _dag_planned_uses_full_stale_closure(planned: PlannedBugGroup) -> bool:
+    return _safe_context_stem(planned.group.group_id) == "dag-stale-forbidden-paths"
+
+
+def _dag_closure_planned_text(planned: PlannedBugGroup) -> str:
+    return "\n".join([
+        planned.group.group_id,
+        planned.group.likely_root_cause,
+        planned.issue_text,
+        planned.rca.hypothesis,
+        planned.rca.proposed_approach,
+        planned.rca.prior_attempt_analysis,
+        planned.rca.contradiction_detail,
+        "\n".join(planned.rca.evidence or []),
+        "\n".join(planned.rca.alternative_hypotheses or []),
+        "\n".join(planned.rca.affected_files or []),
+        "\n".join(getattr(planned.group, "affected_files_hint", []) or []),
+    ])
+
+
+def _dag_closure_path_problems_for_planned(
+    planned: PlannedBugGroup,
+    verifier_path_problems: list[dict[str, Any]] | None,
+    group_tasks: list[ImplementationTask],
+) -> list[dict[str, Any]]:
+    problems = list(verifier_path_problems or [])
+    if not problems:
+        return []
+    if _dag_planned_uses_full_stale_closure(planned):
+        return problems
+
+    def _source_ref_from_repair_ref(ref: str) -> str:
+        if ref.startswith("dag-fragment:"):
+            return ref
+        normalized = _dag_closure_normalize_path(ref)
+        match = re.search(
+            r"(?:^|/)subfeatures/([^/]+)/dag-fragments/slice-(\d+)\.json$",
+            normalized,
+        )
+        if not match:
+            return ""
+        return f"dag-fragment:{match.group(1)}:slice-{match.group(2)}"
+
+    planned_text = _dag_closure_planned_text(planned)
+    planned_text_lower = planned_text.lower()
+    refs = _dag_artifact_repair_refs_from_planned(planned)
+    artifact_keys = {
+        ref for ref in refs
+        if _is_dag_task_artifact_key(ref)
+    }
+    source_refs = {
+        ref for ref in refs
+        if ref.startswith("dag-fragment:")
+    }
+    source_refs.update(
+        ref for ref in (_source_ref_from_repair_ref(ref) for ref in refs)
+        if ref
+    )
+    task_ids = {
+        ref.removeprefix("dag-task:")
+        for ref in artifact_keys
+    }
+    for task in group_tasks:
+        if task.id and task.id.lower() in planned_text_lower:
+            task_ids.add(task.id)
+        source_ref = _dag_fragment_artifact_ref_for_task(task)
+        if source_ref and source_ref.lower() in planned_text_lower:
+            source_refs.add(source_ref)
+        if source_ref and source_ref in source_refs:
+            task_ids.add(task.id)
+
+    scoped: list[dict[str, Any]] = []
+    seen_problem_ids: set[int] = set()
+
+    def _append(problem: dict[str, Any]) -> None:
+        identity = id(problem)
+        if identity in seen_problem_ids:
+            return
+        seen_problem_ids.add(identity)
+        scoped.append(problem)
+
+    for problem in problems:
+        task_id = str(problem.get("task_id", "") or "")
+        artifact_key = str(problem.get("artifact_key", "") or "")
+        source_ref = str(problem.get("source_artifact_ref", "") or "")
+        path_values = [
+            str(problem.get(key, "") or "")
+            for key in ("path", "forbidden_path", "forbidden_rule")
+        ]
+        if artifact_key and artifact_key in artifact_keys:
+            _append(problem)
+            continue
+        if task_id and task_id in task_ids:
+            _append(problem)
+            continue
+        if source_ref and source_ref in source_refs:
+            _append(problem)
+            continue
+        if artifact_key.startswith("dag-task:") and (
+            artifact_key.removeprefix("dag-task:") in task_ids
+        ):
+            _append(problem)
+            continue
+        if any(
+            value
+            and _dag_closure_normalize_path(value).lower() in planned_text_lower
+            for value in path_values
+        ):
+            _append(problem)
+    return scoped
+
+
+def _dag_closure_relative_path(path: Path, artifact_root: Path) -> str:
+    try:
+        return path.resolve().relative_to(artifact_root.resolve()).as_posix()
+    except Exception:
+        return path.as_posix()
+
+
+def _dag_closure_is_text_file(path: Path) -> bool:
+    if not path.is_file():
+        return False
+    if path.name.startswith(".DS_Store"):
+        return False
+    if path.suffix.lower() not in _DAG_CLOSURE_TEXT_SUFFIXES:
+        return False
+    try:
+        return path.stat().st_size <= _DAG_CLOSURE_MAX_SCAN_BYTES
+    except OSError:
+        return False
+
+
+def _dag_closure_read_text(path: Path) -> str:
+    try:
+        with path.open("r", encoding="utf-8", errors="ignore") as handle:
+            return handle.read()
+    except Exception:
+        logger.debug("Failed to read DAG closure candidate %s", path, exc_info=True)
+        return ""
+
+
+def _dag_closure_contains_affected_ref(
+    text: str,
+    *,
+    affected_task_ids: list[str],
+    affected_subfeatures: list[str],
+    affected_slices: list[str],
+) -> bool:
+    lowered = text.lower()
+    for value in [*affected_task_ids, *affected_subfeatures, *affected_slices]:
+        if value and value.lower() in lowered:
+            return True
+    return False
+
+
+def _dag_closure_class_for_path(
+    rel_path: str,
+    *,
+    group_idx: int,
+) -> tuple[str, bool]:
+    rel = rel_path.strip().replace("\\", "/")
+    while rel.startswith("./"):
+        rel = rel[2:]
+    rel = rel.strip("/")
+    if rel == "dag.md":
+        return "feature_dag", True
+    if rel.startswith("compile-") and "dag" in rel and rel.endswith(".md"):
+        return "compile_dag", True
+    if rel.startswith("dag-ws-"):
+        return "root_workspace_dag", True
+    if rel.startswith("dag/dag-ws-"):
+        return "nested_workspace_dag", True
+    if rel.startswith("outputs/dag-ws-"):
+        return "output_workspace_dag", True
+    if rel.startswith(f".iriai-context/g{group_idx}-expanded-verify-"):
+        return "expanded_verify_snapshot", True
+    if rel.startswith(".iriai-context/"):
+        return "generated_context", False
+    if rel.startswith(".staging/"):
+        return "staging_artifact", False
+    parts = rel.split("/")
+    if len(parts) >= 3 and parts[0] == "subfeatures":
+        suffix = "/".join(parts[2:])
+        if suffix == "dag.md":
+            return "subfeature_dag", True
+        if suffix.startswith("dag-fragments/") and suffix.endswith(".json"):
+            return "dag_fragment", True
+        if suffix in {"plan.md", "plan.json"}:
+            return "subfeature_plan", True
+        if suffix.startswith("dag-fragment-attempts/"):
+            return "dag_fragment_attempt", False
+        if suffix.startswith((
+            "prd",
+            "design",
+            "system-design",
+            "test-plan",
+        )):
+            return "historical_planning_doc", False
+        return "subfeature_artifact", False
+    return "historical_artifact", False
+
+
+def _dag_artifact_closure_scan(
+    runner: WorkflowRunner,
+    feature: Feature,
+    group_idx: int,
+    group_tasks: list[ImplementationTask],
+    path_problems: list[dict[str, Any]] | None,
+) -> DagArtifactClosureScan:
+    signature_records = _dag_closure_signature_records_from_path_problems(
+        path_problems
+    )
+    signatures = _dag_closure_blocking_signatures(signature_records)
+    task_ids, subfeatures, slices, source_refs = _dag_closure_affected_context(
+        group_tasks,
+        path_problems,
+    )
+    artifact_root = _dag_artifact_feature_dir(runner, feature)
+    scan = DagArtifactClosureScan(
+        stale_signatures=signatures,
+        signature_records=signature_records,
+        affected_task_ids=task_ids,
+        affected_subfeatures=subfeatures,
+        affected_slices=slices,
+        source_refs=source_refs,
+        suggested_scan_roots=[
+            "subfeatures/{subfeature}/dag.md",
+            "subfeatures/{subfeature}/dag-fragments/*.json",
+            "subfeatures/{subfeature}/plan.md",
+            "subfeatures/{subfeature}/plan.json",
+            "dag.md",
+            "dag-ws-*",
+            "dag/dag-ws-*",
+            "outputs/dag-ws-*",
+            "compile-*dag*.md",
+            f".iriai-context/g{group_idx}-expanded-verify-*",
+        ],
+    )
+    if not signatures or artifact_root is None or not artifact_root.exists():
+        return scan
+
+    for path in sorted(artifact_root.rglob("*")):
+        if not _dag_closure_is_text_file(path):
+            continue
+        rel_path = _dag_closure_relative_path(path, artifact_root)
+        scan.scanned_paths.append(rel_path)
+        text = _dag_closure_read_text(path)
+        if not text:
+            continue
+        matched_records = [
+            record for record in signature_records
+            if str(record.get("signature", "") or "")
+            and str(record.get("signature", "")) in text
+        ]
+        if not matched_records:
+            continue
+        blocking_records = [
+            record for record in matched_records
+            if bool(record.get("blocking"))
+        ]
+        ignored_records = [
+            record for record in matched_records
+            if not bool(record.get("blocking"))
+        ]
+        artifact_class, blocking = _dag_closure_class_for_path(
+            rel_path,
+            group_idx=group_idx,
+        )
+        contains_affected_ref = _dag_closure_contains_affected_ref(
+            text,
+            affected_task_ids=task_ids,
+            affected_subfeatures=subfeatures,
+            affected_slices=slices,
+        )
+        if (
+            ignored_records
+            and len(scan.ignored_matches) < _DAG_CLOSURE_MAX_IGNORED_MATCHES
+        ):
+            scan.ignored_matches.append({
+                "target_ref": str(path),
+                "relative_path": rel_path,
+                "artifact_class": artifact_class,
+                "signatures": [
+                    str(record.get("signature", "") or "")
+                    for record in ignored_records
+                ],
+                "signature_records": ignored_records,
+                "contains_affected_ref": contains_affected_ref,
+                "ignored_reason": "non_blocking_closure_evidence",
+            })
+        if not blocking_records:
+            continue
+        item = {
+            "target_ref": str(path),
+            "relative_path": rel_path,
+            "artifact_class": artifact_class,
+            "stale_signatures": _dedupe_preserving_order([
+                str(record.get("signature", "") or "")
+                for record in blocking_records
+                if str(record.get("signature", "") or "").strip()
+            ]),
+            "signature_records": blocking_records,
+            "contains_affected_ref": contains_affected_ref,
+        }
+        if blocking:
+            scan.blocking_targets.append(item)
+        else:
+            scan.advisory_residuals.append(item)
+    return scan
+
+
+def _dag_closure_record(
+    *,
+    artifact_key: str,
+    group_idx: int,
+    retry: int,
+    group_id: str,
+    before: DagArtifactClosureScan,
+    after: DagArtifactClosureScan | None,
+    status: str,
+    deleted_snapshots: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    return {
+        "artifact_key": artifact_key,
+        "source": "dag-artifact-closure",
+        "group_idx": group_idx,
+        "retry": retry,
+        "group_id": group_id,
+        "status": status,
+        "before": before.to_record(),
+        "after": after.to_record() if after is not None else None,
+        "blocking_residuals": (
+            after.blocking_targets if after is not None else before.blocking_targets
+        ),
+        "advisory_residuals": (
+            after.advisory_residuals if after is not None else before.advisory_residuals
+        ),
+        "deleted_generated_snapshots": deleted_snapshots or [],
+        "created_at": time.time(),
+    }
+
+
+def _dag_artifact_repair_target_path(
+    runner: WorkflowRunner,
+    feature: Feature,
+    target_ref: str,
+    feature_root: Path | None,
+) -> tuple[Path | None, str, str]:
+    normalized = _normalize_dag_artifact_repair_ref(target_ref)
+    if not normalized:
+        return None, "empty_target_ref", ""
+    if not _is_dag_artifact_repair_path(normalized):
+        return None, "target_ref_not_artifact_context", normalized
+
+    services = getattr(runner, "services", {}) or {}
+    mirror = services.get("artifact_mirror")
+    mirror_root: Path | None = None
+    if mirror is not None:
+        try:
+            mirror_root = Path(mirror.feature_dir(feature.id)).resolve()
+        except Exception:
+            logger.debug(
+                "Failed to resolve artifact mirror target root",
+                exc_info=True,
+            )
+
+    roots: list[tuple[str, Path]] = []
+    if mirror_root is not None:
+        roots.append(("artifact_mirror", mirror_root))
+    if feature_root is not None:
+        roots.append(("feature_context", feature_root.resolve()))
+
+    candidate = Path(normalized)
+    if candidate.is_absolute():
+        absolute = candidate.resolve()
+        for kind, root in roots:
+            rel = _path_relative_to(absolute, root)
+            if rel is None:
+                continue
+            if kind == "feature_context" and not (
+                _is_artifact_context_path(rel.as_posix())
+                or _is_artifact_context_path(absolute.as_posix())
+            ):
+                return None, "target_ref_not_feature_context", normalized
+            return absolute, kind, rel.as_posix()
+        return None, "target_ref_outside_allowed_roots", normalized
+
+    parts = candidate.parts
+    feature_parts = (".iriai", "artifacts", "features", feature.id)
+    if mirror_root is not None and parts[:4] == feature_parts:
+        relative = Path(*parts[4:]) if len(parts) > 4 else Path()
+        absolute = (mirror_root / relative).resolve()
+        if _path_relative_to(absolute, mirror_root) is None:
+            return None, "target_ref_outside_artifact_mirror", normalized
+        return absolute, "artifact_mirror", relative.as_posix()
+
+    if mirror_root is not None and (
+        normalized == "dag.md"
+        or normalized.startswith((
+            ".iriai-context/",
+            ".staging/",
+            "compile-",
+            "dag/",
+            "dag-fragments/",
+            "dag-ws-",
+            "outputs/dag-ws-",
+            "subfeatures/",
+        ))
+    ):
+        absolute = (mirror_root / candidate).resolve()
+        if _path_relative_to(absolute, mirror_root) is None:
+            return None, "target_ref_outside_artifact_mirror", normalized
+        return absolute, "artifact_mirror", candidate.as_posix()
+
+    if feature_root is not None and _is_artifact_context_path(normalized):
+        absolute = (feature_root.resolve() / candidate).resolve()
+        if _path_relative_to(absolute, feature_root.resolve()) is None:
+            return None, "target_ref_outside_feature_context", normalized
+        return absolute, "feature_context", candidate.as_posix()
+
+    return None, "target_ref_unsupported_artifact_context", normalized
+
+
+def _prune_empty_artifact_parents(path: Path, stop_root: Path) -> None:
+    parent = path.parent
+    stop = stop_root.resolve()
+    while True:
+        try:
+            resolved_parent = parent.resolve()
+        except Exception:
+            return
+        if resolved_parent == stop:
+            return
+        if _path_relative_to(resolved_parent, stop) is None:
+            return
+        try:
+            parent.rmdir()
+        except OSError:
+            return
+        parent = parent.parent
+
+
+def _dag_artifact_delete_allowed(normalized_ref: str) -> bool:
+    normalized = normalized_ref.strip().replace("\\", "/")
+    return normalized.startswith((".iriai-context/", ".staging/"))
+
+
+async def _apply_dag_artifact_repair_updates(
+    runner: WorkflowRunner,
+    feature: Feature,
+    result: ArtifactRepairResult,
+    feature_root: Path | None = None,
+) -> dict[str, Any]:
+    services = getattr(runner, "services", {}) or {}
+    mirror = services.get("artifact_mirror")
+    applied_updates: list[dict[str, Any]] = []
+    skipped_updates: list[dict[str, Any]] = []
+    applied_target_updates: list[dict[str, Any]] = []
+    deleted_artifacts: list[dict[str, Any]] = []
+    skipped_deletes: list[dict[str, Any]] = []
+    roots = _dag_candidate_file_roots(feature_root)
+
+    for update in result.artifact_updates:
+        artifact_key = update.artifact_key.strip()
+        target_ref = update.target_ref.strip()
+        if not artifact_key and not target_ref:
+            skipped_updates.append({
+                "artifact_key": artifact_key,
+                "target_ref": target_ref,
+                "reason": "missing_artifact_target",
+            })
+            continue
+        if not update.content.strip():
+            skipped_updates.append({
+                "artifact_key": artifact_key,
+                "target_ref": target_ref,
+                "reason": "empty_content",
+            })
+            continue
+        if artifact_key:
+            if _is_dag_task_artifact_key(artifact_key):
+                task_result, reason, validation = _validate_dag_task_artifact_update(
+                    artifact_key,
+                    update.content,
+                    roots,
+                    feature_root,
+                )
+                if task_result is None:
+                    skipped_updates.append({
+                        "artifact_key": artifact_key,
+                        "target_ref": target_ref,
+                        "reason": reason,
+                        "validation": validation,
+                    })
+                else:
+                    stored_content = task_result.model_dump_json()
+                    await runner.artifacts.put(
+                        artifact_key,
+                        stored_content,
+                        feature=feature,
+                    )
+                    applied_updates.append({
+                        "artifact_key": artifact_key,
+                        "artifact_kind": "dag_task",
+                        "task_id": task_result.task_id,
+                        "summary": update.summary,
+                        "bytes": len(stored_content.encode("utf-8")),
+                        "validated_paths": validation,
+                    })
+            elif not _is_dag_artifact_repair_key(artifact_key):
+                skipped_updates.append({
+                    "artifact_key": artifact_key,
+                    "target_ref": target_ref,
+                    "reason": "unsafe_artifact_key",
+                })
+            else:
+                await runner.artifacts.put(artifact_key, update.content, feature=feature)
+                if mirror is not None and hasattr(mirror, "write_artifact"):
+                    try:
+                        mirror.write_artifact(feature.id, artifact_key, update.content)
+                    except Exception:
+                        logger.warning(
+                            "Failed to mirror artifact repair update for %s",
+                            artifact_key,
+                            exc_info=True,
+                        )
+                applied_updates.append({
+                    "artifact_key": artifact_key,
+                    "summary": update.summary,
+                    "bytes": len(update.content.encode("utf-8")),
+                })
+        if target_ref:
+            target_path, target_kind, normalized_ref = (
+                _dag_artifact_repair_target_path(
+                    runner,
+                    feature,
+                    target_ref,
+                    feature_root,
+                )
+            )
+            if target_path is None:
+                skipped_updates.append({
+                    "artifact_key": artifact_key,
+                    "target_ref": target_ref,
+                    "reason": target_kind,
+                    "normalized_ref": normalized_ref,
+                })
+            else:
+                target_path.parent.mkdir(parents=True, exist_ok=True)
+                target_path.write_text(update.content, encoding="utf-8")
+                applied_target_updates.append({
+                    "target_ref": target_ref,
+                    "target_kind": target_kind,
+                    "path": str(target_path),
+                    "summary": update.summary,
+                    "bytes": len(update.content.encode("utf-8")),
+                })
+
+    synced_files: list[dict[str, str]] = []
+    for reported_path in result.artifacts_created + result.artifacts_modified:
+        artifact_key, path = _dag_artifact_key_for_repair_file(
+            runner,
+            feature,
+            reported_path,
+        )
+        if not artifact_key or path is None or not path.exists():
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except Exception:
+            logger.warning(
+                "Failed to read repaired artifact file %s",
+                path,
+                exc_info=True,
+            )
+            continue
+        await runner.artifacts.put(artifact_key, text, feature=feature)
+        synced_files.append({
+            "artifact_key": artifact_key,
+            "path": str(path),
+        })
+
+    for target_ref in result.artifacts_deleted:
+        target_path, target_kind, normalized_ref = _dag_artifact_repair_target_path(
+            runner,
+            feature,
+            target_ref,
+            feature_root,
+        )
+        if target_path is None:
+            skipped_deletes.append({
+                "target_ref": target_ref,
+                "reason": target_kind,
+                "normalized_ref": normalized_ref,
+            })
+            continue
+        if target_path.exists() and not target_path.is_file():
+            skipped_deletes.append({
+                "target_ref": target_ref,
+                "reason": "target_ref_not_file",
+                "normalized_ref": normalized_ref,
+                "path": str(target_path),
+            })
+            continue
+        if not _dag_artifact_delete_allowed(normalized_ref):
+            skipped_deletes.append({
+                "target_ref": target_ref,
+                "reason": "target_ref_delete_not_generated_or_staging_artifact",
+                "normalized_ref": normalized_ref,
+                "path": str(target_path),
+            })
+            continue
+        if target_path.exists():
+            target_path.unlink()
+            stop_root = (
+                _dag_artifact_feature_dir(runner, feature)
+                if target_kind == "artifact_mirror" else feature_root
+            )
+            if stop_root is not None:
+                _prune_empty_artifact_parents(target_path, stop_root)
+        deleted_artifacts.append({
+            "target_ref": target_ref,
+            "target_kind": target_kind,
+            "normalized_ref": normalized_ref,
+            "path": str(target_path),
+        })
+
+    return {
+        "applied_updates": applied_updates,
+        "applied_target_updates": applied_target_updates,
+        "skipped_updates": skipped_updates,
+        "synced_files": synced_files,
+        "deleted_artifacts": deleted_artifacts,
+        "skipped_deletes": skipped_deletes,
+    }
+
+
+def _dag_artifact_repair_synthetic_result(
+    group_idx: int,
+    retry: int,
+    planned: PlannedBugGroup,
+    result: ArtifactRepairResult,
+    record: dict[str, Any],
+) -> ImplementationResult:
+    safe_group = _safe_context_stem(planned.group.group_id)
+    status = (
+        result.status
+        if result.status in {"completed", "partial", "blocked"}
+        else "partial"
+    )
+    return ImplementationResult(
+        task_id=(
+            result.task_id
+            or f"ARTIFACT-REPAIR-g{group_idx}-r{retry}-{safe_group}"
+        ),
+        summary=(
+            "DAG artifact repair lane completed for "
+            f"{planned.group.group_id}: {result.summary}"
+        ),
+        status=status,
+        files_created=[],
+        files_modified=[],
+        notes=json.dumps(record, indent=2),
+        deviations=result.deviations,
+        self_reported_risks=result.self_reported_risks,
+    )
+
+
+async def _run_dag_artifact_repair_lane(
+    runner: WorkflowRunner,
+    feature: Feature,
+    group_idx: int,
+    retry: int,
+    planned: PlannedBugGroup,
+    resolution: DagContradictionResolution,
+    resolution_record: dict[str, Any],
+    *,
+    group_tasks: list[ImplementationTask],
+    feature_root: Path | None,
+    runtime: str | None,
+    feedback: str,
+    fix_context: str,
+    closure_path_problems: list[dict[str, Any]] | None = None,
+) -> tuple[ArtifactRepairResult, ImplementationResult, dict[str, Any]]:
+    safe_group = _safe_context_stem(planned.group.group_id)
+    base_target_refs = _dag_artifact_repair_target_refs(
+        resolution,
+        planned=planned,
+    )
+    closure_before = _dag_artifact_closure_scan(
+        runner,
+        feature,
+        group_idx,
+        group_tasks,
+        closure_path_problems or [],
+    )
+    closure_target_refs = closure_before.target_refs()
+    target_refs = _dedupe_preserving_order([
+        *base_target_refs,
+        *closure_target_refs,
+    ])
+    target_ref_prompt = "\n".join(f"- {ref}" for ref in target_refs) or "- (none)"
+    closure_prompt = (
+        "\n\nHost-required closure targets. These are not optional; a repair "
+        "that leaves any blocking stale signature in these DAG/source artifacts "
+        "must be reported as blocked or partial:\n"
+        + (
+            "\n".join(
+                f"- {item['target_ref']} ({item['artifact_class']}; "
+                f"stale={', '.join(item['stale_signatures'][:3])})"
+                for item in closure_before.blocking_targets
+            )
+            or "- (none)"
+        )
+        + "\n\nAdvisory residuals found in historical/reference artifacts. "
+        "Clean them only when they feed current task-spec/result regeneration:\n"
+        + (
+            "\n".join(
+                f"- {item['target_ref']} ({item['artifact_class']})"
+                for item in closure_before.advisory_residuals[:20]
+            )
+            or "- (none)"
+        )
+    )
+    artifact_key = (
+        f"dag-artifact-repair:g{group_idx}:{safe_group}:retry-{retry}"
+    )
+    closure_artifact_key = (
+        f"dag-artifact-closure:g{group_idx}:retry-{retry}:{safe_group}"
+    )
+    ws_path = _dag_artifact_repair_workspace(runner, feature, feature_root)
+    workspace_ctx = (
+        f"Your working directory is: `{ws_path}`\n"
+        "This lane may edit workflow artifact/context files only. It must not "
+        "edit product source, tests, package manifests, or runtime code."
+        if ws_path else ""
+    )
+    context_package = await _build_prompt_context_package(
+        runner,
+        feature,
+        title=(
+            f"DAG Artifact Repair — Group {group_idx} "
+            f"Retry {retry + 1} Bug Group {planned.group.group_id}"
+        ),
+        file_stem=f"g{group_idx}-artifact-repair-r{retry}-{safe_group}",
+        intro_lines=[
+            (
+                "Repair stale or contradictory workflow artifacts discovered "
+                "during DAG verification."
+            ),
+            (
+                "This lane is separate from product-code repair; keep the work "
+                "artifact-only."
+            ),
+        ],
+        sections=[
+            ("feedback", "Merged Verifier Feedback", feedback),
+            ("issues", "Grouped Issues", planned.issue_text),
+            ("rca", "Root Cause Analysis", to_str(planned.rca)),
+            (
+                "resolution",
+                "Accepted Contradiction Resolution",
+                json.dumps(resolution_record, indent=2),
+            ),
+            ("targets", "Artifact Repair Targets", target_ref_prompt),
+            ("closure", "Host-Required DAG Artifact Closure", closure_prompt),
+            (
+                "task-specs",
+                "Current DAG Group Task Specs",
+                _format_dag_group_task_specs(group_tasks),
+            ),
+            ("fix-context", "Original Enhancement Items", fix_context),
+            ("workspace", "Workspace", workspace_ctx),
+        ],
+    )
+    actor = _make_parallel_actor(
+        implementer,
+        f"dag-g{group_idx}-r{retry}-artifact-repair-{safe_group}",
+        runtime=runtime,
+        workspace_path=ws_path,
+    )
+    try:
+        raw_result = await runner.run(
+            Ask(
+                actor=actor,
+                prompt=(
+                    f"## DAG Artifact Repair: group {planned.group.group_id}\n\n"
+                    f"{_context_package_prompt(context_package)}"
+                    "Apply the accepted artifact_repair resolution. You are repairing "
+                    "workflow artifacts, manifests, context packages, or derived DAG "
+                    "metadata only. Do not modify product source files.\n\n"
+                    "Allowed targets are exactly these artifact/context refs:\n"
+                    f"{target_ref_prompt}\n\n"
+                    f"{closure_prompt}\n\n"
+                    "If a target is available as a file in the artifact mirror or "
+                    ".iriai-context area, either edit that file directly or return a "
+                    "full replacement in artifact_updates with target_ref set to that "
+                    "artifact/context path. If a feature-scoped artifact key must be "
+                    "updated through the store instead, return a full replacement with "
+                    "artifact_key set. For `dag-task:{task_id}` keys, content must be "
+                    "a full ImplementationResult JSON object whose task_id matches "
+                    "the key suffix and whose reported files are canonical existing "
+                    "product paths. Report only artifact/context paths in "
+                    "artifacts_created/artifacts_modified/artifacts_deleted."
+                ),
+                output_type=ArtifactRepairResult,
+            ),
+            feature,
+            phase_name="implementation",
+        )
+        result = (
+            raw_result
+            if isinstance(raw_result, ArtifactRepairResult)
+            else ArtifactRepairResult.model_validate(raw_result)
+        )
+        result = result.model_copy(update={
+            "task_id": result.task_id or (
+                f"ARTIFACT-REPAIR-g{group_idx}-r{retry}-{safe_group}"
+            ),
+            "group_id": result.group_id or planned.group.group_id,
+        })
+        update_record = await _apply_dag_artifact_repair_updates(
+            runner,
+            feature,
+            result,
+            feature_root,
+        )
+        applied_any = bool(
+            update_record.get("applied_updates")
+            or update_record.get("applied_target_updates")
+            or update_record.get("synced_files")
+            or update_record.get("deleted_artifacts")
+        )
+        closure_after: DagArtifactClosureScan | None = None
+        closure_record: dict[str, Any] | None = None
+        if closure_before.stale_signatures:
+            closure_after = _dag_artifact_closure_scan(
+                runner,
+                feature,
+                group_idx,
+                group_tasks,
+                closure_path_problems or [],
+            )
+            closure_status = (
+                "completed" if not closure_after.blocking_targets else "blocked"
+            )
+            deleted_generated = [
+                item for item in update_record.get("deleted_artifacts", [])
+                if (
+                    f"/.iriai-context/g{group_idx}-expanded-verify-"
+                    in str(item.get("path", ""))
+                    or str(item.get("normalized_ref", "")).startswith(
+                        f".iriai-context/g{group_idx}-expanded-verify-"
+                    )
+                )
+            ]
+            closure_record = _dag_closure_record(
+                artifact_key=closure_artifact_key,
+                group_idx=group_idx,
+                retry=retry,
+                group_id=planned.group.group_id,
+                before=closure_before,
+                after=closure_after,
+                status=closure_status,
+                deleted_snapshots=deleted_generated,
+            )
+            await runner.artifacts.put(
+                closure_artifact_key,
+                json.dumps(closure_record, indent=2),
+                feature=feature,
+            )
+            if closure_after.blocking_targets and result.status != "blocked":
+                result = result.model_copy(update={
+                    "status": "blocked",
+                    "summary": (
+                        f"{result.summary} Blocking DAG artifact closure "
+                        "residuals remain after repair."
+                    ).strip(),
+                    "notes": (
+                        f"{result.notes}\n\nDAG artifact closure residuals:\n"
+                        f"{json.dumps(closure_after.to_record(), indent=2)}"
+                    ).strip(),
+                })
+        if not applied_any and result.status != "blocked":
+            result = result.model_copy(update={
+                "status": "blocked",
+                "summary": (
+                    f"{result.summary} No artifact updates, synced files, or "
+                    "safe generated deletions were applied."
+                ).strip(),
+            })
+        record = {
+            "artifact_key": artifact_key,
+            "source": "dag-repair",
+            "group_idx": group_idx,
+            "retry": retry,
+            "group_id": planned.group.group_id,
+            "resolution_artifact_key": resolution_record.get("artifact_key"),
+            "target_refs": target_refs,
+            "base_target_refs": base_target_refs,
+            "closure_target_refs": closure_target_refs,
+            "result": result.model_dump(mode="json"),
+            "artifact_update_application": update_record,
+            "artifact_closure_key": closure_artifact_key,
+            "artifact_closure": closure_record,
+            "created_at": time.time(),
+        }
+        await runner.artifacts.put(
+            artifact_key,
+            json.dumps(record, indent=2),
+            feature=feature,
+        )
+        return (
+            result,
+            _dag_artifact_repair_synthetic_result(
+                group_idx,
+                retry,
+                planned,
+                result,
+                record,
+            ),
+            record,
+        )
+    except Exception as exc:
+        result = ArtifactRepairResult(
+            task_id=f"ARTIFACT-REPAIR-g{group_idx}-r{retry}-{safe_group}",
+            group_id=planned.group.group_id,
+            summary=(
+                "DAG artifact repair lane failed before returning a usable "
+                f"ArtifactRepairResult: {type(exc).__name__}: {exc}"
+            ),
+            status="blocked",
+            notes=repr(exc),
+        )
+        record = {
+            "artifact_key": artifact_key,
+            "source": "dag-repair",
+            "group_idx": group_idx,
+            "retry": retry,
+            "group_id": planned.group.group_id,
+            "resolution_artifact_key": resolution_record.get("artifact_key"),
+            "target_refs": target_refs,
+            "result": result.model_dump(mode="json"),
+            "error": repr(exc),
+            "created_at": time.time(),
+        }
+        await runner.artifacts.put(
+            artifact_key,
+            json.dumps(record, indent=2),
+            feature=feature,
+        )
+        logger.warning(
+            "DAG artifact repair lane failed group=%d retry=%d bug_group=%s: %s",
+            group_idx,
+            retry,
+            planned.group.group_id,
+            exc,
+        )
+        return (
+            result,
+            _dag_artifact_repair_synthetic_result(
+                group_idx,
+                retry,
+                planned,
+                result,
+                record,
+            ),
+            record,
+        )
+
+
+def _dag_filter_fixable_groups_for_quarantine(
+    fixable_groups: list[PlannedBugGroup],
+    quarantined_groups: list[PlannedBugGroup],
+) -> tuple[list[PlannedBugGroup], list[str]]:
+    if not quarantined_groups:
+        return fixable_groups, []
+    runnable: list[PlannedBugGroup] = []
+    blocked: list[str] = []
+    for planned in fixable_groups:
+        if _dag_contradiction_groups_overlap(planned, quarantined_groups):
+            blocked.append(planned.group.group_id)
+        else:
+            runnable.append(planned)
+    return runnable, blocked
+
+
+def _dag_repair_task_failed_result(
+    group_idx: int,
+    retry: int,
+    gid: str,
+    exc: BaseException,
+) -> ImplementationResult:
+    return ImplementationResult(
+        task_id=f"DAG-REPAIR-FAILED-g{group_idx}-r{retry}-{_safe_context_stem(gid)}",
+        status="blocked",
+        summary=(
+            f"DAG repair agent for group {gid} failed before returning a usable "
+            f"ImplementationResult: {type(exc).__name__}: {exc}"
+        ),
+        notes=repr(exc),
+    )
+
+
+async def _run_dag_repair_fix_tasks(
+    runner: WorkflowRunner,
+    feature: Feature,
+    group_idx: int,
+    retry: int,
+    round_idx: int,
+    runnable_ids: list[str],
+    fix_tasks: list[Ask],
+) -> list[ImplementationResult | None]:
+    if len(fix_tasks) == 1:
+        try:
+            result = await runner.run(
+                fix_tasks[0],
+                feature,
+                phase_name="implementation",
+            )
+        except Exception as exc:
+            gid = runnable_ids[0] if runnable_ids else "unknown"
+            failed = _dag_repair_task_failed_result(group_idx, retry, gid, exc)
+            await runner.artifacts.put(
+                f"dag-repair-fix-error:g{group_idx}:{gid}:retry-{retry}:round-{round_idx}",
+                failed.model_dump_json(),
+                feature=feature,
+            )
+            logger.warning(
+                "DAG repair fix task failed group=%d retry=%d bug_group=%s: %s",
+                group_idx,
+                retry,
+                gid,
+                exc,
+            )
+            return [failed]
+        return [result if isinstance(result, ImplementationResult) else None]
+
+    gathered = await _asyncio.gather(
+        *[
+            runner.run(task, feature, phase_name="implementation")
+            for task in fix_tasks
+        ],
+        return_exceptions=True,
+    )
+    results: list[ImplementationResult | None] = []
+    for gid, result in zip(runnable_ids, gathered):
+        if isinstance(result, ImplementationResult):
+            results.append(result)
+            continue
+        if isinstance(result, BaseException):
+            failed = _dag_repair_task_failed_result(group_idx, retry, gid, result)
+            await runner.artifacts.put(
+                f"dag-repair-fix-error:g{group_idx}:{gid}:retry-{retry}:round-{round_idx}",
+                failed.model_dump_json(),
+                feature=feature,
+            )
+            logger.warning(
+                "DAG repair fix task failed group=%d retry=%d bug_group=%s: %s",
+                group_idx,
+                retry,
+                gid,
+                result,
+            )
+            results.append(failed)
+            continue
+        results.append(None)
+    return results
+
+
+async def _persist_dag_contradiction_resolution(
+    runner: WorkflowRunner,
+    feature: Feature,
+    group_idx: int,
+    retry: int,
+    planned: PlannedBugGroup,
+    resolution: DagContradictionResolution,
+) -> dict[str, Any]:
+    safe_group = _safe_context_stem(planned.group.group_id)
+    artifact_key = f"contradiction:dag-repair:g{group_idx}:retry-{retry}:{safe_group}"
+    record = {
+        "artifact_key": artifact_key,
+        "source": "dag-repair",
+        "group_idx": group_idx,
+        "retry": retry,
+        "group_id": planned.group.group_id,
+        "rca_key": planned.rca_key,
+        "resolution": resolution.resolution,
+        "resolution_kind": resolution.resolution_kind,
+        "authoritative_sources": list(resolution.authoritative_sources),
+        "artifact_paths": list(resolution.artifact_paths),
+        "superseded_expectation": resolution.superseded_expectation,
+        "implementation_direction": resolution.implementation_direction,
+        "requires_code_change": resolution.requires_code_change,
+        "needs_human": resolution.needs_human,
+        "confidence": resolution.confidence,
+        "rationale": resolution.rationale,
+        "created_at": time.time(),
+    }
+    await runner.artifacts.put(artifact_key, json.dumps(record, indent=2), feature=feature)
+
+    manifest_raw = await runner.artifacts.get(CONTRADICTION_DECISIONS_KEY, feature=feature)
+    manifest: dict[str, Any]
+    try:
+        manifest = json.loads(manifest_raw) if manifest_raw else {}
+    except Exception:
+        manifest = {}
+    decisions = [
+        item
+        for item in manifest.get("decisions", [])
+        if isinstance(item, dict) and item.get("artifact_key") != artifact_key
+    ]
+    decisions.append(record)
+    manifest = {"decisions": decisions}
+    await runner.artifacts.put(
+        CONTRADICTION_DECISIONS_KEY,
+        json.dumps(manifest, indent=2),
+        feature=feature,
+    )
+    return record
+
+
+async def _resolve_dag_contradiction(
+    runner: WorkflowRunner,
+    feature: Feature,
+    group_idx: int,
+    retry: int,
+    planned: PlannedBugGroup,
+    *,
+    group_tasks: list[ImplementationTask],
+    feature_root: Path | None,
+    runtime: str | None,
+    feedback: str,
+) -> DagContradictionResolution | None:
+    safe_group = _safe_context_stem(planned.group.group_id)
+    file_stem = f"g{group_idx}-contradiction-{safe_group}-r{retry}"
+    existing_decisions = await _format_contradiction_decisions_context(runner, feature)
+    workspace_ctx = (
+        f"Feature repos are rooted at: `{feature_root}`\n"
+        "Use this workspace for read-only source inspection."
+        if feature_root else ""
+    )
+    context_package = await build_context_package(
+        runner,
+        feature,
+        title=f"DAG Contradiction Resolution — Group {group_idx} {planned.group.group_id}",
+        file_stem=file_stem,
+        intro_lines=[
+            "Resolve this DAG repair spec contradiction using the provided source evidence.",
+            "Read the manifest and open only the files needed to cite authoritative sources.",
+        ],
+        items=[
+            ContextPackageItem(
+                key="rca",
+                label="Contradiction RCA",
+                group="Focused Contradiction Evidence",
+                content=to_str(planned.rca),
+                file_name=f"{file_stem}-rca.md",
+            ),
+            ContextPackageItem(
+                key="issues",
+                label="Grouped Verifier/Lens Issues",
+                group="Focused Contradiction Evidence",
+                content=planned.issue_text,
+                file_name=f"{file_stem}-issues.md",
+            ),
+            ContextPackageItem(
+                key="feedback",
+                label="Merged Verifier Feedback",
+                group="Focused Contradiction Evidence",
+                content=feedback,
+                file_name=f"{file_stem}-feedback.md",
+            ),
+            ContextPackageItem(
+                key="task-specs",
+                label="Current DAG Group Task Specs",
+                group="Focused Contradiction Evidence",
+                content=_format_dag_group_task_specs(group_tasks),
+                file_name=f"{file_stem}-task-specs.md",
+            ),
+            ContextPackageItem(
+                key="existing-decisions",
+                label="Existing Resolved Contradiction Decisions",
+                group="Focused Contradiction Evidence",
+                content=existing_decisions,
+                file_name=f"{file_stem}-existing-decisions.md",
+            ),
+            ContextPackageItem(
+                key="workspace",
+                label="Workspace",
+                group="Focused Contradiction Evidence",
+                content=workspace_ctx,
+                file_name=f"{file_stem}-workspace.md",
+            ),
+            ContextPackageItem(
+                key="dag-strategy",
+                label="DAG Strategy",
+                group="Searchable Source Artifacts",
+                artifact_key="dag:strategy",
+                file_name=f"{file_stem}-dag-strategy.md",
+            ),
+            ContextPackageItem(
+                key="decisions-global",
+                label="Global Decisions",
+                group="Searchable Source Artifacts",
+                artifact_key="decisions:global",
+                file_name=f"{file_stem}-decisions-global.md",
+            ),
+            ContextPackageItem(
+                key="decisions",
+                label="Compiled Decisions",
+                group="Searchable Source Artifacts",
+                artifact_key="decisions",
+                file_name=f"{file_stem}-decisions.md",
+            ),
+        ],
+    )
+    prompt = (
+        f"## Autonomous DAG Contradiction Resolution\n\n"
+        f"{_context_package_prompt(context_package)}"
+        "Adjudicate the contradiction. This is not a code-fix task.\n\n"
+        "Rules:\n"
+        "1. Choose the authoritative interpretation only when the cited sources support it.\n"
+        "2. Set resolution_kind to exactly one of: decision_only, requires_code_change, "
+        "artifact_repair, stale_not_reproducing, needs_human.\n"
+        "3. Set confidence to exactly high, medium, or low. Do not set confidence=contradiction.\n"
+        "4. If the right answer is only verifier/spec interpretation, use decision_only "
+        "and set requires_code_change=false.\n"
+        "5. If current source/tests already disprove the finding, use stale_not_reproducing "
+        "and set requires_code_change=false.\n"
+        "6. If task metadata, manifests, or derived artifacts need repair but product code "
+        "does not, use artifact_repair and put only the artifact/context files "
+        "or artifact keys in artifact_paths. Product files may appear only as "
+        "evidence in authoritative_sources or rationale.\n"
+        "7. If implementation must change, use requires_code_change, set requires_code_change=true, "
+        "and provide exact implementation_direction.\n"
+        "8. If evidence is insufficient or product-risky, use needs_human and set needs_human=true.\n"
+        "9. authoritative_sources must cite concrete files/artifacts/decisions.\n"
+        "10. Do not waive real implementation failures; only resolve conflicting expectations.\n"
+    )
+    actor = _make_parallel_actor(
+        root_cause_analyst,
+        f"dag-g{group_idx}-r{retry}-contradiction-{safe_group}",
+        runtime=runtime,
+        workspace_path=str(feature_root) if feature_root else None,
+    )
+    result = await runner.run(
+        Ask(actor=actor, prompt=prompt, output_type=DagContradictionResolution),
+        feature,
+        phase_name="implementation",
+    )
+    if isinstance(result, DagContradictionResolution):
+        return result
+    if isinstance(result, BaseModel):
+        return DagContradictionResolution.model_validate(result.model_dump())
+    return DagContradictionResolution.model_validate(result)
+
+
+def _dedupe_preserving_order(items: list[str]) -> list[str]:
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for item in items:
+        if item in seen:
+            continue
+        seen.add(item)
+        deduped.append(item)
+    return deduped
+
+
+def _dag_candidate_file_roots(feature_root: Path | None) -> list[Path]:
+    if feature_root is None:
+        return []
+    roots = [feature_root]
+    try:
+        roots.extend(_discover_repo_roots_under(feature_root))
+    except Exception:
+        logger.debug("Failed to discover repo roots for DAG preflight", exc_info=True)
+    return sorted(set(roots))
+
+
+def _dag_reported_file_exists(path: str, roots: list[Path]) -> bool:
+    if not path or path.startswith("http://") or path.startswith("https://"):
+        return True
+    candidate = Path(path)
+    if candidate.is_absolute():
+        return candidate.exists()
+    return any((root / candidate).exists() for root in roots)
+
+
+def _dag_existing_path_locations(path: str, roots: list[Path]) -> list[Path]:
+    if not path or path.startswith("http://") or path.startswith("https://"):
+        return []
+    candidate = Path(path)
+    locations: list[Path] = []
+    if candidate.is_absolute():
+        if candidate.exists():
+            locations.append(candidate)
+        return locations
+    seen: set[str] = set()
+    for root in roots:
+        absolute = root / candidate
+        if not absolute.exists():
+            continue
+        key = absolute.resolve().as_posix()
+        if key in seen:
+            continue
+        seen.add(key)
+        locations.append(absolute)
+    return locations
+
+
+def _dag_path_tracked_or_staged(path: str, roots: list[Path]) -> bool:
+    if not path or path.startswith("http://") or path.startswith("https://"):
+        return False
+    if shutil.which("git") is None:
+        return False
+    normalized = path.strip().replace("\\", "/").strip("/")
+    if not normalized:
+        return False
+    for root in roots:
+        if not (root / ".git").exists():
+            continue
+        variants = [normalized]
+        root_name = root.name.strip("/")
+        if root_name and normalized.startswith(f"{root_name}/"):
+            variants.append(normalized[len(root_name) + 1:])
+        for variant in _dedupe_preserving_order(variants):
+            try:
+                result = subprocess.run(
+                    [
+                        "git",
+                        "-C",
+                        str(root),
+                        "ls-files",
+                        "--error-unmatch",
+                        "--",
+                        variant,
+                    ],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                    timeout=2,
+                )
+            except Exception:
+                continue
+            if result.returncode == 0:
+                return True
+    return False
+
+
+def _dag_manifest_path_entries(roots: list[Path]) -> dict[str, list[dict[str, str]]]:
+    entries: dict[str, list[dict[str, str]]] = {
+        "expected_files": [],
+        "forbidden_files": [],
+    }
+    seen_configs: set[Path] = set()
+    for root in roots:
+        for config_path in root.rglob("verify-file-scope.expected-files.json"):
+            try:
+                resolved = config_path.resolve()
+            except Exception:
+                resolved = config_path
+            if resolved in seen_configs:
+                continue
+            seen_configs.add(resolved)
+            try:
+                data = json.loads(config_path.read_text(encoding="utf-8"))
+            except Exception:
+                logger.debug(
+                    "Failed to load verify-file-scope entries from %s",
+                    config_path,
+                    exc_info=True,
+                )
+                continue
+            for key in ("expected_files", "forbidden_files"):
+                for item in data.get(key, []):
+                    path = ""
+                    source = ""
+                    if isinstance(item, str):
+                        path = item
+                    elif isinstance(item, dict):
+                        raw_path = item.get("path")
+                        raw_source = item.get("source")
+                        path = raw_path if isinstance(raw_path, str) else ""
+                        source = raw_source if isinstance(raw_source, str) else ""
+                    if not path.strip():
+                        continue
+                    entries[key].append({
+                        "path": path.strip().replace("\\", "/").strip("/"),
+                        "source": source.strip(),
+                        "config_path": str(config_path),
+                    })
+    return entries
+
+
+def _dag_forbidden_file_entries(roots: list[Path]) -> set[str]:
+    return {
+        item["path"]
+        for item in _dag_manifest_path_entries(roots).get("forbidden_files", [])
+    }
+
+
+def _dag_path_matches_forbidden_file(path: str, forbidden: set[str]) -> bool:
+    normalized = path.strip().replace("\\", "/").strip("/")
+    if not normalized:
+        return False
+    for forbidden_path in forbidden:
+        if (
+            normalized == forbidden_path
+            or normalized.startswith(f"{forbidden_path}/")
+            or normalized.endswith(f"/{forbidden_path}")
+            or f"/{forbidden_path}/" in normalized
+            or forbidden_path.endswith(f"/{normalized}")
+        ):
+            return True
+    return False
+
+
+def _dag_forbidden_match(
+    path: str,
+    forbidden_entries: list[dict[str, str]],
+) -> dict[str, str] | None:
+    forbidden = {entry["path"] for entry in forbidden_entries}
+    if not _dag_path_matches_forbidden_file(path, forbidden):
+        return None
+    normalized = path.strip().replace("\\", "/").strip("/")
+    for entry in forbidden_entries:
+        forbidden_path = entry["path"]
+        if (
+            normalized == forbidden_path
+            or normalized.startswith(f"{forbidden_path}/")
+            or normalized.endswith(f"/{forbidden_path}")
+            or f"/{forbidden_path}/" in normalized
+            or forbidden_path.endswith(f"/{normalized}")
+        ):
+            return entry
+    return {"path": normalized, "source": "", "config_path": ""}
+
+
+def _is_external_reported_path(path: str) -> bool:
+    lowered = path.strip().lower()
+    return (
+        "://" in lowered
+        or lowered.startswith("mailto:")
+        or lowered.startswith("artifact:")
+    )
+
+
+def _is_artifact_context_path(path: str) -> bool:
+    normalized = path.strip().replace("\\", "/")
+    parts = [part for part in normalized.split("/") if part]
+    if not normalized:
+        return True
+    if normalized.startswith(".iriai-context/") or "/.iriai-context/" in normalized:
+        return True
+    if normalized.startswith(".iriai/artifacts/") or "/.iriai/artifacts/" in normalized:
+        return True
+    if normalized.startswith("compile-") or "/compile-" in normalized:
+        return True
+    if "dag-fragments" in parts:
+        return True
+    return False
+
+
+def _feature_relative_path(path: Path, feature_root: Path | None) -> str:
+    if feature_root is None:
+        return path.as_posix()
+    try:
+        return path.resolve().relative_to(feature_root.resolve()).as_posix()
+    except Exception:
+        return path.as_posix()
+
+
+def _existing_product_path(
+    reported_path: str,
+    roots: list[Path],
+    feature_root: Path | None,
+) -> str | None:
+    if not reported_path:
+        return None
+    candidate = Path(reported_path)
+    if candidate.is_absolute():
+        if candidate.exists():
+            return _feature_relative_path(candidate, feature_root)
+        return None
+    for root in roots:
+        absolute = root / candidate
+        if absolute.exists():
+            return _feature_relative_path(absolute, feature_root)
+    return None
+
+
+def _rewrite_legacy_product_path(
+    reported_path: str,
+    roots: list[Path],
+    feature_root: Path | None,
+) -> str | None:
+    if not dag_path_canonicalization_enabled():
+        return None
+    canonical, rule = canonicalize_dag_path(reported_path)
+    if not rule:
+        return None
+    existing = _existing_product_path(canonical, roots, feature_root)
+    if existing:
+        return existing
+    candidate = Path(canonical)
+    if candidate.is_absolute() and feature_root is not None:
+        try:
+            return candidate.resolve().relative_to(feature_root.resolve()).as_posix()
+        except Exception:
+            pass
+    return canonical
+
+
+def _classify_dag_repair_path(
+    reported_path: str,
+    roots: list[Path],
+    feature_root: Path | None,
+) -> tuple[str, str | None]:
+    path = reported_path.strip()
+    if _is_external_reported_path(path):
+        return "external_reference", None
+    if _is_artifact_context_path(path):
+        return "artifact_context", None
+    rewritten = _rewrite_legacy_product_path(path, roots, feature_root)
+    if rewritten:
+        return "rewritten_product", rewritten
+    existing = _existing_product_path(path, roots, feature_root)
+    if existing:
+        return "product", existing
+    return "invalid_product", path
+
+
+def _validate_dag_task_artifact_update(
+    artifact_key: str,
+    content: str,
+    roots: list[Path],
+    feature_root: Path | None,
+) -> tuple[ImplementationResult | None, str, list[dict[str, Any]]]:
+    if not _is_dag_task_artifact_key(artifact_key):
+        return None, "not_dag_task_artifact", []
+    if feature_root is None or not roots:
+        return None, "missing_feature_root", []
+    try:
+        parsed = ImplementationResult.model_validate_json(content)
+    except Exception:
+        return None, "invalid_dag_task_result_json", []
+
+    expected_task_id = artifact_key.removeprefix("dag-task:")
+    if not _dag_task_id_matches_or_alias(expected_task_id, parsed.task_id):
+        return None, "dag_task_id_mismatch", [{
+            "expected_task_id": expected_task_id,
+            "actual_task_id": parsed.task_id,
+        }]
+    if parsed.task_id != expected_task_id:
+        parsed = parsed.model_copy(update={"task_id": expected_task_id})
+    if parsed.status not in {"completed", "partial"}:
+        return None, "dag_task_status_not_completed_or_partial", [{
+            "status": parsed.status,
+        }]
+
+    reported_paths = _dedupe_preserving_order(
+        parsed.files_created + parsed.files_modified
+    )
+    if not reported_paths:
+        return None, "dag_task_no_reported_files", []
+
+    forbidden_files = _dag_forbidden_file_entries(roots)
+    path_records: list[dict[str, Any]] = []
+    for path in reported_paths:
+        if _dag_path_matches_forbidden_file(path, forbidden_files):
+            return None, "dag_task_forbidden_path", [{
+                "path": path,
+            }]
+        category, normalized = _classify_dag_repair_path(
+            path,
+            roots,
+            feature_root,
+        )
+        path_records.append({
+            "path": path,
+            "category": category,
+            "normalized": normalized or "",
+        })
+        if category == "rewritten_product":
+            return None, "dag_task_noncanonical_path", [{
+                "path": path,
+                "canonical": normalized or "",
+            }]
+        if category != "product":
+            return None, f"dag_task_{category}", [{
+                "path": path,
+                "normalized": normalized or "",
+            }]
+
+    return parsed, "", path_records
+
+
+def _sanitize_dag_repair_result(
+    result: ImplementationResult,
+    roots: list[Path],
+    feature_root: Path | None,
+) -> tuple[ImplementationResult, list[dict[str, Any]]]:
+    records: list[dict[str, Any]] = []
+    updates: dict[str, list[str]] = {}
+    for field_name in ("files_created", "files_modified"):
+        kept: list[str] = []
+        for original in getattr(result, field_name):
+            category, normalized = _classify_dag_repair_path(
+                original,
+                roots,
+                feature_root,
+            )
+            if normalized and category in {
+                "product",
+                "rewritten_product",
+                "invalid_product",
+            }:
+                kept.append(normalized)
+            records.append({
+                "task_id": result.task_id,
+                "field": field_name,
+                "original": original,
+                "normalized": normalized or "",
+                "category": category,
+                "kept_for_preflight": bool(
+                    normalized
+                    and category in {
+                        "product",
+                        "rewritten_product",
+                        "invalid_product",
+                    }
+                ),
+            })
+        updates[field_name] = _dedupe_preserving_order(kept)
+    return result.model_copy(update=updates), records
+
+
+async def _sanitize_dag_repair_results(
+    runner: WorkflowRunner,
+    feature: Feature,
+    group_idx: int,
+    retry: int,
+    results: list[ImplementationResult],
+    feature_root: Path | None,
+    context_label: str,
+) -> list[ImplementationResult]:
+    """Normalize DAG repair result paths before they feed deterministic preflight."""
+    roots = _dag_candidate_file_roots(feature_root)
+    sanitized: list[ImplementationResult] = []
+    path_records: list[dict[str, Any]] = []
+    for result in results:
+        clean_result, records = _sanitize_dag_repair_result(
+            result,
+            roots,
+            feature_root,
+        )
+        sanitized.append(clean_result)
+        path_records.extend(records)
+
+    counts = collections.Counter(record["category"] for record in path_records)
+    report = {
+        "group_idx": group_idx,
+        "retry": retry,
+        "context_label": context_label,
+        "result_task_ids": [result.task_id for result in results],
+        "counts": dict(sorted(counts.items())),
+        "ignored_path_count": counts.get("artifact_context", 0)
+        + counts.get("external_reference", 0),
+        "rewritten_path_count": counts.get("rewritten_product", 0),
+        "invalid_product_path_count": counts.get("invalid_product", 0),
+        "has_invalid_product_paths": counts.get("invalid_product", 0) > 0,
+        "paths": path_records,
+    }
+    await runner.artifacts.put(
+        f"dag-repair-result-sanitize:g{group_idx}:retry-{retry}",
+        json.dumps(report),
+        feature=feature,
+    )
+    return sanitized
+
+
+def _dag_result_path_problems(
+    result: ImplementationResult,
+    roots: list[Path],
+    forbidden_entries: list[dict[str, str]],
+    expected_entries: list[dict[str, str]] | None = None,
+) -> list[dict[str, Any]]:
+    problems: list[dict[str, Any]] = []
+    candidate_evidence = _dag_candidate_evidence_for_task_id(
+        result.task_id,
+        expected_entries or [],
+        roots,
+    )
+    for path in _dedupe_preserving_order(
+        result.files_created + result.files_modified
+    ):
+        forbidden = _dag_forbidden_match(path, forbidden_entries)
+        exists = _dag_reported_file_exists(path, roots)
+        tracked_or_staged = _dag_path_tracked_or_staged(path, roots)
+        if forbidden is not None:
+            problems.append({
+                "task_id": result.task_id,
+                "artifact_key": f"dag-task:{result.task_id}",
+                "path": path,
+                "reason": "forbidden",
+                "exists": str(bool(exists)).lower(),
+                "exists_on_disk": bool(exists),
+                "tracked_or_staged": tracked_or_staged,
+                "repair_route": (
+                    "product_cleanup_required"
+                    if exists or tracked_or_staged
+                    else "artifact_only"
+                ),
+                "forbidden_rule": forbidden.get("path", ""),
+                "forbidden_path": forbidden.get("path", ""),
+                "forbidden_source": forbidden.get("source", ""),
+                "candidate_evidence": candidate_evidence,
+            })
+            continue
+        if not exists:
+            problems.append({
+                "task_id": result.task_id,
+                "artifact_key": f"dag-task:{result.task_id}",
+                "path": path,
+                "reason": "missing",
+                "exists": "false",
+                "exists_on_disk": False,
+                "tracked_or_staged": tracked_or_staged,
+                "repair_route": (
+                    "product_cleanup_required"
+                    if tracked_or_staged
+                    else "artifact_only"
+                ),
+                "forbidden_rule": "",
+                "forbidden_path": "",
+                "forbidden_source": "",
+                "candidate_evidence": candidate_evidence,
+            })
+    return problems
+
+
+def _dag_fragment_artifact_ref_for_task(task: ImplementationTask) -> str:
+    subfeature = task.subfeature_id.strip()
+    if not subfeature:
+        return ""
+    match = re.search(r"\bslice-(\d+)\b", task.id)
+    if not match:
+        return ""
+    return f"dag-fragment:{subfeature}:slice-{match.group(1)}"
+
+
+def _dag_task_spec_path_problems(
+    task: ImplementationTask,
+    roots: list[Path],
+    forbidden_entries: list[dict[str, str]],
+    expected_entries: list[dict[str, str]] | None = None,
+) -> list[dict[str, Any]]:
+    problems: list[dict[str, Any]] = []
+    candidate_evidence = _dag_candidate_evidence_for_task_id(
+        task.id,
+        expected_entries or [],
+        roots,
+    )
+    seen: set[tuple[str, str]] = set()
+    entries: list[tuple[str, str]] = []
+    entries.extend(
+        (f"file_scope[{idx}].path", scope.path)
+        for idx, scope in enumerate(task.file_scope)
+        if scope.path
+    )
+    entries.extend(
+        (f"files[{idx}]", path)
+        for idx, path in enumerate(task.files)
+        if path
+    )
+    for field, path in entries:
+        key = (field, path)
+        if key in seen:
+            continue
+        seen.add(key)
+        forbidden = _dag_forbidden_match(path, forbidden_entries)
+        if forbidden is None:
+            continue
+        exists = _dag_reported_file_exists(path, roots)
+        tracked_or_staged = _dag_path_tracked_or_staged(path, roots)
+        problems.append({
+            "task_id": task.id,
+            "artifact_key": f"dag-task:{task.id}",
+            "path": path,
+            "field": field,
+            "reason": "forbidden_task_spec",
+            "exists": str(bool(exists)).lower(),
+            "exists_on_disk": bool(exists),
+            "tracked_or_staged": tracked_or_staged,
+            "repair_route": (
+                "product_cleanup_required"
+                if exists or tracked_or_staged
+                else "artifact_only"
+            ),
+            "forbidden_rule": forbidden.get("path", ""),
+            "forbidden_path": forbidden.get("path", ""),
+            "forbidden_source": forbidden.get("source", ""),
+            "candidate_evidence": candidate_evidence,
+            "source_artifact_ref": _dag_fragment_artifact_ref_for_task(task),
+        })
+    return problems
+
+
+def _dag_forbidden_workspace_path_problems(
+    roots: list[Path],
+    forbidden_entries: list[dict[str, str]],
+    expected_entries: list[dict[str, str]],
+    *,
+    task_id: str = "",
+    artifact_key: str = "",
+    context_text: str = "",
+    include_all: bool = False,
+) -> list[dict[str, Any]]:
+    problems: list[dict[str, Any]] = []
+    context_lower = context_text.lower()
+    for entry in forbidden_entries:
+        path = entry.get("path", "")
+        if not path or _dag_path_matches_expected_entry(path, expected_entries):
+            continue
+        if not include_all:
+            aliases = _dag_task_id_aliases(task_id) if task_id else set()
+            source = entry.get("source", "")
+            relevant_by_task = bool(
+                aliases and any(alias and alias in source for alias in aliases)
+            )
+            relevant_by_text = bool(path and path.lower() in context_lower)
+            if not relevant_by_task and not relevant_by_text:
+                continue
+        exists = bool(_dag_existing_path_locations(path, roots))
+        tracked_or_staged = _dag_path_tracked_or_staged(path, roots)
+        if not exists and not tracked_or_staged:
+            continue
+        problems.append({
+            "task_id": task_id,
+            "artifact_key": artifact_key or (f"dag-task:{task_id}" if task_id else ""),
+            "path": path,
+            "reason": "forbidden_workspace_path",
+            "exists": str(bool(exists)).lower(),
+            "exists_on_disk": exists,
+            "tracked_or_staged": tracked_or_staged,
+            "repair_route": "product_cleanup_required",
+            "forbidden_rule": entry.get("path", ""),
+            "forbidden_path": entry.get("path", ""),
+            "forbidden_source": entry.get("source", ""),
+            "candidate_evidence": (
+                _dag_candidate_evidence_for_task_id(task_id, expected_entries, roots)
+                if task_id else []
+            ),
+        })
+    return problems
+
+
+def _dag_classify_task_drift(
+    task_id: str,
+    artifact_key: str,
+    *,
+    latest_result: ImplementationResult | None,
+    in_memory_results: list[ImplementationResult],
+    verifier_path_problems: list[dict[str, Any]] | None,
+    expected_entries: list[dict[str, str]],
+    forbidden_entries: list[dict[str, str]],
+    roots: list[Path],
+    context_text: str = "",
+) -> DagTaskDriftRoute:
+    matching_results: list[ImplementationResult] = []
+    if latest_result is not None:
+        matching_results.append(latest_result)
+    matching_results.extend([
+        result for result in in_memory_results
+        if _dag_task_id_matches_or_alias(task_id, result.task_id)
+    ])
+    path_problems: list[dict[str, Any]] = []
+    for result in matching_results:
+        path_problems.extend(_dag_result_path_problems(
+            result,
+            roots,
+            forbidden_entries,
+            expected_entries,
+        ))
+
+    for problem in verifier_path_problems or []:
+        problem_task_id = str(problem.get("task_id", ""))
+        problem_key = str(problem.get("artifact_key", ""))
+        if (
+            problem_key == artifact_key
+            or _dag_task_id_matches_or_alias(task_id, problem_task_id)
+        ):
+            path_problems.append(problem)
+
+    forbidden_workspace_paths = _dag_forbidden_workspace_path_problems(
+        roots,
+        forbidden_entries,
+        expected_entries,
+        task_id=task_id,
+        artifact_key=artifact_key,
+        context_text=context_text,
+        include_all=False,
+    )
+    candidate_evidence = _dag_candidate_evidence_for_task_id(
+        task_id,
+        expected_entries,
+        roots,
+    )
+    cleanup_required = any(
+        str(problem.get("repair_route", "")) == "product_cleanup_required"
+        or bool(problem.get("exists_on_disk"))
+        or bool(problem.get("tracked_or_staged"))
+        or str(problem.get("exists", "")).lower() == "true"
+        for problem in path_problems
+        if problem.get("reason") in {"forbidden", "forbidden_workspace_path"}
+    ) or bool(forbidden_workspace_paths)
+    if cleanup_required:
+        return DagTaskDriftRoute(
+            task_id=task_id,
+            artifact_key=artifact_key,
+            route="product_cleanup_required",
+            reason="forbidden_path_present_in_workspace_or_index",
+            path_problems=path_problems,
+            forbidden_workspace_paths=forbidden_workspace_paths,
+            candidate_evidence=candidate_evidence,
+        )
+
+    if path_problems:
+        return DagTaskDriftRoute(
+            task_id=task_id,
+            artifact_key=artifact_key,
+            route="artifact_only",
+            reason="db_only_dag_task_metadata_drift",
+            path_problems=path_problems,
+            forbidden_workspace_paths=forbidden_workspace_paths,
+            candidate_evidence=candidate_evidence,
+        )
+
+    if latest_result is not None:
+        reported = latest_result.files_created + latest_result.files_modified
+        if latest_result.status in {"completed", "partial"} and reported:
+            return DagTaskDriftRoute(
+                task_id=task_id,
+                artifact_key=artifact_key,
+                route="artifact_only",
+                reason="latest_dag_task_row_already_valid",
+                path_problems=[],
+                forbidden_workspace_paths=forbidden_workspace_paths,
+                candidate_evidence=candidate_evidence,
+            )
+
+    return DagTaskDriftRoute(
+        task_id=task_id,
+        artifact_key=artifact_key,
+        route="artifact_only",
+        reason="dag_task_ref_without_detected_product_drift",
+        path_problems=path_problems,
+        forbidden_workspace_paths=forbidden_workspace_paths,
+        candidate_evidence=candidate_evidence,
+    )
+
+
+async def _dag_task_drift_routes_for_refs(
+    runner: WorkflowRunner,
+    feature: Feature,
+    refs: list[str],
+    feature_root: Path | None,
+    *,
+    in_memory_results: list[ImplementationResult] | None = None,
+    verifier_path_problems: list[dict[str, Any]] | None = None,
+    context_text: str = "",
+) -> dict[str, DagTaskDriftRoute]:
+    roots = _dag_candidate_file_roots(feature_root)
+    if not roots:
+        return {}
+    manifest_entries = _dag_manifest_path_entries(roots)
+    expected_entries = manifest_entries.get("expected_files", [])
+    forbidden_entries = manifest_entries.get("forbidden_files", [])
+    routes: dict[str, DagTaskDriftRoute] = {}
+    for artifact_key in _safe_dag_task_artifact_refs(refs):
+        task_id = artifact_key.removeprefix("dag-task:")
+        latest_result: ImplementationResult | None = None
+        parent_record = await _dag_artifact_record_for_key(
+            runner,
+            feature,
+            artifact_key,
+        )
+        if parent_record is not None and parent_record.get("value"):
+            try:
+                latest_result = ImplementationResult.model_validate_json(
+                    str(parent_record.get("value", ""))
+                )
+            except Exception:
+                latest_result = None
+        routes[artifact_key] = _dag_classify_task_drift(
+            task_id,
+            artifact_key,
+            latest_result=latest_result,
+            in_memory_results=in_memory_results or [],
+            verifier_path_problems=verifier_path_problems or [],
+            expected_entries=expected_entries,
+            forbidden_entries=forbidden_entries,
+            roots=roots,
+            context_text=context_text,
+        )
+    return routes
+
+
+def _dag_product_cleanup_guidance(
+    routes: dict[str, DagTaskDriftRoute],
+) -> str:
+    cleanup_routes = [
+        route for route in routes.values()
+        if route.route == "product_cleanup_required"
+    ]
+    if not cleanup_routes:
+        return ""
+    lines = [
+        "\n\n## DAG Drift Routing",
+        "The host classified this as product_cleanup_required, not DB-only artifact repair.",
+        "Clean the product tree first. Do not edit DB artifacts directly; after your product-code repair succeeds, the host will append the corrected dag-task row.",
+        "If the RCA also identifies a stale workflow artifact (for example a dag-fragment file_scope), the host will run an artifact-only follow-up after the product tree is clean.",
+        "Remove or replace only manifest-forbidden files that are not also expected files, and preserve/port any acceptance coverage before reporting completion.",
+        "Forbidden/stale paths that forced product cleanup:",
+    ]
+    seen_paths: set[str] = set()
+    for route in cleanup_routes:
+        for problem in [*route.path_problems, *route.forbidden_workspace_paths]:
+            path = str(problem.get("path", ""))
+            if not path or path in seen_paths:
+                continue
+            seen_paths.add(path)
+            lines.append(
+                f"- `{path}` (artifact `{route.artifact_key}`, "
+                f"exists_on_disk={problem.get('exists_on_disk', False)}, "
+                f"tracked_or_staged={problem.get('tracked_or_staged', False)}, "
+                f"forbidden_rule=`{problem.get('forbidden_rule') or problem.get('forbidden_path') or ''}`)"
+            )
+    return "\n".join(lines)
+
+
+def _dag_repo_relative_product_path(path: str, roots: list[Path]) -> str:
+    normalized = path.strip().replace("\\", "/").strip("/")
+    for root in roots:
+        root_name = root.name.strip("/")
+        if not root_name or not normalized.startswith(f"{root_name}/"):
+            continue
+        candidate = normalized[len(root_name) + 1:]
+        if _dag_reported_file_exists(candidate, roots):
+            return candidate
+    return normalized
+
+
+async def _append_dag_task_rows_from_product_repair(
+    runner: WorkflowRunner,
+    feature: Feature,
+    *,
+    source: str,
+    bug_id: str,
+    routes: dict[str, DagTaskDriftRoute],
+    fix_result: ImplementationResult,
+    feature_root: Path | None,
+) -> dict[str, Any]:
+    roots = _dag_candidate_file_roots(feature_root)
+    report: dict[str, Any] = {
+        "source": source,
+        "bug_id": bug_id,
+        "applied": [],
+        "skipped": [],
+    }
+    if not roots:
+        report["skipped"].append({"reason": "missing_feature_roots"})
+    if fix_result.status not in {"completed", "partial"}:
+        report["skipped"].append({
+            "reason": "fix_result_status_not_completed_or_partial",
+            "status": fix_result.status,
+        })
+    if report["skipped"]:
+        await runner.artifacts.put(
+            f"dag-task-product-reconcile:{source}:{bug_id}",
+            json.dumps(report, indent=2),
+            feature=feature,
+        )
+        return report
+
+    manifest_entries = _dag_manifest_path_entries(roots)
+    forbidden_entries = manifest_entries.get("forbidden_files", [])
+    created_paths: list[str] = []
+    modified_paths: list[str] = []
+    for field_name, output in (
+        ("files_created", created_paths),
+        ("files_modified", modified_paths),
+    ):
+        for path in getattr(fix_result, field_name):
+            if _dag_forbidden_match(path, forbidden_entries) is not None:
+                continue
+            category, normalized = _classify_dag_repair_path(
+                path,
+                roots,
+                feature_root,
+            )
+            if category == "product" and normalized:
+                output.append(
+                    normalized if Path(path).is_absolute()
+                    else _dag_repo_relative_product_path(path, roots)
+                )
+    created_paths = _dedupe_preserving_order(created_paths)
+    modified_paths = [
+        path for path in _dedupe_preserving_order(modified_paths)
+        if path not in created_paths
+    ]
+
+    for artifact_key, route in routes.items():
+        if route.route != "product_cleanup_required":
+            continue
+        task_id = artifact_key.removeprefix("dag-task:")
+        remaining_forbidden = []
+        for problem in [*route.path_problems, *route.forbidden_workspace_paths]:
+            path = str(problem.get("path", ""))
+            if not path:
+                continue
+            if (
+                _dag_reported_file_exists(path, roots)
+                or _dag_path_tracked_or_staged(path, roots)
+            ):
+                remaining_forbidden.append(problem)
+        if remaining_forbidden:
+            report["skipped"].append({
+                "artifact_key": artifact_key,
+                "task_id": task_id,
+                "reason": "product_cleanup_still_required",
+                "remaining_forbidden_paths": remaining_forbidden,
+            })
+            continue
+        if not created_paths and not modified_paths:
+            report["skipped"].append({
+                "artifact_key": artifact_key,
+                "task_id": task_id,
+                "reason": "no_canonical_product_files_reported_by_product_repair",
+            })
+            continue
+        replacement = ImplementationResult(
+            task_id=task_id,
+            summary=(
+                "DAG task metadata reconciled after product cleanup: "
+                f"{fix_result.summary}"
+            ),
+            status=(
+                "completed" if fix_result.status == "completed" else "partial"
+            ),
+            files_created=created_paths,
+            files_modified=modified_paths,
+            notes=(
+                f"Host-appended after product cleanup for {source}:{bug_id}. "
+                "The product repair, not the host, handled source-tree cleanup."
+            ),
+            deviations=fix_result.deviations,
+            self_reported_risks=fix_result.self_reported_risks,
+        )
+        valid, reason, validation = _validate_dag_task_artifact_update(
+            artifact_key,
+            replacement.model_dump_json(),
+            roots,
+            feature_root,
+        )
+        if valid is None:
+            report["skipped"].append({
+                "artifact_key": artifact_key,
+                "task_id": task_id,
+                "reason": reason,
+                "validation": validation,
+            })
+            continue
+        serialized = valid.model_dump_json()
+        parent_record = await _dag_artifact_record_for_key(
+            runner,
+            feature,
+            artifact_key,
+        )
+        latest_hash = (
+            hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+        )
+        if (
+            parent_record is not None
+            and parent_record.get("sha256") == latest_hash
+        ):
+            report["applied"].append({
+                "artifact_key": artifact_key,
+                "task_id": task_id,
+                "action": "already_current",
+                "parent": parent_record,
+                "validated_paths": validation,
+            })
+            continue
+        await runner.artifacts.put(artifact_key, serialized, feature=feature)
+        report["applied"].append({
+            "artifact_key": artifact_key,
+            "task_id": task_id,
+            "action": "appended_dag_task_row",
+            "parent": parent_record,
+            "validated_paths": validation,
+        })
+
+    await runner.artifacts.put(
+        f"dag-task-product-reconcile:{source}:{bug_id}",
+        json.dumps(report, indent=2),
+        feature=feature,
+    )
+    return report
+
+
+def _dag_product_cleanup_ready_for_artifact_repair(
+    report: dict[str, Any],
+) -> bool:
+    """Return true when product cleanup is done enough to repair metadata."""
+    blocking_reasons = {
+        "missing_feature_roots",
+        "fix_result_status_not_completed_or_partial",
+        "product_cleanup_still_required",
+    }
+    for item in report.get("skipped", []) or []:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("reason", "")) in blocking_reasons:
+            return False
+    return True
+
+
+@dataclass(slots=True)
+class DagTaskReconcileOutcome:
+    results: list[object]
+    verify_results_context: list[object]
+    all_results: list[object]
+    report: dict[str, Any]
+
+
+def _dag_task_id_aliases(task_id: str) -> set[str]:
+    aliases = {task_id}
+    for marker in ("TASK-", "T-"):
+        idx = task_id.rfind(marker)
+        if idx >= 0:
+            aliases.add(task_id[idx:])
+    return {alias for alias in aliases if alias}
+
+
+def _dag_task_id_matches_or_alias(expected: str, actual: str) -> bool:
+    actual = (actual or "").strip()
+    return bool(actual) and actual in _dag_task_id_aliases(expected)
+
+
+def _dag_candidate_evidence_for_task_id(
+    task_id: str,
+    expected_entries: list[dict[str, str]],
+    roots: list[Path],
+) -> list[dict[str, Any]]:
+    aliases = _dag_task_id_aliases(task_id)
+    evidence: list[dict[str, Any]] = []
+    for entry in expected_entries:
+        source = entry.get("source", "")
+        if not any(alias and alias in source for alias in aliases):
+            continue
+        path = entry.get("path", "")
+        evidence.append({
+            "path": path,
+            "source": source,
+            "exists": _dag_reported_file_exists(path, roots),
+            "config_path": entry.get("config_path", ""),
+        })
+    return evidence
+
+
+def _dag_task_for_result(
+    result: ImplementationResult,
+    tasks_by_id: dict[str, ImplementationTask],
+) -> ImplementationTask | None:
+    matches = [
+        task for task in tasks_by_id.values()
+        if _dag_task_id_matches_or_alias(task.id, result.task_id)
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _dag_task_scope_path_variants(task: ImplementationTask) -> set[str]:
+    variants: set[str] = set()
+    repo_prefix = task.repo_path.strip().replace("\\", "/").strip("/")
+    for path in [
+        *(scope.path for scope in task.file_scope if scope.path),
+        *task.files,
+    ]:
+        normalized = path.strip().replace("\\", "/").strip("/")
+        if not normalized:
+            continue
+        variants.add(normalized)
+        if repo_prefix and normalized.startswith(f"{repo_prefix}/"):
+            variants.add(normalized[len(repo_prefix) + 1:])
+        elif repo_prefix:
+            variants.add(f"{repo_prefix}/{normalized}")
+    return variants
+
+
+def _dag_expected_entries_for_task(
+    task: ImplementationTask,
+    expected_entries: list[dict[str, str]],
+) -> list[dict[str, str]]:
+    aliases = _dag_task_id_aliases(task.id)
+    matches: list[dict[str, str]] = []
+    for entry in expected_entries:
+        source = entry.get("source", "")
+        if any(alias in source for alias in aliases):
+            matches.append(entry)
+    return matches
+
+
+def _dag_path_matches_expected_entry(
+    path: str,
+    expected_entries: list[dict[str, str]],
+) -> bool:
+    normalized = path.strip().replace("\\", "/").strip("/")
+    for entry in expected_entries:
+        expected = entry.get("path", "").strip().replace("\\", "/").strip("/")
+        if (
+            normalized == expected
+            or normalized.endswith(f"/{expected}")
+            or expected.endswith(f"/{normalized}")
+        ):
+            return True
+    return False
+
+
+async def _dag_artifact_record_for_key(
+    runner: WorkflowRunner,
+    feature: Feature,
+    key: str,
+) -> dict[str, Any] | None:
+    get_record = getattr(runner.artifacts, "get_record", None)
+    if callable(get_record):
+        record = await get_record(key, feature=feature)
+        if record is None:
+            return None
+        value = str(record.get("value", ""))
+        return {
+            "id": record.get("id"),
+            "created_at": str(record.get("created_at", "")),
+            "value": value,
+            "sha256": record.get("sha256")
+            or hashlib.sha256(value.encode("utf-8")).hexdigest(),
+        }
+    value = await runner.artifacts.get(key, feature=feature)
+    if value is None:
+        return None
+    text = str(value)
+    return {
+        "id": None,
+        "created_at": "",
+        "value": text,
+        "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+    }
+
+
+def _dag_artifact_record_changed(
+    before: dict[str, Any] | None,
+    after: dict[str, Any] | None,
+) -> bool:
+    if before is None:
+        return after is not None
+    if after is None:
+        return True
+    if before.get("id") is not None and after.get("id") is not None:
+        return before.get("id") != after.get("id")
+    return before.get("sha256") != after.get("sha256")
+
+
+def _validate_dag_task_reconcile_candidate(
+    task: ImplementationTask,
+    candidate: ImplementationResult,
+    roots: list[Path],
+    feature_root: Path | None,
+    *,
+    expected_entries: list[dict[str, str]],
+    forbidden_entries: list[dict[str, str]],
+    source: str,
+) -> tuple[ImplementationResult | None, str, list[dict[str, Any]]]:
+    if not _dag_task_id_matches_or_alias(task.id, candidate.task_id):
+        return None, "task_id_mismatch", [{
+            "expected_task_id": task.id,
+            "actual_task_id": candidate.task_id,
+        }]
+    if candidate.status not in {"completed", "partial"}:
+        return None, "status_not_completed_or_partial", [{
+            "status": candidate.status,
+        }]
+
+    reported_paths = _dedupe_preserving_order(
+        candidate.files_created + candidate.files_modified
+    )
+    if not reported_paths:
+        return None, "no_reported_files", []
+
+    scope_paths = _dag_task_scope_path_variants(task)
+    expected_task_entries = _dag_expected_entries_for_task(task, expected_entries)
+    records: list[dict[str, Any]] = []
+    for path in reported_paths:
+        forbidden = _dag_forbidden_match(path, forbidden_entries)
+        if forbidden is not None:
+            return None, "forbidden_path", [{
+                "path": path,
+                "forbidden_path": forbidden.get("path", ""),
+                "forbidden_source": forbidden.get("source", ""),
+            }]
+        category, normalized = _classify_dag_repair_path(
+            path,
+            roots,
+            feature_root,
+        )
+        records.append({
+            "path": path,
+            "category": category,
+            "normalized": normalized or "",
+            "source": source,
+        })
+        if category == "rewritten_product":
+            return None, "noncanonical_path", [{
+                "path": path,
+                "canonical": normalized or "",
+            }]
+        if category != "product":
+            return None, f"{category}_path", [{
+                "path": path,
+                "normalized": normalized or "",
+            }]
+        path_variants = {
+            path.strip().replace("\\", "/").strip("/"),
+            (normalized or "").strip().replace("\\", "/").strip("/"),
+        }
+        allowed_by_scope = bool(scope_paths & path_variants)
+        allowed_by_expected = any(
+            _dag_path_matches_expected_entry(variant, expected_task_entries)
+            for variant in path_variants
+            if variant
+        )
+        if scope_paths and not allowed_by_scope and not allowed_by_expected:
+            return None, "outside_task_scope", [{
+                "path": path,
+                "normalized": normalized or "",
+                "task_id": task.id,
+            }]
+
+    return candidate.model_copy(update={"task_id": task.id}), "", records
+
+
+def _dag_result_signature(result: ImplementationResult) -> tuple[Any, ...]:
+    return (
+        result.task_id,
+        result.status,
+        tuple(result.files_created),
+        tuple(result.files_modified),
+    )
+
+
+def _replace_task_result_in_list(
+    items: list[object],
+    task: ImplementationTask,
+    replacement: ImplementationResult,
+) -> list[object]:
+    replaced = False
+    output: list[object] = []
+    for item in items:
+        if (
+            isinstance(item, ImplementationResult)
+            and _dag_task_id_matches_or_alias(task.id, item.task_id)
+        ):
+            if not replaced:
+                output.append(replacement)
+                replaced = True
+            continue
+        output.append(item)
+    return output
+
+
+def _dag_existing_valid_paths_by_field(
+    result: ImplementationResult,
+    roots: list[Path],
+    feature_root: Path | None,
+    forbidden_entries: list[dict[str, str]],
+) -> dict[str, list[str]]:
+    kept: dict[str, list[str]] = {"files_created": [], "files_modified": []}
+    for field_name in ("files_created", "files_modified"):
+        for path in getattr(result, field_name):
+            if _dag_forbidden_match(path, forbidden_entries) is not None:
+                continue
+            category, _normalized = _classify_dag_repair_path(
+                path,
+                roots,
+                feature_root,
+            )
+            if category == "product":
+                kept[field_name].append(path)
+    return {
+        key: _dedupe_preserving_order(value)
+        for key, value in kept.items()
+    }
+
+
+def _normalize_dag_reported_path_key(path: str) -> str:
+    return path.strip().replace("\\", "/").strip("/")
+
+
+def _dag_merge_reconcile_candidate(
+    candidate: ImplementationResult,
+    stale_results: list[ImplementationResult],
+    roots: list[Path],
+    feature_root: Path | None,
+    forbidden_entries: list[dict[str, str]],
+    expected_entries: list[dict[str, str]],
+) -> ImplementationResult:
+    if not stale_results:
+        return candidate
+    stale_path_keys = {
+        _normalize_dag_reported_path_key(problem["path"])
+        for result in stale_results
+        for problem in _dag_result_path_problems(
+            result,
+            roots,
+            forbidden_entries,
+            expected_entries,
+        )
+    }
+    existing: dict[str, list[str]] = {
+        "files_created": [],
+        "files_modified": [],
+    }
+    for stale_result in stale_results:
+        valid_paths = _dag_existing_valid_paths_by_field(
+            stale_result,
+            roots,
+            feature_root,
+            forbidden_entries,
+        )
+        for field_name in ("files_created", "files_modified"):
+            existing[field_name].extend(valid_paths[field_name])
+
+    updates: dict[str, list[str]] = {}
+    for field_name in ("files_created", "files_modified"):
+        merged = [
+            path for path in [
+                *existing[field_name],
+                *getattr(candidate, field_name),
+            ]
+            if _normalize_dag_reported_path_key(path) not in stale_path_keys
+        ]
+        updates[field_name] = _dedupe_preserving_order(merged)
+    return candidate.model_copy(update=updates)
+
+
+def _dag_expected_manifest_candidate(
+    task: ImplementationTask,
+    stale_result: ImplementationResult,
+    roots: list[Path],
+    feature_root: Path | None,
+    expected_entries: list[dict[str, str]],
+    forbidden_entries: list[dict[str, str]],
+) -> ImplementationResult | None:
+    task_entries = _dag_expected_entries_for_task(task, expected_entries)
+    if not task_entries:
+        return None
+    existing = _dag_existing_valid_paths_by_field(
+        stale_result,
+        roots,
+        feature_root,
+        forbidden_entries,
+    )
+    expected_paths = _dedupe_preserving_order([
+        entry["path"] for entry in task_entries
+        if _dag_reported_file_exists(entry["path"], roots)
+        and _dag_forbidden_match(entry["path"], forbidden_entries) is None
+    ])
+    if not expected_paths:
+        return None
+    created = _dedupe_preserving_order(
+        existing["files_created"] + expected_paths
+    )
+    modified = [
+        path for path in existing["files_modified"]
+        if path not in created
+    ]
+    notes = (
+        f"{stale_result.notes}\n\n" if stale_result.notes else ""
+    ) + (
+        "DAG task result metadata reconciled from verify-file-scope "
+        "expected_files entries whose source references this task."
+    )
+    return stale_result.model_copy(update={
+        "task_id": task.id,
+        "summary": (
+            "Reconciled stale DAG task metadata to canonical existing "
+            "product paths from verify-file-scope expected_files."
+        ),
+        "status": "completed" if stale_result.status == "completed" else "partial",
+        "files_created": created,
+        "files_modified": modified,
+        "notes": notes,
+    })
+
+
+async def _reconcile_dag_task_results(
+    runner: WorkflowRunner,
+    feature: Feature,
+    group_idx: int,
+    retry_label: str,
+    group_tasks: list[ImplementationTask],
+    *,
+    results: list[object],
+    verify_results_context: list[object],
+    all_results: list[object],
+    repair_results: list[ImplementationResult],
+    feature_root: Path | None,
+) -> DagTaskReconcileOutcome:
+    roots = _dag_candidate_file_roots(feature_root)
+    report: dict[str, Any] = {
+        "group_idx": group_idx,
+        "retry": retry_label,
+        "applied": [],
+        "skipped": [],
+        "blockers": [],
+    }
+    if not roots or not group_tasks:
+        report["skipped"].append({"reason": "missing_roots_or_tasks"})
+        return DagTaskReconcileOutcome(
+            results,
+            verify_results_context,
+            all_results,
+            report,
+        )
+
+    manifest_entries = _dag_manifest_path_entries(roots)
+    expected_entries = manifest_entries.get("expected_files", [])
+    forbidden_entries = manifest_entries.get("forbidden_files", [])
+    context_results = [
+        item for item in verify_results_context
+        if isinstance(item, ImplementationResult)
+    ]
+    candidate_pool = [
+        *context_results,
+        *repair_results,
+    ]
+
+    updated_results = list(results)
+    updated_context = list(verify_results_context)
+    updated_all_results = list(all_results)
+
+    for task in group_tasks:
+        artifact_key = f"dag-task:{task.id}"
+        same_task_results = [
+            result for result in candidate_pool
+            if _dag_task_id_matches_or_alias(task.id, result.task_id)
+        ]
+        stale_results = [
+            result for result in same_task_results
+            if _dag_result_path_problems(
+                result,
+                roots,
+                forbidden_entries,
+                expected_entries,
+            )
+        ]
+        parent_record = await _dag_artifact_record_for_key(
+            runner,
+            feature,
+            artifact_key,
+        )
+
+        candidates: list[tuple[str, ImplementationResult, list[dict[str, Any]]]] = []
+        if parent_record is not None:
+            try:
+                latest = ImplementationResult.model_validate_json(
+                    parent_record["value"]
+                )
+            except Exception:
+                latest = None
+            if latest is not None:
+                latest_problem = bool(_dag_result_path_problems(
+                    latest,
+                    roots,
+                    forbidden_entries,
+                    expected_entries,
+                ))
+                if not latest_problem:
+                    valid, reason, validation = _validate_dag_task_reconcile_candidate(
+                        task,
+                        latest,
+                        roots,
+                        feature_root,
+                        expected_entries=expected_entries,
+                        forbidden_entries=forbidden_entries,
+                        source="latest_db",
+                    )
+                    if valid is not None:
+                        updated_results = _replace_task_result_in_list(
+                            updated_results,
+                            task,
+                            valid,
+                        )
+                        updated_context = _replace_task_result_in_list(
+                            updated_context,
+                            task,
+                            valid,
+                        )
+                        updated_all_results = _replace_task_result_in_list(
+                            updated_all_results,
+                            task,
+                            valid,
+                        )
+                        report["applied"].append({
+                            "task_id": task.id,
+                            "artifact_key": artifact_key,
+                            "source": "latest_db",
+                            "action": (
+                                "already_current"
+                                if stale_results else "in_memory_replace_only"
+                            ),
+                            "parent": parent_record,
+                            "validated_paths": validation,
+                        })
+                        continue
+                    if stale_results:
+                        report["skipped"].append({
+                            "task_id": task.id,
+                            "artifact_key": artifact_key,
+                            "source": "latest_db",
+                            "reason": reason,
+                            "validation": validation,
+                        })
+                latest = _dag_merge_reconcile_candidate(
+                    latest,
+                    stale_results,
+                    roots,
+                    feature_root,
+                    forbidden_entries,
+                    expected_entries,
+                )
+                valid, reason, validation = _validate_dag_task_reconcile_candidate(
+                    task,
+                    latest,
+                    roots,
+                    feature_root,
+                    expected_entries=expected_entries,
+                    forbidden_entries=forbidden_entries,
+                    source="latest_db",
+                )
+                if valid is not None:
+                    candidates.append((
+                        "latest_db_stale_drop"
+                        if latest_problem and stale_results else "latest_db",
+                        valid,
+                        validation,
+                    ))
+                elif stale_results:
+                    report["skipped"].append({
+                        "task_id": task.id,
+                        "artifact_key": artifact_key,
+                        "source": "latest_db",
+                        "reason": reason,
+                        "validation": validation,
+                    })
+
+        for candidate in same_task_results:
+            candidate_problem = bool(_dag_result_path_problems(
+                candidate,
+                roots,
+                forbidden_entries,
+                expected_entries,
+            ))
+            candidate = _dag_merge_reconcile_candidate(
+                candidate,
+                stale_results,
+                roots,
+                feature_root,
+                forbidden_entries,
+                expected_entries,
+            )
+            valid, reason, validation = _validate_dag_task_reconcile_candidate(
+                task,
+                candidate,
+                roots,
+                feature_root,
+                expected_entries=expected_entries,
+                forbidden_entries=forbidden_entries,
+                source="same_task_result",
+            )
+            if valid is not None:
+                candidates.append((
+                    "same_task_stale_drop"
+                    if candidate_problem and stale_results
+                    else "same_task_result",
+                    valid,
+                    validation,
+                ))
+            elif stale_results:
+                report["skipped"].append({
+                    "task_id": task.id,
+                    "artifact_key": artifact_key,
+                    "source": "same_task_result",
+                    "candidate_task_id": candidate.task_id,
+                    "reason": reason,
+                    "validation": validation,
+                })
+
+        if stale_results:
+            manifest_candidate = _dag_expected_manifest_candidate(
+                task,
+                stale_results[0],
+                roots,
+                feature_root,
+                expected_entries,
+                forbidden_entries,
+            )
+            if manifest_candidate is not None:
+                manifest_candidate = _dag_merge_reconcile_candidate(
+                    manifest_candidate,
+                    stale_results,
+                    roots,
+                    feature_root,
+                    forbidden_entries,
+                    expected_entries,
+                )
+                valid, reason, validation = _validate_dag_task_reconcile_candidate(
+                    task,
+                    manifest_candidate,
+                    roots,
+                    feature_root,
+                    expected_entries=expected_entries,
+                    forbidden_entries=forbidden_entries,
+                    source="expected_files",
+                )
+                if valid is not None:
+                    candidates.append(("expected_files", valid, validation))
+                else:
+                    report["skipped"].append({
+                        "task_id": task.id,
+                        "artifact_key": artifact_key,
+                        "source": "expected_files",
+                        "reason": reason,
+                        "validation": validation,
+                    })
+
+        if stale_results:
+            replacement_candidates = [
+                candidate for candidate in candidates
+                if not candidate[0].endswith("_stale_drop")
+            ]
+            if replacement_candidates:
+                candidates = replacement_candidates
+
+        unique: dict[tuple[Any, ...], tuple[str, ImplementationResult, list[dict[str, Any]]]] = {}
+        for source, candidate, validation in candidates:
+            unique.setdefault(_dag_result_signature(candidate), (
+                source,
+                candidate,
+                validation,
+            ))
+
+        if not stale_results and not unique:
+            continue
+        if not unique:
+            report["skipped"].append({
+                "task_id": task.id,
+                "artifact_key": artifact_key,
+                "reason": "no_valid_candidate",
+                "stale_paths": [
+                    problem
+                    for result in stale_results
+                    for problem in _dag_result_path_problems(
+                        result,
+                        roots,
+                        forbidden_entries,
+                        expected_entries,
+                    )
+                ],
+            })
+            continue
+        if len(unique) > 1:
+            report["blockers"].append({
+                "task_id": task.id,
+                "artifact_key": artifact_key,
+                "reason": "ambiguous_candidates",
+                "candidate_count": len(unique),
+            })
+            continue
+
+        source, replacement, validation = next(iter(unique.values()))
+        updated_results = _replace_task_result_in_list(
+            updated_results,
+            task,
+            replacement,
+        )
+        updated_context = _replace_task_result_in_list(
+            updated_context,
+            task,
+            replacement,
+        )
+        updated_all_results = _replace_task_result_in_list(
+            updated_all_results,
+            task,
+            replacement,
+        )
+
+        if not stale_results:
+            report["applied"].append({
+                "task_id": task.id,
+                "artifact_key": artifact_key,
+                "source": source,
+                "action": "in_memory_replace_only",
+                "validated_paths": validation,
+            })
+            continue
+
+        serialized = replacement.model_dump_json()
+        parent_latest = await _dag_artifact_record_for_key(
+            runner,
+            feature,
+            artifact_key,
+        )
+        if _dag_artifact_record_changed(parent_record, parent_latest):
+            report["skipped"].append({
+                "task_id": task.id,
+                "artifact_key": artifact_key,
+                "source": source,
+                "reason": "parent_artifact_changed",
+                "parent": parent_record,
+                "latest": parent_latest,
+            })
+            continue
+        if (
+            parent_latest is not None
+            and parent_latest.get("sha256")
+            == hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+        ):
+            report["applied"].append({
+                "task_id": task.id,
+                "artifact_key": artifact_key,
+                "source": source,
+                "action": "already_current",
+                "parent": parent_latest,
+                "validated_paths": validation,
+            })
+            continue
+
+        await runner.artifacts.put(artifact_key, serialized, feature=feature)
+        report["applied"].append({
+            "task_id": task.id,
+            "artifact_key": artifact_key,
+            "source": source,
+            "action": "appended_dag_task_row",
+            "parent": parent_latest,
+            "validated_paths": validation,
+            "stale_paths": [
+                problem
+                for result in stale_results
+                for problem in _dag_result_path_problems(
+                    result,
+                    roots,
+                    forbidden_entries,
+                    expected_entries,
+                )
+            ],
+        })
+
+    await runner.artifacts.put(
+        f"dag-task-reconcile:g{group_idx}:retry-{retry_label}",
+        json.dumps(report, indent=2),
+        feature=feature,
+    )
+    return DagTaskReconcileOutcome(
+        updated_results,
+        updated_context,
+        updated_all_results,
+        report,
+    )
+
+
+def _dedupe_task_field(
+    task: ImplementationTask,
+    field_name: str,
+    repairs: list[dict[str, Any]],
+    *,
+    repair_enabled: bool,
+) -> None:
+    values = getattr(task, field_name, None)
+    if not isinstance(values, list) or not values:
+        return
+    if not all(isinstance(item, str) for item in values):
+        return
+    deduped = _dedupe_preserving_order(values)
+    if len(deduped) == len(values):
+        return
+    repairs.append({
+        "task_id": task.id,
+        "field": field_name,
+        "before": list(values),
+        "after": deduped,
+        "applied": repair_enabled,
+    })
+    if repair_enabled:
+        setattr(task, field_name, deduped)
+
+
+async def _run_dag_group_preflight(
+    runner: WorkflowRunner,
+    feature: Feature,
+    group_idx: int,
+    retry_label: str,
+    group_tasks: list[ImplementationTask],
+    results: list[object],
+    *,
+    feature_root: Path | None,
+    known_task_ids: set[str] | None = None,
+) -> Verdict | None:
+    """Run deterministic DAG/group checks before spending verifier tokens.
+
+    The preflight can repair only derived list duplication in the in-memory task
+    specs used for the current verifier prompt. Anything semantic or ambiguous
+    is reported as a blocker and left for the ordinary repair loop.
+    """
+    repair_enabled = _dag_preflight_repair_enabled()
+    concerns: list[Issue] = []
+    warnings: list[str] = []
+    repairs: list[dict[str, Any]] = []
+    path_problems: list[dict[str, Any]] = []
+
+    seen_task_ids: set[str] = set()
+    duplicate_task_ids: set[str] = set()
+    for task in group_tasks:
+        if task.id in seen_task_ids:
+            duplicate_task_ids.add(task.id)
+        seen_task_ids.add(task.id)
+    for task_id in sorted(duplicate_task_ids):
+        concerns.append(Issue(
+            severity="blocker",
+            description=f"duplicate task id in DAG group: {task_id}",
+        ))
+
+    group_task_ids = {task.id for task in group_tasks}
+    all_known_task_ids = known_task_ids or group_task_ids
+    for task in group_tasks:
+        for field_name in (
+            "requirement_ids",
+            "step_ids",
+            "journey_ids",
+            "verification_gates",
+            "dependencies",
+            "files",
+        ):
+            _dedupe_task_field(
+                task,
+                field_name,
+                repairs,
+                repair_enabled=repair_enabled,
+            )
+
+        same_wave_dependencies = sorted(set(task.dependencies) & group_task_ids)
+        if same_wave_dependencies:
+            concerns.append(Issue(
+                severity="blocker",
+                description=(
+                    f"{task.id} depends on task(s) in the same execution wave: "
+                    f"{', '.join(same_wave_dependencies)}"
+                ),
+            ))
+        dangling_dependencies = sorted(
+            dep for dep in set(task.dependencies) if dep not in all_known_task_ids
+        )
+        if dangling_dependencies:
+            concerns.append(Issue(
+                severity="blocker",
+                description=(
+                    f"{task.id} references unknown dependency task id(s): "
+                    f"{', '.join(dangling_dependencies)}"
+                ),
+            ))
+        malformed_gates = sorted(
+            gate for gate in set(task.verification_gates)
+            if gate and not gate.startswith("AC-")
+        )
+        if malformed_gates:
+            concerns.append(Issue(
+                severity="major",
+                description=(
+                    f"{task.id} has malformed or non-canonical verification gate id(s): "
+                    f"{', '.join(malformed_gates)}"
+                ),
+            ))
+
+        scope_paths = {scope.path for scope in task.file_scope if scope.path}
+        legacy_paths = set(task.files)
+        if scope_paths and legacy_paths and not legacy_paths.issubset(scope_paths):
+            warnings.append(
+                f"{task.id} legacy files metadata has entries outside file_scope: "
+                f"{', '.join(sorted(legacy_paths - scope_paths))}"
+            )
+
+    if dag_path_canonicalization_enabled():
+        retired_refs = find_retired_backend_path_references(group_tasks)
+        for ref in retired_refs:
+            concerns.append(Issue(
+                severity="major",
+                description=(
+                    f"{ref.task_id} still references retired backend path "
+                    f"{ref.original!r} in {ref.field} after DAG path canonicalization; "
+                    f"expected {ref.canonical!r}"
+                ),
+                file=ref.original,
+            ))
+
+    roots = _dag_candidate_file_roots(feature_root)
+    if roots:
+        manifest_entries = _dag_manifest_path_entries(roots)
+        expected_entries = manifest_entries.get("expected_files", [])
+        forbidden_entries = manifest_entries.get("forbidden_files", [])
+        workspace_forbidden_problems = _dag_forbidden_workspace_path_problems(
+            roots,
+            forbidden_entries,
+            expected_entries,
+            include_all=True,
+        )
+        path_problems.extend(workspace_forbidden_problems)
+        for problem in workspace_forbidden_problems:
+            path = problem["path"]
+            concerns.append(Issue(
+                severity="major",
+                description=(
+                    "manifest-forbidden path exists in the feature workspace or "
+                    "git index; product cleanup is required before DAG metadata "
+                    f"can be considered repaired: {path}"
+                ),
+                file=path,
+            ))
+        for task in group_tasks:
+            task_spec_problems = _dag_task_spec_path_problems(
+                task,
+                roots,
+                forbidden_entries,
+                expected_entries,
+            )
+            path_problems.extend(task_spec_problems)
+            for problem in task_spec_problems:
+                path = problem["path"]
+                field = problem.get("field", "file_scope")
+                source_refs = [
+                    f"dag-task:{task.id}",
+                    *(
+                        [str(problem["source_artifact_ref"])]
+                        if problem.get("source_artifact_ref") else []
+                    ),
+                ]
+                concerns.append(Issue(
+                    severity="major",
+                    description=(
+                        f"{task.id} task spec {field} references a "
+                        "manifest-forbidden/stale path; source artifacts: "
+                        f"{', '.join(source_refs)}; repair the DAG/source artifact "
+                        "instead of recreating this path: "
+                        f"{path}"
+                    ),
+                    file=path,
+                ))
+        for result in results:
+            if not isinstance(result, ImplementationResult):
+                continue
+            if result.status not in {"completed", "partial"}:
+                concerns.append(Issue(
+                    severity="major",
+                    description=(
+                        f"{result.task_id} implementation result status is {result.status!r}"
+                    ),
+                ))
+            result_problems = _dag_result_path_problems(
+                result,
+                roots,
+                forbidden_entries,
+                expected_entries,
+            )
+            path_problems.extend(result_problems)
+            for problem in result_problems:
+                path = problem["path"]
+                if problem["reason"] == "forbidden":
+                    concerns.append(Issue(
+                        severity="major",
+                        description=(
+                            f"{result.task_id} reports changed file that is "
+                            "forbidden/stale by verify-file-scope.expected-files.json; "
+                            f"source artifact: dag-task:{result.task_id}; "
+                            "repair stale task metadata instead of creating "
+                            f"this path: {path}"
+                        ),
+                        file=path,
+                    ))
+                else:
+                    concerns.append(Issue(
+                        severity="major",
+                        description=(
+                            f"{result.task_id} reports changed file that is missing "
+                            f"from the feature workspace; source artifact: "
+                            f"dag-task:{result.task_id}; path: {path}"
+                        ),
+                        file=path,
+                    ))
+
+    closure_hints: dict[str, Any] = {}
+    if path_problems:
+        closure_hints = _dag_artifact_closure_scan(
+            runner,
+            feature,
+            group_idx,
+            group_tasks,
+            path_problems,
+        ).to_record()
+
+    artifact_key = f"dag-repair-preflight:g{group_idx}:retry-{retry_label}"
+    await runner.artifacts.put(
+        artifact_key,
+        json.dumps({
+            "group_idx": group_idx,
+            "retry": retry_label,
+            "repair_enabled": repair_enabled,
+            "approved": not concerns,
+            "concerns": [issue.model_dump(mode="json") for issue in concerns],
+            "warnings": warnings,
+            "repairs": repairs,
+            "path_problems": path_problems,
+            "closure_hints": closure_hints,
+            "task_ids": [task.id for task in group_tasks],
+            "result_task_ids": [
+                result.task_id
+                for result in results
+                if isinstance(result, ImplementationResult)
+            ],
+        }),
+        feature=feature,
+    )
+    if not concerns:
+        return None
+    return Verdict(
+        approved=False,
+        summary=(
+            "Programmatic DAG preflight failed before model verification. "
+            "Only deterministic structural checks ran; semantic verification was not attempted."
+        ),
+        concerns=concerns,
+        suggestions=[
+            "Fix the structural DAG/group issue, then retry the normal verifier.",
+        ],
+    )
+
+
+def _issue_dedupe_key(issue: Issue) -> tuple[str, str, int]:
+    return (
+        issue.description.strip().lower(),
+        issue.file.strip(),
+        int(issue.line or 0),
+    )
+
+
+def _gap_dedupe_key(gap: Gap) -> tuple[str, str, str]:
+    return (
+        gap.description.strip().lower(),
+        gap.category.strip().lower(),
+        gap.plan_reference.strip(),
+    )
+
+
+_DAG_VERDICT_PATH_RE = re.compile(
+    r"(?:path:|this path:|creating this path:)\s+(`?)([^`\s,;]+)\1",
+    re.IGNORECASE,
+)
+_DAG_VERDICT_DAG_TASK_RE = re.compile(r"dag-task:([A-Za-z0-9_.:@-]+)")
+_DAG_VERDICT_DAG_FRAGMENT_RE = re.compile(
+    r"dag-fragment:([A-Za-z0-9_.@-]+):slice-(\d+)"
+)
+
+
+def _dag_path_problems_from_verdict(
+    verdict: Verdict,
+    group_tasks: list[ImplementationTask],
+) -> list[dict[str, Any]]:
+    task_ids = [task.id for task in group_tasks]
+    problems: list[dict[str, Any]] = []
+    for issue in verdict.concerns:
+        description = issue.description or ""
+        if not description:
+            continue
+        artifact_match = _DAG_VERDICT_DAG_TASK_RE.search(description)
+        fragment_match = _DAG_VERDICT_DAG_FRAGMENT_RE.search(description)
+        task_id = ""
+        for candidate in task_ids:
+            if candidate and candidate in description:
+                task_id = candidate
+                break
+        artifact_key = ""
+        if artifact_match:
+            artifact_key = f"dag-task:{artifact_match.group(1)}"
+            task_id = task_id or artifact_match.group(1)
+        path = issue.file.strip()
+        if not path:
+            path_match = _DAG_VERDICT_PATH_RE.search(description)
+            if path_match:
+                path = path_match.group(2).strip()
+        if not (path or artifact_key or fragment_match):
+            continue
+        reason = "verdict_issue"
+        lowered = description.lower()
+        if "task spec" in lowered and (
+            "forbidden" in lowered or "stale" in lowered
+        ):
+            reason = "forbidden_task_spec"
+        elif "forbidden" in lowered or "stale" in lowered:
+            reason = "forbidden"
+        source_ref = (
+            f"dag-fragment:{fragment_match.group(1)}:slice-{fragment_match.group(2)}"
+            if fragment_match else ""
+        )
+        problems.append({
+            "task_id": task_id,
+            "artifact_key": artifact_key or (f"dag-task:{task_id}" if task_id else ""),
+            "path": path,
+            "file": issue.file.strip(),
+            "reason": reason,
+            "exists_on_disk": False,
+            "tracked_or_staged": False,
+            "repair_route": "artifact_only",
+            "source_artifact_ref": source_ref,
+            "verdict_description": description,
+        })
+    return problems
+
+
+def _prefix_lens_issue(spec: DagVerifyLensSpec, issue: Issue) -> Issue:
+    return issue.model_copy(update={
+        "description": f"[{spec.label} Lens] {issue.description}",
+    })
+
+
+def _prefix_lens_gap(spec: DagVerifyLensSpec, gap: Gap) -> Gap:
+    return gap.model_copy(update={
+        "description": f"[{spec.label} Lens] {gap.description}",
+    })
+
+
+def _merge_dag_expanded_verify_verdicts(
+    base: Verdict,
+    lens_verdicts: list[tuple[DagVerifyLensSpec, Verdict]],
+) -> Verdict:
+    """Merge read-only lens findings into the normal verifier verdict.
+
+    The normal verifier remains authoritative: this helper only broadens the
+    repair queue after a failed verdict and never turns a failed verdict into an
+    approval.
+    """
+    concerns = list(base.concerns)
+    concern_keys = {_issue_dedupe_key(c) for c in concerns}
+    gaps = list(base.gaps)
+    gap_keys = {_gap_dedupe_key(g) for g in gaps}
+
+    checks = list(base.checks)
+    check_keys = {
+        (check.criterion.strip().lower(), check.result.strip().upper(), check.detail.strip().lower())
+        for check in checks
+    }
+    suggestions = list(base.suggestions)
+    suggestion_keys = {s.strip().lower() for s in suggestions}
+    lens_summaries: list[str] = []
+
+    for spec, verdict in lens_verdicts:
+        lens_summaries.append(
+            f"{spec.label}: {'approved' if _is_approved(verdict) else 'findings'} — {verdict.summary}"
+        )
+        for concern in verdict.concerns:
+            key = _issue_dedupe_key(concern)
+            if key in concern_keys:
+                continue
+            concern_keys.add(key)
+            concerns.append(_prefix_lens_issue(spec, concern))
+        for gap in verdict.gaps:
+            key = _gap_dedupe_key(gap)
+            if key in gap_keys:
+                continue
+            gap_keys.add(key)
+            gaps.append(_prefix_lens_gap(spec, gap))
+        for check in verdict.checks:
+            key = (
+                check.criterion.strip().lower(),
+                check.result.strip().upper(),
+                check.detail.strip().lower(),
+            )
+            if key in check_keys:
+                continue
+            check_keys.add(key)
+            checks.append(check.model_copy(update={
+                "criterion": f"[{spec.label} Lens] {check.criterion}",
+            }))
+        for suggestion in verdict.suggestions:
+            prefixed = f"[{spec.label} Lens] {suggestion}"
+            key = prefixed.strip().lower()
+            if key in suggestion_keys:
+                continue
+            suggestion_keys.add(key)
+            suggestions.append(prefixed)
+
+    lens_summary_text = (
+        "\n".join(f"- {summary}" for summary in lens_summaries)
+        if lens_summaries else "- No expanded lens verdicts were produced."
+    )
+    merged_summary = (
+        f"{base.summary}\n\n"
+        "Expanded read-only verification ran after the normal verifier failed. "
+        "These findings are advisory inputs to repair; checkpoint authority remains "
+        "with the final aggregate group verifier.\n"
+        f"{lens_summary_text}"
+    )
+    return base.model_copy(update={
+        "approved": False if not _is_approved(base) else all(_is_approved(v) for _, v in lens_verdicts),
+        "summary": merged_summary,
+        "concerns": concerns,
+        "gaps": gaps,
+        "checks": checks,
+        "suggestions": suggestions,
+    })
+
+
+async def _run_expanded_dag_verify_lenses(
+    runner: WorkflowRunner,
+    feature: Feature,
+    group_idx: int,
+    retry: int,
+    base_verdict: Verdict,
+    results: list[object],
+    files: list[str],
+    tasks: list[ImplementationTask],
+    *,
+    runtime: str | None = None,
+    feature_root: Path | None = None,
+) -> Verdict:
+    if not _dag_expanded_verify_enabled():
+        logger.info(
+            "DAG expanded verify disabled by %s=0 for group=%d retry=%d",
+            DAG_EXPANDED_VERIFY_ENV,
+            group_idx,
+            retry,
+        )
+        return base_verdict
+
+    specs = _dag_verify_lens_specs()
+    await _log_feature_event(
+        runner,
+        feature.id,
+        "dag_expanded_verify_start",
+        "implementation",
+        content=f"g{group_idx}:retry-{retry}",
+        metadata={
+            "group_idx": group_idx,
+            "retry": retry,
+            "lens_slugs": [spec.slug for spec in specs],
+            "runtime": runtime,
+        },
+    )
+    results_summary = "\n\n".join(to_str(r) for r in results)
+    file_list = "\n".join(f"- `{path}`" for path in files) if files else "_No changed files were reported._"
+    workspace_hint = (
+        f"Feature repos root: `{feature_root}`\n"
+        "Read only from this workspace. Do not edit files or run mutating commands."
+        if feature_root else
+        "No feature workspace path was available. Use artifact context only."
+    )
+
+    context = await _build_prompt_context_package(
+        runner,
+        feature,
+        title=f"Expanded DAG Verify — Group {group_idx} Retry {retry}",
+        file_stem=f"g{group_idx}-expanded-verify-r{retry}",
+        intro_lines=[
+            "Run read-only DAG verification lenses after the normal group verifier failed.",
+            "The normal verifier remains authoritative; lenses broaden discovery before RCA/fix.",
+        ],
+        sections=[
+            ("normal-verdict", "Normal Verifier Verdict", _format_feedback("Verify", base_verdict)),
+            ("implementation-results", "Implementation Results", results_summary),
+            ("changed-files", "Changed Files", file_list),
+            ("task-specs", "DAG Group Task Specs", _format_dag_group_task_specs(tasks)),
+            ("workspace", "Workspace", workspace_hint),
+        ],
+    )
+    context_prompt = _context_package_prompt(context)
+
+    async def _run_lens(spec: DagVerifyLensSpec) -> tuple[DagVerifyLensSpec, Verdict | None, str | None]:
+        artifact_key = f"dag-repair-lens:g{group_idx}:{spec.slug}:retry-{retry}"
+        lens_runtime = _dag_repair_runtime_for(f"lens:{spec.slug}", runtime)
+        actor = _make_parallel_actor(
+            spec.actor,
+            f"dag-lens-g{group_idx}-r{retry}-{spec.slug}",
+            runtime=lens_runtime,
+            workspace_path=str(feature_root) if feature_root else None,
+        )
+        prompt = (
+            f"## Expanded DAG Verify Lens: {spec.label}\n\n"
+            f"{context_prompt}"
+            "You are a read-only verifier lens. Do not modify files. Do not run "
+            "formatters, installers, migrations, or write-producing commands. If you "
+            "run commands, use inspection-only commands.\n\n"
+            f"### Lens Focus\n{spec.focus}\n\n"
+            "Return a Verdict for this lens only. Report concrete blocker/major "
+            "issues that should be fixed before this group checkpoints. Put lower "
+            "severity observations in suggestions unless they invalidate the current "
+            "group. Lens approval is advisory and cannot checkpoint the group."
+        )
+        try:
+            verdict = await runner.run(
+                Ask(
+                    actor=actor,
+                    prompt=prompt,
+                    output_type=Verdict,
+                ),
+                feature,
+                phase_name="implementation",
+            )
+            if not isinstance(verdict, Verdict):
+                raise TypeError(f"lens returned {type(verdict).__name__}, expected Verdict")
+            await runner.artifacts.put(
+                artifact_key,
+                json.dumps({
+                    "lens": spec.slug,
+                    "label": spec.label,
+                    "status": "completed",
+                    "runtime": lens_runtime,
+                    "verdict": verdict.model_dump(mode="json"),
+                }),
+                feature=feature,
+            )
+            return spec, verdict, None
+        except Exception as exc:
+            logger.warning(
+                "DAG expanded verify lens failed group=%d retry=%d lens=%s: %s",
+                group_idx,
+                retry,
+                spec.slug,
+                exc,
+            )
+            await runner.artifacts.put(
+                artifact_key,
+                json.dumps({
+                    "lens": spec.slug,
+                    "label": spec.label,
+                    "status": "failed",
+                    "runtime": lens_runtime,
+                    "error": str(exc),
+                }),
+                feature=feature,
+            )
+            return spec, None, str(exc)
+
+    gathered = await _asyncio.gather(*[_run_lens(spec) for spec in specs])
+    successful = [(spec, verdict) for spec, verdict, _err in gathered if verdict is not None]
+    failures = [
+        {
+            "lens": spec.slug,
+            "label": spec.label,
+            "runtime": _dag_repair_runtime_for(f"lens:{spec.slug}", runtime),
+            "error": err,
+        }
+        for spec, verdict, err in gathered
+        if verdict is None and err
+    ]
+    merged = _merge_dag_expanded_verify_verdicts(base_verdict, successful)
+    await runner.artifacts.put(
+        f"dag-repair-expanded-verify:g{group_idx}:retry-{retry}",
+        json.dumps({
+            "group_idx": group_idx,
+            "retry": retry,
+            "enabled": True,
+            "normal_approved": _is_approved(base_verdict),
+            "merged_approved": _is_approved(merged),
+            "successful_lenses": [
+                {
+                    "lens": spec.slug,
+                    "runtime": _dag_repair_runtime_for(f"lens:{spec.slug}", runtime),
+                }
+                for spec, _verdict in successful
+            ],
+            "failed_lenses": failures,
+            "concerns": len(merged.concerns),
+            "gaps": len(merged.gaps),
+            "checks": len(merged.checks),
+            "merged_verdict": merged.model_dump(mode="json"),
+        }),
+        feature=feature,
+    )
+    logger.info(
+        "DAG expanded verify completed group=%d retry=%d successful_lenses=%d "
+        "failed_lenses=%d merged_concerns=%d merged_gaps=%d",
+        group_idx,
+        retry,
+        len(successful),
+        len(failures),
+        len(merged.concerns),
+        len(merged.gaps),
+    )
+    await _log_feature_event(
+        runner,
+        feature.id,
+        "dag_expanded_verify_finish",
+        "implementation",
+        content=f"g{group_idx}:retry-{retry}",
+        metadata={
+            "group_idx": group_idx,
+            "retry": retry,
+            "successful_lenses": [spec.slug for spec, _verdict in successful],
+            "failed_lenses": [item["lens"] for item in failures],
+            "concern_count": len(merged.concerns),
+            "gap_count": len(merged.gaps),
+        },
+    )
+    return merged
+
+
 def _discover_repo_roots_under(repos_root: Path) -> list[Path]:
     repos: list[Path] = []
     for git_dir in repos_root.rglob(".git"):
@@ -2846,7 +8448,10 @@ async def _plan_bug_groups(
             rca_key=rca_key,
         )
         groups.append(planned)
-        if result.confidence == "contradiction":
+        if (
+            result.confidence == "contradiction"
+            and not _planned_needs_dag_task_artifact_repair(planned)
+        ):
             contradiction_groups.append(planned)
         else:
             fixable_groups.append(planned)
@@ -2895,6 +8500,806 @@ async def _plan_bug_groups(
     )
 
 
+async def _attempt_parallel_dag_repair(
+    runner: WorkflowRunner,
+    feature: Feature,
+    group_idx: int,
+    retry: int,
+    verdict: Verdict,
+    group_tasks: list[ImplementationTask],
+    *,
+    feature_root: Path | None,
+    impl_runtime: str | None,
+    rca_runtime: str | None,
+    feedback: str,
+    fix_context: str = "",
+) -> list[ImplementationResult] | None:
+    """Try the faster DAG repair path: triage, parallel RCA, scheduled fixes.
+
+    This does not approve anything. The caller must still run the final aggregate
+    DAG verifier after these fixes.
+    """
+    if not _dag_parallel_repair_enabled():
+        return None
+    total_issues = len(verdict.concerns) + len(verdict.gaps)
+    if total_issues <= 1:
+        return None
+
+    dag_rca_runtime = _dag_repair_runtime_for("dag-rca", rca_runtime)
+    dag_fix_runtime = _dag_repair_runtime_for("dag-fix", impl_runtime)
+    dag_reverify_runtime = _dag_repair_runtime_for("dag-focused-reverify", rca_runtime)
+
+    def _dag_actor_factory(base: AgentActor, suffix: str) -> AgentActor:
+        role = "dag-triage" if suffix == "triage" else "dag-rca"
+        return _make_parallel_actor(
+            base,
+            f"dag-g{group_idx}-r{retry}-{suffix}",
+            runtime=_dag_repair_runtime_for(role, dag_rca_runtime),
+        )
+
+    source = f"dag-repair:g{group_idx}:retry-{retry}"
+    try:
+        dispatch = await _plan_bug_groups(
+            runner,
+            feature,
+            verdict,
+            source,
+            [],
+            phase_name="implementation",
+            repos_root=feature_root,
+            rca_runtime=dag_rca_runtime,
+            actor_factory=_dag_actor_factory,
+        )
+    except Exception as exc:
+        logger.warning(
+            "DAG parallel repair triage/RCA failed group=%d retry=%d: %s",
+            group_idx,
+            retry,
+            exc,
+        )
+        return None
+
+    await runner.artifacts.put(
+        f"dag-repair-triage:g{group_idx}:retry-{retry}",
+        to_str(dispatch.triage),
+        feature=feature,
+    )
+    for planned in dispatch.groups:
+        await runner.artifacts.put(
+            f"dag-repair-rca:g{group_idx}:{planned.group.group_id}:retry-{retry}",
+            to_str(planned.rca),
+            feature=feature,
+        )
+    await _log_feature_event(
+        runner,
+        feature.id,
+        "dag_repair_triage_done",
+        "implementation",
+        content=f"g{group_idx}:retry-{retry}",
+        metadata={
+            "group_idx": group_idx,
+            "retry": retry,
+            "dispatch_key": dispatch.dispatch_key,
+            "group_count": len(dispatch.groups),
+            "fixable_group_count": len(dispatch.fixable_groups),
+            "contradiction_group_count": len(dispatch.contradiction_groups),
+            "rca_group_ids": [planned.group.group_id for planned in dispatch.groups],
+        },
+    )
+
+    fixable_groups = list(dispatch.fixable_groups)
+    decision_results: list[ImplementationResult] = []
+    resolved_contradictions: list[dict[str, Any]] = []
+    rejected_contradictions: list[dict[str, Any]] = []
+    artifact_repair_records: list[dict[str, Any]] = []
+    human_needed_contradictions: list[str] = []
+    quarantined_contradiction_groups: list[PlannedBugGroup] = []
+    auto_resolve = False
+    verifier_path_problems = _dag_path_problems_from_verdict(verdict, group_tasks)
+    dag_task_artifact_candidate_groups = [
+        planned for planned in fixable_groups
+        if _planned_needs_dag_task_artifact_repair(planned)
+    ]
+    dag_task_artifact_groups: list[PlannedBugGroup] = []
+    dag_product_cleanup_routes_by_gid: dict[str, dict[str, DagTaskDriftRoute]] = {}
+    dag_source_artifact_followups: set[str] = {
+        planned.group.group_id for planned in fixable_groups
+        if _planned_needs_source_artifact_repair(planned)
+    }
+    for planned in dag_task_artifact_candidate_groups:
+        target_refs = _dag_task_artifact_refs_from_planned(planned)
+        drift_routes = await _dag_task_drift_routes_for_refs(
+            runner,
+            feature,
+            target_refs,
+            feature_root,
+            verifier_path_problems=verifier_path_problems,
+            context_text=f"{planned.issue_text}\n\n{to_str(planned.rca)}",
+        )
+        cleanup_routes = {
+            key: route for key, route in drift_routes.items()
+            if route.route == "product_cleanup_required"
+        }
+        if cleanup_routes:
+            dag_product_cleanup_routes_by_gid[
+                planned.group.group_id
+            ] = cleanup_routes
+        elif _planned_needs_source_artifact_repair(planned):
+            # This is not DB-only drift. Leave it in fixable_groups so the
+            # general artifact lane repairs the source artifact (for example a
+            # stale dag-fragment) instead of only appending a dag-task row.
+            continue
+        else:
+            dag_task_artifact_groups.append(planned)
+    if dag_task_artifact_groups:
+        dag_task_ids = {
+            planned.group.group_id for planned in dag_task_artifact_groups
+        }
+        fixable_groups = [
+            planned for planned in fixable_groups
+            if planned.group.group_id not in dag_task_ids
+        ]
+    metadata_artifact_groups = [
+        planned for planned in fixable_groups
+        if (
+            planned.group.group_id not in dag_product_cleanup_routes_by_gid
+            and _dag_metadata_only_repair_candidate(planned)
+        )
+    ]
+    if metadata_artifact_groups:
+        metadata_ids = {planned.group.group_id for planned in metadata_artifact_groups}
+        fixable_groups = [
+            planned for planned in fixable_groups
+            if planned.group.group_id not in metadata_ids
+        ]
+
+    async def _run_planned_dag_task_artifact_repair(
+        planned: PlannedBugGroup,
+    ) -> None:
+        target_refs = _dag_task_artifact_refs_from_planned(planned)
+
+        def _artifact_actor_builder(
+            base: AgentActor,
+            suffix: str,
+            **kwargs: Any,
+        ) -> AgentActor:
+            return _make_parallel_actor(
+                base,
+                f"dag-g{group_idx}-r{retry}-{suffix}",
+                runtime=dag_fix_runtime,
+                workspace_path=kwargs.get("workspace_path"),
+            )
+
+        result = await _run_rca_dag_task_artifact_repair(
+            runner,
+            feature,
+            source=source,
+            bug_id=planned.group.group_id,
+            verdict_text=planned.issue_text,
+            rca=planned.rca,
+            fixer=implementer,
+            feature_root=feature_root,
+            phase_name="implementation",
+            actor_builder=_artifact_actor_builder,
+            target_refs=target_refs,
+        )
+        decision_results.append(result)
+        try:
+            artifact_repair_records.append(json.loads(result.notes or "{}"))
+        except Exception:
+            artifact_repair_records.append({
+                "source": source,
+                "bug_id": planned.group.group_id,
+                "target_refs": target_refs,
+                "result_task_id": result.task_id,
+                "status": result.status,
+            })
+
+    async def _run_planned_artifact_repair(
+        planned: PlannedBugGroup,
+        resolution: DagContradictionResolution,
+    ) -> None:
+        validation = _validate_dag_contradiction_resolution(
+            resolution,
+            planned=planned,
+        )
+        if validation.resolution is None:
+            rejection = await _persist_dag_contradiction_rejection(
+                runner,
+                feature,
+                group_idx,
+                retry,
+                planned,
+                resolution,
+                validation.rejection_reasons,
+            )
+            rejected_contradictions.append(rejection)
+            human_needed_contradictions.append(planned.group.group_id)
+            quarantined_contradiction_groups.append(planned)
+            return
+        accepted_resolution = validation.resolution
+        record = await _persist_dag_contradiction_resolution(
+            runner,
+            feature,
+            group_idx,
+            retry,
+            planned,
+            accepted_resolution,
+        )
+        resolved_contradictions.append(record)
+        _artifact_result, synthetic_result, artifact_record = (
+            await _run_dag_artifact_repair_lane(
+                runner,
+                feature,
+                group_idx,
+                retry,
+                planned,
+                accepted_resolution,
+                record,
+                group_tasks=group_tasks,
+                feature_root=feature_root,
+                runtime=dag_fix_runtime,
+                feedback=feedback,
+                fix_context=fix_context,
+                closure_path_problems=_dag_closure_path_problems_for_planned(
+                    planned,
+                    verifier_path_problems,
+                    group_tasks,
+                ),
+            )
+        )
+        artifact_repair_records.append(artifact_record)
+        decision_results.append(synthetic_result)
+
+    for planned in dag_task_artifact_groups:
+        await _run_planned_dag_task_artifact_repair(planned)
+
+    for planned in metadata_artifact_groups:
+        await _run_planned_artifact_repair(
+            planned,
+            _dag_artifact_repair_resolution_from_planned(
+                planned,
+                reason="metadata-only RCA target",
+            ),
+        )
+
+    if dispatch.contradiction_groups:
+        auto_resolve = (
+            _dag_auto_resolve_contradictions_enabled()
+            and autonomous_remainder_enabled(
+                runner, feature, phase_name="implementation",
+            )
+        )
+        if not auto_resolve:
+            logger.info(
+                "DAG parallel repair preserving manual contradiction path "
+                "group=%d retry=%d contradictions=%d",
+                group_idx,
+                retry,
+                len(dispatch.contradiction_groups),
+            )
+        else:
+            resolver_runtime = _dag_repair_runtime_for(
+                "dag-contradiction-resolve",
+                dag_rca_runtime,
+            )
+            for planned in dispatch.contradiction_groups:
+                try:
+                    resolution = await _resolve_dag_contradiction(
+                        runner,
+                        feature,
+                        group_idx,
+                        retry,
+                        planned,
+                        group_tasks=group_tasks,
+                        feature_root=feature_root,
+                        runtime=resolver_runtime,
+                        feedback=feedback,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "DAG contradiction resolver failed group=%d retry=%d "
+                        "bug_group=%s: %s",
+                        group_idx,
+                        retry,
+                        planned.group.group_id,
+                        exc,
+                    )
+                    resolution = None
+                validation = _validate_dag_contradiction_resolution(
+                    resolution,
+                    planned=planned,
+                )
+                if validation.resolution is None:
+                    rejection = await _persist_dag_contradiction_rejection(
+                        runner,
+                        feature,
+                        group_idx,
+                        retry,
+                        planned,
+                        resolution,
+                        validation.rejection_reasons,
+                    )
+                    rejected_contradictions.append(rejection)
+                    human_needed_contradictions.append(planned.group.group_id)
+                    quarantined_contradiction_groups.append(planned)
+                    continue
+                resolution = validation.resolution
+                record = await _persist_dag_contradiction_resolution(
+                    runner,
+                    feature,
+                    group_idx,
+                    retry,
+                    planned,
+                    resolution,
+                )
+                resolved_contradictions.append(record)
+                if _dag_contradiction_needs_artifact_repair(resolution):
+                    _artifact_result, synthetic_result, artifact_record = (
+                        await _run_dag_artifact_repair_lane(
+                            runner,
+                            feature,
+                            group_idx,
+                            retry,
+                            planned,
+                            resolution,
+                            record,
+                            group_tasks=group_tasks,
+                            feature_root=feature_root,
+                            runtime=dag_fix_runtime,
+                            feedback=feedback,
+                            fix_context=fix_context,
+                            closure_path_problems=_dag_closure_path_problems_for_planned(
+                                planned,
+                                verifier_path_problems,
+                                group_tasks,
+                            ),
+                        )
+                    )
+                    artifact_repair_records.append(artifact_record)
+                    decision_results.append(synthetic_result)
+                elif _dag_contradiction_needs_fix(resolution):
+                    guidance = _dag_contradiction_fix_guidance(resolution)
+                    resolved_rca = planned.rca.model_copy(
+                        update={
+                            "confidence": "high",
+                            "proposed_approach": guidance,
+                            "prior_attempt_analysis": (
+                                f"{planned.rca.prior_attempt_analysis}\n\n"
+                                "Autonomous DAG contradiction resolver produced "
+                                f"{record['artifact_key']}."
+                            ).strip(),
+                        }
+                    )
+                    fixable_groups.append(PlannedBugGroup(
+                        group=planned.group,
+                        rca=resolved_rca,
+                        issue_text=planned.issue_text,
+                        rca_key=planned.rca_key,
+                    ))
+                else:
+                    decision_results.append(_dag_contradiction_synthetic_result(
+                        group_idx,
+                        retry,
+                        planned,
+                        resolution,
+                        record,
+                    ))
+
+    blocked_fix_group_ids: list[str] = []
+    fixable_groups, blocked_fix_group_ids = _dag_filter_fixable_groups_for_quarantine(
+        fixable_groups,
+        quarantined_contradiction_groups,
+    )
+
+    fallback_reason = ""
+    if dispatch.contradiction_groups and (
+        not fixable_groups
+        and not decision_results
+        and (
+            human_needed_contradictions
+            or (
+                not resolved_contradictions
+                and _dag_auto_resolve_contradictions_enabled()
+                and autonomous_remainder_enabled(
+                    runner,
+                    feature,
+                    phase_name="implementation",
+                )
+            )
+        )
+    ):
+        logger.info(
+            "DAG parallel repair falling back for unresolved contradictions "
+            "group=%d retry=%d unresolved=%s fixable=%d blocked_fixable=%s",
+            group_idx,
+            retry,
+            human_needed_contradictions,
+            len(fixable_groups),
+            blocked_fix_group_ids,
+        )
+        fallback_reason = "unresolved_contradiction"
+    elif dispatch.contradiction_groups and not resolved_contradictions and not auto_resolve:
+        logger.info(
+            "DAG parallel repair falling back group=%d retry=%d "
+            "contradictions=%d fixable=%d",
+            group_idx,
+            retry,
+            len(dispatch.contradiction_groups),
+            len(fixable_groups),
+        )
+        fallback_reason = "manual_contradiction_resolution_required"
+
+    schedule = [] if fallback_reason else _compute_fix_schedule([
+        (item.group.group_id, item.rca)
+        for item in fixable_groups
+    ])
+
+    dispatch_record = {
+        "group_idx": group_idx,
+        "retry": retry,
+        "parallel_repair_enabled": True,
+        "generic_dispatch_key": dispatch.dispatch_key,
+        "total_issues": total_issues,
+        "group_count": len(dispatch.groups),
+        "fixable_group_count": len(fixable_groups),
+        "contradiction_group_count": len(dispatch.contradiction_groups),
+        "resolved_contradiction_count": len(resolved_contradictions),
+        "rejected_contradiction_count": len(rejected_contradictions),
+        "artifact_repair_group_count": len(artifact_repair_records),
+        "dag_task_artifact_repair_group_count": len(dag_task_artifact_groups),
+        "dag_task_product_cleanup_group_count": len(dag_product_cleanup_routes_by_gid),
+        "dag_source_artifact_followup_count": len(dag_source_artifact_followups),
+        "dag_task_product_cleanup_artifact_followup_count": len([
+            gid for gid in dag_source_artifact_followups
+            if gid in dag_product_cleanup_routes_by_gid
+        ]),
+        "metadata_artifact_repair_group_count": len(metadata_artifact_groups),
+        "human_needed_contradiction_count": len(human_needed_contradictions),
+        "resolved_contradictions": resolved_contradictions,
+        "rejected_contradictions": rejected_contradictions,
+        "artifact_repairs": artifact_repair_records,
+        "human_needed_contradictions": human_needed_contradictions,
+        "blocked_fix_group_ids": blocked_fix_group_ids,
+        "fallback_reason": fallback_reason,
+        "schedule": [
+            {"round": idx, "group_ids": ids}
+            for idx, ids in enumerate(schedule)
+        ],
+        "groups": [
+            {
+                "group_id": item.group.group_id,
+                "likely_root_cause": item.group.likely_root_cause,
+                "issue_count": (
+                    len(item.group.issue_indices) + len(item.group.gap_indices)
+                ),
+                "affected_files": item.rca.affected_files,
+                "confidence": item.rca.confidence,
+            }
+            for item in dispatch.groups
+        ],
+    }
+    await runner.artifacts.put(
+        f"dag-repair-dispatch:g{group_idx}:retry-{retry}",
+        json.dumps(dispatch_record),
+        feature=feature,
+    )
+    await _log_feature_event(
+        runner,
+        feature.id,
+        "dag_repair_dispatch",
+        "implementation",
+        content=f"g{group_idx}:retry-{retry}",
+        metadata={
+            "group_idx": group_idx,
+            "retry": retry,
+            "dispatch_key": f"dag-repair-dispatch:g{group_idx}:retry-{retry}",
+            "schedule": dispatch_record["schedule"],
+            "fixable_group_count": dispatch_record["fixable_group_count"],
+            "fallback_reason": fallback_reason,
+            "human_needed_contradiction_count": len(human_needed_contradictions),
+        },
+    )
+
+    if fallback_reason:
+        return None
+
+    if not fixable_groups or not schedule:
+        if decision_results:
+            return decision_results
+        logger.info(
+            "DAG parallel repair falling back group=%d retry=%d "
+            "contradictions=%d fixable=%d",
+            group_idx,
+            retry,
+            len(dispatch.contradiction_groups),
+            len(fixable_groups),
+        )
+        return None
+
+    group_by_id = {item.group.group_id: item for item in fixable_groups}
+    fix_results: dict[str, ImplementationResult] = {}
+    task_specs = _format_dag_group_task_specs(group_tasks)
+    contradiction_context = await _format_contradiction_decisions_context(
+        runner, feature,
+    )
+    for round_idx, round_ids in enumerate(schedule):
+        fix_tasks: list[Ask] = []
+        runnable_ids: list[str] = []
+        for gid in round_ids:
+            planned = group_by_id.get(gid)
+            if planned is None:
+                continue
+            ws_path = _resolve_fix_workspace(feature_root, planned.rca.affected_files)
+            workspace_ctx = (
+                f"\n\n## Workspace\n"
+                f"Your working directory is: `{ws_path}`\n"
+                f"All file reads and writes MUST use paths within this directory.\n"
+                f"Do NOT use absolute paths from search results that point to "
+                f"other copies of the same repo.\n"
+            ) if ws_path else ""
+            context_package = await _build_prompt_context_package(
+                runner,
+                feature,
+                title=(
+                    f"DAG Parallel Repair — Group {group_idx} "
+                    f"Retry {retry + 1} Bug Group {gid}"
+                ),
+                file_stem=f"g{group_idx}-parallel-fix-r{retry}-{gid}",
+                intro_lines=[
+                    "Fix one root-cause group from the failed DAG verifier.",
+                    "Other repair agents may run concurrently; do not revert unrelated edits.",
+                ],
+                sections=[
+                    ("feedback", "Merged Verifier Feedback", feedback),
+                    ("issues", "Grouped Issues", planned.issue_text),
+                    ("rca", "Root Cause Analysis", to_str(planned.rca)),
+                    (
+                        "contradiction-decisions",
+                        "Resolved Contradiction Decisions",
+                        contradiction_context,
+                    ),
+                    ("task-specs", "Current DAG Group Task Specs", task_specs),
+                    ("fix-context", "Original Enhancement Items", fix_context),
+                    ("workspace", "Workspace", workspace_ctx),
+                    (
+                        "dag-drift-routing",
+                        "DAG Drift Routing",
+                        _dag_product_cleanup_guidance(
+                            dag_product_cleanup_routes_by_gid.get(gid, {})
+                        ),
+                    ),
+                ],
+            )
+            fix_tasks.append(Ask(
+                actor=_make_parallel_actor(
+                    implementer,
+                    f"dag-g{group_idx}-r{retry}-fix-{gid}",
+                    runtime=dag_fix_runtime,
+                    workspace_path=ws_path,
+                ),
+                prompt=(
+                    f"## DAG Repair Fix: group {gid}\n\n"
+                    f"{_context_package_prompt(context_package)}"
+                    "Apply the RCA's proposed fix precisely. You are not alone in "
+                    "the codebase: do not revert changes made by other agents, and "
+                    "keep the patch scoped to this root-cause group. Report every "
+                    "file you create or modify."
+                ),
+                output_type=ImplementationResult,
+            ))
+            runnable_ids.append(gid)
+
+        if not fix_tasks:
+            continue
+        await _log_feature_event(
+            runner,
+            feature.id,
+            "dag_repair_round_start",
+            "implementation",
+            content=f"g{group_idx}:retry-{retry}:round-{round_idx}",
+            metadata={
+                "group_idx": group_idx,
+                "retry": retry,
+                "round_idx": round_idx,
+                "bug_group_ids": runnable_ids,
+                "runtime": dag_fix_runtime,
+            },
+        )
+        round_results = await _run_dag_repair_fix_tasks(
+            runner,
+            feature,
+            group_idx,
+            retry,
+            round_idx,
+            runnable_ids,
+            fix_tasks,
+        )
+        sanitize_inputs = [
+            result for result in round_results
+            if isinstance(result, ImplementationResult)
+        ]
+        sanitized_results = await _sanitize_dag_repair_results(
+            runner,
+            feature,
+            group_idx,
+            retry,
+            sanitize_inputs,
+            feature_root,
+            context_label=f"parallel-round-{round_idx}",
+        )
+        sanitized_iter = iter(sanitized_results)
+        for gid, result in zip(runnable_ids, round_results):
+            if isinstance(result, ImplementationResult):
+                sanitized_result = next(sanitized_iter)
+                planned = group_by_id[gid]
+                if (
+                    gid not in dag_product_cleanup_routes_by_gid
+                    and _dag_blocked_result_should_reroute_to_artifact_repair(
+                        planned,
+                        sanitized_result,
+                    )
+                ):
+                    await _run_planned_artifact_repair(
+                        planned,
+                        _dag_artifact_repair_resolution_from_planned(
+                            planned,
+                            reason="blocked implementer artifact-boundary result",
+                            blocked_result=sanitized_result,
+                        ),
+                    )
+                    continue
+                cleanup_routes = dag_product_cleanup_routes_by_gid.get(gid)
+                artifact_followup_ready = (
+                    sanitized_result.status in {"completed", "partial"}
+                )
+                if cleanup_routes:
+                    cleanup_report = await _append_dag_task_rows_from_product_repair(
+                        runner,
+                        feature,
+                        source=source,
+                        bug_id=gid,
+                        routes=cleanup_routes,
+                        fix_result=sanitized_result,
+                        feature_root=feature_root,
+                    )
+                    artifact_followup_ready = (
+                        artifact_followup_ready
+                        and _dag_product_cleanup_ready_for_artifact_repair(
+                            cleanup_report
+                        )
+                    )
+                if (
+                    gid in dag_source_artifact_followups
+                    and artifact_followup_ready
+                ):
+                    await _run_planned_artifact_repair(
+                        planned,
+                        _dag_artifact_repair_resolution_from_planned(
+                            planned,
+                            reason="post-product-cleanup source artifact repair",
+                            blocked_result=sanitized_result,
+                        ),
+                    )
+                fix_results[gid] = sanitized_result
+        if any(gid in fix_results for gid in runnable_ids):
+            await _commit_repos(
+                runner,
+                feature,
+                f"fix: DAG group {group_idx} repair round {round_idx}",
+            )
+        await _log_feature_event(
+            runner,
+            feature.id,
+            "dag_repair_round_finish",
+            "implementation",
+            content=f"g{group_idx}:retry-{retry}:round-{round_idx}",
+            metadata={
+                "group_idx": group_idx,
+                "retry": retry,
+                "round_idx": round_idx,
+                "bug_group_ids": runnable_ids,
+                "completed_group_ids": [gid for gid in runnable_ids if gid in fix_results],
+                "result_count": len(round_results),
+            },
+        )
+
+    dispatch_record.update({
+        "fixable_group_count": len(fixable_groups),
+        "resolved_contradiction_count": len(resolved_contradictions),
+        "rejected_contradiction_count": len(rejected_contradictions),
+        "artifact_repair_group_count": len(artifact_repair_records),
+        "dag_task_artifact_repair_group_count": len(dag_task_artifact_groups),
+        "dag_task_product_cleanup_group_count": len(dag_product_cleanup_routes_by_gid),
+        "dag_source_artifact_followup_count": len(dag_source_artifact_followups),
+        "dag_task_product_cleanup_artifact_followup_count": len([
+            gid for gid in dag_source_artifact_followups
+            if gid in dag_product_cleanup_routes_by_gid
+        ]),
+        "human_needed_contradiction_count": len(human_needed_contradictions),
+        "resolved_contradictions": resolved_contradictions,
+        "rejected_contradictions": rejected_contradictions,
+        "artifact_repairs": artifact_repair_records,
+        "human_needed_contradictions": human_needed_contradictions,
+    })
+    await runner.artifacts.put(
+        f"dag-repair-dispatch:g{group_idx}:retry-{retry}",
+        json.dumps(dispatch_record),
+        feature=feature,
+    )
+
+    if not fix_results and not decision_results:
+        return None
+
+    reverify_tasks: list[Ask] = []
+    reverify_ids: list[str] = []
+    for gid, fix_result in fix_results.items():
+        planned = group_by_id[gid]
+        reverify_tasks.append(Ask(
+            actor=_make_parallel_actor(
+                verifier,
+                f"dag-g{group_idx}-r{retry}-focused-reverify-{gid}",
+                runtime=dag_reverify_runtime,
+                workspace_path=str(feature_root) if feature_root else None,
+            ),
+            prompt=(
+                f"## Focused DAG Repair Reverify: group {gid}\n\n"
+                "This is an advisory focused reverify for the Claude-discovered "
+                "repair group. It cannot checkpoint the DAG; the final aggregate "
+                "Codex verifier will still run afterward.\n\n"
+                f"### Issues\n{planned.issue_text}\n\n"
+                f"### RCA\n{to_str(planned.rca)}\n\n"
+                f"### Fix Result\n{to_str(fix_result)}\n\n"
+                "Return whether the specific grouped issues appear fixed. Also "
+                "call out any new risks introduced by the patch."
+            ),
+            output_type=Verdict,
+        ))
+        reverify_ids.append(gid)
+
+    if reverify_tasks:
+        await _log_feature_event(
+            runner,
+            feature.id,
+            "dag_focused_reverify_start",
+            "implementation",
+            content=f"g{group_idx}:retry-{retry}",
+            metadata={
+                "group_idx": group_idx,
+                "retry": retry,
+                "bug_group_ids": reverify_ids,
+                "runtime": dag_reverify_runtime,
+            },
+        )
+        if len(reverify_tasks) == 1:
+            reverify_results = [
+                await runner.run(reverify_tasks[0], feature, phase_name="implementation")
+            ]
+        else:
+            reverify_results = await runner.parallel(reverify_tasks, feature)
+        for gid, reverify_result in zip(reverify_ids, reverify_results):
+            await runner.artifacts.put(
+                f"dag-repair-reverify:g{group_idx}:{gid}:retry-{retry}",
+                to_str(reverify_result),
+                feature=feature,
+            )
+        await _log_feature_event(
+            runner,
+            feature.id,
+            "dag_focused_reverify_finish",
+            "implementation",
+            content=f"g{group_idx}:retry-{retry}",
+            metadata={
+                "group_idx": group_idx,
+                "retry": retry,
+                "bug_group_ids": reverify_ids,
+                "result_count": len(reverify_results),
+            },
+        )
+
+    return decision_results + list(fix_results.values())
+
+
 async def _diagnose_and_fix(
     runner: WorkflowRunner,
     feature: Feature,
@@ -2907,6 +9312,7 @@ async def _diagnose_and_fix(
     handover_context: str = "",
     test_plan_section: str = "",
     phase_name: str = "implementation",
+    rca_runtime: str | None = None,
 ) -> list[BugFixAttempt]:
     """Structured failure handling: triage → parallel RCA → fix → re-verify.
 
@@ -2943,6 +9349,7 @@ async def _diagnose_and_fix(
             handover_context=handover_context,
             test_plan_section=test_plan_section,
             phase_name=phase_name,
+            rca_runtime=rca_runtime,
         )
         return [attempt]
 
@@ -2951,9 +9358,14 @@ async def _diagnose_and_fix(
 
     # 1. Triage: group issues by root cause
     indexed_issues = _format_indexed_issues(verdict)
+    triage_actor = AgentActor(name="bug-triager", role=_triage_role)
+    if rca_runtime:
+        triage_actor = _make_parallel_actor(
+            triage_actor, "triage", runtime=rca_runtime,
+        )
     triage: BugTriage = await runner.run(
         Ask(
-            actor=AgentActor(name="bug-triager", role=_triage_role),
+            actor=triage_actor,
             prompt=(
                 f"## Verdict from: {source}\n\n"
                 f"### Summary\n{verdict.summary}\n\n"
@@ -2984,6 +9396,7 @@ async def _diagnose_and_fix(
             handover_context=handover_context,
             test_plan_section=test_plan_section,
             phase_name=phase_name,
+            rca_runtime=rca_runtime,
         )
         return [attempt]
 
@@ -2995,7 +9408,11 @@ async def _diagnose_and_fix(
     # 2. Parallel RCA: one per group (read-only, always safe in parallel)
     rca_tasks = [
         Ask(
-            actor=_make_parallel_actor(root_cause_analyst, f"rca-{group.group_id}"),
+            actor=_make_parallel_actor(
+                root_cause_analyst,
+                f"rca-{group.group_id}",
+                runtime=rca_runtime,
+            ),
             prompt=(
                 f"## Bug Group: {group.group_id}\n\n"
                 f"### Likely Root Cause (from triage)\n{group.likely_root_cause}\n\n"
@@ -3038,6 +9455,7 @@ async def _diagnose_and_fix(
             handover_context=handover_context,
             test_plan_section=test_plan_section,
             phase_name=phase_name,
+            rca_runtime=rca_runtime,
         )
         return [attempt]
 
@@ -3045,13 +9463,36 @@ async def _diagnose_and_fix(
     group_by_id = {g.group_id: g for g in triage.groups}
 
     # ── Contradiction handling ──────────────────────────────────────
+    def _group_dag_task_artifact_refs(
+        gid: str,
+        rca: RootCauseAnalysis,
+    ) -> list[str]:
+        return _dag_task_artifact_refs_from_rca(
+            rca,
+            extra_text=_extract_group_issues(verdict, group_by_id[gid]),
+        )
+
     contradiction_groups = [
         (gid, rca) for gid, rca in group_rcas
-        if rca.confidence == "contradiction"
+        if (
+            rca.confidence == "contradiction"
+            and not _rca_needs_dag_task_artifact_repair(
+                rca,
+                extra_text=_extract_group_issues(verdict, group_by_id[gid]),
+                target_refs=_group_dag_task_artifact_refs(gid, rca),
+            )
+        )
     ]
     fixable_groups = [
         (gid, rca) for gid, rca in group_rcas
-        if rca.confidence != "contradiction"
+        if (
+            rca.confidence != "contradiction"
+            or _rca_needs_dag_task_artifact_repair(
+                rca,
+                extra_text=_extract_group_issues(verdict, group_by_id[gid]),
+                target_refs=_group_dag_task_artifact_refs(gid, rca),
+            )
+        )
     ]
 
     contradiction_results: list[BugFixAttempt] = []
@@ -3134,11 +9575,53 @@ async def _diagnose_and_fix(
     # 4. Fix dispatch: parallel within each round, sequential between rounds
     feature_root = _get_feature_root(runner, feature)
     fix_results: dict[str, ImplementationResult] = {}
+    artifact_only_fix_ids: set[str] = set()
+    dag_product_cleanup_routes_by_gid: dict[str, dict[str, DagTaskDriftRoute]] = {}
 
     for round_idx, round_ids in enumerate(schedule):
         fix_tasks = []
+        fix_task_ids: list[str] = []
         for gid in round_ids:
             rca = rca_by_group[gid]
+            group_issue_text = _extract_group_issues(verdict, group_by_id[gid])
+            dag_task_artifact_refs = _dag_task_artifact_refs_from_rca(
+                rca,
+                extra_text=group_issue_text,
+            )
+            if _rca_needs_dag_task_artifact_repair(
+                rca,
+                extra_text=group_issue_text,
+                target_refs=dag_task_artifact_refs,
+            ):
+                drift_routes = await _dag_task_drift_routes_for_refs(
+                    runner,
+                    feature,
+                    dag_task_artifact_refs,
+                    feature_root=feature_root,
+                    context_text=f"{group_issue_text}\n\n{to_str(rca)}",
+                )
+                cleanup_routes = {
+                    key: route for key, route in drift_routes.items()
+                    if route.route == "product_cleanup_required"
+                }
+                if cleanup_routes:
+                    dag_product_cleanup_routes_by_gid[gid] = cleanup_routes
+                else:
+                    fix_results[gid] = await _run_rca_dag_task_artifact_repair(
+                        runner,
+                        feature,
+                        source=source,
+                        bug_id=gid,
+                        verdict_text=group_issue_text,
+                        rca=rca,
+                        fixer=fixer,
+                        feature_root=feature_root,
+                        phase_name=phase_name,
+                        actor_builder=_make_parallel_actor,
+                        target_refs=dag_task_artifact_refs,
+                    )
+                    artifact_only_fix_ids.add(gid)
+                    continue
             ws_path = _resolve_fix_workspace(feature_root, rca.affected_files)
             ws_ctx = (
                 f"\n\n## Workspace\n"
@@ -3163,6 +9646,7 @@ async def _diagnose_and_fix(
                     + f"\n\n**Proposed Approach:** {rca.proposed_approach}\n\n"
                     f"### Issues\n{_extract_group_issues(verdict, group_by_id[gid])}\n\n"
                     f"{ws_ctx}\n"
+                    f"{_dag_product_cleanup_guidance(dag_product_cleanup_routes_by_gid.get(gid, {}))}\n"
                     "## Instructions\n"
                     "1. Read each affected file listed above\n"
                     "2. Apply the fix described in the RCA — be precise\n"
@@ -3172,23 +9656,61 @@ async def _diagnose_and_fix(
                 ),
                 output_type=ImplementationResult,
             ))
+            fix_task_ids.append(gid)
 
-        if len(fix_tasks) == 1:
-            results = [await runner.run(fix_tasks[0], feature, phase_name=phase_name)]
-        else:
-            results = await runner.parallel(fix_tasks, feature)
+        if fix_tasks:
+            if len(fix_tasks) == 1:
+                results = [await runner.run(fix_tasks[0], feature, phase_name=phase_name)]
+            else:
+                results = await runner.parallel(fix_tasks, feature)
 
-        for gid, result in zip(round_ids, results):
-            if isinstance(result, ImplementationResult):
-                fix_results[gid] = result
+            for gid, result in zip(fix_task_ids, results):
+                if isinstance(result, ImplementationResult):
+                    fix_results[gid] = result
+                    cleanup_routes = dag_product_cleanup_routes_by_gid.get(gid)
+                    if cleanup_routes:
+                        await _append_dag_task_rows_from_product_repair(
+                            runner,
+                            feature,
+                            source=source,
+                            bug_id=gid,
+                            routes=cleanup_routes,
+                            fix_result=result,
+                            feature_root=feature_root,
+                        )
 
         # Commit fixes from this round before re-verification
-        fixed_ids = [gid for gid in round_ids if gid in fix_results]
+        fixed_ids = [
+            gid for gid in round_ids
+            if gid in fix_results and gid not in artifact_only_fix_ids
+        ]
         if fixed_ids:
             await _commit_repos(
                 runner, feature,
                 f"fix: round {round_idx} — {', '.join(fixed_ids)}",
             )
+
+    blocked_artifact_attempts: list[BugFixAttempt] = []
+    for gid in list(fix_results):
+        fix = fix_results[gid]
+        if gid not in artifact_only_fix_ids or fix.status != "blocked":
+            continue
+        group = group_by_id[gid]
+        blocked_artifact_attempts.append(BugFixAttempt(
+            bug_id=f"{source.upper().replace(' ', '-')}-FAIL-{next(bug_counter)}",
+            group_id=gid,
+            source_verdict=source,
+            description=group.likely_root_cause,
+            root_cause=rca_by_group[gid].hypothesis,
+            fix_applied=fix.summary,
+            files_modified=[],
+            re_verify_result="FAIL",
+            attempt_number=attempt_number,
+        ))
+        del fix_results[gid]
+
+    if not fix_results:
+        return contradiction_results + blocked_artifact_attempts
 
     # 5. Parallel re-verify: one per group (read-only, always safe)
     verify_tasks = [
@@ -3249,6 +9771,8 @@ async def _diagnose_and_fix(
             regression_verdict = await _run_regression(
                 runner, feature, all_modified, handover_context=handover_context,
                 phase_name=phase_name,
+                regression_runtime=rca_runtime,
+                integration_runtime=rca_runtime,
             )
             if regression_verdict is not None:
                 await runner.artifacts.put(
@@ -3278,6 +9802,7 @@ async def _diagnose_and_fix(
                         test_plan_section=test_plan_section,
                         skip_regression=True,
                         phase_name=phase_name,
+                        rca_runtime=rca_runtime,
                     )
                     if regression_attempt.re_verify_result == "PASS":
                         await _commit_repos(
@@ -3313,7 +9838,195 @@ async def _diagnose_and_fix(
             attempt_number=attempt_number,
         ))
 
-    return contradiction_results + attempts
+    return contradiction_results + blocked_artifact_attempts + attempts
+
+
+def _dag_task_artifact_refs_from_rca(
+    rca: RootCauseAnalysis,
+    *,
+    extra_text: str = "",
+) -> list[str]:
+    refs: list[str] = []
+    text_parts = [
+        *list(rca.affected_files or []),
+        rca.hypothesis,
+        rca.proposed_approach,
+        rca.prior_attempt_analysis,
+        rca.contradiction_detail,
+        "\n".join(rca.evidence or []),
+        "\n".join(rca.alternative_hypotheses or []),
+        extra_text,
+    ]
+    for text in text_parts:
+        refs.extend(
+            ref for ref in _dag_artifact_repair_refs_from_text(text or "")
+            if _is_dag_task_artifact_key(ref)
+        )
+        refs.extend(_dag_task_artifact_refs_from_reported_result_text(text or ""))
+    return _dedupe_preserving_order(refs)
+
+
+def _rca_needs_dag_task_artifact_repair(
+    rca: RootCauseAnalysis,
+    *,
+    extra_text: str = "",
+    target_refs: list[str] | None = None,
+) -> bool:
+    refs = target_refs or _dag_task_artifact_refs_from_rca(
+        rca,
+        extra_text=extra_text,
+    )
+    if not refs:
+        return False
+    text = "\n".join([
+        rca.hypothesis,
+        rca.proposed_approach,
+        rca.prior_attempt_analysis,
+        rca.contradiction_detail,
+        "\n".join(rca.evidence or []),
+        "\n".join(rca.alternative_hypotheses or []),
+        extra_text,
+    ]).lower()
+    return any(marker in text for marker in (
+        "stale",
+        "persisted",
+        "postgres",
+        "db-backed",
+        "database",
+        "artifact row",
+        "implementationresult",
+        "files_created",
+        "files_modified",
+        "forbidden/stale",
+    ))
+
+
+async def _run_rca_dag_task_artifact_repair(
+    runner: WorkflowRunner,
+    feature: Feature,
+    *,
+    source: str,
+    bug_id: str,
+    verdict_text: str,
+    rca: RootCauseAnalysis,
+    fixer: AgentActor,
+    feature_root: Path | None,
+    phase_name: str,
+    actor_builder: Callable[..., AgentActor],
+    target_refs: list[str] | None = None,
+) -> ImplementationResult:
+    refs = _safe_dag_task_artifact_refs(
+        target_refs or _dag_task_artifact_refs_from_rca(rca)
+    )
+    target_ref_prompt = "\n".join(f"- {ref}" for ref in refs) or "- (none)"
+    ws_path = _dag_artifact_repair_workspace(runner, feature, feature_root)
+    actor = actor_builder(
+        fixer,
+        f"artifact-repair-{bug_id}",
+        workspace_path=ws_path,
+    )
+    try:
+        raw_result = await runner.run(
+            Ask(
+                actor=actor,
+                prompt=(
+                    f"## DB-Backed Artifact Repair: {bug_id}\n\n"
+                    f"### Failure Source\n{source}\n\n"
+                    f"### Original Verdict\n{verdict_text}\n\n"
+                    f"### Root Cause Analysis\n{to_str(rca)}\n\n"
+                    "Apply this as an artifact repair, not a product-code fix. "
+                    "You may update only DB-backed workflow artifacts listed below "
+                    "by returning full replacement entries in artifact_updates. "
+                    "For each `dag-task:{task_id}` update, content must be a full "
+                    "ImplementationResult JSON object whose task_id matches the "
+                    "artifact key suffix and whose reported files are canonical "
+                    "existing product paths.\n\n"
+                    "Allowed artifact keys:\n"
+                    f"{target_ref_prompt}\n\n"
+                    "Do not edit product source files. Do not report product files "
+                    "in artifacts_modified; report DB artifact writes through "
+                    "artifact_updates only."
+                ),
+                output_type=ArtifactRepairResult,
+            ),
+            feature,
+            phase_name=phase_name,
+        )
+        repair_result = (
+            raw_result
+            if isinstance(raw_result, ArtifactRepairResult)
+            else ArtifactRepairResult.model_validate(raw_result)
+        )
+        repair_result = repair_result.model_copy(update={
+            "task_id": repair_result.task_id or f"ARTIFACT-REPAIR-{bug_id}",
+            "group_id": repair_result.group_id or bug_id,
+        })
+        update_record = await _apply_dag_artifact_repair_updates(
+            runner,
+            feature,
+            repair_result,
+            feature_root,
+        )
+    except Exception as exc:
+        repair_result = ArtifactRepairResult(
+            task_id=f"ARTIFACT-REPAIR-{bug_id}",
+            group_id=bug_id,
+            summary=(
+                "DB-backed artifact repair failed before returning a usable "
+                f"ArtifactRepairResult: {type(exc).__name__}: {exc}"
+            ),
+            status="blocked",
+            notes=repr(exc),
+        )
+        update_record = {
+            "applied_updates": [],
+            "applied_target_updates": [],
+            "skipped_updates": [],
+            "synced_files": [],
+            "deleted_artifacts": [],
+            "skipped_deletes": [],
+        }
+
+    applied = bool(
+        update_record.get("applied_updates")
+        or update_record.get("applied_target_updates")
+        or update_record.get("synced_files")
+        or update_record.get("deleted_artifacts")
+    )
+    status = (
+        repair_result.status
+        if repair_result.status in {"completed", "partial", "blocked"}
+        else "partial"
+    )
+    if not applied and status != "blocked":
+        status = "blocked"
+    record = {
+        "artifact_key": f"bug-artifact-repair:{source}:{bug_id}",
+        "source": source,
+        "bug_id": bug_id,
+        "target_refs": refs,
+        "result": repair_result.model_dump(mode="json"),
+        "artifact_update_application": update_record,
+        "created_at": time.time(),
+    }
+    await runner.artifacts.put(
+        record["artifact_key"],
+        json.dumps(record, indent=2),
+        feature=feature,
+    )
+    return ImplementationResult(
+        task_id=repair_result.task_id,
+        summary=(
+            "DB-backed artifact repair completed: "
+            f"{repair_result.summary}"
+        ),
+        status=status,
+        files_created=[],
+        files_modified=[],
+        notes=json.dumps(record, indent=2),
+        deviations=repair_result.deviations,
+        self_reported_risks=repair_result.self_reported_risks,
+    )
 
 
 async def _single_rca_fix_verify(
@@ -3372,52 +10085,119 @@ async def _single_rca_fix_verify(
         feature=feature,
     )
 
-    # 2. Fix via implementer (with workspace_path for correct cwd)
-    ws_path = _resolve_fix_workspace_from_root(feature_root, rca.affected_files)
-    ws_ctx = (
-        f"\n\n## Workspace\n"
-        f"Your working directory is: `{ws_path}`\n"
-        f"All file reads and writes MUST use paths within this directory.\n"
-        f"Do NOT use absolute paths from search results that point to "
-        f"other copies of the same repo.\n"
-    ) if ws_path else ""
+    used_artifact_repair = False
+    dag_product_cleanup_routes: dict[str, DagTaskDriftRoute] = {}
+    dag_product_cleanup_guidance = ""
+    dag_task_artifact_refs = _dag_task_artifact_refs_from_rca(
+        rca,
+        extra_text=verdict_text,
+    )
+    if _rca_needs_dag_task_artifact_repair(
+        rca,
+        extra_text=verdict_text,
+        target_refs=dag_task_artifact_refs,
+    ):
+        drift_routes = await _dag_task_drift_routes_for_refs(
+            runner,
+            feature,
+            dag_task_artifact_refs,
+            feature_root,
+            context_text=f"{verdict_text}\n\n{to_str(rca)}",
+        )
+        dag_product_cleanup_routes = {
+            key: route for key, route in drift_routes.items()
+            if route.route == "product_cleanup_required"
+        }
+        if dag_product_cleanup_routes:
+            dag_product_cleanup_guidance = _dag_product_cleanup_guidance(
+                dag_product_cleanup_routes
+            )
+        else:
+            fix_result = await _run_rca_dag_task_artifact_repair(
+                runner,
+                feature,
+                source=source,
+                bug_id=bug_id,
+                verdict_text=verdict_text,
+                rca=rca,
+                fixer=fixer,
+                feature_root=feature_root,
+                phase_name=phase_name,
+                actor_builder=actor_builder,
+                target_refs=dag_task_artifact_refs,
+            )
+            used_artifact_repair = True
+    if not used_artifact_repair:
+        # 2. Fix via implementer (with workspace_path for correct cwd)
+        ws_path = _resolve_fix_workspace_from_root(feature_root, rca.affected_files)
+        ws_ctx = (
+            f"\n\n## Workspace\n"
+            f"Your working directory is: `{ws_path}`\n"
+            f"All file reads and writes MUST use paths within this directory.\n"
+            f"Do NOT use absolute paths from search results that point to "
+            f"other copies of the same repo.\n"
+        ) if ws_path else ""
 
-    fix_actor = actor_builder(
-        fixer, f"fix-{bug_id}",
-        workspace_path=ws_path,
-    )
-    fix_result: ImplementationResult = await runner.run(
-        Ask(
-            actor=fix_actor,
-            prompt=(
-                f"## Bug Fix: {bug_id}\n\n"
-                f"### Root Cause Analysis\n\n"
-                f"**Hypothesis:** {rca.hypothesis}\n\n"
-                f"**Evidence:**\n"
-                + "\n".join(f"- {e}" for e in rca.evidence)
-                + f"\n\n**Affected Files:**\n"
-                + "\n".join(f"- `{f}`" for f in rca.affected_files)
-                + f"\n\n**Proposed Approach:** {rca.proposed_approach}\n\n"
-                f"### Original Verdict\n\n{verdict_text}\n\n"
-                f"{ws_ctx}\n"
-                "## Instructions\n"
-                "1. Read each affected file listed above\n"
-                "2. Apply the fix described in the RCA — be precise\n"
-                "3. Fix only what the root cause analysis identified\n"
-                "4. Report all files modified"
-                f"{prior_context}"
+        fix_actor = actor_builder(
+            fixer, f"fix-{bug_id}",
+            workspace_path=ws_path,
+        )
+        fix_result = await runner.run(
+            Ask(
+                actor=fix_actor,
+                prompt=(
+                    f"## Bug Fix: {bug_id}\n\n"
+                    f"### Root Cause Analysis\n\n"
+                    f"**Hypothesis:** {rca.hypothesis}\n\n"
+                    f"**Evidence:**\n"
+                    + "\n".join(f"- {e}" for e in rca.evidence)
+                    + f"\n\n**Affected Files:**\n"
+                    + "\n".join(f"- `{f}`" for f in rca.affected_files)
+                    + f"\n\n**Proposed Approach:** {rca.proposed_approach}\n\n"
+                    f"### Original Verdict\n\n{verdict_text}\n\n"
+                    f"{ws_ctx}\n"
+                    f"{dag_product_cleanup_guidance}\n"
+                    "## Instructions\n"
+                    "1. Read each affected file listed above\n"
+                    "2. Apply the fix described in the RCA — be precise\n"
+                    "3. Fix only what the root cause analysis identified\n"
+                    "4. Report all files modified"
+                    f"{prior_context}"
+                ),
+                output_type=ImplementationResult,
             ),
-            output_type=ImplementationResult,
-        ),
-        feature,
-        phase_name=phase_name,
-    )
+            feature,
+            phase_name=phase_name,
+        )
+        if dag_product_cleanup_routes:
+            await _append_dag_task_rows_from_product_repair(
+                runner,
+                feature,
+                source=source,
+                bug_id=bug_id,
+                routes=dag_product_cleanup_routes,
+                fix_result=fix_result,
+                feature_root=feature_root,
+            )
+
+    if used_artifact_repair and fix_result.status == "blocked":
+        return BugFixAttempt(
+            bug_id=bug_id,
+            source_verdict=source,
+            description=verdict_text,
+            root_cause=rca.hypothesis,
+            fix_applied=fix_result.summary,
+            files_modified=[],
+            re_verify_result="FAIL",
+            attempt_number=attempt_number,
+        )
 
     # Commit fix before re-verification
-    if workspace_root is None:
-        await _commit_repos(runner, feature, f"fix: {bug_id}")
-    else:
-        await _commit_repos_in_root(feature_root, f"fix: {bug_id}")
+    if not used_artifact_repair:
+        if workspace_root is None:
+            await _commit_repos(runner, feature, f"fix: {bug_id}")
+        else:
+            await _commit_repos_in_root(feature_root, f"fix: {bug_id}")
 
     # 3. Re-verify with the SAME reviewer that found the bug
     re_verdict: Verdict = await runner.run(
@@ -3751,8 +10531,14 @@ async def _enrich_fallback_result(
     if not status_output:
         return
 
-    # Build expected paths from file_scope for filtering in parallel-task groups
-    scope_paths = {fs.path for fs in task.file_scope} if task.file_scope else set()
+    # Build expected paths from file_scope for filtering in parallel-task groups.
+    # Git status is repo-relative, while DAG scopes are workspace-relative.
+    scope_paths: set[str] = set()
+    for fs in task.file_scope:
+        path = fs.path
+        scope_paths.add(path)
+        if task.repo_path and path.startswith(f"{task.repo_path}/"):
+            scope_paths.add(path[len(task.repo_path) + 1:])
 
     created: list[str] = []
     modified: list[str] = []
@@ -3787,7 +10573,7 @@ def _collect_files(results: list[object]) -> list[str]:
         if isinstance(r, ImplementationResult):
             files.extend(r.files_created)
             files.extend(r.files_modified)
-    return files
+    return _dedupe_preserving_order(files)
 
 
 def _is_approved(verdict: object) -> bool:

@@ -30,6 +30,7 @@ from ....roles import (
     user,
 )
 from ....services.system_design_html import render_system_design_html
+from .._sidecars import refresh_sidecar_for_source_artifact
 from ..._common import (
     HostedInterview,
     broad_interview,
@@ -250,6 +251,20 @@ class ArchitecturePhase(Phase):
                 # gate loop — no need to run the extractor again.
                 await runner.artifacts.put(sd_key, sd_json, feature=feature)
                 await runner.artifacts.put(plan_key, plan_text, feature=feature)
+                await refresh_sidecar_for_source_artifact(
+                    runner,
+                    feature,
+                    sd_key,
+                    sd_json,
+                    generated_from="approved_object",
+                )
+                await refresh_sidecar_for_source_artifact(
+                    runner,
+                    feature,
+                    plan_key,
+                    plan_text,
+                    generated_from="approved_object",
+                )
                 completed_plans[sf.slug] = plan_text
                 summary = await generate_summary(runner, feature, "plan", sf.slug)
                 if summary:
@@ -349,6 +364,20 @@ class ArchitecturePhase(Phase):
 
             await runner.artifacts.put(plan_key, plan_text, feature=feature)
             await runner.artifacts.put(sd_key, sd_text, feature=feature)
+            await refresh_sidecar_for_source_artifact(
+                runner,
+                feature,
+                plan_key,
+                plan_text,
+                generated_from="approved_object",
+            )
+            await refresh_sidecar_for_source_artifact(
+                runner,
+                feature,
+                sd_key,
+                sd_text,
+                generated_from="approved_object",
+            )
             completed_plans[sf.slug] = plan_text
 
             # Generate summary

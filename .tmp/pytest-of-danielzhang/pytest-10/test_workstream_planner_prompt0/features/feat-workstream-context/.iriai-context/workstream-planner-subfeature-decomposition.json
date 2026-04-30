@@ -1,0 +1,14 @@
+[
+  {
+    "id": "SF-1",
+    "slug": "accounts",
+    "name": "Accounts",
+    "description": "Accounts"
+  },
+  {
+    "id": "SF-2",
+    "slug": "billing",
+    "name": "Billing",
+    "description": "Billing"
+  }
+]

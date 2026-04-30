@@ -9,6 +9,8 @@ import signal
 from pathlib import Path
 from typing import Literal
 
+from ...runtime_policy import DEFAULT_RUNTIME_POLICY, RuntimePolicy
+
 logger = logging.getLogger(__name__)
 
 
@@ -19,6 +21,8 @@ async def run_slack_bridge(
     mode: Literal["multiplayer", "singleplayer"] = "multiplayer",
     agent_runtime: str = "claude",
     agent_runtime_override: bool = False,
+    runtime_policy: RuntimePolicy = DEFAULT_RUNTIME_POLICY,
+    runtime_policy_override: bool = False,
     single_agent_runtime: bool = False,
     budget: bool = False,
     autonomous_remainder: bool = False,
@@ -68,6 +72,8 @@ async def run_slack_bridge(
         workspace_path=workspace_path,
         agent_runtime_name=agent_runtime,
         agent_runtime_override=agent_runtime_override,
+        runtime_policy=runtime_policy,
+        runtime_policy_override=runtime_policy_override,
         single_agent_runtime=single_agent_runtime,
         budget=budget,
         autonomous_remainder=autonomous_remainder,
@@ -81,6 +87,7 @@ async def run_slack_bridge(
     print(f"\niriai-build-v2 Slack bridge")
     print(f"  Default mode: {mode}")
     print(f"  Agent runtime: {agent_runtime}")
+    print(f"  Runtime policy: {runtime_policy}")
     print(f"  Autonomous remainder: {autonomous_remainder}")
     print(f"  Channel: {planning_channel}")
     print(f"  Bot: @{adapter.bot_user_id}")

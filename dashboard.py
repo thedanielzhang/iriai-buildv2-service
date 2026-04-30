@@ -14,6 +14,7 @@ from pathlib import Path
 import re
 import sys
 import time
+from datetime import datetime, timezone
 from typing import Any
 
 import asyncpg
@@ -23,6 +24,11 @@ from fastapi.staticfiles import StaticFiles
 import uvicorn
 
 from iriai_build_v2.workflows.bugfix_v2.proof import feature_root_from_workspace
+from iriai_build_v2.runtime_policy import (
+    DEFAULT_RUNTIME_POLICY,
+    PRIMARY_IMPL_SECONDARY_REVIEW_POLICY,
+    SUPPORTED_RUNTIME_POLICIES,
+)
 
 DATABASE_URL = os.environ.get(
     "DATABASE_URL",
@@ -57,6 +63,8 @@ class BridgeManager:
             cmd += ["--mode", str(self.config["mode"])]
         if self.config.get("agent_runtime"):
             cmd += ["--agent-runtime", str(self.config["agent_runtime"])]
+        if self.config.get("runtime_policy"):
+            cmd += ["--runtime-policy", str(self.config["runtime_policy"])]
         if self.config.get("claude_only"):
             cmd.append("--claude-only")
         if self.config.get("budget"):
@@ -197,6 +205,38 @@ _UI_DIST = Path(__file__).resolve().parent / "dashboard-ui" / "dist"
 _BUGFLOW_HEALTHS = {
     "idle", "running", "fix-loop", "awaiting-user", "blocked", "degraded", "complete-ish", "complete",
 }
+_PUBLIC_FORBIDDEN_PATTERNS = [
+    re.compile(r"/Users/[^\s`\"')]+"),
+    re.compile(r"/private/(?:var|tmp)/[^\s`\"')]+"),
+    re.compile(r"/var/folders/[^\s`\"')]+"),
+    re.compile(r"(?<![\w.-])\.iriai(?:/|\b)"),
+    re.compile(r"(?<![\w.-])\.iriai-context(?:/|\b)"),
+    re.compile(r"(?i)(api[_-]?key|secret|token|password)\s*[:=]\s*['\"]?[A-Za-z0-9_\-]{16,}"),
+]
+
+_EXHIBIT_SOURCE_PREFIXES = (
+    "public-",
+    "prd",
+    "design",
+    "plan",
+    "system-design",
+    "test-plan",
+    "decisions",
+    "decomposition",
+    "artifact-audit",
+    "artifact-backfill",
+    "planning-index",
+    "gate-review",
+)
+_EXHIBIT_SOURCE_KEYS = {
+    "project",
+    "scope",
+    "implementation",
+    "handover",
+    "dag",
+    "dag:strategy",
+    "enhancement-backlog",
+}
 
 
 def _evict_stale_cache() -> None:
@@ -262,6 +302,7 @@ async def get_feature(feature_id: str, request: Request):
         if not feat:
             raise HTTPException(404, f"Feature {feature_id!r} not found")
 
+        artifact_meta_rows: list[asyncpg.Record] = []
         if feat["workflow_name"] == "bugfix-v2":
             rows = await conn.fetch(
                 "SELECT DISTINCT ON (key) key, value, created_at "
@@ -285,8 +326,29 @@ async def get_feature(feature_id: str, request: Request):
                 "SELECT DISTINCT ON (key) key, value, created_at "
                 "FROM artifacts WHERE feature_id = $1 "
                 "AND (key LIKE 'dag%' OR key LIKE 'bug-%' "
+                "     OR key LIKE 'dag-repair-%' "
+                "     OR key LIKE 'contradiction:dag-repair:%' "
+                "     OR key LIKE 'contradiction-rejected:dag-repair:%' "
+                "     OR key LIKE 'public-%' "
                 "     OR key LIKE 'enhancement-%' "
+                "     OR key IN ('project', 'scope', 'prd', 'prd:broad', "
+                "                'design:broad', 'plan:broad', 'system-design:broad', "
+                "                'test-plan:broad', 'decomposition', 'decomposition-structured') "
                 "     OR key = 'implementation' OR key = 'handover') "
+                "ORDER BY key, id DESC",
+                feature_id,
+            )
+            artifact_meta_rows = await conn.fetch(
+                "SELECT DISTINCT ON (key) key, created_at "
+                "FROM artifacts WHERE feature_id = $1 "
+                "AND (key LIKE 'public-%' "
+                "     OR key LIKE 'prd%' OR key LIKE 'design%' "
+                "     OR key LIKE 'plan%' OR key LIKE 'system-design%' "
+                "     OR key LIKE 'test-plan%' OR key LIKE 'decisions%' "
+                "     OR key LIKE 'decomposition%' OR key LIKE 'artifact-audit%' "
+                "     OR key LIKE 'artifact-backfill%' OR key LIKE 'planning-index%' "
+                "     OR key LIKE 'gate-review%' "
+                "     OR key IN ('project', 'scope', 'dag', 'dag:strategy', 'implementation', 'handover')) "
                 "ORDER BY key, id DESC",
                 feature_id,
             )
@@ -296,8 +358,12 @@ async def get_feature(feature_id: str, request: Request):
                 "SELECT key, value, created_at FROM artifacts "
                 "WHERE feature_id = $1 "
                 "AND (key LIKE 'dag-verify:%' OR key LIKE 'dag-fix:%' OR key LIKE 'dag-verify-rca:%' "
+                "     OR key LIKE 'dag-repair-%' "
+                "     OR key LIKE 'contradiction:dag-repair:%' "
+                "     OR key LIKE 'contradiction-rejected:dag-repair:%' "
+                "     OR key LIKE 'public-%' "
                 "     OR key LIKE 'bug-%' OR key LIKE '%-verdict') "
-                "ORDER BY created_at DESC LIMIT 100",
+                "ORDER BY created_at DESC LIMIT 500",
                 feature_id,
             )
 
@@ -305,7 +371,7 @@ async def get_feature(feature_id: str, request: Request):
         events = await conn.fetch(
             "SELECT event_type, source, content, created_at "
             "FROM events WHERE feature_id = $1 "
-            "ORDER BY created_at DESC LIMIT 50",
+            "ORDER BY created_at DESC LIMIT 250",
             feature_id,
         )
 
@@ -330,6 +396,9 @@ async def get_feature(feature_id: str, request: Request):
     artifacts: dict[str, tuple[str, str]] = {}  # key → (value, created_at)
     for r in rows:
         artifacts[r["key"]] = (r["value"], r["created_at"].isoformat())
+    artifact_catalog = dict(artifacts)
+    for r in artifact_meta_rows:
+        artifact_catalog.setdefault(r["key"], ("", r["created_at"].isoformat()))
 
     # Parse DAG
     dag_info = None
@@ -420,6 +489,7 @@ async def get_feature(feature_id: str, request: Request):
                     "repo_path": task_def.get("repo_path", ""),
                     "file_scope": task_def.get("file_scope", []),
                     "acceptance_criteria": task_def.get("acceptance_criteria", []),
+                    "dependencies": task_def.get("dependencies", []),
                 })
 
             # Collect verify artifacts for this group
@@ -702,12 +772,37 @@ async def get_feature(feature_id: str, request: Request):
             "created_at": e["created_at"].isoformat(),
         })
 
-    # Active agent
-    active_agent = None
-    for e in events:
-        if e["event_type"] == "agent_start":
-            active_agent = e["source"]
-            break  # events ordered DESC by created_at
+    dag_repair = _assemble_dag_repair_metrics(
+        timeline_rows,
+        artifacts,
+        dag_info,
+    )
+    agent_exhibit_base = _assemble_agent_activity(
+        events,
+        artifacts=artifacts,
+        groups=groups,
+        timeline=timeline,
+    )
+    active_agent = (
+        agent_exhibit_base["active_agents"][0]["name"]
+        if agent_exhibit_base["active_agents"]
+        else None
+    )
+    public_exhibit = _assemble_public_exhibit(
+        feat=feat,
+        artifacts=artifacts,
+        artifact_catalog=artifact_catalog,
+        timeline=timeline,
+        events=event_list,
+        agent_activity=agent_exhibit_base,
+        dag_info=dag_info,
+        groups=groups,
+        workstreams=workstreams_list,
+        dag_repair=dag_repair,
+        active_gate=active_gate,
+        gates=gates,
+        last_activity_at=last_activity_at,
+    )
 
     result = {
         "id": feat["id"],
@@ -723,8 +818,10 @@ async def get_feature(feature_id: str, request: Request):
         "active_gate_steps": active_gate_steps,
         "timeline": timeline,
         "workstreams": workstreams_list,
+        "dag_repair": dag_repair,
         "events": event_list,
         "active_agent": active_agent,
+        "public_exhibit": public_exhibit,
     }
 
     # Cache and return with ETag
@@ -905,6 +1002,1215 @@ def _find_latest_entry(
             "created_at": _ensure_iso(row["created_at"]),
         }
     return None
+
+
+def _row_created_at(row: Any) -> Any:
+    return row["created_at"]
+
+
+def _row_key(row: Any) -> str:
+    return str(row["key"])
+
+
+def _row_value(row: Any) -> str:
+    return str(row["value"] or "")
+
+
+def _parse_time(value: Any) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    if isinstance(value, str):
+        raw = value.replace("Z", "+00:00")
+        try:
+            parsed = datetime.fromisoformat(raw)
+        except ValueError:
+            return None
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    return None
+
+
+def _seconds_between(start: datetime | None, end: datetime | None) -> int | None:
+    if not start or not end:
+        return None
+    return max(0, int((end - start).total_seconds()))
+
+
+def _latest_time(values: list[datetime]) -> datetime | None:
+    return max(values) if values else None
+
+
+def _earliest_time(values: list[datetime]) -> datetime | None:
+    return min(values) if values else None
+
+
+def _dag_repair_cycle_key(key: str) -> tuple[int, str, str] | None:
+    patterns: list[tuple[str, str]] = [
+        (r"^dag-repair-preflight:g(\d+):retry-(.+)$", "preflight"),
+        (r"^dag-verify:g(\d+):(initial|retry-.+)$", "verify"),
+        (r"^dag-repair-lens:g(\d+):[^:]+:retry-(.+)$", "lens"),
+        (r"^dag-repair-expanded-verify:g(\d+):retry-(.+)$", "expanded"),
+        (r"^dag-repair-triage:g(\d+):retry-(.+)$", "triage"),
+        (r"^dag-repair-rca:g(\d+):.+:retry-(.+)$", "rca"),
+        (r"^dag-repair-dispatch:g(\d+):retry-(.+)$", "dispatch"),
+        (r"^dag-fix:g(\d+):retry-(.+)$", "fix"),
+        (r"^dag-repair-reverify:g(\d+):.+:retry-(.+)$", "focused_reverify"),
+        (r"^dag-repair-result-sanitize:g(\d+):retry-(.+)$", "sanitize"),
+        (r"^dag-repair-fix-error:g(\d+):.+:retry-(.+):round-.+$", "fix_error"),
+        (r"^contradiction(?:-rejected)?:dag-repair:g(\d+):retry-(.+):.+$", "contradiction"),
+    ]
+    for pattern, event_type in patterns:
+        match = re.match(pattern, key)
+        if not match:
+            continue
+        retry = match.group(2)
+        if retry.startswith("retry-"):
+            retry = retry[len("retry-"):]
+        return int(match.group(1)), retry, event_type
+    return None
+
+
+def _dag_stage_duration(
+    start_times: list[datetime],
+    end_times: list[datetime],
+) -> int | None:
+    start = _earliest_time(start_times)
+    end = _latest_time(end_times)
+    return _seconds_between(start, end)
+
+
+def _dag_fix_applied_count(value: str) -> int:
+    payload = _safe_dict(value)
+    summary = _text(payload.get("summary") or value)
+    match = re.search(r"applied\s+(\d+)\s+root-cause-group", summary)
+    if match:
+        return int(match.group(1))
+    return 1 if summary else 0
+
+
+def _dag_sanitizer_counts(value: str) -> dict[str, int]:
+    payload = _safe_dict(value)
+    counts = payload.get("counts") if isinstance(payload.get("counts"), dict) else {}
+    return {
+        "ignored": int(payload.get("ignored_path_count") or 0),
+        "rewritten": int(payload.get("rewritten_path_count") or 0),
+        "invalid": int(payload.get("invalid_product_path_count") or 0),
+        "artifact_context": int(counts.get("artifact_context") or 0),
+        "external_reference": int(counts.get("external_reference") or 0),
+    }
+
+
+def _assemble_dag_repair_metrics(
+    timeline_rows: list[asyncpg.Record],
+    artifacts: dict[str, tuple[str, str]],
+    dag_info: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    if not dag_info:
+        return None
+
+    total_groups = int(dag_info.get("total_groups") or 0)
+    completed_group_indices = sorted(
+        int(match.group(1))
+        for key in artifacts
+        if (match := re.match(r"^dag-group:(\d+)$", key))
+    )
+    completed_groups = len(completed_group_indices)
+    latest_checkpoint_group = (
+        max(completed_group_indices) if completed_group_indices else None
+    )
+    active_group_index: int | None = None
+    for idx in range(total_groups):
+        if idx not in set(completed_group_indices):
+            active_group_index = idx
+            break
+
+    cycle_events: dict[tuple[int, str], dict[str, Any]] = {}
+    for row in sorted(timeline_rows, key=lambda r: _row_created_at(r)):
+        key = _row_key(row)
+        parsed = _dag_repair_cycle_key(key)
+        if not parsed:
+            continue
+        group_idx, retry, event_type = parsed
+        created = _parse_time(_row_created_at(row))
+        if created is None:
+            continue
+        value = _row_value(row)
+        cycle = cycle_events.setdefault((group_idx, retry), {
+            "group_idx": group_idx,
+            "retry": retry,
+            "events": [],
+            "times": collections.defaultdict(list),
+            "values": collections.defaultdict(list),
+        })
+        cycle["events"].append({"key": key, "type": event_type, "created_at": created})
+        cycle["times"][event_type].append(created)
+        cycle["values"][event_type].append(value)
+
+    now = datetime.now(timezone.utc)
+    cycles: list[dict[str, Any]] = []
+    summary_counts = {
+        "expanded_verify_runs": 0,
+        "fix_groups_scheduled": 0,
+        "fix_groups_applied": 0,
+        "final_preflight_failures": 0,
+        "sanitizer_ignored_paths": 0,
+        "sanitizer_rewritten_paths": 0,
+        "sanitizer_invalid_paths": 0,
+    }
+    latest_active_cycle: dict[str, Any] | None = None
+
+    for (group_idx, retry), cycle in sorted(cycle_events.items()):
+        times: dict[str, list[datetime]] = cycle["times"]
+        values: dict[str, list[str]] = cycle["values"]
+        all_times = [event["created_at"] for event in cycle["events"]]
+        started = _earliest_time(all_times)
+        checkpoint_raw = artifacts.get(f"dag-group:{group_idx}")
+        checkpoint_time = _parse_time(checkpoint_raw[1]) if checkpoint_raw else None
+        ended = checkpoint_time or _latest_time(all_times)
+
+        latest_verify_value = values.get("verify", [""])[-1] if values.get("verify") else ""
+        latest_verify = _safe_dict(latest_verify_value)
+        latest_verify_approved = bool(latest_verify.get("approved", False))
+        final_blocker_summary = _text(latest_verify.get("summary"))
+
+        is_active_group = active_group_index == group_idx
+        if checkpoint_time:
+            status = "passed"
+        elif latest_verify_value and not latest_verify_approved:
+            status = "failed"
+        elif is_active_group:
+            status = "running"
+            ended = now
+        else:
+            status = "waiting"
+
+        dispatch_value = values.get("dispatch", [""])[-1] if values.get("dispatch") else ""
+        dispatch_payload = _safe_dict(dispatch_value)
+        schedule = dispatch_payload.get("schedule") if isinstance(dispatch_payload.get("schedule"), list) else []
+        scheduled = sum(
+            len(item.get("group_ids", []))
+            for item in schedule
+            if isinstance(item, dict)
+        )
+        applied = sum(_dag_fix_applied_count(value) for value in values.get("fix", []))
+        contradiction_count = int(dispatch_payload.get("contradiction_group_count") or 0)
+        rejected_contradiction_count = int(dispatch_payload.get("rejected_contradiction_count") or 0)
+
+        sanitizer_counts = {"ignored": 0, "rewritten": 0, "invalid": 0}
+        for value in values.get("sanitize", []):
+            counts = _dag_sanitizer_counts(value)
+            sanitizer_counts["ignored"] += counts["ignored"]
+            sanitizer_counts["rewritten"] += counts["rewritten"]
+            sanitizer_counts["invalid"] += counts["invalid"]
+
+        if values.get("expanded"):
+            summary_counts["expanded_verify_runs"] += len(values["expanded"])
+        summary_counts["fix_groups_scheduled"] += scheduled
+        summary_counts["fix_groups_applied"] += applied
+        if latest_verify_value and not latest_verify_approved and "preflight failed" in final_blocker_summary.lower():
+            summary_counts["final_preflight_failures"] += 1
+        summary_counts["sanitizer_ignored_paths"] += sanitizer_counts["ignored"]
+        summary_counts["sanitizer_rewritten_paths"] += sanitizer_counts["rewritten"]
+        summary_counts["sanitizer_invalid_paths"] += sanitizer_counts["invalid"]
+
+        stage_durations = {
+            "preflight_initial": _dag_stage_duration(times.get("preflight", []), times.get("verify", []))
+            if retry == "initial" else None,
+            "normal_verify": _dag_stage_duration(times.get("preflight", []), times.get("verify", []))
+            if retry == "initial" else None,
+            "expanded_verify": _dag_stage_duration(times.get("lens", []), times.get("expanded", [])),
+            "triage_rca": _dag_stage_duration(times.get("triage", []), times.get("rca", [])),
+            "dispatch": 0 if times.get("dispatch") else None,
+            "fix": _dag_stage_duration(times.get("dispatch", []), times.get("fix", [])),
+            "focused_reverify": _dag_stage_duration(
+                times.get("focused_reverify", []),
+                times.get("focused_reverify", []),
+            ),
+            "final_preflight_verify": _dag_stage_duration(times.get("preflight", []), times.get("verify", []))
+            if retry != "initial" else None,
+        }
+        cycle_record = {
+            "group_idx": group_idx,
+            "retry": retry,
+            "started_at": started.isoformat() if started else None,
+            "ended_at": ended.isoformat() if ended else None,
+            "duration_seconds": _seconds_between(started, ended),
+            "status": status,
+            "stage_durations": {
+                key: value for key, value in stage_durations.items()
+                if value is not None
+            },
+            "lens_count": len(values.get("lens", [])),
+            "rca_group_count": len(values.get("rca", [])),
+            "fixable_group_count": int(dispatch_payload.get("fixable_group_count") or 0),
+            "scheduled_round_count": len(schedule),
+            "applied_fix_count": applied,
+            "contradiction_count": contradiction_count,
+            "rejected_contradiction_count": rejected_contradiction_count,
+            "final_blocker_summary": final_blocker_summary,
+        }
+        cycles.append(cycle_record)
+
+    active_elapsed_seconds: int | None = None
+    if active_group_index is not None:
+        active_times = [
+            _parse_time(row["created_at"])
+            for row in timeline_rows
+            if (
+                (parsed := _dag_repair_cycle_key(_row_key(row)))
+                and parsed[0] == active_group_index
+            )
+        ]
+        active_start = _earliest_time([value for value in active_times if value])
+        if active_start is None and latest_checkpoint_group is not None:
+            raw = artifacts.get(f"dag-group:{latest_checkpoint_group}")
+            active_start = _parse_time(raw[1]) if raw else None
+        active_elapsed_seconds = _seconds_between(active_start, now)
+
+    retry_count_for_active = 0
+    if active_group_index is not None:
+        retry_count_for_active = len({
+            cycle["retry"]
+            for cycle in cycles
+            if cycle["group_idx"] == active_group_index and cycle["retry"] != "initial"
+        })
+
+    cycles.sort(key=lambda cycle: cycle.get("started_at") or "")
+    if active_group_index is not None:
+        active_cycles = [
+            cycle for cycle in cycles
+            if cycle["group_idx"] == active_group_index
+        ]
+        latest_active_cycle = active_cycles[-1] if active_cycles else None
+
+    return {
+        "active_group_index": active_group_index,
+        "latest_checkpoint_group": latest_checkpoint_group,
+        "current_cycle": latest_active_cycle,
+        "cycles": cycles[-12:],
+        "summary": {
+            "completed_groups": completed_groups,
+            "total_groups": total_groups,
+            "active_group_elapsed_seconds": active_elapsed_seconds,
+            "retry_count_for_active_group": retry_count_for_active,
+            **summary_counts,
+        },
+    }
+
+
+def _public_text_is_safe(value: Any) -> bool:
+    text = _text(value)
+    if len(text) > 20_000:
+        return False
+    return not any(pattern.search(text) for pattern in _PUBLIC_FORBIDDEN_PATTERNS)
+
+
+def _public_payload_is_safe(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return _public_text_is_safe(value)
+    if isinstance(value, (int, float, bool)):
+        return True
+    if isinstance(value, list):
+        return all(_public_payload_is_safe(item) for item in value)
+    if isinstance(value, dict):
+        return all(
+            _public_text_is_safe(key) and _public_payload_is_safe(item)
+            for key, item in value.items()
+        )
+    return _public_text_is_safe(value)
+
+
+def _scrub_public_text(value: Any, *, max_len: int = 480) -> str:
+    text = _text(value).strip()
+    for pattern in _PUBLIC_FORBIDDEN_PATTERNS:
+        text = pattern.sub("[redacted]", text)
+    text = re.sub(r"\s+", " ", text)
+    if len(text) > max_len:
+        return text[: max_len - 1].rstrip() + "…"
+    return text
+
+
+def _safe_public_artifact(artifacts: dict[str, tuple[str, str]], key: str) -> dict[str, Any] | list[Any] | None:
+    raw = artifacts.get(key)
+    if not raw:
+        return None
+    payload = _safe_json(raw[0])
+    if payload is None:
+        payload = {"summary": raw[0]}
+    if not _public_payload_is_safe(payload):
+        return None
+    return payload
+
+
+def _public_content(payload: dict[str, Any] | list[Any] | None) -> Any:
+    if isinstance(payload, dict):
+        content = payload.get("content")
+        if isinstance(content, (dict, list)):
+            return content
+        return payload
+    return payload
+
+
+def _artifact_family(key: str) -> str:
+    if key.startswith("public-"):
+        return "public narrative"
+    if key.startswith("prd"):
+        return "product"
+    if key.startswith("design") or key.startswith("system-design"):
+        return "design"
+    if key.startswith("plan") or key.startswith("decomposition") or key == "dag" or key.startswith("dag:"):
+        return "planning"
+    if key.startswith("test-plan") or key.startswith("dag-verify") or key.startswith("dag-repair"):
+        return "verification"
+    if key.startswith("decisions") or key.startswith("contradiction"):
+        return "decision"
+    if key.startswith("artifact-audit") or key.startswith("artifact-backfill"):
+        return "audit"
+    if key in {"implementation", "handover"}:
+        return "delivery"
+    return "artifact"
+
+
+def _artifact_label(key: str) -> str:
+    labels = {
+        "project": "Project Context",
+        "scope": "Feature Scope",
+        "prd:broad": "Broad PRD",
+        "design:broad": "Broad Design",
+        "plan:broad": "Broad Technical Plan",
+        "system-design:broad": "Broad System Design",
+        "test-plan:broad": "Broad Test Plan",
+        "decomposition": "Subfeature Decomposition",
+        "decomposition-structured": "Structured Decomposition",
+        "dag:strategy": "DAG Workstream Strategy",
+        "dag": "Root Implementation DAG",
+        "implementation": "Implementation Report",
+        "handover": "Implementation Handover",
+        "public-summary": "Public Summary",
+        "public-artifact-gallery": "Public Artifact Gallery",
+        "public-dag-narrative": "Public DAG Narrative",
+        "public-workstream-summary": "Public Workstream Summary",
+        "public-milestone-feed": "Public Milestone Feed",
+    }
+    if key in labels:
+        return labels[key]
+    if ":" in key:
+        family, slug = key.split(":", 1)
+        return f"{family.replace('-', ' ').title()} — {slug.replace('-', ' ')}"
+    return key.replace("-", " ").title()
+
+
+def _artifact_description(key: str) -> str:
+    family = _artifact_family(key)
+    if key.startswith("public-"):
+        return "Bridge-generated public presentation layer with provenance and safety checks."
+    if family == "product":
+        return "Defines product intent, requirements, journeys, and acceptance criteria."
+    if family == "design":
+        return "Captures experience, architecture, component, and system decisions."
+    if family == "planning":
+        return "Turns the feature plan into executable slices, workstreams, and task batches."
+    if family == "verification":
+        return "Records verifier findings, repair cycles, and quality evidence."
+    if family == "decision":
+        return "Tracks decisions and contradiction resolutions that guide implementation."
+    if family == "audit":
+        return "Shows migration, sidecar, parity, and traceability audit status."
+    if family == "delivery":
+        return "Summarizes completed implementation work and handover notes."
+    return "Workflow artifact produced by the bridge."
+
+
+def _artifact_is_exhibit_source(key: str) -> bool:
+    return key in _EXHIBIT_SOURCE_KEYS or key.startswith(_EXHIBIT_SOURCE_PREFIXES)
+
+
+def _extract_project_title(feat: asyncpg.Record, artifacts: dict[str, tuple[str, str]]) -> str:
+    project = _safe_dict(artifacts.get("project", ("", ""))[0])
+    title = project.get("feature_name") or feat["name"] or feat["id"]
+    return _scrub_public_text(title, max_len=120)
+
+
+def _extract_public_description(artifacts: dict[str, tuple[str, str]]) -> str:
+    for key in ("prd:broad", "prd", "scope"):
+        raw = artifacts.get(key)
+        if not raw:
+            continue
+        payload = _safe_json(raw[0])
+        if isinstance(payload, dict):
+            for candidate in (
+                payload.get("problem_statement"),
+                payload.get("summary"),
+                payload.get("description"),
+                payload.get("overview"),
+            ):
+                if candidate:
+                    return _scrub_public_text(candidate, max_len=540)
+            content = payload.get("content")
+            if isinstance(content, dict):
+                for candidate in (
+                    content.get("problem_statement"),
+                    content.get("summary"),
+                    content.get("description"),
+                    content.get("overview"),
+                ):
+                    if candidate:
+                        return _scrub_public_text(candidate, max_len=540)
+        text = raw[0]
+        match = re.search(
+            r"##\s+(?:Problem Statement|Overview|Summary)\s*\n+(.+?)(?:\n##\s+|\Z)",
+            text,
+            flags=re.S | re.I,
+        )
+        if match:
+            paragraph = next(
+                (part.strip() for part in match.group(1).split("\n\n") if part.strip()),
+                "",
+            )
+            if paragraph:
+                return _scrub_public_text(paragraph, max_len=540)
+    return "A multi-agent workflow is planning, building, verifying, and documenting this feature."
+
+
+def _derive_public_health(
+    *,
+    phase: str,
+    groups: list[dict[str, Any]],
+    dag_repair: dict[str, Any] | None,
+    active_gate: str | None,
+) -> str:
+    if phase == "complete":
+        return "complete"
+    if phase == "failed":
+        return "blocked"
+    if dag_repair and dag_repair.get("current_cycle"):
+        cycle = dag_repair["current_cycle"]
+        if cycle.get("status") == "failed":
+            return "fixing"
+        if cycle.get("status") == "running":
+            return "running"
+    active = next((g for g in groups if g.get("status") == "active"), None)
+    if active:
+        latest = active.get("verify_steps", [])[-1:] or []
+        if latest and latest[0].get("passed") is False:
+            return "fixing"
+        return "running"
+    if active_gate:
+        return "quality-gates"
+    return "planning"
+
+
+def _derive_current_focus(
+    groups: list[dict[str, Any]],
+    dag_repair: dict[str, Any] | None,
+    active_gate: str | None,
+) -> str:
+    active = next((g for g in groups if g.get("status") == "active"), None)
+    if dag_repair and dag_repair.get("current_cycle"):
+        cycle = dag_repair["current_cycle"]
+        blocker = _scrub_public_text(cycle.get("final_blocker_summary"), max_len=220)
+        if blocker:
+            return f"Repairing implementation batch {cycle.get('group_idx')} after verifier feedback: {blocker}"
+    if active:
+        tasks = [
+            _scrub_public_text(task.get("name") or task.get("id"), max_len=70)
+            for task in active.get("tasks", [])
+            if task.get("status") == "in_progress"
+        ]
+        if tasks:
+            return f"Implementing batch {active.get('index')}: {', '.join(tasks[:3])}"
+        return f"Verifying implementation batch {active.get('index')}"
+    if active_gate:
+        return f"Running the {active_gate} quality gate"
+    return "Preparing the next workflow milestone"
+
+
+def _derive_next_checkpoint(
+    groups: list[dict[str, Any]],
+    active_gate: str | None,
+    gates: dict[str, bool],
+) -> str:
+    active = next((g for g in groups if g.get("status") == "active"), None)
+    if active:
+        return f"Checkpoint batch {active.get('index')} after final verifier approval"
+    if active_gate:
+        return f"Approve the {active_gate} gate"
+    pending_gate = next((name for name, passed in gates.items() if not passed), None)
+    if pending_gate:
+        return f"Start the {pending_gate} gate"
+    return "Publish final handover"
+
+
+def _assemble_public_summary(
+    *,
+    feat: asyncpg.Record,
+    artifacts: dict[str, tuple[str, str]],
+    dag_info: dict[str, Any] | None,
+    groups: list[dict[str, Any]],
+    dag_repair: dict[str, Any] | None,
+    active_gate: str | None,
+    gates: dict[str, bool],
+    last_activity_at: str | None,
+) -> dict[str, Any]:
+    generated = _public_content(_safe_public_artifact(artifacts, "public-summary"))
+    completed_groups = sum(1 for group in groups if group.get("status") == "complete")
+    total_groups = int(dag_info.get("total_groups") or len(groups)) if dag_info else len(groups)
+    completed_tasks = sum(int(group.get("completed_count") or 0) for group in groups)
+    total_tasks = int(dag_info.get("total_tasks") or 0) if dag_info else sum(int(group.get("task_count") or 0) for group in groups)
+    percent_complete = round((completed_groups / total_groups) * 100) if total_groups else 0
+
+    fallback = {
+        "title": _extract_project_title(feat, artifacts),
+        "tagline": "A live multi-agent build, verification, and delivery exhibit.",
+        "description": _extract_public_description(artifacts),
+        "phase_label": _scrub_public_text(feat["phase"], max_len=80),
+        "status_label": _derive_current_focus(groups, dag_repair, active_gate),
+        "progress_narrative": (
+            f"{completed_groups} of {total_groups} DAG batches and "
+            f"{completed_tasks} of {total_tasks} implementation tasks are checkpointed."
+            if total_groups else
+            "The feature is still in upstream planning."
+        ),
+        "current_focus": _derive_current_focus(groups, dag_repair, active_gate),
+        "next_checkpoint": _derive_next_checkpoint(groups, active_gate, gates),
+        "health": _derive_public_health(
+            phase=feat["phase"],
+            groups=groups,
+            dag_repair=dag_repair,
+            active_gate=active_gate,
+        ),
+        "percent_complete": percent_complete,
+        "completed_groups": completed_groups,
+        "total_groups": total_groups,
+        "completed_tasks": completed_tasks,
+        "total_tasks": total_tasks,
+        "updated_at": last_activity_at or _ensure_iso(feat["updated_at"]),
+        "source": "deterministic-fallback",
+    }
+
+    if isinstance(generated, dict):
+        merged = dict(fallback)
+        for key in (
+            "title", "tagline", "description", "phase_label", "status_label",
+            "progress_narrative", "current_focus", "next_checkpoint", "health",
+        ):
+            if generated.get(key):
+                merged[key] = _scrub_public_text(generated[key], max_len=900)
+        merged["source"] = "public-summary"
+        merged["provenance"] = generated.get("provenance") or generated.get("sources") or {}
+        return merged
+
+    return fallback
+
+
+def _assemble_dag_exhibit(
+    *,
+    artifacts: dict[str, tuple[str, str]],
+    dag_info: dict[str, Any] | None,
+    groups: list[dict[str, Any]],
+    dag_repair: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    if not dag_info and not groups:
+        return None
+    generated = _public_content(_safe_public_artifact(artifacts, "public-dag-narrative"))
+    active_group = next((group for group in groups if group.get("status") == "active"), None)
+    next_groups = [
+        {"index": group.get("index"), "task_count": group.get("task_count"), "status": group.get("status")}
+        for group in groups
+        if group.get("status") != "complete"
+    ][:8]
+    narrative = ""
+    if isinstance(generated, dict):
+        narrative = _scrub_public_text(
+            generated.get("narrative") or generated.get("summary") or generated.get("description"),
+            max_len=900,
+        )
+    return {
+        "narrative": narrative or "The DAG is the execution map: implementation batches checkpoint only after verification passes.",
+        "total_groups": int(dag_info.get("total_groups") or len(groups)) if dag_info else len(groups),
+        "total_tasks": int(dag_info.get("total_tasks") or 0) if dag_info else sum(int(g.get("task_count") or 0) for g in groups),
+        "completed_groups": sum(1 for group in groups if group.get("status") == "complete"),
+        "active_group": {
+            "index": active_group.get("index"),
+            "task_count": active_group.get("task_count"),
+            "completed_count": active_group.get("completed_count"),
+            "status": active_group.get("status"),
+        } if active_group else None,
+        "next_groups": next_groups,
+        "repair": dag_repair,
+        "source": "public-dag-narrative" if isinstance(generated, dict) else "deterministic-fallback",
+    }
+
+
+def _agent_role_label(name: str) -> str:
+    lowered = name.lower()
+    if "implementer" in lowered:
+        return "Implementer"
+    if "root-cause" in lowered or "rca" in lowered:
+        return "Root-cause analyst"
+    if "triage" in lowered:
+        return "Triage planner"
+    if "verifier" in lowered or "verify" in lowered or "smoke" in lowered:
+        return "Verifier"
+    if "security" in lowered:
+        return "Security reviewer"
+    if "regression" in lowered:
+        return "Regression tester"
+    if "reviewer" in lowered:
+        return "Reviewer"
+    return "Agent"
+
+
+def _agent_runtime_label(content: Any) -> str:
+    text = _text(content).lower()
+    if "codex" in text:
+        return "Codex"
+    if "claude" in text:
+        return "Claude"
+    return "Runtime unknown"
+
+
+def _agent_group_idx(name: str) -> int | None:
+    match = re.search(r"(?:^|[-_:])g(\d+)(?:[-_:]|$)", name)
+    return int(match.group(1)) if match else None
+
+
+def _agent_related_artifact_keys(
+    name: str,
+    *,
+    artifacts: dict[str, tuple[str, str]],
+    group_idx: int | None,
+) -> list[str]:
+    candidates: list[tuple[str, str]] = []
+    normalized_name = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+    group_token = f"g{group_idx}" if group_idx is not None else ""
+    for key, (_value, created_at) in artifacts.items():
+        key_l = key.lower()
+        if group_token and re.search(rf"(?:^|:)dag|dag-", key_l) and group_token in key_l:
+            candidates.append((key, created_at))
+            continue
+        if normalized_name and normalized_name in re.sub(r"[^a-z0-9]+", "-", key_l):
+            candidates.append((key, created_at))
+    candidates.sort(key=lambda item: item[1], reverse=True)
+    return [key for key, _created_at in candidates[:6]]
+
+
+def _agent_task_context(
+    name: str,
+    *,
+    groups: list[dict[str, Any]],
+    group_idx: int | None,
+) -> tuple[str | None, str, list[str]]:
+    normalized_name = name.lower()
+    active_group = next(
+        (group for group in groups if group_idx is not None and group.get("index") == group_idx),
+        None,
+    )
+    candidate_tasks = active_group.get("tasks", []) if active_group else []
+    best_task: dict[str, Any] | None = None
+    best_score = 0
+    for task in candidate_tasks:
+        task_id = _text(task.get("id"))
+        if task_id and task_id.lower() in normalized_name:
+            best_task = task
+            best_score = 999
+            break
+        words = {
+            word for word in re.split(r"[^a-z0-9]+", _text(task.get("name")).lower())
+            if len(word) >= 4
+        }
+        score = sum(1 for word in words if word in normalized_name)
+        if score > best_score:
+            best_task = task
+            best_score = score
+
+    if best_task and (best_score > 0 or len(candidate_tasks) == 1):
+        task_id = _text(best_task.get("id")) or None
+        files = [
+            _text(item.get("path"))
+            for item in best_task.get("file_scope", [])
+            if isinstance(item, dict) and item.get("path")
+        ]
+        preview = _scrub_public_text(
+            best_task.get("description")
+            or best_task.get("summary")
+            or best_task.get("name")
+            or task_id,
+            max_len=260,
+        )
+        return task_id, preview, files[:6]
+
+    topic = _agent_topic_from_name(name)
+    if "contradiction" in normalized_name:
+        return None, f"Resolve contradiction context for {topic} before repair continues." if topic else "Resolve a spec or artifact contradiction before repair continues.", []
+    if "triage" in normalized_name:
+        return None, f"Group verifier findings for {topic} into repairable root-cause clusters." if topic else "Group verifier findings into repairable root-cause clusters.", []
+    if "root-cause" in normalized_name or "rca" in normalized_name:
+        return None, f"Analyze RCA cluster {topic} and propose a safe repair plan." if topic else "Identify the root cause and propose a safe repair plan.", []
+    if "verify" in normalized_name or "verifier" in normalized_name:
+        return None, f"Verify {topic} against DAG gates and product behavior." if topic else "Verify the current DAG group against task gates and product behavior.", []
+    if "fix" in normalized_name or "implementer" in normalized_name:
+        files: list[str] = []
+        for task in candidate_tasks:
+            for item in task.get("file_scope", []):
+                if isinstance(item, dict) and item.get("path"):
+                    files.append(_text(item["path"]))
+        return None, f"Apply focused repair for {topic} from the latest RCA and verifier findings." if topic else "Apply a focused repair from the latest RCA and verifier findings.", files[:6]
+    return None, f"Continue workflow step for {topic} using the latest canonical artifacts." if topic else "Continue the current workflow step using the latest canonical artifacts.", []
+
+
+def _artifact_summary_preview(artifacts: dict[str, tuple[str, str]], keys: list[str]) -> str:
+    for key in keys:
+        raw = artifacts.get(key)
+        if not raw:
+            continue
+        payload = _safe_dict(raw[0])
+        for field in ("summary", "hypothesis", "resolution", "rationale", "final_blocker_summary"):
+            if payload.get(field):
+                return _scrub_public_text(payload[field], max_len=280)
+        text = _text(raw[0]).strip()
+        if text:
+            return _scrub_public_text(text, max_len=280)
+    return ""
+
+
+def _agent_topic_from_name(name: str) -> str:
+    cleaned = re.sub(
+        r"^(?:root-cause-analyst|implementer|verifier|contradiction-resolver)-dag-g\d+(?:-r\d+)?-",
+        "",
+        name,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(r"^(?:rca|fix|lens|verify|contradiction)-", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"^(?:G|group)-", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"[^a-zA-Z0-9]+", " ", cleaned).strip()
+    if not cleaned:
+        return ""
+    words = [
+        word.upper() if len(word) <= 3 and word.isalpha() else word.capitalize()
+        for word in cleaned.split()
+    ]
+    return _scrub_public_text(" ".join(words), max_len=96)
+
+
+def _enrich_agent_record(
+    record: dict[str, Any],
+    *,
+    artifacts: dict[str, tuple[str, str]],
+    groups: list[dict[str, Any]],
+) -> dict[str, Any]:
+    name = _text(record.get("name"))
+    group_idx = _agent_group_idx(name)
+    task_id, prompt_preview, related_files = _agent_task_context(
+        name,
+        groups=groups,
+        group_idx=group_idx,
+    )
+    related_artifact_keys = _agent_related_artifact_keys(
+        name,
+        artifacts=artifacts,
+        group_idx=group_idx,
+    )
+    output_preview = _scrub_public_text(record.get("summary"), max_len=280)
+    if not output_preview or output_preview.lower() in {"codex", "claude", "claude_pool"}:
+        output_preview = _artifact_summary_preview(artifacts, related_artifact_keys)
+    if not output_preview and record.get("status") == "running":
+        output_preview = "Running now; latest output will appear after the agent reports back."
+
+    started = _parse_time(record.get("started_at"))
+    ended = _parse_time(record.get("ended_at")) or datetime.now(timezone.utc)
+    duration_seconds = _seconds_between(started, ended) if started else None
+
+    return {
+        **record,
+        "task_id": task_id,
+        "group_idx": group_idx,
+        "duration_seconds": duration_seconds,
+        "prompt_preview": prompt_preview,
+        "output_preview": output_preview,
+        "related_artifact_keys": related_artifact_keys,
+        "related_files": related_files,
+    }
+
+
+def _assemble_agent_activity(
+    events: list[asyncpg.Record],
+    *,
+    artifacts: dict[str, tuple[str, str]] | None = None,
+    groups: list[dict[str, Any]] | None = None,
+    timeline: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    artifacts = artifacts or {}
+    groups = groups or []
+    active: dict[str, dict[str, Any]] = {}
+    recent_completed: list[dict[str, Any]] = []
+    for event in sorted(events, key=lambda item: item["created_at"]):
+        event_type = _text(event["event_type"])
+        source = _text(event["source"])
+        created_at = _ensure_iso(event["created_at"])
+        if event_type == "agent_start":
+            active[source] = {
+                "name": source,
+                "role": _agent_role_label(source),
+                "runtime": _agent_runtime_label(event["content"]),
+                "started_at": created_at,
+                "status": "running",
+            }
+        elif event_type in {"agent_done", "agent_error", "agent_failed"}:
+            started = active.pop(source, None)
+            recent_completed.append({
+                "name": source,
+                "role": _agent_role_label(source),
+                "runtime": _agent_runtime_label(event["content"]),
+                "started_at": started.get("started_at") if started else None,
+                "ended_at": created_at,
+                "status": "failed" if event_type != "agent_done" else "complete",
+                "summary": _scrub_public_text(event["content"], max_len=220),
+            })
+    active_records = [
+        _enrich_agent_record(record, artifacts=artifacts, groups=groups)
+        for record in active.values()
+    ]
+    recent_records = [
+        _enrich_agent_record(record, artifacts=artifacts, groups=groups)
+        for record in reversed(recent_completed)
+    ]
+    return {
+        "active_agents": sorted(
+            active_records,
+            key=lambda item: item.get("started_at") or "",
+            reverse=True,
+        ),
+        "recent_agents": recent_records[:24],
+    }
+
+
+def _assemble_agent_exhibit(
+    *,
+    artifacts: dict[str, tuple[str, str]],
+    agent_activity: dict[str, Any],
+    dag_repair: dict[str, Any] | None,
+) -> dict[str, Any]:
+    generated_rounds = [
+        {
+            "key": key,
+            "created_at": created_at,
+            "summary": _scrub_public_text((_public_content(_safe_public_artifact(artifacts, key)) or {}).get("summary"), max_len=420)
+            if isinstance(_public_content(_safe_public_artifact(artifacts, key)), dict)
+            else "",
+        }
+        for key, (_value, created_at) in artifacts.items()
+        if key.startswith("public-agent-round-summary:")
+    ]
+    generated_rounds.sort(key=lambda item: item["created_at"], reverse=True)
+    current_cycle = dag_repair.get("current_cycle") if dag_repair else None
+    return {
+        **agent_activity,
+        "round_summaries": generated_rounds[:8],
+        "current_repair_cycle": current_cycle,
+        "headline": (
+            f"{len(agent_activity['active_agents'])} agent(s) active"
+            if agent_activity["active_agents"]
+            else "No active agents at this instant"
+        ),
+    }
+
+
+def _assemble_artifact_exhibit(artifacts: dict[str, tuple[str, str]]) -> dict[str, Any]:
+    generated = _public_content(_safe_public_artifact(artifacts, "public-artifact-gallery"))
+    generated_cards = []
+    if isinstance(generated, dict) and isinstance(generated.get("cards"), list):
+        for card in generated["cards"]:
+            if isinstance(card, dict) and _public_payload_is_safe(card):
+                generated_cards.append(card)
+
+    deterministic_cards = []
+    for key, (_value, created_at) in sorted(artifacts.items()):
+        if not _artifact_is_exhibit_source(key):
+            continue
+        deterministic_cards.append({
+            "key": key,
+            "title": _artifact_label(key),
+            "family": _artifact_family(key),
+            "summary": _artifact_description(key),
+            "created_at": created_at,
+            "status": "available",
+            "public_safe": True,
+            "source": "deterministic-inventory",
+        })
+
+    cards_by_key: dict[str, dict[str, Any]] = {
+        _text(card.get("key")): card for card in deterministic_cards
+    }
+    for card in generated_cards:
+        key = _text(card.get("key"))
+        if not key:
+            continue
+        base = cards_by_key.get(key, {})
+        cards_by_key[key] = {
+            **base,
+            **{
+                "key": key,
+                "title": _scrub_public_text(card.get("title") or base.get("title") or key, max_len=120),
+                "family": _scrub_public_text(card.get("family") or base.get("family") or _artifact_family(key), max_len=60),
+                "summary": _scrub_public_text(card.get("summary") or base.get("summary") or "", max_len=460),
+                "created_at": base.get("created_at") or card.get("created_at"),
+                "status": _scrub_public_text(card.get("status") or base.get("status") or "available", max_len=60),
+                "public_safe": True,
+                "source": "public-artifact-gallery",
+                "provenance": card.get("provenance") or {},
+            },
+        }
+
+    family_order = {
+        "public narrative": 0,
+        "product": 1,
+        "design": 2,
+        "planning": 3,
+        "verification": 4,
+        "decision": 5,
+        "audit": 6,
+        "delivery": 7,
+    }
+    cards = sorted(
+        cards_by_key.values(),
+        key=lambda card: (
+            family_order.get(_text(card.get("family")), 99),
+            _text(card.get("title")),
+        ),
+    )
+    return {
+        "cards": cards[:120],
+        "total_count": len(cards),
+        "generated": bool(generated_cards),
+    }
+
+
+def _assemble_workstream_exhibit(
+    *,
+    artifacts: dict[str, tuple[str, str]],
+    workstreams: list[dict[str, Any]],
+    groups: list[dict[str, Any]],
+) -> dict[str, Any]:
+    generated = _public_content(_safe_public_artifact(artifacts, "public-workstream-summary"))
+    generated_by_id: dict[str, dict[str, Any]] = {}
+    if isinstance(generated, dict):
+        for item in generated.get("workstreams", []) if isinstance(generated.get("workstreams"), list) else []:
+            if isinstance(item, dict) and item.get("id") and _public_payload_is_safe(item):
+                generated_by_id[_text(item["id"])] = item
+    cards = []
+    active_subfeatures = {
+        task.get("subfeature_id")
+        for group in groups
+        if group.get("status") == "active"
+        for task in group.get("tasks", [])
+    }
+    for ws in workstreams:
+        total = int(ws.get("total_tasks") or 0)
+        completed = int(ws.get("completed_tasks") or 0)
+        generated_card = generated_by_id.get(_text(ws.get("id")), {})
+        active = any(slug in active_subfeatures for slug in ws.get("subfeature_slugs", []))
+        cards.append({
+            "id": ws.get("id"),
+            "name": ws.get("name"),
+            "summary": _scrub_public_text(
+                generated_card.get("summary")
+                or f"{len(ws.get('subfeature_slugs', []))} subfeature(s) contributing to the delivery plan.",
+                max_len=360,
+            ),
+            "status": "active" if active else ("complete" if total and completed >= total else "pending"),
+            "completed_tasks": completed,
+            "total_tasks": total,
+            "subfeature_slugs": ws.get("subfeature_slugs", []),
+            "depends_on": ws.get("depends_on", []),
+        })
+    return {
+        "summary": _scrub_public_text(
+            generated.get("summary") if isinstance(generated, dict) else "",
+            max_len=540,
+        ) if isinstance(generated, dict) else "Workstreams organize the DAG into coherent delivery lanes.",
+        "workstreams": cards,
+        "source": "public-workstream-summary" if isinstance(generated, dict) else "deterministic-fallback",
+    }
+
+
+def _assemble_public_milestones(
+    *,
+    artifacts: dict[str, tuple[str, str]],
+    timeline: list[dict[str, Any]],
+    groups: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    generated = _public_content(_safe_public_artifact(artifacts, "public-milestone-feed"))
+    if isinstance(generated, dict) and isinstance(generated.get("milestones"), list):
+        milestones = [
+            {
+                "title": _scrub_public_text(item.get("title"), max_len=120),
+                "summary": _scrub_public_text(item.get("summary"), max_len=420),
+                "kind": _scrub_public_text(item.get("kind") or "milestone", max_len=40),
+                "created_at": _scrub_public_text(item.get("created_at"), max_len=80),
+                "source": "public-milestone-feed",
+            }
+            for item in generated["milestones"]
+            if isinstance(item, dict) and _public_payload_is_safe(item)
+        ]
+        if milestones:
+            return milestones[:20]
+
+    milestones: list[dict[str, Any]] = []
+    for group in groups:
+        if group.get("status") != "complete":
+            continue
+        key = f"dag-group:{group.get('index')}"
+        created_at = artifacts.get(key, ("", ""))[1]
+        if created_at:
+            milestones.append({
+                "title": f"Batch {group.get('index')} checkpointed",
+                "summary": f"{group.get('task_count')} implementation task(s) passed verification and were checkpointed.",
+                "kind": "checkpoint",
+                "created_at": created_at,
+                "source": key,
+            })
+    for entry in timeline[:8]:
+        summary = _scrub_public_text(entry.get("summary"), max_len=260)
+        if not summary:
+            continue
+        milestones.append({
+            "title": _artifact_label(entry.get("key", "")),
+            "summary": summary,
+            "kind": _scrub_public_text(entry.get("type") or "workflow", max_len=40),
+            "created_at": entry.get("created_at"),
+            "source": entry.get("key"),
+        })
+    milestones.sort(key=lambda item: _text(item.get("created_at")), reverse=True)
+    return milestones[:20]
+
+
+def _assemble_current_work(
+    *,
+    groups: list[dict[str, Any]],
+    agent_activity: dict[str, Any],
+    timeline: list[dict[str, Any]],
+    active_gate: str | None,
+    gates: dict[str, bool],
+) -> dict[str, Any]:
+    active_group = next((group for group in groups if group.get("status") == "active"), None)
+    active_tasks = []
+    if active_group:
+        for task in active_group.get("tasks", []):
+            if task.get("status") == "complete":
+                continue
+            active_tasks.append({
+                "id": task.get("id"),
+                "name": task.get("name") or task.get("id"),
+                "status": task.get("status"),
+                "summary": _scrub_public_text(task.get("summary") or task.get("description"), max_len=260),
+                "repo_path": task.get("repo_path"),
+                "subfeature_id": task.get("subfeature_id"),
+                "acceptance_criteria": task.get("acceptance_criteria", [])[:8],
+                "file_scope": task.get("file_scope", [])[:8],
+            })
+
+    recent_outcomes = []
+    for entry in sorted(timeline, key=lambda item: _text(item.get("created_at")), reverse=True):
+        if entry.get("type") not in {
+            "verify", "preflight", "expanded_verify", "triage", "rca", "dispatch",
+            "fix", "reverify", "contradiction", "sanitize",
+        }:
+            continue
+        recent_outcomes.append({
+            "key": entry.get("key"),
+            "type": entry.get("type"),
+            "passed": entry.get("passed"),
+            "summary": _scrub_public_text(entry.get("summary"), max_len=260),
+            "created_at": entry.get("created_at"),
+        })
+        if len(recent_outcomes) >= 8:
+            break
+
+    return {
+        "active_group": {
+            "index": active_group.get("index"),
+            "task_count": active_group.get("task_count"),
+            "completed_count": active_group.get("completed_count"),
+            "status": active_group.get("status"),
+        } if active_group else None,
+        "active_tasks": active_tasks,
+        "active_agents": agent_activity.get("active_agents", []),
+        "recent_outcomes": recent_outcomes,
+        "next_checkpoint": _derive_next_checkpoint(groups, active_gate, gates),
+    }
+
+
+def _assemble_public_exhibit(
+    *,
+    feat: asyncpg.Record,
+    artifacts: dict[str, tuple[str, str]],
+    timeline: list[dict[str, Any]],
+    events: list[dict[str, Any]],
+    agent_activity: dict[str, Any],
+    dag_info: dict[str, Any] | None,
+    groups: list[dict[str, Any]],
+    workstreams: list[dict[str, Any]],
+    dag_repair: dict[str, Any] | None,
+    active_gate: str | None,
+    gates: dict[str, bool],
+    last_activity_at: str | None,
+    artifact_catalog: dict[str, tuple[str, str]] | None = None,
+) -> dict[str, Any]:
+    catalog = artifact_catalog or artifacts
+    artifact_exhibit = _assemble_artifact_exhibit(catalog)
+    return {
+        "public_summary": _assemble_public_summary(
+            feat=feat,
+            artifacts=artifacts,
+            dag_info=dag_info,
+            groups=groups,
+            dag_repair=dag_repair,
+            active_gate=active_gate,
+            gates=gates,
+            last_activity_at=last_activity_at,
+        ),
+        "dag_exhibit": _assemble_dag_exhibit(
+            artifacts=artifacts,
+            dag_info=dag_info,
+            groups=groups,
+            dag_repair=dag_repair,
+        ),
+        "agent_exhibit": _assemble_agent_exhibit(
+            artifacts=artifacts,
+            agent_activity=agent_activity,
+            dag_repair=dag_repair,
+        ),
+        "current_work": _assemble_current_work(
+            groups=groups,
+            agent_activity=agent_activity,
+            timeline=timeline,
+            active_gate=active_gate,
+            gates=gates,
+        ),
+        "artifact_exhibit": artifact_exhibit,
+        "workstream_exhibit": _assemble_workstream_exhibit(
+            artifacts=artifacts,
+            workstreams=workstreams,
+            groups=groups,
+        ),
+        "milestone_feed": _assemble_public_milestones(
+            artifacts=artifacts,
+            timeline=timeline,
+            groups=groups,
+        ),
+        "operations": {
+            "dag_repair": dag_repair,
+            "gates": gates,
+            "active_gate": active_gate,
+            "timeline_count": len(timeline),
+            "event_count": len(events),
+            "artifact_count": artifact_exhibit["total_count"],
+        },
+    }
 
 
 def _derive_bugflow_status_text(
@@ -1711,6 +3017,89 @@ def _parse_timeline_entry(key: str, value: str, created_at) -> dict | None:
             summary = value if value else ""
         return {"key": key, "type": "verify", "passed": passed, "summary": summary, "created_at": ts}
 
+    if key.startswith("dag-repair-preflight:"):
+        payload = _safe_dict(value)
+        passed = bool(payload.get("approved", False))
+        count = len(_safe_list(payload.get("concerns")))
+        summary = "Preflight passed" if passed else f"Preflight blocked on {count} issue(s)"
+        return {"key": key, "type": "preflight", "passed": passed, "summary": summary, "created_at": ts}
+
+    if key.startswith("dag-repair-lens:"):
+        payload = _safe_dict(value)
+        passed = payload.get("approved")
+        parts = key.split(":")
+        lens = parts[2] if len(parts) > 2 else "lens"
+        summary = _text(payload.get("summary") or f"{lens} lens completed")
+        return {
+            "key": key,
+            "type": "lens",
+            "passed": passed if isinstance(passed, bool) else None,
+            "summary": summary,
+            "created_at": ts,
+        }
+
+    if key.startswith("dag-repair-expanded-verify:"):
+        payload = _safe_dict(value)
+        passed = payload.get("approved")
+        summary = _text(payload.get("summary") or "Expanded verify merged")
+        return {
+            "key": key,
+            "type": "expanded-verify",
+            "passed": passed if isinstance(passed, bool) else None,
+            "summary": summary,
+            "created_at": ts,
+        }
+
+    if key.startswith("dag-repair-triage:"):
+        payload = _safe_dict(value)
+        groups = _safe_list(payload.get("groups"))
+        summary = f"{len(groups)} DAG repair group(s) triaged" if groups else "DAG repair triage"
+        return {"key": key, "type": "triage", "passed": None, "summary": summary, "created_at": ts}
+
+    if key.startswith("dag-repair-rca:"):
+        payload = _safe_dict(value)
+        summary = _text(payload.get("hypothesis") or payload.get("summary") or "DAG repair RCA")
+        return {"key": key, "type": "rca", "passed": None, "summary": summary, "created_at": ts}
+
+    if key.startswith("dag-repair-dispatch:"):
+        payload = _safe_dict(value)
+        scheduled = sum(
+            len(item.get("group_ids", []))
+            for item in _safe_list(payload.get("schedule"))
+            if isinstance(item, dict)
+        )
+        summary = (
+            f"{scheduled} fix group(s), "
+            f"{payload.get('contradiction_group_count', 0)} contradiction(s)"
+        )
+        return {"key": key, "type": "dispatch", "passed": None, "summary": summary, "created_at": ts}
+
+    if key.startswith("dag-repair-reverify:"):
+        payload = _safe_dict(value)
+        passed = payload.get("approved")
+        summary = _text(payload.get("summary") or "Focused reverify")
+        return {
+            "key": key,
+            "type": "reverify",
+            "passed": passed if isinstance(passed, bool) else None,
+            "summary": summary,
+            "created_at": ts,
+        }
+
+    if key.startswith("dag-repair-result-sanitize:"):
+        payload = _safe_dict(value)
+        summary = (
+            f"Sanitized paths: ignored={payload.get('ignored_path_count', 0)}, "
+            f"rewritten={payload.get('rewritten_path_count', 0)}, "
+            f"invalid={payload.get('invalid_product_path_count', 0)}"
+        )
+        return {"key": key, "type": "sanitize", "passed": None, "summary": summary, "created_at": ts}
+
+    if key.startswith("dag-repair-fix-error:"):
+        payload = _safe_dict(value)
+        summary = _text(payload.get("summary") or "DAG repair fix task failed")
+        return {"key": key, "type": "fix-error", "passed": False, "summary": summary, "created_at": ts}
+
     if key.startswith("bug-rca:"):
         summary = ""
         try:
@@ -1774,6 +3163,12 @@ def _parse_timeline_entry(key: str, value: str, created_at) -> dict | None:
         except (json.JSONDecodeError, KeyError):
             summary = value if value else ""
         return {"key": key, "type": "observation", "passed": passed, "summary": summary, "created_at": ts}
+
+    if key.startswith("contradiction-rejected:"):
+        payload = _safe_dict(value)
+        reasons = ", ".join(_text(item) for item in _safe_list(payload.get("rejection_reasons")))
+        summary = reasons or "Contradiction resolver rejected output"
+        return {"key": key, "type": "decision", "passed": False, "summary": summary, "created_at": ts}
 
     if key.startswith("contradiction:"):
         summary = value if value else ""
@@ -1948,6 +3343,20 @@ if __name__ == "__main__":
     parser.add_argument("--bridge-workspace", default=None)
     parser.add_argument("--bridge-mode", default="multiplayer", choices=["multiplayer", "singleplayer"])
     parser.add_argument("--bridge-agent-runtime", default=None)
+    parser.add_argument(
+        "--bridge-runtime-policy",
+        default=None,
+        choices=list(SUPPORTED_RUNTIME_POLICIES),
+        help="Runtime routing policy for workflow roles.",
+    )
+    parser.add_argument(
+        "--bridge-claude-pool-codex-review",
+        action="store_true",
+        help=(
+            "Use claude_pool as the primary runtime and Codex as the "
+            "secondary review/verification runtime."
+        ),
+    )
     parser.add_argument("--bridge-claude-only", action="store_true")
     parser.add_argument("--bridge-budget", action="store_true")
     parser.add_argument("--bridge-autonomous-remainder", action="store_true")
@@ -1956,11 +3365,27 @@ if __name__ == "__main__":
     dashboard_config["port"] = args.port
 
     if args.bridge_channel:
+        bridge_agent_runtime = args.bridge_agent_runtime
+        bridge_runtime_policy = args.bridge_runtime_policy
+        if args.bridge_claude_pool_codex_review:
+            if bridge_agent_runtime and bridge_agent_runtime not in {
+                "claude_pool", "claude-pool", "pool",
+            }:
+                parser.error(
+                    "--bridge-claude-pool-codex-review cannot be combined "
+                    "with a non-Claude-pool --bridge-agent-runtime"
+                )
+            bridge_agent_runtime = "claude_pool"
+            bridge_runtime_policy = PRIMARY_IMPL_SECONDARY_REVIEW_POLICY
+        if bridge_runtime_policy == DEFAULT_RUNTIME_POLICY:
+            bridge_runtime_policy = None
+
         bridge_config.update({
             "channel": args.bridge_channel,
             "workspace": args.bridge_workspace,
             "mode": args.bridge_mode,
-            "agent_runtime": args.bridge_agent_runtime,
+            "agent_runtime": bridge_agent_runtime,
+            "runtime_policy": bridge_runtime_policy,
             "claude_only": args.bridge_claude_only,
             "budget": args.bridge_budget,
             "autonomous_remainder": args.bridge_autonomous_remainder,

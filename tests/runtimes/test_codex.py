@@ -25,6 +25,8 @@ class TestNormalizeAgentRuntime:
     def test_accepts_aliases(self):
         assert normalize_agent_runtime("openai") == "codex"
         assert normalize_agent_runtime("anthropic") == "claude"
+        assert normalize_agent_runtime("claude-pool") == "claude_pool"
+        assert normalize_agent_runtime("pool") == "claude_pool"
 
     def test_rejects_unknown_value(self):
         with pytest.raises(ValueError, match="Unsupported agent runtime"):
@@ -35,6 +37,9 @@ class TestNormalizeAgentRuntime:
 
     def test_claude_secondary_is_codex(self):
         assert secondary_agent_runtime_name("claude") == "codex"
+
+    def test_claude_pool_secondary_is_codex(self):
+        assert secondary_agent_runtime_name("claude_pool") == "codex"
 
     def test_claude_secondary_stays_claude_in_single_runtime_mode(self):
         assert secondary_agent_runtime_name("claude", single_runtime=True) == "claude"
@@ -420,7 +425,7 @@ class TestCodexAgentRuntime:
         async def _broken_stdout(*_args, **_kwargs):
             raise ValueError("boom")
 
-        async def _empty_stderr(_stderr):
+        async def _empty_stderr(_stderr, **_kwargs):
             return ""
 
         monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_create_subprocess_exec)
@@ -497,7 +502,7 @@ class TestCodexAgentRuntime:
 
         observed: dict[str, str] = {}
 
-        async def _fake_run_process(command, _prompt, _output_type, *, env=None):
+        async def _fake_run_process(command, _prompt, _output_type, *, env=None, **_kwargs):
             output_path = command[command.index("-o") + 1]
             schema_path = command[command.index("--output-schema") + 1]
             observed["output_path"] = output_path
