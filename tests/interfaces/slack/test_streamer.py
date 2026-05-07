@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
+
+import pytest
 
 from iriai_build_v2.interfaces.slack.streamer import (
     SlackStreamer,
@@ -244,6 +247,23 @@ class TestStructuredOutputSuppression:
         assert streamer._final_text == ""
         assert streamer._message_ts is None
         assert streamer._current_status == ""
+
+    @pytest.mark.asyncio
+    async def test_quiet_verbosity_suppresses_progress_done_and_final_text(self):
+        adapter = MagicMock()
+        adapter.post_message = AsyncMock(return_value="1.234")
+        adapter.update_message = AsyncMock()
+        streamer = SlackStreamer(adapter, "C123", verbosity="quiet")
+
+        streamer.on_message(AssistantMessage(
+            content=[TextBlock("final answer")],
+            id="msg-quiet-1",
+        ))
+        streamer.on_message(ResultMessage(structured_output=None))
+        await asyncio.sleep(0)
+
+        adapter.post_message.assert_not_awaited()
+        adapter.update_message.assert_not_awaited()
 
 
 # ── _extract_question empty Envelope handling ────────────────────────────

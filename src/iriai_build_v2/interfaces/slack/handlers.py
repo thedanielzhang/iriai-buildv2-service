@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     from .adapter import SlackAdapter
 
 logger = logging.getLogger(__name__)
+_SLACK_MENTION_RE = re.compile(r"<@([A-Z0-9]+)(?:\|[^>]+)?>")
 
 
 async def handle_message(adapter: SlackAdapter, event: dict) -> None:
@@ -22,17 +23,27 @@ async def handle_message(adapter: SlackAdapter, event: dict) -> None:
 
     Applies multiplayer/singleplayer filtering before forwarding.
     """
-    # Ignore bot's own messages
-    if event.get("user") == adapter.bot_user_id:
-        return
-
-    # Ignore bot_message subtypes (other bots/integrations)
-    subtype = event.get("subtype")
-    if subtype in ("bot_message", "message_changed", "message_deleted"):
+    # Ignore bot/app-origin messages. Slack does not always set subtype=bot_message
+    # for app-authored messages, so filter on every bot marker before workflow
+    # routing. Otherwise a supervisor/status bot can accidentally resume a
+    # recovered workflow because workflow channels treat "any message" as input.
+    if _is_bot_message(event, adapter.bot_user_id):
         return
 
     text = event.get("text", "")
     channel = event.get("channel", "")
+    bot_mention = f"<@{adapter.bot_user_id}>"
+    if _mentions_ignored_user(
+        text,
+        adapter.ignored_mention_user_ids,
+        adapter.bot_user_id,
+    ):
+        logger.debug(
+            "[slack] ignoring message in %s directed at ignored mention: %s",
+            channel,
+            text[:100],
+        )
+        return
 
     if channel == adapter.planning_channel:
         # Planning channel: only forward messages matching a [TAG] pattern
@@ -42,10 +53,13 @@ async def handle_message(adapter: SlackAdapter, event: dict) -> None:
             return
     elif adapter.get_channel_mode(channel) == "multiplayer":
         # Multiplayer workflow channels: only respond if bot is @mentioned
-        bot_mention = f"<@{adapter.bot_user_id}>"
         if bot_mention not in text:
             return
         # Strip the mention from the message text
+        text = re.sub(rf"\s*{re.escape(bot_mention)}\s*", " ", text).strip()
+    elif bot_mention in text:
+        # Singleplayer channels accept natural messages, but still clean up an
+        # explicit mention when Slack delivers an app_mention event.
         text = re.sub(rf"\s*{re.escape(bot_mention)}\s*", " ", text).strip()
 
     # singleplayer: all messages pass through
@@ -59,6 +73,40 @@ async def handle_message(adapter: SlackAdapter, event: dict) -> None:
 
     if adapter.on_message_callback:
         await adapter.on_message_callback({**event, "text": text})
+
+
+def _mentions_ignored_user(
+    text: str,
+    ignored_user_ids: set[str],
+    own_bot_user_id: str | None,
+) -> bool:
+    """Return True when a human message is explicitly addressed elsewhere."""
+
+    if not ignored_user_ids:
+        return False
+    mentions = set(_SLACK_MENTION_RE.findall(text or ""))
+    if not mentions or (own_bot_user_id and own_bot_user_id in mentions):
+        return False
+    return bool(mentions & ignored_user_ids)
+
+
+def _is_bot_message(event: dict, own_bot_user_id: str | None) -> bool:
+    """Return True for Slack messages that were not authored by a human user."""
+
+    if own_bot_user_id and event.get("user") == own_bot_user_id:
+        return True
+    subtype = event.get("subtype")
+    if subtype in ("bot_message", "message_changed", "message_deleted"):
+        return True
+    return any(
+        event.get(key)
+        for key in (
+            "bot_id",
+            "app_id",
+            "bot_profile",
+            "is_bot",
+        )
+    )
 
 
 async def handle_action(adapter: SlackAdapter, body: dict, action: dict) -> None:

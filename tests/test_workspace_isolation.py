@@ -131,6 +131,118 @@ async def test_ensure_task_worktrees_scaffolds_new_repo_inside_feature_sandbox(
     assert not (workspace_root / "services" / "newsvc").exists()
 
 
+@pytest.mark.asyncio
+async def test_ensure_task_worktrees_normalizes_nested_repo_path_to_existing_parent(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    workspace_root = tmp_path / "workspace"
+    source_repo = workspace_root / "iriai-studio"
+    (source_repo / ".git").mkdir(parents=True)
+
+    calls: list[tuple[Path, tuple[str, ...]]] = []
+
+    async def _fake_run_git(cwd: Path, *args: str) -> str:
+        calls.append((cwd, args))
+        if args and args[0] == "clone":
+            dest = Path(args[-1])
+            dest.mkdir(parents=True, exist_ok=True)
+            (dest / ".git").mkdir(exist_ok=True)
+        return ""
+
+    async def _unexpected_scaffold_repo(path: Path) -> None:
+        raise AssertionError(f"must not scaffold nested repo at {path}")
+
+    monkeypatch.setattr(
+        "iriai_build_v2.workflows.develop.phases.implementation._run_git",
+        _fake_run_git,
+    )
+    monkeypatch.setattr(
+        "iriai_build_v2.workflows.develop.phases.implementation._scaffold_repo",
+        _unexpected_scaffold_repo,
+    )
+
+    task = ImplementationTask(
+        id="task-nested",
+        name="Repair retired dashboard",
+        description="Task metadata incorrectly points at a nested repo.",
+        repo_path="iriai-studio/src/webviews/dashboard",
+        file_scope=[
+            TaskFileScope(
+                path="iriai-studio/src/webviews/dashboard/README.md",
+                action="modify",
+            )
+        ],
+    )
+
+    runner = SimpleNamespace(services={"workspace_manager": SimpleNamespace(_base=workspace_root)})
+    feature = SimpleNamespace(slug="feat")
+
+    await _ensure_task_worktrees(runner, feature, [task])
+
+    dest = workspace_root / ".iriai" / "features" / "feat" / "repos" / "iriai-studio"
+    nested_dest = dest / "src" / "webviews" / "dashboard"
+    assert task.repo_path == "iriai-studio"
+    assert dest.exists()
+    assert (dest / ".git").exists()
+    assert not (nested_dest / ".git").exists()
+    assert any(args[0] == "clone" and Path(args[-1]) == dest for _cwd, args in calls)
+
+
+@pytest.mark.asyncio
+async def test_ensure_task_worktrees_reuses_feature_repo_for_nested_resume_path(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    workspace_root = tmp_path / "workspace"
+    feature_repo = (
+        workspace_root
+        / ".iriai"
+        / "features"
+        / "feat"
+        / "repos"
+        / "iriai-studio"
+    )
+    (feature_repo / ".git").mkdir(parents=True)
+
+    async def _unexpected_run_git(cwd: Path, *args: str) -> str:
+        raise AssertionError(f"must not run git for existing feature repo: {cwd} {args}")
+
+    async def _unexpected_scaffold_repo(path: Path) -> None:
+        raise AssertionError(f"must not scaffold nested repo at {path}")
+
+    monkeypatch.setattr(
+        "iriai_build_v2.workflows.develop.phases.implementation._run_git",
+        _unexpected_run_git,
+    )
+    monkeypatch.setattr(
+        "iriai_build_v2.workflows.develop.phases.implementation._scaffold_repo",
+        _unexpected_scaffold_repo,
+    )
+
+    task = ImplementationTask(
+        id="task-resume-nested",
+        name="Repair retired dashboard",
+        description="Resume metadata incorrectly points at a nested repo.",
+        repo_path="iriai-studio/src/webviews/dashboard",
+        file_scope=[
+            TaskFileScope(
+                path="iriai-studio/src/webviews/dashboard/README.md",
+                action="modify",
+            )
+        ],
+    )
+
+    runner = SimpleNamespace(services={"workspace_manager": SimpleNamespace(_base=workspace_root)})
+    feature = SimpleNamespace(slug="feat")
+
+    await _ensure_task_worktrees(runner, feature, [task])
+
+    assert task.repo_path == "iriai-studio"
+    assert (feature_repo / ".git").exists()
+    assert not (feature_repo / "src" / "webviews" / "dashboard" / ".git").exists()
+
+
 def test_remove_repo_path_quarantines_busy_directory(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

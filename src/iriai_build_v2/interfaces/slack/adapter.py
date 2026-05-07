@@ -64,6 +64,7 @@ class SlackAdapter:
         bot_token: str,
         planning_channel: str,
         mode: Literal["multiplayer", "singleplayer"] = "multiplayer",
+        ignored_mention_user_ids: set[str] | None = None,
     ) -> None:
         self._app_token = app_token
         self._bot_token = bot_token
@@ -73,6 +74,7 @@ class SlackAdapter:
         self._web = AsyncWebClient(token=bot_token)
         self._socket = SocketModeClient(app_token=app_token, web_client=self._web)
         self._bot_user_id: str | None = None
+        self._ignored_mention_user_ids = ignored_mention_user_ids or set()
         self._channel_modes: dict[str, str] = {}  # per-channel mode overrides
 
         # Callback hooks for inbound events (set by workflow/consumer later)
@@ -117,7 +119,7 @@ class SlackAdapter:
             event = req.payload.get("event", {})
             event_type = event.get("type", "")
 
-            if event_type == "message":
+            if event_type in {"message", "app_mention"}:
                 await handle_message(self, event)
             elif event_type == "reaction_added":
                 await handle_reaction(self, event)
@@ -284,6 +286,10 @@ class SlackAdapter:
     @property
     def bot_user_id(self) -> str | None:
         return self._bot_user_id
+
+    @property
+    def ignored_mention_user_ids(self) -> set[str]:
+        return set(self._ignored_mention_user_ids)
 
     @property
     def web(self) -> AsyncWebClient:

@@ -130,6 +130,48 @@ def test_queue_user_note_forwards_to_active_runtime():
     assert runtime.notes == [("feat-1", "Please include rollback notes.")]
 
 
+def test_quiet_verbosity_disables_silent_invocation_observer():
+    adapter = _RecoveringAdapter()
+    interaction = _RecoveringInteraction()
+    orchestrator = SlackWorkflowOrchestrator(
+        adapter=adapter,
+        interaction_runtime=interaction,
+        slack_verbosity="quiet",
+    )
+
+    assert orchestrator._make_invocation_observer("feat-1", "full-develop", "C123") is None
+
+
+@pytest.mark.asyncio
+async def test_quiet_verbosity_suppresses_workflow_completion_message():
+    class _Runner:
+        def bind_invocation_observer(self, _observer):
+            from contextlib import nullcontext
+
+            return nullcontext()
+
+        async def execute_workflow(self, _workflow, _feature, _state):
+            return None
+
+    feature = SimpleNamespace(
+        id="feat-1",
+        workflow_name="full-develop",
+        metadata={},
+    )
+    adapter = _RecoveringAdapter()
+    interaction = _RecoveringInteraction()
+    orchestrator = SlackWorkflowOrchestrator(
+        adapter=adapter,
+        interaction_runtime=interaction,
+        slack_verbosity="quiet",
+    )
+
+    await orchestrator._run_workflow(_Runner(), object(), feature, object(), "C123")
+
+    assert adapter.messages == []
+    assert adapter.reactions == [("CPLANNING", "", "white_check_mark")]
+
+
 @pytest.mark.asyncio
 async def test_recovery_preserves_saved_runtime_without_explicit_override():
     async def _list_active():

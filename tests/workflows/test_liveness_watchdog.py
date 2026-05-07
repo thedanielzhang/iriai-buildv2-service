@@ -13,11 +13,14 @@ import sys
 import time
 import types
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from iriai_compose import Workspace
+from iriai_compose.tasks import Ask
 
+from iriai_build_v2.agent_concurrency import AgentConcurrencyLimiter
 from iriai_build_v2.roles import implementer, verifier
 from iriai_build_v2.runtimes.claude import ClaudeAgentRuntime
 from iriai_build_v2.workflows._runner import (
@@ -41,6 +44,65 @@ class _FakeRuntime:
 class _ContextProvider:
     async def resolve(self, *_args, **_kwargs):
         return ""
+
+
+class _FeatureStore:
+    async def log_event(self, *_args, **_kwargs):
+        return None
+
+
+class _CountingRuntime:
+    name = "counting"
+    on_message = None
+
+    def __init__(self, *, fail_actor: str | None = None) -> None:
+        self.fail_actor = fail_actor
+        self.active = 0
+        self.max_active = 0
+
+    async def ask(self, task, **_kwargs):
+        self.active += 1
+        self.max_active = max(self.max_active, self.active)
+        try:
+            await asyncio.sleep(0.02)
+            if task.actor.name == self.fail_actor:
+                raise RuntimeError("boom")
+            return task.actor.name
+        finally:
+            self.active -= 1
+
+
+def _feature(feature_id: str = "bf123456"):
+    return SimpleNamespace(id=feature_id, workspace_id="main", metadata={})
+
+
+def _ask(name: str) -> Ask:
+    role = implementer.role.model_copy(
+        update={
+            "metadata": {
+                **implementer.role.metadata,
+                "liveness_timeout": 0,
+            }
+        }
+    )
+    return Ask(
+        actor=implementer.model_copy(update={"name": name, "role": role}),
+        prompt="do work",
+    )
+
+
+def _runner(runtime, limiter: AgentConcurrencyLimiter | None = None) -> TrackedWorkflowRunner:
+    return TrackedWorkflowRunner(
+        feature_store=_FeatureStore(),
+        agent_runtime=runtime,
+        secondary_runtime=None,
+        agent_concurrency_limiter=limiter,
+        interaction_runtimes={"terminal": object()},
+        artifacts=object(),
+        sessions=object(),
+        context_provider=_ContextProvider(),
+        workspaces={"main": Workspace(id="main", path=Path("/tmp"))},
+    )
 
 
 class TestLivenessTracker:
@@ -100,6 +162,53 @@ class TestAgentStalled:
     def test_is_runtime_error(self):
         exc = AgentStalled("test")
         assert isinstance(exc, RuntimeError)
+
+
+@pytest.mark.asyncio
+async def test_tracked_runner_limits_parallel_agent_invocations():
+    runtime = _CountingRuntime()
+    limiter = AgentConcurrencyLimiter(2)
+    runner = _runner(runtime, limiter)
+
+    results = await runner.parallel(
+        [_ask(f"worker-{idx}") for idx in range(5)],
+        _feature(),
+    )
+
+    assert results == [f"worker-{idx}" for idx in range(5)]
+    assert runtime.max_active == 2
+    assert limiter.active_count == 0
+    assert limiter.queued_count == 0
+
+
+@pytest.mark.asyncio
+async def test_shared_agent_limiter_caps_multiple_runners():
+    runtime = _CountingRuntime()
+    limiter = AgentConcurrencyLimiter(2)
+    runner_a = _runner(runtime, limiter)
+    runner_b = _runner(runtime, limiter)
+
+    await asyncio.gather(
+        runner_a.parallel([_ask(f"a-{idx}") for idx in range(3)], _feature("feat-a")),
+        runner_b.parallel([_ask(f"b-{idx}") for idx in range(3)], _feature("feat-b")),
+    )
+
+    assert runtime.max_active == 2
+    assert limiter.active_count == 0
+    assert limiter.queued_count == 0
+
+
+@pytest.mark.asyncio
+async def test_agent_limiter_releases_permit_after_runtime_error():
+    runtime = _CountingRuntime(fail_actor="fail")
+    limiter = AgentConcurrencyLimiter(1)
+    runner = _runner(runtime, limiter)
+
+    with pytest.raises(RuntimeError, match="boom"):
+        await runner.resolve(_ask("fail"), _feature())
+
+    assert limiter.active_count == 0
+    assert limiter.queued_count == 0
 
 
 class TestWatchdogIntegration:

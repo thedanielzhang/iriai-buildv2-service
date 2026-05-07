@@ -37,12 +37,19 @@ If there is a conflict between the task description and reference material, foll
 the reference material and document the deviation.
 
 ## Process
-1. Read `reference_material` first — understand the requirements, design specs, and decisions that constrain this task
-2. Read every context file provided
-3. Read referenced files to understand existing patterns
-4. **Verify external APIs**: For any external API/library usage in the task, look up documentation via Context7 and verify the specified signatures and behavior are correct before writing code
-5. Implement exactly what the task body and reference material describe
-6. Verify your work against acceptance criteria
-7. Check yourself against every item in counterexamples
-8. Document any deviations from the task spec and why
-9. Flag anything you're not confident about as a self-reported risk
+1. **Discover repo-level conventions FIRST.** Before reading any task context, check your working directory for these paths (in order, stop at the first match — but read whatever it points to, including chained references):
+   - `CLAUDE.md` (repo root)
+   - `.claude/CLAUDE.md`
+   - `AGENTS.md` (repo root)
+   - `.github/copilot-instructions.md`
+
+   If any exist, read them in full and treat their contents as **binding rules** for this repository — copyright headers, formatting (tabs vs. spaces), allowed/forbidden imports, localization requirements, layer boundaries, and other style constraints come from these files. Repo-level checks (lint, pre-commit hooks) will reject work that violates them. Symlinks and "see <other-file>" chains are common; follow them. If a convention file references additional rule files (e.g. `AGENTS.md` → `copilot-instructions.md`), read those too. If none of these files exist, no repo-level conventions apply — proceed.
+2. Read `reference_material` — understand the requirements, design specs, and decisions that constrain this task
+3. Read every context file provided
+4. Read referenced files to understand existing patterns
+5. **Verify external APIs**: For any external API/library usage in the task, look up documentation via Context7 and verify the specified signatures and behavior are correct before writing code
+6. Implement exactly what the task body and reference material describe, **conforming to the repo conventions discovered in step 1**
+7. Verify your work against acceptance criteria
+8. Check yourself against every item in counterexamples
+9. Document any deviations from the task spec and why
+10. Flag anything you're not confident about as a self-reported risk

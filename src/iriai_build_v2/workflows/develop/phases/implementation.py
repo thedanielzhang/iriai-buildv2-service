@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio as _asyncio
 import collections
+import dataclasses
 import hashlib
 import itertools
 import json
@@ -9,12 +10,18 @@ import logging
 import os
 import re
 import shutil
+import stat
 import subprocess
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 from uuid import uuid4
+
+try:
+    import grp
+except ImportError:  # pragma: no cover - non-Unix fallback.
+    grp = None  # type: ignore[assignment]
 
 from iriai_compose import AgentActor, Ask, Feature, Phase, WorkflowRunner, to_str
 from iriai_compose.actors import Role
@@ -94,7 +101,11 @@ DAG_EXPANDED_VERIFY_ENV = "IRIAI_DAG_EXPANDED_VERIFY"
 DAG_PARALLEL_REPAIR_ENV = "IRIAI_DAG_PARALLEL_REPAIR"
 DAG_PREFLIGHT_REPAIR_ENV = "IRIAI_DAG_PREFLIGHT_REPAIR"
 DAG_AUTO_RESOLVE_CONTRADICTIONS_ENV = "IRIAI_DAG_AUTO_RESOLVE_CONTRADICTIONS"
+DAG_WORKSPACE_PERMISSION_REPAIR_ENV = "IRIAI_DAG_WORKSPACE_PERMISSION_REPAIR"
+AGENT_SHARED_GROUP_ENV = "IRIAI_AGENT_SHARED_GROUP"
+DEFAULT_AGENT_SHARED_GROUP = "iriai-agents"
 CONTRADICTION_DECISIONS_KEY = "contradiction-decisions"
+COMMIT_FAILURE_OUTPUT_LIMIT = 12000
 
 DAG_REPAIR_ROLE_RUNTIMES: dict[str, str] = {
     # Under --bridge-claude-pool-codex-review, primary=Claude pool and
@@ -140,6 +151,1014 @@ def _dag_repair_runtime_for(
     fallback: str | None = None,
 ) -> str | None:
     return DAG_REPAIR_ROLE_RUNTIMES.get(role_or_lens, fallback)
+
+
+def _bounded_commit_output(value: str, *, limit: int = COMMIT_FAILURE_OUTPUT_LIMIT) -> str:
+    if len(value) <= limit:
+        return value
+    omitted = len(value) - limit
+    return f"{value[:limit]}\n\n[... truncated {omitted} chars ...]"
+
+
+@dataclass(slots=True)
+class CommitRepoOutcome:
+    repo_path: str
+    repo_name: str
+    message: str
+    status_before: str = ""
+    status_after: str = ""
+    dirty: bool = False
+    command: list[str] = field(default_factory=list)
+    exit_code: int = 0
+    stdout: str = ""
+    stderr: str = ""
+    commit_hash: str = ""
+    error: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "repo_path": self.repo_path,
+            "repo_name": self.repo_name,
+            "message": self.message,
+            "status_before": _bounded_commit_output(self.status_before),
+            "status_after": _bounded_commit_output(self.status_after),
+            "dirty": self.dirty,
+            "command": self.command,
+            "exit_code": self.exit_code,
+            "stdout": _bounded_commit_output(self.stdout),
+            "stderr": _bounded_commit_output(self.stderr),
+            "commit_hash": self.commit_hash,
+            "error": self.error,
+        }
+
+
+class WorkflowCommitError(RuntimeError):
+    """Raised when a dirty workflow repo cannot be committed."""
+
+    def __init__(self, message: str, outcomes: list[CommitRepoOutcome]) -> None:
+        self.outcomes = outcomes
+        self.successful_hashes = [
+            outcome.commit_hash for outcome in outcomes if outcome.commit_hash
+        ]
+        failed = [outcome for outcome in outcomes if outcome.error or outcome.exit_code]
+        failed_repos = ", ".join(
+            outcome.repo_name or outcome.repo_path for outcome in failed
+        ) or "unknown repo"
+        super().__init__(f"{message}: commit failed for {failed_repos}")
+
+    @property
+    def failed_outcomes(self) -> list[CommitRepoOutcome]:
+        return [
+            outcome for outcome in self.outcomes
+            if outcome.error or outcome.exit_code
+        ]
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "error": str(self),
+            "failed_repo_count": len(self.failed_outcomes),
+            "successful_commit_hashes": self.successful_hashes,
+            "outcomes": [outcome.to_dict() for outcome in self.outcomes],
+        }
+
+
+@dataclass(slots=True)
+class CommitFailureLocation:
+    file: str = ""
+    line: int = 0
+
+
+@dataclass(slots=True)
+class CommitForbiddenPathMatch:
+    path: str
+    repo_path: str
+    repo_name: str
+    manifest_rule: str
+    config_path: str
+    source: str
+    git_state: str = ""
+    line: int = 0
+    operator_required: bool = False
+    operator_reasons: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "path": self.path,
+            "repo_path": self.repo_path,
+            "repo_name": self.repo_name,
+            "manifest_rule": self.manifest_rule,
+            "config_path": self.config_path,
+            "source": self.source,
+            "git_state": self.git_state,
+            "line": self.line,
+            "operator_required": self.operator_required,
+            "operator_reasons": self.operator_reasons,
+        }
+
+
+@dataclass(slots=True)
+class DagDirectRepairRoute:
+    route: str
+    reason: str
+    signature: str
+    target_files: list[str] = field(default_factory=list)
+    skip_expanded_verify: bool = False
+    skip_parallel_repair: bool = False
+    skip_rca: bool = False
+    operator_required: bool = False
+    workspace_permission_repair: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "route": self.route,
+            "reason": self.reason,
+            "signature": self.signature,
+            "target_files": self.target_files,
+            "skip_expanded_verify": self.skip_expanded_verify,
+            "skip_parallel_repair": self.skip_parallel_repair,
+            "skip_rca": self.skip_rca,
+            "operator_required": self.operator_required,
+            "workspace_permission_repair": self.workspace_permission_repair,
+        }
+
+
+_COMMIT_HYGIENE_ROUTE = "commit_hygiene_focused"
+_MANIFEST_FORBIDDEN_CLEANUP_ROUTE = "manifest_forbidden_product_cleanup"
+_REPO_HYGIENE_ROUTE = "repo_hygiene_operator"
+_NORMAL_VERIFY_ROUTE = "normal_verify_repair"
+_MANIFEST_FORBIDDEN_MARKER = "manifest-forbidden product cleanup"
+_OPERATOR_REQUIRED_MARKER = "operator_required=true"
+_DAG_AUTHORITY_SEMANTIC_ROUTE = "semantic_verify_needed"
+_DAG_AUTHORITY_DB_TASK_RESULT_ROUTE = "db_task_result_drift"
+_DAG_AUTHORITY_TASK_SPEC_PROJECTION_ROUTE = "task_spec_projection_drift"
+_DAG_AUTHORITY_SOURCE_ARTIFACT_ROUTE = "source_dag_artifact_drift"
+_DAG_AUTHORITY_PRODUCT_WORKSPACE_ROUTE = "product_workspace_drift"
+_DAG_AUTHORITY_REPO_BLOCKER_ROUTE = "repo_or_permission_blocker"
+
+
+@dataclass(slots=True)
+class DagAuthorityGateOutcome:
+    route: str = _DAG_AUTHORITY_SEMANTIC_ROUTE
+    status: str = "not_applicable"
+    reason: str = ""
+    repair_results: list[ImplementationResult] = field(default_factory=list)
+    blocked_verdict: Verdict | None = None
+    report: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def handled(self) -> bool:
+        return bool(self.repair_results or self.blocked_verdict is not None)
+
+
+def _commit_failure_output(outcome: CommitRepoOutcome | None) -> str:
+    if outcome is None:
+        return ""
+    return outcome.stderr.strip() or outcome.stdout.strip() or outcome.error.strip()
+
+
+def _looks_like_file_path(value: str) -> bool:
+    if not value or "://" in value:
+        return False
+    normalized = value.replace("\\", "/")
+    if normalized.startswith(("/", "../", "./")):
+        return True
+    if "/" in normalized:
+        return True
+    return bool(re.search(r"\.[A-Za-z0-9]{1,8}$", normalized))
+
+
+def _normalize_commit_failure_path(
+    raw_path: str,
+    outcome: CommitRepoOutcome,
+) -> str:
+    path_text = raw_path.strip().strip("`'\"")
+    while path_text.startswith("./"):
+        path_text = path_text[2:]
+    if not path_text:
+        return ""
+    repo_path = Path(outcome.repo_path)
+    try:
+        path_obj = Path(path_text).expanduser()
+        if path_obj.is_absolute():
+            try:
+                path_text = path_obj.relative_to(repo_path).as_posix()
+            except ValueError:
+                return path_obj.as_posix()
+    except (OSError, RuntimeError, ValueError):
+        pass
+    path_text = path_text.replace("\\", "/")
+    repo_name = outcome.repo_name.strip()
+    if repo_name and path_text != repo_name and not path_text.startswith(f"{repo_name}/"):
+        return f"{repo_name}/{path_text}"
+    return path_text
+
+
+def _parse_commit_failure_location(
+    outcome: CommitRepoOutcome | None,
+) -> CommitFailureLocation:
+    locations = _parse_commit_failure_locations(outcome)
+    return locations[0] if locations else CommitFailureLocation()
+
+
+def _parse_commit_failure_locations(
+    outcome: CommitRepoOutcome | None,
+) -> list[CommitFailureLocation]:
+    if outcome is None:
+        return []
+    output = "\n".join(
+        part
+        for part in [
+            outcome.stderr,
+            outcome.stdout,
+            outcome.error,
+            outcome.status_after,
+            outcome.status_before,
+        ]
+        if part
+    )
+    locations: list[CommitFailureLocation] = []
+    seen: set[tuple[str, int]] = set()
+    patterns = [
+        re.compile(r"(?P<path>[^\n()]+?)\((?P<line>\d+),(?P<column>\d+)\)"),
+        re.compile(r"(?P<path>[^\s:\n][^:\n]*?):(?P<line>\d+):(?P<column>\d+)(?::|\s|$)"),
+        re.compile(r"(?P<path>[^\s:\n][^:\n]*?):(?P<line>\d+)(?::|\s|$)"),
+    ]
+    for pattern in patterns:
+        for match in pattern.finditer(output):
+            path = match.group("path").strip()
+            if not _looks_like_file_path(path):
+                continue
+            normalized = _normalize_commit_failure_path(path, outcome)
+            if not normalized:
+                continue
+            line = int(match.group("line") or 0)
+            key = (normalized, line)
+            if key in seen:
+                continue
+            seen.add(key)
+            locations.append(CommitFailureLocation(file=normalized, line=line))
+    return locations
+
+
+def _commit_failure_manifest_entries(
+    outcome: CommitRepoOutcome | None,
+) -> list[dict[str, str]]:
+    if outcome is None or not outcome.repo_path:
+        return []
+    config_path = (
+        Path(outcome.repo_path)
+        / "scripts"
+        / "verify-file-scope.expected-files.json"
+    )
+    try:
+        data = json.loads(config_path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    entries: list[dict[str, str]] = []
+    for item in data.get("forbidden_files", []):
+        path = ""
+        source = ""
+        if isinstance(item, str):
+            path = item
+        elif isinstance(item, dict):
+            raw_path = item.get("path")
+            raw_source = item.get("source")
+            path = raw_path if isinstance(raw_path, str) else ""
+            source = raw_source if isinstance(raw_source, str) else ""
+        path = path.strip().replace("\\", "/").strip("/")
+        if not path:
+            continue
+        entries.append({
+            "path": path,
+            "source": source.strip(),
+            "config_path": str(config_path),
+        })
+    return entries
+
+
+def _commit_repo_relative_path(path: str, outcome: CommitRepoOutcome) -> str:
+    normalized = path.strip().strip("`'\"").replace("\\", "/").strip("/")
+    repo_path = Path(outcome.repo_path)
+    if normalized:
+        try:
+            path_obj = Path(normalized).expanduser()
+            if path_obj.is_absolute():
+                normalized = path_obj.relative_to(repo_path).as_posix()
+        except Exception:
+            pass
+    repo_name = outcome.repo_name.strip().strip("/")
+    if repo_name and normalized.startswith(f"{repo_name}/"):
+        normalized = normalized[len(repo_name) + 1:]
+    return normalized.strip("/")
+
+
+def _commit_path_matches_forbidden_entry(
+    path: str,
+    entry: dict[str, str],
+) -> bool:
+    normalized = path.strip().replace("\\", "/").strip("/")
+    forbidden = str(entry.get("path", "")).strip().replace("\\", "/").strip("/")
+    if not normalized or not forbidden:
+        return False
+    return (
+        normalized == forbidden
+        or normalized.startswith(f"{forbidden}/")
+        or forbidden.endswith(f"/{normalized}")
+    )
+
+
+def _commit_status_paths(
+    status_text: str,
+    *,
+    source: str,
+) -> list[dict[str, str]]:
+    paths: list[dict[str, str]] = []
+    for raw_line in status_text.splitlines():
+        line = raw_line.rstrip()
+        if not line:
+            continue
+        if len(line) < 4:
+            continue
+        xy = line[:2]
+        path_text = line[3:].strip()
+        if not path_text:
+            continue
+        deletion_only = "D" in xy and all(char in {" ", "D"} for char in xy)
+        if deletion_only:
+            continue
+        if " -> " in path_text:
+            _, path_text = path_text.rsplit(" -> ", 1)
+        paths.append({
+            "path": path_text.strip().strip('"'),
+            "git_state": xy.strip() or xy,
+            "source": source,
+        })
+    return paths
+
+
+def _commit_deletion_only_status_paths(status_text: str) -> set[str]:
+    paths: set[str] = set()
+    for raw_line in status_text.splitlines():
+        line = raw_line.rstrip()
+        if len(line) < 4:
+            continue
+        xy = line[:2]
+        if "D" not in xy or not all(char in {" ", "D"} for char in xy):
+            continue
+        path_text = line[3:].strip()
+        if not path_text:
+            continue
+        if " -> " in path_text:
+            _, path_text = path_text.rsplit(" -> ", 1)
+        paths.add(path_text.strip().strip('"'))
+    return paths
+
+
+def _feature_workspace_agent_owner_write_is_trustworthy(repo_path: Path) -> bool:
+    parts = repo_path.resolve().parts
+    return ".iriai" not in parts or "features" not in parts
+
+
+def _path_agent_writable(path: Path, *, repo_path: Path) -> bool:
+    try:
+        st = path.stat()
+    except OSError:
+        return False
+    mode = st.st_mode
+    if mode & (stat.S_IWGRP | stat.S_IWOTH):
+        return True
+    if (
+        st.st_uid == os.getuid()
+        and mode & stat.S_IWUSR
+        and _feature_workspace_agent_owner_write_is_trustworthy(repo_path)
+    ):
+        return True
+    return False
+
+
+def _commit_forbidden_operator_reasons(
+    outcome: CommitRepoOutcome,
+    repo_relative_path: str,
+) -> list[str]:
+    repo_path = Path(outcome.repo_path)
+    reasons: list[str] = []
+    target = repo_path / repo_relative_path
+    parent = target.parent
+    if target.exists() and target.is_dir() and not _path_agent_writable(
+        target,
+        repo_path=repo_path,
+    ):
+        reasons.append(f"forbidden directory is not writable by repair agent: {target}")
+    if parent.exists() and not _path_agent_writable(parent, repo_path=repo_path):
+        reasons.append(f"parent directory is not writable by repair agent: {parent}")
+    git_index = repo_path / ".git" / "index"
+    if git_index.exists() and not _path_agent_writable(git_index, repo_path=repo_path):
+        reasons.append(f"git index is not writable by repair agent: {git_index}")
+    return reasons
+
+
+def _commit_forbidden_path_matches(
+    outcome: CommitRepoOutcome | None,
+) -> list[CommitForbiddenPathMatch]:
+    if outcome is None:
+        return []
+    entries = _commit_failure_manifest_entries(outcome)
+    if not entries:
+        return []
+    candidates: list[dict[str, str | int]] = []
+    candidates.extend(_commit_status_paths(outcome.status_after, source="status_after"))
+    candidates.extend(_commit_status_paths(outcome.status_before, source="status_before"))
+    deletion_only_paths = {
+        _commit_repo_relative_path(path, outcome)
+        for path in (
+            _commit_deletion_only_status_paths(outcome.status_after)
+            | _commit_deletion_only_status_paths(outcome.status_before)
+        )
+    }
+    for location in _parse_commit_failure_locations(outcome):
+        candidates.append({
+            "path": location.file,
+            "source": "hook_output",
+            "git_state": "",
+            "line": location.line,
+        })
+
+    matches: list[CommitForbiddenPathMatch] = []
+    seen: set[tuple[str, str, str]] = set()
+    for candidate in candidates:
+        raw_path = str(candidate.get("path", ""))
+        repo_relative = _commit_repo_relative_path(raw_path, outcome)
+        if not repo_relative:
+            continue
+        if (
+            str(candidate.get("source", "")) == "hook_output"
+            and repo_relative in deletion_only_paths
+            and not (Path(outcome.repo_path) / repo_relative).exists()
+        ):
+            continue
+        for entry in entries:
+            if not _commit_path_matches_forbidden_entry(repo_relative, entry):
+                continue
+            source = str(candidate.get("source", ""))
+            key = (repo_relative, str(entry.get("path", "")), source)
+            if key in seen:
+                continue
+            seen.add(key)
+            operator_reasons = _commit_forbidden_operator_reasons(
+                outcome,
+                repo_relative,
+            )
+            matches.append(CommitForbiddenPathMatch(
+                path=(
+                    f"{outcome.repo_name}/{repo_relative}"
+                    if outcome.repo_name
+                    else repo_relative
+                ),
+                repo_path=outcome.repo_path,
+                repo_name=outcome.repo_name,
+                manifest_rule=str(entry.get("path", "")),
+                config_path=str(entry.get("config_path", "")),
+                source=source,
+                git_state=str(candidate.get("git_state", "")),
+                line=int(candidate.get("line") or 0),
+                operator_required=bool(operator_reasons),
+                operator_reasons=operator_reasons,
+            ))
+    return matches
+
+
+def _is_repo_hygiene_outcome(outcome: CommitRepoOutcome | None) -> bool:
+    if outcome is None:
+        return False
+    if outcome.command == ["workflow-repo-hygiene-check"]:
+        return True
+    text = f"{outcome.error}\n{outcome.stderr}\n{outcome.stdout}".lower()
+    return (
+        "workflow repos with hygiene blockers" in text
+        or "embedded .git" in text
+        or "gitlink" in text
+    )
+
+
+def _commit_failure_issue(exc: WorkflowCommitError, *, stage: str) -> Issue:
+    failed = exc.failed_outcomes[0] if exc.failed_outcomes else None
+    detail = ""
+    if failed:
+        output = _commit_failure_output(failed)
+        if output:
+            detail = f" Hook/output excerpt: {_bounded_commit_output(output, limit=2000)}"
+    location = _parse_commit_failure_location(failed)
+    forbidden_matches = _commit_forbidden_path_matches(failed)
+    if forbidden_matches:
+        first = forbidden_matches[0]
+        operator_required = any(match.operator_required for match in forbidden_matches)
+        operator_text = ""
+        if operator_required:
+            reasons = []
+            for match in forbidden_matches:
+                reasons.extend(match.operator_reasons)
+            unique_reasons = list(dict.fromkeys(reasons))
+            operator_text = (
+                " Host workspace permission normalization is required before "
+                "dispatch because the repair agent may not be able to delete/stage "
+                "the forbidden path."
+            )
+            if unique_reasons:
+                operator_text += (
+                    " Permission evidence: "
+                    + "; ".join(unique_reasons[:3])
+                )
+        return Issue(
+            severity="blocker",
+            description=(
+                f"{_MANIFEST_FORBIDDEN_MARKER} required during {stage}; "
+                "pre-commit/husky output or git status references a path "
+                "forbidden by verify-file-scope.expected-files.json. "
+                "Do not repair this by adding ignore/suppression rules; "
+                "delete or port the forbidden product files and preserve "
+                "canonical coverage. "
+                f"Matched path: {first.path}; manifest rule: "
+                f"{first.manifest_rule}; git_state: {first.git_state or 'n/a'}; "
+                f"source: {first.source}.{operator_text}{detail}"
+            ),
+            file=first.path,
+            line=first.line or location.line,
+        )
+    if _is_repo_hygiene_outcome(failed):
+        return Issue(
+            severity="blocker",
+            description=(
+                f"workflow repo hygiene blocker during {stage}; operator/worktree "
+                f"cleanup is required before checkpoint.{detail}"
+            ),
+            file=location.file or (failed.repo_path if failed else ""),
+            line=location.line,
+        )
+    return Issue(
+        severity="major",
+        description=(
+            f"pre-commit/husky failed during {stage}; fix repo hygiene before "
+            f"checkpoint.{detail}"
+        ),
+        file=location.file or (failed.repo_path if failed else ""),
+        line=location.line,
+    )
+
+
+def _commit_failure_verdict(
+    exc: WorkflowCommitError,
+    *,
+    group_idx: int,
+    stage: str,
+) -> Verdict:
+    failed_repos = [
+        outcome.repo_name or outcome.repo_path for outcome in exc.failed_outcomes
+    ]
+    repo_summary = ", ".join(failed_repos) if failed_repos else "unknown repo"
+    return Verdict(
+        approved=False,
+        summary=(
+            f"Group {group_idx} cannot checkpoint: commit failed during {stage} "
+            f"for {repo_summary}."
+        ),
+        concerns=[_commit_failure_issue(exc, stage=stage)],
+    )
+
+
+def _commit_failure_payload(
+    exc: WorkflowCommitError,
+    *,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    payload = exc.to_payload()
+    matches = [
+        match.to_dict()
+        for outcome in exc.failed_outcomes
+        for match in _commit_forbidden_path_matches(outcome)
+    ]
+    if matches:
+        payload["manifest_forbidden_matches"] = matches
+    if metadata:
+        payload["metadata"] = metadata
+    return payload
+
+
+async def _record_commit_failure_artifact(
+    runner: WorkflowRunner,
+    feature: Feature,
+    key: str,
+    exc: WorkflowCommitError,
+    *,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    await runner.artifacts.put(
+        key,
+        json.dumps(_commit_failure_payload(exc, metadata=metadata), indent=2),
+        feature=feature,
+    )
+
+
+async def _record_dag_commit_failure(
+    runner: WorkflowRunner,
+    feature: Feature,
+    group_idx: int,
+    stage: str,
+    exc: WorkflowCommitError,
+    *,
+    message: str = "",
+    extra_metadata: dict[str, Any] | None = None,
+) -> None:
+    metadata = {
+        "group_idx": group_idx,
+        "stage": stage,
+        "message": message,
+    }
+    if extra_metadata:
+        metadata.update(extra_metadata)
+    await _record_commit_failure_artifact(
+        runner,
+        feature,
+        f"dag-commit-failure:g{group_idx}:{stage}",
+        exc,
+        metadata=metadata,
+    )
+    await _log_feature_event(
+        runner,
+        feature.id,
+        "dag_commit_failed",
+        "implementation",
+        content=f"g{group_idx}:{stage}",
+        metadata={
+            "group_idx": group_idx,
+            "stage": stage,
+            "failed_repo_count": len(exc.failed_outcomes),
+            "successful_commit_hashes": exc.successful_hashes,
+        },
+    )
+
+
+def _commit_failure_issue_kind(issue: Issue) -> str:
+    text = f"{issue.description}\n{issue.file}".lower()
+    if _MANIFEST_FORBIDDEN_MARKER in text:
+        return _MANIFEST_FORBIDDEN_CLEANUP_ROUTE
+    if (
+        "workflow repo hygiene blocker" in text
+        or "workflow repos with hygiene blockers" in text
+        or "embedded .git" in text
+        or "gitlink" in text
+    ):
+        return _REPO_HYGIENE_ROUTE
+    if (
+        "pre-commit/husky failed" in text
+        or ("commit failed" in text and ("pre-commit" in text or "husky" in text))
+    ):
+        return _COMMIT_HYGIENE_ROUTE
+    return _NORMAL_VERIFY_ROUTE
+
+
+def _is_deterministic_dag_preflight_issue(issue: Issue) -> bool:
+    text = f"{issue.description}\n{issue.file}".lower()
+    return bool(
+        _MANIFEST_FORBIDDEN_MARKER in text
+        or "dag-task:" in text
+        or "source artifact:" in text
+        or "source artifacts:" in text
+        or "manifest-forbidden/stale path" in text
+        or "reports changed file that is missing from the feature workspace" in text
+        or "repair stale task metadata" in text
+        or "programmatic dag preflight" in text
+    )
+
+
+def _direct_route_target(issue: Issue) -> str:
+    if not issue.file:
+        return ""
+    if issue.line:
+        return f"{issue.file}:{issue.line}"
+    return issue.file
+
+
+def _direct_route_issue_operator_required(issue: Issue) -> bool:
+    return _OPERATOR_REQUIRED_MARKER in issue.description
+
+
+def _normalize_direct_route_signature(verdict: Verdict, route: str) -> str:
+    parts = [route]
+    for issue in sorted(
+        verdict.concerns,
+        key=lambda item: (
+            item.file,
+            item.line,
+            re.sub(r"\s+", " ", item.description.strip().lower()),
+        ),
+    ):
+        description = re.sub(r"\s+", " ", issue.description.strip().lower())
+        description = re.sub(r"retry-\d+", "retry-N", description)
+        description = re.sub(r"attempt \d+", "attempt N", description)
+        parts.append(f"{issue.file}:{issue.line}:{description[:500]}")
+    return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()
+
+
+def _classify_dag_direct_repair_route(verdict: object) -> DagDirectRepairRoute:
+    if not isinstance(verdict, Verdict) or verdict.approved:
+        return DagDirectRepairRoute(
+            route=_NORMAL_VERIFY_ROUTE,
+            reason="not_a_failed_verdict",
+            signature="",
+        )
+    if verdict.gaps:
+        return DagDirectRepairRoute(
+            route=_NORMAL_VERIFY_ROUTE,
+            reason="verdict_has_gaps",
+            signature="",
+        )
+    failed_checks = [check for check in verdict.checks if check.result == "FAIL"]
+    if failed_checks:
+        return DagDirectRepairRoute(
+            route=_NORMAL_VERIFY_ROUTE,
+            reason="verdict_has_failed_checks",
+            signature="",
+        )
+    if not verdict.concerns:
+        return DagDirectRepairRoute(
+            route=_NORMAL_VERIFY_ROUTE,
+            reason="verdict_has_no_concerns",
+            signature="",
+        )
+
+    kinds = [_commit_failure_issue_kind(issue) for issue in verdict.concerns]
+    if any(kind == _MANIFEST_FORBIDDEN_CLEANUP_ROUTE for kind in kinds) and all(
+        kind == _MANIFEST_FORBIDDEN_CLEANUP_ROUTE
+        or _is_deterministic_dag_preflight_issue(issue)
+        for kind, issue in zip(kinds, verdict.concerns)
+    ):
+        targets = sorted({
+            target
+            for kind, issue in zip(kinds, verdict.concerns)
+            if kind == _MANIFEST_FORBIDDEN_CLEANUP_ROUTE
+            if (target := _direct_route_target(issue))
+        })
+        operator_required = any(
+            _direct_route_issue_operator_required(issue)
+            for issue in verdict.concerns
+        )
+        return DagDirectRepairRoute(
+            route=_MANIFEST_FORBIDDEN_CLEANUP_ROUTE,
+            reason=(
+                "manifest_forbidden_cleanup_operator_required"
+                if operator_required
+                else "manifest_forbidden_cleanup"
+            ),
+            signature=_normalize_direct_route_signature(
+                verdict,
+                _MANIFEST_FORBIDDEN_CLEANUP_ROUTE,
+            ),
+            target_files=targets,
+            skip_expanded_verify=True,
+            skip_parallel_repair=True,
+            skip_rca=True,
+            operator_required=operator_required,
+        )
+    if any(kind == _NORMAL_VERIFY_ROUTE for kind in kinds):
+        return DagDirectRepairRoute(
+            route=_NORMAL_VERIFY_ROUTE,
+            reason="verdict_has_non_commit_concerns",
+            signature="",
+        )
+    if all(kind == _REPO_HYGIENE_ROUTE for kind in kinds):
+        targets = sorted({
+            target
+            for issue in verdict.concerns
+            if (target := _direct_route_target(issue))
+        })
+        return DagDirectRepairRoute(
+            route=_REPO_HYGIENE_ROUTE,
+            reason="repo_hygiene_only_verdict",
+            signature=_normalize_direct_route_signature(verdict, _REPO_HYGIENE_ROUTE),
+            target_files=targets,
+            skip_expanded_verify=True,
+            skip_parallel_repair=True,
+            skip_rca=True,
+            operator_required=True,
+        )
+    if all(kind == _COMMIT_HYGIENE_ROUTE for kind in kinds):
+        targets = sorted({
+            target
+            for issue in verdict.concerns
+            if (target := _direct_route_target(issue))
+        })
+        return DagDirectRepairRoute(
+            route=_COMMIT_HYGIENE_ROUTE,
+            reason="commit_hygiene_only_verdict",
+            signature=_normalize_direct_route_signature(verdict, _COMMIT_HYGIENE_ROUTE),
+            target_files=targets,
+            skip_expanded_verify=True,
+            skip_parallel_repair=True,
+            skip_rca=True,
+        )
+    if all(kind == _MANIFEST_FORBIDDEN_CLEANUP_ROUTE for kind in kinds):
+        targets = sorted({
+            target
+            for issue in verdict.concerns
+            if (target := _direct_route_target(issue))
+        })
+        operator_required = any(
+            _direct_route_issue_operator_required(issue)
+            for issue in verdict.concerns
+        )
+        return DagDirectRepairRoute(
+            route=_MANIFEST_FORBIDDEN_CLEANUP_ROUTE,
+            reason=(
+                "manifest_forbidden_commit_failure_operator_required"
+                if operator_required
+                else "manifest_forbidden_commit_failure"
+            ),
+            signature=_normalize_direct_route_signature(
+                verdict,
+                _MANIFEST_FORBIDDEN_CLEANUP_ROUTE,
+            ),
+            target_files=targets,
+            skip_expanded_verify=True,
+            skip_parallel_repair=True,
+            skip_rca=True,
+            operator_required=operator_required,
+        )
+    return DagDirectRepairRoute(
+        route=_NORMAL_VERIFY_ROUTE,
+        reason="mixed_deterministic_routes",
+        signature="",
+    )
+
+
+async def _record_dag_direct_repair_route(
+    runner: WorkflowRunner,
+    feature: Feature,
+    group_idx: int,
+    retry: int,
+    route: DagDirectRepairRoute,
+    *,
+    status: str,
+    source_verdict_key: str,
+    guardrail_decision: str,
+) -> None:
+    payload = route.to_dict()
+    payload.update({
+        "group_idx": group_idx,
+        "retry": retry,
+        "status": status,
+        "source_verdict_key": source_verdict_key,
+        "guardrail_decision": guardrail_decision,
+    })
+    await runner.artifacts.put(
+        f"dag-direct-repair-route:g{group_idx}:retry-{retry}",
+        json.dumps(payload, indent=2),
+        feature=feature,
+    )
+
+
+async def _direct_route_repeated_signature(
+    runner: WorkflowRunner,
+    feature: Feature,
+    group_idx: int,
+    retry: int,
+    route: DagDirectRepairRoute,
+) -> bool:
+    if retry <= 0 or not route.signature:
+        return False
+    if route.route == _MANIFEST_FORBIDDEN_CLEANUP_ROUTE and retry <= 1:
+        return False
+    previous = await runner.artifacts.get(
+        f"dag-direct-repair-route:g{group_idx}:retry-{retry - 1}",
+        feature=feature,
+    )
+    if not previous:
+        return False
+    try:
+        payload = json.loads(previous)
+    except (TypeError, ValueError):
+        return False
+    return (
+        payload.get("route") == route.route
+        and payload.get("signature") == route.signature
+        and payload.get("status") in {"selected", "blocked_repeat"}
+    )
+
+
+def _repeated_direct_route_verdict(
+    *,
+    group_idx: int,
+    retry: int,
+    route: DagDirectRepairRoute,
+) -> Verdict:
+    target = route.target_files[0] if route.target_files else ""
+    file = target
+    line = 0
+    if ":" in target:
+        maybe_file, maybe_line = target.rsplit(":", 1)
+        if maybe_line.isdigit():
+            file = maybe_file
+            line = int(maybe_line)
+    return Verdict(
+        approved=False,
+        summary=(
+            f"Group {group_idx} cannot continue: deterministic {route.route} "
+            f"blocker repeated after focused repair attempt retry-{retry - 1}."
+        ),
+        concerns=[
+            Issue(
+                severity="blocker",
+                description=(
+                    "The same deterministic commit/worktree blocker repeated "
+                    "after a focused repair attempt; operator review is required "
+                    "before another broad repair cycle."
+                ),
+                file=file,
+                line=line,
+            )
+        ],
+    )
+
+
+def _bug_commit_failure_verdict(
+    exc: WorkflowCommitError,
+    *,
+    bug_id: str,
+    stage: str,
+) -> Verdict:
+    failed_repos = [
+        outcome.repo_name or outcome.repo_path for outcome in exc.failed_outcomes
+    ]
+    repo_summary = ", ".join(failed_repos) if failed_repos else "unknown repo"
+    issue = _commit_failure_issue(exc, stage=stage)
+    issue.description = (
+        f"pre-commit/husky failed while committing fix for {bug_id}; "
+        f"fix repo hygiene before reverify. "
+        f"{issue.description}"
+    )
+    return Verdict(
+        approved=False,
+        summary=(
+            f"Commit failed while applying {bug_id} during {stage} "
+            f"for {repo_summary}."
+        ),
+        concerns=[issue],
+    )
+
+
+async def _record_bug_commit_failure(
+    runner: WorkflowRunner,
+    feature: Feature,
+    source: str,
+    bug_id: str,
+    attempt_number: int,
+    stage: str,
+    exc: WorkflowCommitError,
+    *,
+    message: str = "",
+) -> Verdict:
+    artifact_key = (
+        f"bug-commit-failure:{source}:{bug_id}:attempt-{attempt_number}:{stage}"
+    )
+    await _record_commit_failure_artifact(
+        runner,
+        feature,
+        artifact_key,
+        exc,
+        metadata={
+            "source": source,
+            "bug_id": bug_id,
+            "attempt_number": attempt_number,
+            "stage": stage,
+            "message": message,
+        },
+    )
+    verdict = _bug_commit_failure_verdict(exc, bug_id=bug_id, stage=stage)
+    await runner.artifacts.put(
+        f"bug-reverify:{source}:{bug_id}",
+        to_str(verdict),
+        feature=feature,
+    )
+    if isinstance(verdict, Verdict):
+        ledger = await _load_ledger(runner, feature)
+        ledger = _update_ledger(ledger, verdict, f"commit:{source}", 0)
+        await _save_ledger(runner, feature, ledger)
+    await _log_feature_event(
+        runner,
+        feature.id,
+        "bug_commit_failed",
+        "implementation",
+        content=f"{source}:{bug_id}:{stage}",
+        metadata={
+            "source": source,
+            "bug_id": bug_id,
+            "attempt_number": attempt_number,
+            "stage": stage,
+            "artifact_key": artifact_key,
+            "failed_repo_count": len(exc.failed_outcomes),
+            "successful_commit_hashes": exc.successful_hashes,
+        },
+    )
+    return verdict
 
 
 async def _log_feature_event(
@@ -344,6 +1363,82 @@ def _discover_repo(file_path: str, workspace_root: Path) -> Path | None:
     return None
 
 
+def _normalize_workspace_repo_path(
+    repo_path: str,
+    workspace_root: Path,
+    *,
+    feature_root: Path | None = None,
+) -> tuple[str, str | None]:
+    """Return a safe workspace repo path and the rejected nested request, if any.
+
+    Exact existing repos are valid, even when their workspace-relative path has
+    multiple segments. Missing paths nested inside an existing repo are not valid
+    repo boundaries; treating them as new repos creates embedded .git directories
+    in the feature worktree.
+    """
+    normalized = str(Path((repo_path or "").strip().replace("\\", "/").strip("/")))
+    if not normalized or normalized == ".":
+        return "", None
+
+    if (workspace_root / normalized / ".git").exists():
+        return normalized, None
+
+    parts = Path(normalized).parts
+    search_roots = [workspace_root]
+    if feature_root is not None:
+        search_roots.append(feature_root)
+
+    for root in search_roots:
+        for depth in range(1, len(parts)):
+            candidate_rel = Path(*parts[:depth])
+            candidate = root / candidate_rel
+            if (candidate / ".git").exists():
+                return candidate_rel.as_posix(), normalized
+
+    if feature_root is not None and (feature_root / normalized / ".git").exists():
+        return normalized, None
+
+    return normalized, None
+
+
+def _repo_action_rank(action: str) -> int:
+    return {"read_only": 0, "new": 1, "extend": 2}.get(action, 0)
+
+
+def _remember_repo_needed(
+    repos_needed: dict[str, str],
+    repo_path: str,
+    action: str,
+    *,
+    workspace_root: Path,
+    feature_root: Path | None = None,
+    task_id: str = "",
+) -> str:
+    safe_repo_path, nested_request = _normalize_workspace_repo_path(
+        repo_path,
+        workspace_root,
+        feature_root=feature_root,
+    )
+    if not safe_repo_path:
+        return ""
+    if nested_request:
+        action = "extend"
+        logger.warning(
+            "Task %s requested nested repo boundary %s inside existing repo %s; "
+            "using the existing repo to avoid embedded .git creation",
+            task_id or "<unknown>",
+            nested_request,
+            safe_repo_path,
+        )
+    elif action == "new" and (workspace_root / safe_repo_path / ".git").exists():
+        action = "extend"
+
+    existing = repos_needed.get(safe_repo_path)
+    if existing is None or _repo_action_rank(action) > _repo_action_rank(existing):
+        repos_needed[safe_repo_path] = action
+    return safe_repo_path
+
+
 def _infer_new_repo_from_tasks(
     tasks: list[ImplementationTask],
 ) -> dict[str, list[str]]:
@@ -410,7 +1505,16 @@ async def _ensure_task_worktrees(
                 if fs.action in ("create", "modify"):
                     action = "extend"
                     break
-            repos_needed.setdefault(task.repo_path, action)
+            safe_repo_path = _remember_repo_needed(
+                repos_needed,
+                task.repo_path,
+                action,
+                workspace_root=workspace_root,
+                feature_root=feature_root,
+                task_id=task.id,
+            )
+            if safe_repo_path and safe_repo_path != task.repo_path:
+                task.repo_path = safe_repo_path
             continue
 
         # 2. Discover existing repos from file_scope
@@ -418,7 +1522,14 @@ async def _ensure_task_worktrees(
             repo_path = _discover_repo(fs.path, workspace_root)
             if repo_path:
                 action = "read_only" if fs.action == "read_only" else "extend"
-                repos_needed.setdefault(str(repo_path), action)
+                _remember_repo_needed(
+                    repos_needed,
+                    str(repo_path),
+                    action,
+                    workspace_root=workspace_root,
+                    feature_root=feature_root,
+                    task_id=task.id,
+                )
 
     # 3. Infer new repos from common-prefix for unresolved writable paths
     unresolved = [
@@ -432,7 +1543,14 @@ async def _ensure_task_worktrees(
     if unresolved:
         new_repos = _infer_new_repo_from_tasks(unresolved)
         for repo_path in new_repos:
-            repos_needed.setdefault(repo_path, "new")
+            _remember_repo_needed(
+                repos_needed,
+                repo_path,
+                "new",
+                workspace_root=workspace_root,
+                feature_root=feature_root,
+                task_id=",".join(new_repos.get(repo_path, [])),
+            )
 
     # 4. Create feature-local repo copies
     for ws_rel_path, action in repos_needed.items():
@@ -445,12 +1563,32 @@ async def _ensure_task_worktrees(
         source_path = workspace_root / ws_rel_path
 
         if action == "new":
+            safe_repo_path, nested_request = _normalize_workspace_repo_path(
+                ws_rel_path,
+                workspace_root,
+                feature_root=feature_root,
+            )
+            if nested_request:
+                raise RuntimeError(
+                    "Refusing to scaffold nested workflow repo "
+                    f"{nested_request!r} inside existing repo {safe_repo_path!r}"
+                )
             logger.info("Scaffolding new feature-local repo at %s", worktree_dest)
             worktree_dest.parent.mkdir(parents=True, exist_ok=True)
             await _scaffold_repo(worktree_dest)
             continue
 
         if not (source_path / ".git").exists():
+            safe_repo_path, nested_request = _normalize_workspace_repo_path(
+                ws_rel_path,
+                workspace_root,
+                feature_root=feature_root,
+            )
+            if nested_request:
+                raise RuntimeError(
+                    "Refusing to scaffold missing workflow repo "
+                    f"{nested_request!r} inside existing repo {safe_repo_path!r}"
+                )
             logger.info("Scaffolding feature-local repo at %s", worktree_dest)
             worktree_dest.parent.mkdir(parents=True, exist_ok=True)
             await _scaffold_repo(worktree_dest)
@@ -1014,7 +2152,13 @@ class ImplementationPhase(Phase):
                     test_result.model_dump_json(),
                     feature=feature,
                 )
-                await _commit_repos(runner, feature, "test: add tests")
+                await _commit_repos(
+                    runner,
+                    feature,
+                    "test: add tests",
+                    failure_key="dag-commit-failure:test-authoring:commit",
+                    failure_metadata={"stage": "test-authoring"},
+                )
 
             # ── Step 5: Full QA (dynamic) ─────────────────────────────────
             if await runner.artifacts.get("dag-gate:qa", feature=feature):
@@ -1519,6 +2663,8 @@ async def _verify_and_fix_group(
     verify_fn: Any | None = None,
     fix_context: str = "",
     known_task_ids: set[str] | None = None,
+    initial_verdict: object | None = None,
+    initial_verdict_key: str | None = None,
 ) -> tuple[bool, str]:
     """Verify a group's implementation and fix issues via RCA → fix → re-verify.
 
@@ -1590,81 +2736,93 @@ async def _verify_and_fix_group(
         )
         group_tasks[:] = spec_reconcile.tasks
     group_files = _collect_files(verify_results_context)
-    logger.info(
-        "DAG group verify starting group=%d attempt=initial runtime=%s rca_runtime=%s "
-        "tasks=%s files=%d results=%d",
-        group_idx,
-        dag_review_runtime or "<default>",
-        dag_rca_runtime or "<default>",
-        [task.id for task in group_tasks],
-        len(group_files),
-        len(results),
-    )
-    await _log_feature_event(
-        runner,
-        feature.id,
-        "dag_verify_start",
-        "implementation",
-        content=f"g{group_idx}:initial",
-        metadata={
-            "group_idx": group_idx,
-            "retry": "initial",
-            "runtime": dag_review_runtime,
-            "task_ids": [task.id for task in group_tasks],
-            "file_count": len(group_files),
-            "result_count": len(results),
-        },
-    )
-    verdict: object | None = None
-    if verify_fn is None:
-        verdict = await _run_dag_group_preflight(
-            runner,
-            feature,
+    verdict: object | None = initial_verdict
+    if initial_verdict is None:
+        logger.info(
+            "DAG group verify starting group=%d attempt=initial runtime=%s rca_runtime=%s "
+            "tasks=%s files=%d results=%d",
             group_idx,
-            "initial",
-            group_tasks,
-            verify_results_context,
-            feature_root=feature_root,
-            known_task_ids=known_task_ids,
+            dag_review_runtime or "<default>",
+            dag_rca_runtime or "<default>",
+            [task.id for task in group_tasks],
+            len(group_files),
+            len(results),
         )
-    if verdict is None:
-        verdict = await _do_verify(
-            runner, feature, verify_results_context, group_files, group_tasks,
-            runtime=dag_review_runtime,
+        await _log_feature_event(
+            runner,
+            feature.id,
+            "dag_verify_start",
+            "implementation",
+            content=f"g{group_idx}:initial",
+            metadata={
+                "group_idx": group_idx,
+                "retry": "initial",
+                "runtime": dag_review_runtime,
+                "task_ids": [task.id for task in group_tasks],
+                "file_count": len(group_files),
+                "result_count": len(results),
+            },
         )
-    logger.info(
-        "DAG group verify finished group=%d attempt=initial approved=%s",
-        group_idx,
-        _is_approved(verdict),
-    )
-    await _log_feature_event(
-        runner,
-        feature.id,
-        "dag_verify_finish",
-        "implementation",
-        content=f"g{group_idx}:initial",
-        metadata={
-            "group_idx": group_idx,
-            "retry": "initial",
-            "approved": _is_approved(verdict),
-            "runtime": dag_review_runtime,
-        },
-    )
-    await runner.artifacts.put(
-        f"dag-verify:g{group_idx}:initial",
-        to_str(verdict),
-        feature=feature,
-    )
-    # Ledger dedup + severity partition
-    if isinstance(verdict, Verdict):
-        ledger = await _load_ledger(runner, feature)
-        verdict, _suppressed = _dedup_findings(verdict, ledger, "verify")
-        if _suppressed:
-            logger.info("Suppressed %d duplicate findings from verify (group %d)", len(_suppressed), group_idx)
-        verdict, _enhancements = _partition_verdict(verdict, "verify", f"group-{group_idx}")
-        await _append_enhancements(runner, feature, _enhancements)
-        ledger = _update_ledger(ledger, verdict, "verify", 0)
-        await _save_ledger(runner, feature, ledger)
+        if verify_fn is None:
+            verdict = await _run_dag_group_preflight(
+                runner,
+                feature,
+                group_idx,
+                "initial",
+                group_tasks,
+                verify_results_context,
+                feature_root=feature_root,
+                known_task_ids=known_task_ids,
+            )
+        if verdict is None:
+            verdict = await _do_verify(
+                runner, feature, verify_results_context, group_files, group_tasks,
+                runtime=dag_review_runtime,
+            )
+        logger.info(
+            "DAG group verify finished group=%d attempt=initial approved=%s",
+            group_idx,
+            _is_approved(verdict),
+        )
+        await _log_feature_event(
+            runner,
+            feature.id,
+            "dag_verify_finish",
+            "implementation",
+            content=f"g{group_idx}:initial",
+            metadata={
+                "group_idx": group_idx,
+                "retry": "initial",
+                "approved": _is_approved(verdict),
+                "runtime": dag_review_runtime,
+            },
+        )
+        await runner.artifacts.put(
+            f"dag-verify:g{group_idx}:initial",
+            to_str(verdict),
+            feature=feature,
+        )
+        # Ledger dedup + severity partition
+        if isinstance(verdict, Verdict):
+            ledger = await _load_ledger(runner, feature)
+            ledger_verdict, _suppressed = _dedup_findings(verdict, ledger, "verify")
+            if _suppressed:
+                logger.info("Suppressed %d duplicate findings from verify (group %d)", len(_suppressed), group_idx)
+            ledger_verdict, _enhancements = _partition_verdict(
+                ledger_verdict,
+                "verify",
+                f"group-{group_idx}",
+            )
+            await _append_enhancements(runner, feature, _enhancements)
+            ledger = _update_ledger(ledger, ledger_verdict, "verify", 0)
+            await _save_ledger(runner, feature, ledger)
+    else:
+        logger.info(
+            "DAG group %d entering repair loop from host verdict key=%s approved=%s",
+            group_idx,
+            initial_verdict_key or "<unknown>",
+            _is_approved(verdict),
+        )
 
     # ── RCA → fix → re-verify loop ───────────────────────────────────
     for retry in range(VERIFY_RETRIES):
@@ -1686,21 +2844,136 @@ async def _verify_and_fix_group(
             },
         )
 
+        direct_route = DagDirectRepairRoute(
+            route=_NORMAL_VERIFY_ROUTE,
+            reason="not_classified",
+            signature="",
+        )
         if verify_fn is None and isinstance(verdict, Verdict):
-            verdict = await _run_expanded_dag_verify_lenses(
+            source_verdict_key = (
+                initial_verdict_key
+                if retry == 0 and initial_verdict_key
+                else f"dag-verify:g{group_idx}:initial"
+                if retry == 0
+                else f"dag-verify:g{group_idx}:retry-{retry - 1}"
+            )
+            direct_route = _classify_dag_direct_repair_route(verdict)
+            if direct_route.route != _NORMAL_VERIFY_ROUTE:
+                direct_route = await _normalize_direct_route_workspace_permissions(
+                    runner,
+                    feature,
+                    group_idx,
+                    retry,
+                    feature_root,
+                    direct_route,
+                )
+                if await _direct_route_repeated_signature(
+                    runner,
+                    feature,
+                    group_idx,
+                    retry,
+                    direct_route,
+                ):
+                    verdict = _repeated_direct_route_verdict(
+                        group_idx=group_idx,
+                        retry=retry,
+                        route=direct_route,
+                    )
+                    await _record_dag_direct_repair_route(
+                        runner,
+                        feature,
+                        group_idx,
+                        retry,
+                        direct_route,
+                        status="blocked_repeat",
+                        source_verdict_key=source_verdict_key,
+                        guardrail_decision=(
+                            "same deterministic route signature repeated; "
+                            "expanded verify and broad repair skipped"
+                        ),
+                    )
+                    await runner.artifacts.put(
+                        f"dag-verify:g{group_idx}:retry-{retry}",
+                        to_str(verdict),
+                        feature=feature,
+                    )
+                    break
+                await _record_dag_direct_repair_route(
+                    runner,
+                    feature,
+                    group_idx,
+                    retry,
+                    direct_route,
+                    status=(
+                        "operator_blocked"
+                        if direct_route.operator_required
+                        else "selected"
+                    ),
+                    source_verdict_key=source_verdict_key,
+                    guardrail_decision=(
+                        "operator/worktree blocker detected before repair dispatch"
+                        if direct_route.operator_required
+                        else "deterministic route selected before expanded verify"
+                    ),
+                )
+                if direct_route.operator_required:
+                    logger.warning(
+                        "DAG group %d retry %d blocked by operator-required route %s",
+                        group_idx,
+                        retry,
+                        direct_route.route,
+                    )
+                    await runner.artifacts.put(
+                        f"dag-verify:g{group_idx}:retry-{retry}",
+                        to_str(verdict),
+                        feature=feature,
+                    )
+                    break
+
+        feedback = _format_feedback("Verify", verdict)
+        authority_gate = DagAuthorityGateOutcome()
+        if (
+            verify_fn is None
+            and isinstance(verdict, Verdict)
+            and direct_route.route == _NORMAL_VERIFY_ROUTE
+        ):
+            authority_gate = await _attempt_dag_authority_gate_repair(
                 runner,
                 feature,
                 group_idx,
                 retry,
                 verdict,
-                verify_results_context,
-                group_files,
                 group_tasks,
-                runtime=dag_final_review_runtime,
+                results=results,
+                verify_results_context=verify_results_context,
+                all_results=all_results,
                 feature_root=feature_root,
+                runtime=dag_impl_runtime,
+                feedback=feedback,
+                known_task_ids=known_task_ids,
             )
-
-        feedback = _format_feedback("Verify", verdict)
+            if authority_gate.blocked_verdict is not None:
+                verdict = authority_gate.blocked_verdict
+                await runner.artifacts.put(
+                    f"dag-verify:g{group_idx}:retry-{retry}",
+                    to_str(verdict),
+                    feature=feature,
+                )
+                break
+            if not authority_gate.repair_results:
+                verdict = await _run_expanded_dag_verify_lenses(
+                    runner,
+                    feature,
+                    group_idx,
+                    retry,
+                    verdict,
+                    verify_results_context,
+                    group_files,
+                    group_tasks,
+                    runtime=dag_final_review_runtime,
+                    feature_root=feature_root,
+                )
+                feedback = _format_feedback("Verify", verdict)
 
         workspace_hint = (
             f"\n\n### Workspace\nFeature repos at: `{feature_root}`\n"
@@ -1734,20 +3007,49 @@ async def _verify_and_fix_group(
                 "from each flagged file to the actual root cause."
             )
 
-        if verify_fn is None and isinstance(verdict, Verdict):
-            parallel_fix_results = await _attempt_parallel_dag_repair(
-                runner,
-                feature,
-                group_idx,
-                retry,
-                verdict,
-                group_tasks,
-                feature_root=feature_root,
-                impl_runtime=dag_impl_runtime,
-                rca_runtime=dag_rca_runtime,
-                feedback=feedback,
-                fix_context=fix_context,
-            )
+        if (
+            verify_fn is None
+            and isinstance(verdict, Verdict)
+            and direct_route.route == _NORMAL_VERIFY_ROUTE
+        ):
+            try:
+                authority_repair = bool(authority_gate.repair_results)
+                if authority_repair:
+                    parallel_fix_results = list(authority_gate.repair_results)
+                else:
+                    parallel_fix_results = await _attempt_parallel_dag_repair(
+                        runner,
+                        feature,
+                        group_idx,
+                        retry,
+                        verdict,
+                        group_tasks,
+                        feature_root=feature_root,
+                        impl_runtime=dag_impl_runtime,
+                        rca_runtime=dag_rca_runtime,
+                        feedback=feedback,
+                        fix_context=fix_context,
+                    )
+            except WorkflowCommitError as exc:
+                await _record_dag_commit_failure(
+                    runner,
+                    feature,
+                    group_idx,
+                    f"retry-{retry}",
+                    exc,
+                    message=f"parallel DAG repair commit failed in retry {retry}",
+                )
+                verdict = _commit_failure_verdict(
+                    exc,
+                    group_idx=group_idx,
+                    stage=f"retry-{retry}",
+                )
+                await runner.artifacts.put(
+                    f"dag-verify:g{group_idx}:retry-{retry}",
+                    to_str(verdict),
+                    feature=feature,
+                )
+                continue
             if parallel_fix_results:
                 all_results.extend(parallel_fix_results)
                 parallel_fix_task_ids = {result.task_id for result in parallel_fix_results}
@@ -1762,7 +3064,10 @@ async def _verify_and_fix_group(
                     retry,
                     verify_results_context,
                     feature_root,
-                    context_label="parallel-final-preflight",
+                    context_label=(
+                        "authority-final-preflight"
+                        if authority_repair else "parallel-final-preflight"
+                    ),
                 )
                 sanitized_by_task_id = {
                     result.task_id: result
@@ -1773,6 +3078,25 @@ async def _verify_and_fix_group(
                     sanitized_by_task_id.get(result.task_id, result)
                     for result in parallel_fix_results
                 ]
+                permission_report = _normalize_feature_workspace_cleanup_permissions(
+                    feature_root,
+                    _implementation_result_permission_targets(parallel_fix_results),
+                    reason=(
+                        "authority-fix-output"
+                        if authority_repair else "parallel-fix-output"
+                    ),
+                )
+                await _record_workspace_permission_repair(
+                    runner,
+                    feature,
+                    group_idx,
+                    str(retry),
+                    permission_report,
+                    context=(
+                        "authority-fix-output"
+                        if authority_repair else "parallel-fix-output"
+                    ),
+                )
                 reconcile = await _reconcile_dag_task_results(
                     runner,
                     feature,
@@ -1808,10 +3132,20 @@ async def _verify_and_fix_group(
                     for path in result.files_modified
                 })
                 aggregate_fix = ImplementationResult(
-                    task_id=f"g{group_idx}-parallel-fix-{retry}",
+                    task_id=(
+                        f"g{group_idx}-authority-repair-{retry}"
+                        if authority_repair else f"g{group_idx}-parallel-fix-{retry}"
+                    ),
                     summary=(
-                        f"Parallel DAG repair applied {len(parallel_fix_results)} "
-                        "root-cause-group fix(es); final aggregate verifier still required."
+                        (
+                            "DAG authority gate repaired deterministic "
+                            "workflow metadata; final aggregate verifier still "
+                            "required."
+                        )
+                        if authority_repair else (
+                            f"Parallel DAG repair applied {len(parallel_fix_results)} "
+                            "root-cause-group fix(es); final aggregate verifier still required."
+                        )
                     ),
                     status=(
                         "completed"
@@ -1829,7 +3163,7 @@ async def _verify_and_fix_group(
                 group_files = _collect_files(verify_results_context)
                 logger.info(
                     "DAG group verify starting group=%d attempt=retry-%d runtime=%s rca_runtime=%s "
-                    "tasks=%s files=%d results=%d parallel_repair=true",
+                    "tasks=%s files=%d results=%d parallel_repair=%s authority_repair=%s",
                     group_idx,
                     retry,
                     dag_final_review_runtime or "<default>",
@@ -1837,6 +3171,8 @@ async def _verify_and_fix_group(
                     [task.id for task in group_tasks],
                     len(group_files),
                     len(verify_results_context),
+                    not authority_repair,
+                    authority_repair,
                 )
                 await _log_feature_event(
                     runner,
@@ -1851,7 +3187,8 @@ async def _verify_and_fix_group(
                         "task_ids": [task.id for task in group_tasks],
                         "file_count": len(group_files),
                         "result_count": len(verify_results_context),
-                        "parallel_repair": True,
+                        "parallel_repair": not authority_repair,
+                        "authority_repair": authority_repair,
                     },
                 )
                 preflight_verdict = await _run_dag_group_preflight(
@@ -1892,7 +3229,8 @@ async def _verify_and_fix_group(
                         "retry": retry,
                         "approved": _is_approved(verdict),
                         "runtime": dag_final_review_runtime,
-                        "parallel_repair": True,
+                        "parallel_repair": not authority_repair,
+                        "authority_repair": authority_repair,
                     },
                 )
                 await runner.artifacts.put(
@@ -1902,70 +3240,125 @@ async def _verify_and_fix_group(
                 )
                 if isinstance(verdict, Verdict):
                     ledger = await _load_ledger(runner, feature)
-                    verdict, _suppressed = _dedup_findings(verdict, ledger, "verify")
+                    ledger_verdict, _suppressed = _dedup_findings(
+                        verdict,
+                        ledger,
+                        "verify",
+                    )
                     if _suppressed:
                         logger.info(
                             "Suppressed %d duplicate findings from verify retry (group %d)",
                             len(_suppressed),
                             group_idx,
                         )
-                    verdict, _enhancements = _partition_verdict(
-                        verdict,
+                    ledger_verdict, _enhancements = _partition_verdict(
+                        ledger_verdict,
                         "verify",
                         f"group-{group_idx}-retry-{retry}",
                     )
                     await _append_enhancements(runner, feature, _enhancements)
-                    ledger = _update_ledger(ledger, verdict, "verify", 0)
+                    ledger = _update_ledger(ledger, ledger_verdict, "verify", 0)
                     await _save_ledger(runner, feature, ledger)
                 continue
 
-        rca_context = await _build_prompt_context_package(
-            runner,
-            feature,
-            title=f"DAG Verify RCA — Group {group_idx} Retry {retry + 1}",
-            file_stem=f"g{group_idx}-rca-{retry}",
-            intro_lines=[
-                "Investigate the root cause of the verifier's findings for this DAG group.",
-                "Use the verifier feedback, specific findings, and prior-attempt history from the referenced files.",
-            ],
-            sections=[
-                ("feedback", "Verifier Feedback", feedback),
-                ("issues", "Verifier Specific Findings", verifier_issues_section),
-                ("prior-attempt", "Prior Verify Attempt", prior_ctx),
-                ("workspace", "Workspace", workspace_hint),
-            ],
-        )
-        rca_prompt = (
-            f"## DAG Verify Failed (group {group_idx}, attempt {retry + 1})\n\n"
-            f"{_context_package_prompt(rca_context)}"
-            "Investigate the root cause of the specific issues listed above. "
-            "Read each flagged file and check git history for oscillating changes. "
-            "Check if the issue is a spec contradiction (task reference_material says X but a D-GR decision says Y)."
-        )
         rca_result: RootCauseAnalysis | None = None
-        try:
-            rca_result = await runner.run(
-                Ask(
-                    actor=_make_parallel_actor(
-                        root_cause_analyst, f"dag-rca-g{group_idx}-r{retry}",
-                        runtime=dag_rca_runtime,
-                        workspace_path=str(feature_root) if feature_root else None,
-                    ),
-                    prompt=rca_prompt,
-                    output_type=RootCauseAnalysis,
+        if direct_route.route == _COMMIT_HYGIENE_ROUTE:
+            rca_result = RootCauseAnalysis(
+                hypothesis=(
+                    "The group is blocked by a deterministic pre-commit/husky "
+                    "failure, not by a broad verifier finding."
                 ),
+                evidence=[
+                    direct_route.reason,
+                    "The host skipped expanded verify because the current verdict "
+                    "contains only commit-hook hygiene concerns.",
+                    *direct_route.target_files,
+                ],
+                affected_files=[
+                    target.rsplit(":", 1)[0]
+                    if target.rsplit(":", 1)[-1].isdigit()
+                    else target
+                    for target in direct_route.target_files
+                ],
+                proposed_approach=(
+                    "Apply the minimal source hygiene change required by the hook "
+                    "output, then let the normal commit and verifier path run."
+                ),
+                confidence="high",
+            )
+        elif direct_route.route == _MANIFEST_FORBIDDEN_CLEANUP_ROUTE:
+            rca_result = RootCauseAnalysis(
+                hypothesis=(
+                    "The commit hook failure is a symptom of manifest-forbidden "
+                    "product drift: forbidden files are present in git status or "
+                    "hook output and must be deleted or ported, not suppressed."
+                ),
+                evidence=[
+                    direct_route.reason,
+                    "The host skipped expanded verify because the current verdict "
+                    "contains only deterministic manifest-forbidden cleanup concerns.",
+                    *direct_route.target_files,
+                ],
+                affected_files=[
+                    target.rsplit(":", 1)[0]
+                    if target.rsplit(":", 1)[-1].isdigit()
+                    else target
+                    for target in direct_route.target_files
+                ],
+                proposed_approach=(
+                    "Remove or port the manifest-forbidden files, preserve any "
+                    "acceptance coverage in canonical locations, then let the "
+                    "normal commit and verifier path run."
+                ),
+                confidence="high",
+            )
+        else:
+            rca_context = await _build_prompt_context_package(
+                runner,
                 feature,
-                phase_name="implementation",
+                title=f"DAG Verify RCA — Group {group_idx} Retry {retry + 1}",
+                file_stem=f"g{group_idx}-rca-{retry}",
+                intro_lines=[
+                    "Investigate the root cause of the verifier's findings for this DAG group.",
+                    "Use the verifier feedback, specific findings, and prior-attempt history from the referenced files.",
+                ],
+                sections=[
+                    ("feedback", "Verifier Feedback", feedback),
+                    ("issues", "Verifier Specific Findings", verifier_issues_section),
+                    ("prior-attempt", "Prior Verify Attempt", prior_ctx),
+                    ("workspace", "Workspace", workspace_hint),
+                ],
             )
-        except Exception as rca_err:
-            logger.warning("DAG verify RCA failed: %s", rca_err)
+            rca_prompt = (
+                f"## DAG Verify Failed (group {group_idx}, attempt {retry + 1})\n\n"
+                f"{_context_package_prompt(rca_context)}"
+                "Investigate the root cause of the specific issues listed above. "
+                "Read each flagged file and check git history for oscillating changes. "
+                "Check if the issue is a spec contradiction (task reference_material says X but a D-GR decision says Y)."
+            )
+            try:
+                rca_result = await runner.run(
+                    Ask(
+                        actor=_make_parallel_actor(
+                            root_cause_analyst, f"dag-rca-g{group_idx}-r{retry}",
+                            runtime=dag_rca_runtime,
+                            workspace_path=str(feature_root) if feature_root else None,
+                        ),
+                        prompt=rca_prompt,
+                        output_type=RootCauseAnalysis,
+                    ),
+                    feature,
+                    phase_name="implementation",
+                )
+            except Exception as rca_err:
+                logger.warning("DAG verify RCA failed: %s", rca_err)
 
-        if isinstance(rca_result, RootCauseAnalysis):
-            await runner.artifacts.put(
-                f"dag-verify-rca:g{group_idx}:retry-{retry}",
-                rca_result.model_dump_json(),
-                feature=feature,
-            )
+            if isinstance(rca_result, RootCauseAnalysis):
+                await runner.artifacts.put(
+                    f"dag-verify-rca:g{group_idx}:retry-{retry}",
+                    rca_result.model_dump_json(),
+                    feature=feature,
+                )
 
         # If RCA found a contradiction, escalate and use resolution
         fix_direction = ""
@@ -2006,6 +3399,39 @@ async def _verify_and_fix_group(
                 f"**Hypothesis:** {rca_result.hypothesis}\n"
                 f"**Proposed approach:** {rca_result.proposed_approach}\n"
             )
+        direct_route_guidance = ""
+        if direct_route.route == _COMMIT_HYGIENE_ROUTE:
+            targets = "\n".join(f"- `{target}`" for target in direct_route.target_files)
+            direct_route_guidance = (
+                "\n\n## Deterministic Commit-Blocker Route\n"
+                "The host classified this retry as commit_hygiene_focused. "
+                "Expanded verify, parallel repair, and RCA were skipped because "
+                "the current verdict contains only commit-hook hygiene concerns.\n\n"
+                "Fix only the pre-commit/husky blocker shown in the feedback. "
+                "Do not broaden the change into semantic redesign; the normal "
+                "commit and verifier path will run after this repair.\n\n"
+                f"**Route signature:** `{direct_route.signature}`\n\n"
+                f"**Target files:**\n{targets if targets else '- (from hook output)'}\n"
+            )
+        elif direct_route.route == _MANIFEST_FORBIDDEN_CLEANUP_ROUTE:
+            targets = "\n".join(f"- `{target}`" for target in direct_route.target_files)
+            direct_route_guidance = (
+                "\n\n## Manifest-Forbidden Commit Cleanup Route\n"
+                "The host classified this retry as "
+                "manifest_forbidden_product_cleanup. Expanded verify, parallel "
+                "repair, and RCA were skipped because the preflight or "
+                "commit/husky failure references files that are forbidden by "
+                "verify-file-scope.expected-files.json.\n\n"
+                "Treat the hook failure as a symptom of forbidden product drift. "
+                "Delete or port the forbidden files into the canonical tree, and "
+                "preserve any acceptance coverage before reporting completion.\n\n"
+                "Do NOT fix this by adding `.eslint-ignore`, eslint-disable "
+                "comments, test skips, hook bypasses, or other suppression rules. "
+                "Suppression is invalid when the target path is manifest-forbidden.\n\n"
+                f"**Route signature:** `{direct_route.signature}`\n\n"
+                f"**Forbidden cleanup targets:**\n"
+                f"{targets if targets else '- (from hook output/git status)'}\n"
+            )
 
         fix_actor = _make_parallel_actor(
             implementer, f"g{group_idx}-fix-{retry}",
@@ -2034,6 +3460,7 @@ async def _verify_and_fix_group(
                 "Fix the verifier findings for this DAG group using the referenced RCA and feedback files.",
             ],
             sections=[
+                ("direct-route", "Deterministic Repair Route", direct_route_guidance),
                 ("feedback", "Verifier Feedback", feedback),
                 ("rca-guidance", "RCA Guidance", rca_guidance),
                 ("user-direction", "User Decision", fix_direction),
@@ -2076,6 +3503,19 @@ async def _verify_and_fix_group(
                 context_label="single-fix",
             )
             fix_result = sanitized[0]
+            permission_report = _normalize_feature_workspace_cleanup_permissions(
+                feature_root,
+                _implementation_result_permission_targets([fix_result]),
+                reason="single-fix-output",
+            )
+            await _record_workspace_permission_repair(
+                runner,
+                feature,
+                group_idx,
+                str(retry),
+                permission_report,
+                context="single-fix-output",
+            )
             await runner.artifacts.put(
                 f"dag-fix:g{group_idx}:retry-{retry}",
                 fix_result.model_dump_json(),
@@ -2092,10 +3532,73 @@ async def _verify_and_fix_group(
             feature_root,
             context_label="single-final-preflight",
         )
-        await _commit_repos(
-            runner, feature,
-            f"fix: group {group_idx} verify retry {retry + 1}",
-        )
+        if direct_route.route == _MANIFEST_FORBIDDEN_CLEANUP_ROUTE:
+            remaining, staging_only = _manifest_forbidden_cleanup_remaining_problems(
+                feature_root,
+                direct_route.target_files,
+            )
+            await runner.artifacts.put(
+                f"dag-manifest-cleanup-gate:g{group_idx}:retry-{retry}",
+                json.dumps({
+                    "group_idx": group_idx,
+                    "retry": retry,
+                    "approved": not remaining,
+                    "blocking_problems": remaining,
+                    "staging_only_deletions": staging_only,
+                    "target_files": direct_route.target_files,
+                    "route": direct_route.to_dict(),
+                }, indent=2),
+                feature=feature,
+            )
+            if remaining:
+                verdict = _manifest_cleanup_remaining_verdict(
+                    group_idx=group_idx,
+                    retry=retry,
+                    problems=remaining,
+                )
+                await runner.artifacts.put(
+                    f"dag-verify:g{group_idx}:retry-{retry}",
+                    to_str(verdict),
+                    feature=feature,
+                )
+                continue
+        try:
+            await _commit_repos(
+                runner,
+                feature,
+                f"fix: group {group_idx} verify retry {retry + 1}",
+                failure_key=f"dag-commit-failure:g{group_idx}:retry-{retry}",
+                failure_metadata={
+                    "group_idx": group_idx,
+                    "stage": f"retry-{retry}",
+                    "retry": retry,
+                    "message": f"fix: group {group_idx} verify retry {retry + 1}",
+                },
+            )
+        except WorkflowCommitError as exc:
+            await _record_dag_commit_failure(
+                runner,
+                feature,
+                group_idx,
+                f"retry-{retry}",
+                exc,
+                message=f"single DAG repair commit failed in retry {retry}",
+            )
+            verdict = _commit_failure_verdict(
+                exc,
+                group_idx=group_idx,
+                stage=f"retry-{retry}",
+            )
+            await runner.artifacts.put(
+                f"dag-verify:g{group_idx}:retry-{retry}",
+                to_str(verdict),
+                feature=feature,
+            )
+            if isinstance(verdict, Verdict):
+                ledger = await _load_ledger(runner, feature)
+                ledger = _update_ledger(ledger, verdict, "verify", 0)
+                await _save_ledger(runner, feature, ledger)
+            continue
         reconcile = await _reconcile_dag_task_results(
             runner,
             feature,
@@ -2200,12 +3703,16 @@ async def _verify_and_fix_group(
         # Ledger dedup + severity partition for re-verify
         if isinstance(verdict, Verdict):
             ledger = await _load_ledger(runner, feature)
-            verdict, _suppressed = _dedup_findings(verdict, ledger, "verify")
+            ledger_verdict, _suppressed = _dedup_findings(verdict, ledger, "verify")
             if _suppressed:
                 logger.info("Suppressed %d duplicate findings from verify retry (group %d)", len(_suppressed), group_idx)
-            verdict, _enhancements = _partition_verdict(verdict, "verify", f"group-{group_idx}-retry-{retry}")
+            ledger_verdict, _enhancements = _partition_verdict(
+                ledger_verdict,
+                "verify",
+                f"group-{group_idx}-retry-{retry}",
+            )
             await _append_enhancements(runner, feature, _enhancements)
-            ledger = _update_ledger(ledger, verdict, "verify", 0)
+            ledger = _update_ledger(ledger, ledger_verdict, "verify", 0)
             await _save_ledger(runner, feature, ledger)
 
     # ── Record outcomes + checkpoint ──────────────────────────────────
@@ -2214,7 +3721,36 @@ async def _verify_and_fix_group(
             if isinstance(r, ImplementationResult):
                 handover.record_success(r)
 
-        commit_hash = await _commit_group(runner, feature, group_idx, group_tasks)
+        try:
+            commit_hash = await _commit_group(runner, feature, group_idx, group_tasks)
+        except WorkflowCommitError as exc:
+            await _record_dag_commit_failure(
+                runner,
+                feature,
+                group_idx,
+                "checkpoint",
+                exc,
+                message="checkpoint commit failed",
+                extra_metadata={"task_ids": [task.id for task in group_tasks]},
+            )
+            verdict = _commit_failure_verdict(
+                exc,
+                group_idx=group_idx,
+                stage="checkpoint",
+            )
+            await runner.artifacts.put(
+                f"dag-verify:g{group_idx}:checkpoint-commit",
+                to_str(verdict),
+                feature=feature,
+            )
+            for r in results:
+                if isinstance(r, ImplementationResult):
+                    handover.record_failure(
+                        r.task_id,
+                        r.summary,
+                        _format_feedback("Commit", verdict),
+                    )
+            return False, _format_feedback("Commit", verdict)
 
         checkpoint = {
             "group_idx": group_idx,
@@ -2382,10 +3918,58 @@ async def _implement_dag(
             else None
         )
 
+        if pending_tasks:
+            writeability_problems = _dag_workspace_writeability_problems(
+                feature_root,
+                pending_tasks,
+            )
+            if writeability_problems:
+                await runner.artifacts.put(
+                    f"dag-writeability-preflight:g{group_idx}:initial",
+                    _json.dumps({
+                        "group_idx": group_idx,
+                        "approved": False,
+                        "problems": writeability_problems,
+                    }),
+                    feature=feature,
+                )
+                await _log_feature_event(
+                    runner,
+                    feature.id,
+                    "dag_writeability_preflight_failed",
+                    "implementation",
+                    content=f"group {group_idx}",
+                    metadata={
+                        "group_idx": group_idx,
+                        "problem_count": len(writeability_problems),
+                        "task_ids": sorted({
+                            str(problem.get("task_id", ""))
+                            for problem in writeability_problems
+                            if problem.get("task_id")
+                        }),
+                    },
+                )
+                details = "; ".join(
+                    f"{problem.get('task_id')}: {problem.get('path')} "
+                    f"({problem.get('reason')} at {problem.get('directory')})"
+                    for problem in writeability_problems[:10]
+                )
+                if len(writeability_problems) > 10:
+                    details += f"; +{len(writeability_problems) - 10} more"
+                failure = (
+                    "Workspace writeability preflight failed before task dispatch. "
+                    "Fix canonical target permissions instead of allowing agents to "
+                    f"park _pending_* fallbacks. Problems: {details}"
+                )
+                return "\n\n".join(to_str(r) for r in all_results), failure, handover
+
         # ── Dispatch pending tasks with retry on crash ──────────────
         TASK_MAX_RETRIES = 5
         TASK_WARN_AT = 3  # Send Slack notification at this attempt
         new_results: list[object] = []
+        results: list[object] = list(completed_results)
+        initial_verdict: object | None = None
+        initial_verdict_key: str | None = None
         if pending_tasks:
             await _log_feature_event(
                 runner,
@@ -2581,16 +4165,50 @@ async def _implement_dag(
                         feature=feature,
                     )
 
+            results = list(completed_results) + list(new_results)
+            all_results.extend(new_results)  # Don't double-count resumed results
+
             # Commit after implementation so work is never left uncommitted
             task_ids = [r.task_id for r in new_results if isinstance(r, ImplementationResult) and r.task_id]
-            await _commit_repos(
-                runner, feature,
-                f"feat: group {group_idx} impl — {', '.join(task_ids[:3])}"
-                + (f" (+{len(task_ids) - 3} more)" if len(task_ids) > 3 else ""),
-            )
-
-        results = list(completed_results) + list(new_results)
-        all_results.extend(new_results)  # Don't double-count resumed results
+            try:
+                await _commit_repos(
+                    runner,
+                    feature,
+                    f"feat: group {group_idx} impl — {', '.join(task_ids[:3])}"
+                    + (f" (+{len(task_ids) - 3} more)" if len(task_ids) > 3 else ""),
+                    failure_key=f"dag-commit-failure:g{group_idx}:implementation",
+                    failure_metadata={
+                        "group_idx": group_idx,
+                        "stage": "implementation",
+                        "task_ids": task_ids,
+                    },
+                )
+            except WorkflowCommitError as exc:
+                await _log_feature_event(
+                    runner,
+                    feature.id,
+                    "dag_commit_failed",
+                    "implementation",
+                    content=f"g{group_idx}:implementation",
+                    metadata={
+                        "group_idx": group_idx,
+                        "stage": "implementation",
+                        "failed_repo_count": len(exc.failed_outcomes),
+                        "successful_commit_hashes": exc.successful_hashes,
+                        "task_ids": task_ids,
+                    },
+                )
+                initial_verdict = _commit_failure_verdict(
+                    exc,
+                    group_idx=group_idx,
+                    stage="implementation",
+                )
+                initial_verdict_key = f"dag-verify:g{group_idx}:implementation-commit"
+                await runner.artifacts.put(
+                    initial_verdict_key,
+                    to_str(initial_verdict),
+                    feature=feature,
+                )
 
         # ── Verify + fix loop (shared with enhancement group) ─────────
         approved, failure = await _verify_and_fix_group(
@@ -2598,6 +4216,8 @@ async def _implement_dag(
             results, all_results, handover, feature_root,
             impl_runtime, review_runtime, diagnostic_runtime,
             known_task_ids=set(tasks_by_id),
+            initial_verdict=initial_verdict,
+            initial_verdict_key=initial_verdict_key,
         )
         if not approved:
             remaining = dag.execution_order[group_idx + 1 :]
@@ -2987,8 +4607,14 @@ async def _run_enhancement_group(
                 )
 
         await _commit_repos(
-            runner, feature,
+            runner,
+            feature,
             f"feat: enhancement group — {len(backlog.items)} items",
+            failure_key=f"dag-commit-failure:g{enhancement_group_idx}:implementation",
+            failure_metadata={
+                "group_idx": enhancement_group_idx,
+                "stage": "enhancement-implementation",
+            },
         )
 
     results = list(completed_results) + list(new_results)
@@ -3048,6 +4674,9 @@ async def _commit_repos(
     runner: WorkflowRunner,
     feature: Feature,
     msg: str,
+    *,
+    failure_key: str | None = None,
+    failure_metadata: dict[str, Any] | None = None,
 ) -> str:
     """Commit uncommitted changes in all feature repo clones.
 
@@ -3058,7 +4687,33 @@ async def _commit_repos(
     Returns a comma-separated list of commit hashes (one per repo).
     """
     repos_root = _get_feature_root(runner, feature)
-    return await _commit_repos_in_root(repos_root, msg)
+    try:
+        return await _commit_repos_in_root(repos_root, msg)
+    except WorkflowCommitError as exc:
+        if failure_key:
+            await _record_commit_failure_artifact(
+                runner,
+                feature,
+                failure_key,
+                exc,
+                metadata=failure_metadata,
+            )
+        raise
+
+
+async def _run_git_for_commit(repo_path: Path, *args: str) -> tuple[int, str, str]:
+    proc = await _asyncio.create_subprocess_exec(
+        "git", *args,
+        cwd=str(repo_path),
+        stdout=_asyncio.subprocess.PIPE,
+        stderr=_asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await proc.communicate()
+    return proc.returncode or 0, stdout.decode(errors="replace"), stderr.decode(errors="replace")
+
+
+async def _git_status_for_commit(repo_path: Path) -> tuple[int, str, str]:
+    return await _run_git_for_commit(repo_path, "status", "--porcelain")
 
 
 async def _commit_repos_in_root(
@@ -3070,34 +4725,166 @@ async def _commit_repos_in_root(
         logger.warning("_commit_repos_in_root: no feature workspace found — skipping")
         return ""
 
-    hashes: list[str] = []
+    hygiene_problems = _dag_repo_hygiene_problems(repos_root)
+    if hygiene_problems:
+        details = ", ".join(
+            str(problem.get("path", "<unknown>"))
+            for problem in hygiene_problems[:10]
+        )
+        if len(hygiene_problems) > 10:
+            details += f", +{len(hygiene_problems) - 10} more"
+        raise WorkflowCommitError(
+            "Refusing to commit workflow repos with hygiene blockers",
+            [
+                CommitRepoOutcome(
+                    repo_path=str(repos_root),
+                    repo_name=repos_root.name,
+                    message=msg,
+                    dirty=True,
+                    command=["workflow-repo-hygiene-check"],
+                    exit_code=1,
+                    stderr=details,
+                    status_after=json.dumps(hygiene_problems[:25], indent=2),
+                    error=(
+                        "Refusing to commit workflow repos with hygiene blockers: "
+                        f"{details}"
+                    ),
+                )
+            ],
+        )
 
-    async def _commit_in_repo(repo_path: Path) -> str | None:
+    outcomes: list[CommitRepoOutcome] = []
+
+    def _is_workflow_repo(repo_dir: Path) -> bool:
+        # Workflow repos live exactly at feature_root/repos/<name>/. Nested
+        # .git dirs (e.g. created by `npm create vite`, `git init` inside an
+        # agent shell) are accidental embedded repos; committing in them
+        # produces orphaned history. Filter them out.
         try:
-            proc = await _asyncio.create_subprocess_exec(
-                "git", "status", "--porcelain",
-                cwd=str(repo_path),
-                stdout=_asyncio.subprocess.PIPE,
-                stderr=_asyncio.subprocess.PIPE,
+            return repo_dir.parent == repos_root and repos_root.name == "repos"
+        except Exception:
+            return False
+
+    discovered = _discover_repo_roots_under(repos_root)
+    for repo_dir in discovered:
+        if not _is_workflow_repo(repo_dir):
+            logger.info("Skipping nested .git at %s (not a workflow repo)", repo_dir)
+            continue
+        status_rc, status_stdout, status_stderr = await _git_status_for_commit(repo_dir)
+        if status_rc != 0:
+            outcomes.append(
+                CommitRepoOutcome(
+                    repo_path=str(repo_dir),
+                    repo_name=repo_dir.name,
+                    message=msg,
+                    dirty=True,
+                    command=["git", "status", "--porcelain"],
+                    exit_code=status_rc,
+                    stdout=status_stdout,
+                    stderr=status_stderr,
+                    error="git status failed before commit",
+                )
             )
-            stdout, _ = await proc.communicate()
-            if not stdout.decode().strip():
-                return None
+            continue
+        status_before = status_stdout.strip()
+        if not status_before:
+            continue
 
-            await _run_git(repo_path, "add", "--all", ".")
-            await _run_git(repo_path, "commit", "-m", msg)
-            commit_hash = await _run_git(repo_path, "rev-parse", "HEAD")
-            logger.info("Committed in %s: %s", repo_path.name, commit_hash[:8])
-            return commit_hash
-        except Exception as e:
-            logger.warning("Failed to commit in %s: %s", repo_path, e)
-            return None
+        add_rc, add_stdout, add_stderr = await _run_git_for_commit(
+            repo_dir, "add", "--all", ".",
+        )
+        if add_rc != 0:
+            _, status_after, _ = await _git_status_for_commit(repo_dir)
+            outcomes.append(
+                CommitRepoOutcome(
+                    repo_path=str(repo_dir),
+                    repo_name=repo_dir.name,
+                    message=msg,
+                    status_before=status_before,
+                    status_after=status_after.strip(),
+                    dirty=True,
+                    command=["git", "add", "--all", "."],
+                    exit_code=add_rc,
+                    stdout=add_stdout,
+                    stderr=add_stderr,
+                    error="git add failed before commit",
+                )
+            )
+            continue
 
-    for repo_dir in _discover_repo_roots_under(repos_root):
-        h = await _commit_in_repo(repo_dir)
-        if h:
-            hashes.append(h)
+        commit_rc, commit_stdout, commit_stderr = await _run_git_for_commit(
+            repo_dir, "commit", "-m", msg,
+        )
+        if commit_rc != 0:
+            _, status_after, _ = await _git_status_for_commit(repo_dir)
+            outcomes.append(
+                CommitRepoOutcome(
+                    repo_path=str(repo_dir),
+                    repo_name=repo_dir.name,
+                    message=msg,
+                    status_before=status_before,
+                    status_after=status_after.strip(),
+                    dirty=True,
+                    command=["git", "commit", "-m", msg],
+                    exit_code=commit_rc,
+                    stdout=commit_stdout,
+                    stderr=commit_stderr,
+                    error="git commit failed",
+                )
+            )
+            logger.warning(
+                "Failed to commit in %s (exit %s): %s",
+                repo_dir,
+                commit_rc,
+                commit_stderr.strip() or commit_stdout.strip(),
+            )
+            continue
 
+        rev_rc, rev_stdout, rev_stderr = await _run_git_for_commit(
+            repo_dir, "rev-parse", "HEAD",
+        )
+        if rev_rc != 0:
+            _, status_after, _ = await _git_status_for_commit(repo_dir)
+            outcomes.append(
+                CommitRepoOutcome(
+                    repo_path=str(repo_dir),
+                    repo_name=repo_dir.name,
+                    message=msg,
+                    status_before=status_before,
+                    status_after=status_after.strip(),
+                    dirty=True,
+                    command=["git", "rev-parse", "HEAD"],
+                    exit_code=rev_rc,
+                    stdout=rev_stdout,
+                    stderr=rev_stderr,
+                    error="git commit succeeded but HEAD lookup failed",
+                )
+            )
+            continue
+
+        commit_hash = rev_stdout.strip()
+        _, status_after, _ = await _git_status_for_commit(repo_dir)
+        outcomes.append(
+            CommitRepoOutcome(
+                repo_path=str(repo_dir),
+                repo_name=repo_dir.name,
+                message=msg,
+                status_before=status_before,
+                status_after=status_after.strip(),
+                dirty=True,
+                command=["git", "commit", "-m", msg],
+                stdout=commit_stdout,
+                stderr=commit_stderr,
+                commit_hash=commit_hash,
+            )
+        )
+        logger.info("Committed in %s: %s", repo_dir.name, commit_hash[:8])
+
+    failures = [outcome for outcome in outcomes if outcome.error or outcome.exit_code]
+    if failures:
+        raise WorkflowCommitError("Failed to commit dirty workflow repos", outcomes)
+
+    hashes = [outcome.commit_hash for outcome in outcomes if outcome.commit_hash]
     return ",".join(hashes) if hashes else ""
 
 
@@ -3112,7 +4899,18 @@ async def _commit_group(
     msg = f"feat: group {group_idx} — {', '.join(task_names)}"
     if len(group_tasks) > 3:
         msg += f" (+{len(group_tasks) - 3} more)"
-    return await _commit_repos(runner, feature, msg)
+    return await _commit_repos(
+        runner,
+        feature,
+        msg,
+        failure_key=f"dag-commit-failure:g{group_idx}:checkpoint",
+        failure_metadata={
+            "group_idx": group_idx,
+            "stage": "checkpoint",
+            "task_ids": [task.id for task in group_tasks],
+            "message": msg,
+        },
+    )
 
 
 async def _verify(
@@ -5968,14 +7766,50 @@ def _dag_existing_path_locations(path: str, roots: list[Path]) -> list[Path]:
     return locations
 
 
-def _dag_path_tracked_or_staged(path: str, roots: list[Path]) -> bool:
+def _dag_git_path_state(path: str, roots: list[Path]) -> dict[str, Any]:
     if not path or path.startswith("http://") or path.startswith("https://"):
-        return False
+        return {
+            "kind": "absent",
+            "states": [],
+            "tracked_or_staged": False,
+            "blocks_forbidden": False,
+            "matches": [],
+        }
     if shutil.which("git") is None:
-        return False
+        return {
+            "kind": "absent",
+            "states": [],
+            "tracked_or_staged": False,
+            "blocks_forbidden": False,
+            "matches": [],
+        }
     normalized = path.strip().replace("\\", "/").strip("/")
     if not normalized:
-        return False
+        return {
+            "kind": "absent",
+            "states": [],
+            "tracked_or_staged": False,
+            "blocks_forbidden": False,
+            "matches": [],
+        }
+
+    def _git_lines(root: Path, args: list[str]) -> list[str]:
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(root), *args],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                check=False,
+                timeout=2,
+            )
+        except Exception:
+            return []
+        if result.returncode not in {0, 1}:
+            return []
+        return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+    state_matches: list[dict[str, str]] = []
     for root in roots:
         if not (root / ".git").exists():
             continue
@@ -5984,27 +7818,64 @@ def _dag_path_tracked_or_staged(path: str, roots: list[Path]) -> bool:
         if root_name and normalized.startswith(f"{root_name}/"):
             variants.append(normalized[len(root_name) + 1:])
         for variant in _dedupe_preserving_order(variants):
-            try:
-                result = subprocess.run(
-                    [
-                        "git",
-                        "-C",
-                        str(root),
-                        "ls-files",
-                        "--error-unmatch",
-                        "--",
-                        variant,
-                    ],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    check=False,
-                    timeout=2,
-                )
-            except Exception:
-                continue
-            if result.returncode == 0:
-                return True
-    return False
+            checks = [
+                (
+                    "unstaged_delete",
+                    ["diff", "--name-only", "--diff-filter=D", "--", variant],
+                ),
+                (
+                    "staged_delete",
+                    ["diff", "--cached", "--name-only", "--diff-filter=D", "--", variant],
+                ),
+                (
+                    "staged_add",
+                    ["diff", "--cached", "--name-only", "--diff-filter=ACMR", "--", variant],
+                ),
+                ("clean_tracked", ["ls-files", "--", variant]),
+                (
+                    "untracked",
+                    ["ls-files", "--others", "--exclude-standard", "--", variant],
+                ),
+            ]
+            for state_name, args in checks:
+                for match in _git_lines(root, args):
+                    state_matches.append({
+                        "state": state_name,
+                        "repo": str(root),
+                        "path": match,
+                    })
+
+    states = {match["state"] for match in state_matches}
+    priority = [
+        "untracked",
+        "staged_add",
+        "unstaged_delete",
+        "clean_tracked",
+        "staged_delete",
+    ]
+    kind = next((state for state in priority if state in states), "absent")
+    blocks_forbidden = bool(
+        states & {"untracked", "staged_add", "unstaged_delete", "clean_tracked"}
+    )
+    return {
+        "kind": kind,
+        "states": sorted(states),
+        "tracked_or_staged": blocks_forbidden,
+        "blocks_forbidden": blocks_forbidden,
+        "matches": state_matches[:50],
+    }
+
+
+def _dag_path_tracked_or_staged(path: str, roots: list[Path]) -> bool:
+    return bool(_dag_git_path_state(path, roots).get("tracked_or_staged"))
+
+
+def _dag_git_state_problem_fields(git_state: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "git_state": git_state.get("kind", "absent"),
+        "git_states": git_state.get("states", []),
+        "git_matches": git_state.get("matches", []),
+    }
 
 
 def _dag_manifest_path_entries(roots: list[Path]) -> dict[str, list[dict[str, str]]]:
@@ -6200,6 +8071,11 @@ def _validate_dag_task_artifact_update(
         return None, "not_dag_task_artifact", []
     if feature_root is None or not roots:
         return None, "missing_feature_root", []
+    raw_payload: Any = None
+    try:
+        raw_payload = json.loads(content)
+    except Exception:
+        raw_payload = None
     try:
         parsed = ImplementationResult.model_validate_json(content)
     except Exception:
@@ -6222,7 +8098,26 @@ def _validate_dag_task_artifact_update(
         parsed.files_created + parsed.files_modified
     )
     if not reported_paths:
-        return None, "dag_task_no_reported_files", []
+        non_authoritative_fields: list[str] = []
+        if isinstance(raw_payload, dict):
+            non_authoritative_fields = [
+                field_name for field_name in (
+                    "files",
+                    "artifacts_created",
+                    "artifacts_modified",
+                    "artifacts_deleted",
+                )
+                if field_name in raw_payload
+            ]
+        return None, "dag_task_no_reported_files", [{
+            "message": (
+                "dag-task artifact_updates.content must be an "
+                "ImplementationResult JSON object with non-empty "
+                "files_created and/or files_modified. ArtifactRepairResult "
+                "fields are not authoritative inside dag-task content."
+            ),
+            "non_authoritative_fields_present": non_authoritative_fields,
+        }]
 
     forbidden_files = _dag_forbidden_file_entries(roots)
     path_records: list[dict[str, Any]] = []
@@ -6356,7 +8251,8 @@ def _dag_result_path_problems(
     ):
         forbidden = _dag_forbidden_match(path, forbidden_entries)
         exists = _dag_reported_file_exists(path, roots)
-        tracked_or_staged = _dag_path_tracked_or_staged(path, roots)
+        git_state = _dag_git_path_state(path, roots)
+        tracked_or_staged = bool(git_state.get("tracked_or_staged"))
         if forbidden is not None:
             problems.append({
                 "task_id": result.task_id,
@@ -6366,6 +8262,7 @@ def _dag_result_path_problems(
                 "exists": str(bool(exists)).lower(),
                 "exists_on_disk": bool(exists),
                 "tracked_or_staged": tracked_or_staged,
+                **_dag_git_state_problem_fields(git_state),
                 "repair_route": (
                     "product_cleanup_required"
                     if exists or tracked_or_staged
@@ -6386,6 +8283,7 @@ def _dag_result_path_problems(
                 "exists": "false",
                 "exists_on_disk": False,
                 "tracked_or_staged": tracked_or_staged,
+                **_dag_git_state_problem_fields(git_state),
                 "repair_route": (
                     "product_cleanup_required"
                     if tracked_or_staged
@@ -6442,7 +8340,8 @@ def _dag_task_spec_path_problems(
         if forbidden is None:
             continue
         exists = _dag_reported_file_exists(path, roots)
-        tracked_or_staged = _dag_path_tracked_or_staged(path, roots)
+        git_state = _dag_git_path_state(path, roots)
+        tracked_or_staged = bool(git_state.get("tracked_or_staged"))
         problems.append({
             "task_id": task.id,
             "artifact_key": f"dag-task:{task.id}",
@@ -6452,6 +8351,7 @@ def _dag_task_spec_path_problems(
             "exists": str(bool(exists)).lower(),
             "exists_on_disk": bool(exists),
             "tracked_or_staged": tracked_or_staged,
+            **_dag_git_state_problem_fields(git_state),
             "repair_route": (
                 "product_cleanup_required"
                 if exists or tracked_or_staged
@@ -6716,7 +8616,8 @@ def _dag_task_bearing_source_artifact_path_problems(
             return
         seen.add(key)
         exists = _dag_reported_file_exists(path, roots)
-        tracked_or_staged = _dag_path_tracked_or_staged(path, roots)
+        git_state = _dag_git_path_state(path, roots)
+        tracked_or_staged = bool(git_state.get("tracked_or_staged"))
         problems.append({
             "task_id": task_id,
             "artifact_key": f"dag-task:{task_id}" if task_id else "",
@@ -6726,6 +8627,7 @@ def _dag_task_bearing_source_artifact_path_problems(
             "exists": str(bool(exists)).lower(),
             "exists_on_disk": bool(exists),
             "tracked_or_staged": tracked_or_staged,
+            **_dag_git_state_problem_fields(git_state),
             "repair_route": (
                 "product_cleanup_required"
                 if exists or tracked_or_staged
@@ -6999,7 +8901,8 @@ def _dag_forbidden_workspace_path_problems(
             if not relevant_by_task and not relevant_by_text:
                 continue
         exists = bool(_dag_existing_path_locations(path, roots))
-        tracked_or_staged = _dag_path_tracked_or_staged(path, roots)
+        git_state = _dag_git_path_state(path, roots)
+        tracked_or_staged = bool(git_state.get("tracked_or_staged"))
         if not exists and not tracked_or_staged:
             continue
         problems.append({
@@ -7010,6 +8913,7 @@ def _dag_forbidden_workspace_path_problems(
             "exists": str(bool(exists)).lower(),
             "exists_on_disk": exists,
             "tracked_or_staged": tracked_or_staged,
+            **_dag_git_state_problem_fields(git_state),
             "repair_route": "product_cleanup_required",
             "forbidden_rule": entry.get("path", ""),
             "forbidden_path": entry.get("path", ""),
@@ -7019,6 +8923,715 @@ def _dag_forbidden_workspace_path_problems(
                 if task_id else []
             ),
         })
+    return problems
+
+
+def _dag_direct_workflow_repo_roots(repos_root: Path | None) -> list[Path]:
+    if repos_root is None:
+        return []
+    direct_repos_dir = repos_root if repos_root.name == "repos" else repos_root / "repos"
+    if not direct_repos_dir.exists():
+        return []
+    repos: list[Path] = []
+    try:
+        children = sorted(direct_repos_dir.iterdir())
+    except Exception:
+        return []
+    for child in children:
+        if child.is_dir() and (child / ".git").exists():
+            repos.append(child)
+    return repos
+
+
+def _dag_workspace_permission_repair_enabled() -> bool:
+    return _env_flag_enabled(DAG_WORKSPACE_PERMISSION_REPAIR_ENV, default=True)
+
+
+def _agent_shared_gid() -> int | None:
+    if grp is None:
+        return None
+    group_name = os.environ.get(
+        AGENT_SHARED_GROUP_ENV,
+        DEFAULT_AGENT_SHARED_GROUP,
+    ).strip()
+    if not group_name:
+        return None
+    try:
+        return grp.getgrnam(group_name).gr_gid
+    except KeyError:
+        return None
+
+
+def _strip_direct_route_line_suffix(value: str) -> str:
+    target = str(value or "").strip().strip("`'\"")
+    if ":" in target:
+        maybe_path, maybe_line = target.rsplit(":", 1)
+        if maybe_line.isdigit():
+            target = maybe_path
+    while target.startswith("./"):
+        target = target[2:]
+    return target.replace("\\", "/").strip("/")
+
+
+def _dag_workspace_permission_repo_roots(feature_root: Path | None) -> list[Path]:
+    repos = _dag_direct_workflow_repo_roots(feature_root)
+    if repos:
+        return repos
+    if feature_root is None or not feature_root.exists():
+        return []
+    # Test/fixture fallback: still only direct child repos, never recursive repos.
+    try:
+        return sorted(
+            child for child in feature_root.iterdir()
+            if child.is_dir() and (child / ".git").exists()
+        )
+    except Exception:
+        return []
+
+
+def _repo_relative_cleanup_target(repo: Path, target: str) -> str | None:
+    normalized = _strip_direct_route_line_suffix(target)
+    if not normalized:
+        return None
+    try:
+        candidate = Path(normalized).expanduser()
+        if candidate.is_absolute():
+            return candidate.resolve(strict=False).relative_to(
+                repo.resolve(strict=False)
+            ).as_posix()
+    except Exception:
+        return None
+    repo_name = repo.name.strip("/")
+    if repo_name and normalized.startswith(f"{repo_name}/"):
+        normalized = normalized[len(repo_name) + 1:]
+    if normalized.startswith("../") or normalized == "..":
+        return None
+    return normalized
+
+
+def _git_path_has_state(repo: Path, repo_relative_path: str) -> bool:
+    state = _dag_git_path_state(repo_relative_path, [repo])
+    return bool(state.get("states"))
+
+
+def _cleanup_target_matches_repo_manifest(
+    repo: Path,
+    repo_relative_path: str,
+) -> bool:
+    entries = _dag_manifest_path_entries([repo]).get("forbidden_files", [])
+    return _dag_forbidden_match(repo_relative_path, entries) is not None
+
+
+def _cleanup_permission_candidates(
+    feature_root: Path | None,
+    target_files: list[str],
+) -> tuple[list[tuple[Path, Path, str]], list[str]]:
+    repos = _dag_workspace_permission_repo_roots(feature_root)
+    candidates: list[tuple[Path, Path, str]] = []
+    skipped: list[str] = []
+    seen: set[tuple[str, str]] = set()
+    for raw_target in target_files:
+        target = _strip_direct_route_line_suffix(raw_target)
+        if not target:
+            continue
+        matched = False
+        for repo in repos:
+            repo_relative = _repo_relative_cleanup_target(repo, target)
+            if not repo_relative:
+                continue
+            absolute = repo / repo_relative
+            relevant = (
+                absolute.exists()
+                or _git_path_has_state(repo, repo_relative)
+                or _cleanup_target_matches_repo_manifest(repo, repo_relative)
+            )
+            if not relevant:
+                continue
+            key = (str(repo.resolve(strict=False)), repo_relative)
+            if key in seen:
+                continue
+            seen.add(key)
+            candidates.append((repo, absolute, repo_relative))
+            matched = True
+        if repos and not matched:
+            skipped.append(f"no direct workflow repo matched target {target}")
+    return candidates, skipped
+
+
+def _path_has_symlink_ancestor(repo: Path, target: Path) -> str:
+    try:
+        relative = target.resolve(strict=False).relative_to(repo.resolve(strict=False))
+    except Exception:
+        return "target escapes direct workflow repo"
+    current = repo
+    for part in relative.parts:
+        current = current / part
+        try:
+            if current.is_symlink():
+                return f"symlink path component is not permission-normalized: {current}"
+        except OSError:
+            return f"failed to inspect path component: {current}"
+    return ""
+
+
+def _nearest_existing_dir_for_permission(target: Path) -> Path | None:
+    current = target if target.exists() and target.is_dir() else target.parent
+    while True:
+        if current.exists():
+            return current if current.is_dir() else current.parent
+        if current == current.parent:
+            return None
+        current = current.parent
+
+
+def _chmod_for_agent_group(
+    path: Path,
+    *,
+    repo: Path,
+    report: dict[str, Any],
+    reason: str,
+    shared_gid: int | None,
+) -> None:
+    try:
+        st = path.lstat()
+    except OSError as exc:
+        report["failed"].append({
+            "path": str(path),
+            "reason": reason,
+            "error": f"stat failed: {exc}",
+        })
+        return
+    if stat.S_ISLNK(st.st_mode):
+        report["failed"].append({
+            "path": str(path),
+            "reason": reason,
+            "error": "refusing to chmod symlink",
+        })
+        return
+
+    changed: dict[str, Any] = {
+        "path": str(path),
+        "reason": reason,
+        "old_mode": stat.filemode(st.st_mode),
+    }
+    try:
+        if shared_gid is not None and st.st_gid != shared_gid:
+            os.chown(path, -1, shared_gid)
+            changed["group_changed"] = True
+            st = path.lstat()
+    except PermissionError as exc:
+        report["skipped"].append({
+            "path": str(path),
+            "reason": reason,
+            "error": f"group change skipped: {exc}",
+        })
+    except OSError as exc:
+        report["skipped"].append({
+            "path": str(path),
+            "reason": reason,
+            "error": f"group change skipped: {exc}",
+        })
+
+    mode = stat.S_IMODE(st.st_mode)
+    if stat.S_ISDIR(st.st_mode):
+        desired = mode | stat.S_IRGRP | stat.S_IWGRP | stat.S_IXGRP | stat.S_ISGID
+    else:
+        desired = mode | stat.S_IRGRP | stat.S_IWGRP
+    if desired == mode and not changed.get("group_changed"):
+        report["already_ok"].append({
+            "path": str(path),
+            "reason": reason,
+            "mode": stat.filemode(st.st_mode),
+        })
+        return
+    try:
+        os.chmod(path, desired)
+    except OSError as exc:
+        report["failed"].append({
+            "path": str(path),
+            "reason": reason,
+            "error": f"chmod failed: {exc}",
+            "mode": stat.filemode(st.st_mode),
+        })
+        return
+    try:
+        new_mode = stat.filemode(path.lstat().st_mode)
+    except OSError:
+        new_mode = oct(desired)
+    changed["new_mode"] = new_mode
+    report["changed"].append(changed)
+
+
+def _workspace_permission_paths_for_target(repo: Path, target: Path) -> list[Path]:
+    paths: list[Path] = []
+    try:
+        relative = target.resolve(strict=False).relative_to(repo.resolve(strict=False))
+    except Exception:
+        return paths
+    current = repo
+    if current.exists():
+        paths.append(current)
+    parts_for_parents = relative.parts
+    if not (target.exists() and target.is_dir()):
+        parts_for_parents = relative.parts[:-1]
+    for part in parts_for_parents:
+        current = current / part
+        if current.exists():
+            paths.append(current)
+        else:
+            break
+    if target.exists():
+        paths.append(target)
+    git_dir = repo / ".git"
+    git_index = git_dir / "index"
+    for path in [git_dir, git_index]:
+        if path.exists():
+            paths.append(path)
+    deduped: list[Path] = []
+    seen: set[str] = set()
+    for path in paths:
+        key = path.resolve(strict=False).as_posix()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(path)
+    return deduped
+
+
+def _cleanup_operator_reasons(repo: Path, target: Path) -> list[str]:
+    reasons: list[str] = []
+    symlink_reason = _path_has_symlink_ancestor(repo, target)
+    if symlink_reason:
+        reasons.append(symlink_reason)
+        return reasons
+    parent = _nearest_existing_dir_for_permission(target)
+    if parent is None:
+        reasons.append(f"no existing parent directory for cleanup target: {target}")
+    elif not _path_agent_writable(parent, repo_path=repo):
+        reasons.append(f"parent directory is not writable by repair agent: {parent}")
+    if target.exists() and target.is_dir() and not _path_agent_writable(
+        target,
+        repo_path=repo,
+    ):
+        reasons.append(f"forbidden directory is not writable by repair agent: {target}")
+    git_index = repo / ".git" / "index"
+    if git_index.exists() and not _path_agent_writable(git_index, repo_path=repo):
+        reasons.append(f"git index is not writable by repair agent: {git_index}")
+    return reasons
+
+
+def _normalize_feature_workspace_cleanup_permissions(
+    feature_root: Path | None,
+    target_files: list[str],
+    *,
+    reason: str,
+) -> dict[str, Any]:
+    report: dict[str, Any] = {
+        "enabled": _dag_workspace_permission_repair_enabled(),
+        "reason": reason,
+        "target_files": list(target_files),
+        "changed": [],
+        "already_ok": [],
+        "skipped": [],
+        "failed": [],
+        "operator_reasons": [],
+        "operator_required": False,
+    }
+    if not report["enabled"]:
+        report["operator_required"] = False
+        report["skipped"].append({
+            "reason": "workspace_permission_repair_disabled",
+        })
+        return report
+    if feature_root is None:
+        report["operator_required"] = True
+        report["operator_reasons"].append("missing feature workspace root")
+        return report
+
+    candidates, skipped_targets = _cleanup_permission_candidates(
+        feature_root,
+        target_files,
+    )
+    for skipped in skipped_targets:
+        report["skipped"].append({"reason": skipped})
+    if target_files and not candidates:
+        report["operator_required"] = True
+        report["operator_reasons"].append(
+            "no direct workflow repo target could be matched for permission repair"
+        )
+        return report
+
+    shared_gid = _agent_shared_gid()
+    for repo, target, repo_relative in candidates:
+        symlink_reason = _path_has_symlink_ancestor(repo, target)
+        if symlink_reason:
+            report["failed"].append({
+                "repo": str(repo),
+                "path": str(target),
+                "repo_relative_path": repo_relative,
+                "error": symlink_reason,
+            })
+            continue
+        for path in _workspace_permission_paths_for_target(repo, target):
+            _chmod_for_agent_group(
+                path,
+                repo=repo,
+                report=report,
+                reason=reason,
+                shared_gid=shared_gid,
+            )
+        for operator_reason in _cleanup_operator_reasons(repo, target):
+            report["operator_reasons"].append(operator_reason)
+
+    report["operator_reasons"] = list(dict.fromkeys(report["operator_reasons"]))
+    report["operator_required"] = bool(report["failed"] or report["operator_reasons"])
+    return report
+
+
+async def _record_workspace_permission_repair(
+    runner: WorkflowRunner,
+    feature: Feature,
+    group_idx: int,
+    retry_label: str,
+    report: dict[str, Any],
+    *,
+    context: str,
+) -> None:
+    payload = dict(report)
+    payload.update({
+        "group_idx": group_idx,
+        "retry": retry_label,
+        "context": context,
+    })
+    await runner.artifacts.put(
+        f"dag-workspace-permission-repair:g{group_idx}:retry-{retry_label}:{context}",
+        json.dumps(payload, indent=2),
+        feature=feature,
+    )
+
+
+async def _normalize_direct_route_workspace_permissions(
+    runner: WorkflowRunner,
+    feature: Feature,
+    group_idx: int,
+    retry: int,
+    feature_root: Path | None,
+    route: DagDirectRepairRoute,
+) -> DagDirectRepairRoute:
+    if route.route != _MANIFEST_FORBIDDEN_CLEANUP_ROUTE:
+        return route
+    report = _normalize_feature_workspace_cleanup_permissions(
+        feature_root,
+        route.target_files,
+        reason=route.route,
+    )
+    await _record_workspace_permission_repair(
+        runner,
+        feature,
+        group_idx,
+        str(retry),
+        report,
+        context="direct-route",
+    )
+    route = dataclasses.replace(
+        route,
+        operator_required=bool(report.get("operator_required")),
+        workspace_permission_repair=report,
+    )
+    if report.get("operator_required"):
+        route.reason = f"{route.reason}_workspace_permission_blocked"
+    elif report.get("changed"):
+        route.reason = f"{route.reason}_workspace_permission_normalized"
+    return route
+
+
+def _implementation_result_permission_targets(
+    results: list[ImplementationResult],
+) -> list[str]:
+    return _dedupe_preserving_order([
+        path for result in results
+        for path in [*result.files_created, *result.files_modified]
+        if path
+    ])
+
+
+def _manifest_cleanup_scoped_entries(
+    feature_root: Path | None,
+    target_files: list[str],
+) -> tuple[list[Path], list[dict[str, str]], list[dict[str, str]]]:
+    roots = _dag_candidate_file_roots(feature_root)
+    manifest_entries = _dag_manifest_path_entries(roots)
+    expected_entries = manifest_entries.get("expected_files", [])
+    forbidden_entries = manifest_entries.get("forbidden_files", [])
+    if not target_files:
+        return roots, expected_entries, forbidden_entries
+    scoped: list[dict[str, str]] = []
+    seen: set[str] = set()
+    repos = _dag_workspace_permission_repo_roots(feature_root)
+    normalized_targets: set[str] = set()
+    for target in target_files:
+        clean = _strip_direct_route_line_suffix(target)
+        if not clean:
+            continue
+        normalized_targets.add(clean)
+        for repo in repos:
+            repo_relative = _repo_relative_cleanup_target(repo, clean)
+            if repo_relative:
+                normalized_targets.add(repo_relative)
+    for entry in forbidden_entries:
+        forbidden_path = entry.get("path", "")
+        if not forbidden_path:
+            continue
+        if any(
+            _dag_path_matches_forbidden_file(target, {forbidden_path})
+            or _dag_path_matches_forbidden_file(forbidden_path, {target})
+            for target in normalized_targets
+        ):
+            if forbidden_path not in seen:
+                seen.add(forbidden_path)
+                scoped.append(entry)
+    return roots, expected_entries, scoped
+
+
+def _manifest_forbidden_cleanup_remaining_problems(
+    feature_root: Path | None,
+    target_files: list[str],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    roots, expected_entries, forbidden_entries = _manifest_cleanup_scoped_entries(
+        feature_root,
+        target_files,
+    )
+    problems = _dag_forbidden_workspace_path_problems(
+        roots,
+        forbidden_entries,
+        expected_entries,
+        include_all=True,
+    )
+    blocking: list[dict[str, Any]] = []
+    staging_only: list[dict[str, Any]] = []
+    for problem in problems:
+        if (
+            problem.get("git_state") == "unstaged_delete"
+            and not problem.get("exists_on_disk")
+        ):
+            staging_only.append(problem)
+            continue
+        blocking.append(problem)
+    return blocking, staging_only
+
+
+def _manifest_cleanup_remaining_verdict(
+    *,
+    group_idx: int,
+    retry: int,
+    problems: list[dict[str, Any]],
+) -> Verdict:
+    concerns = [
+        Issue(
+            severity="blocker",
+            description=(
+                f"{_MANIFEST_FORBIDDEN_MARKER} remains after focused cleanup "
+                f"retry-{retry}; forbidden product files still exist on disk or "
+                "in a blocking git state. The workflow will retry focused cleanup "
+                "instead of broad expanded verification."
+            ),
+            file=str(problem.get("path", "")),
+        )
+        for problem in problems[:10]
+    ]
+    return Verdict(
+        approved=False,
+        summary=(
+            f"Group {group_idx} manifest-forbidden cleanup is incomplete after "
+            f"retry-{retry}."
+        ),
+        concerns=concerns,
+    )
+
+
+def _dag_repo_hygiene_problems(repos_root: Path | None) -> list[dict[str, Any]]:
+    problems: list[dict[str, Any]] = []
+    for repo in _dag_direct_workflow_repo_roots(repos_root):
+        repo_name = repo.name
+
+        def _repo_rel(path: Path) -> str:
+            try:
+                rel = path.relative_to(repo)
+            except ValueError:
+                rel = path
+            return f"{repo_name}/{rel.as_posix()}"
+
+        def _ignored(path: Path) -> bool:
+            parts = set(path.parts)
+            return bool(
+                parts
+                & {
+                    ".git",
+                    ".git.backup-pre-cleanup",
+                    ".venv",
+                    "node_modules",
+                    "__pycache__",
+                    ".iriai-context",
+                    ".iriai-evidence",
+                }
+            )
+
+        try:
+            for git_dir in repo.rglob(".git"):
+                if git_dir == repo / ".git" or _ignored(git_dir.parent):
+                    continue
+                problems.append({
+                    "task_id": "",
+                    "artifact_key": "",
+                    "path": _repo_rel(git_dir),
+                    "reason": "embedded_git",
+                    "exists": "true",
+                    "exists_on_disk": True,
+                    "tracked_or_staged": False,
+                    "git_state": "embedded_git",
+                    "repair_route": "product_cleanup_required",
+                    "forbidden_rule": "",
+                    "forbidden_path": "",
+                    "forbidden_source": "repo hygiene guard",
+                    "candidate_evidence": [],
+                })
+        except Exception:
+            logger.debug("Failed to scan %s for embedded .git directories", repo, exc_info=True)
+
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(repo), "ls-files", "-s"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                check=False,
+                timeout=5,
+            )
+            if result.returncode == 0:
+                for line in result.stdout.splitlines():
+                    if not line.startswith("160000 "):
+                        continue
+                    path = line.split("\t", 1)[-1].strip()
+                    if path:
+                        problems.append({
+                            "task_id": "",
+                            "artifact_key": "",
+                            "path": f"{repo_name}/{path}",
+                            "reason": "gitlink",
+                            "exists": "true",
+                            "exists_on_disk": True,
+                            "tracked_or_staged": True,
+                            "git_state": "gitlink",
+                            "repair_route": "product_cleanup_required",
+                            "forbidden_rule": "",
+                            "forbidden_path": "",
+                            "forbidden_source": "repo hygiene guard",
+                            "candidate_evidence": [],
+                        })
+        except Exception:
+            logger.debug("Failed to scan %s for gitlinks", repo, exc_info=True)
+
+        try:
+            parked = list(repo.rglob("_pending_*.py")) + list(repo.rglob("*.PROPOSED"))
+        except Exception:
+            parked = []
+        for path in sorted(parked):
+            if _ignored(path):
+                continue
+            problems.append({
+                "task_id": "",
+                "artifact_key": "",
+                "path": _repo_rel(path),
+                "reason": "parked_implementation_file",
+                "exists": "true",
+                "exists_on_disk": True,
+                "tracked_or_staged": _dag_path_tracked_or_staged(_repo_rel(path), [repo]),
+                "git_state": "parked_implementation_file",
+                "repair_route": "product_cleanup_required",
+                "forbidden_rule": "",
+                "forbidden_path": "",
+                "forbidden_source": "repo hygiene guard",
+                "candidate_evidence": [],
+            })
+    return problems
+
+
+def _dag_workspace_writeability_problems(
+    repos_root: Path | None,
+    tasks: list[ImplementationTask],
+) -> list[dict[str, Any]]:
+    if repos_root is None:
+        return []
+
+    def _task_repo_root(task: ImplementationTask) -> Path:
+        if task.repo_path:
+            return repos_root / task.repo_path
+        return repos_root
+
+    def _target_path(task: ImplementationTask, raw_path: str) -> Path:
+        normalized = raw_path.strip().replace("\\", "/").strip("/")
+        repo_root = _task_repo_root(task)
+        if task.repo_path and normalized.startswith(f"{task.repo_path.strip('/')}/"):
+            normalized = normalized[len(task.repo_path.strip("/")) + 1:]
+        return repo_root / normalized
+
+    def _nearest_existing_dir(path: Path) -> Path | None:
+        current = path if path.is_dir() else path.parent
+        while True:
+            if current.exists():
+                return current if current.is_dir() else current.parent
+            if current == current.parent:
+                return None
+            current = current.parent
+
+    def _can_write_dir(directory: Path) -> bool:
+        probe = directory / f".iriai-write-probe-{uuid4().hex}"
+        try:
+            with probe.open("xb") as fh:
+                fh.write(b"")
+            probe.unlink(missing_ok=True)
+            return True
+        except Exception:
+            try:
+                probe.unlink(missing_ok=True)
+            except Exception:
+                pass
+            return False
+
+    problems: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for task in tasks:
+        entries: list[tuple[str, str]] = [
+            (scope.path, scope.action)
+            for scope in task.file_scope
+            if scope.path and scope.action != "read_only"
+        ]
+        if not entries:
+            entries = [(path, "modify") for path in task.files if path]
+        for raw_path, action in entries:
+            target = _target_path(task, raw_path)
+            check_dir = _nearest_existing_dir(target)
+            key = (task.id, raw_path, action)
+            if key in seen:
+                continue
+            seen.add(key)
+            if check_dir is None:
+                problems.append({
+                    "task_id": task.id,
+                    "path": raw_path,
+                    "action": action,
+                    "reason": "writeability_missing_parent",
+                    "directory": str(target.parent),
+                })
+                continue
+            if not _can_write_dir(check_dir):
+                problems.append({
+                    "task_id": task.id,
+                    "path": raw_path,
+                    "action": action,
+                    "reason": "writeability_denied",
+                    "directory": str(check_dir),
+                })
     return problems
 
 
@@ -8286,6 +10899,32 @@ async def _run_dag_group_preflight(
 
     roots = _dag_candidate_file_roots(feature_root)
     if roots:
+        hygiene_problems = _dag_repo_hygiene_problems(feature_root)
+        path_problems.extend(hygiene_problems)
+        for problem in hygiene_problems:
+            path = str(problem.get("path", ""))
+            reason = str(problem.get("reason", "repo_hygiene"))
+            if reason == "embedded_git":
+                description = (
+                    "embedded .git directory exists inside a workflow repo; "
+                    f"remove it before checkpointing: {path}"
+                )
+            elif reason == "gitlink":
+                description = (
+                    "gitlink/submodule entry exists inside a workflow repo; "
+                    f"convert or remove it before checkpointing: {path}"
+                )
+            else:
+                description = (
+                    "parked implementation fallback exists outside its canonical "
+                    f"package path; promote or remove it before checkpointing: {path}"
+                )
+            concerns.append(Issue(
+                severity="major",
+                description=description,
+                file=path,
+            ))
+
         manifest_entries = _dag_manifest_path_entries(roots)
         expected_entries = manifest_entries.get("expected_files", [])
         forbidden_entries = manifest_entries.get("forbidden_files", [])
@@ -8298,13 +10937,26 @@ async def _run_dag_group_preflight(
         path_problems.extend(workspace_forbidden_problems)
         for problem in workspace_forbidden_problems:
             path = problem["path"]
-            concerns.append(Issue(
-                severity="major",
-                description=(
+            if (
+                problem.get("git_state") == "unstaged_delete"
+                and not problem.get("exists_on_disk")
+            ):
+                description = (
+                    f"{_MANIFEST_FORBIDDEN_MARKER} required; "
+                    "manifest-forbidden path has been deleted from disk but "
+                    "the deletion is not staged; stage the deletion before DAG "
+                    f"metadata can be considered repaired: {path}"
+                )
+            else:
+                description = (
+                    f"{_MANIFEST_FORBIDDEN_MARKER} required; "
                     "manifest-forbidden path exists in the feature workspace or "
                     "git index; product cleanup is required before DAG metadata "
                     f"can be considered repaired: {path}"
-                ),
+                )
+            concerns.append(Issue(
+                severity="major",
+                description=description,
                 file=path,
             ))
         for task in group_tasks:
@@ -8318,6 +10970,11 @@ async def _run_dag_group_preflight(
             for problem in task_spec_problems:
                 path = problem["path"]
                 field = problem.get("field", "file_scope")
+                product_cleanup_prefix = (
+                    f"{_MANIFEST_FORBIDDEN_MARKER} required; "
+                    if problem.get("repair_route") == "product_cleanup_required"
+                    else ""
+                )
                 source_refs = [
                     f"dag-task:{task.id}",
                     *(
@@ -8328,7 +10985,7 @@ async def _run_dag_group_preflight(
                 concerns.append(Issue(
                     severity="major",
                     description=(
-                        f"{task.id} task spec {field} references a "
+                        f"{product_cleanup_prefix}{task.id} task spec {field} references a "
                         "manifest-forbidden/stale path; source artifacts: "
                         f"{', '.join(source_refs)}; repair the DAG/source artifact "
                         "instead of recreating this path: "
@@ -8351,10 +11008,15 @@ async def _run_dag_group_preflight(
             source_ref = str(problem.get("source_artifact_ref", ""))
             source_path = str(problem.get("source_artifact_path", ""))
             field = str(problem.get("field", "file_scope"))
+            product_cleanup_prefix = (
+                f"{_MANIFEST_FORBIDDEN_MARKER} required; "
+                if problem.get("repair_route") == "product_cleanup_required"
+                else ""
+            )
             concerns.append(Issue(
                 severity="major",
                 description=(
-                    "DAG source artifact task spec metadata references a "
+                    f"{product_cleanup_prefix}DAG source artifact task spec metadata references a "
                     "manifest-forbidden/stale path; source artifact: "
                     f"{source_ref or source_path}; field {field}; repair the "
                     "DAG/source artifact instead of recreating this path: "
@@ -8382,10 +11044,15 @@ async def _run_dag_group_preflight(
             for problem in result_problems:
                 path = problem["path"]
                 if problem["reason"] == "forbidden":
+                    product_cleanup_prefix = (
+                        f"{_MANIFEST_FORBIDDEN_MARKER} required; "
+                        if problem.get("repair_route") == "product_cleanup_required"
+                        else ""
+                    )
                     concerns.append(Issue(
                         severity="major",
                         description=(
-                            f"{result.task_id} reports changed file that is "
+                            f"{product_cleanup_prefix}{result.task_id} reports changed file that is "
                             "forbidden/stale by verify-file-scope.expected-files.json; "
                             f"source artifact: dag-task:{result.task_id}; "
                             "repair stale task metadata instead of creating "
@@ -8668,6 +11335,546 @@ def _deterministic_dag_artifact_repair_group(
         rca=rca,
         issue_text=issue_text,
         rca_key=f"host-deterministic:dag-repair:g{group_idx}:retry-{retry}:{group_id}",
+    )
+
+
+def _dag_authority_preflight_key(
+    group_idx: int,
+    retry_label: str,
+) -> str:
+    return f"dag-repair-preflight:g{group_idx}:retry-{retry_label}"
+
+
+async def _dag_authority_load_preflight_report(
+    runner: WorkflowRunner,
+    feature: Feature,
+    group_idx: int,
+    retry_label: str,
+) -> tuple[str, dict[str, Any]]:
+    key = _dag_authority_preflight_key(group_idx, retry_label)
+    try:
+        raw = await runner.artifacts.get(key, feature=feature)
+    except Exception:
+        logger.debug("Failed to load DAG authority preflight report %s", key, exc_info=True)
+        return key, {}
+    if not raw:
+        return key, {}
+    try:
+        payload = json.loads(str(raw))
+    except Exception:
+        logger.debug("Invalid DAG authority preflight report JSON %s", key, exc_info=True)
+        return key, {}
+    return key, payload if isinstance(payload, dict) else {}
+
+
+def _dag_authority_path_problem_route(
+    problems: list[dict[str, Any]],
+    artifact_only: list[dict[str, Any]],
+) -> tuple[str, str]:
+    if not problems:
+        return _DAG_AUTHORITY_SEMANTIC_ROUTE, "no_path_problems"
+    if any(
+        str(problem.get("reason", "")) in {"embedded_git", "gitlink", "parked_fallback"}
+        for problem in problems
+    ):
+        return _DAG_AUTHORITY_REPO_BLOCKER_ROUTE, "repo_hygiene_path_problem"
+    if any(
+        str(problem.get("repair_route", "")) == "product_cleanup_required"
+        or bool(problem.get("exists_on_disk"))
+        or bool(problem.get("tracked_or_staged"))
+        or str(problem.get("git_state", "")) in {
+            "clean_tracked",
+            "unstaged_delete",
+            "staged_add",
+            "untracked",
+        }
+        for problem in problems
+    ):
+        return _DAG_AUTHORITY_PRODUCT_WORKSPACE_ROUTE, (
+            "path_problem_requires_product_workspace_cleanup"
+        )
+    if not artifact_only:
+        return _DAG_AUTHORITY_SEMANTIC_ROUTE, "no_deterministic_artifact_only_problem"
+    if any(
+        str(problem.get("reason", "")) in {
+            "forbidden_task_spec",
+            "forbidden_task_spec_source_artifact",
+        }
+        for problem in artifact_only
+    ):
+        return _DAG_AUTHORITY_TASK_SPEC_PROJECTION_ROUTE, "task_spec_projection_drift"
+    if any(
+        str(problem.get("source_artifact_ref", "")).strip()
+        and not str(problem.get("artifact_key", "")).startswith("dag-task:")
+        for problem in artifact_only
+    ):
+        return _DAG_AUTHORITY_SOURCE_ARTIFACT_ROUTE, "source_artifact_drift"
+    return _DAG_AUTHORITY_DB_TASK_RESULT_ROUTE, "db_task_result_drift"
+
+
+def _dag_authority_task_refs_from_path_problems(
+    problems: list[dict[str, Any]],
+) -> list[str]:
+    refs: list[str] = []
+    for problem in problems:
+        artifact_key = str(problem.get("artifact_key", "") or "").strip()
+        task_id = str(problem.get("task_id", "") or "").strip()
+        if _is_dag_task_artifact_key(artifact_key):
+            refs.append(artifact_key)
+        elif task_id:
+            ref = f"dag-task:{task_id}"
+            if _is_dag_task_artifact_key(ref):
+                refs.append(ref)
+    return _safe_dag_task_artifact_refs(refs)
+
+
+async def _dag_authority_latest_records(
+    runner: WorkflowRunner,
+    feature: Feature,
+    refs: list[str],
+) -> dict[str, dict[str, Any] | None]:
+    return {
+        ref: await _dag_artifact_record_for_key(runner, feature, ref)
+        for ref in refs
+    }
+
+
+def _dag_authority_blocked_verdict(
+    group_idx: int,
+    retry: int,
+    *,
+    route: str,
+    reason: str,
+    target_refs: list[str],
+    detail: str,
+) -> Verdict:
+    refs = ", ".join(target_refs) if target_refs else "(none)"
+    return Verdict(
+        approved=False,
+        summary=(
+            f"Group {group_idx} authority gate blocked retry {retry}: "
+            f"{route} did not produce a valid authoritative repair."
+        ),
+        concerns=[
+            Issue(
+                severity="blocker",
+                description=(
+                    "DAG authority gate blocked broad repair. "
+                    f"Route: {route}; reason: {reason}; target refs: {refs}. "
+                    f"{detail}"
+                ),
+            )
+        ],
+        suggestions=[
+            "Repair the authoritative DAG/task artifact state, then retry verification.",
+        ],
+    )
+
+
+async def _record_dag_authority_gate(
+    runner: WorkflowRunner,
+    feature: Feature,
+    group_idx: int,
+    retry: int,
+    report: dict[str, Any],
+) -> None:
+    await runner.artifacts.put(
+        f"dag-authority-gate:g{group_idx}:retry-{retry}",
+        json.dumps(report, indent=2),
+        feature=feature,
+    )
+
+
+def _dag_authority_synthetic_result(
+    group_idx: int,
+    retry: int,
+    report: dict[str, Any],
+) -> ImplementationResult:
+    return ImplementationResult(
+        task_id=f"DAG-AUTHORITY-REPAIR-g{group_idx}-r{retry}",
+        summary=(
+            "DAG authority gate repaired deterministic workflow metadata "
+            f"via {report.get('status', 'unknown')}."
+        ),
+        status="completed",
+        files_created=[],
+        files_modified=[],
+        notes=json.dumps(report, indent=2),
+    )
+
+
+def _dag_authority_applied_dag_task_updates(
+    repair_result: ImplementationResult,
+) -> list[dict[str, Any]]:
+    try:
+        record = json.loads(repair_result.notes or "{}")
+    except Exception:
+        return []
+    application = record.get("artifact_update_application", {})
+    if not isinstance(application, dict):
+        return []
+    applied = application.get("applied_updates", [])
+    if not isinstance(applied, list):
+        return []
+    return [
+        item for item in applied
+        if isinstance(item, dict)
+        and item.get("artifact_kind") == "dag_task"
+        and _is_dag_task_artifact_key(str(item.get("artifact_key", "")))
+    ]
+
+
+async def _attempt_dag_authority_gate_repair(
+    runner: WorkflowRunner,
+    feature: Feature,
+    group_idx: int,
+    retry: int,
+    verdict: Verdict,
+    group_tasks: list[ImplementationTask],
+    *,
+    results: list[object],
+    verify_results_context: list[object],
+    all_results: list[object],
+    feature_root: Path | None,
+    runtime: str | None,
+    feedback: str,
+    known_task_ids: set[str] | None = None,
+) -> DagAuthorityGateOutcome:
+    preflight_key, preflight_report = await _dag_authority_load_preflight_report(
+        runner,
+        feature,
+        group_idx,
+        "initial" if retry == 0 else str(retry - 1),
+    )
+    path_problems = [
+        problem for problem in preflight_report.get("path_problems", [])
+        if isinstance(problem, dict)
+    ]
+    if not path_problems:
+        path_problems = _dag_path_problems_from_verdict(verdict, group_tasks)
+    artifact_only = _dag_deterministic_artifact_only_path_problems(
+        path_problems,
+        feature_root,
+    )
+    route, reason = _dag_authority_path_problem_route(path_problems, artifact_only)
+    target_refs = _dag_authority_task_refs_from_path_problems(artifact_only)
+    report: dict[str, Any] = {
+        "group_idx": group_idx,
+        "retry": retry,
+        "route": route,
+        "reason": reason,
+        "status": "no_action",
+        "preflight_artifact_key": preflight_key,
+        "parallel_repair_enabled": _dag_parallel_repair_enabled(),
+        "parallel_repair_affects_authority_gate": False,
+        "path_problems": path_problems,
+        "artifact_only_path_problems": artifact_only,
+        "target_refs": target_refs,
+        "task_ids": [task.id for task in group_tasks],
+        "latest_records_before": {},
+        "latest_records_after": {},
+        "reconcile_reports": [],
+        "artifact_repair": None,
+        "post_repair_preflight_key": "",
+    }
+
+    if route == _DAG_AUTHORITY_SEMANTIC_ROUTE:
+        await _record_dag_authority_gate(runner, feature, group_idx, retry, report)
+        return DagAuthorityGateOutcome(route=route, status="no_action", reason=reason, report=report)
+    if route in {
+        _DAG_AUTHORITY_PRODUCT_WORKSPACE_ROUTE,
+        _DAG_AUTHORITY_REPO_BLOCKER_ROUTE,
+    }:
+        report["status"] = "delegated_to_existing_product_or_operator_route"
+        await _record_dag_authority_gate(runner, feature, group_idx, retry, report)
+        return DagAuthorityGateOutcome(route=route, status=report["status"], reason=reason, report=report)
+    if route in {
+        _DAG_AUTHORITY_TASK_SPEC_PROJECTION_ROUTE,
+        _DAG_AUTHORITY_SOURCE_ARTIFACT_ROUTE,
+    }:
+        spec_reconcile = await _reconcile_dag_task_specs(
+            runner,
+            feature,
+            group_idx,
+            f"{retry}-authority-spec",
+            group_tasks,
+            feature_root=feature_root,
+        )
+        report["task_spec_reconcile"] = spec_reconcile.report
+        post_spec_label = f"{retry}-authority-spec"
+        post_spec = await _run_dag_group_preflight(
+            runner,
+            feature,
+            group_idx,
+            post_spec_label,
+            spec_reconcile.tasks,
+            verify_results_context,
+            feature_root=feature_root,
+            known_task_ids=known_task_ids,
+        )
+        report["post_repair_preflight_key"] = _dag_authority_preflight_key(
+            group_idx,
+            post_spec_label,
+        )
+        if post_spec is None:
+            report["status"] = "repaired_by_task_spec_reconcile"
+            await _record_dag_authority_gate(runner, feature, group_idx, retry, report)
+            return DagAuthorityGateOutcome(
+                route=route,
+                status=report["status"],
+                reason=reason,
+                repair_results=[_dag_authority_synthetic_result(group_idx, retry, report)],
+                report=report,
+            )
+        if not target_refs:
+            detail = (
+                "Task-spec/source artifact drift remained after task-spec "
+                "reconciliation and no safe dag-task DB target was available."
+            )
+            blocked = _dag_authority_blocked_verdict(
+                group_idx,
+                retry,
+                route=route,
+                reason=reason,
+                target_refs=target_refs,
+                detail=detail,
+            )
+            report["status"] = "blocked_source_artifact_or_projection_drift"
+            report["blocked_verdict"] = blocked.model_dump(mode="json")
+            await _record_dag_authority_gate(runner, feature, group_idx, retry, report)
+            return DagAuthorityGateOutcome(
+                route=route,
+                status=report["status"],
+                reason=reason,
+                blocked_verdict=blocked,
+                report=report,
+            )
+        report["status"] = "task_spec_reconcile_incomplete_try_dag_task_refs"
+    if not target_refs:
+        report["status"] = "blocked_no_dag_task_refs"
+        blocked = _dag_authority_blocked_verdict(
+            group_idx,
+            retry,
+            route=route,
+            reason=reason,
+            target_refs=target_refs,
+            detail=(
+                "Preflight reported deterministic artifact-only drift, but the "
+                "host could not derive any dag-task artifact refs to repair."
+            ),
+        )
+        report["blocked_verdict"] = blocked.model_dump(mode="json")
+        await _record_dag_authority_gate(runner, feature, group_idx, retry, report)
+        return DagAuthorityGateOutcome(
+            route=route,
+            status=report["status"],
+            reason=reason,
+            blocked_verdict=blocked,
+            report=report,
+        )
+
+    report["latest_records_before"] = await _dag_authority_latest_records(
+        runner,
+        feature,
+        target_refs,
+    )
+    reconcile = await _reconcile_dag_task_results(
+        runner,
+        feature,
+        group_idx,
+        f"{retry}-authority-reconcile",
+        group_tasks,
+        results=results,
+        verify_results_context=verify_results_context,
+        all_results=all_results,
+        repair_results=[],
+        feature_root=feature_root,
+    )
+    report["reconcile_reports"].append(reconcile.report)
+    reconcile_label = f"{retry}-authority-reconcile"
+    post_reconcile = await _run_dag_group_preflight(
+        runner,
+        feature,
+        group_idx,
+        reconcile_label,
+        group_tasks,
+        reconcile.verify_results_context,
+        feature_root=feature_root,
+        known_task_ids=known_task_ids,
+    )
+    report["post_repair_preflight_key"] = _dag_authority_preflight_key(
+        group_idx,
+        reconcile_label,
+    )
+    if post_reconcile is None:
+        report["status"] = "repaired_by_reconcile"
+        report["latest_records_after"] = await _dag_authority_latest_records(
+            runner,
+            feature,
+            target_refs,
+        )
+        await _record_dag_authority_gate(runner, feature, group_idx, retry, report)
+        return DagAuthorityGateOutcome(
+            route=route,
+            status=report["status"],
+            reason=reason,
+            repair_results=[_dag_authority_synthetic_result(group_idx, retry, report)],
+            report=report,
+        )
+
+    planned = _deterministic_dag_artifact_repair_group(
+        group_idx,
+        retry,
+        post_reconcile,
+        group_tasks,
+        artifact_only,
+        feature_root,
+    )
+    rca = (
+        planned.rca
+        if planned is not None else RootCauseAnalysis(
+            hypothesis=(
+                "Deterministic preflight found stale DB-backed dag-task "
+                "ImplementationResult metadata with no product file drift."
+            ),
+            evidence=[
+                "The flagged paths are absent from disk and the git index.",
+                *target_refs,
+            ],
+            affected_files=target_refs,
+            proposed_approach=(
+                "Append corrected dag-task ImplementationResult rows with "
+                "canonical existing product paths."
+            ),
+            confidence="high",
+        )
+    )
+
+    def _authority_actor_builder(
+        base: AgentActor,
+        suffix: str,
+        **kwargs: Any,
+    ) -> AgentActor:
+        return _make_parallel_actor(
+            base,
+            f"dag-g{group_idx}-r{retry}-authority-{suffix}",
+            runtime=runtime,
+            workspace_path=kwargs.get("workspace_path"),
+        )
+
+    repair_result = await _run_rca_dag_task_artifact_repair(
+        runner,
+        feature,
+        source=f"dag-authority-gate:g{group_idx}:retry-{retry}",
+        bug_id=f"g{group_idx}-r{retry}-dag-task-result-drift",
+        verdict_text=feedback,
+        rca=rca,
+        fixer=implementer,
+        feature_root=feature_root,
+        phase_name="implementation",
+        actor_builder=_authority_actor_builder,
+        target_refs=target_refs,
+    )
+    applied_dag_task_updates = _dag_authority_applied_dag_task_updates(repair_result)
+    report["artifact_repair"] = {
+        "result": repair_result.model_dump(mode="json"),
+        "applied_dag_task_updates": applied_dag_task_updates,
+    }
+    if not applied_dag_task_updates:
+        detail = (
+            "Artifact repair returned no valid applied dag-task updates. "
+            "The repair likely used the wrong nested schema or omitted "
+            "ImplementationResult.files_created/files_modified; broad product "
+            "repair was intentionally skipped."
+        )
+        blocked = _dag_authority_blocked_verdict(
+            group_idx,
+            retry,
+            route=route,
+            reason="artifact_repair_applied_no_dag_task_updates",
+            target_refs=target_refs,
+            detail=detail,
+        )
+        report["status"] = "blocked_artifact_repair_no_applied_updates"
+        report["blocked_verdict"] = blocked.model_dump(mode="json")
+        report["latest_records_after"] = await _dag_authority_latest_records(
+            runner,
+            feature,
+            target_refs,
+        )
+        await _record_dag_authority_gate(runner, feature, group_idx, retry, report)
+        return DagAuthorityGateOutcome(
+            route=route,
+            status=report["status"],
+            reason="artifact_repair_applied_no_dag_task_updates",
+            blocked_verdict=blocked,
+            report=report,
+        )
+
+    after_reconcile = await _reconcile_dag_task_results(
+        runner,
+        feature,
+        group_idx,
+        f"{retry}-authority-artifact",
+        group_tasks,
+        results=results,
+        verify_results_context=verify_results_context,
+        all_results=all_results,
+        repair_results=[],
+        feature_root=feature_root,
+    )
+    report["reconcile_reports"].append(after_reconcile.report)
+    after_label = f"{retry}-authority-artifact"
+    post_artifact = await _run_dag_group_preflight(
+        runner,
+        feature,
+        group_idx,
+        after_label,
+        group_tasks,
+        after_reconcile.verify_results_context,
+        feature_root=feature_root,
+        known_task_ids=known_task_ids,
+    )
+    report["post_repair_preflight_key"] = _dag_authority_preflight_key(
+        group_idx,
+        after_label,
+    )
+    report["latest_records_after"] = await _dag_authority_latest_records(
+        runner,
+        feature,
+        target_refs,
+    )
+    if post_artifact is None:
+        report["status"] = "repaired_by_artifact_repair"
+        await _record_dag_authority_gate(runner, feature, group_idx, retry, report)
+        return DagAuthorityGateOutcome(
+            route=route,
+            status=report["status"],
+            reason=reason,
+            repair_results=[_dag_authority_synthetic_result(group_idx, retry, report)],
+            report=report,
+        )
+
+    blocked = _dag_authority_blocked_verdict(
+        group_idx,
+        retry,
+        route=route,
+        reason="preflight_still_failed_after_authority_repair",
+        target_refs=target_refs,
+        detail=(
+            "A dag-task update was applied, but deterministic preflight still "
+            "reported stale/forbidden task metadata."
+        ),
+    )
+    report["status"] = "blocked_preflight_still_failed"
+    report["blocked_verdict"] = blocked.model_dump(mode="json")
+    await _record_dag_authority_gate(runner, feature, group_idx, retry, report)
+    return DagAuthorityGateOutcome(
+        route=route,
+        status=report["status"],
+        reason="preflight_still_failed_after_authority_repair",
+        blocked_verdict=blocked,
+        report=report,
     )
 
 
@@ -9913,6 +13120,13 @@ async def _attempt_parallel_dag_repair(
                 runner,
                 feature,
                 f"fix: DAG group {group_idx} repair round {round_idx}",
+                failure_key=f"dag-commit-failure:g{group_idx}:retry-{retry}",
+                failure_metadata={
+                    "group_idx": group_idx,
+                    "stage": f"retry-{retry}",
+                    "retry": retry,
+                    "repair_round": round_idx,
+                },
             )
         await _log_feature_event(
             runner,
@@ -10302,6 +13516,7 @@ async def _diagnose_and_fix(
     feature_root = _get_feature_root(runner, feature)
     fix_results: dict[str, ImplementationResult] = {}
     artifact_only_fix_ids: set[str] = set()
+    commit_failed_attempts: list[BugFixAttempt] = []
     dag_product_cleanup_routes_by_gid: dict[str, dict[str, DagTaskDriftRoute]] = {}
 
     for round_idx, round_ids in enumerate(schedule):
@@ -10411,10 +13626,49 @@ async def _diagnose_and_fix(
             if gid in fix_results and gid not in artifact_only_fix_ids
         ]
         if fixed_ids:
-            await _commit_repos(
-                runner, feature,
-                f"fix: round {round_idx} — {', '.join(fixed_ids)}",
-            )
+            commit_message = f"fix: round {round_idx} — {', '.join(fixed_ids)}"
+            try:
+                await _commit_repos(
+                    runner,
+                    feature,
+                    commit_message,
+                )
+            except WorkflowCommitError as exc:
+                verdict = await _record_bug_commit_failure(
+                    runner,
+                    feature,
+                    source,
+                    f"round-{round_idx}",
+                    attempt_number,
+                    f"round-{round_idx}",
+                    exc,
+                    message=commit_message,
+                )
+                feedback = _format_feedback("Commit", verdict)
+                for gid in fixed_ids:
+                    group = group_by_id[gid]
+                    fix = fix_results.get(gid)
+                    commit_failed_attempts.append(BugFixAttempt(
+                        bug_id=(
+                            f"{source.upper().replace(' ', '-')}-FAIL-"
+                            f"{next(bug_counter)}"
+                        ),
+                        group_id=gid,
+                        source_verdict=source,
+                        description=group.likely_root_cause,
+                        root_cause=rca_by_group[gid].hypothesis,
+                        fix_applied=(
+                            (fix.summary if fix else "Fix completed")
+                            + f"\n\nCommit failed before reverify:\n{feedback}"
+                        ),
+                        files_modified=(
+                            (fix.files_created + fix.files_modified)
+                            if fix else []
+                        ),
+                        re_verify_result="FAIL",
+                        attempt_number=attempt_number,
+                    ))
+                    fix_results.pop(gid, None)
 
     blocked_artifact_attempts: list[BugFixAttempt] = []
     for gid in list(fix_results):
@@ -10436,7 +13690,11 @@ async def _diagnose_and_fix(
         del fix_results[gid]
 
     if not fix_results:
-        return contradiction_results + blocked_artifact_attempts
+        return (
+            contradiction_results
+            + blocked_artifact_attempts
+            + commit_failed_attempts
+        )
 
     # 5. Parallel re-verify: one per group (read-only, always safe)
     verify_tasks = [
@@ -10564,7 +13822,12 @@ async def _diagnose_and_fix(
             attempt_number=attempt_number,
         ))
 
-    return contradiction_results + blocked_artifact_attempts + attempts
+    return (
+        contradiction_results
+        + blocked_artifact_attempts
+        + commit_failed_attempts
+        + attempts
+    )
 
 
 def _dag_task_artifact_refs_from_rca(
@@ -10920,10 +14183,41 @@ async def _single_rca_fix_verify(
 
     # Commit fix before re-verification
     if not used_artifact_repair:
-        if workspace_root is None:
-            await _commit_repos(runner, feature, f"fix: {bug_id}")
-        else:
-            await _commit_repos_in_root(feature_root, f"fix: {bug_id}")
+        commit_message = f"fix: {bug_id}"
+        try:
+            if workspace_root is None:
+                await _commit_repos(
+                    runner,
+                    feature,
+                    commit_message,
+                )
+            else:
+                await _commit_repos_in_root(feature_root, commit_message)
+        except WorkflowCommitError as exc:
+            verdict = await _record_bug_commit_failure(
+                runner,
+                feature,
+                source,
+                bug_id,
+                attempt_number,
+                "fix",
+                exc,
+                message=commit_message,
+            )
+            return BugFixAttempt(
+                bug_id=bug_id,
+                source_verdict=source,
+                description=verdict_text,
+                root_cause=rca.hypothesis,
+                fix_applied=(
+                    fix_result.summary
+                    + "\n\nCommit failed before reverify:\n"
+                    + _format_feedback("Commit", verdict)
+                ),
+                files_modified=fix_result.files_created + fix_result.files_modified,
+                re_verify_result="FAIL",
+                attempt_number=attempt_number,
+            )
 
     # 3. Re-verify with the SAME reviewer that found the bug
     re_verdict: Verdict = await runner.run(
@@ -11011,13 +14305,33 @@ async def _single_rca_fix_verify(
                 )
                 passed = regression_attempt.re_verify_result == "PASS"
                 if passed:
-                    if workspace_root is None:
-                        await _commit_repos(
-                            runner, feature, f"fix: regression after {bug_id}",
+                    commit_message = f"fix: regression after {bug_id}"
+                    try:
+                        if workspace_root is None:
+                            await _commit_repos(
+                                runner,
+                                feature,
+                                commit_message,
+                            )
+                        else:
+                            await _commit_repos_in_root(
+                                feature_root, commit_message,
+                            )
+                    except WorkflowCommitError as exc:
+                        verdict = await _record_bug_commit_failure(
+                            runner,
+                            feature,
+                            source,
+                            bug_id,
+                            attempt_number,
+                            "regression",
+                            exc,
+                            message=commit_message,
                         )
-                    else:
-                        await _commit_repos_in_root(
-                            feature_root, f"fix: regression after {bug_id}",
+                        passed = False
+                        fix_result.summary += (
+                            "\n\nRegression fix commit failed:\n"
+                            + _format_feedback("Commit", verdict)
                         )
 
     return BugFixAttempt(

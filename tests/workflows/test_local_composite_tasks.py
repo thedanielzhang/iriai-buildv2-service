@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -21,6 +22,7 @@ from iriai_compose import (
 )
 from iriai_compose.prompts import Select
 
+from iriai_build_v2.agent_concurrency import AgentConcurrencyLimiter
 from iriai_build_v2.interfaces.auto_interaction import (
     AgentDelegateInteractionRuntime,
     _ApprovalDecision,
@@ -251,6 +253,46 @@ async def test_autonomous_runtime_treats_select_prompts_as_choose() -> None:
     result = await runtime.ask(task)
 
     assert result == "Option B"
+
+
+@pytest.mark.asyncio
+async def test_autonomous_runtime_uses_agent_concurrency_limiter() -> None:
+    class _CountingAgentRuntime:
+        def __init__(self) -> None:
+            self.active = 0
+            self.max_active = 0
+
+        async def ask(self, task: Ask, **_kwargs):
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+            try:
+                await asyncio.sleep(0.02)
+                return task.output_type(choice="Option A")
+            finally:
+                self.active -= 1
+
+    agent_runtime = _CountingAgentRuntime()
+    limiter = AgentConcurrencyLimiter(1)
+    runtime = AgentDelegateInteractionRuntime(
+        agent_runtime=agent_runtime,
+        agent_concurrency_limiter=limiter,
+    )
+    task = Ask(
+        actor=InteractionActor(name="user", resolver="auto"),
+        prompt="Pick the best option",
+        input=Select(options=["Option A", "Option B"]),
+        input_type=Select,
+    )
+
+    results = await asyncio.gather(
+        runtime.ask(task, feature_id="feature-a", phase_name="plan-review"),
+        runtime.ask(task, feature_id="feature-a", phase_name="plan-review"),
+    )
+
+    assert results == ["Option A", "Option A"]
+    assert agent_runtime.max_active == 1
+    assert limiter.active_count == 0
+    assert limiter.queued_count == 0
 
 
 @pytest.mark.asyncio

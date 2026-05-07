@@ -31,10 +31,12 @@ from ....roles import (
 from ..._common import Interview
 from ..._common._helpers import _offload_if_large
 from .implementation import (
+    WorkflowCommitError,
     _commit_repos,
     _commit_repos_in_root,
     _get_feature_root,
     _make_parallel_actor,
+    _record_commit_failure_artifact,
 )
 
 logger = logging.getLogger(__name__)
@@ -42,6 +44,41 @@ logger = logging.getLogger(__name__)
 # No iteration cap — broad observations like "all E2E tests green" need
 # many RCA→impl→verify cycles.  Managed manually via Slack.
 MAX_FIX_ITERATIONS = 50
+
+
+async def _commit_observation_repos(
+    runner: WorkflowRunner,
+    feature: Feature,
+    feature_root: Path | None,
+    workspace_root: Path | None,
+    message: str,
+    *,
+    artifact_key: str,
+) -> None:
+    try:
+        if workspace_root is None:
+            await _commit_repos(
+                runner,
+                feature,
+                message,
+                failure_key=artifact_key,
+                failure_metadata={"stage": "post-test-observation", "message": message},
+            )
+        else:
+            await _commit_repos_in_root(feature_root, message)
+    except WorkflowCommitError as exc:
+        if workspace_root is not None:
+            await _record_commit_failure_artifact(
+                runner,
+                feature,
+                artifact_key,
+                exc,
+                metadata={"stage": "post-test-observation", "message": message},
+            )
+        raise RuntimeError(
+            "Observation fix cannot continue because pre-commit/husky failed; "
+            f"see `{artifact_key}` for hook output."
+        ) from exc
 
 
 # Live testing instructions for verify prompts — extracted from
@@ -516,10 +553,14 @@ async def _dispatch_observation(
             feature,
             phase_name=phase_name,
         )
-        if workspace_root is None:
-            await _commit_repos(runner, feature, f"fix: {obs.id} (iter {iteration + 1})")
-        else:
-            await _commit_repos_in_root(feature_root, f"fix: {obs.id} (iter {iteration + 1})")
+        await _commit_observation_repos(
+            runner,
+            feature,
+            feature_root,
+            workspace_root,
+            f"fix: {obs.id} (iter {iteration + 1})",
+            artifact_key=f"post-test-commit-failure:{obs.id}:iter-{iteration + 1}:fix",
+        )
 
         # 3. Write tests (requirement + missing_test categories only)
         test_result: ImplementationResult | None = None
@@ -538,10 +579,14 @@ async def _dispatch_observation(
                 feature,
                 phase_name=phase_name,
             )
-            if workspace_root is None:
-                await _commit_repos(runner, feature, f"test: {obs.id} (iter {iteration + 1})")
-            else:
-                await _commit_repos_in_root(feature_root, f"test: {obs.id} (iter {iteration + 1})")
+            await _commit_observation_repos(
+                runner,
+                feature,
+                feature_root,
+                workspace_root,
+                f"test: {obs.id} (iter {iteration + 1})",
+                artifact_key=f"post-test-commit-failure:{obs.id}:iter-{iteration + 1}:test",
+            )
 
         # 4. Verify
         re_verdict: Verdict = await runner.run(

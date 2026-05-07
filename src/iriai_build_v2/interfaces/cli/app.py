@@ -289,9 +289,31 @@ def bugfix(
     help="Use Sonnet for implementers, Opus for verifiers.",
 )
 @click.option(
+    "--concurrency-max",
+    type=click.IntRange(min=1),
+    default=None,
+    help="Maximum active agent invocations across the Slack bridge.",
+)
+@click.option(
     "--autonomous-remainder",
     is_flag=True,
     help="Delegate later-phase human prompts (plan-review through implementation) to an agent.",
+)
+@click.option(
+    "--slack-verbosity",
+    type=click.Choice(["normal", "quiet"]),
+    default="normal",
+    show_default=True,
+    help="Slack bridge message verbosity.",
+)
+@click.option(
+    "--ignore-mention-user-id",
+    "ignored_mention_user_ids",
+    multiple=True,
+    help=(
+        "Slack user id whose mentions should be ignored by this bridge, "
+        "for colocated bots such as the supervisor."
+    ),
 )
 def slack_cmd(
     channel: str,
@@ -302,7 +324,10 @@ def slack_cmd(
     claude_pool_codex_review: bool,
     claude_only: bool,
     budget: bool,
+    concurrency_max: int | None,
     autonomous_remainder: bool,
+    slack_verbosity: str,
+    ignored_mention_user_ids: tuple[str, ...],
 ) -> None:
     """Start the Slack bridge (long-lived process)."""
     import logging as _logging
@@ -355,7 +380,113 @@ def slack_cmd(
             runtime_policy_override=runtime_policy_override,
             single_agent_runtime=claude_only,
             budget=budget,
+            concurrency_max=concurrency_max,
             autonomous_remainder=autonomous_remainder,
+            slack_verbosity=slack_verbosity,
+            ignored_mention_user_ids=set(ignored_mention_user_ids),
+        )
+    )
+
+
+@cli.command("supervisor")
+@click.option("--channel", required=True, help="Slack channel ID for the supervisor bot.")
+@click.option("--feature", default=None, help="Feature ID the supervisor should focus on.")
+@click.option("--dashboard-url", default=None, help="Dashboard URL for the supervised feature.")
+@click.option(
+    "--runtime",
+    default="codex",
+    show_default=True,
+    help="Supervisor service runtime name.",
+)
+@click.option(
+    "--mode",
+    type=click.Choice(["multiplayer", "singleplayer"]),
+    default="singleplayer",
+    show_default=True,
+    help="multiplayer: respond to @mentions. singleplayer: respond to all channel messages.",
+)
+@click.option(
+    "--supervisor-mode",
+    type=click.Choice(["read_only", "guarded"]),
+    default="read_only",
+    show_default=True,
+    help="Supervisor action authority.",
+)
+@click.option(
+    "--poll-interval",
+    type=float,
+    default=30.0,
+    show_default=True,
+    help="Seconds between supervisor evidence polls.",
+)
+@click.option(
+    "--digest-interval",
+    type=float,
+    default=120.0,
+    show_default=True,
+    help="Minimum seconds between identical supervisor digests.",
+)
+@click.option(
+    "--worktree-root",
+    multiple=True,
+    help="Repo/worktree root to probe for hygiene blockers. May be repeated.",
+)
+@click.option(
+    "--forbidden-path",
+    multiple=True,
+    help="Manifest-forbidden path or prefix to probe in worktree roots. May be repeated.",
+)
+@click.option(
+    "--app-token-env",
+    default="SUPERVISOR_SLACK_APP_TOKEN",
+    show_default=True,
+    help="Environment variable containing the supervisor Socket Mode app token.",
+)
+@click.option(
+    "--bot-token-env",
+    default="SUPERVISOR_SLACK_BOT_TOKEN",
+    show_default=True,
+    help="Environment variable containing the supervisor bot token.",
+)
+def supervisor_cmd(
+    channel: str,
+    feature: str | None,
+    dashboard_url: str | None,
+    runtime: str,
+    mode: str,
+    supervisor_mode: str,
+    poll_interval: float,
+    digest_interval: float,
+    worktree_root: tuple[str, ...],
+    forbidden_path: tuple[str, ...],
+    app_token_env: str,
+    bot_token_env: str,
+) -> None:
+    """Start the supervisor Slack bot (long-lived process)."""
+    import logging as _logging
+
+    _logging.basicConfig(
+        level=_logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
+    from ...supervisor.slack import run_supervisor_slack_app
+
+    asyncio.run(
+        run_supervisor_slack_app(
+            channel=channel,
+            feature_id=feature,
+            dashboard_url=dashboard_url,
+            runtime=runtime,
+            mode=mode,
+            supervisor_mode=supervisor_mode,
+            poll_interval_seconds=poll_interval,
+            min_digest_interval_seconds=digest_interval,
+            worktree_roots=list(worktree_root),
+            forbidden_paths=list(forbidden_path),
+            app_token_env=app_token_env,
+            bot_token_env=bot_token_env,
         )
     )
 

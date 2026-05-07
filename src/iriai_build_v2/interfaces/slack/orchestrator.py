@@ -14,8 +14,9 @@ import logging
 import re
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
+from ...agent_concurrency import AgentConcurrencyLimiter
 from ...config import DASHBOARD_BASE_URL
 from ...runtime_policy import (
     DEFAULT_RUNTIME_POLICY,
@@ -43,6 +44,7 @@ if TYPE_CHECKING:
     from .._bootstrap import BootstrappedEnv
 
 logger = logging.getLogger(__name__)
+SlackVerbosity = Literal["normal", "quiet"]
 
 _SILENT_INVOCATION_NOTICE_DELAY = 8.0
 _SILENT_INVOCATION_UPDATE_INTERVAL = 15.0
@@ -194,8 +196,14 @@ class SlackWorkflowOrchestrator:
         runtime_policy_override: bool = False,
         single_agent_runtime: bool = False,
         budget: bool = False,
+        concurrency_max: int | None = None,
         autonomous_remainder: bool = False,
+        slack_verbosity: SlackVerbosity = "normal",
     ) -> None:
+        if concurrency_max is not None and concurrency_max < 1:
+            raise ValueError("concurrency_max must be >= 1")
+        if slack_verbosity not in {"normal", "quiet"}:
+            raise ValueError("slack_verbosity must be 'normal' or 'quiet'")
         self._adapter = adapter
         self._interaction = interaction_runtime
         self._default_workspace = workspace_path  # suggestion, not binding
@@ -205,7 +213,14 @@ class SlackWorkflowOrchestrator:
         self._runtime_policy_override = runtime_policy_override
         self._single_agent_runtime = single_agent_runtime
         self._budget = budget
+        self._concurrency_max = concurrency_max
+        self._agent_concurrency_limiter = (
+            AgentConcurrencyLimiter(concurrency_max)
+            if concurrency_max is not None
+            else None
+        )
         self._autonomous_remainder = autonomous_remainder
+        self._slack_verbosity = slack_verbosity
         self._env: BootstrappedEnv | None = None
 
         # Workflow tracking
@@ -247,11 +262,15 @@ class SlackWorkflowOrchestrator:
 
         await self._recover_active_features()
         logger.info(
-            "Orchestrator started, default_workspace=%s, agent_runtime=%s, single_agent_runtime=%s, autonomous_remainder=%s",
+            "Orchestrator started, default_workspace=%s, agent_runtime=%s, "
+            "single_agent_runtime=%s, concurrency_max=%s, "
+            "autonomous_remainder=%s, slack_verbosity=%s",
             self._default_workspace,
             self._agent_runtime_name,
             self._single_agent_runtime,
+            self._concurrency_max,
             self._autonomous_remainder,
+            self._slack_verbosity,
         )
 
     async def shutdown(self) -> None:
@@ -416,6 +435,8 @@ class SlackWorkflowOrchestrator:
             "mode": mode,
             "agent_runtime": self._agent_runtime_name,
             "runtime_policy": self._runtime_policy,
+            "concurrency_max": self._concurrency_max,
+            "slack_verbosity": self._slack_verbosity,
         })
         feature = await self._env.feature_store.get_feature(feature.id) or feature
 
@@ -517,6 +538,8 @@ class SlackWorkflowOrchestrator:
                     "mode": "singleplayer",
                     "agent_runtime": self._agent_runtime_name,
                     "runtime_policy": self._runtime_policy,
+                    "concurrency_max": self._concurrency_max,
+                    "slack_verbosity": self._slack_verbosity,
                     "source_feature_id": source_feature.id,
                     "source_feature_name": source_feature.name,
                     "source_channel_id": source_feature.metadata.get("channel_id", ""),
@@ -603,7 +626,8 @@ class SlackWorkflowOrchestrator:
             binder = getattr(runner, "bind_invocation_observer", None)
             with binder(observer) if observer is not None and callable(binder) else nullcontext():
                 await runner.execute_workflow(workflow, feature, state)
-            await self._adapter.post_message(channel_id, "Workflow complete!")
+            if self._slack_verbosity != "quiet":
+                await self._adapter.post_message(channel_id, "Workflow complete!")
             await self._adapter.add_reaction(
                 self._adapter.planning_channel, "", "white_check_mark"
             )
@@ -842,6 +866,8 @@ class SlackWorkflowOrchestrator:
                 "phase": phase,
                 "agent_runtime": agent_runtime,
                 "runtime_policy": runtime_policy,
+                "concurrency_max": self._concurrency_max,
+                "slack_verbosity": self._slack_verbosity,
             }
 
             try:
@@ -918,6 +944,11 @@ class SlackWorkflowOrchestrator:
                     f"Cannot resume: feature `{feature_id}` not found in database.",
                 )
                 return
+            await self._env.feature_store.update_metadata(
+                feature.id,
+                {"concurrency_max": self._concurrency_max},
+            )
+            feature = await self._env.feature_store.get_feature(feature_id) or feature
 
             # Reconstruct state from artifacts
             workflow = select_workflow(feature.workflow_name)
@@ -978,7 +1009,8 @@ class SlackWorkflowOrchestrator:
                 await runner.resume_workflow(
                     workflow, feature, state, resume_from_phase=resume_phase
                 )
-            await self._adapter.post_message(channel_id, "Workflow complete!")
+            if self._slack_verbosity != "quiet":
+                await self._adapter.post_message(channel_id, "Workflow complete!")
         except Exception as e:
             logger.exception("Resumed workflow failed for %s", feature.id)
             current_feature = await self._env.feature_store.get_feature(feature.id) or feature
@@ -1017,6 +1049,8 @@ class SlackWorkflowOrchestrator:
         workflow_name: str,
         channel_id: str,
     ) -> _SlackInvocationObserver | None:
+        if self._slack_verbosity == "quiet":
+            return None
         if workflow_name == "bugfix-v2":
             return None
         streamer = self._feature_streamers.get(feature_id)
@@ -1160,7 +1194,11 @@ class SlackWorkflowOrchestrator:
         assert self._env is not None
         resolved_runtime_policy = normalize_runtime_policy(runtime_policy)
 
-        streamer = SlackStreamer(self._adapter, channel_id)
+        streamer = SlackStreamer(
+            self._adapter,
+            channel_id,
+            verbosity=self._slack_verbosity,
+        )
 
         from iriai_compose import Workspace
 
@@ -1191,7 +1229,10 @@ class SlackWorkflowOrchestrator:
         self._interaction._agent_runtime = agent_runtime
         self._interaction._feature_store = self._env.feature_store
         auto_interaction = (
-            AgentDelegateInteractionRuntime(agent_runtime=agent_runtime)
+            AgentDelegateInteractionRuntime(
+                agent_runtime=agent_runtime,
+                agent_concurrency_limiter=self._agent_concurrency_limiter,
+            )
             if self._autonomous_remainder
             else self._interaction
         )
@@ -1206,6 +1247,7 @@ class SlackWorkflowOrchestrator:
             feature_store=self._env.feature_store,
             agent_runtime=agent_runtime,
             secondary_runtime=secondary_runtime,
+            agent_concurrency_limiter=self._agent_concurrency_limiter,
             interaction_runtimes={"terminal": self._interaction, "auto": auto_interaction},
             artifacts=self._env.artifacts,
             sessions=self._env.sessions,

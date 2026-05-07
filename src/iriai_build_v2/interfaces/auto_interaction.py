@@ -10,6 +10,7 @@ from iriai_compose.actors import Role
 from iriai_compose.prompts import Confirm, Select
 from iriai_compose.runner import InteractionRuntime
 
+from ..agent_concurrency import AgentConcurrencyLimiter
 from ..planning_signals import GateRejection
 
 
@@ -40,6 +41,7 @@ class AgentDelegateInteractionRuntime(InteractionRuntime):
 
     agent_runtime: Any
     model_hint: str | None = None
+    agent_concurrency_limiter: AgentConcurrencyLimiter | None = None
 
     name = "auto"
 
@@ -124,11 +126,23 @@ class AgentDelegateInteractionRuntime(InteractionRuntime):
         )
         actor = AgentActor(name=actor_name, role=role, context_keys=[])
         task = Ask(actor=actor, prompt=prompt, output_type=output_type)
-        result = await self.agent_runtime.ask(
-            task,
-            context=context,
-            phase_name=phase_name,
-        )
+        if self.agent_concurrency_limiter is None:
+            result = await self.agent_runtime.ask(
+                task,
+                context=context,
+                phase_name=phase_name,
+            )
+        else:
+            async with self.agent_concurrency_limiter.acquire(
+                actor_name=actor_name,
+                feature_id=feature_id,
+                phase_name=phase_name,
+            ):
+                result = await self.agent_runtime.ask(
+                    task,
+                    context=context,
+                    phase_name=phase_name,
+                )
         if isinstance(result, output_type):
             return result
         if isinstance(result, BaseModel):

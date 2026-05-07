@@ -1,4 +1,7 @@
 import json
+import stat
+import subprocess
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -9,6 +12,8 @@ from iriai_build_v2.models.outputs import (
     ArtifactRepairUpdate,
     BugGroup,
     BugTriage,
+    FindingLedger,
+    FindingRecord,
     Gap,
     ImplementationResult,
     ImplementationTask,
@@ -53,6 +58,1270 @@ def test_dag_auto_resolve_contradictions_kill_switch(monkeypatch):
     monkeypatch.setenv(implementation_module.DAG_AUTO_RESOLVE_CONTRADICTIONS_ENV, "0")
 
     assert implementation_module._dag_auto_resolve_contradictions_enabled() is False
+
+
+def _init_git_repo(repo: Path) -> None:
+    repo.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init"], cwd=repo, check=True, stdout=subprocess.PIPE)
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"],
+        cwd=repo,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test User"],
+        cwd=repo,
+        check=True,
+    )
+    (repo / "README.md").write_text("seed\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", "seed"],
+        cwd=repo,
+        check=True,
+        stdout=subprocess.PIPE,
+    )
+
+
+def _write_forbidden_manifest(repo: Path, forbidden_path: str) -> None:
+    config = repo / "scripts" / "verify-file-scope.expected-files.json"
+    config.parent.mkdir(parents=True, exist_ok=True)
+    config.write_text(
+        json.dumps({
+            "expected_files": [],
+            "forbidden_files": [
+                {
+                    "path": forbidden_path,
+                    "source": "test-manifest",
+                }
+            ],
+        }),
+        encoding="utf-8",
+    )
+
+
+@pytest.mark.asyncio
+async def test_commit_repos_in_root_hard_fails_on_pre_commit_hook(tmp_path):
+    repos_root = tmp_path / "repos"
+    repo = repos_root / "app"
+    _init_git_repo(repo)
+    hook = repo / ".git" / "hooks" / "pre-commit"
+    hook.write_text(
+        "#!/bin/sh\n"
+        "echo 'husky says no' >&2\n"
+        "exit 1\n",
+        encoding="utf-8",
+    )
+    hook.chmod(0o755)
+    (repo / "README.md").write_text("dirty\n", encoding="utf-8")
+
+    with pytest.raises(implementation_module.WorkflowCommitError) as raised:
+        await implementation_module._commit_repos_in_root(repos_root, "test: hook")
+
+    exc = raised.value
+    assert exc.failed_outcomes
+    failure = exc.failed_outcomes[0]
+    assert failure.repo_name == "app"
+    assert failure.command == ["git", "commit", "-m", "test: hook"]
+    assert failure.exit_code != 0
+    assert "husky says no" in failure.stderr
+    assert "README.md" in failure.status_before
+    assert "README.md" in failure.status_after
+    assert exc.to_payload()["failed_repo_count"] == 1
+
+
+def test_commit_failure_issue_extracts_hook_file_and_line(tmp_path):
+    exc = implementation_module.WorkflowCommitError(
+        "commit failed",
+        [
+            implementation_module.CommitRepoOutcome(
+                repo_path=str(tmp_path / "iriai-studio"),
+                repo_name="iriai-studio",
+                message="fix",
+                dirty=True,
+                command=["git", "commit", "-m", "fix"],
+                exit_code=1,
+                stderr=(
+                    "src/webviews/projectSurface/src/chat/__tests__/"
+                    "ChatSidepaneShell.test.tsx(149,29): unexpected unicode "
+                    "character U+00A7"
+                ),
+                error="git commit failed",
+            )
+        ],
+    )
+
+    issue = implementation_module._commit_failure_issue(exc, stage="retry-0")
+
+    assert issue.file == (
+        "iriai-studio/src/webviews/projectSurface/src/chat/__tests__/"
+        "ChatSidepaneShell.test.tsx"
+    )
+    assert issue.line == 149
+    assert "unexpected unicode" in issue.description
+
+
+def test_commit_failure_manifest_forbidden_status_routes_to_cleanup(tmp_path):
+    repo = tmp_path / "iriai-studio"
+    _init_git_repo(repo)
+    forbidden_root = "src/vs/workbench/contrib/studioWorkflow/browser/workflowTab/chat"
+    _write_forbidden_manifest(repo, forbidden_root)
+    exc = implementation_module.WorkflowCommitError(
+        "commit failed",
+        [
+            implementation_module.CommitRepoOutcome(
+                repo_path=str(repo),
+                repo_name="iriai-studio",
+                message="fix",
+                dirty=True,
+                command=["git", "commit", "-m", "fix"],
+                exit_code=1,
+                stderr=(
+                    f"{forbidden_root}/test/browser/cardVariantRegistry.test.ts:32:1 "
+                    "Suites should include disposables leak checks"
+                ),
+                status_after=(
+                    f"A  {forbidden_root}/cardVariantRegistry.ts\n"
+                    f"A  {forbidden_root}/test/browser/cardVariantRegistry.test.ts"
+                ),
+                error="git commit failed",
+            )
+        ],
+    )
+
+    issue = implementation_module._commit_failure_issue(exc, stage="retry-0")
+    payload = implementation_module._commit_failure_payload(exc)
+    route = implementation_module._classify_dag_direct_repair_route(
+        Verdict(approved=False, summary="commit failed", concerns=[issue])
+    )
+
+    assert issue.severity == "blocker"
+    assert "manifest-forbidden product cleanup" in issue.description
+    assert "Do not repair this by adding ignore/suppression rules" in issue.description
+    assert issue.file == f"iriai-studio/{forbidden_root}/cardVariantRegistry.ts"
+    assert payload["manifest_forbidden_matches"][0]["manifest_rule"] == forbidden_root
+    assert route.route == "manifest_forbidden_product_cleanup"
+    assert route.operator_required is False
+
+
+def test_commit_failure_manifest_forbidden_reports_permission_normalization_need(
+    tmp_path,
+):
+    repo = tmp_path / ".iriai" / "features" / "feat" / "repos" / "iriai-studio"
+    _init_git_repo(repo)
+    forbidden_root = "src/vs/workbench/contrib/studioWorkflow/browser/workflowTab/chat"
+    _write_forbidden_manifest(repo, forbidden_root)
+    forbidden_dir = repo / forbidden_root
+    forbidden_dir.mkdir(parents=True)
+    (forbidden_dir / "cardVariantRegistry.ts").write_text("export {};\n", encoding="utf-8")
+    forbidden_dir.chmod(0o755)
+    (repo / ".git" / "index").chmod(0o644)
+    exc = implementation_module.WorkflowCommitError(
+        "commit failed",
+        [
+            implementation_module.CommitRepoOutcome(
+                repo_path=str(repo),
+                repo_name="iriai-studio",
+                message="fix",
+                dirty=True,
+                command=["git", "commit", "-m", "fix"],
+                exit_code=1,
+                stderr=f"{forbidden_root}/cardVariantRegistry.ts:1:1 warning",
+                status_after=f"A  {forbidden_root}/cardVariantRegistry.ts",
+                error="git commit failed",
+            )
+        ],
+    )
+
+    issue = implementation_module._commit_failure_issue(exc, stage="retry-0")
+    route = implementation_module._classify_dag_direct_repair_route(
+        Verdict(approved=False, summary="commit failed", concerns=[issue])
+    )
+
+    assert route.route == "manifest_forbidden_product_cleanup"
+    assert route.operator_required is False
+    assert "workspace permission normalization is required" in issue.description
+    assert "git index is not writable by repair agent" in issue.description
+
+
+def test_commit_failure_deletion_only_forbidden_status_stays_commit_hygiene(tmp_path):
+    repo = tmp_path / "iriai-studio"
+    _init_git_repo(repo)
+    forbidden_root = "src/vs/workbench/contrib/studioWorkflow/browser/workflowTab/chat"
+    _write_forbidden_manifest(repo, forbidden_root)
+    exc = implementation_module.WorkflowCommitError(
+        "commit failed",
+        [
+            implementation_module.CommitRepoOutcome(
+                repo_path=str(repo),
+                repo_name="iriai-studio",
+                message="fix",
+                dirty=True,
+                command=["git", "commit", "-m", "fix"],
+                exit_code=1,
+                stderr=f"{forbidden_root}/cardVariantRegistry.ts:1:1 stale deletion warning",
+                status_after=f"D  {forbidden_root}/cardVariantRegistry.ts",
+                error="git commit failed",
+            )
+        ],
+    )
+
+    issue = implementation_module._commit_failure_issue(exc, stage="retry-0")
+    route = implementation_module._classify_dag_direct_repair_route(
+        Verdict(approved=False, summary="commit failed", concerns=[issue])
+    )
+
+    assert "manifest-forbidden product cleanup" not in issue.description
+    assert route.route == "commit_hygiene_focused"
+
+
+def test_dag_direct_route_classifier_keeps_semantic_failures_on_normal_route():
+    commit_only = Verdict(
+        approved=False,
+        summary="Group cannot checkpoint: commit failed",
+        concerns=[
+            Issue(
+                severity="major",
+                description="pre-commit/husky failed during retry-0",
+                file="iriai-studio/src/App.test.tsx",
+                line=12,
+            )
+        ],
+    )
+    mixed = Verdict(
+        approved=False,
+        summary="Group cannot checkpoint: commit failed and tests failed",
+        concerns=[
+            Issue(
+                severity="major",
+                description="pre-commit/husky failed during retry-0",
+                file="iriai-studio/src/App.test.tsx",
+                line=12,
+            ),
+            Issue(
+                severity="major",
+                description="acceptance coverage is fake-only",
+                file="iriai-studio/src/App.test.tsx",
+            ),
+        ],
+    )
+    with_gap = Verdict(
+        approved=False,
+        summary="Group cannot checkpoint: commit failed",
+        concerns=commit_only.concerns,
+        gaps=[
+            Gap(
+                category="coverage",
+                severity="major",
+                description="AC coverage missing",
+            )
+        ],
+    )
+    repo_hygiene = Verdict(
+        approved=False,
+        summary="Group cannot checkpoint: commit failed",
+        concerns=[
+            Issue(
+                severity="blocker",
+                description="workflow repo hygiene blocker during retry-0",
+                file="iriai-studio/src/webviews/dashboard/.git",
+            )
+        ],
+    )
+
+    assert (
+        implementation_module._classify_dag_direct_repair_route(commit_only).route
+        == "commit_hygiene_focused"
+    )
+    assert (
+        implementation_module._classify_dag_direct_repair_route(mixed).route
+        == "normal_verify_repair"
+    )
+    assert (
+        implementation_module._classify_dag_direct_repair_route(with_gap).route
+        == "normal_verify_repair"
+    )
+    repo_route = implementation_module._classify_dag_direct_repair_route(repo_hygiene)
+    assert repo_route.route == "repo_hygiene_operator"
+    assert repo_route.operator_required is True
+
+
+@pytest.mark.asyncio
+async def test_dag_direct_route_repeated_signature_blocks_spin():
+    feature = SimpleNamespace(id="feat-repeat-route")
+
+    class _Artifacts:
+        def __init__(self) -> None:
+            self.store: dict[str, str] = {}
+
+        async def get(self, key: str, *, feature):
+            del feature
+            return self.store.get(key, "")
+
+        async def put(self, key: str, value: str, *, feature):
+            del feature
+            self.store[key] = value
+
+    runner = SimpleNamespace(artifacts=_Artifacts())
+    verdict = Verdict(
+        approved=False,
+        summary="Group cannot checkpoint: commit failed",
+        concerns=[
+            Issue(
+                severity="major",
+                description="pre-commit/husky failed during retry-0",
+                file="iriai-studio/src/App.test.tsx",
+                line=12,
+            )
+        ],
+    )
+    route = implementation_module._classify_dag_direct_repair_route(verdict)
+    await implementation_module._record_dag_direct_repair_route(
+        runner,
+        feature,
+        31,
+        0,
+        route,
+        status="selected",
+        source_verdict_key="dag-verify:g31:retry-0",
+        guardrail_decision="test",
+    )
+
+    assert await implementation_module._direct_route_repeated_signature(
+        runner,
+        feature,
+        31,
+        1,
+        route,
+    )
+    repeated = implementation_module._repeated_direct_route_verdict(
+        group_idx=31,
+        retry=1,
+        route=route,
+    )
+    assert repeated.approved is False
+    assert repeated.concerns[0].severity == "blocker"
+    assert repeated.concerns[0].file == "iriai-studio/src/App.test.tsx"
+    assert repeated.concerns[0].line == 12
+
+
+@pytest.mark.asyncio
+async def test_commit_repos_in_root_clean_repo_returns_empty_string(tmp_path):
+    repos_root = tmp_path / "repos"
+    repo = repos_root / "app"
+    _init_git_repo(repo)
+
+    assert await implementation_module._commit_repos_in_root(repos_root, "noop") == ""
+
+
+@pytest.mark.asyncio
+async def test_commit_repos_in_root_dirty_repo_returns_commit_hash(tmp_path):
+    repos_root = tmp_path / "repos"
+    repo = repos_root / "app"
+    _init_git_repo(repo)
+    (repo / "README.md").write_text("dirty success\n", encoding="utf-8")
+
+    commit_hash = await implementation_module._commit_repos_in_root(
+        repos_root,
+        "test: commit dirty repo",
+    )
+
+    assert len(commit_hash) == 40
+    status = subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=repo,
+        check=True,
+        stdout=subprocess.PIPE,
+        text=True,
+    ).stdout.strip()
+    assert status == ""
+
+
+@pytest.mark.asyncio
+async def test_dag_checkpoint_commit_failure_blocks_group_and_writes_artifact(tmp_path):
+    feature = SimpleNamespace(id="feat-commit-block", slug="commit-block")
+    repos_root = tmp_path / ".iriai" / "features" / feature.slug / "repos"
+    repo = repos_root / "app"
+    _init_git_repo(repo)
+    hook = repo / ".git" / "hooks" / "pre-commit"
+    hook.write_text(
+        "#!/bin/sh\n"
+        "echo 'husky checkpoint failure' >&2\n"
+        "exit 1\n",
+        encoding="utf-8",
+    )
+    hook.chmod(0o755)
+    (repo / "README.md").write_text("dirty checkpoint\n", encoding="utf-8")
+
+    class _Artifacts:
+        def __init__(self) -> None:
+            self.store: dict[str, str] = {}
+
+        async def get(self, key: str, *, feature):
+            del feature
+            return self.store.get(key)
+
+        async def put(self, key: str, value: str, *, feature):
+            del feature
+            self.store[key] = value
+
+    runner = SimpleNamespace(
+        artifacts=_Artifacts(),
+        services={"workspace_manager": SimpleNamespace(_base=tmp_path)},
+    )
+    task = ImplementationTask(id="TASK-1", name="A", description="A")
+    result = ImplementationResult(
+        task_id="TASK-1",
+        summary="done",
+        files_modified=["README.md"],
+    )
+
+    async def _approved(*_args, **_kwargs):
+        return Verdict(approved=True, summary="approved")
+
+    approved, failure = await implementation_module._verify_and_fix_group(
+        runner,
+        feature,
+        12,
+        [task],
+        [result],
+        [result],
+        implementation_module.HandoverDoc(),
+        repos_root,
+        "primary",
+        "secondary",
+        "primary",
+        verify_fn=_approved,
+    )
+
+    assert approved is False
+    assert "pre-commit/husky failed" in failure
+    assert "husky checkpoint failure" in failure
+    assert "dag-group:12" not in runner.artifacts.store
+    payload = json.loads(runner.artifacts.store["dag-commit-failure:g12:checkpoint"])
+    assert payload["failed_repo_count"] == 1
+    assert "husky checkpoint failure" in payload["outcomes"][0]["stderr"]
+    checkpoint_verdict = json.loads(
+        runner.artifacts.store["dag-verify:g12:checkpoint-commit"]
+    )
+    assert checkpoint_verdict["approved"] is False
+
+
+@pytest.mark.asyncio
+async def test_dag_retry_commit_failure_skips_reverify_and_becomes_next_issue(
+    tmp_path,
+    monkeypatch,
+):
+    feature = SimpleNamespace(id="feat-retry-commit-block", slug="retry-commit-block")
+
+    class _Artifacts:
+        def __init__(self) -> None:
+            self.store: dict[str, str] = {}
+
+        async def get(self, key: str, *, feature):
+            del feature
+            return self.store.get(key, "")
+
+        async def put(self, key: str, value: str, *, feature):
+            del feature
+            self.store[key] = value
+
+    class _Runner:
+        def __init__(self) -> None:
+            self.artifacts = _Artifacts()
+            self.services = {}
+            self.output_types: list[object] = []
+
+        async def run(self, task, feature, phase_name=""):
+            del feature, phase_name
+            self.output_types.append(task.output_type)
+            if task.output_type is RootCauseAnalysis:
+                return RootCauseAnalysis(
+                    hypothesis="Pre-commit hygiene failed",
+                    evidence=["commit hook output is deterministic"],
+                    affected_files=["README.md"],
+                    proposed_approach="Fix hygiene before committing",
+                    confidence="high",
+                )
+            if task.output_type is ImplementationResult:
+                return ImplementationResult(
+                    task_id="TASK-1",
+                    summary="attempted hygiene repair",
+                    files_modified=["README.md"],
+                )
+            raise AssertionError(f"unexpected task: {task!r}")
+
+    verify_calls = 0
+
+    async def _verify_once(*_args, **_kwargs):
+        nonlocal verify_calls
+        verify_calls += 1
+        return Verdict(
+            approved=False,
+            summary="needs a fix",
+            concerns=[Issue(severity="major", description="fix needed")],
+        )
+
+    async def _failing_commit(*_args, **_kwargs):
+        raise implementation_module.WorkflowCommitError(
+            "commit failed",
+            [
+                implementation_module.CommitRepoOutcome(
+                    repo_path=str(tmp_path),
+                    repo_name="repo",
+                    message="fix",
+                    dirty=True,
+                    command=["git", "commit", "-m", "fix"],
+                    exit_code=1,
+                    stderr="husky retry failure",
+                    status_before="M README.md",
+                    status_after="M README.md",
+                    error="git commit failed",
+                )
+            ],
+        )
+
+    monkeypatch.setattr(implementation_module, "VERIFY_RETRIES", 1)
+    monkeypatch.setattr(implementation_module, "_commit_repos", _failing_commit)
+
+    runner = _Runner()
+    approved, failure = await implementation_module._verify_and_fix_group(
+        runner,
+        feature,
+        13,
+        [ImplementationTask(id="TASK-1", name="A", description="A")],
+        [ImplementationResult(task_id="TASK-1", summary="done", files_modified=["README.md"])],
+        [],
+        implementation_module.HandoverDoc(),
+        tmp_path,
+        "primary",
+        "secondary",
+        "primary",
+        verify_fn=_verify_once,
+    )
+
+    assert approved is False
+    assert verify_calls == 1
+    assert "husky retry failure" in failure
+    assert RootCauseAnalysis in runner.output_types
+    assert ImplementationResult in runner.output_types
+    retry_verdict = json.loads(runner.artifacts.store["dag-verify:g13:retry-0"])
+    assert retry_verdict["approved"] is False
+    assert "pre-commit/husky failed" in retry_verdict["concerns"][0]["description"]
+    payload = json.loads(runner.artifacts.store["dag-commit-failure:g13:retry-0"])
+    assert "husky retry failure" in payload["outcomes"][0]["stderr"]
+
+
+@pytest.mark.asyncio
+async def test_commit_only_retry_routes_directly_without_expanded_verify_or_rca(
+    tmp_path,
+    monkeypatch,
+):
+    feature = SimpleNamespace(id="feat-direct-commit-route", slug="direct-commit-route")
+
+    class _Artifacts:
+        def __init__(self) -> None:
+            self.store: dict[str, str] = {}
+
+        async def get(self, key: str, *, feature):
+            del feature
+            return self.store.get(key, "")
+
+        async def put(self, key: str, value: str, *, feature):
+            del feature
+            self.store[key] = value
+
+    class _Runner:
+        def __init__(self) -> None:
+            self.artifacts = _Artifacts()
+            self.services = {}
+            self.output_types: list[object] = []
+            self.prompts: list[str] = []
+
+        async def run(self, task, feature, phase_name=""):
+            del feature, phase_name
+            self.output_types.append(task.output_type)
+            self.prompts.append(task.prompt)
+            if task.output_type is RootCauseAnalysis:
+                raise AssertionError("commit-only route must skip RCA")
+            if task.output_type is ImplementationResult:
+                return ImplementationResult(
+                    task_id="VERIFY-COMMIT-HYGIENE",
+                    summary="removed forbidden unicode marker",
+                    files_modified=[
+                        "iriai-studio/src/webviews/projectSurface/src/chat/"
+                        "__tests__/ChatSidepaneShell.test.tsx"
+                    ],
+                )
+            raise AssertionError(f"unexpected task: {task!r}")
+
+    task = ImplementationTask(id="TASK-1", name="Task", description="Task")
+    result = ImplementationResult(
+        task_id="TASK-1",
+        summary="done",
+        files_modified=[
+            "iriai-studio/src/webviews/projectSurface/src/chat/__tests__/"
+            "ChatSidepaneShell.test.tsx"
+        ],
+    )
+    verify_calls = 0
+
+    async def _verify(*_args, **_kwargs):
+        nonlocal verify_calls
+        verify_calls += 1
+        if verify_calls == 1:
+            return Verdict(
+                approved=False,
+                summary="Group 38 cannot checkpoint: commit failed during retry-0",
+                concerns=[
+                    Issue(
+                        severity="major",
+                        description=(
+                            "pre-commit/husky failed during retry-0; fix repo "
+                            "hygiene before checkpoint. Hook/output excerpt: "
+                            "unexpected unicode character U+00A7"
+                        ),
+                        file=(
+                            "iriai-studio/src/webviews/projectSurface/src/chat/"
+                            "__tests__/ChatSidepaneShell.test.tsx"
+                        ),
+                        line=149,
+                    )
+                ],
+            )
+        return Verdict(approved=True, summary="clean")
+
+    async def _no_preflight(*_args, **_kwargs):
+        return None
+
+    async def _no_sanitize(*_args, **_kwargs):
+        return _args[4]
+
+    async def _no_result_reconcile(
+        runner,
+        feature,
+        group_idx,
+        retry_label,
+        group_tasks,
+        *,
+        results,
+        verify_results_context,
+        all_results,
+        repair_results,
+        feature_root,
+    ):
+        del runner, feature, group_idx, retry_label, group_tasks, repair_results, feature_root
+        return implementation_module.DagTaskReconcileOutcome(
+            results,
+            verify_results_context,
+            all_results,
+            {},
+        )
+
+    async def _no_spec_reconcile(*args, **kwargs):
+        del kwargs
+        return implementation_module.DagTaskSpecReconcileOutcome(args[4], {})
+
+    async def _unexpected_expanded(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("commit-only route must skip expanded verify")
+
+    async def _unexpected_parallel(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("commit-only route must skip parallel repair")
+
+    monkeypatch.setattr(implementation_module, "VERIFY_RETRIES", 1)
+    monkeypatch.setattr(implementation_module, "_verify", _verify)
+    monkeypatch.setattr(implementation_module, "_run_dag_group_preflight", _no_preflight)
+    monkeypatch.setattr(implementation_module, "_sanitize_dag_repair_results", _no_sanitize)
+    monkeypatch.setattr(implementation_module, "_reconcile_dag_task_results", _no_result_reconcile)
+    monkeypatch.setattr(implementation_module, "_reconcile_dag_task_specs", _no_spec_reconcile)
+    monkeypatch.setattr(implementation_module, "_run_expanded_dag_verify_lenses", _unexpected_expanded)
+    monkeypatch.setattr(implementation_module, "_attempt_parallel_dag_repair", _unexpected_parallel)
+    async def _commit_repos_success(*_args, **_kwargs):
+        return ""
+
+    monkeypatch.setattr(implementation_module, "_commit_repos", _commit_repos_success)
+
+    async def _checkpoint(*_args, **_kwargs):
+        return "a" * 40
+
+    monkeypatch.setattr(implementation_module, "_commit_group", _checkpoint)
+
+    runner = _Runner()
+    approved, failure = await implementation_module._verify_and_fix_group(
+        runner,
+        feature,
+        38,
+        [task],
+        [result],
+        [result],
+        implementation_module.HandoverDoc(),
+        tmp_path,
+        "primary",
+        "secondary",
+        "primary",
+    )
+
+    assert approved is True
+    assert failure == ""
+    assert verify_calls == 2
+    assert RootCauseAnalysis not in runner.output_types
+    assert ImplementationResult in runner.output_types
+    route_payload = json.loads(
+        runner.artifacts.store["dag-direct-repair-route:g38:retry-0"]
+    )
+    assert route_payload["route"] == "commit_hygiene_focused"
+    assert route_payload["skip_expanded_verify"] is True
+    assert "dag-repair-expanded-verify:g38:retry-0" not in runner.artifacts.store
+    assert route_payload["target_files"] == [
+        "iriai-studio/src/webviews/projectSurface/src/chat/__tests__/"
+        "ChatSidepaneShell.test.tsx:149"
+    ]
+    assert "Read the context" in runner.prompts[0]
+
+
+@pytest.mark.asyncio
+async def test_implementation_commit_verdict_routes_directly_without_initial_verify(
+    tmp_path,
+    monkeypatch,
+):
+    feature = SimpleNamespace(id="feat-implementation-commit-route", slug="impl-commit")
+
+    class _Artifacts:
+        def __init__(self) -> None:
+            self.store: dict[str, str] = {}
+
+        async def get(self, key: str, *, feature):
+            del feature
+            return self.store.get(key, "")
+
+        async def put(self, key: str, value: str, *, feature):
+            del feature
+            self.store[key] = value
+
+    class _Runner:
+        def __init__(self) -> None:
+            self.artifacts = _Artifacts()
+            self.services = {}
+            self.output_types: list[object] = []
+
+        async def run(self, task, feature, phase_name=""):
+            del feature, phase_name
+            self.output_types.append(task.output_type)
+            if task.output_type is RootCauseAnalysis:
+                raise AssertionError("implementation commit route must skip RCA")
+            if task.output_type is ImplementationResult:
+                return ImplementationResult(
+                    task_id="VERIFY-COMMIT-HYGIENE",
+                    summary="fixed husky hygiene",
+                    files_modified=[
+                        "iriai-studio/src/vs/workbench/contrib/studioWorkflow/"
+                        "browser/workflowTab/chat/test/browser/cardVariantRegistry.test.ts"
+                    ],
+                )
+            raise AssertionError(f"unexpected task: {task!r}")
+
+    task = ImplementationTask(id="TASK-1", name="Task", description="Task")
+    result = ImplementationResult(
+        task_id="TASK-1",
+        summary="done",
+        files_modified=[
+            "iriai-studio/src/vs/workbench/contrib/studioWorkflow/browser/"
+            "workflowTab/chat/test/browser/cardVariantRegistry.test.ts"
+        ],
+    )
+    initial_verdict = Verdict(
+        approved=False,
+        summary="Group 39 cannot checkpoint: commit failed during implementation",
+        concerns=[
+            Issue(
+                severity="major",
+                description=(
+                    "pre-commit/husky failed during implementation; fix repo "
+                    "hygiene before checkpoint."
+                ),
+                file=(
+                    "iriai-studio/src/vs/workbench/contrib/studioWorkflow/browser/"
+                    "workflowTab/chat/test/browser/cardVariantRegistry.test.ts"
+                ),
+                line=32,
+            )
+        ],
+    )
+    verify_calls = 0
+    preflight_calls = 0
+
+    async def _verify(*_args, **_kwargs):
+        nonlocal verify_calls
+        verify_calls += 1
+        return Verdict(approved=True, summary="clean")
+
+    async def _preflight(*_args, **_kwargs):
+        nonlocal preflight_calls
+        preflight_calls += 1
+        return None
+
+    async def _no_sanitize(*_args, **_kwargs):
+        return _args[4]
+
+    async def _no_result_reconcile(
+        runner,
+        feature,
+        group_idx,
+        retry_label,
+        group_tasks,
+        *,
+        results,
+        verify_results_context,
+        all_results,
+        repair_results,
+        feature_root,
+    ):
+        del runner, feature, group_idx, retry_label, group_tasks, repair_results, feature_root
+        return implementation_module.DagTaskReconcileOutcome(
+            results,
+            verify_results_context,
+            all_results,
+            {},
+        )
+
+    async def _no_spec_reconcile(*args, **kwargs):
+        del kwargs
+        return implementation_module.DagTaskSpecReconcileOutcome(args[4], {})
+
+    async def _unexpected_expanded(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("commit-only route must skip expanded verify")
+
+    async def _unexpected_parallel(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("commit-only route must skip parallel repair")
+
+    async def _commit_repos_success(*_args, **_kwargs):
+        return ""
+
+    async def _checkpoint(*_args, **_kwargs):
+        return "b" * 40
+
+    monkeypatch.setattr(implementation_module, "VERIFY_RETRIES", 1)
+    monkeypatch.setattr(implementation_module, "_verify", _verify)
+    monkeypatch.setattr(implementation_module, "_run_dag_group_preflight", _preflight)
+    monkeypatch.setattr(implementation_module, "_sanitize_dag_repair_results", _no_sanitize)
+    monkeypatch.setattr(implementation_module, "_reconcile_dag_task_results", _no_result_reconcile)
+    monkeypatch.setattr(implementation_module, "_reconcile_dag_task_specs", _no_spec_reconcile)
+    monkeypatch.setattr(implementation_module, "_run_expanded_dag_verify_lenses", _unexpected_expanded)
+    monkeypatch.setattr(implementation_module, "_attempt_parallel_dag_repair", _unexpected_parallel)
+    monkeypatch.setattr(implementation_module, "_commit_repos", _commit_repos_success)
+    monkeypatch.setattr(implementation_module, "_commit_group", _checkpoint)
+
+    runner = _Runner()
+    approved, failure = await implementation_module._verify_and_fix_group(
+        runner,
+        feature,
+        39,
+        [task],
+        [result],
+        [result],
+        implementation_module.HandoverDoc(),
+        tmp_path,
+        "primary",
+        "secondary",
+        "primary",
+        initial_verdict=initial_verdict,
+        initial_verdict_key="dag-verify:g39:implementation-commit",
+    )
+
+    assert approved is True
+    assert failure == ""
+    assert verify_calls == 1
+    assert preflight_calls == 1
+    assert RootCauseAnalysis not in runner.output_types
+    route_payload = json.loads(
+        runner.artifacts.store["dag-direct-repair-route:g39:retry-0"]
+    )
+    assert route_payload["route"] == "commit_hygiene_focused"
+    assert route_payload["source_verdict_key"] == "dag-verify:g39:implementation-commit"
+
+
+@pytest.mark.asyncio
+async def test_manifest_forbidden_commit_route_prompts_cleanup_not_suppression(
+    tmp_path,
+    monkeypatch,
+):
+    feature = SimpleNamespace(id="feat-manifest-commit-route", slug="manifest-commit")
+    repo = tmp_path / "iriai-studio"
+    _init_git_repo(repo)
+    forbidden_root = "src/vs/workbench/contrib/studioWorkflow/browser/workflowTab/chat"
+    _write_forbidden_manifest(repo, forbidden_root)
+    exc = implementation_module.WorkflowCommitError(
+        "commit failed",
+        [
+            implementation_module.CommitRepoOutcome(
+                repo_path=str(repo),
+                repo_name="iriai-studio",
+                message="fix",
+                dirty=True,
+                command=["git", "commit", "-m", "fix"],
+                exit_code=1,
+                stderr=f"{forbidden_root}/test/browser/cardVariantRegistry.test.ts:32:1 warning",
+                status_after=f"A  {forbidden_root}/test/browser/cardVariantRegistry.test.ts",
+                error="git commit failed",
+            )
+        ],
+    )
+    initial_verdict = implementation_module._commit_failure_verdict(
+        exc,
+        group_idx=39,
+        stage="implementation",
+    )
+
+    class _Artifacts:
+        def __init__(self) -> None:
+            self.store: dict[str, str] = {}
+
+        async def get(self, key: str, *, feature):
+            del feature
+            return self.store.get(key, "")
+
+        async def put(self, key: str, value: str, *, feature):
+            del feature
+            self.store[key] = value
+
+    class _Runner:
+        def __init__(self) -> None:
+            self.artifacts = _Artifacts()
+            self.services = {}
+            self.prompts: list[str] = []
+            self.output_types: list[object] = []
+
+        async def run(self, task, feature, phase_name=""):
+            del feature, phase_name
+            self.prompts.append(task.prompt)
+            self.output_types.append(task.output_type)
+            if task.output_type is RootCauseAnalysis:
+                raise AssertionError("manifest-forbidden commit route must skip RCA")
+            if task.output_type is ImplementationResult:
+                return ImplementationResult(
+                    task_id="VERIFY-MANIFEST-CLEANUP",
+                    summary="ported coverage and removed forbidden file",
+                    files_modified=["iriai-studio/src/webviews/projectSurface/src/chat/index.ts"],
+                )
+            raise AssertionError(f"unexpected task: {task!r}")
+
+    async def _verify(*_args, **_kwargs):
+        return Verdict(approved=True, summary="clean")
+
+    async def _preflight(*_args, **_kwargs):
+        return None
+
+    async def _no_sanitize(*args, **_kwargs):
+        return args[4]
+
+    async def _no_result_reconcile(
+        runner,
+        feature,
+        group_idx,
+        retry_label,
+        group_tasks,
+        *,
+        results,
+        verify_results_context,
+        all_results,
+        repair_results,
+        feature_root,
+    ):
+        del runner, feature, group_idx, retry_label, group_tasks, repair_results, feature_root
+        return implementation_module.DagTaskReconcileOutcome(
+            results,
+            verify_results_context,
+            all_results,
+            {},
+        )
+
+    async def _no_spec_reconcile(*args, **kwargs):
+        del kwargs
+        return implementation_module.DagTaskSpecReconcileOutcome(args[4], {})
+
+    async def _unexpected_expanded(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("manifest-forbidden route must skip expanded verify")
+
+    async def _unexpected_parallel(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("manifest-forbidden route must skip parallel repair")
+
+    async def _commit_repos_success(*_args, **_kwargs):
+        return ""
+
+    async def _checkpoint(*_args, **_kwargs):
+        return "c" * 40
+
+    monkeypatch.setattr(implementation_module, "VERIFY_RETRIES", 1)
+    monkeypatch.setattr(implementation_module, "_verify", _verify)
+    monkeypatch.setattr(implementation_module, "_run_dag_group_preflight", _preflight)
+    monkeypatch.setattr(implementation_module, "_sanitize_dag_repair_results", _no_sanitize)
+    monkeypatch.setattr(implementation_module, "_reconcile_dag_task_results", _no_result_reconcile)
+    monkeypatch.setattr(implementation_module, "_reconcile_dag_task_specs", _no_spec_reconcile)
+    monkeypatch.setattr(implementation_module, "_run_expanded_dag_verify_lenses", _unexpected_expanded)
+    monkeypatch.setattr(implementation_module, "_attempt_parallel_dag_repair", _unexpected_parallel)
+    monkeypatch.setattr(implementation_module, "_commit_repos", _commit_repos_success)
+    monkeypatch.setattr(implementation_module, "_commit_group", _checkpoint)
+
+    runner = _Runner()
+    approved, failure = await implementation_module._verify_and_fix_group(
+        runner,
+        feature,
+        39,
+        [ImplementationTask(id="TASK-1", name="Task", description="Task")],
+        [ImplementationResult(task_id="TASK-1", summary="done", files_modified=[])],
+        [],
+        implementation_module.HandoverDoc(),
+        tmp_path,
+        "primary",
+        "secondary",
+        "primary",
+        initial_verdict=initial_verdict,
+        initial_verdict_key="dag-verify:g39:implementation-commit",
+    )
+
+    assert approved is True
+    assert failure == ""
+    route_payload = json.loads(
+        runner.artifacts.store["dag-direct-repair-route:g39:retry-0"]
+    )
+    assert route_payload["route"] == "manifest_forbidden_product_cleanup"
+    assert route_payload["skip_expanded_verify"] is True
+    assert route_payload["operator_required"] is False
+    index_path = Path(runner.prompts[0].split("`")[1])
+    prompt_context = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in index_path.parent.glob("g39-fix-0-*.md")
+    )
+    assert "Do NOT fix this by adding `.eslint-ignore`" in prompt_context
+    assert "Suppression is invalid" in prompt_context
+
+
+@pytest.mark.asyncio
+async def test_implement_dag_routes_implementation_commit_failure_to_repair_loop(
+    tmp_path,
+    monkeypatch,
+):
+    feature = SimpleNamespace(
+        id="feat-impl-commit-catch",
+        slug="impl-commit-catch",
+        metadata={},
+    )
+    repos_root = tmp_path / ".iriai" / "features" / feature.slug / "repos"
+    (repos_root / "app").mkdir(parents=True)
+
+    class _Artifacts:
+        def __init__(self) -> None:
+            self.store: dict[str, str] = {}
+
+        async def get(self, key: str, *, feature):
+            del feature
+            return self.store.get(key, "")
+
+        async def put(self, key: str, value: str, *, feature):
+            del feature
+            self.store[key] = value
+
+    class _Runner:
+        def __init__(self) -> None:
+            self.artifacts = _Artifacts()
+            self.services = {"workspace_manager": SimpleNamespace(_base=tmp_path)}
+
+        async def run(self, task, feature, phase_name=""):
+            del feature, phase_name
+            if task.output_type is ImplementationResult:
+                return ImplementationResult(
+                    task_id="TASK-1",
+                    summary="implemented task",
+                    files_modified=["app/src/example.ts"],
+                )
+            raise AssertionError(f"unexpected task: {task!r}")
+
+    async def _noop(*_args, **_kwargs):
+        return None
+
+    async def _failing_commit(*_args, **_kwargs):
+        raise implementation_module.WorkflowCommitError(
+            "commit failed",
+            [
+                implementation_module.CommitRepoOutcome(
+                    repo_path=str(repos_root / "app"),
+                    repo_name="app",
+                    message="feat",
+                    dirty=True,
+                    command=["git", "commit", "-m", "feat"],
+                    exit_code=1,
+                    stderr="app/src/example.ts:7:1 husky says no",
+                    status_before="M src/example.ts",
+                    status_after="M src/example.ts",
+                    error="git commit failed",
+                )
+            ],
+        )
+
+    routed: dict[str, object] = {}
+
+    async def _fake_verify_and_fix_group(
+        runner,
+        feature,
+        group_idx,
+        group_tasks,
+        results,
+        all_results,
+        handover,
+        feature_root,
+        impl_runtime,
+        review_runtime,
+        rca_runtime=None,
+        **kwargs,
+    ):
+        del runner, feature, group_tasks, all_results, handover, feature_root
+        del impl_runtime, review_runtime, rca_runtime
+        routed.update({
+            "group_idx": group_idx,
+            "results": results,
+            "initial_verdict": kwargs.get("initial_verdict"),
+            "initial_verdict_key": kwargs.get("initial_verdict_key"),
+        })
+        return False, "routed commit failure"
+
+    monkeypatch.setattr(implementation_module, "dag_path_canonicalization_enabled", lambda: False)
+    monkeypatch.setattr(implementation_module, "_ensure_task_worktrees", _noop)
+    monkeypatch.setattr(
+        implementation_module,
+        "_dag_workspace_writeability_problems",
+        lambda *_args, **_kwargs: [],
+    )
+    monkeypatch.setattr(implementation_module, "_commit_repos", _failing_commit)
+    monkeypatch.setattr(implementation_module, "_verify_and_fix_group", _fake_verify_and_fix_group)
+
+    dag = implementation_module.ImplementationDAG(
+        tasks=[
+            ImplementationTask(
+                id="TASK-1",
+                name="Task",
+                description="Task",
+                repo_path="app",
+                files=["app/src/example.ts"],
+            )
+        ],
+        execution_order=[["TASK-1"]],
+    )
+
+    impl_text, failure, _handover = await implementation_module._implement_dag(
+        _Runner(),
+        feature,
+        dag,
+    )
+
+    assert "implemented task" in impl_text
+    assert "routed commit failure" in failure
+    assert routed["group_idx"] == 0
+    assert routed["initial_verdict_key"] == "dag-verify:g0:implementation-commit"
+    assert isinstance(routed["initial_verdict"], Verdict)
+    assert "commit failed during implementation" in routed["initial_verdict"].summary
+
+
+@pytest.mark.asyncio
+async def test_single_rca_fix_verify_commit_failure_records_artifact_not_crash(
+    tmp_path,
+    monkeypatch,
+):
+    feature = SimpleNamespace(id="feat-single-commit-block", slug="single-commit-block")
+
+    class _Artifacts:
+        def __init__(self) -> None:
+            self.store: dict[str, str] = {}
+
+        async def get(self, key: str, *, feature):
+            del feature
+            return self.store.get(key, "")
+
+        async def put(self, key: str, value: str, *, feature):
+            del feature
+            self.store[key] = value
+
+    class _Runner:
+        def __init__(self) -> None:
+            self.artifacts = _Artifacts()
+            self.services = {}
+            self.output_types: list[object] = []
+
+        async def run(self, task, feature, phase_name=""):
+            del feature, phase_name
+            self.output_types.append(task.output_type)
+            if task.output_type is RootCauseAnalysis:
+                return RootCauseAnalysis(
+                    hypothesis="Aria label does not match the plan",
+                    evidence=["component and test pin a non-spec string"],
+                    affected_files=["repo/src/ChatSidepaneShell.tsx"],
+                    proposed_approach="Update the literal and test",
+                    confidence="high",
+                )
+            if task.output_type is ImplementationResult:
+                return ImplementationResult(
+                    task_id="VERIFY-FAIL-COMMIT",
+                    summary="Updated the literal and test",
+                    files_modified=[
+                        "repo/src/ChatSidepaneShell.tsx",
+                        "repo/src/ChatSidepaneShell.test.tsx",
+                    ],
+                )
+            if task.output_type is Verdict:
+                raise AssertionError("reverify must not run after commit failure")
+            raise AssertionError(f"unexpected task: {task!r}")
+
+    async def _failing_commit(*_args, **_kwargs):
+        raise implementation_module.WorkflowCommitError(
+            "commit failed",
+            [
+                implementation_module.CommitRepoOutcome(
+                    repo_path=str(tmp_path),
+                    repo_name="repo",
+                    message="fix",
+                    dirty=True,
+                    command=["git", "commit", "-m", "fix"],
+                    exit_code=1,
+                    stderr="Unexpected unicode character",
+                    status_before="M repo/src/ChatSidepaneShell.test.tsx",
+                    status_after="M repo/src/ChatSidepaneShell.test.tsx",
+                    error="git commit failed",
+                )
+            ],
+        )
+
+    monkeypatch.setattr(implementation_module, "_commit_repos", _failing_commit)
+
+    runner = _Runner()
+    attempt = await implementation_module._single_rca_fix_verify(
+        runner,
+        feature,
+        "Verifier failed on ChatSidepaneShell aria-label",
+        "verify",
+        implementation_module.qa_engineer,
+        implementation_module.implementer,
+        "",
+        bug_id="VERIFY-FAIL-COMMIT",
+        attempt_number=1,
+        workspace_root=None,
+    )
+
+    assert attempt.re_verify_result == "FAIL"
+    assert "Commit failed before reverify" in attempt.fix_applied
+    assert RootCauseAnalysis in runner.output_types
+    assert ImplementationResult in runner.output_types
+    assert Verdict not in runner.output_types
+    artifact_key = "bug-commit-failure:verify:VERIFY-FAIL-COMMIT:attempt-1:fix"
+    payload = json.loads(runner.artifacts.store[artifact_key])
+    assert "Unexpected unicode character" in payload["outcomes"][0]["stderr"]
+    reverify = json.loads(runner.artifacts.store["bug-reverify:verify:VERIFY-FAIL-COMMIT"])
+    assert reverify["approved"] is False
+    assert "pre-commit/husky failed" in reverify["concerns"][0]["description"]
 
 
 def test_dag_expanded_verify_merges_and_dedupes_lens_findings():
@@ -279,6 +1548,208 @@ async def test_dag_group_preflight_reports_structural_blockers(tmp_path):
     assert payload["approved"] is False
     assert payload["repairs"][0]["field"] == "verification_gates"
     assert task_a.verification_gates == ["AC-1", "BAD-GATE"]
+
+
+@pytest.mark.asyncio
+async def test_dag_group_preflight_uses_raw_verdict_for_checkpoint_gate(
+    tmp_path,
+    monkeypatch,
+):
+    feature = SimpleNamespace(id="feat-ledger-raw", slug="ledger-raw", metadata={})
+
+    class _Artifacts:
+        def __init__(self) -> None:
+            self.store: dict[str, str] = {}
+
+        async def get(self, key: str, *, feature):
+            del feature
+            return self.store.get(key, "")
+
+        async def put(self, key: str, value: str, *, feature):
+            del feature
+            self.store[key] = value
+
+    runner = SimpleNamespace(artifacts=_Artifacts(), services={})
+    task = ImplementationTask(id="TASK-1", name="Task", description="Task")
+    result = ImplementationResult(
+        task_id="TASK-1",
+        summary="done",
+        files_modified=["missing.py"],
+    )
+    resolved = FindingLedger(
+        findings=[
+            FindingRecord(
+                id="F-001",
+                source="verify",
+                description=(
+                    "TASK-1 reports changed file that is missing from the "
+                    "feature workspace; source artifact: dag-task:TASK-1; "
+                    "path: missing.py"
+                ),
+                file="missing.py",
+                severity="major",
+                status="resolved",
+            )
+        ]
+    )
+    runner.artifacts.store["finding-ledger"] = resolved.model_dump_json()
+
+    monkeypatch.setattr(implementation_module, "VERIFY_RETRIES", 0)
+
+    async def _unexpected_commit(*args, **kwargs):  # pragma: no cover - failure path
+        del args, kwargs
+        raise AssertionError("raw failing preflight must not checkpoint")
+
+    monkeypatch.setattr(implementation_module, "_commit_group", _unexpected_commit)
+
+    approved, failure = await implementation_module._verify_and_fix_group(
+        runner,
+        feature,
+        37,
+        [task],
+        [result],
+        [result],
+        implementation_module.HandoverDoc(),
+        tmp_path,
+        "primary",
+        "secondary",
+        "primary",
+        known_task_ids={"TASK-1"},
+    )
+
+    assert approved is False
+    assert "missing.py" in failure
+    assert "dag-group:37" not in runner.artifacts.store
+    raw_verify = json.loads(runner.artifacts.store["dag-verify:g37:initial"])
+    assert raw_verify["approved"] is False
+    assert raw_verify["concerns"]
+
+
+@pytest.mark.asyncio
+async def test_dag_preflight_distinguishes_staged_and_unstaged_forbidden_deletes(
+    tmp_path,
+):
+    feature = SimpleNamespace(id="feat-git-state", slug="git-state", metadata={})
+    feature_root = tmp_path / "repos"
+    repo = feature_root / "iriai-studio"
+    forbidden_path = "src/webviews/dashboard/README.md"
+    forbidden = repo / forbidden_path
+    forbidden.parent.mkdir(parents=True)
+    forbidden.write_text("old", encoding="utf-8")
+    config_path = repo / "scripts/verify-file-scope.expected-files.json"
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text(
+        json.dumps({
+            "expected_files": [],
+            "forbidden_files": [
+                {"path": "src/webviews/dashboard", "source": "retired dashboard"}
+            ],
+        }),
+        encoding="utf-8",
+    )
+
+    def git(*args: str) -> None:
+        subprocess.run(
+            ["git", "-C", str(repo), *args],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+    subprocess.run(["git", "init", str(repo)], check=True, stdout=subprocess.PIPE)
+    git("config", "user.email", "test@example.com")
+    git("config", "user.name", "Test")
+    git("add", ".")
+    git("commit", "-m", "seed")
+
+    class _Artifacts:
+        def __init__(self) -> None:
+            self.store: dict[str, str] = {}
+
+        async def put(self, key: str, value: str, *, feature):
+            del feature
+            self.store[key] = value
+
+    runner = SimpleNamespace(artifacts=_Artifacts())
+    task = ImplementationTask(id="TASK-1", name="Task", description="Task")
+
+    forbidden.unlink()
+    forbidden.parent.rmdir()
+    unstaged = await implementation_module._run_dag_group_preflight(
+        runner,
+        feature,
+        37,
+        "unstaged",
+        [task],
+        [],
+        feature_root=feature_root,
+    )
+
+    assert unstaged is not None
+    assert any("stage the deletion" in issue.description for issue in unstaged.concerns)
+    unstaged_report = json.loads(
+        runner.artifacts.store["dag-repair-preflight:g37:retry-unstaged"]
+    )
+    unstaged_problem = unstaged_report["path_problems"][0]
+    assert unstaged_problem["git_state"] == "unstaged_delete"
+    assert unstaged_problem["tracked_or_staged"] is True
+
+    git("add", "-u", forbidden_path)
+    staged = await implementation_module._run_dag_group_preflight(
+        runner,
+        feature,
+        37,
+        "staged",
+        [task],
+        [],
+        feature_root=feature_root,
+    )
+
+    assert staged is None
+    staged_report = json.loads(
+        runner.artifacts.store["dag-repair-preflight:g37:retry-staged"]
+    )
+    assert staged_report["approved"] is True
+    assert staged_report["path_problems"] == []
+
+
+@pytest.mark.asyncio
+async def test_dag_preflight_blocks_repo_hygiene_leaks(tmp_path):
+    feature = SimpleNamespace(id="feat-hygiene", slug="hygiene", metadata={})
+    feature_root = tmp_path / "repos"
+    repo = feature_root / "iriai-studio"
+    (repo / ".git").mkdir(parents=True)
+    (repo / "src/webviews/dashboard/.git").mkdir(parents=True)
+    (repo / "_pending_orchestrator.py").write_text("parked", encoding="utf-8")
+
+    class _Artifacts:
+        def __init__(self) -> None:
+            self.store: dict[str, str] = {}
+
+        async def put(self, key: str, value: str, *, feature):
+            del feature
+            self.store[key] = value
+
+    runner = SimpleNamespace(artifacts=_Artifacts())
+
+    verdict = await implementation_module._run_dag_group_preflight(
+        runner,
+        feature,
+        38,
+        "initial",
+        [ImplementationTask(id="TASK-1", name="Task", description="Task")],
+        [],
+        feature_root=feature_root,
+    )
+
+    assert verdict is not None
+    descriptions = [issue.description for issue in verdict.concerns]
+    assert any("embedded .git directory" in description for description in descriptions)
+    assert any("parked implementation fallback" in description for description in descriptions)
+    report = json.loads(runner.artifacts.store["dag-repair-preflight:g38:retry-initial"])
+    reasons = {problem["reason"] for problem in report["path_problems"]}
+    assert {"embedded_git", "parked_implementation_file"} <= reasons
 
 
 @pytest.mark.asyncio
@@ -1926,6 +3397,288 @@ async def test_dag_preflight_fails_manifest_forbidden_file_on_disk(tmp_path):
     assert problem["exists_on_disk"] is True
 
 
+def test_workspace_permission_repair_makes_forbidden_cleanup_agent_writable(tmp_path):
+    repos_root = tmp_path / "repos"
+    repo = repos_root / "iriai-studio"
+    _init_git_repo(repo)
+    forbidden_root = "src/vs/workbench/contrib/studioWorkflow/browser/workflowTab/chat"
+    _write_forbidden_manifest(repo, forbidden_root)
+    forbidden_dir = repo / forbidden_root
+    forbidden_dir.mkdir(parents=True, exist_ok=True)
+    target = forbidden_dir / "cardVariantRegistry.ts"
+    target.write_text("export {};\n", encoding="utf-8")
+    forbidden_dir.chmod(0o755)
+
+    report = implementation_module._normalize_feature_workspace_cleanup_permissions(
+        repos_root,
+        [f"iriai-studio/{forbidden_root}/cardVariantRegistry.ts"],
+        reason="test",
+    )
+
+    assert report["operator_required"] is False
+    mode = forbidden_dir.stat().st_mode
+    assert mode & stat.S_IWGRP
+    assert mode & stat.S_ISGID
+
+
+@pytest.mark.asyncio
+async def test_manifest_forbidden_preflight_routes_to_focused_cleanup_after_permission_repair(
+    tmp_path,
+    monkeypatch,
+):
+    feature = SimpleNamespace(id="feat-g39-preflight-cleanup", slug="g39-cleanup")
+    repos_root = tmp_path / "repos"
+    repo = repos_root / "iriai-studio"
+    _init_git_repo(repo)
+    forbidden_root = "src/vs/workbench/contrib/studioWorkflow/browser/workflowTab/chat"
+    _write_forbidden_manifest(repo, forbidden_root)
+    forbidden_dir = repo / forbidden_root
+    forbidden_dir.mkdir(parents=True, exist_ok=True)
+    forbidden_file = forbidden_dir / "cardVariantRegistry.ts"
+    forbidden_file.write_text("export {};\n", encoding="utf-8")
+    forbidden_dir.chmod(0o755)
+    canonical = repo / "src/webviews/projectSurface/src/chat/cardVariantRegistry.ts"
+    canonical.parent.mkdir(parents=True, exist_ok=True)
+    canonical.write_text("export {};\n", encoding="utf-8")
+
+    class _Artifacts:
+        def __init__(self) -> None:
+            self.store: dict[str, str] = {}
+
+        async def get(self, key: str, *, feature):
+            del feature
+            return self.store.get(key, "")
+
+        async def put(self, key: str, value: str, *, feature):
+            del feature
+            self.store[key] = value
+
+    class _Runner:
+        def __init__(self) -> None:
+            self.artifacts = _Artifacts()
+            self.services = {}
+            self.prompts: list[str] = []
+            self.output_types: list[object] = []
+
+        async def run(self, task, feature, phase_name=""):
+            del feature, phase_name
+            self.prompts.append(task.prompt)
+            self.output_types.append(task.output_type)
+            if task.output_type is RootCauseAnalysis:
+                raise AssertionError("preflight product cleanup route must skip RCA")
+            if task.output_type is ImplementationResult:
+                assert forbidden_dir.stat().st_mode & stat.S_IWGRP
+                forbidden_file.unlink()
+                forbidden_dir.rmdir()
+                return ImplementationResult(
+                    task_id="VERIFY-MANIFEST-PREFLIGHT-CLEANUP",
+                    summary="removed forbidden subtree and preserved canonical registry",
+                    files_modified=[
+                        "iriai-studio/src/webviews/projectSurface/src/chat/cardVariantRegistry.ts"
+                    ],
+                )
+            raise AssertionError(f"unexpected task: {task!r}")
+
+    async def _verify(*_args, **_kwargs):
+        return Verdict(approved=True, summary="clean")
+
+    async def _no_result_reconcile(
+        runner,
+        feature,
+        group_idx,
+        retry_label,
+        group_tasks,
+        *,
+        results,
+        verify_results_context,
+        all_results,
+        repair_results,
+        feature_root,
+    ):
+        del runner, feature, group_idx, retry_label, group_tasks, repair_results, feature_root
+        return implementation_module.DagTaskReconcileOutcome(
+            results,
+            verify_results_context,
+            all_results,
+            {},
+        )
+
+    async def _no_spec_reconcile(*args, **kwargs):
+        del kwargs
+        return implementation_module.DagTaskSpecReconcileOutcome(args[4], {})
+
+    async def _unexpected_expanded(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("manifest-forbidden preflight route must skip expanded verify")
+
+    async def _unexpected_parallel(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("manifest-forbidden preflight route must skip parallel repair")
+
+    async def _commit_repos_success(*_args, **_kwargs):
+        return ""
+
+    async def _checkpoint(*_args, **_kwargs):
+        return "d" * 40
+
+    monkeypatch.setattr(implementation_module, "VERIFY_RETRIES", 1)
+    monkeypatch.setattr(implementation_module, "_verify", _verify)
+    monkeypatch.setattr(implementation_module, "_reconcile_dag_task_results", _no_result_reconcile)
+    monkeypatch.setattr(implementation_module, "_reconcile_dag_task_specs", _no_spec_reconcile)
+    monkeypatch.setattr(implementation_module, "_run_expanded_dag_verify_lenses", _unexpected_expanded)
+    monkeypatch.setattr(implementation_module, "_attempt_parallel_dag_repair", _unexpected_parallel)
+    monkeypatch.setattr(implementation_module, "_commit_repos", _commit_repos_success)
+    monkeypatch.setattr(implementation_module, "_commit_group", _checkpoint)
+
+    runner = _Runner()
+    approved, failure = await implementation_module._verify_and_fix_group(
+        runner,
+        feature,
+        39,
+        [ImplementationTask(id="TASK-csps-10-2", name="Task", description="Task")],
+        [
+            ImplementationResult(
+                task_id="TASK-csps-10-2",
+                summary="canonical",
+                files_modified=[
+                    "iriai-studio/src/webviews/projectSurface/src/chat/cardVariantRegistry.ts"
+                ],
+            )
+        ],
+        [],
+        implementation_module.HandoverDoc(),
+        repos_root,
+        "primary",
+        "secondary",
+        "primary",
+    )
+
+    assert approved is True
+    assert failure == ""
+    assert RootCauseAnalysis not in runner.output_types
+    route_payload = json.loads(
+        runner.artifacts.store["dag-direct-repair-route:g39:retry-0"]
+    )
+    assert route_payload["route"] == "manifest_forbidden_product_cleanup"
+    assert route_payload["operator_required"] is False
+    assert route_payload["skip_expanded_verify"] is True
+    permission_payload = json.loads(
+        runner.artifacts.store[
+            "dag-workspace-permission-repair:g39:retry-0:direct-route"
+        ]
+    )
+    assert permission_payload["operator_required"] is False
+    gate_payload = json.loads(
+        runner.artifacts.store["dag-manifest-cleanup-gate:g39:retry-0"]
+    )
+    assert gate_payload["approved"] is True
+    prompt_context_path = Path(runner.prompts[0].split("`")[1])
+    prompt_context = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in prompt_context_path.parent.glob("g39-fix-0-*.md")
+    )
+    assert "Do NOT fix this by adding `.eslint-ignore`" in prompt_context
+
+
+@pytest.mark.asyncio
+async def test_manifest_forbidden_cleanup_blocks_when_permission_repair_fails(
+    tmp_path,
+    monkeypatch,
+):
+    feature = SimpleNamespace(id="feat-permission-block", slug="permission-block")
+    verdict = Verdict(
+        approved=False,
+        summary="preflight failed",
+        concerns=[
+            Issue(
+                severity="major",
+                description=(
+                    "manifest-forbidden product cleanup required; "
+                    "manifest-forbidden path exists in the feature workspace"
+                ),
+                file=(
+                    "iriai-studio/src/vs/workbench/contrib/studioWorkflow/browser/"
+                    "workflowTab/chat/cardVariantRegistry.ts"
+                ),
+            )
+        ],
+    )
+
+    class _Artifacts:
+        def __init__(self) -> None:
+            self.store: dict[str, str] = {}
+
+        async def get(self, key: str, *, feature):
+            del feature
+            return self.store.get(key, "")
+
+        async def put(self, key: str, value: str, *, feature):
+            del feature
+            self.store[key] = value
+
+    class _Runner:
+        def __init__(self) -> None:
+            self.artifacts = _Artifacts()
+            self.services = {}
+
+        async def run(self, *_args, **_kwargs):
+            raise AssertionError("operator-blocked cleanup must not dispatch implementer")
+
+    def _permission_block(*_args, **_kwargs):
+        return {
+            "enabled": True,
+            "changed": [],
+            "already_ok": [],
+            "skipped": [],
+            "failed": [
+                {
+                    "path": "/tmp/forbidden",
+                    "error": "chmod failed",
+                }
+            ],
+            "operator_reasons": ["chmod failed"],
+            "operator_required": True,
+        }
+
+    async def _unexpected_expanded(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("operator-blocked cleanup must skip expanded verify")
+
+    monkeypatch.setattr(implementation_module, "VERIFY_RETRIES", 1)
+    monkeypatch.setattr(
+        implementation_module,
+        "_normalize_feature_workspace_cleanup_permissions",
+        _permission_block,
+    )
+    monkeypatch.setattr(implementation_module, "_run_expanded_dag_verify_lenses", _unexpected_expanded)
+
+    runner = _Runner()
+    approved, failure = await implementation_module._verify_and_fix_group(
+        runner,
+        feature,
+        39,
+        [ImplementationTask(id="TASK", name="Task", description="Task")],
+        [ImplementationResult(task_id="TASK", summary="done")],
+        [],
+        implementation_module.HandoverDoc(),
+        tmp_path,
+        "primary",
+        "secondary",
+        "primary",
+        initial_verdict=verdict,
+        initial_verdict_key="dag-verify:g39:initial",
+    )
+
+    assert approved is False
+    assert "manifest-forbidden" in failure
+    route_payload = json.loads(
+        runner.artifacts.store["dag-direct-repair-route:g39:retry-0"]
+    )
+    assert route_payload["route"] == "manifest_forbidden_product_cleanup"
+    assert route_payload["operator_required"] is True
+    assert route_payload["status"] == "operator_blocked"
+
+
 @pytest.mark.asyncio
 async def test_dag_task_artifact_repair_clears_preflight_stale_row(tmp_path):
     feature = SimpleNamespace(id="feat-preflight-repair", slug="preflight-repair", metadata={})
@@ -2025,6 +3778,312 @@ async def test_dag_task_artifact_repair_clears_preflight_stale_row(tmp_path):
     )
 
     assert after is None
+
+
+@pytest.mark.asyncio
+async def test_authority_gate_repairs_artifact_only_dag_task_when_parallel_disabled(
+    monkeypatch,
+    tmp_path,
+):
+    feature = SimpleNamespace(id="feat-authority-g39", slug="authority-g39", metadata={})
+    feature_root = tmp_path / "repos"
+    repo = feature_root / "iriai-studio"
+    (repo / ".git").mkdir(parents=True)
+    stale_path = (
+        "src/vs/workbench/contrib/studioWorkflow/browser/workflowTab/chat/"
+        "slices/slice10.ts"
+    )
+    canonical_path = "src/webviews/projectSurface/src/chat/slices/slice10.ts"
+    canonical = repo / canonical_path
+    canonical.parent.mkdir(parents=True, exist_ok=True)
+    canonical.write_text("export {};\n", encoding="utf-8")
+    config_path = repo / "scripts/verify-file-scope.expected-files.json"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(
+        json.dumps({
+            "forbidden_files": [
+                {
+                    "path": (
+                        "src/vs/workbench/contrib/studioWorkflow/browser/"
+                        "workflowTab/chat"
+                    ),
+                    "source": "retired chat subtree",
+                }
+            ]
+        }),
+        encoding="utf-8",
+    )
+    task_id = "chat-sidepane-shell-slice-10-TASK-csps-10-2"
+    stale = ImplementationResult(
+        task_id=task_id,
+        summary="stale",
+        files_modified=[stale_path],
+    )
+    corrected = ImplementationResult(
+        task_id=task_id,
+        summary="corrected",
+        files_modified=[canonical_path],
+    )
+
+    class _Artifacts:
+        def __init__(self) -> None:
+            self.store: dict[str, str] = {
+                f"dag-task:{task_id}": stale.model_dump_json()
+            }
+
+        async def get(self, key: str, *, feature):
+            del feature
+            return self.store.get(key, "")
+
+        async def get_record(self, key: str, *, feature):
+            del feature
+            value = self.store.get(key)
+            if value is None:
+                return None
+            return {
+                "id": len(self.store),
+                "created_at": "now",
+                "value": value,
+            }
+
+        async def put(self, key: str, value: str, *, feature):
+            del feature
+            self.store[key] = value
+
+    class _Runner:
+        def __init__(self) -> None:
+            self.artifacts = _Artifacts()
+            self.services = {}
+            self.output_types: list[object] = []
+
+        async def run(self, task, feature, phase_name=""):
+            del feature, phase_name
+            self.output_types.append(task.output_type)
+            if task.output_type is ArtifactRepairResult:
+                return ArtifactRepairResult(
+                    task_id="AUTHORITY-ARTIFACT-REPAIR",
+                    group_id="g39-r0-dag-task-result-drift",
+                    summary="appended corrected dag-task row",
+                    artifact_updates=[
+                        ArtifactRepairUpdate(
+                            artifact_key=f"dag-task:{task_id}",
+                            content=corrected.model_dump_json(),
+                        )
+                    ],
+                )
+            raise AssertionError(f"unexpected agent output type {task.output_type}")
+
+    verify_calls = 0
+
+    async def _verify(*_args, **_kwargs):
+        nonlocal verify_calls
+        verify_calls += 1
+        return Verdict(approved=True, summary="semantic verifier clean")
+
+    async def _unexpected_expanded(*_args, **_kwargs):
+        raise AssertionError("artifact-only authority repair must skip expanded verify")
+
+    async def _unexpected_parallel(*_args, **_kwargs):
+        raise AssertionError("authority gate must not depend on parallel repair")
+
+    async def _checkpoint(*_args, **_kwargs):
+        return "e" * 40
+
+    monkeypatch.setenv(implementation_module.DAG_PARALLEL_REPAIR_ENV, "0")
+    monkeypatch.setattr(implementation_module, "VERIFY_RETRIES", 1)
+    monkeypatch.setattr(implementation_module, "_verify", _verify)
+    monkeypatch.setattr(
+        implementation_module,
+        "_run_expanded_dag_verify_lenses",
+        _unexpected_expanded,
+    )
+    monkeypatch.setattr(
+        implementation_module,
+        "_attempt_parallel_dag_repair",
+        _unexpected_parallel,
+    )
+    monkeypatch.setattr(implementation_module, "_commit_group", _checkpoint)
+
+    runner = _Runner()
+    approved, failure = await implementation_module._verify_and_fix_group(
+        runner,
+        feature,
+        39,
+        [ImplementationTask(id=task_id, name="Task", description="Task")],
+        [stale],
+        [stale],
+        implementation_module.HandoverDoc(),
+        feature_root,
+        "primary",
+        "secondary",
+        "primary",
+    )
+
+    assert approved is True
+    assert failure == ""
+    assert verify_calls == 1
+    assert ArtifactRepairResult in runner.output_types
+    assert ImplementationResult not in runner.output_types
+    stored = ImplementationResult.model_validate_json(
+        runner.artifacts.store[f"dag-task:{task_id}"]
+    )
+    assert stored.files_modified == [canonical_path]
+    gate = json.loads(runner.artifacts.store["dag-authority-gate:g39:retry-0"])
+    assert gate["route"] == "db_task_result_drift"
+    assert gate["status"] == "repaired_by_artifact_repair"
+    assert gate["parallel_repair_enabled"] is False
+    assert gate["parallel_repair_affects_authority_gate"] is False
+    assert "dag-repair-expanded-verify:g39:retry-0" not in runner.artifacts.store
+    assert "dag-repair-dispatch:g39:retry-0" not in runner.artifacts.store
+
+
+@pytest.mark.asyncio
+async def test_authority_gate_blocks_invalid_dag_task_artifact_schema(
+    monkeypatch,
+    tmp_path,
+):
+    feature = SimpleNamespace(id="feat-authority-schema", slug="authority-schema", metadata={})
+    feature_root = tmp_path / "repos"
+    repo = feature_root / "iriai-studio"
+    (repo / ".git").mkdir(parents=True)
+    stale_path = (
+        "src/vs/workbench/contrib/studioWorkflow/browser/workflowTab/chat/"
+        "slices/slice12.ts"
+    )
+    canonical_path = "src/webviews/projectSurface/src/chat/slices/slice12.ts"
+    canonical = repo / canonical_path
+    canonical.parent.mkdir(parents=True, exist_ok=True)
+    canonical.write_text("export {};\n", encoding="utf-8")
+    config_path = repo / "scripts/verify-file-scope.expected-files.json"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(
+        json.dumps({
+            "forbidden_files": [
+                {
+                    "path": (
+                        "src/vs/workbench/contrib/studioWorkflow/browser/"
+                        "workflowTab/chat"
+                    ),
+                    "source": "retired chat subtree",
+                }
+            ]
+        }),
+        encoding="utf-8",
+    )
+    task_id = "chat-sidepane-shell-slice-12-T-csp-s12-1"
+    stale = ImplementationResult(
+        task_id=task_id,
+        summary="stale",
+        files_modified=[stale_path],
+    )
+
+    class _Artifacts:
+        def __init__(self) -> None:
+            self.store: dict[str, str] = {
+                f"dag-task:{task_id}": stale.model_dump_json()
+            }
+
+        async def get(self, key: str, *, feature):
+            del feature
+            return self.store.get(key, "")
+
+        async def get_record(self, key: str, *, feature):
+            del feature
+            value = self.store.get(key)
+            if value is None:
+                return None
+            return {
+                "id": len(self.store),
+                "created_at": "now",
+                "value": value,
+            }
+
+        async def put(self, key: str, value: str, *, feature):
+            del feature
+            self.store[key] = value
+
+    class _Runner:
+        def __init__(self) -> None:
+            self.artifacts = _Artifacts()
+            self.services = {}
+            self.output_types: list[object] = []
+
+        async def run(self, task, feature, phase_name=""):
+            del feature, phase_name
+            self.output_types.append(task.output_type)
+            if task.output_type is ArtifactRepairResult:
+                return ArtifactRepairResult(
+                    task_id="AUTHORITY-ARTIFACT-REPAIR",
+                    group_id="g39-r0-dag-task-result-drift",
+                    summary="used wrong nested schema",
+                    artifact_updates=[
+                        ArtifactRepairUpdate(
+                            artifact_key=f"dag-task:{task_id}",
+                            content=json.dumps({
+                                "task_id": task_id,
+                                "summary": "wrong schema",
+                                "status": "completed",
+                                "artifacts_modified": [canonical_path],
+                            }),
+                        )
+                    ],
+                )
+            raise AssertionError(f"unexpected agent output type {task.output_type}")
+
+    async def _verify(*_args, **_kwargs):
+        raise AssertionError("invalid authority repair must not run semantic verifier")
+
+    async def _unexpected_expanded(*_args, **_kwargs):
+        raise AssertionError("invalid authority repair must skip expanded verify")
+
+    async def _unexpected_parallel(*_args, **_kwargs):
+        raise AssertionError("invalid authority repair must not enter parallel repair")
+
+    monkeypatch.setenv(implementation_module.DAG_PARALLEL_REPAIR_ENV, "0")
+    monkeypatch.setattr(implementation_module, "VERIFY_RETRIES", 1)
+    monkeypatch.setattr(implementation_module, "_verify", _verify)
+    monkeypatch.setattr(
+        implementation_module,
+        "_run_expanded_dag_verify_lenses",
+        _unexpected_expanded,
+    )
+    monkeypatch.setattr(
+        implementation_module,
+        "_attempt_parallel_dag_repair",
+        _unexpected_parallel,
+    )
+
+    runner = _Runner()
+    approved, failure = await implementation_module._verify_and_fix_group(
+        runner,
+        feature,
+        39,
+        [ImplementationTask(id=task_id, name="Task", description="Task")],
+        [stale],
+        [stale],
+        implementation_module.HandoverDoc(),
+        feature_root,
+        "primary",
+        "secondary",
+        "primary",
+    )
+
+    assert approved is False
+    assert "DAG authority gate blocked broad repair" in failure
+    stored = ImplementationResult.model_validate_json(
+        runner.artifacts.store[f"dag-task:{task_id}"]
+    )
+    assert stored.files_modified == [stale_path]
+    gate = json.loads(runner.artifacts.store["dag-authority-gate:g39:retry-0"])
+    assert gate["route"] == "db_task_result_drift"
+    assert gate["status"] == "blocked_artifact_repair_no_applied_updates"
+    repair_record = gate["artifact_repair"]["result"]
+    assert repair_record["status"] == "blocked"
+    skipped = json.dumps(gate["artifact_repair"])
+    assert "dag_task_no_reported_files" in skipped
+    assert "artifacts_modified" in skipped
+    assert "dag-repair-expanded-verify:g39:retry-0" not in runner.artifacts.store
+    assert "dag-repair-dispatch:g39:retry-0" not in runner.artifacts.store
 
 
 @pytest.mark.asyncio

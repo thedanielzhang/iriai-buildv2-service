@@ -25,7 +25,10 @@ async def run_slack_bridge(
     runtime_policy_override: bool = False,
     single_agent_runtime: bool = False,
     budget: bool = False,
+    concurrency_max: int | None = None,
     autonomous_remainder: bool = False,
+    slack_verbosity: Literal["normal", "quiet"] = "normal",
+    ignored_mention_user_ids: set[str] | None = None,
 ) -> None:
     """Start the long-lived Slack bridge.
 
@@ -54,6 +57,7 @@ async def run_slack_bridge(
             "SLACK_BOT_TOKEN environment variable is required. "
             "Get it from your Slack app's OAuth settings (xoxb-...)."
         )
+    ignored_mentions = await _load_ignored_mention_user_ids(ignored_mention_user_ids)
 
     # 2. Create adapter
     adapter = SlackAdapter(
@@ -61,6 +65,7 @@ async def run_slack_bridge(
         bot_token=bot_token,
         planning_channel=planning_channel,
         mode=mode,
+        ignored_mention_user_ids=ignored_mentions,
     )
 
     # 3. Create interaction runtime and orchestrator
@@ -76,7 +81,9 @@ async def run_slack_bridge(
         runtime_policy_override=runtime_policy_override,
         single_agent_runtime=single_agent_runtime,
         budget=budget,
+        concurrency_max=concurrency_max,
         autonomous_remainder=autonomous_remainder,
+        slack_verbosity=slack_verbosity,
     )
     await orchestrator.start()
 
@@ -88,7 +95,11 @@ async def run_slack_bridge(
     print(f"  Default mode: {mode}")
     print(f"  Agent runtime: {agent_runtime}")
     print(f"  Runtime policy: {runtime_policy}")
+    print(f"  Concurrency max: {concurrency_max if concurrency_max is not None else 'unlimited'}")
     print(f"  Autonomous remainder: {autonomous_remainder}")
+    print(f"  Slack verbosity: {slack_verbosity}")
+    if ignored_mentions:
+        print(f"  Ignored mentions: {', '.join(sorted(ignored_mentions))}")
     print(f"  Channel: {planning_channel}")
     print(f"  Bot: @{adapter.bot_user_id}")
     print(f"  Listening for [FEATURE] and [BUG] messages...\n")
@@ -107,3 +118,44 @@ async def run_slack_bridge(
         print("\nShutting down Slack bridge...")
         await orchestrator.shutdown()
         await adapter.disconnect()
+
+
+async def _load_ignored_mention_user_ids(
+    configured: set[str] | None = None,
+) -> set[str]:
+    """Load user ids that belong to other bots owning the same channel."""
+
+    user_ids = set(configured or set())
+    for env_name in (
+        "IRIAI_SLACK_IGNORED_MENTION_USER_IDS",
+        "SUPERVISOR_SLACK_BOT_USER_ID",
+        "IRIAI_SUPERVISOR_SLACK_BOT_USER_ID",
+    ):
+        raw = os.environ.get(env_name, "")
+        if raw:
+            user_ids.update(_parse_user_id_list(raw))
+
+    supervisor_token = os.environ.get("SUPERVISOR_SLACK_BOT_TOKEN", "")
+    if supervisor_token and not (
+        os.environ.get("SUPERVISOR_SLACK_BOT_USER_ID")
+        or os.environ.get("IRIAI_SUPERVISOR_SLACK_BOT_USER_ID")
+    ):
+        try:
+            from slack_sdk.web.async_client import AsyncWebClient
+
+            auth = await AsyncWebClient(token=supervisor_token).auth_test()
+            supervisor_user_id = auth.get("user_id")
+            if supervisor_user_id:
+                user_ids.add(str(supervisor_user_id))
+        except Exception:
+            logger.warning(
+                "Could not resolve supervisor Slack bot user id; set "
+                "SUPERVISOR_SLACK_BOT_USER_ID or IRIAI_SLACK_IGNORED_MENTION_USER_IDS "
+                "to keep supervisor mentions out of the workflow bridge.",
+                exc_info=True,
+            )
+    return user_ids
+
+
+def _parse_user_id_list(raw: str) -> set[str]:
+    return {part.strip() for part in raw.replace(",", " ").split() if part.strip()}

@@ -239,6 +239,7 @@ class TestBuildRunner:
             preview_service=object(),
             playwright_service=object(),
             artifact_mirror=object(),
+            public_dashboard=object(),
             workspace_manager=object(),
         )
 
@@ -292,6 +293,7 @@ class TestBuildRunner:
             preview_service=object(),
             playwright_service=object(),
             artifact_mirror=object(),
+            public_dashboard=object(),
             workspace_manager=object(),
         )
 
@@ -346,6 +348,7 @@ class TestBuildRunner:
             preview_service=object(),
             playwright_service=object(),
             artifact_mirror=object(),
+            public_dashboard=object(),
             workspace_manager=object(),
         )
 

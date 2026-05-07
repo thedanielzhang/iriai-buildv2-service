@@ -38,7 +38,12 @@ from iriai_build_v2.workflows.bugfix_v2.models import (
 )
 from iriai_build_v2.workflows.bugfix_v2.phases import queue as queue_module
 from iriai_build_v2.workflows._common import Gate, Interview
-from iriai_build_v2.workflows.develop.phases.implementation import PlannedBugDispatch, PlannedBugGroup
+from iriai_build_v2.workflows.develop.phases.implementation import (
+    CommitRepoOutcome,
+    PlannedBugDispatch,
+    PlannedBugGroup,
+    WorkflowCommitError,
+)
 
 
 class _Artifacts:
@@ -1179,6 +1184,111 @@ async def test_execute_bug_lane_routes_fix_primary_and_verify_secondary(
 
     assert success is True
     assert seen == [("primary", "ImplementationResult"), ("secondary", "Verdict")]
+
+
+@pytest.mark.asyncio
+async def test_execute_bug_lane_blocks_on_commit_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    feature = _feature()
+    artifacts = _Artifacts()
+    report = _report("BR-commit", status="queued", category="bug", summary="Checkout button does nothing")
+    cluster = queue_module.BugflowClusterSnapshot(
+        cluster_id="C-commit",
+        group_id="BG-commit",
+        report_ids=[report.report_id],
+        lane_id="L-commit",
+    )
+    lane_root = tmp_path / "lanes" / "L-commit" / "repos"
+    lane_root.mkdir(parents=True, exist_ok=True)
+    lane = BugflowLaneSnapshot(
+        lane_id="L-commit",
+        report_ids=[report.report_id],
+        category="bug",
+        source_cluster_id=cluster.cluster_id,
+        status="active_fix",
+        workspace_root=str(lane_root),
+        base_main_commits_by_repo={},
+        latest_rca_keys=["bug-rca:test:BG-commit"],
+        issue_summary="Checkout button does nothing",
+        lane_attempt=1,
+    )
+    rca = RootCauseAnalysis(
+        hypothesis="Missing submit handler",
+        evidence=["Button click is never bound"],
+        affected_files=["frontend/src/checkout.tsx"],
+        proposed_approach="Restore submit binding",
+        confidence="high",
+    )
+    await artifacts.put(report_key(report.report_id), report.model_dump_json(), feature=feature)
+    await artifacts.put(queue_module.cluster_key(cluster.cluster_id), cluster.model_dump_json(), feature=feature)
+    await artifacts.put(lane_key(lane.lane_id), lane.model_dump_json(), feature=feature)
+    await artifacts.put("bug-rca:test:BG-commit", rca.model_dump_json(), feature=feature)
+
+    seen: list[str] = []
+    runner = SimpleNamespace(
+        artifacts=artifacts,
+        services={"slack_adapter": _Adapter()},
+        feature_store=_FeatureStore(),
+    )
+
+    async def _fake_run(task, *_args, **_kwargs):
+        if isinstance(task, Ask):
+            seen.append(task.output_type.__name__)
+            if task.output_type is ImplementationResult:
+                return ImplementationResult(
+                    task_id="task-1",
+                    summary="Restored submit binding",
+                    files_modified=["frontend/src/checkout.tsx"],
+                )
+            if task.output_type is Verdict:
+                raise AssertionError("lane must not enter active_verify after commit failure")
+        raise AssertionError(f"Unexpected task: {task!r}")
+
+    runner.run = _fake_run
+
+    async def _failing_commit(*_args, **_kwargs):
+        raise WorkflowCommitError(
+            "commit failed",
+            [
+                CommitRepoOutcome(
+                    repo_path=str(lane_root),
+                    repo_name="lane",
+                    message="fix",
+                    dirty=True,
+                    command=["git", "commit", "-m", "fix"],
+                    exit_code=1,
+                    stderr="husky lane failure",
+                    status_before="M frontend/src/checkout.tsx",
+                    status_after="M frontend/src/checkout.tsx",
+                    error="git commit failed",
+                )
+            ],
+        )
+
+    async def _noop(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(queue_module, "_commit_repos_in_root", _failing_commit)
+    monkeypatch.setattr(queue_module, "_run_regression", _noop)
+    monkeypatch.setattr(queue_module, "_append_bug_fix_attempts", _noop)
+    monkeypatch.setattr(queue_module, "_resolve_fix_workspace_from_root", lambda *_args, **_kwargs: str(lane_root))
+
+    phase = queue_module.BugflowQueuePhase()
+    success = await phase._execute_bug_lane(runner, feature, lane)
+
+    assert success is False
+    assert seen == ["ImplementationResult"]
+    saved_lane = BugflowLaneSnapshot.model_validate_json(
+        artifacts.values[(feature.id, lane_key(lane.lane_id))]
+    )
+    assert saved_lane.status == "blocked"
+    assert saved_lane.current_phase == "commit-failed"
+    assert "pre-commit/husky failed" in saved_lane.wait_reason
+    artifact_key = "bug-commit-failure:lane:L-commit:attempt-1"
+    payload = json.loads(artifacts.values[(feature.id, artifact_key)])
+    assert "husky lane failure" in payload["outcomes"][0]["stderr"]
 
 
 @pytest.mark.asyncio

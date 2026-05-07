@@ -44,6 +44,7 @@ from ....runtimes import create_agent_runtime
 from ...develop.phases.implementation import (
     PlannedBugDispatch,
     PlannedBugGroup,
+    WorkflowCommitError,
     _commit_repos_in_root,
     _discover_repo_roots_under,
     _format_feedback,
@@ -53,6 +54,7 @@ from ...develop.phases.implementation import (
     _make_parallel_actor,
     _plan_bug_groups,
     _push_clones_to_source_root,
+    _record_commit_failure_artifact,
     _repo_heads_for_root,
     _resolve_fix_workspace_from_root,
     _run_git,
@@ -2226,11 +2228,48 @@ class BugflowQueuePhase(Phase):
             feature,
             phase_name=self.name,
         )
-        await _commit_repos_in_root(lane_root, f"fix: {lane.lane_id} attempt {lane.lane_attempt}")
-
         lane.latest_fix_summary = fix_result.summary
         lane.modified_files = sorted(set(fix_result.files_created + fix_result.files_modified))
         lane.implementation_result = fix_result.model_dump(mode="json")
+        try:
+            await _commit_repos_in_root(
+                lane_root,
+                f"fix: {lane.lane_id} attempt {lane.lane_attempt}",
+            )
+        except WorkflowCommitError as exc:
+            artifact_key = (
+                f"bug-commit-failure:lane:{lane.lane_id}:attempt-{lane.lane_attempt}"
+            )
+            await _record_commit_failure_artifact(
+                runner,
+                feature,
+                artifact_key,
+                exc,
+                metadata={
+                    "lane_id": lane.lane_id,
+                    "lane_attempt": lane.lane_attempt,
+                    "stage": "fix-commit",
+                },
+            )
+            lane.status = "blocked"
+            lane.promotion_status = "blocked"
+            lane.current_phase = "commit-failed"
+            lane.wait_reason = (
+                "pre-commit/husky failed; fix repo hygiene before lane reverify. "
+                f"See `{artifact_key}`."
+            )
+            lane.updated_at = utc_now()
+            await _save_lane(runner, feature, lane)
+            await _mark_cluster_from_lane(
+                runner,
+                feature,
+                lane,
+                status="blocked",
+                current_phase="commit-failed",
+                wait_reason=lane.wait_reason,
+            )
+            return False
+
         lane.status = "active_verify"
         lane.updated_at = utc_now()
         await _save_lane(runner, feature, lane)

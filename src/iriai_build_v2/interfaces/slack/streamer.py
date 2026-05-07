@@ -12,7 +12,7 @@ import asyncio
 import json
 import logging
 import time
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any, Callable, Literal
 
 from .helpers import markdown_to_mrkdwn
 
@@ -20,6 +20,7 @@ if TYPE_CHECKING:
     from .adapter import SlackAdapter
 
 logger = logging.getLogger(__name__)
+SlackVerbosity = Literal["normal", "quiet"]
 
 # Minimum seconds between Slack API updates (avoids 429 rate limits)
 _MIN_FLUSH_INTERVAL = 1.5
@@ -106,10 +107,14 @@ class SlackStreamer:
         channel: str,
         *,
         thread_ts: str | None = None,
+        verbosity: SlackVerbosity = "normal",
     ) -> None:
+        if verbosity not in {"normal", "quiet"}:
+            raise ValueError("verbosity must be 'normal' or 'quiet'")
         self._adapter = adapter
         self._channel = channel
         self._thread_ts = thread_ts
+        self._verbosity = verbosity
         self._message_ts: str | None = None
         self._final_text: str = ""
         self._current_status: str = ""
@@ -135,6 +140,16 @@ class SlackStreamer:
     def on_message(self, msg: Any) -> None:
         """Synchronous callback for ClaudeAgentRuntime. Schedules async updates."""
         typ = type(msg).__name__
+
+        if self._verbosity == "quiet":
+            if typ == "ResultMessage":
+                self._current_status = ""
+                self._final_text = ""
+                self._message_ts = None
+                self._seen_ids = set()
+                self._pending = False
+                self._last_flush_time = 0.0
+            return
 
         if typ == "AssistantMessage":
             # Deduplicate by message ID
@@ -290,7 +305,13 @@ def make_slack_on_message(
     adapter: SlackAdapter,
     channel: str,
     thread_ts: str | None = None,
+    verbosity: SlackVerbosity = "normal",
 ) -> Callable[[Any], None]:
     """Create an on_message callback bound to a specific channel/thread."""
-    streamer = SlackStreamer(adapter, channel, thread_ts=thread_ts)
+    streamer = SlackStreamer(
+        adapter,
+        channel,
+        thread_ts=thread_ts,
+        verbosity=verbosity,
+    )
     return streamer.on_message

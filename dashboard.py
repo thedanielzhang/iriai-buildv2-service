@@ -44,7 +44,7 @@ _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 class BridgeManager:
     """Manages the Slack bridge as a child process with output capture."""
 
-    def __init__(self, config: dict[str, str | bool | None]) -> None:
+    def __init__(self, config: dict[str, str | bool | int | None]) -> None:
         self.config = config
         self.process: asyncio.subprocess.Process | None = None
         self.lines: collections.deque[str] = collections.deque(maxlen=5000)
@@ -69,8 +69,16 @@ class BridgeManager:
             cmd.append("--claude-only")
         if self.config.get("budget"):
             cmd.append("--budget")
+        if self.config.get("concurrency_max"):
+            cmd += ["--concurrency-max", str(self.config["concurrency_max"])]
         if self.config.get("autonomous_remainder"):
             cmd.append("--autonomous-remainder")
+        if self.config.get("slack_verbosity"):
+            cmd += ["--slack-verbosity", str(self.config["slack_verbosity"])]
+        ignored_mentions = self.config.get("ignored_mention_user_ids")
+        if isinstance(ignored_mentions, str):
+            for user_id in ignored_mentions.replace(",", " ").split():
+                cmd += ["--ignore-mention-user-id", user_id]
         return cmd
 
     def _build_env(self) -> dict[str, str]:
@@ -137,12 +145,14 @@ class BridgeManager:
             "line_count": self.line_count,
             "buffer_size": len(self.lines),
             "dashboard_base_url": self.config.get("dashboard_base_url"),
+            "concurrency_max": self.config.get("concurrency_max"),
+            "slack_verbosity": self.config.get("slack_verbosity"),
         }
 
 
 # ── App setup ──────────────────────────────────────────────────────────────
 
-bridge_config: dict[str, str | bool | None] = {}
+bridge_config: dict[str, str | bool | int | None] = {}
 bridge: BridgeManager | None = None
 dashboard_config: dict[str, int | bool | str | None] = {"port": 8080}
 dashboard_tunnel: Any | None = None
@@ -3359,7 +3369,19 @@ if __name__ == "__main__":
     )
     parser.add_argument("--bridge-claude-only", action="store_true")
     parser.add_argument("--bridge-budget", action="store_true")
+    parser.add_argument("--bridge-concurrency-max", type=int, default=None)
     parser.add_argument("--bridge-autonomous-remainder", action="store_true")
+    parser.add_argument(
+        "--bridge-slack-verbosity",
+        default="normal",
+        choices=["normal", "quiet"],
+    )
+    parser.add_argument(
+        "--bridge-ignore-mention-user-id",
+        action="append",
+        default=[],
+        help="Slack user id whose mentions should not be routed to the workflow bridge.",
+    )
     args = parser.parse_args()
 
     dashboard_config["port"] = args.port
@@ -3379,6 +3401,8 @@ if __name__ == "__main__":
             bridge_runtime_policy = PRIMARY_IMPL_SECONDARY_REVIEW_POLICY
         if bridge_runtime_policy == DEFAULT_RUNTIME_POLICY:
             bridge_runtime_policy = None
+        if args.bridge_concurrency_max is not None and args.bridge_concurrency_max < 1:
+            parser.error("--bridge-concurrency-max must be >= 1")
 
         bridge_config.update({
             "channel": args.bridge_channel,
@@ -3388,7 +3412,10 @@ if __name__ == "__main__":
             "runtime_policy": bridge_runtime_policy,
             "claude_only": args.bridge_claude_only,
             "budget": args.bridge_budget,
+            "concurrency_max": args.bridge_concurrency_max,
             "autonomous_remainder": args.bridge_autonomous_remainder,
+            "slack_verbosity": args.bridge_slack_verbosity,
+            "ignored_mention_user_ids": ",".join(args.bridge_ignore_mention_user_id),
         })
 
     uvicorn.run(app, host="0.0.0.0", port=args.port, log_level="info")

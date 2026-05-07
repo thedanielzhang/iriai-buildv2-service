@@ -31,6 +31,7 @@ def test_bridge_manager_forwards_runtime_policy_to_slack_bridge():
         "workspace": "/tmp/workspace",
         "agent_runtime": "claude_pool",
         "runtime_policy": PRIMARY_IMPL_SECONDARY_REVIEW_POLICY,
+        "concurrency_max": 2,
     })
 
     cmd = manager._build_cmd()
@@ -39,6 +40,8 @@ def test_bridge_manager_forwards_runtime_policy_to_slack_bridge():
     assert cmd[cmd.index("--agent-runtime") + 1] == "claude_pool"
     assert "--runtime-policy" in cmd
     assert cmd[cmd.index("--runtime-policy") + 1] == PRIMARY_IMPL_SECONDARY_REVIEW_POLICY
+    assert "--concurrency-max" in cmd
+    assert cmd[cmd.index("--concurrency-max") + 1] == "2"
 
 
 @pytest.mark.asyncio

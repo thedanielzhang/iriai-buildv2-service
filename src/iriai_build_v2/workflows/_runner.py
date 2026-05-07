@@ -24,6 +24,8 @@ from pydantic import BaseModel
 from iriai_compose.prompts import Select
 from iriai_compose.tasks import Ask
 
+from ..agent_concurrency import AgentConcurrencyLimiter
+
 if TYPE_CHECKING:
     from iriai_compose.runner import AgentRuntime
 
@@ -135,6 +137,7 @@ class TrackedWorkflowRunner(DefaultWorkflowRunner):
         feature_store: PostgresFeatureStore,
         secondary_runtime: AgentRuntime | None = None,
         budget: bool = False,
+        agent_concurrency_limiter: AgentConcurrencyLimiter | None = None,
         services: dict | None = None,
         **kwargs: object,
     ) -> None:
@@ -144,6 +147,7 @@ class TrackedWorkflowRunner(DefaultWorkflowRunner):
         self.feature_store = feature_store
         self.secondary_runtime = secondary_runtime
         self.budget = budget
+        self.agent_concurrency_limiter = agent_concurrency_limiter
         self._active_invocations: dict[str, _InvocationState] = {}
 
     @contextmanager
@@ -418,52 +422,57 @@ class TrackedWorkflowRunner(DefaultWorkflowRunner):
                     "Watchdog disabled for %s (liveness_timeout=0)",
                     actor_name,
                 )
-                invocation_id = uuid4().hex
-                await self.feature_store.log_event(
-                    feature.id,
-                    "agent_invocation_start",
-                    actor.name,
-                    content=runtime_name,
-                    metadata={
-                        "phase_name": _phase_name_var.get(),
-                        "invocation_id": invocation_id,
-                        "runtime_name": runtime_name,
-                        "attempt": 0,
-                        "liveness_timeout_seconds": 0,
-                    },
-                )
-                self._record_invocation_started(
-                    invocation_id,
-                    runtime=target_runtime,
+                async with self._agent_concurrency_slot(
                     actor_name=actor_name,
-                    timeout_seconds=0,
-                )
-                tracker = _LivenessTracker(
-                    None,
-                    activity_callback=lambda: self._record_invocation_activity(invocation_id),
-                )
-                try:
-                    result = await self._resolve_with_runtime(
-                        target_runtime,
-                        task,
-                        runtime_kwargs=runtime_call_kwargs,
-                        tracker=tracker,
-                        invocation_id=invocation_id,
-                    )
+                    feature_id=feature.id,
+                    phase_name=_phase_name_var.get(),
+                ):
+                    invocation_id = uuid4().hex
                     await self.feature_store.log_event(
                         feature.id,
-                        "agent_done",
+                        "agent_invocation_start",
                         actor.name,
                         content=runtime_name,
                         metadata={
                             "phase_name": _phase_name_var.get(),
                             "invocation_id": invocation_id,
                             "runtime_name": runtime_name,
+                            "attempt": 0,
+                            "liveness_timeout_seconds": 0,
                         },
                     )
-                    return result
-                finally:
-                    self._record_invocation_finished(invocation_id)
+                    self._record_invocation_started(
+                        invocation_id,
+                        runtime=target_runtime,
+                        actor_name=actor_name,
+                        timeout_seconds=0,
+                    )
+                    tracker = _LivenessTracker(
+                        None,
+                        activity_callback=lambda: self._record_invocation_activity(invocation_id),
+                    )
+                    try:
+                        result = await self._resolve_with_runtime(
+                            target_runtime,
+                            task,
+                            runtime_kwargs=runtime_call_kwargs,
+                            tracker=tracker,
+                            invocation_id=invocation_id,
+                        )
+                        await self.feature_store.log_event(
+                            feature.id,
+                            "agent_done",
+                            actor.name,
+                            content=runtime_name,
+                            metadata={
+                                "phase_name": _phase_name_var.get(),
+                                "invocation_id": invocation_id,
+                                "runtime_name": runtime_name,
+                            },
+                        )
+                        return result
+                    finally:
+                        self._record_invocation_finished(invocation_id)
 
             effective_timeout = (
                 role_timeout if role_timeout is not None else LIVENESS_TIMEOUT
@@ -472,61 +481,21 @@ class TrackedWorkflowRunner(DefaultWorkflowRunner):
             last_err: Exception | None = None
 
             for attempt in range(RESOLVE_MAX_RETRIES + 1):
-                invocation_id = uuid4().hex
-                await self.feature_store.log_event(
-                    feature.id,
-                    "agent_invocation_start",
-                    actor.name,
-                    content=runtime_name,
-                    metadata={
-                        "phase_name": _phase_name_var.get(),
-                        "invocation_id": invocation_id,
-                        "runtime_name": runtime_name,
-                        "attempt": attempt,
-                        "liveness_timeout_seconds": effective_timeout,
-                    },
-                )
-                self._record_invocation_started(
-                    invocation_id,
-                    runtime=target_runtime,
-                    actor_name=actor_name,
-                    timeout_seconds=effective_timeout,
-                )
                 if attempt > 0:
                     await asyncio.sleep(RESOLVE_RETRY_BACKOFF * attempt)
                     logger.info(
                         "Retrying %s (attempt %d/%d) after stall",
                         actor_name, attempt + 1, RESOLVE_MAX_RETRIES + 1,
                     )
-                    await self.feature_store.log_event(
-                        feature.id, "agent_start", actor.name,
-                        content=f"retry {attempt} after stall",
-                        metadata={
-                            "phase_name": _phase_name_var.get(),
-                            "invocation_id": invocation_id,
-                            "runtime_name": runtime_name,
-                            "attempt": attempt,
-                            "retry_reason": "stall",
-                        },
-                    )
-
-                tracker = _LivenessTracker(
-                    None,
-                    activity_callback=lambda: self._record_invocation_activity(invocation_id),
-                )
-                try:
-                    result = await self._resolve_with_watchdog(
-                        task,
-                        tracker,
-                        target_runtime,
-                        invocation_id=invocation_id,
-                        runtime_kwargs=runtime_call_kwargs,
-                        actor_name=actor_name,
-                        liveness_timeout=effective_timeout,
-                    )
+                invocation_id = uuid4().hex
+                async with self._agent_concurrency_slot(
+                    actor_name=actor_name,
+                    feature_id=feature.id,
+                    phase_name=_phase_name_var.get(),
+                ):
                     await self.feature_store.log_event(
                         feature.id,
-                        "agent_done",
+                        "agent_invocation_start",
                         actor.name,
                         content=runtime_name,
                         metadata={
@@ -534,22 +503,68 @@ class TrackedWorkflowRunner(DefaultWorkflowRunner):
                             "invocation_id": invocation_id,
                             "runtime_name": runtime_name,
                             "attempt": attempt,
+                            "liveness_timeout_seconds": effective_timeout,
                         },
                     )
-                    return result
-                except AgentStalled as exc:
-                    last_err = exc
-                    logger.warning(
-                        "%s stalled after %ds of inactivity (attempt %d/%d)",
-                        actor_name, effective_timeout,
-                        attempt + 1, RESOLVE_MAX_RETRIES + 1,
+                    self._record_invocation_started(
+                        invocation_id,
+                        runtime=target_runtime,
+                        actor_name=actor_name,
+                        timeout_seconds=effective_timeout,
                     )
-                    await self.feature_store.log_event(
-                        feature.id, "agent_stalled", actor.name,
-                        content=f"no output for {effective_timeout}s",
+                    if attempt > 0:
+                        await self.feature_store.log_event(
+                            feature.id, "agent_start", actor.name,
+                            content=f"retry {attempt} after stall",
+                            metadata={
+                                "phase_name": _phase_name_var.get(),
+                                "invocation_id": invocation_id,
+                                "runtime_name": runtime_name,
+                                "attempt": attempt,
+                                "retry_reason": "stall",
+                            },
+                        )
+
+                    tracker = _LivenessTracker(
+                        None,
+                        activity_callback=lambda: self._record_invocation_activity(invocation_id),
                     )
-                finally:
-                    self._record_invocation_finished(invocation_id)
+                    try:
+                        result = await self._resolve_with_watchdog(
+                            task,
+                            tracker,
+                            target_runtime,
+                            invocation_id=invocation_id,
+                            runtime_kwargs=runtime_call_kwargs,
+                            actor_name=actor_name,
+                            liveness_timeout=effective_timeout,
+                        )
+                        await self.feature_store.log_event(
+                            feature.id,
+                            "agent_done",
+                            actor.name,
+                            content=runtime_name,
+                            metadata={
+                                "phase_name": _phase_name_var.get(),
+                                "invocation_id": invocation_id,
+                                "runtime_name": runtime_name,
+                                "attempt": attempt,
+                            },
+                        )
+                        return result
+                    except AgentStalled as exc:
+                        last_err = exc
+                        logger.warning(
+                            "%s stalled after %ds of inactivity (attempt %d/%d)",
+                            actor_name, effective_timeout,
+                            attempt + 1, RESOLVE_MAX_RETRIES + 1,
+                        )
+                        await self.feature_store.log_event(
+                            feature.id, "agent_stalled", actor.name,
+                            content=f"no output for {effective_timeout}s",
+                        )
+                    finally:
+                        self._record_invocation_finished(invocation_id)
 
             # All retries exhausted
             raise RuntimeError(
@@ -571,6 +586,24 @@ class TrackedWorkflowRunner(DefaultWorkflowRunner):
         finally:
             # Clear the per-coroutine workspace override
             _workspace_override_var.set(None)
+
+    @contextlib.asynccontextmanager
+    async def _agent_concurrency_slot(
+        self,
+        *,
+        actor_name: str,
+        feature_id: str,
+        phase_name: str,
+    ):
+        if self.agent_concurrency_limiter is None:
+            yield
+            return
+        async with self.agent_concurrency_limiter.acquire(
+            actor_name=actor_name,
+            feature_id=feature_id,
+            phase_name=phase_name,
+        ):
+            yield
 
     def _coerce_resolve_call(
         self,
