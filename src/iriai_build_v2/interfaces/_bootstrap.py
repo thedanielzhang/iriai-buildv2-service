@@ -321,3 +321,84 @@ def build_state(
     if workflow_name == "bugfix-v2":
         return BugFixV2State()
     return BuildState()
+
+
+async def maybe_assert_adopted_or_legacy_for_resume(
+    *,
+    feature: Feature,
+    artifacts: PostgresArtifactStore,
+    is_resume: bool,
+) -> Any | None:
+    """Slice 12e -- consult the resume guard at the CLI/Slack workflow seam.
+
+    Per doc 11 § "PR 11.13" + doc 12 § "In-Flight Cutover Policy" line 73-78:
+    the resume guard
+    :func:`iriai_build_v2.execution_control.adoption.assert_feature_adopted_or_legacy`
+    is the SINGLE arbiter of whether an in-flight feature may enter the typed
+    control-plane resume path. The guard:
+
+    * pass-through when ``IRIAI_EXEC_CONTROL_PLANE_ENABLED`` is UNSET or
+      DISABLED (the env flag from Slice 12c is the global product switch;
+      legacy mode is bit-exact identical to pre-12e behavior).
+    * pass-through when ``is_resume=False`` (a fresh feature has nothing to
+      adopt; no marker is required).
+    * under ``ENABLED`` + ``is_resume=True``: require an explicit adoption
+      marker. If absent, the guard raises
+      :class:`~iriai_build_v2.execution_control.adoption.ControlPlaneAdoptionError`
+      and the workflow MUST NOT enter the control-plane resume path. The
+      caller (CLI ``_run`` / Slack ``_resume_workflow``) propagates the
+      error to the operator -- NO silent fallback to legacy per doc 12.
+
+    The ``is_resume`` flag is supplied EXPLICITLY by the caller -- the CLI
+    today always creates a fresh feature in ``_run`` (so callers pass
+    ``is_resume=False``); the Slack ``_resume_workflow`` is the actual
+    resume seam (so it passes ``is_resume=True``). This keeps the existing
+    fresh-vs-resume distinction at each entrypoint and avoids new state
+    machinery per the Slice-12e brief's hard rule.
+
+    Returns:
+        ``None`` when the guard is a pass-through (env flag UNSET/DISABLED,
+        or ``is_resume=False``); the :class:`~iriai_build_v2.
+        execution_control.atomic_landing.InFlightAdoptionRecord` when the
+        flag is ENABLED and the marker is present.
+
+    Raises:
+        ControlPlaneAdoptionError: when the env flag is ENABLED and
+            ``is_resume=True`` but no adoption marker exists for ``feature``.
+        AdoptionMarkerCorruptError: when the marker exists but cannot be
+            parsed.
+        ControlPlaneEnvFlagError: when the env flag value is malformed
+            (propagated from the Slice-12c env-flag reader).
+    """
+
+    from ..execution_control.adoption import assert_feature_adopted_or_legacy
+    from ..execution_control.startup import (
+        EnvFlagState,
+        read_control_plane_env_flag,
+    )
+
+    # Slice 12c env-flag short-circuit. We re-read here (not consume a
+    # caller-supplied state) so the guard reflects the LIVE env at the
+    # workflow seam -- the CLI's process-startup read can race a long-lived
+    # Slack bridge whose env was set on launch but whose features resume
+    # later. The guard's own internal env read (in
+    # `assert_feature_adopted_or_legacy`) is redundant under is_resume=True,
+    # but we keep this explicit double-check so the "fresh start under
+    # ENABLED skips the adoption check" contract is plain at the call site.
+    flag_state = read_control_plane_env_flag()
+    if flag_state is not EnvFlagState.ENABLED:
+        # Legacy mode (UNSET / DISABLED). NO automatic migration per doc 12.
+        return None
+
+    if not is_resume:
+        # Fresh feature -- nothing to adopt. The adoption marker is only
+        # required at the in-flight RESUME boundary (doc 12 line 73-74:
+        # "Resume sees the adoption marker, verifies it ... and only then
+        # enters the control-plane resume path"). A freshly-created feature
+        # is implicitly under the new control plane already.
+        return None
+
+    return await assert_feature_adopted_or_legacy(
+        feature=feature,
+        artifact_store=artifacts,
+    )

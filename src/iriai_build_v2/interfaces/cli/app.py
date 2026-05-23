@@ -31,6 +31,11 @@ async def _run(
 ) -> None:
     from iriai_compose.runtimes import AutoApproveRuntime
 
+    from ...execution_control.startup import (
+        EnvFlagState,
+        assert_control_plane_ready_for_workflow_launch,
+        read_control_plane_env_flag,
+    )
     from ...stream import print_stream
     from .interaction import ThreadAwareTerminalInteractionRuntime
     from .._bootstrap import (
@@ -38,6 +43,7 @@ async def _run(
         build_runner,
         build_state,
         create_feature,
+        maybe_assert_adopted_or_legacy_for_resume,
         select_workflow,
         teardown,
     )
@@ -46,6 +52,24 @@ async def _run(
     env = await bootstrap(workspace_path)
 
     try:
+        # Slice 12c — IRIAI_EXEC_CONTROL_PLANE_ENABLED env-flag + startup
+        # guard. The env flag is the SINGLE product-authoritative switch for
+        # the typed execution control plane per doc 12 § "Atomic Landing
+        # Contract". When the flag is unset/disabled the CLI continues with
+        # the legacy executor (preserves backward compatibility during the
+        # rollout). When enabled, the Slice-10f assert_control_plane_ready
+        # fires BEFORE any workflow runs; missing dependencies / mismatched
+        # deploy artifact / missing migrations / forbidden partial controls
+        # raise ControlPlaneStartupError (NOT silent fallback to legacy).
+        # Malformed env values raise ControlPlaneEnvFlagError from
+        # read_control_plane_env_flag (fail closed; never silently default).
+        flag_state = read_control_plane_env_flag()
+        if flag_state is EnvFlagState.ENABLED:
+            await assert_control_plane_ready_for_workflow_launch(
+                pool=env.pool,
+                require_enabled=True,
+            )
+
         # Runtimes
         if auto:
             interaction_runtime = AutoApproveRuntime()
@@ -61,6 +85,24 @@ async def _run(
 
         # Feature
         feature = await create_feature(env.feature_store, name, workflow_name)
+
+        # Slice 12e -- PR 11.13 final atomic landing: consult the Slice-12d
+        # resume guard at the workflow seam. The CLI today always CREATES a
+        # fresh feature in `_run` (no CLI resume path exists -- the only
+        # production resume seam is Slack's `_resume_workflow` at
+        # `interfaces/slack/orchestrator.py:925`), so `is_resume=False` is
+        # the existing distinction. Under `IRIAI_EXEC_CONTROL_PLANE_ENABLED=
+        # ENABLED` a fresh feature is implicitly under the new control plane
+        # -- the adoption marker is only required at the in-flight RESUME
+        # boundary per doc 12 § "In-Flight Cutover Policy" lines 73-78.
+        # The helper centralizes the env-flag short-circuit + the
+        # fresh-vs-resume distinction so the CLI and Slack seams stay in
+        # lockstep.
+        await maybe_assert_adopted_or_legacy_for_resume(
+            feature=feature,
+            artifacts=env.artifacts,
+            is_resume=False,
+        )
 
         # Workflow + state
         workflow = select_workflow(workflow_name)

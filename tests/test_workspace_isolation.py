@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import shutil
 from pathlib import Path
 from types import SimpleNamespace
@@ -9,7 +10,13 @@ import pytest
 from iriai_build_v2.models.outputs import ImplementationTask, RepoSpec, TaskFileScope
 from iriai_build_v2.models.outputs import ScopeOutput
 from iriai_build_v2.services.workspace import DirectoryMap, RepoEntry, WorkspaceManager
-from iriai_build_v2.workflows.develop.phases.implementation import _ensure_task_worktrees, _remove_repo_path
+from iriai_build_v2.workflows.develop.phases.implementation import (
+    WorktreeRegistry,
+    _discover_repo_roots_under,
+    _ensure_task_worktrees,
+    _remove_repo_path,
+    _workflow_repos_root_guard_problems,
+)
 
 
 @pytest.mark.asyncio
@@ -92,6 +99,214 @@ async def test_ensure_task_worktrees_clones_read_only_repo_instead_of_symlink(
     assert not dest.is_symlink()
     assert any(args[0] == "clone" for _cwd, args in calls)
     assert all("branch" not in args for _cwd, args in calls)
+
+
+@pytest.mark.asyncio
+async def test_ensure_task_worktrees_rejects_symlinked_source_repo_before_clone(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    workspace_root = tmp_path / "workspace"
+    workspace_root.mkdir()
+    outside_root = tmp_path / "outside-root"
+    outside_repo = outside_root / "app"
+    (outside_repo / ".git").mkdir(parents=True)
+    (workspace_root / "link").symlink_to(outside_root, target_is_directory=True)
+
+    git_calls: list[tuple[Path, tuple[str, ...]]] = []
+    scaffold_calls: list[Path] = []
+
+    async def _unexpected_run_git(cwd: Path, *args: str) -> str:
+        git_calls.append((cwd, args))
+        raise AssertionError(f"must not clone symlinked source repo: {cwd} {args}")
+
+    async def _unexpected_scaffold_repo(path: Path) -> None:
+        scaffold_calls.append(path)
+        raise AssertionError(f"must not scaffold from symlinked source repo: {path}")
+
+    monkeypatch.setattr(
+        "iriai_build_v2.workflows.develop.phases.implementation._run_git",
+        _unexpected_run_git,
+    )
+    monkeypatch.setattr(
+        "iriai_build_v2.workflows.develop.phases.implementation._scaffold_repo",
+        _unexpected_scaffold_repo,
+    )
+
+    task = ImplementationTask(
+        id="task-source-symlink",
+        name="Reject symlinked source",
+        description="Do not trust source repos behind workspace symlinks.",
+        repo_path="link/app",
+        file_scope=[TaskFileScope(path="link/app/README.md", action="modify")],
+    )
+    runner = SimpleNamespace(services={"workspace_manager": SimpleNamespace(_base=workspace_root)})
+    feature = SimpleNamespace(slug="feat")
+
+    with pytest.raises(RuntimeError, match="source repo.*symlink ancestor"):
+        await _ensure_task_worktrees(runner, feature, [task])
+
+    assert git_calls == []
+    assert scaffold_calls == []
+    assert (outside_repo / ".git").exists()
+    assert not (
+        workspace_root / ".iriai" / "features" / "feat" / "repos" / "link" / "app"
+    ).exists()
+
+
+@pytest.mark.asyncio
+async def test_ensure_task_worktrees_rejects_symlink_ancestor_before_delete(
+    tmp_path: Path,
+):
+    workspace_root = tmp_path / "workspace"
+    source_repo = workspace_root / "link" / "app"
+    (source_repo / ".git").mkdir(parents=True)
+    feature_root = workspace_root / ".iriai" / "features" / "feat" / "repos"
+    feature_root.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    (outside / "app" / ".git").mkdir(parents=True)
+    (feature_root / "link").symlink_to(outside, target_is_directory=True)
+
+    task = ImplementationTask(
+        id="task-symlink",
+        name="Reject symlink ancestor",
+        description="Reject symlink ancestor",
+        repo_path="link/app",
+        file_scope=[TaskFileScope(path="link/app/README.md", action="modify")],
+    )
+    runner = SimpleNamespace(services={"workspace_manager": SimpleNamespace(_base=workspace_root)})
+    feature = SimpleNamespace(slug="feat")
+
+    with pytest.raises(RuntimeError, match="symlink ancestor"):
+        await _ensure_task_worktrees(runner, feature, [task])
+
+    assert (outside / "app" / ".git").exists()
+
+
+@pytest.mark.asyncio
+async def test_ensure_task_worktrees_rejects_symlink_repos_root_before_clone(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    workspace_root = tmp_path / "workspace"
+    source_repo = workspace_root / "app"
+    (source_repo / ".git").mkdir(parents=True)
+    feature_parent = workspace_root / ".iriai" / "features" / "feat"
+    feature_parent.mkdir(parents=True)
+    outside = tmp_path / "outside-repos"
+    outside.mkdir()
+    (feature_parent / "repos").symlink_to(outside, target_is_directory=True)
+
+    async def _unexpected_run_git(cwd: Path, *args: str) -> str:
+        raise AssertionError(f"must not clone through symlinked repos root: {cwd} {args}")
+
+    async def _unexpected_scaffold_repo(path: Path) -> None:
+        raise AssertionError(f"must not scaffold through symlinked repos root: {path}")
+
+    monkeypatch.setattr(
+        "iriai_build_v2.workflows.develop.phases.implementation._run_git",
+        _unexpected_run_git,
+    )
+    monkeypatch.setattr(
+        "iriai_build_v2.workflows.develop.phases.implementation._scaffold_repo",
+        _unexpected_scaffold_repo,
+    )
+
+    task = ImplementationTask(
+        id="task-root-symlink",
+        name="Reject root symlink",
+        description="Reject symlinked feature repos root.",
+        repo_path="app",
+        file_scope=[TaskFileScope(path="app/README.md", action="modify")],
+    )
+    runner = SimpleNamespace(services={"workspace_manager": SimpleNamespace(_base=workspace_root)})
+    feature = SimpleNamespace(slug="feat")
+
+    with pytest.raises(RuntimeError, match="symlink.*repos root|repos root.*symlink"):
+        await _ensure_task_worktrees(runner, feature, [task])
+
+    assert not (outside / "app").exists()
+
+
+def test_workflow_repo_guard_rejects_symlinked_feature_ancestor_before_discovery(
+    tmp_path: Path,
+):
+    workspace_root = tmp_path / "workspace"
+    feature_parent = workspace_root / ".iriai" / "features"
+    feature_parent.mkdir(parents=True)
+    outside_feature = tmp_path / "outside-feature"
+    outside_repo = outside_feature / "repos" / "app"
+    (outside_repo / ".git").mkdir(parents=True)
+    (feature_parent / "feat").symlink_to(outside_feature, target_is_directory=True)
+    repos_root = feature_parent / "feat" / "repos"
+
+    problems = _workflow_repos_root_guard_problems(repos_root)
+
+    assert problems
+    assert problems[0]["reason"] == "workflow_repos_root_symlink_ancestor"
+    assert str(feature_parent / "feat") == problems[0]["path"]
+    assert _discover_repo_roots_under(repos_root) == []
+
+
+@pytest.mark.asyncio
+async def test_ensure_task_worktrees_writes_registry_preflight(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    workspace_root = tmp_path / "workspace"
+    source_repo = workspace_root / "app"
+    (source_repo / ".git").mkdir(parents=True)
+
+    async def _fake_run_git(cwd: Path, *args: str) -> str:
+        if args and args[0] == "clone":
+            dest = Path(args[-1])
+            dest.mkdir(parents=True, exist_ok=True)
+            (dest / ".git").mkdir(exist_ok=True)
+        return ""
+
+    monkeypatch.setattr(
+        "iriai_build_v2.workflows.develop.phases.implementation._run_git",
+        _fake_run_git,
+    )
+
+    class _Artifacts:
+        def __init__(self) -> None:
+            self.store: dict[str, str] = {}
+
+        async def put(self, key: str, value: str, *, feature):
+            del feature
+            self.store[key] = value
+
+    task = ImplementationTask(
+        id="task-registry",
+        name="Modify app",
+        description="Touch app code.",
+        repo_path="app/src",
+        file_scope=[TaskFileScope(path="app/src/main.py", action="modify")],
+    )
+
+    artifacts = _Artifacts()
+    runner = SimpleNamespace(
+        artifacts=artifacts,
+        services={"workspace_manager": SimpleNamespace(_base=workspace_root)},
+    )
+    feature = SimpleNamespace(id="feat-id", slug="feat")
+
+    await _ensure_task_worktrees(runner, feature, [task], group_idx=45)
+
+    registry = WorktreeRegistry.model_validate_json(
+        artifacts.store["worktree-registry:g45"]
+    )
+    assert registry.complete is True
+    assert registry.repos[0].repo_path == "app"
+    assert registry.repos[0].action == "extend"
+    assert registry.repos[0].task_ids == ["task-registry"]
+    assert registry.repos[0].nested_requests == ["app/src"]
+    assert registry.repos[0].preflight_status == "cloned"
+
+    authority_registry = json.loads(artifacts.store["workspace-authority-registry:g45"])
+    assert authority_registry["authoritative_mode"] == "compatibility_projection"
+    assert authority_registry["registry"]["repos"][0]["workspace_relative_path"] == "app"
 
 
 @pytest.mark.asyncio

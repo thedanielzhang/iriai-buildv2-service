@@ -11,6 +11,10 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Protocol
 
+from ..execution_control.store import (
+    ExecutionControlStore,
+    fetch_control_plane_snapshot,
+)
 from .models import (
     ArtifactRecord,
     BridgeProbe,
@@ -21,9 +25,11 @@ from .models import (
     SupervisorObservation,
     WorktreeProbe,
 )
+from .stale_codex import detect_stale_codex_invocations
 
 KEY_PREFIXES = (
     "dag-verify:",
+    "dag-verify-graph:",
     "dag-repair-preflight:",
     "dag-authority-gate:",
     "dag-direct-repair-route:",
@@ -32,16 +38,31 @@ KEY_PREFIXES = (
     "dag-verify-rca:",
     "dag-repair-dispatch:",
     "dag-fix:",
+    "dag-task-contract:",
+    "dag-contract-verdict:",
+    "dag-sandbox-patch:",
     "dag-task-reconcile:",
     "dag-task-spec-reconcile:",
     "dag-task-product-reconcile:",
     "dag-commit-failure:",
+    "dag-runtime-failure:",
     "dag-group:",
     "dag-path-canonicalization:",
+    "dag-worktree-alias-preflight:",
+    "dag-worktree-alias-canonicalization:",
+    "dag-workspace-acl-normalization:",
+    "dag-workspace-permission-repair:",
     "dag-writeability-preflight:",
+    "runtime-workspace-binding:",
+    "dag-runtime-workspace-binding:",
+    "workspace-authority-",
+    "workflow-blocker:",
     "bug-",
     "finding-ledger",
 )
+_MAX_BRIDGE_LOG_LINES = 500
+_MAX_BRIDGE_ERROR_LINES = 100
+_MAX_BRIDGE_LINE_CHARS = 1000
 _CURRENT_EVENT_TYPES = {
     "dag_task_dispatch",
     "dag_task_start",
@@ -53,13 +74,49 @@ _CURRENT_EVENT_TYPES = {
     "dag_verify_start",
     "dag_verify_finish",
     "dag_commit_failed",
+    "control_plane_runtime_failure",
 }
+
+
+def _bool_metadata(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def _optional_bool_metadata(value: Any) -> bool | None:
+    if value is None:
+        return None
+    return _bool_metadata(value)
+
+
+def _runtime_failure_typed_bool(
+    route_decision: Any,
+    key: str,
+    fallback: Any,
+) -> bool | None:
+    if isinstance(route_decision, dict) and route_decision.get(key) is not None:
+        return _bool_metadata(route_decision.get(key))
+    return _optional_bool_metadata(fallback)
 
 
 class FeatureStoreReader(Protocol):
     async def get_feature(self, feature_id: str) -> Any | None: ...
 
     async def get_events(self, feature_id: str) -> list[dict[str, Any]]: ...
+
+    async def list_event_summaries(
+        self,
+        feature_id: str,
+        *,
+        after_id: int = 0,
+        limit: int = 50,
+        order: str = "asc",
+        group_idx: int | None = None,
+        preview_chars: int = 700,
+    ) -> list[dict[str, Any]]: ...
 
 
 class ArtifactStoreReader(Protocol):
@@ -100,18 +157,40 @@ async def collect_evidence(
     feature_snapshot = _feature_snapshot(feature, feature_id)
     event_start_cursor = cursor if event_cursor is None else event_cursor
     artifact_start_cursor = cursor if artifact_cursor is None else artifact_cursor
-    all_events = await _load_all_events(feature_store, feature_id)
-    events = [
-        record
-        for record in all_events
-        if (record.id or 0) > event_start_cursor
-    ]
+    base_events = await _load_all_events(feature_store, feature_id)
     artifacts = await _load_artifacts(
         artifact_store,
         feature,
         feature_id,
         artifact_start_cursor,
     )
+    control_plane_events = await _load_control_plane_failure_events(
+        artifact_store,
+        feature_id,
+    )
+    control_plane_snapshot = await _load_control_plane_snapshot(
+        artifact_store,
+        feature_id,
+    )
+    # Slice 10e — doc-10 § "Refactoring Steps" step 4: read the typed snapshot
+    # FIRST. The typed `ControlPlaneSnapshot` populates `control_plane`;
+    # `evidence_mode` follows its `source`. When the typed read is unavailable
+    # (no pool / a store error) `typed_control_plane` is `None` and
+    # `evidence_mode` is `legacy_fallback` (NOT `typed`) — fail-safe, the
+    # classifier stays on the legacy artifact path.
+    typed_control_plane = await load_typed_control_plane_snapshot(
+        artifact_store,
+        feature_id,
+    )
+    evidence_mode = evidence_mode_for_snapshot(typed_control_plane)
+    all_events = _sort_events_by_recency([*base_events, *control_plane_events])
+    events = [
+        record
+        for record in base_events
+        if (record.id or 0) > event_start_cursor
+    ]
+    events.extend(control_plane_events)
+    events = _sort_events_by_recency(events)
     bridge = None
     if dashboard_url or dashboard_client:
         bridge = await probe_bridge(
@@ -125,12 +204,18 @@ async def collect_evidence(
         bridge=bridge,
         phase=feature_snapshot.phase,
     )
+    stale_codex_invocations = detect_stale_codex_invocations(
+        feature_id=feature_id,
+        bridge=bridge,
+        events=all_events,
+        current=current,
+    )
     worktrees = [
         probe_worktree(Path(root), forbidden_paths=forbidden_paths or [])
         for root in (worktree_roots or [])
     ]
     next_event_cursor = max(
-        [event_start_cursor] + [event.id or event_start_cursor for event in events]
+        [event_start_cursor] + [event.id or event_start_cursor for event in base_events]
     )
     next_artifact_cursor = max(
         [artifact_start_cursor] + [artifact.id or artifact_start_cursor for artifact in artifacts]
@@ -151,8 +236,20 @@ async def collect_evidence(
         artifacts=artifacts,
         bridge=bridge,
         current=current,
+        control_plane_snapshot=control_plane_snapshot,
+        control_plane=typed_control_plane,
+        evidence_mode=evidence_mode,
         worktrees=worktrees,
-        query_labels=["feature", "events", "artifacts", "bridge", "worktrees"],
+        stale_codex_invocations=stale_codex_invocations,
+        query_labels=[
+            "feature",
+            "events",
+            "artifacts",
+            "control_plane",
+            "control_plane_typed",
+            "bridge",
+            "worktrees",
+        ],
     )
 
 
@@ -171,7 +268,19 @@ async def probe_bridge(
         status = await client.get_json("/api/bridge/status")
         logs = await client.get_json("/api/bridge/logs", {"after": after})
         lines = [str(line) for line in logs.get("lines", [])]
+        if after:
+            try:
+                tail_logs = await client.get_json("/api/bridge/logs")
+                lines = _dedupe_strings(
+                    [*[str(line) for line in tail_logs.get("lines", [])], *lines]
+                )
+            except Exception:
+                pass
         errors = [line for line in lines if _bridge_log_is_error(line)]
+        truncated_line_count = max(0, len(lines) - _MAX_BRIDGE_LOG_LINES)
+        truncated_error_count = max(0, len(errors) - _MAX_BRIDGE_ERROR_LINES)
+        lines = [_shorten_log_line(line) for line in lines[-_MAX_BRIDGE_LOG_LINES:]]
+        errors = [_shorten_log_line(line) for line in errors[-_MAX_BRIDGE_ERROR_LINES:]]
         return probe.model_copy(
             update={
                 "ok": True,
@@ -179,6 +288,8 @@ async def probe_bridge(
                 "log_cursor": int(logs.get("cursor", after) or 0),
                 "log_lines": lines,
                 "errors": errors,
+                "truncated_log_line_count": truncated_line_count,
+                "truncated_error_count": truncated_error_count,
             }
         )
     except Exception as exc:
@@ -252,9 +363,22 @@ async def _load_all_events(
     feature_store: FeatureStoreReader,
     feature_id: str,
 ) -> list[EventRecord]:
-    rows = await feature_store.get_events(feature_id)
-    records = [_event_record(row) for row in rows]
-    return sorted(records, key=lambda record: record.id or 0)
+    if hasattr(feature_store, "list_event_summaries"):
+        rows = await feature_store.list_event_summaries(
+            feature_id,
+            after_id=0,
+            limit=500,
+            order="desc",
+            preview_chars=700,
+        )
+        records = [_event_record(row) for row in rows]
+        return sorted(records, key=lambda record: record.id or 0)
+    get_events = getattr(feature_store, "get_events", None)
+    if callable(get_events):
+        rows = await get_events(feature_id)
+        records = [_event_record(row) for row in rows]
+        return _sort_events_by_recency(records)[-500:]
+    return []
 
 
 async def _load_artifacts(
@@ -263,8 +387,8 @@ async def _load_artifacts(
     feature_id: str,
     cursor: int,
 ) -> list[ArtifactRecord]:
-    if hasattr(artifact_store, "list_records"):
-        rows = await _list_artifact_records(
+    if hasattr(artifact_store, "list_record_summaries"):
+        rows = await _list_artifact_record_summaries(
             artifact_store,
             feature_id=feature_id,
             prefixes=KEY_PREFIXES,
@@ -275,7 +399,7 @@ async def _load_artifacts(
         latest_rows: list[dict[str, Any]] = []
         for prefix in KEY_PREFIXES:
             latest_rows.extend(
-                await _list_artifact_records(
+                await _list_artifact_record_summaries(
                     artifact_store,
                     feature_id=feature_id,
                     prefixes=(prefix,),
@@ -290,24 +414,29 @@ async def _load_artifacts(
             ),
             key=lambda item: item.id or 0,
         )
-    if hasattr(artifact_store, "list_artifacts"):
-        rows = await artifact_store.list_artifacts(feature_id, prefixes=KEY_PREFIXES, after_id=cursor)
-        return sorted(_artifact_records(rows), key=lambda item: item.id or 0)
     pool = getattr(artifact_store, "_pool", None)
     if pool is not None:
-        clauses = " OR ".join(f"key LIKE ${idx + 3}" for idx, _prefix in enumerate(KEY_PREFIXES))
+        limit = 500
+        clauses = " OR ".join(f"key LIKE ${idx + 4}" for idx, _prefix in enumerate(KEY_PREFIXES))
         rows = await pool.fetch(
             f"""
-            SELECT id, key, created_at, value
+            SELECT id, key, created_at,
+                   pg_column_size(value)::bigint AS stored_bytes,
+                   substring(value from 1 for 2000) AS value_preview,
+                   TRUE AS summary_only
             FROM artifacts
             WHERE feature_id = $1 AND id > $2 AND ({clauses})
             ORDER BY id
+            LIMIT $3
             """,
             feature_id,
             cursor,
+            limit,
             *[f"{prefix}%" for prefix in KEY_PREFIXES],
         )
         return [_artifact_record(dict(row)) for row in rows]
+    if hasattr(artifact_store, "list_records"):
+        return [_legacy_artifact_projection_unsupported_record(feature_id)]
     if feature is None or not hasattr(artifact_store, "get_record"):
         return []
     records: list[ArtifactRecord] = []
@@ -320,6 +449,355 @@ async def _load_artifacts(
         if (record.id or 0) > cursor:
             records.append(record)
     return sorted(records, key=lambda item: item.id or 0)
+
+
+def _legacy_artifact_projection_unsupported_record(feature_id: str) -> ArtifactRecord:
+    payload = {
+        "failure_class": "artifact_evidence",
+        "failure_type": "legacy_artifact_projection_unbounded",
+        "route": "workflow_unblock",
+        "deterministic_workflow_blocker": True,
+        "summary": (
+            "Artifact store exposes list_records without bounded summaries; "
+            "broad legacy blocker projections cannot be read safely."
+        ),
+        "feature_id": feature_id,
+    }
+    preview = json.dumps(payload, sort_keys=True)
+    return ArtifactRecord(
+        id=None,
+        key="workflow-blocker:artifact-evidence-unsupported",
+        value="",
+        sha256=hashlib.sha256(preview.encode("utf-8")).hexdigest(),
+        value_preview=preview,
+        summary_only=True,
+    )
+
+
+async def _load_control_plane_failure_events(
+    artifact_store: Any,
+    feature_id: str,
+    *,
+    limit: int = 40,
+) -> list[EventRecord]:
+    loader = getattr(artifact_store, "list_control_plane_failure_summaries", None)
+    if callable(loader):
+        try:
+            rows = await loader(feature_id=feature_id, limit=limit)
+        except Exception:
+            return []
+    else:
+        pool = getattr(artifact_store, "_pool", None)
+        if pool is None:
+            return []
+        query = (
+            "SELECT id, attempt_id, group_idx, stage, name, status, "
+            "deterministic, source_ref, substring(summary from 1 for 500) AS summary, "
+            "char_length(summary) AS summary_length, "
+            "octet_length(summary) AS summary_bytes, created_at, "
+            "payload->'route_decision' AS route_decision, "
+            "payload->'retry_budget' AS retry_budget, "
+            "payload->'affected_product_files' AS affected_product_files, "
+            "payload->'canonical_product_files' AS canonical_product_files, "
+            "payload->'concerns' AS concerns, "
+            "payload->'issues' AS issues, "
+            "payload->'product_defect' AS product_defect, "
+            "payload->'product_evidence' AS product_evidence, "
+            "payload->'product_files' AS product_files, "
+            "payload->'product_paths' AS product_paths, "
+            "payload->'semantic_product_failure' AS semantic_product_failure, "
+            "payload->'test_failures' AS test_failures, "
+            "payload->>'failure_class' AS failure_class, "
+            "payload->>'failure_type' AS failure_type, "
+            "payload->>'route' AS route, "
+            "(payload->>'operator_required')::boolean AS operator_required, "
+            "(payload->>'retryable')::boolean AS retryable "
+            "FROM evidence_nodes WHERE feature_id = $1 "
+            "AND kind = 'runtime_failure_context' "
+            "ORDER BY id DESC LIMIT $2"
+        )
+        acquire = getattr(pool, "acquire", None)
+        try:
+            if callable(acquire):
+                async with acquire() as conn:
+                    rows = await conn.fetch(
+                        query,
+                        feature_id,
+                        limit,
+                    )
+            else:
+                fetch = getattr(pool, "fetch", None)
+                if not callable(fetch):
+                    return []
+                rows = await fetch(
+                    query,
+                    feature_id,
+                    limit,
+                )
+        except Exception:
+            return []
+    events: list[EventRecord] = []
+    for row in rows:
+        def get(key: str, default: Any = None) -> Any:
+            if isinstance(row, dict):
+                return row.get(key, default)
+            try:
+                return row[key]
+            except (KeyError, IndexError, TypeError):
+                return default
+
+        raw_payload = get("payload", {}) or {}
+        if isinstance(raw_payload, str):
+            try:
+                payload = json.loads(raw_payload)
+            except Exception:
+                payload = {}
+        elif isinstance(raw_payload, dict):
+            payload = dict(raw_payload)
+        else:
+            payload = {}
+        for key in (
+            "route_decision",
+            "retry_budget",
+            "affected_product_files",
+            "canonical_product_files",
+            "concerns",
+            "issues",
+            "product_defect",
+            "product_evidence",
+            "product_files",
+            "product_paths",
+            "semantic_product_failure",
+            "test_failures",
+        ):
+            value = get(key)
+            if value is not None:
+                payload[key] = _decode_jsonish_metadata_value(value)
+        row_id = get("id")
+        name = str(get("name") or "")
+        summary = str(get("summary") or "")
+        summary_length = int(get("summary_length", len(summary)) or len(summary))
+        summary_bytes = int(
+            get("summary_bytes", len(summary.encode("utf-8")))
+            or len(summary.encode("utf-8"))
+        )
+        route_decision = payload.get("route_decision")
+        retry_budget = payload.get("retry_budget")
+        deterministic = _runtime_failure_typed_bool(
+            route_decision,
+            "deterministic",
+            get("deterministic", payload.get("deterministic")),
+        )
+        operator_required = _runtime_failure_typed_bool(
+            route_decision,
+            "operator_required",
+            get("operator_required", payload.get("operator_required")),
+        )
+        retryable = _runtime_failure_typed_bool(
+            route_decision,
+            "retryable",
+            get("retryable", payload.get("retryable")),
+        )
+        metadata = {
+            "evidence_node_id": int(row_id) if row_id is not None else None,
+            "group_idx": get("group_idx"),
+            "attempt_id": get("attempt_id"),
+            "failure_class": get("failure_class") or payload.get("failure_class"),
+            "failure_type": get("failure_type") or payload.get("failure_type"),
+            "route": get("route") or payload.get("route"),
+            "status": get("status") or payload.get("status"),
+            "deterministic": deterministic,
+            "operator_required": operator_required,
+            "retryable": retryable,
+            "summary_length": summary_length,
+            "summary_bytes": summary_bytes,
+            "summary_truncated": summary_length > len(summary),
+        }
+        if isinstance(route_decision, dict):
+            metadata["route_decision"] = route_decision
+        if isinstance(retry_budget, dict):
+            metadata["retry_budget"] = retry_budget
+        for key in (
+            "affected_product_files",
+            "canonical_product_files",
+            "concerns",
+            "issues",
+            "product_defect",
+            "product_evidence",
+            "product_files",
+            "product_paths",
+            "semantic_product_failure",
+            "test_failures",
+        ):
+            if key in payload:
+                metadata[key] = payload[key]
+        events.append(
+            EventRecord(
+                id=None,
+                event_type="control_plane_runtime_failure",
+                source="execution_control",
+                content=f"{name}: {summary}".strip(": "),
+                metadata=metadata,
+                created_at=get("created_at"),
+            )
+        )
+    return events
+
+
+def _decode_jsonish_metadata_value(value: Any) -> Any:
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped.startswith(("{", "[")) or stripped in {"true", "false", "null"}:
+            try:
+                return json.loads(stripped)
+            except json.JSONDecodeError:
+                return value
+    return value
+
+
+async def _load_control_plane_snapshot(
+    artifact_store: Any,
+    feature_id: str,
+) -> dict[str, Any] | None:
+    pool = getattr(artifact_store, "_pool", None)
+    if pool is None:
+        return None
+    try:
+        acquire = getattr(pool, "acquire", None)
+        if callable(acquire):
+            async with acquire() as conn:
+                snapshot = await fetch_control_plane_snapshot(conn, feature_id)
+        else:
+            snapshot = await fetch_control_plane_snapshot(pool, feature_id)
+        return snapshot.model_dump(mode="json")
+    except Exception:
+        return None
+
+
+# Slice 10e — the doc-10 § "Refactoring Steps" step-4 `evidence_mode` wiring.
+#
+# `collect_evidence` / `SupervisorEvidenceMcpService.get_current_snapshot` are
+# read paths; doc 10 step 4 says: "Update `collect_evidence` and
+# `get_current_snapshot` to call the typed snapshot first. Legacy
+# artifact/event summaries are used only when typed tables are absent or the
+# typed query degrades." `load_typed_control_plane_snapshot` reads the
+# Slice-10a bounded `ExecutionControlStore.get_control_plane_snapshot` (already
+# `LIMIT cap+1` truncated, `SET LOCAL statement_timeout` bounded, feature-scoped
+# and SUMMARY-ONLY — no artifact bodies); `evidence_mode_for_snapshot` derives
+# the typed `SupervisorObservation.evidence_mode` from the snapshot's `source`.
+
+# The supervisor calls the typed snapshot read with the doc-10 "supervisor"
+# scope (doc 10 § "Proposed Interfaces/Types" — `SnapshotScope`).
+_SUPERVISOR_SNAPSHOT_SCOPE = "supervisor"
+
+
+async def load_typed_control_plane_snapshot(
+    artifact_store: Any,
+    feature_id: str,
+    *,
+    fallback_pool_source: Any | None = None,
+) -> Any | None:
+    """Return the Slice-10a bounded typed :class:`ControlPlaneSnapshot`, or None.
+
+    doc 10 § "Refactoring Steps" step 4: the supervisor evidence collection
+    reads the TYPED snapshot first. This resolves the Postgres pool off
+    ``artifact_store._pool`` (and, when absent, ``fallback_pool_source._pool``
+    — matching the legacy :func:`_load_control_plane_snapshot` /
+    ``SupervisorEvidenceMcpService._control_plane_snapshot`` resolution so the
+    typed path is never silently skipped on an asymmetric store wiring) and
+    calls the bounded Slice-10a
+    ``ExecutionControlStore.get_control_plane_snapshot`` — a feature-scoped,
+    ``LIMIT cap+1``-truncated, ``statement_timeout``-bounded, SUMMARY-ONLY read
+    (constraint: the typed read MUST stay bounded; this introduces no new
+    unbounded or artifact-body read).
+
+    FAIL-SAFE (doc 10 § "Edge Cases And Failure Handling": "Typed state
+    unavailable: supervisor returns degraded legacy summary"): returns ``None``
+    when there is no Postgres pool, or the typed read raises. The caller then
+    derives a non-``"typed"`` ``evidence_mode`` and the classifier correctly
+    falls back to the legacy artifact classifiers — fail-safe, never
+    fail-open-to-wrong-mode.
+
+    READ-ONLY contract (Slice 10c-1): ``ExecutionControlStore`` is constructed
+    here purely to call its READ method ``get_control_plane_snapshot``; no
+    writer is invoked. The supervisor evidence service holds no
+    ``ExecutionControlStore`` *slot* (that is the Slice-10c-1 mechanical
+    guarantee against an execution-authority WRITE); a transient store
+    constructed for a single bounded READ does not breach that — it is the
+    Slice-10a read path the dashboard already uses.
+    """
+
+    pool = getattr(artifact_store, "_pool", None)
+    if pool is None and fallback_pool_source is not None:
+        pool = getattr(fallback_pool_source, "_pool", None)
+    if pool is None:
+        return None
+    try:
+        from ..workflows.develop.execution.snapshots import (
+            ControlPlaneSnapshotQuery,
+        )
+
+        query = ControlPlaneSnapshotQuery(
+            feature_id=feature_id,
+            scope=_SUPERVISOR_SNAPSHOT_SCOPE,
+        )
+        store = ExecutionControlStore(pool)
+        return await store.get_control_plane_snapshot(query)
+    except Exception:
+        # Fail-safe: any typed-read failure (missing typed tables, a store
+        # error, a degenerate query plan) yields no typed snapshot, so the
+        # caller stays on the legacy path. NEVER `evidence_mode == "typed"`.
+        return None
+
+
+def evidence_mode_for_snapshot(snapshot: Any | None) -> str:
+    """Derive the typed ``SupervisorObservation.evidence_mode`` from a snapshot.
+
+    doc 10 § "Refactoring Steps" step 4 + STATUS.md: ``evidence_mode`` follows
+    the typed snapshot's ``source`` (doc 10 § "Proposed Interfaces/Types": the
+    snapshot carries ``source`` / ``degraded`` / ``degradation_reasons``):
+
+    * ``"typed"`` — the normal path: a typed snapshot whose ``source ==
+      "typed"`` and which did NOT degrade. The Slice-10c-2 typed-PRIMARY
+      classifier path goes LIVE only for this mode.
+    * ``"mixed"`` — a typed snapshot that partially degraded (doc 10 § "Edge
+      Cases": "Typed query timeout: return ``source="mixed"``, ``degraded=true``"
+      — the Slice-10a builder also flags ``degraded`` on a per-section bounded
+      timeout). The legacy artifact classifiers run as the fallback.
+    * ``"legacy_fallback"`` — no typed snapshot at all (the FAIL-SAFE: an old
+      feature with no typed rows, or a typed read that was unavailable / raised
+      — :func:`load_typed_control_plane_snapshot` returned ``None``), OR a typed
+      snapshot whose own ``source`` is ``legacy_fallback``.
+
+    The classifier (``SupervisorClassifier.classify`` / ``_Context``) treats
+    ONLY ``evidence_mode == "typed"`` as typed-primary; ``"mixed"`` /
+    ``"legacy_fallback"`` / ``""`` run the legacy artifact classifiers. So a
+    missing or degraded typed snapshot can never silently activate the
+    typed-primary path — fail-safe.
+    """
+
+    if snapshot is None:
+        return "legacy_fallback"
+    source = str(_snapshot_attr(snapshot, "source", "") or "").strip().lower()
+    degraded = bool(_snapshot_attr(snapshot, "degraded", False))
+    if source == "typed" and not degraded:
+        return "typed"
+    if source == "legacy_fallback":
+        return "legacy_fallback"
+    # A degraded typed snapshot, or any non-`typed`/non-`legacy_fallback`
+    # source, is `mixed` — typed rows present but only partially trustworthy,
+    # so the classifier uses the legacy fallback (never typed-primary).
+    return "mixed"
+
+
+def _snapshot_attr(obj: Any, name: str, default: Any = None) -> Any:
+    """Read ``name`` off a typed snapshot (Pydantic model or dict) uniformly."""
+
+    if obj is None:
+        return default
+    if isinstance(obj, dict):
+        return obj.get(name, default)
+    return getattr(obj, name, default)
 
 
 async def _list_artifact_records(
@@ -355,18 +833,75 @@ async def _list_artifact_records(
             )
 
 
+async def _list_artifact_record_summaries(
+    artifact_store: Any,
+    *,
+    feature_id: str,
+    prefixes: tuple[str, ...],
+    after_id: int,
+    limit: int,
+    order: str,
+) -> list[dict[str, Any]]:
+    if hasattr(artifact_store, "list_record_summaries"):
+        try:
+            return await artifact_store.list_record_summaries(
+                feature_id=feature_id,
+                prefixes=prefixes,
+                after_id=after_id,
+                limit=limit,
+                order=order,
+            )
+        except TypeError:
+            return await artifact_store.list_record_summaries(
+                feature_id=feature_id,
+                prefixes=prefixes,
+                after_id=after_id,
+                limit=limit,
+            )
+    pool = getattr(artifact_store, "_pool", None)
+    if pool is None:
+        return []
+    direction = "DESC" if str(order).lower() == "desc" else "ASC"
+    args: list[Any] = [feature_id, after_id, limit]
+    prefix_clause = ""
+    if prefixes:
+        prefix_clause = " AND (" + " OR ".join(
+            f"key LIKE ${idx + 4}" for idx, _prefix in enumerate(prefixes)
+        ) + ")"
+        args.extend(f"{prefix}%" for prefix in prefixes)
+    rows = await pool.fetch(
+        f"""
+        SELECT id, key, created_at,
+               pg_column_size(value)::bigint AS stored_bytes,
+               substring(value from 1 for 2000) AS value_preview,
+               TRUE AS summary_only
+        FROM artifacts
+        WHERE feature_id = $1 AND id > $2{prefix_clause}
+        ORDER BY id {direction}
+        LIMIT $3
+        """,
+        *args,
+    )
+    return [dict(row) for row in rows]
+
+
 def _candidate_keys(feature: Any) -> list[str]:
     metadata = getattr(feature, "metadata", {}) or {}
     groups = metadata.get("supervisor_groups") or metadata.get("dag_groups") or []
     retries = metadata.get("supervisor_retries") or ["initial", "retry-initial", "retry-0", "retry-1"]
+    task_ids = metadata.get("supervisor_task_ids") or metadata.get("dag_task_ids") or []
+    repo_ids = metadata.get("supervisor_repo_ids") or metadata.get("repo_ids") or ["main"]
     keys: list[str] = []
     for group in groups:
         group_text = str(group).removeprefix("g")
         keys.append(f"dag-group:{group_text}")
+        for task_id in task_ids:
+            keys.append(f"dag-task-contract:{task_id}")
         for retry in retries:
             keys.extend(
                 [
                     f"dag-verify:g{group_text}:{retry}",
+                    f"dag-verify-graph:g{group_text}:{retry}",
                     f"dag-repair-preflight:g{group_text}:{retry}",
                     f"dag-authority-gate:g{group_text}:{retry}",
                     f"dag-direct-repair-route:g{group_text}:{retry}",
@@ -378,8 +913,32 @@ def _candidate_keys(feature: Any) -> list[str]:
                     f"dag-task-spec-reconcile:g{group_text}:{retry}",
                     f"dag-task-product-reconcile:g{group_text}:{retry}",
                     f"dag-commit-failure:g{group_text}:{retry}",
+                    f"dag-runtime-failure:g{group_text}:verify-{retry}",
+                    f"dag-runtime-failure:g{group_text}:rca-{retry}",
+                    f"dag-worktree-alias-preflight:g{group_text}:{retry}",
+                    f"dag-worktree-alias-canonicalization:g{group_text}:{retry}",
+                    f"workspace-authority-preflight:g{group_text}:{retry}",
+                    f"workspace-authority-routes:g{group_text}:{retry}",
+                    f"workspace-authority-snapshot:g{group_text}:{retry}",
                 ]
             )
+            for task_id in task_ids:
+                keys.append(f"dag-contract-verdict:g{group_text}:{task_id}:{retry}")
+            for repo_id in repo_ids:
+                keys.append(f"dag-sandbox-patch:g{group_text}:{retry}:repo-{repo_id}")
+        keys.append(f"dag-worktree-alias-preflight:g{group_text}:initial-dispatch")
+        keys.extend(
+            [
+                f"workspace-authority-registry:g{group_text}",
+                f"workspace-authority-preflight:g{group_text}:initial-dispatch",
+                f"workspace-authority-routes:g{group_text}:initial-dispatch",
+                f"workspace-authority-snapshot:g{group_text}:initial-dispatch",
+                "workflow-blocker:verify",
+                "workflow-blocker:verifier",
+                "dag-runtime-failure:source-push",
+                "dag-runtime-failure:notify",
+            ]
+        )
     return keys
 
 
@@ -399,14 +958,22 @@ def _feature_snapshot(feature: Any, feature_id: str) -> FeatureSnapshot:
 
 
 def _artifact_record(row: dict[str, Any]) -> ArtifactRecord:
-    value = row.get("value")
+    value = row.get("value", row.get("value_preview", ""))
     text = value if isinstance(value, str) else json.dumps(value, sort_keys=True, default=str)
     return ArtifactRecord(
         id=row.get("id"),
         key=str(row.get("key", "")),
         value=value,
         created_at=row.get("created_at"),
-        sha256=row.get("sha256") or hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        sha256=row.get("sha256")
+        or (
+            None
+            if row.get("summary_only", False)
+            else hashlib.sha256(text.encode("utf-8")).hexdigest()
+        ),
+        stored_bytes=row.get("stored_bytes"),
+        value_preview=row.get("value_preview"),
+        summary_only=bool(row.get("summary_only", False)),
     )
 
 
@@ -444,6 +1011,31 @@ def _event_record(row: dict[str, Any]) -> EventRecord:
     )
 
 
+def _sort_events_by_recency(events: list[EventRecord]) -> list[EventRecord]:
+    return sorted(events, key=_event_recency_key)
+
+
+def _event_recency_key(event: EventRecord) -> tuple[int, float, int]:
+    sequence_id = _event_sequence_id(event)
+    if event.created_at is not None:
+        try:
+            return (1, float(event.created_at.timestamp()), sequence_id)
+        except Exception:
+            pass
+    return (0, float(sequence_id), sequence_id)
+
+
+def _event_sequence_id(event: EventRecord) -> int:
+    if event.id is not None:
+        return int(event.id)
+    metadata = event.metadata or {}
+    evidence_node_id = metadata.get("evidence_node_id")
+    try:
+        return int(evidence_node_id)
+    except (TypeError, ValueError):
+        return 0
+
+
 def build_current_workflow_snapshot(
     *,
     events: list[EventRecord],
@@ -458,7 +1050,7 @@ def build_current_workflow_snapshot(
     active-agent UX when the DB has not emitted a fresh row yet.
     """
 
-    sorted_events = sorted(events, key=lambda event: event.id or 0)
+    sorted_events = _sort_events_by_recency(events)
     sorted_artifacts = sorted(artifacts, key=lambda artifact: artifact.id or 0)
     group_idx: int | None = None
     retry: int | None = None
@@ -543,6 +1135,8 @@ def _current_state(
             continue
         if event.event_type in {"dag_verify_start", "dag_verify_finish"}:
             return "verifying"
+        if event.event_type == "control_plane_runtime_failure":
+            return "workflow_blocked"
         if event.event_type in {
             "dag_task_dispatch",
             "dag_task_start",
@@ -714,6 +1308,13 @@ def _dedupe_strings(values: list[str]) -> list[str]:
             seen.add(value)
             result.append(value)
     return result
+
+
+def _shorten_log_line(value: str) -> str:
+    text = " ".join(str(value).split())
+    if len(text) <= _MAX_BRIDGE_LINE_CHARS:
+        return text
+    return f"{text[: _MAX_BRIDGE_LINE_CHARS - 16]}... [truncated]"
 
 
 def _bridge_log_is_error(line: str) -> bool:

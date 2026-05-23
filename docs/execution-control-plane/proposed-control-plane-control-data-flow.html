@@ -1,0 +1,657 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Proposed Execution Control Plane</title>
+  <style>
+    :root {
+      --bg: #f5f7fb;
+      --ink: #172033;
+      --muted: #5d6878;
+      --line: #c8d4e2;
+      --soft: #edf2f7;
+      --card: #ffffff;
+      --control: #1d4ed8;
+      --state: #6d28d9;
+      --evidence: #047857;
+      --compat: #7c3aed;
+      --repo: #b45309;
+      --failure: #be123c;
+      --guard: #334155;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--ink);
+      font: 14px/1.42 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    header {
+      background: #101827;
+      color: #fff;
+      padding: 28px 36px 22px;
+    }
+
+    header h1 {
+      margin: 0 0 8px;
+      font-size: 30px;
+      letter-spacing: 0;
+    }
+
+    header p {
+      margin: 0;
+      max-width: 1120px;
+      color: #d7dfed;
+      font-size: 15px;
+    }
+
+    main {
+      padding: 26px 36px 46px;
+    }
+
+    .top-strip {
+      display: grid;
+      grid-template-columns: 1.3fr 0.7fr;
+      gap: 16px;
+      margin-bottom: 18px;
+    }
+
+    .notice,
+    .legend {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      box-shadow: 0 8px 22px rgba(23, 32, 51, 0.05);
+    }
+
+    .notice {
+      padding: 16px 18px;
+      border-left: 6px solid var(--guard);
+    }
+
+    .notice h2,
+    .legend h2,
+    .section h2 {
+      margin: 0 0 8px;
+      font-size: 17px;
+      letter-spacing: 0;
+    }
+
+    .notice p {
+      margin: 0;
+      color: var(--muted);
+    }
+
+    .legend {
+      padding: 14px 16px;
+    }
+
+    .legend-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 8px 10px;
+    }
+
+    .key {
+      display: flex;
+      gap: 7px;
+      align-items: center;
+      color: var(--muted);
+      font-size: 12px;
+      min-width: 0;
+    }
+
+    .swatch {
+      width: 11px;
+      height: 11px;
+      border-radius: 3px;
+      flex: 0 0 auto;
+    }
+
+    .swatch.control { background: var(--control); }
+    .swatch.state { background: var(--state); }
+    .swatch.evidence { background: var(--evidence); }
+    .swatch.compat { background: var(--compat); }
+    .swatch.repo { background: var(--repo); }
+    .swatch.failure { background: var(--failure); }
+    .swatch.guard { background: var(--guard); }
+
+    .section {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 18px;
+      margin-top: 18px;
+      box-shadow: 0 8px 22px rgba(23, 32, 51, 0.05);
+    }
+
+    .map {
+      display: grid;
+      grid-template-columns: 1.1fr 1.55fr 1.15fr;
+      gap: 14px;
+      align-items: stretch;
+    }
+
+    .rail {
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: #fbfcfe;
+      padding: 14px;
+      min-width: 0;
+    }
+
+    .rail-title {
+      margin: 0 0 12px;
+      color: #334155;
+      font-size: 13px;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+    }
+
+    .node {
+      position: relative;
+      border: 1px solid var(--line);
+      border-left: 6px solid var(--control);
+      background: #fff;
+      border-radius: 10px;
+      padding: 11px 12px;
+      margin: 0 0 10px;
+    }
+
+    .node h3 {
+      margin: 0 0 5px;
+      font-size: 14px;
+      letter-spacing: 0;
+    }
+
+    .node p,
+    .node ul {
+      margin: 0;
+      color: var(--muted);
+    }
+
+    .node ul {
+      padding-left: 18px;
+    }
+
+    .node li + li {
+      margin-top: 3px;
+    }
+
+    .node.state { border-left-color: var(--state); background: #faf7ff; }
+    .node.evidence { border-left-color: var(--evidence); background: #f4fbf8; }
+    .node.compat { border-left-color: var(--compat); background: #fbf8ff; }
+    .node.repo { border-left-color: var(--repo); background: #fff8ed; }
+    .node.failure { border-left-color: var(--failure); background: #fff6f8; }
+    .node.guard { border-left-color: var(--guard); background: #f8fafc; }
+
+    .tag {
+      display: inline-block;
+      margin: 0 6px 5px 0;
+      padding: 2px 7px;
+      border-radius: 999px;
+      color: #fff;
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: 0.03em;
+      vertical-align: middle;
+    }
+
+    .tag.control { background: var(--control); }
+    .tag.state { background: var(--state); }
+    .tag.evidence { background: var(--evidence); }
+    .tag.compat { background: var(--compat); }
+    .tag.repo { background: var(--repo); }
+    .tag.failure { background: var(--failure); }
+    .tag.guard { background: var(--guard); }
+
+    .arrow {
+      color: #748196;
+      font-weight: 700;
+      margin: -3px 0 8px 12px;
+    }
+
+    .branch {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+      margin-top: 4px;
+    }
+
+    .mini-label {
+      margin: 6px 0 8px;
+      color: #475569;
+      font-weight: 700;
+      font-size: 12px;
+    }
+
+    .back-loop {
+      border: 1px dashed var(--failure);
+      border-radius: 10px;
+      padding: 10px;
+      margin-top: 8px;
+      color: #881337;
+      background: #fffafb;
+      font-size: 12px;
+    }
+
+    .backbone {
+      display: grid;
+      grid-template-columns: 1.1fr 1fr 1fr;
+      gap: 12px;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      overflow: hidden;
+      background: #fff;
+    }
+
+    th,
+    td {
+      border-bottom: 1px solid var(--line);
+      padding: 10px 12px;
+      text-align: left;
+      vertical-align: top;
+    }
+
+    th {
+      background: var(--soft);
+      color: #334155;
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+
+    tr:last-child td {
+      border-bottom: 0;
+    }
+
+    code {
+      background: #eef2f7;
+      border: 1px solid #d7e0ea;
+      border-radius: 4px;
+      padding: 1px 4px;
+      font-size: 12px;
+    }
+
+    .two-col {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
+      margin-top: 18px;
+    }
+
+    .caption {
+      color: var(--muted);
+      margin: 0 0 12px;
+    }
+
+    @media (max-width: 1180px) {
+      .map,
+      .top-strip,
+      .backbone,
+      .two-col {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    @media (max-width: 760px) {
+      main,
+      header {
+        padding-left: 18px;
+        padding-right: 18px;
+      }
+      .branch {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Proposed Execution Control Plane</h1>
+    <p>
+      This is not just a cleaner version of the monolith. It splits authority
+      into durable modules: typed journal state, workspace and contract
+      preflight, sandboxed candidate production, evidence-backed verification,
+      typed failure routing, durable merge/checkpoint ownership, and guarded
+      post-DAG completion.
+    </p>
+  </header>
+
+  <main>
+    <section class="top-strip">
+      <div class="notice">
+        <h2>Atomic Landing Constraint</h2>
+        <p>
+          No per-slice production rollout, no partial product-authoritative
+          mode, and no automatic migration of active legacy features. The
+          complete bundle is enabled only after the landing gate passes.
+          Rollback stops admission or rolls back the complete feature while
+          preserving typed audit rows and compatibility projections.
+        </p>
+      </div>
+      <div class="legend">
+        <h2>Encoding</h2>
+        <div class="legend-grid">
+          <span class="key"><span class="swatch control"></span>Control owner</span>
+          <span class="key"><span class="swatch state"></span>Typed state/store</span>
+          <span class="key"><span class="swatch evidence"></span>Evidence/gate</span>
+          <span class="key"><span class="swatch compat"></span>Legacy projection/read model</span>
+          <span class="key"><span class="swatch repo"></span>Canonical repo mutation</span>
+          <span class="key"><span class="swatch failure"></span>Failure route/loop</span>
+          <span class="key"><span class="swatch guard"></span>Readiness guard</span>
+        </div>
+      </div>
+    </section>
+
+    <section class="section">
+      <h2>End-To-End Control And Data Ownership</h2>
+      <p class="caption">
+        The center rail is the normal candidate path. The left rail owns
+        orchestration and persistent state. The right rail owns failure routing,
+        compatibility readers, regroup overlays, and post-DAG/post-test guards.
+      </p>
+
+      <div class="map">
+        <div class="rail">
+          <h2 class="rail-title">Orchestration And State Backbone</h2>
+          <div class="node control">
+            <span class="tag control">CONTROL</span>
+            <h3>ImplementationPhase Adapter</h3>
+            <p>Legacy phase entrypoint. Keeps quiesce semantics and compatibility shims, but delegates control-plane work.</p>
+          </div>
+          <div class="arrow">down</div>
+          <div class="node control">
+            <span class="tag control">CONTROL</span>
+            <h3>ExecutionControlPlane / Coordinator</h3>
+            <p>Owns state transitions, effective group order, idempotent handoffs, quiesce propagation, and service orchestration.</p>
+          </div>
+          <div class="arrow">down</div>
+          <div class="node state">
+            <span class="tag state">CANONICAL</span>
+            <h3>ExecutionControlStore / Journal</h3>
+            <ul>
+              <li>Postgres typed rows are canonical.</li>
+              <li>Every mutation has an idempotency key.</li>
+              <li>Legacy <code>dag-*</code> artifacts are synchronous compatibility projections.</li>
+              <li>No typed success is valid without required projection parity while legacy readers exist.</li>
+            </ul>
+          </div>
+          <div class="arrow">side effects</div>
+          <div class="node compat">
+            <span class="tag compat">READ MODEL</span>
+            <h3>Resume, Dashboard, Supervisor, Regroup</h3>
+            <p>Read typed snapshots first. Legacy fallback is visibly degraded, bounded, capped, and never hydrates broad artifact bodies.</p>
+          </div>
+        </div>
+
+        <div class="rail">
+          <h2 class="rail-title">Candidate Production And Approval</h2>
+          <div class="node evidence">
+            <span class="tag evidence">PREFLIGHT</span>
+            <h3>WorkspaceAuthority</h3>
+            <p>Canonical repo identity, alias classification, divergent alias fail-closed, ACL/writeability, symlink/outside-root checks, dirty generated-output checks, and workspace snapshots.</p>
+          </div>
+          <div class="arrow">then</div>
+          <div class="node evidence">
+            <span class="tag evidence">CONTRACT</span>
+            <h3>TaskContractCompiler</h3>
+            <p>Compiles required, allowed, and forbidden paths; acceptance criteria; verification gates; write-set ownership; and merge admission rules.</p>
+          </div>
+          <div class="arrow">then</div>
+          <div class="node evidence">
+            <span class="tag evidence">GATE REQUEST</span>
+            <h3>Deterministic Preflight Gates</h3>
+            <p>Workspace, contract, dependency, stale-context, path-scope, and projection checks block dispatch before model work when evidence is unsafe.</p>
+          </div>
+          <div class="arrow">then</div>
+          <div class="node control">
+            <span class="tag control">SANDBOX</span>
+            <h3>SandboxRunner</h3>
+            <p>Allocates isolated roots and captures immutable patch evidence. Product-content mutation of canonical repos waits for the merge queue; metadata-only workspace normalization is recorded separately.</p>
+          </div>
+          <div class="arrow">then</div>
+          <div class="node control">
+            <span class="tag control">RUNTIME</span>
+            <h3>RuntimeDispatcher</h3>
+            <p>Invokes Claude, Codex, or pool runtimes through a narrow journal facade. It records attempts and runtime failures, but cannot enqueue merge, route repair, commit, checkpoint, or treat dispatch success as integration success.</p>
+          </div>
+          <div class="arrow">produces</div>
+          <div class="node compat">
+            <span class="tag compat">ATTEMPT ONLY</span>
+            <h3><code>dag-task:*</code> Projection</h3>
+            <p>Visible to legacy consumers as attempt evidence. It is not group completion, integration proof, or checkpoint proof.</p>
+          </div>
+          <div class="arrow">then</div>
+          <div class="node evidence">
+            <span class="tag evidence">APPROVAL GRAPH</span>
+            <h3>VerificationGraph / GateRunner</h3>
+            <ul>
+              <li>Candidate manifest, contract ids, workspace snapshots, patch summaries, and bounded context package.</li>
+              <li>Raw verifier, expanded lenses, aggregate verdict, stale-context rejection, and read-budget proof.</li>
+              <li>Pre-queue approval, post-apply gates, <code>merge_gate</code>, and separate <code>checkpoint_gate</code>.</li>
+              <li>Raw <code>dag-verify:*</code> projections and summary-only evidence are never authoritative alone.</li>
+            </ul>
+          </div>
+          <div class="branch">
+            <div>
+              <div class="mini-label">Approved Candidate</div>
+              <div class="node repo">
+                <span class="tag repo">CANONICAL WRITE</span>
+                <h3>DurableMergeQueue + GitService</h3>
+                <ul>
+                  <li>Lease, claim, apply, rebase/conflict handling, and recovery.</li>
+                  <li>Records <code>merge_queue_task_coverage</code> and <code>merge_queue_repo_targets</code>.</li>
+                  <li>Runs post-apply gates before commit.</li>
+                  <li>Writes merge proof, commit proof, no-dirty snapshot, checkpoint gate, checkpoint body evidence, and idempotent <code>dag-group:*</code> projection.</li>
+                </ul>
+              </div>
+            </div>
+            <div>
+              <div class="mini-label">Typed Failure</div>
+              <div class="node failure">
+                <span class="tag failure">ROUTE</span>
+                <h3>FailureRouter Selects; Bounded Executors Act</h3>
+                <p>FailureRouter classifies and selects the route. RepairService, Dispatcher, MergeQueue, WorkspaceAuthority, and GitService execute only the selected bounded action: product repair, contract repair, canonicalization repair, workspace repair, commit hygiene, verifier retry, runtime retry, merge retry, sandbox capture retry, sandbox cleanup, explicit operator-required, or quiesce. Workflow failures do not default to broad product repair.</p>
+              </div>
+              <div class="back-loop">Retry loops return to the earliest safe owner: workspace, contracts, sandbox, dispatcher, verifier, merge queue, or post-DAG gate.</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="rail">
+          <h2 class="rail-title">Outer Guards And Consumers</h2>
+          <div class="node evidence">
+            <span class="tag evidence">SCHEDULING</span>
+            <h3>RegroupOverlayService</h3>
+            <p>Root DAG remains immutable. The typed active overlay and effective-DAG resolver define dispatch, resume, checkpoint coverage, rollback-before-first-wave, and post-test readiness. <code>dag-regroup:*</code> projections mirror that state for legacy readers. Scheduler feedback is advisory; safety outranks speed.</p>
+          </div>
+          <div class="arrow">after all effective groups checkpoint</div>
+          <div class="node evidence">
+            <span class="tag evidence">FEATURE GATES</span>
+            <h3>PostDagGateService</h3>
+            <p>Preserves code review, security audit, test authoring, QA, integration testing, final verifier, source-repo push, implementation report, backlog report, and completion notification. Group checkpoint is not final implementation approval.</p>
+          </div>
+          <div class="arrow">then</div>
+          <div class="node guard">
+            <span class="tag guard">GUARD</span>
+            <h3>PostTestReadinessGuard</h3>
+            <p>Allows observation only after effective-DAG completion, post-DAG gate approval, no active queue/repair work, and compatible projections. It never relies on root-DAG length alone.</p>
+          </div>
+          <div class="arrow">side visibility</div>
+          <div class="node compat">
+            <span class="tag compat">ADVISORY</span>
+            <h3>Supervisor And Dashboard</h3>
+            <p>No executor/control-plane/product mutation authority. Allowed writes are bounded audit, dedupe, display outbox, and explicitly configured guarded bridge actions. Typed snapshots outrank legacy fallback.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section">
+      <h2>Module Ownership Matrix</h2>
+      <p class="caption">
+        This is the refactor map in diagram form: each responsibility from the
+        current implementation monolith gets one target owner.
+      </p>
+      <table>
+        <thead>
+          <tr>
+            <th>Current monolith responsibility</th>
+            <th>Target owner</th>
+            <th>Writes</th>
+            <th>Must not own</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Phase entry, resume, quiesce, and phase handoff</td>
+            <td><code>ImplementationPhase</code> adapter plus <code>ExecutionControlPlane</code></td>
+            <td>Typed transition events through journal</td>
+            <td>Git commands, provider calls, checkpoint success</td>
+          </tr>
+          <tr>
+            <td>Legacy artifact key construction and resume reconstruction</td>
+            <td><code>ExecutionControlStore</code> / <code>journal.py</code></td>
+            <td>Typed rows, projection links, legacy <code>dag-*</code> projections</td>
+            <td>Runtime dispatch, path canonicalization, git mutation</td>
+          </tr>
+          <tr>
+            <td>Worktrees, aliases, ACL, symlink/outside-root checks</td>
+            <td><code>WorkspaceAuthority</code></td>
+            <td>Workspace snapshots and deterministic workspace failures</td>
+            <td>Product repair, checkpoint writes, broad file copying</td>
+          </tr>
+          <tr>
+            <td>Task output interpretation and write-set safety</td>
+            <td><code>TaskContractCompiler</code></td>
+            <td>Contract rows, path rules, acceptance/gate requirements</td>
+            <td>Model repair execution or git staging</td>
+          </tr>
+          <tr>
+            <td>Agent workspace and provider invocation</td>
+            <td><code>SandboxRunner</code> and <code>RuntimeDispatcher</code></td>
+            <td>Sandbox leases, patch summaries, execution attempts, runtime failures</td>
+            <td>Canonical repo mutation, merge admission, checkpointing</td>
+          </tr>
+          <tr>
+            <td>Verifier context, lenses, stale projection checks</td>
+            <td><code>VerificationGraph</code>, <code>GateRunner</code>, <code>VerificationService</code></td>
+            <td>Evidence nodes/edges, read budgets, aggregate verdicts</td>
+            <td>Product repair, queue apply, raw artifact-only approval</td>
+          </tr>
+          <tr>
+            <td>RCA/fix retry selection and deterministic unblock routing</td>
+            <td><code>FailureRouter</code> and <code>RepairService</code></td>
+            <td>Typed failures, route decisions, repair attempts</td>
+            <td>Failure classification inside git/dispatcher/queue modules</td>
+          </tr>
+          <tr>
+            <td>Commit, hook failure parsing, canonical integration, checkpoint</td>
+            <td><code>GitService</code> and <code>DurableMergeQueue</code></td>
+            <td>Merge proof, commit proof, no-dirty snapshot, checkpoint gate, <code>dag-group:*</code></td>
+            <td>Runtime dispatch, sandbox patch generation, broad repair policy</td>
+          </tr>
+          <tr>
+            <td>Derived DAG overlays and adaptive sizing feedback</td>
+            <td><code>RegroupOverlayService</code></td>
+            <td>Validated active overlay projections and scheduler feedback rows</td>
+            <td>Root DAG mutation or speed-over-safety scheduling</td>
+          </tr>
+          <tr>
+            <td>Post-DAG gates and post-test boundary</td>
+            <td><code>PostDagGateService</code> and <code>PostTestReadinessGuard</code></td>
+            <td>Feature-level gate evidence, <code>dag-gate:*</code> projections, readiness proof</td>
+            <td>Group dispatch, merge queue internals, observation collection</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section class="two-col">
+      <div class="section">
+        <h2>Proof Boundary Rules</h2>
+        <table>
+          <thead>
+            <tr><th>Surface</th><th>Meaning In Target Architecture</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>dag-task:*</code></td>
+              <td>Attempt evidence projected from typed execution attempts. It never proves integration or checkpoint completion.</td>
+            </tr>
+            <tr>
+              <td><code>dag-verify:*</code></td>
+              <td>Projection of verification graph nodes. Raw approval alone cannot admit merge or checkpoint.</td>
+            </tr>
+            <tr>
+              <td><code>dag-commit-failure:*</code></td>
+              <td>Projection of typed commit-hygiene failure with bounded command output and a narrow route.</td>
+            </tr>
+            <tr>
+              <td><code>dag-group:*</code></td>
+              <td>Written only after queue success, approved gate/checkpoint evidence, merge proof, commit proof, no-dirty proof, checkpoint body evidence, and idempotent projection/link success.</td>
+            </tr>
+            <tr>
+              <td><code>dag-gate:*</code></td>
+              <td>Feature-level post-DAG gate projection backed by typed gate evidence. It is required before post-test observation.</td>
+            </tr>
+            <tr>
+              <td><code>dag-regroup:*</code></td>
+              <td>Validated effective-DAG overlay projection. Root DAG remains immutable; rollback is guarded and forward-only after first work starts.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="section">
+        <h2>Failure Route Examples</h2>
+        <table>
+          <thead>
+            <tr><th>Failure class</th><th>Route</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Alias, ACL, symlink, outside-root, dirty generated output</td>
+              <td>Workspace repair or canonicalization repair before runtime dispatch.</td>
+            </tr>
+            <tr>
+              <td>Missing required path or contract violation after virtual apply</td>
+              <td>Contract/product repair depending on workspace freshness evidence.</td>
+            </tr>
+            <tr>
+              <td>Stale verifier context or stale projection</td>
+              <td>Refresh/retry verifier context; do not send to broad product RCA first.</td>
+            </tr>
+            <tr>
+              <td>Provider/runtime failure</td>
+              <td>Runtime retry through dispatcher budget, then quiesce if unsafe.</td>
+            </tr>
+            <tr>
+              <td>Commit hook/status failure</td>
+              <td>Commit hygiene repair through GitService/merge queue, not full reimplementation.</td>
+            </tr>
+            <tr>
+              <td>Merge conflict or stale base</td>
+              <td>Merge retry/rebase path with queue lease fencing and recovery evidence.</td>
+            </tr>
+            <tr>
+              <td>Evidence corruption or checkpoint contradiction</td>
+              <td>Quiesce or stop/escalate as a control-plane safety failure. Operator-required appears only when the typed router emits that explicit route and no deterministic repair remains.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+</body>
+</html>

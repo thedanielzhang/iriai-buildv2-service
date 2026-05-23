@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import signal
 import shutil
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,8 +14,36 @@ from iriai_compose.actors import Role
 from iriai_compose.storage import AgentSession
 
 from iriai_build_v2.runtimes import normalize_agent_runtime, secondary_agent_runtime_name
+import iriai_build_v2.runtimes.codex as codex_mod
 from iriai_build_v2.runtimes.codex import CodexAgentRuntime, _prepare_schema
 from iriai_build_v2.models.outputs import Envelope, ReviewOutcome
+
+
+def _write_sandbox_manifest(
+    sandbox_root: Path,
+    cwd: Path,
+    *,
+    sandbox_id: str = "sandbox-04",
+    writable_roots: list[Path] | None = None,
+    blocked_roots: list[Path] | None = None,
+) -> Path:
+    manifest_path = sandbox_root / "sandbox-manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "manifest_version": "sandbox-runner-v1",
+                "sandbox_id": sandbox_id,
+                "root": str(sandbox_root),
+                "repo_roots": {"app": str(cwd)},
+                "writable_roots": [
+                    str(path) for path in (writable_roots if writable_roots is not None else [cwd])
+                ],
+                "blocked_roots": [str(path) for path in (blocked_roots or [])],
+            }
+        ),
+        encoding="utf-8",
+    )
+    return manifest_path
 
 
 class TestNormalizeAgentRuntime:
@@ -263,6 +292,51 @@ class TestCodexAgentRuntime:
         assert "--full-auto" not in command
         assert "shell_environment_policy.inherit=all" in command
 
+    def test_bound_write_command_never_uses_dangerous_bypass_for_e2e_role(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ):
+        runtime = self._runtime(monkeypatch)
+        sandbox_root = tmp_path / "sandbox"
+        cwd = sandbox_root / "repos" / "app"
+        cwd.mkdir(parents=True)
+        manifest_path = _write_sandbox_manifest(sandbox_root, cwd)
+        role = Role(
+            name="lead-architect",
+            prompt="Review and write a fix.",
+            tools=["Read", "Write"],
+            metadata={
+                "auto_approve_mcp_tools": True,
+                "runtime_workspace_binding": {
+                    "sandbox_id": "sandbox-04",
+                    "cwd": str(cwd),
+                    "writable_roots": [str(cwd)],
+                    "readonly_roots": [],
+                    "blocked_roots": [],
+                    "manifest_path": str(manifest_path),
+                    "expires_at": "2999-01-01T00:00:00+00:00",
+                    "runtime": "codex",
+                },
+            },
+        )
+
+        command = runtime._build_command(
+            role=role,
+            workspace=SimpleNamespace(path=str(cwd)),
+            output_schema_path=None,
+            output_path=str(cwd / ".iriai" / "runtime" / "codex" / "out.txt"),
+            resume_thread_id=None,
+            ephemeral=True,
+            session_key="lead-architect-gate-reviewer:feat-1",
+        )
+
+        assert "--full-auto" in command
+        assert "--dangerously-bypass-approvals-and-sandbox" not in command
+        assert "shell_environment_policy.inherit=all" not in command
+        assert "--add-dir" not in command
+        assert not any(".npm" in arg for arg in command)
+
     def test_build_command_keeps_full_auto_for_non_e2e_role(
         self,
         monkeypatch: pytest.MonkeyPatch,
@@ -282,6 +356,121 @@ class TestCodexAgentRuntime:
 
         assert "--full-auto" in command
         assert "--dangerously-bypass-approvals-and-sandbox" not in command
+
+    def test_build_command_rejects_shell_disabled_guarded_role(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        runtime = self._runtime(monkeypatch)
+        role = Role(
+            name="workflow-supervisor",
+            prompt="Inspect supervisor evidence.",
+            metadata={
+                "auto_approve_mcp_tools": True,
+                "forbid_command_execution": True,
+                "mcp_servers": {
+                    "supervisor-evidence": {
+                        "command": "python",
+                        "args": ["-m", "iriai_build_v2.supervisor.mcp_server"],
+                    },
+                },
+            },
+        )
+
+        with pytest.raises(RuntimeError, match="no-shell execution is not available"):
+            runtime._build_command(
+                role=role,
+                workspace=None,
+                output_schema_path=None,
+                output_path="/tmp/out.txt",
+                resume_thread_id=None,
+                ephemeral=True,
+                session_key="workflow-supervisor:proc:question:feat-1",
+            )
+
+    def test_build_command_allows_supervisor_read_only_codex_opt_in(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        runtime = self._runtime(monkeypatch)
+        role = Role(
+            name="workflow-supervisor",
+            prompt="Inspect supervisor evidence.",
+            metadata={
+                "auto_approve_mcp_tools": True,
+                "forbid_command_execution": True,
+                "disable_shell_tools": True,
+                "codex_read_only_shell": True,
+                "mcp_servers": {
+                    "supervisor-evidence": {
+                        "command": "python",
+                        "args": ["-m", "iriai_build_v2.supervisor.mcp_server"],
+                    },
+                },
+            },
+        )
+
+        command = runtime._build_command(
+            role=role,
+            workspace=None,
+            output_schema_path=None,
+            output_path="/tmp/out.txt",
+            resume_thread_id=None,
+            ephemeral=True,
+            session_key="workflow-supervisor:proc:question:feat-1",
+        )
+
+        assert "--full-auto" in command
+        assert "--sandbox" in command
+        assert "read-only" in command
+        assert "--dangerously-bypass-approvals-and-sandbox" not in command
+
+    @pytest.mark.asyncio
+    async def test_run_codex_keeps_command_guard_for_read_only_opt_in(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ):
+        runtime = self._runtime(monkeypatch)
+        role = Role(
+            name="workflow-supervisor",
+            prompt="Inspect supervisor evidence.",
+            metadata={
+                "forbid_command_execution": True,
+                "disable_shell_tools": True,
+                "codex_read_only_shell": True,
+                "mcp_servers": {
+                    "supervisor-evidence": {
+                        "command": "python",
+                        "args": ["-m", "iriai_build_v2.supervisor.mcp_server"],
+                    },
+                },
+            },
+        )
+        captured: dict[str, object] = {}
+
+        async def _fake_run_process(command, _prompt, _output_type, **kwargs):
+            captured["command"] = command
+            captured["forbid_command_execution"] = kwargs["forbid_command_execution"]
+            return "supervisor assessment", None, ""
+
+        monkeypatch.setattr(runtime, "_run_process", _fake_run_process)
+
+        final_text, _thread_id = await runtime._run_codex(
+            role,
+            "status?",
+            workspace=SimpleNamespace(path=tmp_path),
+            output_type=None,
+            resume_thread_id=None,
+            ephemeral=True,
+            feature_id="8ac124d6",
+            session_key="workflow-supervisor:8ac124d6",
+        )
+
+        assert final_text == "supervisor assessment"
+        assert captured["forbid_command_execution"] is True
+        assert "--sandbox" in captured["command"]
+        assert "read-only" in captured["command"]
 
     def test_compose_prompt_includes_mcp_tools_section(
         self,
@@ -382,6 +571,147 @@ class TestCodexAgentRuntime:
         assert state["last_agent_message"] == large_text
         assert emitted
         assert emitted[-1].content[0].text == large_text
+
+    @pytest.mark.asyncio
+    async def test_read_stdout_rejects_overlong_single_line(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ):
+        runtime = self._runtime(monkeypatch)
+        trace_path = tmp_path / "trace.jsonl"
+        monkeypatch.setattr(codex_mod, "_STDOUT_LINE_MAX_BYTES", 32)
+
+        stdout = asyncio.StreamReader()
+        stdout.feed_data(b"x" * 40)
+        stdout.feed_eof()
+
+        state = {"thread_id": None, "last_agent_message": "", "last_error": ""}
+        with pytest.raises(RuntimeError, match="stdout line exceeded"):
+            await runtime._read_stdout(
+                stdout,
+                state=state,
+                output_type=None,
+                trace_path=trace_path,
+            )
+
+        assert state["stdout_line_too_large"] is True
+        assert "stdout.line_too_large" in trace_path.read_text()
+
+    @pytest.mark.asyncio
+    async def test_read_stdout_blocks_forbidden_command_execution(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        runtime = self._runtime(monkeypatch)
+        emitted: list[object] = []
+        runtime.on_message = emitted.append
+
+        line = json.dumps(
+            {
+                "type": "item.started",
+                "item": {
+                    "id": "cmd-1",
+                    "type": "command_execution",
+                    "command": "pwd && rg --files",
+                },
+            }
+        ) + "\n"
+
+        stdout = asyncio.StreamReader()
+        stdout.feed_data(line.encode("utf-8"))
+        stdout.feed_eof()
+
+        state = {"thread_id": None, "last_agent_message": "", "last_error": ""}
+        with pytest.raises(RuntimeError, match="command execution is disabled"):
+            await runtime._read_stdout(
+                stdout,
+                state=state,
+                output_type=None,
+                forbid_command_execution=True,
+            )
+
+        assert "MCP evidence tools" in state["last_error"]
+        assert emitted == []
+
+    @pytest.mark.asyncio
+    async def test_read_stdout_traces_mcp_tool_call_payload(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ):
+        runtime = self._runtime(monkeypatch)
+        trace_path = tmp_path / "trace.jsonl"
+        line = json.dumps(
+            {
+                "type": "item.completed",
+                "item": {
+                    "id": "mcp-1",
+                    "type": "mcp_tool_call",
+                    "server": "supervisor-evidence",
+                    "tool": "get_current_snapshot",
+                    "result": {"feature_id": "8ac124d6"},
+                },
+            }
+        ) + "\n"
+
+        stdout = asyncio.StreamReader()
+        stdout.feed_data(line.encode("utf-8"))
+        stdout.feed_eof()
+
+        state = {"thread_id": None, "last_agent_message": "", "last_error": ""}
+        await runtime._read_stdout(stdout, state=state, output_type=None, trace_path=trace_path)
+
+        trace = trace_path.read_text()
+        assert "stdout.mcp_tool_call" in trace
+        assert "get_current_snapshot" in trace
+
+    @pytest.mark.asyncio
+    async def test_read_stderr_returns_bounded_tail(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ):
+        runtime = self._runtime(monkeypatch)
+        trace_path = tmp_path / "trace.jsonl"
+        monkeypatch.setattr(codex_mod, "_STDERR_CAPTURE_LINES", 2)
+        monkeypatch.setattr(codex_mod, "_STDERR_CAPTURE_CHARS", 80)
+        monkeypatch.setattr(codex_mod, "_STDERR_LINE_CHARS", 20)
+
+        stderr = asyncio.StreamReader()
+        stderr.feed_data(b"first line\n")
+        stderr.feed_data(b"second line is intentionally too long\n")
+        stderr.feed_data(b"third line\n")
+        stderr.feed_eof()
+
+        state = {"stderr_lines": 0}
+        text = await runtime._read_stderr(stderr, state=state, trace_path=trace_path)
+
+        assert "first line" not in text
+        assert "second line is inte" in text
+        assert "third line" in text
+        assert state["stderr_lines"] == 3
+        assert state["stderr_truncated_lines"] >= 1
+        assert "stderr.reader_done" in trace_path.read_text()
+
+    @pytest.mark.asyncio
+    async def test_abort_process_kills_process_group(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        runtime = self._runtime(monkeypatch)
+        killed: list[tuple[int, int]] = []
+        monkeypatch.setattr("iriai_build_v2.runtimes.codex.os.killpg", lambda pid, sig: killed.append((pid, sig)))
+
+        async def _done() -> int:
+            return 0
+
+        proc = SimpleNamespace(pid=4321, returncode=None, kill=lambda: None)
+        wait_task = asyncio.create_task(_done())
+
+        await runtime._abort_process(proc, wait_task)
+
+        assert killed == [(4321, signal.SIGKILL)]
 
     @pytest.mark.asyncio
     async def test_run_process_aborts_if_stdout_reader_crashes(
@@ -529,6 +859,300 @@ class TestCodexAgentRuntime:
         # CODEX_HOME should have been passed in env
         assert observed["env"] is not None
         assert "CODEX_HOME" in observed["env"]
+
+    @pytest.mark.asyncio
+    async def test_bound_run_codex_keeps_artifacts_inside_runtime_roots(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ):
+        runtime = self._runtime(monkeypatch)
+        sandbox_root = tmp_path / "sandbox"
+        cwd = sandbox_root / "repos" / "app"
+        cwd.mkdir(parents=True)
+        manifest_path = _write_sandbox_manifest(sandbox_root, cwd)
+
+        class _SimpleOutput(BaseModel):
+            value: str
+
+        observed: dict[str, str] = {}
+
+        async def _fake_run_process(command, _prompt, _output_type, *, env=None, **_kwargs):
+            output_path = Path(command[command.index("-o") + 1])
+            schema_path = Path(command[command.index("--output-schema") + 1])
+            codex_home = Path(env["CODEX_HOME"])
+            runtime_root = sandbox_root / ".iriai" / "runtime" / "codex"
+            observed["command"] = " ".join(command)
+            observed["codex_home"] = str(codex_home)
+            assert output_path.parent == runtime_root
+            assert schema_path.parent == runtime_root
+            assert codex_home.parent.parent == runtime_root
+            assert not output_path.is_relative_to(cwd)
+            assert not schema_path.is_relative_to(cwd)
+            assert not codex_home.is_relative_to(cwd)
+            assert "--dangerously-bypass-approvals-and-sandbox" not in command
+            assert "--add-dir" not in command
+            assert not any(".npm" in arg for arg in command)
+            output_path.write_text('{"value":"ok"}', encoding="utf-8")
+            return "", None, ""
+
+        monkeypatch.setattr(runtime, "_run_process", _fake_run_process)
+        role = Role(
+            name="lead-architect",
+            prompt="Review and fix.",
+            tools=["Read", "Write"],
+            metadata={
+                "auto_approve_mcp_tools": True,
+                "runtime_workspace_binding": {
+                    "sandbox_id": "sandbox-04",
+                    "cwd": str(cwd),
+                    "writable_roots": [str(cwd)],
+                    "readonly_roots": [],
+                    "blocked_roots": [],
+                    "manifest_path": str(manifest_path),
+                    "expires_at": "2999-01-01T00:00:00+00:00",
+                    "runtime": "codex",
+                },
+            },
+        )
+
+        final_text, _thread_id = await runtime._run_codex(
+            role,
+            "Return a value.",
+            workspace=SimpleNamespace(path=str(cwd)),
+            output_type=_SimpleOutput,
+            resume_thread_id=None,
+            ephemeral=True,
+            feature_id="feat-1",
+            session_key="lead-architect-gate-reviewer:feat-1",
+        )
+
+        assert final_text == '{"value":"ok"}'
+        assert str(sandbox_root / ".iriai" / "runtime" / "codex") in observed["codex_home"]
+
+    @pytest.mark.asyncio
+    async def test_bound_run_codex_rejects_symlinked_runtime_root_before_writes(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ):
+        runtime = self._runtime(monkeypatch)
+        sandbox_root = tmp_path / "sandbox"
+        cwd = sandbox_root / "repos" / "app"
+        cwd.mkdir(parents=True)
+        escape_root = tmp_path / "escape"
+        escape_root.mkdir()
+        (sandbox_root / ".iriai").symlink_to(escape_root, target_is_directory=True)
+        manifest_path = _write_sandbox_manifest(sandbox_root, cwd)
+        run_called = False
+
+        async def _fake_run_process(*_args, **_kwargs):
+            nonlocal run_called
+            run_called = True
+            return "", None, ""
+
+        monkeypatch.setattr(runtime, "_run_process", _fake_run_process)
+        role = Role(
+            name="lead-architect",
+            prompt="Review and fix.",
+            tools=["Read", "Write"],
+            metadata={
+                "runtime_workspace_binding": {
+                    "sandbox_id": "sandbox-04",
+                    "cwd": str(cwd),
+                    "writable_roots": [str(cwd)],
+                    "readonly_roots": [],
+                    "blocked_roots": [],
+                    "manifest_path": str(manifest_path),
+                    "expires_at": "2999-01-01T00:00:00+00:00",
+                    "runtime": "codex",
+                },
+            },
+        )
+
+        with pytest.raises(RuntimeError, match="runtime artifact root is symlinked"):
+            await runtime._run_codex(
+                role,
+                "Return a value.",
+                workspace=SimpleNamespace(path=str(cwd)),
+                output_type=None,
+                resume_thread_id=None,
+                ephemeral=True,
+                feature_id="feat-1",
+                session_key="lead-architect-gate-reviewer:feat-1",
+            )
+
+        assert run_called is False
+
+    @pytest.mark.asyncio
+    async def test_bound_run_codex_rejects_cwd_ancestor_of_writable_root(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ):
+        runtime = self._runtime(monkeypatch)
+        sandbox_root = tmp_path / "sandbox"
+        cwd = sandbox_root / "repos" / "app"
+        writable_file_parent = cwd / "src"
+        writable_file_parent.mkdir(parents=True)
+        manifest_path = _write_sandbox_manifest(
+            sandbox_root,
+            cwd,
+            writable_roots=[writable_file_parent],
+        )
+        run_called = False
+
+        async def _fake_run_process(*_args, **_kwargs):
+            nonlocal run_called
+            run_called = True
+            return "", None, ""
+
+        monkeypatch.setattr(runtime, "_run_process", _fake_run_process)
+        role = Role(
+            name="implementer",
+            prompt="Patch the file.",
+            tools=["Read", "Write"],
+            metadata={
+                "runtime_workspace_binding": {
+                    "sandbox_id": "sandbox-04",
+                    "cwd": str(cwd),
+                    "writable_roots": [str(writable_file_parent)],
+                    "readonly_roots": [],
+                    "blocked_roots": [],
+                    "manifest_path": str(manifest_path),
+                    "expires_at": "2999-01-01T00:00:00+00:00",
+                    "runtime": "codex",
+                },
+            },
+        )
+
+        with pytest.raises(RuntimeError, match="cwd is outside writable roots"):
+            await runtime._run_codex(
+                role,
+                "Return a value.",
+                workspace=SimpleNamespace(path=str(cwd)),
+                output_type=None,
+                resume_thread_id=None,
+                ephemeral=True,
+                feature_id="feat-1",
+                session_key="implementer:feat-1",
+            )
+
+        assert run_called is False
+
+    def test_bound_codex_write_authority_accepts_manifest_matched_binding(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ):
+        runtime = self._runtime(monkeypatch)
+        sandbox_root = tmp_path / "sandbox"
+        cwd = sandbox_root / "repos" / "app"
+        cwd.mkdir(parents=True)
+        manifest_path = _write_sandbox_manifest(sandbox_root, cwd)
+        role = Role(
+            name="implementer",
+            prompt="Fix it.",
+            tools=["Read", "Write"],
+            metadata={
+                "runtime_workspace_binding": {
+                    "sandbox_id": "sandbox-04",
+                    "runtime": "codex",
+                    "cwd": str(cwd),
+                    "workspace_override": str(cwd),
+                    "repo_roots": {"app": str(cwd)},
+                    "writable_roots": [str(cwd)],
+                    "blocked_roots": [],
+                    "manifest_path": str(manifest_path),
+                    "expires_at": "2999-01-01T00:00:00+00:00",
+                }
+            },
+        )
+
+        authority = runtime._bound_runtime_authority(role, SimpleNamespace(path=str(cwd)))
+
+        assert authority.cwd == cwd.resolve()
+        assert cwd.resolve() in authority.writable_roots
+
+    @pytest.mark.parametrize(
+        ("mutate", "message"),
+        [
+            (lambda binding, canonical: binding.update({"cwd": str(canonical)}), "workspace does not match binding cwd"),
+            (
+                lambda binding, canonical: binding.update({"writable_roots": [str(canonical)]}),
+                "binding writable root is outside sandbox root|binding writable roots do not match manifest",
+            ),
+        ],
+    )
+    def test_bound_codex_write_authority_rejects_stale_or_tampered_binding(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        mutate,
+        message: str,
+    ):
+        runtime = self._runtime(monkeypatch)
+        sandbox_root = tmp_path / "sandbox"
+        cwd = sandbox_root / "repos" / "app"
+        cwd.mkdir(parents=True)
+        canonical = tmp_path / "canonical" / "app"
+        canonical.mkdir(parents=True)
+        manifest_path = _write_sandbox_manifest(sandbox_root, cwd)
+        binding = {
+            "sandbox_id": "sandbox-04",
+            "runtime": "codex",
+            "cwd": str(cwd),
+            "workspace_override": str(cwd),
+            "repo_roots": {"app": str(cwd)},
+            "writable_roots": [str(cwd)],
+            "blocked_roots": [str(canonical)],
+            "manifest_path": str(manifest_path),
+            "expires_at": "2999-01-01T00:00:00+00:00",
+        }
+        mutate(binding, canonical)
+        role = Role(
+            name="implementer",
+            prompt="Fix it.",
+            tools=["Read", "Write"],
+            metadata={"runtime_workspace_binding": binding},
+        )
+
+        with pytest.raises(RuntimeError, match=message):
+            runtime._bound_runtime_authority(role, SimpleNamespace(path=str(cwd)))
+
+    def test_bound_codex_write_authority_rejects_symlinked_cwd(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ):
+        runtime = self._runtime(monkeypatch)
+        sandbox_root = tmp_path / "sandbox"
+        real_cwd = sandbox_root / "repos" / "app"
+        real_cwd.mkdir(parents=True)
+        link_cwd = sandbox_root / "repos" / "link-app"
+        link_cwd.symlink_to(real_cwd, target_is_directory=True)
+        manifest_path = _write_sandbox_manifest(sandbox_root, real_cwd)
+        role = Role(
+            name="implementer",
+            prompt="Fix it.",
+            tools=["Read", "Write"],
+            metadata={
+                "runtime_workspace_binding": {
+                    "sandbox_id": "sandbox-04",
+                    "runtime": "codex",
+                    "cwd": str(link_cwd),
+                    "workspace_override": str(link_cwd),
+                    "repo_roots": {"app": str(real_cwd)},
+                    "writable_roots": [str(real_cwd)],
+                    "blocked_roots": [],
+                    "manifest_path": str(manifest_path),
+                    "expires_at": "2999-01-01T00:00:00+00:00",
+                }
+            },
+        )
+
+        with pytest.raises(RuntimeError, match="binding cwd is symlinked"):
+            runtime._bound_runtime_authority(role, SimpleNamespace(path=str(link_cwd)))
 
 
 class TestCodexHomeIsolation:
@@ -707,6 +1331,48 @@ class TestCodexHomeIsolation:
         auth_link = Path(codex_home) / "auth.json"
         assert auth_link.exists()
         assert auth_link.read_text() == '{"auth_mode": "test"}'
+
+        shutil.rmtree(codex_home)
+
+    def test_prepare_codex_home_copies_auth_for_bound_runtime(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path,
+    ):
+        runtime = self._runtime(monkeypatch)
+        runtime._global_codex_config = {}
+
+        fake_global_home = tmp_path / "global_codex"
+        fake_global_home.mkdir()
+        auth = fake_global_home / "auth.json"
+        auth.write_text('{"auth_mode": "test"}')
+        monkeypatch.setenv("CODEX_HOME", str(fake_global_home))
+
+        sandbox_root = tmp_path / "sandbox"
+        cwd = sandbox_root / "repos" / "app"
+        artifact_root = sandbox_root / ".iriai" / "runtime" / "codex"
+        cwd.mkdir(parents=True)
+        artifact_root.mkdir(parents=True)
+        role = Role(name="impl", prompt="Do it", tools=["Write"])
+        authority = codex_mod._BoundRuntimeAuthority(
+            cwd=cwd.resolve(),
+            sandbox_root=sandbox_root.resolve(),
+            writable_roots=(cwd.resolve(),),
+            blocked_roots=(),
+            artifact_roots=(artifact_root.resolve(),),
+        )
+
+        codex_home = runtime._prepare_codex_home(
+            role,
+            SimpleNamespace(path=str(cwd)),
+            authority=authority,
+            temp_dir=str(artifact_root),
+        )
+
+        auth_copy = Path(codex_home) / "auth.json"
+        assert auth_copy.exists()
+        assert not auth_copy.is_symlink()
+        assert auth_copy.read_text() == '{"auth_mode": "test"}'
 
         shutil.rmtree(codex_home)
 

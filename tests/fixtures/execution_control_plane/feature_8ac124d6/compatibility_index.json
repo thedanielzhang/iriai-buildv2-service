@@ -1,0 +1,92 @@
+{
+  "feature_id": "8ac124d6",
+  "indexes": [
+    {
+      "artifact_ids": [
+        "art_8ac124d6_000017"
+      ],
+      "prefix": "checkpoint"
+    },
+    {
+      "artifact_ids": [
+        "art_8ac124d6_000006",
+        "art_8ac124d6_000007",
+        "art_8ac124d6_000008",
+        "art_8ac124d6_000020"
+      ],
+      "prefix": "dag-commit-failure"
+    },
+    {
+      "artifact_ids": [
+        "art_8ac124d6_000021"
+      ],
+      "prefix": "dag-merge-queue"
+    },
+    {
+      "artifact_ids": [
+        "art_8ac124d6_000009",
+        "art_8ac124d6_000010"
+      ],
+      "prefix": "dag-group"
+    },
+    {
+      "artifact_ids": [
+        "art_8ac124d6_000011",
+        "art_8ac124d6_000012"
+      ],
+      "prefix": "dag-regroup"
+    },
+    {
+      "artifact_ids": [
+        "art_8ac124d6_000001",
+        "art_8ac124d6_000002",
+        "art_8ac124d6_000003"
+      ],
+      "prefix": "dag-task"
+    },
+    {
+      "artifact_ids": [
+        "art_8ac124d6_000004",
+        "art_8ac124d6_000005"
+      ],
+      "prefix": "dag-verify"
+    },
+    {
+      "artifact_ids": [
+        "art_8ac124d6_000016"
+      ],
+      "prefix": "direct-route"
+    },
+    {
+      "artifact_ids": [
+        "art_8ac124d6_000019"
+      ],
+      "prefix": "legacy-consumer"
+    },
+    {
+      "artifact_ids": [
+        "art_8ac124d6_000014"
+      ],
+      "prefix": "preflight"
+    },
+    {
+      "artifact_ids": [
+        "art_8ac124d6_000015"
+      ],
+      "prefix": "projection"
+    },
+    {
+      "artifact_ids": [
+        "art_8ac124d6_000018"
+      ],
+      "prefix": "runtime-provider"
+    },
+    {
+      "artifact_ids": [
+        "art_8ac124d6_000013"
+      ],
+      "prefix": "workspace-alias"
+    }
+  ],
+  "schema_version": 1
+}

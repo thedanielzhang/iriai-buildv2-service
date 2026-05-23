@@ -187,6 +187,7 @@ class Notify(Task):
     """One-way notification that never creates interactive pending state."""
 
     message: str
+    delivery_id: str = ""
 
     async def execute(
         self,
@@ -198,11 +199,18 @@ class Notify(Task):
         runtime = runtimes.get("terminal") or next(iter(runtimes.values()), None)
         notify = getattr(runtime, "notify", None)
         if callable(notify):
-            await notify(
-                feature_id=feature.id,
-                phase_name=_current_phase_name(kwargs.get("phase_name")),
-                message=self.message,
-            )
+            payload = {
+                "feature_id": feature.id,
+                "phase_name": _current_phase_name(kwargs.get("phase_name")),
+                "message": self.message,
+            }
+            if self.delivery_id:
+                payload["delivery_id"] = self.delivery_id
+            try:
+                await notify(**payload)
+            except TypeError:
+                payload.pop("delivery_id", None)
+                await notify(**payload)
             return
         print(self.message)
 

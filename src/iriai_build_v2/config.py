@@ -19,6 +19,12 @@ BUDGET_TIERS = {
 # ── MCP Server Definitions ──────────────────────────────────────────────────
 
 IRIAI_ROOT = Path(os.environ.get("IRIAI_ROOT", Path.home() / "src" / "iriai"))
+IRIAI_BUILD_V2_SRC = Path(__file__).resolve().parent.parent
+IRIAI_BUILD_V2_PYTHONPATH = os.pathsep.join(
+    item
+    for item in (str(IRIAI_BUILD_V2_SRC), os.environ.get("PYTHONPATH", ""))
+    if item
+)
 
 MCP_SERVERS = {
     "playwright": {
@@ -57,6 +63,16 @@ MCP_SERVERS = {
         "command": "python",
         "args": ["-m", "preview.mcp_server"],
         "env": {"RAILWAY_TOKEN": os.environ.get("RAILWAY_TOKEN", "")},
+    },
+    "supervisor-evidence": {
+        "type": "stdio",
+        "command": "python",
+        "args": ["-m", "iriai_build_v2.supervisor.mcp_server"],
+        "env": {
+            "DATABASE_URL": DATABASE_URL,
+            "IRIAI_DASHBOARD_BASE_URL": DASHBOARD_BASE_URL,
+            "PYTHONPATH": IRIAI_BUILD_V2_PYTHONPATH,
+        },
     },
 }
 

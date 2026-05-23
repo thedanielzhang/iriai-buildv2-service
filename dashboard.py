@@ -9,6 +9,7 @@ import asyncio
 import asyncio.subprocess
 import collections
 import json
+import logging
 import os
 from pathlib import Path
 import re
@@ -23,6 +24,23 @@ from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 import uvicorn
 
+from iriai_build_v2.execution_control.store import ExecutionControlStore
+from iriai_build_v2.workflows.develop.execution.snapshots import (
+    ControlPlaneSnapshot,
+    ControlPlaneSnapshotQuery,
+    SnapshotBudget,
+)
+from iriai_build_v2.public_dashboard import (
+    PublicDashboardOutbox,
+    project_control_plane_snapshot_if_changed,
+)
+from iriai_build_v2.storage.artifacts import (
+    _SPILL_SQL_PREFIX,
+    _content_ref_from_stored_value,
+    _read_spilled_slice,
+    _spilled_ref_size_matches,
+    _summary_stored_bytes,
+)
 from iriai_build_v2.workflows.bugfix_v2.proof import feature_root_from_workspace
 from iriai_build_v2.runtime_policy import (
     DEFAULT_RUNTIME_POLICY,
@@ -30,10 +48,60 @@ from iriai_build_v2.runtime_policy import (
     SUPPORTED_RUNTIME_POLICIES,
 )
 
+logger = logging.getLogger(__name__)
+
 DATABASE_URL = os.environ.get(
     "DATABASE_URL",
     "postgresql://danielzhang@localhost:5431/iriai_build_v2",
 )
+
+
+def _bounded_int_env(
+    name: str,
+    default: int,
+    *,
+    minimum: int = 1,
+    maximum: int | None = None,
+) -> int:
+    try:
+        value = int(os.environ.get(name, str(default)) or default)
+    except (TypeError, ValueError):
+        value = default
+    value = max(minimum, value)
+    if maximum is not None:
+        value = min(maximum, value)
+    return value
+
+
+DASHBOARD_STRUCTURED_ARTIFACT_PREVIEW_CHARS = _bounded_int_env(
+    "IRIAI_DASHBOARD_STRUCTURED_ARTIFACT_PREVIEW_CHARS",
+    120_000,
+    maximum=240_000,
+)
+DASHBOARD_ARTIFACT_PREVIEW_CHARS = _bounded_int_env(
+    "IRIAI_DASHBOARD_ARTIFACT_PREVIEW_CHARS",
+    16_000,
+    maximum=120_000,
+)
+DASHBOARD_TIMELINE_PREVIEW_CHARS = _bounded_int_env(
+    "IRIAI_DASHBOARD_TIMELINE_PREVIEW_CHARS",
+    8_000,
+    maximum=120_000,
+)
+DASHBOARD_TIMELINE_ROWS = _bounded_int_env(
+    "IRIAI_DASHBOARD_TIMELINE_ROWS",
+    200,
+    maximum=500,
+)
+DASHBOARD_EVENT_PREVIEW_CHARS = _bounded_int_env(
+    "IRIAI_DASHBOARD_EVENT_PREVIEW_CHARS",
+    4_000,
+    maximum=40_000,
+)
+BRIDGE_LOG_BUFFER_LINES = _bounded_int_env("IRIAI_BRIDGE_LOG_BUFFER_LINES", 1_000, maximum=5_000)
+BRIDGE_LOG_LINE_CHARS = _bounded_int_env("IRIAI_BRIDGE_LOG_LINE_CHARS", 2_000, maximum=10_000)
+BRIDGE_LOG_RESPONSE_LINES = _bounded_int_env("IRIAI_BRIDGE_LOG_RESPONSE_LINES", 500, maximum=5_000)
+_BRIDGE_LOG_READ_CHUNK = 64 * 1024
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
@@ -47,8 +115,9 @@ class BridgeManager:
     def __init__(self, config: dict[str, str | bool | int | None]) -> None:
         self.config = config
         self.process: asyncio.subprocess.Process | None = None
-        self.lines: collections.deque[str] = collections.deque(maxlen=5000)
+        self.lines: collections.deque[str] = collections.deque(maxlen=BRIDGE_LOG_BUFFER_LINES)
         self.line_count: int = 0
+        self.truncated_line_count: int = 0
         self.subscribers: list[asyncio.Queue[str]] = []
         self._reader_task: asyncio.Task | None = None
 
@@ -122,15 +191,66 @@ class BridgeManager:
 
     async def _read_output(self) -> None:
         assert self.process and self.process.stdout
-        async for raw in self.process.stdout:
-            line = _ANSI_RE.sub("", raw.decode("utf-8", errors="replace").rstrip("\n"))
-            # Also print to dashboard's own stderr so the operator can see it
-            print(line, file=sys.stderr, flush=True)
-            self._append_line(line)
+        pending = ""
+        truncated_chars = 0
+        while True:
+            raw = await self.process.stdout.read(_BRIDGE_LOG_READ_CHUNK)
+            if not raw:
+                break
+            text = _ANSI_RE.sub("", raw.decode("utf-8", errors="replace"))
+            while text:
+                newline = text.find("\n")
+                if newline < 0:
+                    pending, truncated_chars = self._append_log_fragment(
+                        pending,
+                        truncated_chars,
+                        text,
+                    )
+                    break
+                fragment = text[:newline].rstrip("\r")
+                pending, truncated_chars = self._append_log_fragment(
+                    pending,
+                    truncated_chars,
+                    fragment,
+                )
+                self._emit_log_line(pending, truncated_chars)
+                pending = ""
+                truncated_chars = 0
+                text = text[newline + 1 :]
+        if pending or truncated_chars:
+            self._emit_log_line(pending, truncated_chars)
         rc = self.process.returncode
         self._append_line(f"{time.strftime('%H:%M:%S')} --- BRIDGE EXITED (code={rc}) ---")
 
-    def _append_line(self, line: str) -> None:
+    def _append_log_fragment(
+        self,
+        pending: str,
+        truncated_chars: int,
+        fragment: str,
+    ) -> tuple[str, int]:
+        if not fragment:
+            return pending, truncated_chars
+        remaining = max(0, BRIDGE_LOG_LINE_CHARS - len(pending))
+        if remaining:
+            pending += fragment[:remaining]
+        if len(fragment) > remaining:
+            truncated_chars += len(fragment) - remaining
+        return pending, truncated_chars
+
+    def _emit_log_line(self, line: str, truncated_chars: int = 0) -> None:
+        if truncated_chars > 0:
+            line = f"{line} ... [truncated bridge log line by {truncated_chars} chars]"
+        # Also print to dashboard's own stderr so the operator can see it.
+        print(line, file=sys.stderr, flush=True)
+        self._append_line(line, already_capped=True)
+
+    def _append_line(self, line: str, *, already_capped: bool = False) -> None:
+        if not already_capped and len(line) > BRIDGE_LOG_LINE_CHARS:
+            self.truncated_line_count += 1
+            omitted = len(line) - BRIDGE_LOG_LINE_CHARS
+            line = f"{line[:BRIDGE_LOG_LINE_CHARS]} ... [truncated bridge log line by {omitted} chars]"
+        elif already_capped and "truncated bridge log line" in line:
+            self.truncated_line_count += 1
         self.lines.append(line)
         self.line_count += 1
         for q in self.subscribers:
@@ -144,6 +264,11 @@ class BridgeManager:
             "exit_code": self.process.returncode if self.process else None,
             "line_count": self.line_count,
             "buffer_size": len(self.lines),
+            "earliest_cursor": max(0, self.line_count - len(self.lines)),
+            "truncated_line_count": self.truncated_line_count,
+            "line_char_cap": BRIDGE_LOG_LINE_CHARS,
+            "buffer_line_cap": BRIDGE_LOG_BUFFER_LINES,
+            "response_line_cap": BRIDGE_LOG_RESPONSE_LINES,
             "dashboard_base_url": self.config.get("dashboard_base_url"),
             "concurrency_max": self.config.get("concurrency_max"),
             "slack_verbosity": self.config.get("slack_verbosity"),
@@ -211,6 +336,16 @@ async def _shutdown():
 
 _CACHE_TTL = 3.0  # seconds
 _response_cache: dict[str, tuple[float, str, dict]] = {}  # feature_id → (ts, etag, data)
+
+# Slice 10g-1 (doc 10 step 11 — the atomic landing). The last typed
+# `control_plane.snapshot_changed` outbox version this process has projected,
+# per feature. `project_control_plane_snapshot_if_changed` no-ops when the
+# freshly-read typed snapshot version equals the stored value, so a steady
+# stream of dashboard polls enqueues exactly ONE public display event per
+# typed-snapshot-version advance (the enqueue is also idempotent on
+# `(feature_id, snapshot_version)` at the DB, so this in-process cache is a
+# poll-rate optimisation, not the correctness boundary).
+_projected_snapshot_versions: dict[str, str] = {}  # feature_id → last projected version
 _UI_DIST = Path(__file__).resolve().parent / "dashboard-ui" / "dist"
 _BUGFLOW_HEALTHS = {
     "idle", "running", "fix-loop", "awaiting-user", "blocked", "degraded", "complete-ish", "complete",
@@ -247,6 +382,36 @@ _EXHIBIT_SOURCE_KEYS = {
     "dag:strategy",
     "enhancement-backlog",
 }
+DAG_READINESS_GATE_NAMES = [
+    "code-review",
+    "security",
+    "test-authoring",
+    "qa",
+    "integration",
+    "verifier",
+    "source-push",
+    "implementation-report",
+    "notify",
+]
+CONTROL_PLANE_ATTEMPT_LIMIT = _bounded_int_env("IRIAI_CONTROL_PLANE_ATTEMPT_LIMIT", 20, maximum=100)
+CONTROL_PLANE_FAILURE_LIMIT = _bounded_int_env("IRIAI_CONTROL_PLANE_FAILURE_LIMIT", 20, maximum=100)
+CONTROL_PLANE_WORKSPACE_LIMIT = _bounded_int_env("IRIAI_CONTROL_PLANE_WORKSPACE_LIMIT", 20, maximum=100)
+CONTROL_PLANE_SANDBOX_LIMIT = _bounded_int_env("IRIAI_CONTROL_PLANE_SANDBOX_LIMIT", 20, maximum=100)
+CONTROL_PLANE_GATE_LIMIT = _bounded_int_env("IRIAI_CONTROL_PLANE_GATE_LIMIT", 40, maximum=200)
+CONTROL_PLANE_PROJECTION_LIMIT = _bounded_int_env("IRIAI_CONTROL_PLANE_PROJECTION_LIMIT", 40, maximum=200)
+
+# Slice 10b — embedded typed `control_plane` object row caps. The embedded
+# object in `/api/feature/{id}` is a COMPACT view of the typed snapshot; the
+# full bounded typed snapshot is at `/api/feature/{id}/control-plane`.
+# These caps only SHRINK the already-bounded typed snapshot lists for the
+# overview surface — they never widen a store read (the store query budget is
+# clamped to its own ceiling by `ControlPlaneSnapshotQuery`).
+CONTROL_PLANE_TYPED_EMBED_ATTEMPTS = _bounded_int_env(
+    "IRIAI_CONTROL_PLANE_TYPED_EMBED_ATTEMPTS", 6, maximum=20
+)
+CONTROL_PLANE_TYPED_EMBED_ROWS = _bounded_int_env(
+    "IRIAI_CONTROL_PLANE_TYPED_EMBED_ROWS", 6, maximum=40
+)
 
 
 def _evict_stale_cache() -> None:
@@ -266,7 +431,9 @@ async def get_feature(feature_id: str, request: Request):
     _evict_stale_cache()
 
     async with pool.acquire() as conn:
-        # 0. Lightweight version check for ETag
+        # 0. Lightweight legacy version check for ETag. Keep this query
+        # compatible with pre-control-plane schemas; typed state is versioned
+        # through the store-owned bounded snapshot below.
         version = await conn.fetchrow(
             "SELECT f.updated_at, "
             "  COALESCE((SELECT MAX(id) FROM artifacts WHERE feature_id = $1), 0) AS max_art, "
@@ -281,11 +448,56 @@ async def get_feature(feature_id: str, request: Request):
         if not version:
             raise HTTPException(404, f"Feature {feature_id!r} not found")
 
-        etag = f'"{version["updated_at"]}:{version["max_art"]}:{version["max_evt"]}"'
+        # Slice 10b: the typed control-plane snapshot + its version digest.
+        # doc 10 § "Dashboard Integration Points" step 6: the typed
+        # `ControlPlaneSnapshot` is the single control-plane contract — the
+        # `/api/feature/{id}` response embeds the compact typed `control_plane`
+        # object and the typed snapshot version extends the ETag composition so
+        # a control-plane-only change — a new attempt row, a sandbox-only
+        # update — refreshes the UI WITHOUT waiting for an artifact/event
+        # write. The typed snapshot is a bounded read of typed rows only (no
+        # artifact bodies). On a snapshot-builder failure the call degrades
+        # gracefully (empty snapshot + "" version) — see
+        # `_typed_control_plane_snapshot` — so the route never 500s.
+        typed_control_plane = await _typed_control_plane_snapshot(
+            conn, _typed_snapshot_query(feature_id)
+        )
+        typed_control_plane_version = str(
+            typed_control_plane.get("snapshot_version") or ""
+        )
+        last_activity_token = (
+            version["last_activity_at"].isoformat()
+            if version["last_activity_at"]
+            else ""
+        )
+        etag = (
+            f'"{version["updated_at"]}:{version["max_art"]}:{version["max_evt"]}:'
+            f'{last_activity_token}:{typed_control_plane_version}"'
+        )
         last_activity_at = (
             version["last_activity_at"].isoformat()
             if version["last_activity_at"]
             else None
+        )
+
+        # Slice 10g-1 (doc 10 step 11 — the atomic landing): mirror a bounded
+        # `control_plane.snapshot_changed` display event when the typed
+        # snapshot version advances. doc 10 § "Dashboard Integration Points":
+        # "Public dashboard mirroring emits a bounded
+        # `control_plane.snapshot_changed` outbox event ... It does not publish
+        # private evidence bodies." This is the production caller of the
+        # Slice-10f projection driver — wired at the dashboard ETag path, the
+        # natural snapshot-version-advance observation point. The driver
+        # no-ops when the outbox is disabled (the production default) and when
+        # the typed version is unchanged, so a steady poll stream enqueues
+        # exactly one public event per version advance. A display-outbox
+        # enqueue failure is LOGGED and the dashboard read still serves — this
+        # is a read path with no typed-write transaction to keep consistent
+        # (doc 10 § "Edge Cases": "Public dashboard async delivery failure ...
+        # log and continue. Private dashboard and supervisor still read the
+        # typed snapshot directly.").
+        await _project_control_plane_snapshot_event(
+            conn, feature_id, typed_control_plane_version
         )
 
         # Check If-None-Match
@@ -315,28 +527,54 @@ async def get_feature(feature_id: str, request: Request):
         artifact_meta_rows: list[asyncpg.Record] = []
         if feat["workflow_name"] == "bugfix-v2":
             rows = await conn.fetch(
-                "SELECT DISTINCT ON (key) key, value, created_at "
+                f"SELECT DISTINCT ON (key) key, "
+                f"substring(value from 1 for $2) AS value, "
+                f"char_length(value)::bigint AS total_chars, "
+                f"pg_column_size(value)::bigint AS stored_bytes, "
+                f"CASE WHEN value LIKE {_SPILL_SQL_PREFIX} THEN value ELSE NULL END AS content_ref, "
+                f"(char_length(value) > $2) AS value_truncated, "
+                f"created_at "
                 "FROM artifacts WHERE feature_id = $1 "
                 "AND (key LIKE 'bugflow-%' OR key LIKE 'bug-%' "
                 "     OR key LIKE 'obs-verdict:%' OR key LIKE 'contradiction:%') "
                 "ORDER BY key, id DESC",
                 feature_id,
+                DASHBOARD_ARTIFACT_PREVIEW_CHARS,
             )
             timeline_rows = await conn.fetch(
-                "SELECT key, value, created_at FROM artifacts "
+                f"SELECT key, substring(value from 1 for $2) AS value, "
+                f"char_length(value)::bigint AS total_chars, "
+                f"pg_column_size(value)::bigint AS stored_bytes, "
+                f"CASE WHEN value LIKE {_SPILL_SQL_PREFIX} THEN value ELSE NULL END AS content_ref, "
+                f"(char_length(value) > $2) AS value_truncated, "
+                f"created_at FROM artifacts "
                 "WHERE feature_id = $1 "
                 "AND (key LIKE 'bugflow-%' OR key LIKE 'bug-%' "
                 "     OR key LIKE 'obs-verdict:%' OR key LIKE 'contradiction:%') "
-                "ORDER BY created_at DESC LIMIT 250",
+                "ORDER BY created_at DESC LIMIT $3",
                 feature_id,
+                DASHBOARD_TIMELINE_PREVIEW_CHARS,
+                DASHBOARD_TIMELINE_ROWS,
             )
         else:
             # 2. Latest artifacts (append-only: latest = highest id per key)
             rows = await conn.fetch(
-                "SELECT DISTINCT ON (key) key, value, created_at "
+                f"SELECT DISTINCT ON (key) key, "
+                f"substring(value from 1 for "
+                f"CASE WHEN (key = 'dag' OR key = 'dag:strategy' OR key LIKE 'dag:%') "
+                f"THEN $2 ELSE $3 END) AS value, "
+                f"char_length(value)::bigint AS total_chars, "
+                f"pg_column_size(value)::bigint AS stored_bytes, "
+                f"CASE WHEN value LIKE {_SPILL_SQL_PREFIX} THEN value ELSE NULL END AS content_ref, "
+                f"(char_length(value) > "
+                f"CASE WHEN (key = 'dag' OR key = 'dag:strategy' OR key LIKE 'dag:%') "
+                f"THEN $2 ELSE $3 END) AS value_truncated, "
+                f"created_at "
                 "FROM artifacts WHERE feature_id = $1 "
                 "AND (key LIKE 'dag%' OR key LIKE 'bug-%' "
                 "     OR key LIKE 'dag-repair-%' "
+                "     OR key LIKE 'workspace-authority-%' "
+                "     OR key LIKE 'runtime-workspace-binding:%' "
                 "     OR key LIKE 'contradiction:dag-repair:%' "
                 "     OR key LIKE 'contradiction-rejected:dag-repair:%' "
                 "     OR key LIKE 'public-%' "
@@ -347,6 +585,8 @@ async def get_feature(feature_id: str, request: Request):
                 "     OR key = 'implementation' OR key = 'handover') "
                 "ORDER BY key, id DESC",
                 feature_id,
+                DASHBOARD_STRUCTURED_ARTIFACT_PREVIEW_CHARS,
+                DASHBOARD_ARTIFACT_PREVIEW_CHARS,
             )
             artifact_meta_rows = await conn.fetch(
                 "SELECT DISTINCT ON (key) key, created_at "
@@ -358,6 +598,8 @@ async def get_feature(feature_id: str, request: Request):
                 "     OR key LIKE 'decomposition%' OR key LIKE 'artifact-audit%' "
                 "     OR key LIKE 'artifact-backfill%' OR key LIKE 'planning-index%' "
                 "     OR key LIKE 'gate-review%' "
+                "     OR key LIKE 'workspace-authority-%' "
+                "     OR key LIKE 'runtime-workspace-binding:%' "
                 "     OR key IN ('project', 'scope', 'dag', 'dag:strategy', 'implementation', 'handover')) "
                 "ORDER BY key, id DESC",
                 feature_id,
@@ -365,26 +607,64 @@ async def get_feature(feature_id: str, request: Request):
 
             # 3. All verify/bug artifacts with full history (for timeline)
             timeline_rows = await conn.fetch(
-                "SELECT key, value, created_at FROM artifacts "
+                f"SELECT key, substring(value from 1 for $2) AS value, "
+                f"char_length(value)::bigint AS total_chars, "
+                f"pg_column_size(value)::bigint AS stored_bytes, "
+                f"CASE WHEN value LIKE {_SPILL_SQL_PREFIX} THEN value ELSE NULL END AS content_ref, "
+                f"(char_length(value) > $2) AS value_truncated, "
+                f"created_at FROM artifacts "
                 "WHERE feature_id = $1 "
                 "AND (key LIKE 'dag-verify:%' OR key LIKE 'dag-fix:%' OR key LIKE 'dag-verify-rca:%' "
                 "     OR key LIKE 'dag-repair-%' "
+                "     OR key LIKE 'dag-task-contract:%' "
+                "     OR key LIKE 'dag-contract-verdict:%' "
+                "     OR key LIKE 'dag-sandbox-patch:%' "
+                "     OR key LIKE 'workspace-authority-%' "
+                "     OR key LIKE 'runtime-workspace-binding:%' "
                 "     OR key LIKE 'contradiction:dag-repair:%' "
                 "     OR key LIKE 'contradiction-rejected:dag-repair:%' "
                 "     OR key LIKE 'public-%' "
                 "     OR key LIKE 'bug-%' OR key LIKE '%-verdict') "
-                "ORDER BY created_at DESC LIMIT 500",
+                "ORDER BY created_at DESC LIMIT $3",
                 feature_id,
+                DASHBOARD_TIMELINE_PREVIEW_CHARS,
+                DASHBOARD_TIMELINE_ROWS,
             )
+
+        if feat["workflow_name"] == "bugfix-v2":
+            rows = [
+                _dashboard_artifact_preview_row(row, DASHBOARD_ARTIFACT_PREVIEW_CHARS)
+                for row in rows
+            ]
+            timeline_rows = [
+                _dashboard_artifact_preview_row(row, DASHBOARD_TIMELINE_PREVIEW_CHARS)
+                for row in timeline_rows
+            ]
+        else:
+            rows = [
+                _dashboard_artifact_preview_row(
+                    row,
+                    _dashboard_artifact_preview_limit(str(_row_get(row, "key") or "")),
+                )
+                for row in rows
+            ]
+            timeline_rows = [
+                _dashboard_artifact_preview_row(row, DASHBOARD_TIMELINE_PREVIEW_CHARS)
+                for row in timeline_rows
+            ]
 
         # 4. Recent events
         events = await conn.fetch(
-            "SELECT event_type, source, content, created_at "
+            "SELECT event_type, source, "
+            "substring(content from 1 for $2) AS content, "
+            "COALESCE(pg_column_size(content), 0)::bigint AS content_bytes, "
+            "(char_length(content) > $2) AS content_truncated, "
+            "created_at "
             "FROM events WHERE feature_id = $1 "
             "ORDER BY created_at DESC LIMIT 250",
             feature_id,
+            DASHBOARD_EVENT_PREVIEW_CHARS,
         )
-
     if feat["workflow_name"] == "bugfix-v2":
         result = _assemble_bugflow_response(
             feat=feat,
@@ -394,6 +674,7 @@ async def get_feature(feature_id: str, request: Request):
             feature_id=feature_id,
             last_activity_at=last_activity_at,
             request_base_url=str(request.base_url).rstrip("/"),
+            control_plane=_compact_typed_control_plane(typed_control_plane),
         )
         _response_cache[feature_id] = (time.monotonic(), etag, result)
         return Response(
@@ -404,57 +685,72 @@ async def get_feature(feature_id: str, request: Request):
 
     # ── Assemble response ───────────────────────────────────────────
     artifacts: dict[str, tuple[str, str]] = {}  # key → (value, created_at)
+    truncated_artifact_keys: set[str] = set()
     for r in rows:
         artifacts[r["key"]] = (r["value"], r["created_at"].isoformat())
+        if bool(_row_get(r, "value_truncated", False)):
+            truncated_artifact_keys.add(r["key"])
     artifact_catalog = dict(artifacts)
     for r in artifact_meta_rows:
         artifact_catalog.setdefault(r["key"], ("", r["created_at"].isoformat()))
 
+    def complete_artifact_json(key: str) -> dict[str, Any]:
+        if key in truncated_artifact_keys:
+            return {}
+        return _safe_dict(artifacts.get(key, ("", ""))[0])
+
     # Parse DAG
     dag_info = None
+    tasks_by_id: dict[str, dict[str, Any]] = {}
     if "dag" in artifacts:
-        try:
-            dag = json.loads(artifacts["dag"][0])
-            tasks_by_id = {t["id"]: t for t in dag.get("tasks", [])}
-            exec_order = dag.get("execution_order", [])
+        dag = complete_artifact_json("dag")
+        tasks = dag.get("tasks") if isinstance(dag.get("tasks"), list) else []
+        exec_order = dag.get("execution_order") if isinstance(dag.get("execution_order"), list) else []
+        if dag and tasks is not None and exec_order is not None:
+            tasks_by_id = {
+                str(t["id"]): t
+                for t in tasks
+                if isinstance(t, dict) and t.get("id") not in (None, "")
+            }
             dag_info = {
-                "total_tasks": len(dag.get("tasks", [])),
+                "total_tasks": len(tasks),
                 "total_groups": len(exec_order),
                 "execution_order": exec_order,
             }
-        except (json.JSONDecodeError, KeyError):
-            pass
 
     # Workstreams
     workstreams_list = []
     if "dag:strategy" in artifacts:
-        try:
-            ws_data = json.loads(artifacts["dag:strategy"][0])
-            for ws in ws_data.get("workstreams", []):
-                total = 0
-                completed = 0
-                for slug in ws.get("subfeature_slugs", []):
-                    sf_key = f"dag:{slug}"
-                    if sf_key in artifacts:
-                        try:
-                            sf_dag = json.loads(artifacts[sf_key][0])
-                            sf_tasks = sf_dag.get("tasks", [])
-                            total += len(sf_tasks)
-                            for t in sf_tasks:
-                                if f"dag-task:{t['id']}" in artifacts:
-                                    completed += 1
-                        except (json.JSONDecodeError, KeyError):
-                            pass
-                workstreams_list.append({
-                    "id": ws.get("id", ""),
-                    "name": ws.get("name", ""),
-                    "subfeature_slugs": ws.get("subfeature_slugs", []),
-                    "depends_on": ws.get("depends_on", []),
-                    "total_tasks": total,
-                    "completed_tasks": completed,
-                })
-        except (json.JSONDecodeError, KeyError):
-            pass
+        ws_data = complete_artifact_json("dag:strategy")
+        workstreams = ws_data.get("workstreams") if isinstance(ws_data.get("workstreams"), list) else []
+        for ws in workstreams:
+            if not isinstance(ws, dict):
+                continue
+            total = 0
+            completed = 0
+            for slug in ws.get("subfeature_slugs", []):
+                sf_key = f"dag:{slug}"
+                if sf_key in artifacts:
+                    sf_dag = complete_artifact_json(sf_key)
+                    sf_tasks = sf_dag.get("tasks", []) if sf_dag else []
+                    if not isinstance(sf_tasks, list):
+                        continue
+                    total += len(sf_tasks)
+                    for t in sf_tasks:
+                        if (
+                            isinstance(t, dict)
+                            and t.get("id") not in (None, "")
+                            and f"dag-task:{t['id']}" in artifacts
+                        ):
+                            completed += 1
+            workstreams_list.append({
+                "id": ws.get("id", ""),
+                "name": ws.get("name", ""),
+                "subfeature_slugs": ws.get("subfeature_slugs", []),
+                "depends_on": ws.get("depends_on", []),
+                "total_tasks": total,
+                "completed_tasks": completed,
+            })
 
     # Group statuses
     groups = []
@@ -722,7 +1018,7 @@ async def get_feature(feature_id: str, request: Request):
             dag_info["total_tasks"] += len(enh_task_details)
 
     # Gates
-    gate_names = ["code-review", "security", "test-authoring", "qa", "integration", "verifier"]
+    gate_names = DAG_READINESS_GATE_NAMES
     gates = {}
     for g in gate_names:
         gates[g] = f"dag-gate:{g}" in artifacts
@@ -779,6 +1075,8 @@ async def get_feature(feature_id: str, request: Request):
             "event_type": e["event_type"],
             "source": e["source"],
             "content": e["content"] or "",
+            "content_bytes": _row_get(e, "content_bytes"),
+            "content_truncated": bool(_row_get(e, "content_truncated", False)),
             "created_at": e["created_at"].isoformat(),
         })
 
@@ -832,12 +1130,76 @@ async def get_feature(feature_id: str, request: Request):
         "events": event_list,
         "active_agent": active_agent,
         "public_exhibit": public_exhibit,
+        "control_plane": _compact_typed_control_plane(typed_control_plane),
     }
 
     # Cache and return with ETag
     _response_cache[feature_id] = (time.monotonic(), etag, result)
     return Response(
         content=json.dumps(result, default=str),
+        media_type="application/json",
+        headers={"ETag": etag},
+    )
+
+
+@app.get("/api/feature/{feature_id}/control-plane")
+async def get_feature_control_plane(
+    feature_id: str,
+    request: Request = None,
+    group_idx: int | None = None,
+    scope: str = "dashboard",
+    include_terminal_groups: bool = False,
+    after_snapshot_version: str | None = None,
+):
+    """Return the Slice-10a typed bounded `ControlPlaneSnapshot` for a feature.
+
+    doc 10 § "Dashboard Integration Points" / "Refactoring Steps" step 6: the
+    typed, bounded control-plane API used by the typed dashboard panels (active
+    attempts, workspace/sandbox snapshots, typed failures, retry budgets, merge
+    queue, gates, checkpoints, the supervisor digest) and supervisor tooling.
+    It serves the typed `ControlPlaneSnapshot` built by
+    `ExecutionControlStore.get_control_plane_snapshot`, serialized through
+    stable JSON.
+
+    The typed snapshot IS the `/control-plane` endpoint (doc 10 step 6): there
+    is one typed control-plane contract; the pre-Slice-10 dict-based snapshot
+    is superseded.
+
+    Bounded query parameters map to `ControlPlaneSnapshotQuery`. The query
+    `budget` is the default `SnapshotBudget` ceiling — a caller cannot widen a
+    store read (the model validator clamps every field DOWN to the ceiling).
+    The ETag is the typed `snapshot_version` digest, so a control-plane-only
+    change invalidates a cached response. The response carries SUMMARY-ONLY
+    typed rows + `EvidenceRef` ids; detail panes fetch bounded slices by
+    `EvidenceRef` id via the existing bounded artifact/event detail endpoints.
+    """
+
+    # A negative `group_idx` is nonsensical; reject it with a 422 rather than
+    # silently returning an empty group-scoped snapshot (doc 10 § "Tests":
+    # bounded-query inputs are validated, not coerced).
+    if group_idx is not None and group_idx < 0:
+        raise HTTPException(422, "group_idx must be >= 0")
+    assert pool
+    async with pool.acquire() as conn:
+        feature = await conn.fetchrow(
+            "SELECT id FROM features WHERE id = $1",
+            feature_id,
+        )
+        if not feature:
+            raise HTTPException(404, f"Feature {feature_id!r} not found")
+        query = _typed_snapshot_query(
+            feature_id,
+            scope=scope,
+            group_idx=group_idx,
+            include_terminal_groups=include_terminal_groups,
+            after_snapshot_version=after_snapshot_version,
+        )
+        snapshot = await _typed_control_plane_snapshot(conn, query)
+    etag = f'"control-plane:{snapshot.get("snapshot_version") or ""}"'
+    if request is not None and request.headers.get("if-none-match") == etag:
+        return Response(status_code=304, headers={"ETag": etag})
+    return Response(
+        content=json.dumps(snapshot, default=str),
         media_type="application/json",
         headers={"ETag": etag},
     )
@@ -851,6 +1213,54 @@ def _ensure_iso(value: Any) -> str | None:
     if hasattr(value, "isoformat"):
         return value.isoformat()
     return str(value)
+
+
+def _row_get(row: Any, key: str, default: Any = None) -> Any:
+    try:
+        return row[key]
+    except (KeyError, IndexError, TypeError):
+        return default
+
+
+def _dashboard_artifact_preview_limit(key: str) -> int:
+    if key == "dag" or key == "dag:strategy" or key.startswith("dag:"):
+        return DASHBOARD_STRUCTURED_ARTIFACT_PREVIEW_CHARS
+    return DASHBOARD_ARTIFACT_PREVIEW_CHARS
+
+
+def _dashboard_artifact_preview_row(row: Any, preview_chars: int) -> dict[str, Any]:
+    key = str(_row_get(row, "key") or "")
+    value = str(_row_get(row, "value") or "")
+    stored_bytes = _row_get(row, "stored_bytes")
+    total_chars = int(_row_get(row, "total_chars", len(value)) or len(value))
+    content_ref = _content_ref_from_stored_value(
+        _row_get(row, "content_ref"),
+        verify_hash=False,
+    )
+    if content_ref:
+        total_chars = int(content_ref.get("chars") or content_ref.get("bytes") or 0)
+        stored_bytes = _summary_stored_bytes(stored_bytes, content_ref)
+        value = (
+            _read_spilled_slice(content_ref, start=0, chars=preview_chars)
+            if _spilled_ref_size_matches(content_ref)
+            else ""
+        )
+        value_truncated = total_chars > len(value)
+    else:
+        try:
+            stored_bytes = int(stored_bytes or len(value.encode("utf-8")))
+        except (TypeError, ValueError):
+            stored_bytes = len(value.encode("utf-8"))
+        value_truncated = bool(_row_get(row, "value_truncated", total_chars > len(value)))
+    return {
+        "key": key,
+        "value": value,
+        "total_chars": total_chars,
+        "stored_bytes": stored_bytes,
+        "value_truncated": value_truncated,
+        "created_at": _row_get(row, "created_at"),
+        "content_ref": content_ref,
+    }
 
 
 def _safe_json(value: Any) -> Any | None:
@@ -989,6 +1399,516 @@ def _key_refs_cluster(key: str, cluster_id: str | None) -> bool:
 
 def _artifact_lookup(rows: list[asyncpg.Record]) -> dict[str, tuple[str, str]]:
     return {r["key"]: (r["value"], _ensure_iso(r["created_at"]) or "") for r in rows}
+
+
+# ── Slice 10b — typed control-plane snapshot wiring ─────────────────────────
+#
+# These helpers wire the dashboard onto the Slice-10a typed
+# `ControlPlaneSnapshot` store (`ExecutionControlStore.get_control_plane_
+# snapshot` / `get_control_plane_snapshot_version`). doc 10 § "Refactoring
+# Steps" step 6: the typed `ControlPlaneSnapshot` is the SINGLE control-plane
+# contract — it backs the `/api/feature/{id}/control-plane` route AND the
+# compact `control_plane` object embedded in `/api/feature/{id}`. The
+# pre-Slice-10 dict-based snapshot path is superseded (the Slice-10b
+# remediation reconciled the route + the embedded-object key against doc 10).
+#
+# CONSTRAINT (doc 10 § "Bounded-Read Constraints"): the dashboard reads ONLY
+# the bounded typed snapshot. It introduces NO new unbounded read and NO
+# artifact-body read of its own — every typed panel renders from the typed
+# rows the store already bounded (`LIMIT cap + 1`, `SET LOCAL
+# statement_timeout`, feature/group-scoped, SUMMARY-ONLY).
+
+
+def _typed_snapshot_query(
+    feature_id: str,
+    *,
+    scope: str = "dashboard",
+    group_idx: int | None = None,
+    include_terminal_groups: bool = False,
+    after_snapshot_version: str | None = None,
+) -> ControlPlaneSnapshotQuery:
+    """Build a bounded `ControlPlaneSnapshotQuery` for a dashboard read.
+
+    The `budget` is the default `SnapshotBudget` ceiling — the model validator
+    clamps any field DOWN to the ceiling, so a dashboard request can never
+    widen a store read. `scope` is validated by the typed enum
+    (`dashboard`/`supervisor`/`mcp`); an unknown value falls back to
+    `dashboard` rather than raising a 500 for a caller typo.
+    """
+
+    if scope not in ("dashboard", "supervisor", "mcp"):
+        scope = "dashboard"
+    return ControlPlaneSnapshotQuery(
+        feature_id=feature_id,
+        group_idx=group_idx,
+        after_snapshot_version=after_snapshot_version or None,
+        include_terminal_groups=include_terminal_groups,
+        scope=scope,  # type: ignore[arg-type]
+        budget=SnapshotBudget(),
+    )
+
+
+def _degraded_typed_control_plane(feature_id: str, reason: str) -> dict[str, Any]:
+    """Return a shape-valid empty typed snapshot dict for graceful degradation.
+
+    Built through the typed `ControlPlaneSnapshot` model so the contract shape
+    (fields, types, the `degraded`/`degradation_reasons` invariant) is
+    guaranteed. `snapshot_version=""` so the composed ETag simply omits a typed
+    component — it never 500s.
+    """
+
+    snapshot = ControlPlaneSnapshot(
+        feature_id=feature_id,
+        snapshot_version="",
+        generated_at=datetime.now(timezone.utc),
+        source="legacy_fallback",
+        degraded=True,
+        degradation_reasons=[reason],
+        active_group_idx=None,
+    )
+    return snapshot.model_dump(mode="json")
+
+
+async def _typed_control_plane_snapshot(
+    conn: asyncpg.Connection,
+    query: ControlPlaneSnapshotQuery,
+) -> dict[str, Any]:
+    """Return the typed `ControlPlaneSnapshot` as stable JSON for one query.
+
+    `ExecutionControlStore` is pool-bound; its `_connection()` yields the
+    "pool" directly when the object has no `acquire` method, so the live
+    asyncpg connection is passed as the pool here (the typed snapshot read is
+    one bounded `statement_timeout`-scoped transaction — it does not need its
+    own pooled connection). The builder degrades each section to empty + a
+    `degradation_reasons` entry on a missing-table / timeout error (doc 10 §
+    "Edge Cases"). This wrapper adds a top-level graceful-degrade guard so an
+    UNEXPECTED snapshot-builder failure still yields a shape-valid degraded
+    snapshot (doc 10 § "Edge Cases": "Typed state unavailable: ... degraded
+    ...") — the live route and the `/api/feature/{id}` ETag path never 500 on
+    a control-plane read.
+    """
+
+    try:
+        store = ExecutionControlStore(conn)
+        snapshot = await store.get_control_plane_snapshot(query)
+        return snapshot.model_dump(mode="json")
+    except Exception as exc:  # noqa: BLE001 — degrade, never 500 the dashboard
+        return _degraded_typed_control_plane(
+            query.feature_id,
+            f"typed_control_plane_snapshot_unavailable: {type(exc).__name__}",
+        )
+
+
+async def _project_control_plane_snapshot_event(
+    conn: asyncpg.Connection,
+    feature_id: str,
+    typed_control_plane_version: str,
+) -> None:
+    """Mirror a bounded `control_plane.snapshot_changed` display event.
+
+    Slice 10g-1 (doc 10 step 11). This is the production caller of the
+    Slice-10f `project_control_plane_snapshot_if_changed` projection driver
+    (doc 10 step 9 / § "Dashboard Integration Points": "Public dashboard
+    mirroring emits a bounded `control_plane.snapshot_changed` outbox event").
+    It fires at the `/api/feature/{id}` ETag path — the natural
+    snapshot-version-advance observation point — once the typed snapshot
+    version is known.
+
+    The driver itself reads the version (cheaply, eight feature-scoped
+    aggregates) and no-ops both when the outbox is disabled (the production
+    default — `IRIAI_PUBLIC_DASHBOARD_OUTBOX` / `..._CONSUMER_ENABLED` opt-in)
+    and when the typed version equals the last in-process projected value, so
+    a steady poll stream enqueues exactly ONE public event per typed-snapshot
+    advance. `ExecutionControlStore(conn)` runs the version/snapshot reads on
+    the live request connection.
+
+    A display-outbox enqueue failure is LOGGED and swallowed here: this is a
+    READ path with no typed-write transaction to keep consistent, so a public
+    display-mirror failure must never 500 the dashboard read (doc 10 §
+    "Edge Cases": "Public dashboard async delivery failure after enqueue
+    commit: log and continue. Private dashboard and supervisor still read the
+    typed snapshot directly."). The projection driver keeps its fail-closed
+    contract for store-transaction callers (none in Slice 10).
+    """
+
+    if pool is None:
+        return
+    # `_typed_control_plane_snapshot` degraded with a "" version: there is no
+    # typed snapshot to project (a legacy / pre-control-plane feature). Skip.
+    if not typed_control_plane_version:
+        return
+    try:
+        outbox = PublicDashboardOutbox(pool)
+        if not outbox.outbox_enabled:
+            return
+        store = ExecutionControlStore(conn)
+        previous = _projected_snapshot_versions.get(feature_id)
+        event_id = await project_control_plane_snapshot_if_changed(
+            outbox,
+            store,
+            feature_id,
+            previous_snapshot_version=previous,
+            scope="dashboard",
+            conn=conn,
+        )
+        # Record the version actually observed so the next poll no-ops until
+        # the typed snapshot advances again. The enqueue is DB-idempotent on
+        # `(feature_id, snapshot_version)`, so a missed cache update only
+        # re-attempts a no-op INSERT — never a duplicate public event.
+        _projected_snapshot_versions[feature_id] = typed_control_plane_version
+        if event_id is not None:
+            logger.debug(
+                "Projected control_plane.snapshot_changed feature=%s version=%s",
+                feature_id,
+                typed_control_plane_version,
+            )
+    except Exception:  # noqa: BLE001 — display mirror, never 500 the dashboard
+        logger.warning(
+            "Failed to project control_plane.snapshot_changed feature=%s",
+            feature_id,
+            exc_info=True,
+        )
+
+
+def _typed_evidence_ref(ref: dict[str, Any]) -> dict[str, Any]:
+    """Normalise one `EvidenceRef` for a detail pane.
+
+    A detail pane fetches a bounded slice by `(table, id)` via the existing
+    bounded artifact/event detail endpoints — the typed snapshot itself never
+    carries an artifact body (doc 10 § "Dashboard Integration Points").
+    """
+
+    return {
+        "table": ref.get("table"),
+        "id": ref.get("id"),
+        "citation": ref.get("citation", ""),
+        "kind": ref.get("kind", ""),
+        "summary": ref.get("summary", ""),
+        "artifact_key": ref.get("artifact_key", ""),
+    }
+
+
+def _compact_typed_control_plane(snapshot: dict[str, Any]) -> dict[str, Any]:
+    """Compact typed control-plane object embedded in `/api/feature/{id}`.
+
+    doc 10 § "Dashboard Integration Points" step 6: "Keep
+    `/api/feature/{feature_id}` compatible by embedding a compact
+    `control_plane` object when typed tables exist." This is the single typed
+    `control_plane` object exposed in the `/api/feature/{id}` response. Every
+    value here is a typed row already bounded + summarised by the Slice-10a
+    store; this only SHRINKS the lists for the overview surface. The full
+    bounded typed snapshot (all panels, all `EvidenceRef`s for detail panes) is
+    at `/api/feature/{id}/control-plane`.
+    """
+
+    attempt_cap = CONTROL_PLANE_TYPED_EMBED_ATTEMPTS
+    row_cap = CONTROL_PLANE_TYPED_EMBED_ROWS
+    omitted = snapshot.get("omitted_counts")
+    return {
+        "schema": "typed",
+        "feature_id": snapshot.get("feature_id"),
+        "snapshot_version": snapshot.get("snapshot_version"),
+        "generated_at": snapshot.get("generated_at"),
+        "source": snapshot.get("source"),
+        "degraded": bool(snapshot.get("degraded")),
+        "degradation_reasons": list(snapshot.get("degradation_reasons") or [])[:8],
+        "truncated": bool(snapshot.get("truncated")),
+        "omitted_counts": omitted if isinstance(omitted, dict) else {},
+        "active_group_idx": snapshot.get("active_group_idx"),
+        "recommended_route": snapshot.get("recommended_route", ""),
+        "recommended_action": snapshot.get("recommended_action", "observe"),
+        "counts": {
+            "active_attempts": len(snapshot.get("active_attempts") or []),
+            "workspace_snapshots": len(snapshot.get("workspace_snapshots") or []),
+            "latest_failures": len(snapshot.get("latest_failures") or []),
+            "merge_queue": len(snapshot.get("merge_queue") or []),
+            "retry_budgets": len(snapshot.get("retry_budgets") or []),
+            "sandbox_leases": len(snapshot.get("sandbox_leases") or []),
+            "runtime_bindings": len(snapshot.get("runtime_bindings") or []),
+            "gates": len(snapshot.get("gates") or []),
+            "checkpoints": len(snapshot.get("checkpoints") or []),
+        },
+        "active_attempts": list(snapshot.get("active_attempts") or [])[:attempt_cap],
+        "workspace_snapshots": list(snapshot.get("workspace_snapshots") or [])[:row_cap],
+        "latest_failures": list(snapshot.get("latest_failures") or [])[:row_cap],
+        "merge_queue": list(snapshot.get("merge_queue") or [])[:row_cap],
+        "retry_budgets": list(snapshot.get("retry_budgets") or [])[:row_cap],
+        "sandbox_leases": list(snapshot.get("sandbox_leases") or [])[:row_cap],
+        "gates": list(snapshot.get("gates") or [])[:row_cap],
+        "checkpoints": [
+            _typed_evidence_ref(ref)
+            for ref in list(snapshot.get("checkpoints") or [])[:row_cap]
+            if isinstance(ref, dict)
+        ],
+    }
+
+
+async def _control_plane_fetch(
+    conn: asyncpg.Connection,
+    section: str,
+    degradation_reasons: list[str],
+    query: str,
+    *args: Any,
+) -> list[Any]:
+    try:
+        return list(await conn.fetch(query, *args))
+    except Exception as exc:
+        degradation_reasons.append(f"{section}:{type(exc).__name__}")
+        return []
+
+
+def _bounded_rows(rows: list[Any], limit: int) -> tuple[list[Any], bool]:
+    if len(rows) <= limit:
+        return rows, False
+    return rows[:limit], True
+
+
+def _truncation_meta(rows: list[Any], limit: int, truncated: bool) -> dict[str, Any]:
+    return {
+        "returned": len(rows),
+        "limit": limit,
+        "truncated": truncated,
+    }
+
+
+def _coerce_bool(value: Any) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"true", "t", "1", "yes"}:
+            return True
+        if lowered in {"false", "f", "0", "no"}:
+            return False
+    if value is None:
+        return None
+    return bool(value)
+
+
+def _control_plane_payload(row: Any) -> dict[str, Any]:
+    payload = _row_get(row, "payload", {})
+    if isinstance(payload, dict):
+        return payload
+    if isinstance(payload, str):
+        parsed = _safe_dict(payload)
+        return parsed
+    return {}
+
+
+def _control_plane_attempt(row: Any) -> dict[str, Any]:
+    payload = _control_plane_payload(row)
+    return {
+        "id": _row_get(row, "id"),
+        "entry_type": _row_get(row, "entry_type"),
+        "status": _row_get(row, "status"),
+        "dispatcher_state": _row_get(row, "dispatcher_state"),
+        "actor": _row_get(row, "actor"),
+        "runtime": _row_get(row, "runtime"),
+        "group_idx": _row_get(row, "group_idx"),
+        "task_id": _row_get(row, "task_id"),
+        "request_digest": _row_get(row, "request_digest"),
+        "retry": payload.get("retry") or payload.get("attempt_no"),
+        "retry_budget": payload.get("retry_budget") or payload.get("max_retries"),
+        "runtime_policy_digest": payload.get("runtime_policy_digest"),
+        "workspace_snapshot_ids": _jsonish_list(payload.get("workspace_snapshot_ids")),
+        "created_at": _ensure_iso(_row_get(row, "created_at")),
+        "updated_at": _ensure_iso(_row_get(row, "updated_at")),
+    }
+
+
+def _control_plane_workspace_snapshot(row: Any) -> dict[str, Any]:
+    return {
+        "id": _row_get(row, "id"),
+        "execution_journal_row_id": _row_get(row, "execution_journal_row_id"),
+        "dag_sha256": _row_get(row, "dag_sha256"),
+        "group_idx": _row_get(row, "group_idx"),
+        "attempt_id": _row_get(row, "attempt_id"),
+        "stage": _row_get(row, "stage"),
+        "repo_id": _row_get(row, "repo_id"),
+        "canonical_path": _row_get(row, "canonical_path"),
+        "registry_digest": _row_get(row, "registry_digest"),
+        "snapshot_digest": _row_get(row, "snapshot_digest"),
+        "captured_at": _ensure_iso(_row_get(row, "captured_at")),
+        "created_at": _ensure_iso(_row_get(row, "created_at")),
+        "updated_at": _ensure_iso(_row_get(row, "updated_at")),
+    }
+
+
+def _control_plane_sandbox_snapshot(row: Any) -> dict[str, Any]:
+    return {
+        "id": _row_get(row, "id"),
+        "execution_journal_row_id": _row_get(row, "execution_journal_row_id"),
+        "dag_sha256": _row_get(row, "dag_sha256"),
+        "group_idx": _row_get(row, "group_idx"),
+        "attempt_no": _row_get(row, "attempt_no"),
+        "mode": _row_get(row, "mode"),
+        "status": _row_get(row, "status"),
+        "lease_owner": _row_get(row, "lease_owner"),
+        "leased_until": _ensure_iso(_row_get(row, "leased_until")),
+        "lease_version": _row_get(row, "lease_version"),
+        "base_snapshot_ids": _jsonish_list(_row_get(row, "base_snapshot_ids")),
+        "sandbox_id": _row_get(row, "sandbox_id"),
+        "manifest_path": _row_get(row, "manifest_path"),
+        "repo_ids": _jsonish_list(_row_get(row, "repo_ids")),
+        "task_ids": _jsonish_list(_row_get(row, "task_ids")),
+        "contract_ids": _jsonish_list(_row_get(row, "contract_ids")),
+        "lease_digest": _row_get(row, "lease_digest"),
+        "created_at": _ensure_iso(_row_get(row, "created_at")),
+        "updated_at": _ensure_iso(_row_get(row, "updated_at")),
+    }
+
+
+def _control_plane_gate_node(row: Any) -> dict[str, Any]:
+    return {
+        "id": _row_get(row, "id"),
+        "group_idx": _row_get(row, "group_idx"),
+        "stage": _row_get(row, "stage"),
+        "kind": _row_get(row, "kind"),
+        "name": _row_get(row, "name"),
+        "status": _row_get(row, "status"),
+        "deterministic": bool(_row_get(row, "deterministic", False)),
+        "source_ref": _row_get(row, "source_ref"),
+        "artifact_key": _row_get(row, "artifact_key"),
+        "created_at": _ensure_iso(_row_get(row, "created_at")),
+        "updated_at": _ensure_iso(_row_get(row, "updated_at")),
+    }
+
+
+def _control_plane_projection_ref(row: Any) -> dict[str, Any]:
+    payload = _control_plane_payload(row)
+    return {
+        "id": _row_get(row, "id"),
+        "typed_row_id": _row_get(row, "typed_row_id"),
+        "artifact_id": _row_get(row, "artifact_id"),
+        "source_table": _row_get(row, "source_table"),
+        "source_id": _row_get(row, "source_id"),
+        "projection_owner": _row_get(row, "projection_owner"),
+        "projection_kind": _row_get(row, "projection_kind"),
+        "projection_key": _row_get(row, "projection_key"),
+        "projection_sha256": _row_get(row, "projection_sha256"),
+        "legacy_event_id": _row_get(row, "legacy_event_id"),
+        "dashboard_outbox_event_id": _row_get(row, "dashboard_outbox_event_id"),
+        "group_idx": payload.get("group_idx"),
+        "status": payload.get("status"),
+        "created_at": _ensure_iso(_row_get(row, "created_at")),
+    }
+
+
+def _control_plane_gates(
+    gate_nodes: list[dict[str, Any]],
+    gate_artifacts: list[Any],
+) -> dict[str, Any]:
+    artifact_names = {
+        str(_row_get(row, "key", "")).removeprefix("dag-gate:")
+        for row in gate_artifacts
+        if str(_row_get(row, "key", "")).startswith("dag-gate:")
+    }
+    node_names = {
+        str(node.get("name") or node.get("stage") or "")
+        for node in gate_nodes
+        if node.get("status") in {"approved", "succeeded", "passed"}
+    }
+    readiness = {
+        name: name in artifact_names or name in node_names
+        for name in DAG_READINESS_GATE_NAMES
+    }
+    return {
+        "readiness": readiness,
+        "recent": gate_nodes,
+        "artifact_refs": [
+            {
+                "id": _row_get(row, "id"),
+                "key": _row_get(row, "key"),
+                "created_at": _ensure_iso(_row_get(row, "created_at")),
+            }
+            for row in gate_artifacts
+        ],
+    }
+
+
+def _control_plane_checkpoint_refs(
+    attempts: list[dict[str, Any]],
+    projections: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    refs: list[dict[str, Any]] = []
+    refs.extend(
+        {
+            "source": "execution_journal_rows",
+            "typed_row_id": attempt.get("id"),
+            "group_idx": attempt.get("group_idx"),
+            "status": attempt.get("status"),
+            "updated_at": attempt.get("updated_at"),
+        }
+        for attempt in attempts
+        if attempt.get("entry_type") == "group_checkpoint"
+    )
+    refs.extend(
+        {
+            "source": projection.get("source_table") or "execution_artifact_projections",
+            "typed_row_id": projection.get("typed_row_id"),
+            "artifact_id": projection.get("artifact_id"),
+            "projection_key": projection.get("projection_key"),
+            "projection_sha256": projection.get("projection_sha256"),
+            "created_at": projection.get("created_at"),
+        }
+        for projection in projections
+        if projection.get("projection_kind") == "group_checkpoint"
+    )
+    return refs[:CONTROL_PLANE_PROJECTION_LIMIT]
+
+
+def _control_plane_retry_budgets(attempts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    grouped: dict[tuple[Any, Any], dict[str, Any]] = {}
+    for attempt in reversed(attempts):
+        key = (attempt.get("group_idx"), attempt.get("task_id"))
+        if key == (None, None):
+            continue
+        budget = attempt.get("retry_budget")
+        state = grouped.setdefault(
+            key,
+            {
+                "group_idx": attempt.get("group_idx"),
+                "task_id": attempt.get("task_id"),
+                "attempts_used": 0,
+                "retry_budget": budget,
+                "last_status": None,
+                "last_dispatcher_state": None,
+                "last_attempt_id": None,
+            },
+        )
+        state["attempts_used"] += 1
+        state["retry_budget"] = state["retry_budget"] if state["retry_budget"] is not None else budget
+        state["last_status"] = attempt.get("status")
+        state["last_dispatcher_state"] = attempt.get("dispatcher_state")
+        state["last_attempt_id"] = attempt.get("id")
+    for state in grouped.values():
+        budget = state.get("retry_budget")
+        if isinstance(budget, int):
+            state["remaining"] = max(0, budget - int(state["attempts_used"]))
+    return list(grouped.values())[:CONTROL_PLANE_ATTEMPT_LIMIT]
+
+
+def _control_plane_snapshot_version(*row_groups: list[Any]) -> int:
+    max_id = 0
+    for rows in row_groups:
+        for row in rows:
+            try:
+                max_id = max(max_id, int(_row_get(row, "id", 0) or 0))
+            except (TypeError, ValueError):
+                continue
+    return max_id
+
+
+def _jsonish_list(value: Any) -> list[Any]:
+    if isinstance(value, list):
+        return value
+    if isinstance(value, tuple):
+        return list(value)
+    if isinstance(value, str):
+        parsed = _safe_json(value)
+        if isinstance(parsed, list):
+            return parsed
+    return []
 
 
 def _find_latest_entry(
@@ -2335,6 +3255,7 @@ def _assemble_bugflow_response(
     feature_id: str,
     last_activity_at: str | None,
     request_base_url: str,
+    control_plane: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     metadata = feat["metadata"] if isinstance(feat["metadata"], dict) else _safe_dict(feat["metadata"])
     artifacts = _artifact_lookup(rows)
@@ -2821,6 +3742,8 @@ def _assemble_bugflow_response(
             "event_type": event["event_type"],
             "source": event["source"],
             "content": event["content"] or "",
+            "content_bytes": _row_get(event, "content_bytes"),
+            "content_truncated": bool(_row_get(event, "content_truncated", False)),
             "created_at": event["created_at"].isoformat(),
         }
         for event in events
@@ -2884,6 +3807,7 @@ def _assemble_bugflow_response(
         "workstreams": [],
         "events": event_list,
         "active_agent": active_agent,
+        "control_plane": control_plane or _compact_typed_control_plane({}),
     }
 
 
@@ -3335,13 +4259,27 @@ async def bridge_logs(after: int = 0):
     if not bridge:
         raise HTTPException(404, "Bridge not configured (missing --bridge-channel)")
     current = bridge.line_count
+    earliest = max(0, current - len(bridge.lines))
+    base = {
+        "cursor": current,
+        "earliest_cursor": earliest,
+        "dropped_line_count": 0,
+        "line_char_cap": BRIDGE_LOG_LINE_CHARS,
+        "buffer_line_cap": BRIDGE_LOG_BUFFER_LINES,
+        "response_line_cap": BRIDGE_LOG_RESPONSE_LINES,
+        "truncated_line_count": bridge.truncated_line_count,
+    }
     if after >= current:
-        return {"lines": [], "cursor": current}
+        return {"lines": [], **base}
     # How many lines back from current to start
     skip = current - after
     snapshot = list(bridge.lines)
+    dropped = max(0, earliest - after)
     new_lines = snapshot[-skip:] if skip <= len(snapshot) else snapshot
-    return {"lines": new_lines, "cursor": current}
+    if len(new_lines) > BRIDGE_LOG_RESPONSE_LINES:
+        dropped += len(new_lines) - BRIDGE_LOG_RESPONSE_LINES
+        new_lines = new_lines[-BRIDGE_LOG_RESPONSE_LINES:]
+    return {"lines": new_lines, **{**base, "dropped_line_count": dropped}}
 
 
 if __name__ == "__main__":

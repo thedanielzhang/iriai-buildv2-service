@@ -60,6 +60,12 @@ class TestMultiplayer:
         await handle_message(adapter, _msg("<@B001> do something"))
         assert adapter.received[0]["text"] == "do something"
 
+    @pytest.mark.asyncio
+    async def test_marks_messages_that_mentioned_the_bot(self):
+        adapter = MockAdapter(mode="multiplayer")
+        await handle_message(adapter, _msg("<@B001> do something"))
+        assert adapter.received[0]["mentioned_bot"] is True
+
 
 # ── Singleplayer mode ────────────────────────────────────────────────────
 
@@ -171,3 +177,4 @@ class TestBothModes:
         assert received["text"] == "build it"
         assert received["user"] == "U555"
         assert received["channel"] == "C123"
+        assert received["mentioned_bot"] is True

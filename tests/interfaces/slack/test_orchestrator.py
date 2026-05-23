@@ -13,6 +13,8 @@ from iriai_build_v2.interfaces.slack.orchestrator import (
 )
 from iriai_build_v2.interfaces.slack.parser import ParsedRequest
 from iriai_build_v2.interfaces.slack.streamer import SlackStreamer
+from iriai_build_v2.runtime_policy import PRIMARY_IMPL_SECONDARY_REVIEW_POLICY
+from iriai_build_v2.workflows._runner import WorkflowQuiesceResult
 
 
 class _QueuedRuntime:
@@ -170,6 +172,115 @@ async def test_quiet_verbosity_suppresses_workflow_completion_message():
 
     assert adapter.messages == []
     assert adapter.reactions == [("CPLANNING", "", "white_check_mark")]
+
+
+@pytest.mark.asyncio
+async def test_recoverable_bugflow_failure_preserves_selected_runtime_policy():
+    class _Runner:
+        def bind_invocation_observer(self, _observer):
+            from contextlib import nullcontext
+
+            return nullcontext()
+
+        async def execute_workflow(self, _workflow, _feature, _state):
+            raise RuntimeError("recoverable boom")
+
+    feature = SimpleNamespace(
+        id="bf123456",
+        workflow_name="bugfix-v2",
+        metadata={
+            "workspace_path": "/tmp/workspace",
+            "mode": "singleplayer",
+            "agent_runtime": "codex",
+            "_db_phase": "bugflow-queue",
+        },
+    )
+    adapter = _RecoveringAdapter()
+    interaction = _RecoveringInteraction()
+    orchestrator = SlackWorkflowOrchestrator(
+        adapter=adapter,
+        interaction_runtime=interaction,
+        runtime_policy=PRIMARY_IMPL_SECONDARY_REVIEW_POLICY,
+    )
+    orchestrator._env = SimpleNamespace(
+        feature_store=_FakeFeatureStore({feature.id: feature})
+    )
+
+    await orchestrator._run_workflow(_Runner(), object(), feature, object(), "CBUGFLOW")
+
+    assert orchestrator._recoverable_features[feature.id]["runtime_policy"] == (
+        PRIMARY_IMPL_SECONDARY_REVIEW_POLICY
+    )
+    assert adapter.messages[-1] == (
+        "CBUGFLOW",
+        "Workflow failed: recoverable boom\nSend any message to retry.",
+    )
+
+
+@pytest.mark.asyncio
+async def test_resumed_workflow_quiesce_posts_paused_and_remains_recoverable():
+    class _Runner:
+        last_workflow_quiesce = None
+
+        def bind_invocation_observer(self, _observer):
+            from contextlib import nullcontext
+
+            return nullcontext()
+
+        async def resume_workflow(self, _workflow, _feature, _state, *, resume_from_phase):
+            self.last_workflow_quiesce = WorkflowQuiesceResult(
+                phase_name=resume_from_phase,
+                reason="operator_required=true; ACL normalized but commit hygiene remains",
+                metadata={"group_idx": 48},
+            )
+
+    feature = SimpleNamespace(
+        id="feat-1",
+        workflow_name="full-develop",
+        metadata={
+            "workspace_path": "/tmp/workspace",
+            "mode": "multiplayer",
+            "agent_runtime": "claude-pool",
+            "_db_phase": "implementation",
+        },
+    )
+    adapter = _RecoveringAdapter()
+    interaction = _RecoveringInteraction()
+    orchestrator = SlackWorkflowOrchestrator(
+        adapter=adapter,
+        interaction_runtime=interaction,
+        slack_verbosity="normal",
+        agent_runtime_name="codex",
+    )
+    orchestrator._env = SimpleNamespace(
+        feature_store=_FakeFeatureStore({"feat-1": feature})
+    )
+
+    await orchestrator._run_workflow_resumed(
+        _Runner(),
+        object(),
+        feature,
+        object(),
+        "C123",
+        "implementation",
+        runtime_policy=PRIMARY_IMPL_SECONDARY_REVIEW_POLICY,
+    )
+
+    assert adapter.messages == [
+        (
+            "C123",
+            "Workflow paused in phase `implementation`.\n"
+            "Reason: operator_required=true; ACL normalized but commit hygiene remains\n"
+            "Send any message to resume when the pause condition is cleared.",
+        )
+    ]
+    assert "feat-1" in orchestrator._recoverable_features
+    assert orchestrator._recoverable_features["feat-1"]["phase"] == "implementation"
+    assert orchestrator._recoverable_features["feat-1"]["runtime_policy"] == (
+        PRIMARY_IMPL_SECONDARY_REVIEW_POLICY
+    )
+    assert orchestrator._feature_workflows["feat-1"] == "full-develop"
+    assert interaction.channels[-1] == ("feat-1", "C123")
 
 
 @pytest.mark.asyncio
@@ -486,6 +597,126 @@ async def test_resume_failure_keeps_bugflow_recoverable():
     assert adapter.messages[-1] == (
         "CBUGFLOW",
         "Resume failed for `bf123456`: state rebuild exploded\nSend any message to retry.",
+    )
+
+
+@pytest.mark.asyncio
+async def test_resume_recovers_sandbox_leases_before_restarting_workflow(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    feature = SimpleNamespace(
+        id="bf123456",
+        name="Bugflow feature",
+        slug="bugflow-feature-bf123456",
+        workflow_name="bugfix-v2",
+        metadata={
+            "channel_id": "CBUGFLOW",
+            "workspace_path": str(tmp_path),
+            "mode": "singleplayer",
+            "agent_runtime": "claude",
+            "_db_phase": "bugflow-queue",
+        },
+    )
+    feature_store = _FakeFeatureStore({feature.id: feature})
+    events: list[str] = []
+
+    async def _fake_rebuild_state(*_args, **_kwargs):
+        return object()
+
+    monkeypatch.setattr(
+        "iriai_build_v2.interfaces.slack.orchestrator.select_workflow",
+        lambda _name: object(),
+    )
+    monkeypatch.setattr(
+        "iriai_build_v2.interfaces.slack.orchestrator.rebuild_state",
+        _fake_rebuild_state,
+    )
+
+    adapter = _RecoveringAdapter()
+    interaction = _RecoveringInteraction()
+    orchestrator = SlackWorkflowOrchestrator(adapter=adapter, interaction_runtime=interaction)
+    orchestrator._env = SimpleNamespace(
+        feature_store=feature_store,
+        artifacts=object(),
+    )
+    orchestrator._recoverable_features = {
+        feature.id: {
+            "workspace_path": str(tmp_path),
+            "mode": "singleplayer",
+            "phase": "bugflow-queue",
+            "agent_runtime": "claude",
+        }
+    }
+    runner = SimpleNamespace(services={})
+    orchestrator._create_runtime_and_runner = (  # type: ignore[method-assign]
+        lambda **_kwargs: (SimpleNamespace(), runner)
+    )
+
+    async def _recover(_runner, _feature, _workspace_path):
+        events.append("recover")
+        return 1
+
+    async def _run_resumed(*_args, **_kwargs):
+        events.append("resume")
+
+    orchestrator._recover_sandbox_leases_for_resume = _recover  # type: ignore[method-assign]
+    orchestrator._run_workflow_resumed = _run_resumed  # type: ignore[method-assign]
+
+    await orchestrator._resume_workflow(feature.id, "CBUGFLOW")
+    await orchestrator._active_workflows[feature.id]
+
+    assert events == ["recover", "resume"]
+
+
+@pytest.mark.asyncio
+async def test_resumed_recoverable_failure_preserves_runtime_policy_for_retry():
+    class _Runner:
+        last_workflow_quiesce = None
+
+        def bind_invocation_observer(self, _observer):
+            from contextlib import nullcontext
+
+            return nullcontext()
+
+        async def resume_workflow(self, _workflow, _feature, _state, *, resume_from_phase):
+            raise RuntimeError(f"resume exploded in {resume_from_phase}")
+
+    feature = SimpleNamespace(
+        id="bf123456",
+        name="Bugflow feature",
+        slug="bugflow-feature-bf123456",
+        workflow_name="bugfix-v2",
+        metadata={
+            "workspace_path": "/tmp/workspace",
+            "mode": "singleplayer",
+            "agent_runtime": "claude",
+            "_db_phase": "bugflow-queue",
+        },
+    )
+    adapter = _RecoveringAdapter()
+    interaction = _RecoveringInteraction()
+    orchestrator = SlackWorkflowOrchestrator(adapter=adapter, interaction_runtime=interaction)
+    orchestrator._env = SimpleNamespace(
+        feature_store=_FakeFeatureStore({feature.id: feature})
+    )
+
+    await orchestrator._run_workflow_resumed(
+        _Runner(),
+        object(),
+        feature,
+        object(),
+        "CBUGFLOW",
+        "bugflow-queue",
+        runtime_policy=PRIMARY_IMPL_SECONDARY_REVIEW_POLICY,
+    )
+
+    assert orchestrator._recoverable_features[feature.id]["runtime_policy"] == (
+        PRIMARY_IMPL_SECONDARY_REVIEW_POLICY
+    )
+    assert adapter.messages[-1] == (
+        "CBUGFLOW",
+        "Resumed workflow failed: resume exploded in bugflow-queue\nSend any message to retry.",
     )
 
 
