@@ -36,7 +36,15 @@ class _Runner:
     def __init__(self, responses: list[object]) -> None:
         self._responses = responses
         self.artifacts = _Artifacts()
-        self.services: dict[str, object] = {}
+        # The Slice 04 sandbox runner makes a repair sandbox binding mandatory
+        # for write-producing repair roles; `test_allow_legacy_repair_without_
+        # sandbox` is the sanctioned production test seam (implementation.py
+        # `_bind_repair_sandbox`) for exercising the legacy non-sandbox repair
+        # path in isolation — these tests verify RCA→fix→verify text handling,
+        # not the durable sandbox/merge-queue path.
+        self.services: dict[str, object] = {
+            "test_allow_legacy_repair_without_sandbox": True,
+        }
         self.tasks: list[object] = []
 
     async def run(self, _task, _feature, *, phase_name: str = "") -> object:
@@ -178,7 +186,20 @@ async def test_single_rca_fix_verify_uses_actor_factory_for_nested_agents(
     lane_root.mkdir(parents=True, exist_ok=True)
     thread_runtime = SimpleNamespace(name="thread-runtime")
 
-    def _thread_factory(base, suffix, *, runtime=None, workspace_path=None):
+    # Mirror the production `_make_parallel_actor` signature: the Slice 04
+    # sandbox runner threads `runtime_workspace_binding` / `sandbox_required`
+    # into the fix-actor builder, so a substitute actor factory must accept
+    # them (the legacy non-sandbox repair path leaves the binding None).
+    def _thread_factory(
+        base,
+        suffix,
+        *,
+        runtime=None,
+        workspace_path=None,
+        runtime_workspace_binding=None,
+        sandbox_required=False,
+    ):
+        del runtime_workspace_binding, sandbox_required
         metadata = dict(base.role.metadata)
         if runtime:
             metadata["runtime"] = runtime

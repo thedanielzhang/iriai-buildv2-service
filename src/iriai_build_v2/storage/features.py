@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
+import os
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -10,6 +12,9 @@ import asyncpg
 from iriai_compose import Feature
 
 from ..public_dashboard import PublicDashboardOutbox
+
+_MIRROR_TIMEOUT_ENV = "IRIAI_PUBLIC_DASHBOARD_MIRROR_TIMEOUT_SECONDS"
+_DEFAULT_MIRROR_TIMEOUT_SECONDS = 0.75
 
 
 class PostgresFeatureStore:
@@ -69,13 +74,15 @@ class PostgresFeatureStore:
             metadata_json,
         )
         if self._public_dashboard is not None:
-            await self._public_dashboard.mirror_private_event(
-                source_event_id=event_id,
-                feature_id=feature_id,
-                event_type=event_type,
-                source=source,
-                content=content,
-                metadata=metadata or {},
+            await _best_effort_mirror(
+                self._public_dashboard.mirror_private_event(
+                    source_event_id=event_id,
+                    feature_id=feature_id,
+                    event_type=event_type,
+                    source=source,
+                    content=content,
+                    metadata=metadata or {},
+                )
             )
 
     async def get_feature(self, feature_id: str) -> Feature | None:
@@ -109,6 +116,47 @@ class PostgresFeatureStore:
         rows = await self._pool.fetch(
             "SELECT * FROM events WHERE feature_id = $1 ORDER BY created_at",
             feature_id,
+        )
+        return [dict(row) for row in rows]
+
+    async def list_event_summaries(
+        self,
+        feature_id: str,
+        *,
+        after_id: int = 0,
+        limit: int = 50,
+        order: str = "asc",
+        group_idx: int | None = None,
+        preview_chars: int = 700,
+    ) -> list[dict[str, Any]]:
+        direction = "DESC" if str(order).lower() == "desc" else "ASC"
+        limit = max(1, min(500, int(limit or 50)))
+        preview_chars = max(0, min(4_000, int(preview_chars or 0)))
+        args: list[Any] = [feature_id, max(0, int(after_id or 0)), limit, preview_chars]
+        group_clause = ""
+        if group_idx is not None:
+            args.append(str(int(group_idx)))
+            group_clause = (
+                " AND (metadata->>'group_idx' = $5 OR metadata->>'group' = $5 "
+                "OR metadata->>'group_index' = $5 OR metadata->>'dag_group' = $5)"
+            )
+        rows = await self._pool.fetch(
+            f"""
+            SELECT id, feature_id, event_type, source,
+                   CASE
+                       WHEN content IS NULL THEN NULL
+                       WHEN $4 = 0 THEN NULL
+                       ELSE substring(content from 1 for $4)
+                   END AS content,
+                   metadata,
+                   created_at,
+                   COALESCE(pg_column_size(content), 0)::bigint AS content_bytes
+            FROM events
+            WHERE feature_id = $1 AND id > $2{group_clause}
+            ORDER BY id {direction}
+            LIMIT $3
+            """,
+            *args,
         )
         return [dict(row) for row in rows]
 
@@ -149,3 +197,19 @@ def _advisory_lock_key(feature_id: str, name: str) -> int:
         digest_size=8,
     ).digest()
     return int.from_bytes(digest, byteorder="big", signed=True)
+
+
+async def _best_effort_mirror(awaitable: Any) -> None:
+    try:
+        await asyncio.wait_for(awaitable, timeout=_mirror_timeout_seconds())
+    except Exception:
+        return
+
+
+def _mirror_timeout_seconds() -> float:
+    raw = os.environ.get(_MIRROR_TIMEOUT_ENV, "")
+    try:
+        parsed = float(raw)
+    except (TypeError, ValueError):
+        parsed = _DEFAULT_MIRROR_TIMEOUT_SECONDS
+    return max(0.05, parsed)

@@ -33,6 +33,7 @@ async def handle_message(adapter: SlackAdapter, event: dict) -> None:
     text = event.get("text", "")
     channel = event.get("channel", "")
     bot_mention = f"<@{adapter.bot_user_id}>"
+    mentioned_bot = bool(bot_mention and bot_mention in text)
     if _mentions_ignored_user(
         text,
         adapter.ignored_mention_user_ids,
@@ -72,7 +73,9 @@ async def handle_message(adapter: SlackAdapter, event: dict) -> None:
     )
 
     if adapter.on_message_callback:
-        await adapter.on_message_callback({**event, "text": text})
+        await adapter.on_message_callback(
+            {**event, "text": text, "mentioned_bot": mentioned_bot}
+        )
 
 
 def _mentions_ignored_user(
@@ -117,7 +120,6 @@ async def handle_action(adapter: SlackAdapter, body: dict, action: dict) -> None
     action_id = action.get("action_id", "")
     user_id = body.get("user", {}).get("id", "")
     channel = body.get("channel", {}).get("id", "")
-    message_ts = body.get("message", {}).get("ts", "")
 
     logger.info(
         "[slack] action %s by %s in %s",

@@ -85,6 +85,9 @@ _ROOT_DAG_SURFACE_REVISION_MARKERS = (
 # ── Prompt offloading ────────────────────────────────────────────────────────
 
 PROMPT_FILE_THRESHOLD = 100_000  # chars — offload to files above this
+CONTEXT_PACKAGE_ITEM_MAX_CHARS = int(
+    os.environ.get("IRIAI_CONTEXT_PACKAGE_ITEM_MAX_CHARS", "120000")
+)
 
 
 def _write_context_text(path: Path, text: str) -> None:
@@ -142,6 +145,27 @@ def _offload_if_large(
     return (
         f"Your full task prompt is in `{display_path}` ({len(prompt)} chars).\n"
         f"**Read that file** before proceeding."
+    )
+
+
+def _bounded_context_item_text(text: str, *, label: str, key: str) -> str:
+    """Return bounded context item text while preserving a retrievable signal."""
+    limit = max(10_000, CONTEXT_PACKAGE_ITEM_MAX_CHARS)
+    if len(text) <= limit:
+        return text
+    head_budget = max(4_000, limit // 2)
+    tail_budget = max(4_000, limit - head_budget - 1_500)
+    omitted = len(text) - head_budget - tail_budget
+    return (
+        f"# {label} (compacted)\n\n"
+        f"Context item `{key}` was {len(text)} chars and exceeded the "
+        f"{limit} char context-package cap. The middle {omitted} chars were "
+        "omitted from this prompt transport file; use the cited source artifact "
+        "or full archive pointer when exact historical detail is required.\n\n"
+        "## Head\n\n"
+        f"{text[:head_budget].rstrip()}\n\n"
+        "## Tail\n\n"
+        f"{text[-tail_budget:].lstrip()}\n"
     )
 
 
@@ -375,7 +399,12 @@ async def build_context_package(
                     file_stem=file_stem,
                     item=item,
                 )
-                _write_context_text(item_path, text.rstrip() + "\n")
+                bounded = _bounded_context_item_text(
+                    text.rstrip(),
+                    label=item.label,
+                    key=item.key,
+                )
+                _write_context_text(item_path, bounded.rstrip() + "\n")
                 path = str(item_path)
         elif path is None and item.content:
             item_path = _context_item_path(
@@ -383,7 +412,12 @@ async def build_context_package(
                 file_stem=file_stem,
                 item=item,
             )
-            _write_context_text(item_path, item.content.rstrip() + "\n")
+            bounded = _bounded_context_item_text(
+                item.content.rstrip(),
+                label=item.label,
+                key=item.key,
+            )
+            _write_context_text(item_path, bounded.rstrip() + "\n")
             path = str(item_path)
 
         if not path:

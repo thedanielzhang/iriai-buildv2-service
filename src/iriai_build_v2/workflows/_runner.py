@@ -4,11 +4,14 @@ import asyncio
 import contextlib
 import contextvars
 import hashlib
+import json
 import logging
+import re
 import time
+from collections.abc import Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 from uuid import uuid4
@@ -55,10 +58,37 @@ LIVENESS_TIMEOUT = 10 * 60  # 10 min of silence → agent is stuck
 LIVENESS_POLL_INTERVAL = 30  # check every 30s
 RESOLVE_MAX_RETRIES = 2  # retry stuck invocations up to 2 times
 RESOLVE_RETRY_BACKOFF = 15  # seconds between retries
+RUNTIME_WORKSPACE_BINDING_KEY = "runtime_workspace_binding"
+_WRITE_PRODUCING_TOOLS = {"Write", "Edit", "MultiEdit", "NotebookEdit", "Bash"}
 
 
 class AgentStalled(RuntimeError):
     """Raised when an agent invocation produces no output for too long."""
+
+
+class WorkflowQuiesced(RuntimeError):
+    """Raised when a workflow reaches an intentional pause boundary."""
+
+    def __init__(
+        self,
+        *,
+        phase_name: str,
+        reason: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        self.phase_name = phase_name
+        self.reason = reason
+        self.metadata = metadata or {}
+        super().__init__(reason or f"Workflow quiesced in phase {phase_name}")
+
+
+@dataclass
+class WorkflowQuiesceResult:
+    """Last intentional workflow pause observed by the runner."""
+
+    phase_name: str
+    reason: str
+    metadata: dict[str, Any]
 
 
 def _prompt_observability(prompt: str) -> dict[str, Any]:
@@ -70,6 +100,324 @@ def _prompt_observability(prompt: str) -> dict[str, Any]:
         "prompt_preview": preview,
         "prompt_length": len(prompt),
     }
+
+
+def _combined_ask_prompt(task: Ask, *, prompt: str, context: str) -> str:
+    task_prompt = task.model_copy(update={"prompt": prompt}).to_prompt()
+    return f"{context}\n\n## Task\n{task_prompt}" if context else task_prompt
+
+
+def _offloaded_prompt_path(prompt: str) -> str:
+    match = re.search(r"in `([^`]+)`", prompt)
+    return match.group(1) if match else ""
+
+
+def _as_string_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, (str, Path)):
+        text = str(value).strip()
+        return [text] if text else []
+    if isinstance(value, (list, tuple, set)):
+        return [str(item) for item in value if str(item).strip()]
+    return []
+
+
+def _path_is_under(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def _path_has_symlink_component(path: Path) -> bool:
+    current = Path(path.anchor) if path.is_absolute() else Path()
+    parts = path.parts[1:] if path.is_absolute() else path.parts
+    for part in parts:
+        current = current / part
+        try:
+            if current.is_symlink():
+                return True
+        except OSError:
+            return True
+    return False
+
+
+def _parse_binding_expires_at(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        expires = value
+    elif isinstance(value, str) and value.strip():
+        text = value.strip()
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        try:
+            expires = datetime.fromisoformat(text)
+        except ValueError:
+            return None
+    else:
+        return None
+
+    if expires.tzinfo is None:
+        expires = expires.replace(tzinfo=timezone.utc)
+    return expires.astimezone(timezone.utc)
+
+
+def _role_metadata_for_binding(metadata: Mapping[str, Any]) -> dict[str, Any]:
+    role_metadata: dict[str, Any] = {}
+    for key, value in metadata.items():
+        if key == RUNTIME_WORKSPACE_BINDING_KEY:
+            continue
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            role_metadata[str(key)] = value
+        elif isinstance(value, (list, tuple, set)):
+            role_metadata[str(key)] = [
+                item if isinstance(item, (str, int, float, bool)) or item is None else str(item)
+                for item in value
+            ]
+        elif isinstance(value, Mapping):
+            role_metadata[str(key)] = {
+                str(inner_key): (
+                    inner_value
+                    if isinstance(inner_value, (str, int, float, bool)) or inner_value is None
+                    else str(inner_value)
+                )
+                for inner_key, inner_value in value.items()
+            }
+        else:
+            role_metadata[str(key)] = str(value)
+    return role_metadata
+
+
+def _coerce_runtime_workspace_binding(
+    role: Any,
+    *,
+    actor_name: str,
+) -> tuple[dict[str, Any] | None, str | None]:
+    metadata = role.metadata or {}
+    if RUNTIME_WORKSPACE_BINDING_KEY not in metadata:
+        return None, None
+
+    raw = metadata.get(RUNTIME_WORKSPACE_BINDING_KEY)
+    if hasattr(raw, "model_dump"):
+        raw = raw.model_dump(mode="json")
+    if not isinstance(raw, Mapping):
+        return None, "runtime workspace binding must be a mapping"
+
+    binding = dict(raw)
+    cwd = binding.get("cwd") or binding.get("workspace_override")
+    if cwd is not None:
+        binding["cwd"] = str(Path(str(cwd)).expanduser())
+    if binding.get("cwd") and not binding.get("workspace_override"):
+        binding["workspace_override"] = binding["cwd"]
+    for key in ("writable_roots", "readonly_roots", "blocked_roots", "contract_ids"):
+        binding[key] = _as_string_list(binding.get(key))
+    repo_roots_raw = binding.get("repo_roots")
+    if isinstance(repo_roots_raw, Mapping):
+        binding["repo_roots"] = {
+            str(key): str(value)
+            for key, value in repo_roots_raw.items()
+            if str(key).strip() and str(value).strip()
+        }
+    else:
+        binding["repo_roots"] = _as_string_list(repo_roots_raw)
+    binding.setdefault("runtime", metadata.get("runtime"))
+    binding.setdefault(
+        "role",
+        {
+            "actor_name": actor_name,
+            "name": getattr(role, "name", ""),
+            "tools": [str(tool) for tool in (getattr(role, "tools", None) or [])],
+            "metadata": _role_metadata_for_binding(metadata),
+        },
+    )
+    return binding, _runtime_workspace_binding_error(
+        binding,
+        validate_manifest=_role_is_write_producing(role),
+    )
+
+
+def _runtime_workspace_binding_error(
+    binding: Mapping[str, Any],
+    *,
+    validate_manifest: bool = False,
+) -> str | None:
+    sandbox_id = str(binding.get("sandbox_id") or "").strip()
+    if not sandbox_id:
+        return "missing sandbox_id"
+
+    cwd = str(binding.get("cwd") or "").strip()
+    if not cwd:
+        return "missing cwd"
+
+    cwd_path = Path(cwd).expanduser()
+    if not cwd_path.is_absolute():
+        return "cwd must be absolute"
+    if not cwd_path.exists():
+        return f"cwd does not exist: {cwd}"
+    if not cwd_path.is_dir():
+        return f"cwd is not a directory: {cwd}"
+    if cwd_path.is_symlink():
+        return f"cwd is symlinked: {cwd}"
+
+    workspace_override = str(binding.get("workspace_override") or "").strip()
+    if workspace_override and Path(workspace_override).expanduser().resolve() != cwd_path.resolve():
+        return "workspace_override must match cwd"
+
+    cwd_resolved = cwd_path.resolve()
+    blocked_roots = [
+        Path(path).expanduser().resolve()
+        for path in _as_string_list(binding.get("blocked_roots"))
+        if str(path).strip()
+    ]
+    if any(_path_is_under(cwd_resolved, blocked) for blocked in blocked_roots):
+        return "cwd resolves into a blocked root"
+    repo_roots_value = binding.get("repo_roots")
+    repo_root_paths = (
+        list(repo_roots_value.values())
+        if isinstance(repo_roots_value, Mapping)
+        else _as_string_list(repo_roots_value)
+    )
+    repo_roots = [
+        Path(path).expanduser().resolve()
+        for path in repo_root_paths
+        if str(path).strip()
+    ]
+    writable_roots = [
+        Path(path).expanduser().resolve()
+        for path in _as_string_list(binding.get("writable_roots"))
+        if str(path).strip()
+    ]
+    allowed_roots = writable_roots or repo_roots
+    if allowed_roots and not any(
+        _path_is_under(cwd_resolved, root)
+        for root in allowed_roots
+    ):
+        return "cwd is outside runtime workspace roots"
+
+    if validate_manifest:
+        manifest_path_text = str(binding.get("manifest_path") or "").strip()
+        if not manifest_path_text:
+            return "missing sandbox manifest"
+        manifest_path = Path(manifest_path_text).expanduser()
+        if not manifest_path.is_absolute():
+            return "sandbox manifest must be absolute"
+        if not manifest_path.exists():
+            return "sandbox manifest does not exist"
+        if not manifest_path.is_file():
+            return "sandbox manifest is not a file"
+        if _path_has_symlink_component(manifest_path):
+            return "sandbox manifest is symlinked"
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return "sandbox manifest is unreadable"
+        if not isinstance(manifest, Mapping):
+            return "sandbox manifest is invalid"
+
+        manifest_sandbox_id = str(manifest.get("sandbox_id") or "").strip()
+        if manifest_sandbox_id and manifest_sandbox_id != sandbox_id:
+            return "binding sandbox_id does not match manifest"
+
+        sandbox_root_text = str(manifest.get("root") or "").strip()
+        if not sandbox_root_text:
+            return "sandbox manifest missing root"
+        sandbox_root = Path(sandbox_root_text).expanduser()
+        if not sandbox_root.is_absolute():
+            return "sandbox root must be absolute"
+        if not sandbox_root.exists():
+            return "sandbox root does not exist"
+        if not sandbox_root.is_dir():
+            return "sandbox root is not a directory"
+        if _path_has_symlink_component(sandbox_root):
+            return "sandbox root is symlinked"
+        sandbox_root_resolved = sandbox_root.resolve()
+        if not _path_is_under(manifest_path.resolve(), sandbox_root_resolved):
+            return "manifest is outside sandbox root"
+        if not _path_is_under(cwd_resolved, sandbox_root_resolved):
+            return "cwd is outside sandbox root"
+
+        manifest_writable_roots = [
+            Path(path).expanduser().resolve(strict=False)
+            for path in _as_string_list(manifest.get("writable_roots"))
+            if str(path).strip()
+        ]
+        for root in manifest_writable_roots:
+            if root.exists() and _path_has_symlink_component(root):
+                return "writable root is symlinked"
+            if not _path_is_under(root, sandbox_root_resolved):
+                return "writable root is outside sandbox root"
+        binding_writable_roots = [
+            Path(path).expanduser().resolve(strict=False)
+            for path in _as_string_list(binding.get("writable_roots"))
+            if str(path).strip()
+        ]
+        for root in binding_writable_roots:
+            if root.exists() and _path_has_symlink_component(root):
+                return "binding writable root is symlinked"
+            if not _path_is_under(root, sandbox_root_resolved):
+                return "binding writable root is outside sandbox root"
+        manifest_allowed_roots = manifest_writable_roots or binding_writable_roots
+        if not manifest_allowed_roots:
+            return "missing writable roots"
+        if binding_writable_roots and set(binding_writable_roots) != set(manifest_allowed_roots):
+            return "binding writable roots do not match manifest"
+        if not any(_path_is_under(cwd_resolved, root) for root in manifest_allowed_roots):
+            return "cwd is outside writable roots"
+
+    expires_raw = binding.get("expires_at")
+    if not expires_raw:
+        return "missing expires_at"
+    expires_at = _parse_binding_expires_at(expires_raw)
+    if expires_at is None:
+        return "expires_at is invalid"
+    if expires_at <= datetime.now(timezone.utc):
+        return "binding is expired"
+
+    return None
+
+
+def _role_is_write_producing(role: Any) -> bool:
+    tools = {str(tool) for tool in (getattr(role, "tools", None) or [])}
+    metadata = role.metadata or {}
+    return bool(
+        tools & _WRITE_PRODUCING_TOOLS
+        or metadata.get("write_producing")
+        or metadata.get("produces_writes")
+    )
+
+
+def _role_requires_runtime_workspace_binding(role: Any, *, actor_name: str) -> bool:
+    metadata = role.metadata or {}
+
+    explicit = any(
+        bool(metadata.get(key))
+        for key in (
+            "sandbox_required",
+            "requires_sandbox",
+            "runtime_workspace_binding_required",
+            "workspace_binding_required",
+            "require_runtime_workspace_binding",
+        )
+    )
+    for policy_key in ("execution_policy", "sandbox_policy", "runtime_workspace_binding_policy"):
+        policy = metadata.get(policy_key)
+        if isinstance(policy, Mapping) and any(
+            bool(policy.get(key))
+            for key in (
+                "sandbox_required",
+                "requires_sandbox",
+                "runtime_workspace_binding_required",
+                "workspace_binding_required",
+                "required",
+            )
+        ):
+            explicit = True
+
+    if not explicit or not _role_is_write_producing(role):
+        return False
+
+    return True
 
 
 @dataclass
@@ -283,7 +631,28 @@ class TrackedWorkflowRunner(DefaultWorkflowRunner):
         ws_path = None
         from iriai_compose import Workspace
 
-        ws_path = actor.role.metadata.get("workspace_override")
+        binding, binding_error = _coerce_runtime_workspace_binding(
+            actor.role,
+            actor_name=actor.name,
+        )
+        if binding_error:
+            raise RuntimeError(
+                f"Invalid runtime workspace binding for {actor.name}: {binding_error}"
+            )
+        if binding:
+            metadata = dict(actor.role.metadata or {})
+            metadata[RUNTIME_WORKSPACE_BINDING_KEY] = binding
+            role = actor.role.model_copy(update={"metadata": metadata})
+            actor = actor.model_copy(update={"role": role})
+            task = task.model_copy(update={"actor": actor})
+            ws_path = binding["cwd"]
+        elif _role_requires_runtime_workspace_binding(actor.role, actor_name=actor.name):
+            raise RuntimeError(
+                f"Runtime workspace binding required for sandbox-required write role {actor.name}"
+            )
+        else:
+            ws_path = actor.role.metadata.get("workspace_override")
+
         if not ws_path:
             worktree_root = self.services.get("worktree_root")
             if worktree_root:
@@ -313,18 +682,31 @@ class TrackedWorkflowRunner(DefaultWorkflowRunner):
         # is preferable to a crash).
         from ._common._helpers import PROMPT_FILE_THRESHOLD, _offload_if_large
 
-        offload_base = ws_path
+        offload_base = None if binding else ws_path
         if not offload_base:
             # Fallback for phases without worktree_root (e.g. planning):
             # use the artifact mirror's feature directory.
             mirror = self.services.get("artifact_mirror")
-            if mirror:
+            if mirror and not binding:
                 offload_base = str(mirror.feature_dir(feature.id))
 
-        if offload_base and len(prompt) > PROMPT_FILE_THRESHOLD:
-            prompt = _offload_if_large(prompt, Path(offload_base), f"prompt-{actor.name}")
-
-        task = task.model_copy(update={"prompt": prompt})
+        original_context_length = len(context)
+        combined_prompt = _combined_ask_prompt(task, prompt=prompt, context=context)
+        combined_prompt_length = len(combined_prompt)
+        prompt_offloaded = False
+        prompt_offload_path = ""
+        if offload_base and combined_prompt_length > PROMPT_FILE_THRESHOLD:
+            prompt = _offload_if_large(
+                combined_prompt,
+                Path(offload_base),
+                f"prompt-{actor.name}",
+            )
+            prompt_offloaded = prompt != combined_prompt
+            prompt_offload_path = _offloaded_prompt_path(prompt)
+            context = ""
+            task = task.model_copy(update={"prompt": prompt, "input": None})
+        else:
+            task = task.model_copy(update={"prompt": prompt})
 
         try:
             # ── Budget mode: downgrade implementers to Sonnet ──────
@@ -350,6 +732,11 @@ class TrackedWorkflowRunner(DefaultWorkflowRunner):
                     "tools": list(actor.role.tools or []),
                     "output_type": getattr(getattr(task, "output_type", None), "__name__", str(getattr(task, "output_type", "") or "")),
                     **_prompt_observability(prompt),
+                    "context_length": original_context_length,
+                    "combined_prompt_length": combined_prompt_length,
+                    "runtime_prompt_length": len(prompt),
+                    "prompt_offloaded": prompt_offloaded,
+                    "prompt_offload_path": prompt_offload_path,
                 },
             )
 
@@ -762,6 +1149,7 @@ class TrackedWorkflowRunner(DefaultWorkflowRunner):
         feature: Feature,
         state: BaseModel,
     ) -> BaseModel:
+        self.last_workflow_quiesce = None
         await workflow.on_start(self, feature, state)
         try:
             from .public_exhibit import (
@@ -797,6 +1185,27 @@ class TrackedWorkflowRunner(DefaultWorkflowRunner):
                 )
                 try:
                     state = await phase.execute(self, feature, state)
+                except WorkflowQuiesced as exc:
+                    self.last_workflow_quiesce = WorkflowQuiesceResult(
+                        phase_name=exc.phase_name,
+                        reason=exc.reason,
+                        metadata=dict(exc.metadata),
+                    )
+                    await self.feature_store.log_event(
+                        feature.id,
+                        "phase_execute_quiesced",
+                        "workflow",
+                        phase.name,
+                        metadata={
+                            "workflow": workflow.__class__.__name__,
+                            "phase_name": exc.phase_name,
+                            "reason": exc.reason[:1000],
+                            **exc.metadata,
+                        },
+                    )
+                    await phase.on_done(self, feature, state)
+                    await workflow.on_done(self, feature, state)
+                    return state
                 except Exception as exc:
                     await self.feature_store.log_event(
                         feature.id,
@@ -835,6 +1244,7 @@ class TrackedWorkflowRunner(DefaultWorkflowRunner):
         resume_from_phase: str,
     ) -> BaseModel:
         """Resume a workflow, skipping phases before *resume_from_phase*."""
+        self.last_workflow_quiesce = None
         phases = workflow.build_phases()
         phase_names = [cls().name for cls in phases]
 
@@ -904,6 +1314,27 @@ class TrackedWorkflowRunner(DefaultWorkflowRunner):
                 )
                 try:
                     state = await phase.execute(self, feature, state)
+                except WorkflowQuiesced as exc:
+                    self.last_workflow_quiesce = WorkflowQuiesceResult(
+                        phase_name=exc.phase_name,
+                        reason=exc.reason,
+                        metadata=dict(exc.metadata),
+                    )
+                    await self.feature_store.log_event(
+                        feature.id,
+                        "phase_execute_quiesced",
+                        "resume",
+                        phase.name,
+                        metadata={
+                            "workflow": workflow.__class__.__name__,
+                            "phase_name": exc.phase_name,
+                            "reason": exc.reason[:1000],
+                            **exc.metadata,
+                        },
+                    )
+                    await phase.on_done(self, feature, state)
+                    await workflow.on_done(self, feature, state)
+                    return state
                 except Exception as exc:
                     await self.feature_store.log_event(
                         feature.id,

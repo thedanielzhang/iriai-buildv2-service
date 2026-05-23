@@ -1,0 +1,615 @@
+{
+  "consumers": [
+    {
+      "artifact_prefixes_read": [
+        "dag-commit-failure:",
+        "dag-direct-repair-route:",
+        "dag-group:",
+        "dag-verify:"
+      ],
+      "artifact_prefixes_written": [
+        "dag-commit-failure:",
+        "dag-group:",
+        "dag-task:",
+        "dag-verify:"
+      ],
+      "body_read_behavior": "storage_api_supports_full_rows_summaries_and_slices",
+      "bounded_read_status": "mixed_legacy_and_bounded_api",
+      "consumer_id": "storage_artifact_access_layer",
+      "consumer_role": "storage access layer",
+      "event_types_read": [],
+      "event_types_written": [],
+      "files": [
+        {
+          "path": "src/iriai_build_v2/storage/artifacts.py",
+          "refs": [
+            "29-55",
+            "180-279",
+            "361-381"
+          ]
+        },
+        {
+          "path": "src/iriai_build_v2/storage/features.py",
+          "refs": [
+            "55-122"
+          ]
+        }
+      ],
+      "notes": [
+        "Artifact store exposes broad legacy full-row reads, bounded summary reads, and bounded slices.",
+        "Preview allowlists do not cover every Slice 00 focus key; later slices must avoid treating missing preview coverage as missing evidence.",
+        "Mutation APIs exist here but Slice 00 fixtures do not call them."
+      ]
+    },
+    {
+      "artifact_prefixes_read": [
+        "dag-group:",
+        "dag-regroup-active:",
+        "dag-task:"
+      ],
+      "artifact_prefixes_written": [
+        "dag-task:",
+        "dag-group:"
+      ],
+      "body_read_behavior": "legacy_resume_body_required",
+      "bounded_read_status": "legacy_artifact_get",
+      "consumer_id": "legacy_resume_and_task_markers",
+      "consumer_role": "legacy resume",
+      "event_types_read": [],
+      "event_types_written": [
+        "dag_task_dispatch",
+        "dag_task_start",
+        "dag_task_finish",
+        "dag_task_error"
+      ],
+      "files": [
+        {
+          "path": "src/iriai_build_v2/workflows/develop/phases/implementation.py",
+          "refs": [
+            "4727-4750",
+            "4890-4910",
+            "4986-5179"
+          ]
+        }
+      ],
+      "notes": [
+        "Group resume reconstructs ImplementationResult objects from dag-group checkpoint bodies.",
+        "Per-task resume reads dag-task bodies and skips only completed task results.",
+        "Slice 01 projections must keep these legacy bodies visible while legacy readers exist."
+      ]
+    },
+    {
+      "artifact_prefixes_read": [
+        "dag-direct-repair-route:",
+        "dag-task:",
+        "dag-task-reconcile:",
+        "dag-task-spec-reconcile:",
+        "dag-workspace-acl-normalization:",
+        "dag-worktree-alias-preflight:",
+        "worktree-registry"
+      ],
+      "artifact_prefixes_written": [
+        "dag-task-reconcile:",
+        "dag-task-spec-reconcile:",
+        "dag-workspace-acl-normalization:",
+        "dag-worktree-alias-preflight:",
+        "worktree-registry"
+      ],
+      "body_read_behavior": "workflow_repair_and_workspace_body_required",
+      "bounded_read_status": "legacy_exact_artifact_reads",
+      "consumer_id": "implementation_repair_and_worktree_compatibility",
+      "consumer_role": "implementation repair/worktree",
+      "event_types_read": [],
+      "event_types_written": [
+        "dag_writeability_preflight_failed"
+      ],
+      "files": [
+        {
+          "path": "src/iriai_build_v2/workflows/develop/phases/implementation.py",
+          "refs": [
+            "1058-1083",
+            "9900-10040",
+            "13798-13980",
+            "14245-14420",
+            "4912-4977"
+          ]
+        }
+      ],
+      "notes": [
+        "Alias guards, registry reconciliation, ACL normalization, and task artifact reconciliation are deterministic workflow compatibility paths.",
+        "These keys must route to typed workflow remediation rather than broad product repair unless product-defect evidence exists.",
+        "Some supervisor/dashboard summary allowlists do not currently include all of these prefixes."
+      ]
+    },
+    {
+      "artifact_prefixes_read": [
+        "dag-verify:",
+        "dag-repair-preflight:",
+        "dag-direct-repair-route:",
+        "dag-commit-failure:"
+      ],
+      "artifact_prefixes_written": [
+        "dag-verify:",
+        "dag-commit-failure:",
+        "dag-direct-repair-route:"
+      ],
+      "body_read_behavior": "legacy_verifier_and_repair_body_required",
+      "bounded_read_status": "legacy_artifact_get_and_put",
+      "consumer_id": "verification_repair_and_commit_failure_loop",
+      "consumer_role": "verification/repair",
+      "event_types_read": [
+        "dag_commit_failed"
+      ],
+      "event_types_written": [
+        "dag_commit_failed"
+      ],
+      "files": [
+        {
+          "path": "src/iriai_build_v2/workflows/develop/phases/implementation.py",
+          "refs": [
+            "800-835",
+            "901-1083",
+            "5199-5234",
+            "16917-16959"
+          ]
+        }
+      ],
+      "notes": [
+        "Commit failures write both dag-commit-failure artifacts and dag_commit_failed events.",
+        "Direct repair routing reads prior route artifacts to avoid repeated broad repair loops.",
+        "Compatibility projections must preserve enough body shape for current verifier, RCA, and repair parsing."
+      ]
+    },
+    {
+      "artifact_prefixes_read": [
+        "dag-group:",
+        "dag-regroup:",
+        "dag-regroup-active:",
+        "dag-regroup-observation:",
+        "dag-task:",
+        "dag-verify:",
+        "dag-commit-failure:"
+      ],
+      "artifact_prefixes_written": [
+        "dag-regroup:",
+        "dag-regroup-active:",
+        "dag-regroup-observation:",
+        "dag-regroup-rollback:"
+      ],
+      "body_read_behavior": "regroup_overlay_body_required",
+      "bounded_read_status": "mixed_cli_sql_and_runtime_artifact_get",
+      "consumer_id": "regroup_overlay_resolver_and_cli",
+      "consumer_role": "regroup",
+      "event_types_read": [
+        "dag_commit_failed",
+        "dag_expanded_verify_finish",
+        "dag_verify_finish"
+      ],
+      "event_types_written": [
+        "dag_regroup_overlay_applied",
+        "dag-regroup"
+      ],
+      "files": [
+        {
+          "path": "src/iriai_build_v2/workflows/develop/phases/implementation.py",
+          "refs": [
+            "4615-4658",
+            "4693-4700",
+            "4762-4810"
+          ]
+        },
+        {
+          "path": "src/iriai_build_v2/workflows/develop/dag_regroup.py",
+          "refs": [
+            "24-28",
+            "542-601",
+            "836-861",
+            "1394-1492",
+            "1534-1681",
+            "1729-1789"
+          ]
+        }
+      ],
+      "notes": [
+        "Runtime resolver reads active marker before dispatch and may write observation evidence.",
+        "CLI metrics categorize legacy DAG artifacts and events for regroup recommendations.",
+        "Slice 09 must make legacy dag-regroup artifacts compatibility projections of typed overlay state."
+      ]
+    },
+    {
+      "artifact_prefixes_read": [
+        "dag",
+        "dag-group:"
+      ],
+      "artifact_prefixes_written": [
+        "post-test-commit-failure:"
+      ],
+      "body_read_behavior": "post_test_checkpoint_body_required",
+      "bounded_read_status": "legacy_artifact_get",
+      "consumer_id": "post_test_readiness_guard",
+      "consumer_role": "post-test guard",
+      "event_types_read": [],
+      "event_types_written": [],
+      "files": [
+        {
+          "path": "src/iriai_build_v2/workflows/develop/phases/post_test_observation.py",
+          "refs": [
+            "55-86",
+            "96-120"
+          ]
+        }
+      ],
+      "notes": [
+        "Post-test observation refuses to run when root DAG groups are not checkpointed.",
+        "Checkpoint projections must remain visible to preserve current post-DAG business gating."
+      ]
+    },
+    {
+      "artifact_prefixes_read": [
+        "dag",
+        "dag:",
+        "dag-task:",
+        "dag-group:",
+        "dag-verify:",
+        "dag-fix:",
+        "dag-verify-rca:",
+        "dag-regroup:"
+      ],
+      "artifact_prefixes_written": [],
+      "body_read_behavior": "bounded_dashboard_previews",
+      "bounded_read_status": "sql_substring_preview",
+      "consumer_id": "dashboard_feature_api",
+      "consumer_role": "dashboard",
+      "event_types_read": [
+        "*"
+      ],
+      "event_types_written": [],
+      "files": [
+        {
+          "path": "dashboard.py",
+          "refs": [
+            "373-536",
+            "554-656",
+            "1209-1326",
+            "1425-1494"
+          ]
+        }
+      ],
+      "notes": [
+        "Dashboard assembles feature state from latest artifact previews and recent event previews.",
+        "The dashboard currently parses previews for DAG, task, group, and verify status; Slice 10 must keep reads bounded and typed-first."
+      ]
+    },
+    {
+      "artifact_prefixes_read": [
+        "dag-group:",
+        "dag-verify:",
+        "public-"
+      ],
+      "artifact_prefixes_written": [
+        "public-summary",
+        "public-dag-narrative",
+        "public-artifact-gallery",
+        "public-workstream-summary",
+        "public-milestone-feed"
+      ],
+      "body_read_behavior": "selected_public_source_body_required",
+      "bounded_read_status": "legacy_selected_artifact_get",
+      "consumer_id": "public_dashboard_and_exhibit",
+      "consumer_role": "public dashboard",
+      "event_types_read": [
+        "artifact.written"
+      ],
+      "event_types_written": [
+        "artifact.written"
+      ],
+      "files": [
+        {
+          "path": "src/iriai_build_v2/public_dashboard.py",
+          "refs": [
+            "192-274",
+            "449-465"
+          ]
+        },
+        {
+          "path": "src/iriai_build_v2/workflows/public_exhibit.py",
+          "refs": [
+            "322-351",
+            "440-544",
+            "619-660"
+          ]
+        }
+      ],
+      "notes": [
+        "Public exhibit selects group and verifier artifacts as source material for public-safe projections.",
+        "Public dashboard mirroring is best-effort and must not become an authority for execution state."
+      ]
+    },
+    {
+      "artifact_prefixes_read": [
+        "dag-task-contract:",
+        "dag-contract-verdict:",
+        "dag-sandbox-patch:"
+      ],
+      "artifact_prefixes_written": [
+        "dag-task-contract:",
+        "dag-contract-verdict:",
+        "dag-sandbox-patch:"
+      ],
+      "body_read_behavior": "bounded_contract_and_verdict_projection_summary_only",
+      "bounded_read_status": "typed_contract_rows_and_evidence_nodes_authoritative",
+      "consumer_id": "task_deliverable_contract_projection_consumers",
+      "consumer_role": "task contract compatibility",
+      "event_types_read": [],
+      "event_types_written": [],
+      "files": [
+        {
+          "path": "src/iriai_build_v2/execution_control/store.py",
+          "refs": [
+            "145-286",
+            "1721-1804"
+          ]
+        },
+        {
+          "path": "src/iriai_build_v2/workflows/develop/phases/implementation.py",
+          "refs": [
+            "1922-2200",
+            "5608-5715"
+          ]
+        },
+        {
+          "path": "src/iriai_build_v2/supervisor/evidence.py",
+          "refs": [
+            "30-60",
+            "460-505"
+          ]
+        },
+        {
+          "path": "dashboard.py",
+          "refs": [
+            "454-515"
+          ]
+        }
+      ],
+      "notes": [
+        "Task contract, patch summary, and contract verdict projections are bounded compatibility summaries of typed rows.",
+        "Legacy resume must not treat dag-task-contract artifacts as dag-task completion evidence.",
+        "Verifier, repair, sandbox, and merge queue paths use typed contract identity as authority; projections are display/resume compatibility only."
+      ]
+    },
+    {
+      "artifact_prefixes_read": [
+        "dag-commit-failure:",
+        "dag-group:",
+        "dag-repair-preflight:",
+        "dag-task-reconcile:",
+        "dag-task-spec-reconcile:",
+        "dag-verify:",
+        "dag-worktree-alias-canonicalization:",
+        "dag-worktree-alias-preflight:"
+      ],
+      "artifact_prefixes_written": [],
+      "body_read_behavior": "supervisor_classifier_uses_observation_records",
+      "bounded_read_status": "depends_on_observation_collection",
+      "consumer_id": "supervisor_classifier",
+      "consumer_role": "supervisor classifier",
+      "event_types_read": [
+        "dag_commit_failed",
+        "checkpoint"
+      ],
+      "event_types_written": [],
+      "files": [
+        {
+          "path": "src/iriai_build_v2/supervisor/classifier.py",
+          "refs": [
+            "110-164",
+            "254-337",
+            "340-390",
+            "681-692",
+            "817-834"
+          ]
+        }
+      ],
+      "notes": [
+        "Classifier differentiates checkpoint contradictions, deterministic commit/workspace unblocks, and normal product repair from observation artifacts/events.",
+        "Slice 07 must keep workflow-class failures out of broad product repair unless typed evidence proves a product defect."
+      ]
+    },
+    {
+      "artifact_prefixes_read": [
+        "dag-commit-failure:",
+        "dag-group:",
+        "dag-verify:"
+      ],
+      "artifact_prefixes_written": [
+        "supervisor-observation:",
+        "supervisor-decision:"
+      ],
+      "body_read_behavior": "bounded_summary_collection_with_latest_rows",
+      "bounded_read_status": "list_record_summaries_and_list_event_summaries",
+      "consumer_id": "supervisor_evidence_collector",
+      "consumer_role": "supervisor evidence",
+      "event_types_read": [
+        "*"
+      ],
+      "event_types_written": [],
+      "files": [
+        {
+          "path": "src/iriai_build_v2/supervisor/evidence.py",
+          "refs": [
+            "102-179",
+            "293-339",
+            "374-420"
+          ]
+        },
+        {
+          "path": "src/iriai_build_v2/supervisor/app.py",
+          "refs": [
+            "59-84"
+          ]
+        }
+      ],
+      "notes": [
+        "Collection prefers bounded summaries but SupervisorApp persistence writes supervisor observation/decision artifacts.",
+        "Slice 10 must make supervisor reads typed and bounded first, and keep supervisor behavior read-only against executor/control-plane/product state."
+      ]
+    },
+    {
+      "artifact_prefixes_read": [
+        "dag-commit-failure:",
+        "dag-group:",
+        "dag-verify:"
+      ],
+      "artifact_prefixes_written": [],
+      "body_read_behavior": "bounded_index_detail_and_chunk_reads",
+      "bounded_read_status": "list_record_summaries_get_slice",
+      "consumer_id": "supervisor_mcp_evidence_tools",
+      "consumer_role": "MCP",
+      "event_types_read": [
+        "*"
+      ],
+      "event_types_written": [],
+      "files": [
+        {
+          "path": "src/iriai_build_v2/supervisor/mcp_server.py",
+          "refs": [
+            "160-193",
+            "200-243",
+            "243-332",
+            "520-549",
+            "580-617"
+          ]
+        },
+        {
+          "path": "src/iriai_build_v2/supervisor/tools.py",
+          "refs": [
+            "137-218",
+            "356-402"
+          ]
+        }
+      ],
+      "notes": [
+        "MCP tools expose compact indexes first and bounded detail/chunk reads on demand.",
+        "Slice 10 must not broaden MCP reads to hydrate artifact bodies."
+      ]
+    },
+    {
+      "artifact_prefixes_read": [
+        "dag-commit-failure:",
+        "dag-group:",
+        "dag-verify:",
+        "supervisor-thread-context:"
+      ],
+      "artifact_prefixes_written": [
+        "supervisor-assessment:",
+        "supervisor-thread-context:"
+      ],
+      "body_read_behavior": "bounded_slack_context_with_optional_slice",
+      "bounded_read_status": "list_record_summaries_then_get_slice",
+      "consumer_id": "supervisor_slack_context",
+      "consumer_role": "Slack",
+      "event_types_read": [
+        "*"
+      ],
+      "event_types_written": [],
+      "files": [
+        {
+          "path": "src/iriai_build_v2/supervisor/slack.py",
+          "refs": [
+            "330-425",
+            "899-909",
+            "1074-1168",
+            "1170-1268"
+          ]
+        }
+      ],
+      "notes": [
+        "Slack builds scoped prefixes from live context and reuses bounded summary/detail evidence APIs.",
+        "Thread context persistence is supervisor-local and must be deduped/suppressed in Slice 10."
+      ]
+    },
+    {
+      "artifact_prefixes_read": [
+        "dag-commit-failure:",
+        "dag-group:",
+        "dag-merge-queue:"
+      ],
+      "artifact_prefixes_written": [
+        "dag-merge-queue:"
+      ],
+      "atomic_landing_blocker_status": "must be owned by slice-08 durable merge queue before production enablement",
+      "body_read_behavior": "queue_style_recovery_body_required_for_crash_replay",
+      "bounded_read_status": "typed_queue_summary_then_bounded_proof_slice",
+      "consumer_id": "durable_merge_queue_recovery_anchor",
+      "consumer_role": "queue recovery",
+      "event_types_read": [
+        "dag_commit_failed",
+        "dag_merge_queue_recovery_required"
+      ],
+      "event_types_written": [
+        "dag_merge_queue_recovery_required"
+      ],
+      "files": [
+        {
+          "path": "docs/execution-control-plane/08-durable-merge-queue.md",
+          "refs": [
+            "1-220"
+          ]
+        },
+        {
+          "path": "tests/fixtures/execution_control_plane/feature_8ac124d6/artifact_summaries.jsonl",
+          "refs": [
+            "21"
+          ]
+        },
+        {
+          "path": "tests/fixtures/execution_control_plane/feature_8ac124d6/drag_findings.json",
+          "refs": [
+            "54-62"
+          ]
+        }
+      ],
+      "migration_owner": "slice-08-durable-merge-queue",
+      "notes": [
+        "Pre-control-plane execution has no durable queue authority; this compatibility anchor prevents queue recovery from being lost between Slice 00 evidence and Slice 08 implementation.",
+        "Queue-style recovery must route as workflow infrastructure evidence, not broad product repair.",
+        "Later slices must replace this fixture anchor with typed queue item, lease, merge proof, commit proof, no-dirty proof, and checkpoint projection links."
+      ]
+    }
+  ],
+  "coverage_requirements": {
+    "consumer_roles": [
+      "storage access layer",
+      "legacy resume",
+      "verification/repair",
+      "implementation repair/worktree",
+      "regroup",
+      "post-test guard",
+      "dashboard",
+      "public dashboard",
+      "supervisor classifier",
+      "supervisor evidence",
+      "MCP",
+      "Slack",
+      "queue recovery"
+    ],
+    "prefixes": [
+      "dag-task:",
+      "dag-task-contract:",
+      "dag-contract-verdict:",
+      "dag-sandbox-patch:",
+      "dag-verify:",
+      "dag-commit-failure:",
+      "dag-group:",
+      "dag-regroup:",
+      "dag-regroup-active:",
+      "dag-merge-queue:",
+      "dag-workspace-acl-normalization:",
+      "worktree-registry"
+    ]
+  },
+  "generated_for_slice": "00-evidence-fixtures-and-compatibility-inventory",
+  "schema": "execution-control-plane-compatibility-consumers-v1",
+  "source": "static repository inventory; no production behavior changed",
+  "updated_at": "2026-05-20T05:37:58Z"
+}

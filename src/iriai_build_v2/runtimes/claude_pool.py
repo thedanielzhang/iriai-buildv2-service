@@ -2,17 +2,21 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import hashlib
+import hmac
 import json
 import logging
 import math
 import os
 import plistlib
 import pwd
+import secrets
 import shlex
 import shutil
 import sys
 import time
 import uuid
+from collections.abc import Mapping
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -24,7 +28,7 @@ from pydantic import BaseModel
 from iriai_compose.runner import AgentRuntime
 from iriai_compose.storage import AgentSession, SessionStore
 
-from .claude import _inline_defs
+from .claude import _inline_defs, _validate_runtime_workspace_binding
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -33,6 +37,13 @@ if TYPE_CHECKING:
     from iriai_compose.workflow import Workspace
 
 logger = logging.getLogger(__name__)
+_RUNTIME_WORKSPACE_BINDING_KEY = "runtime_workspace_binding"
+_BOUND_WRITE_AUTHORIZED_KEY = "runtime_workspace_write_authorized"
+_BOUND_WRITE_AUTHORIZATION_KEY = "runtime_workspace_write_authorization"
+_BOUND_WRITE_AUTH_SECRET_FILE = "runtime-write-auth.secret"
+_BOUND_WRITE_GUARD_KEY = "runtime_workspace_write_guard"
+_BOUND_WRITE_GUARD_SANDBOX_EXEC = "sandbox_exec"
+_WRITE_PRODUCING_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit", "Bash"}
 
 DEFAULT_POOL_ROOT = Path(
     os.environ.get("IRIAI_CLAUDE_POOL_ROOT", "/Users/Shared/iriai/claude-pool")
@@ -137,6 +148,193 @@ def _jsonable(value: Any) -> Any:
         return value
     except TypeError:
         return str(value)
+
+
+def _jsonable_deep(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {str(key): _jsonable_deep(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_jsonable_deep(item) for item in value]
+    return _jsonable(value)
+
+
+def _is_relative_to(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def _runtime_workspace_binding(role: Any) -> dict[str, Any] | None:
+    raw = (getattr(role, "metadata", None) or {}).get(_RUNTIME_WORKSPACE_BINDING_KEY)
+    if hasattr(raw, "model_dump"):
+        raw = raw.model_dump(mode="json")
+    if not isinstance(raw, Mapping):
+        return None
+    return dict(raw)
+
+
+def _role_is_write_producing(role: Any) -> bool:
+    tools = {str(tool) for tool in (getattr(role, "tools", None) or [])}
+    return bool(
+        tools & _WRITE_PRODUCING_TOOLS
+        or (getattr(role, "metadata", None) or {}).get("write_producing")
+    )
+
+
+def _manifest_role_is_write_producing(role: Any) -> bool:
+    if not isinstance(role, Mapping):
+        return False
+    tools = {str(tool) for tool in (role.get("tools") or [])}
+    metadata = role.get("metadata") or {}
+    return bool(
+        tools & _WRITE_PRODUCING_TOOLS
+        or (isinstance(metadata, Mapping) and metadata.get("write_producing"))
+        or role.get("write_producing")
+    )
+
+
+def _pool_write_auth_secret(root: Path) -> str:
+    secret_path = root / _BOUND_WRITE_AUTH_SECRET_FILE
+    try:
+        secret_path.parent.mkdir(parents=True, exist_ok=True)
+        if not secret_path.exists():
+            fd = os.open(
+                secret_path,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+            )
+            try:
+                os.write(fd, secrets.token_hex(32).encode("utf-8"))
+            finally:
+                os.close(fd)
+        try:
+            secret_path.chmod(0o600)
+        except OSError:
+            logger.warning("Unable to chmod Claude pool write auth secret %s", secret_path)
+        secret = secret_path.read_text(encoding="utf-8").strip()
+    except FileExistsError:
+        secret = secret_path.read_text(encoding="utf-8").strip()
+    if not secret:
+        raise RuntimeError("Claude pool write authorization secret is empty")
+    return secret
+
+
+def _bound_write_authorization(manifest: Mapping[str, Any], secret: str) -> str:
+    binding = manifest.get(_RUNTIME_WORKSPACE_BINDING_KEY)
+    binding_map = dict(binding) if isinstance(binding, Mapping) else {}
+    role = manifest.get("role")
+    role_map = dict(role) if isinstance(role, Mapping) else {}
+    paths = manifest.get("paths")
+    paths_map = dict(paths) if isinstance(paths, Mapping) else {}
+    payload = {
+        "id": manifest.get("id"),
+        "created_at": manifest.get("created_at"),
+        "cwd": manifest.get("cwd"),
+        "prompt_path": paths_map.get("prompt"),
+        "role_name": role_map.get("name"),
+        "role_tools": sorted(str(tool) for tool in (role_map.get("tools") or [])),
+        "sandbox_id": binding_map.get("sandbox_id") or manifest.get("sandbox_id"),
+        "runtime": binding_map.get("runtime"),
+        "workspace_override": binding_map.get("workspace_override"),
+        "manifest_path": binding_map.get("manifest_path") or manifest.get("manifest_path"),
+        "expires_at": binding_map.get("expires_at") or manifest.get("expires_at"),
+        "sandbox_profile": paths_map.get("sandbox_profile"),
+        "write_guard": manifest.get(_BOUND_WRITE_GUARD_KEY),
+        "repo_roots": binding_map.get("repo_roots") or manifest.get("repo_roots") or {},
+        "writable_roots": binding_map.get("writable_roots") or manifest.get("writable_roots") or [],
+        "blocked_roots": binding_map.get("blocked_roots") or manifest.get("blocked_roots") or [],
+        "contract_ids": binding_map.get("contract_ids") or manifest.get("contract_ids") or [],
+    }
+    return hmac.new(
+        secret.encode("utf-8"),
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def _sandbox_profile_quote(value: Path) -> str:
+    return str(value).replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _write_guard_roots(manifest: Mapping[str, Any]) -> list[Path]:
+    binding = manifest.get(_RUNTIME_WORKSPACE_BINDING_KEY)
+    binding_map = dict(binding) if isinstance(binding, Mapping) else {}
+    paths = manifest.get("paths")
+    paths_map = dict(paths) if isinstance(paths, Mapping) else {}
+    roots: list[Path] = []
+    for raw in [
+        manifest.get("cwd"),
+        paths_map.get("prompt"),
+        paths_map.get("system_prompt"),
+        paths_map.get("schema"),
+        paths_map.get("result"),
+        paths_map.get("stdout"),
+        paths_map.get("stderr"),
+        paths_map.get("sandbox_profile"),
+        *(binding_map.get("writable_roots") or []),
+    ]:
+        if not str(raw or "").strip():
+            continue
+        path = Path(str(raw)).expanduser()
+        if path.suffix and not path.exists():
+            path = path.parent
+        elif path.exists() and path.is_file():
+            path = path.parent
+        roots.append(path)
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for root in roots:
+        try:
+            resolved = root.resolve(strict=False)
+        except OSError:
+            resolved = root.absolute()
+        key = str(resolved)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(resolved)
+    return unique
+
+
+def _write_sandbox_exec_profile(manifest: Mapping[str, Any]) -> Path:
+    paths = manifest.get("paths")
+    paths_map = dict(paths) if isinstance(paths, Mapping) else {}
+    profile_text = str(paths_map.get("sandbox_profile") or "").strip()
+    if not profile_text:
+        raise RuntimeError("Bound Claude pool job is missing sandbox-exec profile path")
+    profile_path = Path(profile_text).expanduser()
+    profile_path.parent.mkdir(parents=True, exist_ok=True)
+    allowed_roots = _write_guard_roots(manifest)
+    allow_lines = "\n".join(
+        f'  (subpath "{_sandbox_profile_quote(root)}")'
+        for root in allowed_roots
+    )
+    profile = (
+        "(version 1)\n"
+        "(allow default)\n"
+        "(deny file-write*)\n"
+        "(allow file-write*\n"
+        f"{allow_lines}\n"
+        ")\n"
+    )
+    profile_path.write_text(profile, encoding="utf-8")
+    return profile_path
+
+
+def _coerce_aware_datetime(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str) and value.strip():
+        parsed = _parse_iso(value.strip())
+    else:
+        return None
+    if parsed is None:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
 
 
 def _safe_name(value: str) -> str:
@@ -365,6 +563,13 @@ def _classify_claude_pool_error(error: str) -> str | None:
     if "overloaded_error" in lowered or '"message":"overloaded"' in lowered or "overloaded" in lowered:
         return "overloaded"
     if (
+        "internal server error" in lowered
+        or '"type":"api_error"' in lowered
+        or '"type": "api_error"' in lowered
+        or "'type': 'api_error'" in lowered
+    ):
+        return "transient_api_error"
+    if (
         "monthly usage limit" in lowered
         or "usage limit" in lowered
         or "out of extra usage" in lowered
@@ -380,7 +585,7 @@ def _classify_claude_pool_error(error: str) -> str | None:
 
 
 def _probe_delay_seconds_for_error(kind: str) -> float:
-    if kind == "overloaded":
+    if kind in {"overloaded", "transient_api_error"}:
         return DEFAULT_OVERLOAD_PROBE_AFTER_SECONDS
     if kind == "auth_failed":
         return DEFAULT_AUTH_PROBE_AFTER_SECONDS
@@ -1019,6 +1224,23 @@ class ClaudePoolRuntime(AgentRuntime):
         result_path = payload_dir / "result.json"
         stdout_path = payload_dir / "stdout.json"
         stderr_path = payload_dir / "stderr.log"
+        sandbox_profile_path = payload_dir / "sandbox-exec.sb"
+        binding = _runtime_workspace_binding(role)
+        bound_authority = (
+            _validate_runtime_workspace_binding(
+                binding or {},
+                role_name=role.name,
+                expected_runtime="claude_pool",
+                workspace_path=workspace.path if workspace and workspace.path else None,
+            )
+            if binding and _role_is_write_producing(role)
+            else None
+        )
+        manifest_cwd = (
+            str(bound_authority.cwd)
+            if bound_authority is not None
+            else str(workspace.path) if workspace and workspace.path else None
+        )
 
         prompt_path.write_text(prompt, encoding="utf-8")
         system_prompt_path.write_text(role.prompt or "", encoding="utf-8")
@@ -1035,7 +1257,7 @@ class ClaudePoolRuntime(AgentRuntime):
             "updated_at": _utc_now_iso(),
             "session_key": session_key,
             "feature_id": session_key.rsplit(":", 1)[-1] if session_key and ":" in session_key else None,
-            "cwd": str(workspace.path) if workspace and workspace.path else None,
+            "cwd": manifest_cwd,
             "role": {
                 "name": role.name,
                 "model": str(role.model or "claude-opus-4-7"),
@@ -1050,6 +1272,7 @@ class ClaudePoolRuntime(AgentRuntime):
                 "result": str(result_path),
                 "stdout": str(stdout_path),
                 "stderr": str(stderr_path),
+                "sandbox_profile": str(sandbox_profile_path),
             },
             "claude": {
                 "command": profile.claude_command,
@@ -1057,6 +1280,26 @@ class ClaudePoolRuntime(AgentRuntime):
                 "add_dirs": [os.path.expanduser("~/.npm")],
             },
         }
+        if binding:
+            manifest[_RUNTIME_WORKSPACE_BINDING_KEY] = _jsonable_deep(binding)
+            for key in (
+                "sandbox_id",
+                "repo_roots",
+                "contract_ids",
+                "writable_roots",
+                "blocked_roots",
+                "manifest_path",
+                "expires_at",
+            ):
+                if key in binding:
+                    manifest[key] = _jsonable_deep(binding.get(key))
+            if _role_is_write_producing(role):
+                manifest[_BOUND_WRITE_AUTHORIZED_KEY] = True
+                manifest[_BOUND_WRITE_GUARD_KEY] = _BOUND_WRITE_GUARD_SANDBOX_EXEC
+                manifest[_BOUND_WRITE_AUTHORIZATION_KEY] = _bound_write_authorization(
+                    manifest,
+                    _pool_write_auth_secret(self.root),
+                )
         queued_path = _job_state_path(self.root, "queued", profile.name, job_id)
         _write_json_atomic(queued_path, manifest)
         logger.info("Queued Claude pool job %s on profile %s", job_id, profile.name)
@@ -1223,6 +1466,87 @@ class ClaudePoolRunner:
         _write_json_atomic(running_path, manifest)
         return running_path
 
+    def _validate_bound_job_manifest(self, manifest: dict[str, Any]) -> None:
+        binding = manifest.get(_RUNTIME_WORKSPACE_BINDING_KEY)
+        if binding is None:
+            if _manifest_role_is_write_producing(manifest.get("role")):
+                raise RuntimeError(
+                    "Claude pool write-producing job requires runtime workspace binding"
+                )
+            return
+        if not isinstance(binding, Mapping):
+            raise RuntimeError("Bound Claude pool job has invalid runtime workspace binding")
+        role_map = manifest.get("role")
+        role_name = str(role_map.get("name") if isinstance(role_map, Mapping) else "unknown")
+        _validate_runtime_workspace_binding(
+            binding,
+            role_name=role_name or "unknown",
+            expected_runtime="claude_pool",
+            workspace_path=manifest.get("cwd"),
+        )
+        if (
+            _manifest_role_is_write_producing(manifest.get("role"))
+        ):
+            if not bool(manifest.get(_BOUND_WRITE_AUTHORIZED_KEY)):
+                raise RuntimeError(
+                    "Bound Claude pool job cannot run write-producing tools under "
+                    "runtime workspace binding"
+                )
+            if manifest.get(_BOUND_WRITE_GUARD_KEY) != _BOUND_WRITE_GUARD_SANDBOX_EXEC:
+                raise RuntimeError(
+                    "Bound Claude pool job requires sandbox-exec write guard for "
+                    "runtime workspace binding"
+                )
+            expected_authorization = _bound_write_authorization(
+                manifest,
+                _pool_write_auth_secret(self.root),
+            )
+            if manifest.get(_BOUND_WRITE_AUTHORIZATION_KEY) != expected_authorization:
+                raise RuntimeError(
+                    "Bound Claude pool job has invalid write authorization for "
+                    "runtime workspace binding"
+                )
+
+        cwd_text = str(manifest.get("cwd") or "").strip()
+        if not cwd_text:
+            raise RuntimeError("Bound Claude pool job is missing cwd")
+        cwd = Path(cwd_text).expanduser()
+        if not cwd.is_absolute():
+            raise RuntimeError(f"Bound Claude pool job cwd must be absolute: {cwd_text}")
+        if cwd.is_symlink():
+            raise RuntimeError(f"Bound Claude pool job cwd is symlinked: {cwd_text}")
+        if not cwd.exists():
+            raise RuntimeError(f"Bound Claude pool job cwd does not exist: {cwd_text}")
+        if not cwd.is_dir():
+            raise RuntimeError(f"Bound Claude pool job cwd is not a directory: {cwd_text}")
+
+        binding_cwd = str(binding.get("cwd") or "").strip()
+        if binding_cwd and Path(binding_cwd).expanduser().resolve() != cwd.resolve():
+            raise RuntimeError("Bound Claude pool job cwd does not match binding cwd")
+        blocked_roots = [
+            Path(str(path)).expanduser().resolve()
+            for path in binding.get("blocked_roots", [])
+            if str(path).strip()
+        ]
+        if any(_is_relative_to(cwd.resolve(), blocked) for blocked in blocked_roots):
+            raise RuntimeError("Bound Claude pool job cwd resolves into a blocked root")
+        writable_roots = [
+            Path(str(path)).expanduser().resolve()
+            for path in binding.get("writable_roots", [])
+            if str(path).strip()
+        ]
+        if writable_roots and not any(
+            _is_relative_to(cwd.resolve(), root) or _is_relative_to(root, cwd.resolve())
+            for root in writable_roots
+        ):
+            raise RuntimeError("Bound Claude pool job cwd is outside writable roots")
+
+        expires_at = _coerce_aware_datetime(binding.get("expires_at") or manifest.get("expires_at"))
+        if expires_at is None:
+            raise RuntimeError("Bound Claude pool job is missing or has invalid expires_at")
+        if expires_at <= datetime.now(UTC):
+            raise RuntimeError("Bound Claude pool job binding is expired")
+
     async def _execute_claimed(self, running_path: Path) -> None:
         manifest = _read_json(running_path, {})
         job_id = str(manifest.get("id") or running_path.stem)
@@ -1233,6 +1557,7 @@ class ClaudePoolRunner:
             elif manifest.get("kind") == "availability":
                 await self._execute_availability(manifest)
             else:
+                self._validate_bound_job_manifest(manifest)
                 await self._execute_claude(manifest)
             status = "done"
             error = None
@@ -1363,6 +1688,7 @@ class ClaudePoolRunner:
         return stdout.decode("utf-8", errors="replace"), stderr.decode("utf-8", errors="replace")
 
     async def _execute_claude(self, manifest: dict[str, Any]) -> None:
+        self._validate_bound_job_manifest(manifest)
         paths = manifest.get("paths") or {}
         prompt = Path(paths["prompt"]).read_text(encoding="utf-8")
         system_prompt = Path(paths["system_prompt"]).read_text(encoding="utf-8")
@@ -1450,6 +1776,15 @@ class ClaudePoolRunner:
             command.extend(["--allowedTools", ",".join(str(tool) for tool in tools)])
         for add_dir in claude.get("add_dirs") or []:
             command.extend(["--add-dir", os.path.expanduser(str(add_dir))])
+        if (
+            manifest.get(_BOUND_WRITE_GUARD_KEY) == _BOUND_WRITE_GUARD_SANDBOX_EXEC
+            and _manifest_role_is_write_producing(role)
+        ):
+            sandbox_exec = shutil.which("sandbox-exec")
+            if not sandbox_exec:
+                raise RuntimeError("Claude pool write guard requires sandbox-exec")
+            profile_path = _write_sandbox_exec_profile(manifest)
+            return [sandbox_exec, "-f", str(profile_path), *command]
         return command
 
     def _write_result(self, manifest: dict[str, Any], result: dict[str, Any]) -> None:

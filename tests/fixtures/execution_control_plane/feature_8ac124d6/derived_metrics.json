@@ -1,0 +1,46 @@
+{
+  "artifact_summary_rows": 21,
+  "collector_audit_rows": 8,
+  "event_summary_rows": 16,
+  "failure_class_counts": {
+    "acl_writeability": 1,
+    "broad_read_legacy_consumer": 1,
+    "checkpoint_contradiction": 1,
+    "commit_hygiene": 1,
+    "commit_only_routing": 1,
+    "product_contract_drift": 1,
+    "queue_recovery": 1,
+    "regroup_overlay_readiness": 1,
+    "runtime_provider": 1,
+    "stale_projection": 1,
+    "worktree_alias": 1
+  },
+  "group_counts": {
+    "active": 2,
+    "commit": 5,
+    "dispatch": 2,
+    "preflight": 2,
+    "queue": 1,
+    "regroup": 3,
+    "verify": 4,
+    "workspace": 2
+  },
+  "jsonl_sha256": "5a70c353cb695ba72fda786fc8828863fbb6f01a19ad4bf7c961d32f783fa2a4",
+  "prefix_counts": {
+    "checkpoint": 1,
+    "dag-commit-failure": 4,
+    "dag-group": 2,
+    "dag-merge-queue": 1,
+    "dag-regroup": 2,
+    "dag-task": 3,
+    "dag-verify": 2,
+    "direct-route": 1,
+    "legacy-consumer": 1,
+    "preflight": 1,
+    "projection": 1,
+    "runtime-provider": 1,
+    "workspace-alias": 1
+  },
+  "schema_version": 1,
+  "selected_artifact_slice_rows": 11
+}

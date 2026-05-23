@@ -1,0 +1,3516 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Execution Flow Comparison</title>
+  <style>
+    :root {
+      --bg: #f5f7fb;
+      --ink: #172033;
+      --muted: #5f6b7c;
+      --line: #cad5e3;
+      --panel: #ffffff;
+      --soft: #edf2f7;
+      --existing: #9a5b15;
+      --proposed: #0f766e;
+      --delta: #1d4ed8;
+      --risk: #be123c;
+      --state: #6d28d9;
+      --guard: #334155;
+      --shadow: 0 12px 32px rgba(23, 32, 51, 0.08);
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      background:
+        linear-gradient(180deg, #111827 0, #111827 260px, transparent 260px),
+        var(--bg);
+      color: var(--ink);
+      font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    header {
+      color: #fff;
+      padding: 30px 36px 22px;
+    }
+
+    header h1 {
+      margin: 0 0 10px;
+      font-size: clamp(28px, 4vw, 44px);
+      letter-spacing: 0;
+    }
+
+    header p {
+      margin: 0;
+      max-width: 1120px;
+      color: #dce5f2;
+      font-size: 16px;
+    }
+
+    main {
+      padding: 0 36px 48px;
+    }
+
+    .toolbar {
+      position: sticky;
+      top: 0;
+      z-index: 20;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      align-items: center;
+      justify-content: space-between;
+      margin: 0 0 20px;
+      padding: 14px;
+      border: 1px solid rgba(202, 213, 227, 0.95);
+      border-radius: 16px;
+      background: rgba(255, 255, 255, 0.94);
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(14px);
+    }
+
+    .toolbar-title {
+      min-width: 240px;
+    }
+
+    .toolbar-title strong {
+      display: block;
+      font-size: 15px;
+    }
+
+    .toolbar-title span {
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .toggle-group {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+
+    button {
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: #fff;
+      color: #334155;
+      cursor: pointer;
+      font: inherit;
+      font-weight: 700;
+      padding: 8px 12px;
+    }
+
+    button[aria-pressed="true"] {
+      background: #172033;
+      border-color: #172033;
+      color: #fff;
+    }
+
+    .summary {
+      display: grid;
+      grid-template-columns: 1.25fr 1fr 1fr;
+      gap: 16px;
+      margin-bottom: 20px;
+    }
+
+    .summary-card,
+    .section,
+    .legend-card {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      box-shadow: var(--shadow);
+    }
+
+    .summary-card {
+      padding: 18px;
+    }
+
+    .summary-card h2,
+    .section h2,
+    .legend-card h2 {
+      margin: 0 0 8px;
+      font-size: 17px;
+      letter-spacing: 0;
+    }
+
+    .summary-card p,
+    .section-intro {
+      margin: 0;
+      color: var(--muted);
+    }
+
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      border-radius: 999px;
+      color: #fff;
+      font-size: 11px;
+      font-weight: 800;
+      letter-spacing: 0.03em;
+      padding: 3px 8px;
+      text-transform: uppercase;
+    }
+
+    .badge.existing { background: var(--existing); }
+    .badge.proposed { background: var(--proposed); }
+    .badge.delta { background: var(--delta); }
+    .badge.risk { background: var(--risk); }
+    .badge.state { background: var(--state); }
+    .badge.guard { background: var(--guard); }
+
+    .flow-legend {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 10px;
+      margin: 14px 0 0;
+    }
+
+    .legend-item {
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 10px;
+      background: #fbfcfe;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .legend-item strong {
+      display: block;
+      color: var(--ink);
+      margin-bottom: 3px;
+    }
+
+    .section {
+      padding: 18px;
+      margin-top: 20px;
+    }
+
+    .stage-header,
+    .stage-row {
+      display: grid;
+      grid-template-columns: 0.74fr 1.05fr 1.05fr 0.96fr;
+      gap: 12px;
+      align-items: stretch;
+    }
+
+    .stage-header {
+      position: sticky;
+      top: 86px;
+      z-index: 10;
+      margin-top: 16px;
+      padding: 9px 0;
+      background: rgba(245, 247, 251, 0.94);
+      backdrop-filter: blur(10px);
+    }
+
+    .column-label {
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 9px 11px;
+      background: var(--soft);
+      color: #334155;
+      font-size: 12px;
+      font-weight: 800;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+
+    .stage-row {
+      border-top: 1px solid var(--line);
+      padding: 14px 0;
+    }
+
+    .stage-row:first-of-type {
+      border-top: 0;
+    }
+
+    .stage-title {
+      border-left: 5px solid var(--delta);
+      border-radius: 12px;
+      background: #f8fafc;
+      padding: 12px;
+      min-width: 0;
+    }
+
+    .stage-title h3 {
+      margin: 0 0 6px;
+      font-size: 15px;
+    }
+
+    .stage-title p {
+      margin: 0;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .cell {
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: #fff;
+      padding: 12px;
+      min-width: 0;
+    }
+
+    .cell.existing-col { border-left: 5px solid var(--existing); background: #fffaf2; }
+    .cell.proposed-col { border-left: 5px solid var(--proposed); background: #f4fbf8; }
+    .cell.delta-col { border-left: 5px solid var(--delta); background: #f4f8ff; }
+
+    .stage-row.no-change .cell.proposed-col,
+    .stage-row.no-change .cell.delta-col {
+      background: #fff;
+      border-left: 1px solid var(--line);
+    }
+
+    .cell h4 {
+      margin: 7px 0 7px;
+      font-size: 14px;
+      letter-spacing: 0;
+    }
+
+    .cell p {
+      margin: 0;
+      color: var(--muted);
+    }
+
+    .cell ul {
+      margin: 7px 0 0;
+      padding-left: 18px;
+      color: var(--muted);
+    }
+
+    .cell li + li { margin-top: 4px; }
+
+    .note {
+      margin-top: 8px;
+      border-radius: 10px;
+      background: rgba(23, 32, 51, 0.06);
+      color: #334155;
+      padding: 8px;
+      font-size: 12px;
+    }
+
+    .risk-note {
+      margin-top: 8px;
+      border-radius: 10px;
+      background: #fff1f2;
+      color: #9f1239;
+      padding: 8px;
+      font-size: 12px;
+    }
+
+    .token {
+      display: inline-block;
+      margin: 2px 4px 2px 0;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 2px 7px;
+      background: #fff;
+      color: #475569;
+      font-size: 11px;
+      font-weight: 700;
+    }
+
+    code {
+      background: #e9eef6;
+      border: 1px solid #d7e0ec;
+      border-radius: 4px;
+      padding: 1px 4px;
+      font-size: 12px;
+    }
+
+    .matrix {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 14px;
+      overflow: hidden;
+      border-radius: 12px;
+      border: 1px solid var(--line);
+      background: #fff;
+    }
+
+    .matrix th,
+    .matrix td {
+      border-bottom: 1px solid var(--line);
+      padding: 10px 12px;
+      text-align: left;
+      vertical-align: top;
+    }
+
+    .matrix th {
+      background: var(--soft);
+      color: #334155;
+      font-size: 12px;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+
+    .matrix tr:last-child td { border-bottom: 0; }
+
+    .ownership-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 12px;
+      margin-top: 14px;
+    }
+
+    .workflow-band {
+      display: grid;
+      grid-template-columns: 1.15fr 1fr 1.05fr;
+      gap: 12px;
+      margin-top: 16px;
+    }
+
+    .band-card {
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: #fff;
+      padding: 13px;
+    }
+
+    .band-card h3 {
+      margin: 8px 0 6px;
+      font-size: 15px;
+    }
+
+    .band-card p {
+      margin: 0;
+      color: var(--muted);
+    }
+
+    .phase-list {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin-top: 10px;
+    }
+
+    .phase-subtitle {
+      margin: 20px 0 8px;
+      color: #334155;
+      font-size: 13px;
+      font-weight: 900;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+    }
+
+    .progression-note {
+      margin: 14px 0 0;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: #fbfcfe;
+      color: var(--muted);
+      padding: 11px 12px;
+    }
+
+    .owner-card {
+      border: 1px solid var(--line);
+      border-radius: 13px;
+      background: #fff;
+      padding: 12px;
+    }
+
+    .owner-card h3 {
+      margin: 7px 0 6px;
+      font-size: 14px;
+    }
+
+    .owner-card p {
+      margin: 0;
+      color: var(--muted);
+    }
+
+    body[data-mode="existing"] .proposed-col,
+    body[data-mode="existing"] .delta-col,
+    body[data-mode="existing"] .proposed-only,
+    body[data-mode="existing"] .delta-only {
+      display: none !important;
+    }
+
+    body[data-mode="proposed"] .existing-col,
+    body[data-mode="proposed"] .delta-col,
+    body[data-mode="proposed"] .existing-only,
+    body[data-mode="proposed"] .delta-only {
+      display: none !important;
+    }
+
+    body[data-mode="delta"] .existing-col,
+    body[data-mode="delta"] .proposed-col,
+    body[data-mode="delta"] .existing-only,
+    body[data-mode="delta"] .proposed-only {
+      display: none !important;
+    }
+
+    body[data-mode="existing"] .stage-header,
+    body[data-mode="existing"] .stage-row,
+    body[data-mode="proposed"] .stage-header,
+    body[data-mode="proposed"] .stage-row,
+    body[data-mode="delta"] .stage-header,
+    body[data-mode="delta"] .stage-row {
+      grid-template-columns: 0.75fr 1.45fr;
+    }
+
+    body[data-mode="delta"] .stage-title {
+      border-left-color: var(--delta);
+    }
+
+    body[data-mode="existing"] .stage-title {
+      border-left-color: var(--existing);
+    }
+
+    body[data-mode="proposed"] .stage-title {
+      border-left-color: var(--proposed);
+    }
+
+    body[data-mode="proposed"] .section.no-change-section,
+    body[data-mode="delta"] .section.no-change-section {
+      display: none !important;
+    }
+
+    body[data-mode="proposed"] .stage-row.no-change,
+    body[data-mode="delta"] .stage-row.no-change {
+      display: none !important;
+    }
+
+    @media (max-width: 1180px) {
+      .summary,
+      .workflow-band,
+      .ownership-grid {
+        grid-template-columns: 1fr;
+      }
+
+      .flow-legend {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+
+      .stage-header {
+        display: none;
+      }
+
+      .stage-row,
+      body[data-mode="existing"] .stage-row,
+      body[data-mode="proposed"] .stage-row,
+      body[data-mode="delta"] .stage-row {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    @media (max-width: 760px) {
+      main,
+      header {
+        padding-left: 18px;
+        padding-right: 18px;
+      }
+
+      .toolbar {
+        position: static;
+      }
+
+      .flow-legend {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body data-mode="compare">
+  <header>
+    <h1>Existing vs Proposed Execution Flow</h1>
+    <p>
+      A single comparison surface for the full develop workflow: unchanged
+      planning, the current `ImplementationPhase` / `_implement_dag` monolith,
+      the proposed transactional execution control plane, and preserved
+      post-execution flows. Use the toggle to isolate existing behavior,
+      proposed behavior, or the exact architectural deltas.
+    </p>
+  </header>
+
+  <main>
+    <section class="toolbar" aria-label="View controls">
+      <div class="toolbar-title">
+        <strong>Flow comparison mode</strong>
+        <span>Aligned by execution stage, not by source file.</span>
+      </div>
+      <div class="toggle-group" role="group" aria-label="Select comparison view">
+        <button type="button" data-mode="compare" aria-pressed="true">Compare</button>
+        <button type="button" data-mode="existing" aria-pressed="false">Existing only</button>
+        <button type="button" data-mode="proposed" aria-pressed="false">Proposed only</button>
+        <button type="button" data-mode="delta" aria-pressed="false">Changes only</button>
+      </div>
+    </section>
+
+    <section class="summary" aria-label="Comparison summary">
+      <div class="summary-card">
+        <span class="badge delta">Primary change</span>
+        <h2>Authority moves out of the monolith</h2>
+        <p>
+          Existing execution centralizes scheduling, dispatch, verification,
+          repair, commit, checkpoint, and post-DAG gates inside the implementation
+          phase. The proposed architecture assigns each authority to a typed,
+          durable module with explicit proof boundaries.
+        </p>
+      </div>
+      <div class="summary-card existing-only">
+        <span class="badge existing">Existing</span>
+        <h2>Artifacts carry mixed meaning</h2>
+        <p>
+          `dag-task:*`, `dag-verify:*`, and `dag-group:*` are durable evidence,
+          but current consumers can treat latest artifacts as more authoritative
+          than their provenance proves.
+        </p>
+      </div>
+      <div class="summary-card proposed-only">
+        <span class="badge proposed">Proposed</span>
+        <h2>Typed rows become canonical</h2>
+        <p>
+          Typed journal rows, evidence graphs, queue rows, and gate proofs become
+          the source of truth. Legacy `dag-*` artifacts remain synchronous
+          compatibility projections while readers migrate.
+        </p>
+      </div>
+      <div class="summary-card delta-only">
+        <span class="badge delta">How to read changes</span>
+        <h2>Each row answers one question</h2>
+        <p>
+          What does the existing flow do, what module owns it in the proposed
+          flow, and which correctness or speed failure class should disappear?
+        </p>
+      </div>
+    </section>
+
+    <section class="section">
+      <h2>Full Feature Progression Flow</h2>
+      <p class="section-intro">
+        `FullDevelopWorkflow` is `PlanningWorkflow` plus `ImplementationPhase`
+        and `PostTestObservationPhase`. The control-plane rearchitecture changes
+        the implementation execution core; planning remains the upstream producer
+        of the approved root DAG, and post-execution business/observation
+        remains downstream with stronger readiness proof.
+      </p>
+
+      <div class="workflow-band" aria-label="Workflow bands">
+        <div class="band-card">
+          <span class="badge guard">Preserved</span>
+          <h3>Planning produces intent</h3>
+          <p>
+            Scope, broad decomposition, subfeatures, plan review, and task
+            planning still produce the plan, test plan, and approved root `dag`.
+          </p>
+          <div class="phase-list">
+            <span class="token">scoping</span>
+            <span class="token">broad</span>
+            <span class="token">subfeature</span>
+            <span class="token">plan-review</span>
+            <span class="token">task-planning</span>
+          </div>
+        </div>
+        <div class="band-card">
+          <span class="badge delta">Changed</span>
+          <h3>Implementation executes intent</h3>
+          <p>
+            The monolithic DAG loop is replaced by typed journal, workspace
+            authority, contracts, sandbox runner, verification graph, failure
+            router, and merge queue.
+          </p>
+          <div class="phase-list">
+            <span class="token">implementation</span>
+            <span class="token">effective DAG</span>
+            <span class="token">checkpoint proof</span>
+          </div>
+        </div>
+        <div class="band-card">
+          <span class="badge guard">Preserved + typed</span>
+          <h3>Post-execution confirms outcome</h3>
+          <p>
+            Post-DAG gates and post-test observation still happen after
+            implementation, but readiness reads effective completion and typed
+            gate evidence rather than inferred artifact state.
+          </p>
+          <div class="phase-list">
+            <span class="token">post-DAG gates</span>
+            <span class="token">post-test-observation</span>
+            <span class="token">workflow done</span>
+          </div>
+        </div>
+      </div>
+
+      <p class="progression-note">
+        The rows below use the same aligned comparison component as the
+        implementation deep dive. Planning and observation are not hidden
+        sidebars: they are explicit phases in the same feature progression.
+      </p>
+    </section>
+
+    <section class="legend-card section">
+      <h2>Legend</h2>
+      <div class="flow-legend">
+        <div class="legend-item"><strong>Existing</strong> Current workflow code paths and artifact behavior.</div>
+        <div class="legend-item"><strong>Proposed</strong> Target execution-control-plane module ownership.</div>
+        <div class="legend-item"><strong>Changed</strong> Responsibility, authority, or proof boundary moves.</div>
+        <div class="legend-item"><strong>Preserved</strong> Business behavior remains but moves behind typed evidence.</div>
+      </div>
+    </section>
+
+    <section class="section">
+      <h2>Scoping Phase Flow</h2>
+      <p class="section-intro">
+        `ScopingPhase` remains a preserved planning phase. It establishes the
+        feature boundary before decomposition and executable planning begin.
+      </p>
+
+      <div class="stage-header" aria-hidden="true">
+        <div class="column-label">Scoping step</div>
+        <div class="column-label existing-col">Existing flow</div>
+        <div class="column-label proposed-col">Proposed control plane</div>
+        <div class="column-label delta-col">What changes</div>
+      </div>
+
+      <article class="stage-row">
+        <div class="stage-title">
+          <h3>S1. Resume And Recovery Check</h3>
+          <p>Determines whether approved scope already exists.</p>
+        </div>
+        <div class="cell existing-col">
+          <span class="badge existing">Existing</span>
+          <h4>Approved marker and draft artifacts</h4>
+          <p>
+            The phase reads the scope approved marker, `scope`, structured scope
+            draft, and project context. If approved scope exists, it finalizes
+            scoping outputs or recovers a scope model from the approved text.
+          </p>
+        </div>
+        <div class="cell proposed-col">
+          <span class="badge proposed">Proposed</span>
+          <h4>Scope remains upstream evidence</h4>
+          <p>
+            No execution-control state is created here. The approved scope later
+            becomes an input to task contracts, verifier context, and planning
+            traceability.
+          </p>
+        </div>
+        <div class="cell delta-col">
+          <span class="badge guard">Preserved</span>
+          <h4>No authority change</h4>
+          <p>
+            Resume/recovery behavior stays in planning. The control plane must
+            consume scope, not reinterpret or bypass it.
+          </p>
+        </div>
+      </article>
+
+      <article class="stage-row">
+        <div class="stage-title">
+          <h3>S1A. Input Hydration</h3>
+          <p>Loads scope text, structured draft, and project context.</p>
+        </div>
+        <div class="cell existing-col">
+          <span class="badge existing">Existing</span>
+          <h4>`scope`, `_SCOPE_DRAFT_KEY`, project context</h4>
+          <p>
+            Before deciding whether to interview, the phase hydrates persisted
+            scope text, structured `ScopeOutput` draft state, and project context
+            so resume paths have the same inputs as fresh paths.
+          </p>
+        </div>
+        <div class="cell proposed-col">
+          <span class="badge proposed">Proposed</span>
+          <h4>Hydrated intent remains immutable upstream context</h4>
+          <p>
+            Execution modules later consume this context through contracts and
+            verifier packages. They do not ask scoping to rerun or reinterpret
+            partially hydrated state.
+          </p>
+        </div>
+        <div class="cell delta-col">
+          <span class="badge guard">Preserved</span>
+          <h4>Recovery stays planning-local</h4>
+          <p>
+            Scope recovery can influence planning, but it does not create a
+            runnable task, sandbox, queue item, or checkpoint.
+          </p>
+        </div>
+      </article>
+
+      <article class="stage-row">
+        <div class="stage-title">
+          <h3>S2. Scope Interview</h3>
+          <p>Collects focused feature boundaries from the user.</p>
+        </div>
+        <div class="cell existing-col">
+          <span class="badge existing">Existing</span>
+          <h4>`HostedInterview` with `scoper`</h4>
+          <p>
+            If no draft exists, `ScopingPhase` asks about repos involved, change
+            type, and out-of-scope areas, producing a structured `ScopeOutput`
+            and hosted `scope` artifact.
+          </p>
+        </div>
+        <div class="cell proposed-col">
+          <span class="badge proposed">Proposed</span>
+          <h4>User interaction remains unchanged</h4>
+          <p>
+            The control plane does not replace the scoping interview. Later
+            execution contracts should cite the approved scope when enforcing
+            non-goals and allowed surfaces.
+          </p>
+        </div>
+        <div class="cell delta-col">
+          <span class="badge guard">Preserved</span>
+          <h4>Intent capture stays human-led</h4>
+          <p>
+            This phase remains focused on feature intent, not product-file
+            mutation or execution scheduling.
+          </p>
+        </div>
+      </article>
+
+      <article class="stage-row">
+        <div class="stage-title">
+          <h3>S2A. Draft Persistence</h3>
+          <p>Stores structured scope before approval.</p>
+        </div>
+        <div class="cell existing-col">
+          <span class="badge existing">Existing</span>
+          <h4>Structured draft written before the gate</h4>
+          <p>
+            Fresh interviews write the draft `ScopeOutput` to `_SCOPE_DRAFT_KEY`
+            before `gate_and_revise`, allowing interrupted scope sessions to
+            resume without losing the structured answer.
+          </p>
+        </div>
+        <div class="cell proposed-col">
+          <span class="badge proposed">Proposed</span>
+          <h4>Draft remains non-authoritative</h4>
+          <p>
+            The draft can seed a later approval gate, but task contracts and
+            execution admission should cite the approved scope, not the draft.
+          </p>
+        </div>
+        <div class="cell delta-col">
+          <span class="badge guard">Preserved</span>
+          <h4>Draft evidence does not unlock execution</h4>
+          <p>
+            The control plane must not treat draft planning artifacts as proof
+            that implementation can begin.
+          </p>
+        </div>
+      </article>
+
+      <article class="stage-row">
+        <div class="stage-title">
+          <h3>S3. Gate, Revise, Finalize</h3>
+          <p>Approves the scope and writes durable planning outputs.</p>
+        </div>
+        <div class="cell existing-col">
+          <span class="badge existing">Existing</span>
+          <h4>`gate_and_revise` then `_finalize_scoping_outputs`</h4>
+          <p>
+            The scope is reviewed and revised through the hosted gate. On
+            approval, structured scope/project outputs are finalized; fallback
+            behavior writes `scope` and the approved marker.
+          </p>
+        </div>
+        <div class="cell proposed-col">
+          <span class="badge proposed">Proposed</span>
+          <h4>Approved scope becomes contract context</h4>
+          <p>
+            Execution-control modules must treat finalized scope as immutable
+            planning evidence for the feature unless planning is rerun.
+          </p>
+        </div>
+        <div class="cell delta-col">
+          <span class="badge guard">Preserved + referenced</span>
+          <h4>Downstream traceability improves</h4>
+          <p>
+            Scope approval remains the same, but implementation contracts can
+            now explicitly point to the scope evidence they enforce.
+          </p>
+        </div>
+      </article>
+
+      <article class="stage-row">
+        <div class="stage-title">
+          <h3>S4. Structured Recovery Fallback</h3>
+          <p>Recovers model-shaped scope from approved text when needed.</p>
+        </div>
+        <div class="cell existing-col">
+          <span class="badge existing">Existing</span>
+          <h4>`_recover_scope_model` fallback</h4>
+          <p>
+            If the gate returns text or only approved scope text is present, the
+            phase attempts to recover a `ScopeOutput`; if recovery fails, it
+            still persists approved text and state scope.
+          </p>
+        </div>
+        <div class="cell proposed-col">
+          <span class="badge proposed">Proposed</span>
+          <h4>Contracts tolerate text-backed scope</h4>
+          <p>
+            Later contract compilation should accept either structured scope or
+            approved text evidence, while marking provenance clearly.
+          </p>
+        </div>
+        <div class="cell delta-col">
+          <span class="badge guard">Preserved + explicit</span>
+          <h4>Execution sees provenance, not guesswork</h4>
+          <p>
+            The planning fallback is preserved, but the implementation layer
+            should know whether scope evidence was structured or recovered.
+          </p>
+        </div>
+      </article>
+
+      <article class="stage-row">
+        <div class="stage-title">
+          <h3>S5. Final Artifact Write</h3>
+          <p>Commits approved scope and project outputs to planning evidence.</p>
+        </div>
+        <div class="cell existing-col">
+          <span class="badge existing">Existing</span>
+          <h4>`_finalize_scoping_outputs` or fallback writes</h4>
+          <p>
+            Successful structured approval finalizes scope/project artifacts and
+            approved markers. Fallback approval writes `scope`,
+            `_SCOPE_APPROVED_KEY`, and `state.scope`.
+          </p>
+        </div>
+        <div class="cell proposed-col">
+          <span class="badge proposed">Proposed</span>
+          <h4>Final scope becomes immutable planning source</h4>
+          <p>
+            Future execution state should reference this approved scope through
+            stable evidence links rather than copying it into ad hoc prompts.
+          </p>
+        </div>
+        <div class="cell delta-col">
+          <span class="badge guard">Preserved + referenced</span>
+          <h4>Traceability improves without changing scoping</h4>
+          <p>
+            The scoping write remains the same; downstream records get better at
+            pointing back to it.
+          </p>
+        </div>
+      </article>
+
+      <article class="stage-row">
+        <div class="stage-title">
+          <h3>S6. Broad Planning Handoff</h3>
+          <p>Returns state so broad planning can build shared artifacts.</p>
+        </div>
+        <div class="cell existing-col">
+          <span class="badge existing">Existing</span>
+          <h4>Phase returns `BuildState`</h4>
+          <p>
+            `PlanningWorkflow` advances from scoping to broad planning with the
+            approved scope in state and artifacts.
+          </p>
+        </div>
+        <div class="cell proposed-col">
+          <span class="badge proposed">Proposed</span>
+          <h4>Control-plane boundary remains later</h4>
+          <p>
+            No execution-control journal row is created until implementation
+            consumes the approved root DAG.
+          </p>
+        </div>
+        <div class="cell delta-col">
+          <span class="badge guard">Preserved</span>
+          <h4>Feature progress stays phase ordered</h4>
+          <p>
+            Scoping remains the first feature boundary and cannot be skipped by
+            the transactional execution architecture.
+          </p>
+        </div>
+      </article>
+    </section>
+
+    <section class="section">
+      <h2>Broad Planning Phase Flow</h2>
+      <p class="section-intro">
+        `BroadPhase` builds the shared product, design, and architecture
+        foundation before the feature is split into subfeatures.
+      </p>
+
+      <div class="stage-header" aria-hidden="true">
+        <div class="column-label">Broad step</div>
+        <div class="column-label existing-col">Existing flow</div>
+        <div class="column-label proposed-col">Proposed control plane</div>
+        <div class="column-label delta-col">What changes</div>
+      </div>
+
+      <article class="stage-row">
+        <div class="stage-title">
+          <h3>B1. Planning Control Stage</h3>
+          <p>Sets the resumable planning-control state to broad.</p>
+        </div>
+        <div class="cell existing-col">
+          <span class="badge existing">Existing</span>
+          <h4>`load_planning_control` and `set_current_stage("broad")`</h4>
+          <p>
+            The phase persists planning-control state before running broad
+            artifact stages, giving planning a restart-aware stage marker.
+          </p>
+        </div>
+        <div class="cell proposed-col">
+          <span class="badge proposed">Proposed</span>
+          <h4>Planning-control remains separate from execution control</h4>
+          <p>
+            The future typed execution journal starts later. Broad planning
+            control remains a planning concern and does not become merge or
+            checkpoint authority.
+          </p>
+        </div>
+        <div class="cell delta-col">
+          <span class="badge guard">Preserved</span>
+          <h4>Two journals, two meanings</h4>
+          <p>
+            Planning-control state tracks planning progress; execution-control
+            state tracks implementation authority.
+          </p>
+        </div>
+      </article>
+
+      <article class="stage-row">
+        <div class="stage-title">
+          <h3>B2. Broad PRD</h3>
+          <p>Captures high-level requirements.</p>
+        </div>
+        <div class="cell existing-col">
+          <span class="badge existing">Existing</span>
+          <h4>`_run_broad_artifact_stage(... step="prd")`</h4>
+          <p>
+            `lead_pm` and the PM fill responder produce `prd:broad`, then broad
+            decisions are refreshed from that PRD source.
+          </p>
+        </div>
+        <div class="cell proposed-col">
+          <span class="badge proposed">Proposed</span>
+          <h4>PRD remains planning evidence</h4>
+          <p>
+            Task contracts and verifier context may reference PRD acceptance
+            expectations, but the PRD stage itself is not rearchitected.
+          </p>
+        </div>
+        <div class="cell delta-col">
+          <span class="badge guard">Preserved</span>
+          <h4>Requirements source stays upstream</h4>
+          <p>
+            The control plane enforces later work against requirements; it does
+            not replace requirements authoring.
+          </p>
+        </div>
+      </article>
+
+      <article class="stage-row">
+        <div class="stage-title">
+          <h3>B2A. PRD Decision Refresh</h3>
+          <p>Extracts broad requirements decisions for later planning stages.</p>
+        </div>
+        <div class="cell existing-col">
+          <span class="badge existing">Existing</span>
+          <h4>`_refresh_broad_decisions(... artifact_kind="prd")`</h4>
+          <p>
+            After `prd:broad` is produced, broad decisions are refreshed from
+            the PRD source so subsequent design, architecture, decomposition,
+            and subfeature steps can inherit those requirements.
+          </p>
+        </div>
+        <div class="cell proposed-col">
+          <span class="badge proposed">Proposed</span>
+          <h4>Decision extraction remains planning evidence</h4>
+          <p>
+            The control plane should reference extracted decisions only after
+            they survive the later plan-review and task-planning gates.
+          </p>
+        </div>
+        <div class="cell delta-col">
+          <span class="badge guard">Preserved + referenced</span>
+          <h4>Decision provenance is preserved downstream</h4>
+          <p>
+            Requirement decisions can explain contract acceptance criteria, but
+            they do not independently approve implementation work.
+          </p>
+        </div>
+      </article>
+
+      <article class="stage-row">
+        <div class="stage-title">
+          <h3>B3. Broad Design</h3>
+          <p>Defines shared visual and interaction direction.</p>
+        </div>
+        <div class="cell existing-col">
+          <span class="badge existing">Existing</span>
+          <h4>`_run_broad_artifact_stage(... step="design")`</h4>
+          <p>
+            `lead_designer_broad` and the design fill responder produce
+            `design:broad`, including shared design system and reusable
+            interaction patterns.
+          </p>
+        </div>
+        <div class="cell proposed-col">
+          <span class="badge proposed">Proposed</span>
+          <h4>Design remains contract input</h4>
+          <p>
+            Execution contracts can later require or forbid UI surfaces based on
+            broad design, but design generation remains planning-owned.
+          </p>
+        </div>
+        <div class="cell delta-col">
+          <span class="badge guard">Preserved</span>
+          <h4>No product mutation here</h4>
+          <p>
+            Design intent stays separate from implementation patches.
+          </p>
+        </div>
+      </article>
+
+      <article class="stage-row">
+        <div class="stage-title">
+          <h3>B3A. Design Decision Refresh</h3>
+          <p>Promotes shared design decisions into planning control.</p>
+        </div>
+        <div class="cell existing-col">
+          <span class="badge existing">Existing</span>
+          <h4>`_refresh_broad_decisions(... artifact_kind="design")`</h4>
+          <p>
+            The phase refreshes broad design decisions after `design:broad`,
+            making shared tokens, interaction conventions, and reusable design
+            rules available to later per-subfeature steps.
+          </p>
+        </div>
+        <div class="cell proposed-col">
+          <span class="badge proposed">Proposed</span>
+          <h4>Design decisions become contract context</h4>
+          <p>
+            UI and frontend contracts can cite approved design decisions when
+            requiring or forbidding surfaces, but design remains upstream.
+          </p>
+        </div>
+        <div class="cell delta-col">
+          <span class="badge guard">Preserved + referenced</span>
+          <h4>Visual intent is traceable through execution</h4>
+          <p>
+            Later verifier packages can show which approved design evidence
+            they are checking against.
+          </p>
+        </div>
+      </article>
+
+      <article class="stage-row">
+        <div class="stage-title">
+          <h3>B4. Broad Architecture</h3>
+          <p>Defines topology and cross-cutting technical constraints.</p>
+        </div>
+        <div class="cell existing-col">
+          <span class="badge existing">Existing</span>
+          <h4>`_run_broad_artifact_stage(... step="architecture")`</h4>
+          <p>
+            `lead_architect_broad` produces `plan:broad`, using PRD and design
+            to define system topology, technical constraints, and platform
+            conventions.
+          </p>
+        </div>
+        <div class="cell proposed-col">
+          <span class="badge proposed">Proposed</span>
+          <h4>Architecture constrains later scheduling</h4>
+          <p>
+            Scheduler feedback and task contracts may use broad architecture
+            surfaces to infer risk, barriers, and verification expectations.
+          </p>
+        </div>
+        <div class="cell delta-col">
+          <span class="badge guard">Preserved + referenced</span>
+          <h4>Architecture is input, not queue proof</h4>
+          <p>
+            It can influence execution policy, but it cannot substitute for
+            sandbox, verifier, merge, or checkpoint evidence.
+          </p>
+        </div>
+      </article>
+
+      <article class="stage-row">
+        <div class="stage-title">
+          <h3>B4A. Architecture Decision Refresh</h3>
+          <p>Extracts technical constraints before decomposition.</p>
+        </div>
+        <div class="cell existing-col">
+          <span class="badge existing">Existing</span>
+          <h4>`_refresh_broad_decisions(... artifact_kind="plan")`</h4>
+          <p>
+            After `plan:broad`, architecture decisions are refreshed so
+            decomposition and subfeature planning inherit technical constraints,
+            repo boundaries, and cross-cutting platform choices.
+          </p>
+        </div>
+        <div class="cell proposed-col">
+          <span class="badge proposed">Proposed</span>
+          <h4>Architecture decisions inform execution risk</h4>
+          <p>
+            The scheduler and contract compiler can use approved architecture
+            evidence to identify shared services, barriers, generated outputs,
+            and verification expectations.
+          </p>
+        </div>
+        <div class="cell delta-col">
+          <span class="badge guard">Preserved + referenced</span>
+          <h4>Execution policy cites planning evidence</h4>
+          <p>
+            Risk classification gets a clearer source, while merge/checkpoint
+            authority still belongs to typed execution proof.
+          </p>
+        </div>
+      </article>
+
+      <article class="stage-row">
+        <div class="stage-title">
+          <h3>B5. Decomposition Stage</h3>
+          <p>Splits the feature into subfeatures and dependency edges.</p>
+        </div>
+        <div class="cell existing-col">
+          <span class="badge existing">Existing</span>
+          <h4>`_run_decomposition_stage`</h4>
+          <p>
+            The phase builds `state.decomposition` from broad PRD, design, and
+            architecture context before any subfeature planning steps execute.
+          </p>
+        </div>
+        <div class="cell proposed-col">
+          <span class="badge proposed">Proposed</span>
+          <h4>Decomposition remains the handoff to subfeature planning</h4>
+          <p>
+            The control plane later consumes the approved root DAG, not raw
+            decomposition alone. Decomposition still shapes downstream planning.
+          </p>
+        </div>
+        <div class="cell delta-col">
+          <span class="badge guard">Preserved</span>
+          <h4>Execution waits for later approval</h4>
+          <p>
+            No implementation agent should start from broad decomposition alone.
+          </p>
+        </div>
+      </article>
+
+      <article class="stage-row">
+        <div class="stage-title">
+          <h3>B6. Broad Reconciliation</h3>
+          <p>Reconciles decomposition boundaries against broad intent.</p>
+        </div>
+        <div class="cell existing-col">
+          <span class="badge existing">Existing</span>
+          <h4>`_run_broad_reconciliation_stage`</h4>
+          <p>
+            The decomposition is reviewed and reconciled before it is accepted
+            as `state.decomposition`, reducing mismatches between broad
+            requirements, design, architecture, and subfeature boundaries.
+          </p>
+        </div>
+        <div class="cell proposed-col">
+          <span class="badge proposed">Proposed</span>
+          <h4>Boundary reconciliation remains planning-time</h4>
+          <p>
+            Execution-control modules should assume decomposition has already
+            passed this broad consistency step and should not silently repair
+            decomposition while implementing product files.
+          </p>
+        </div>
+        <div class="cell delta-col">
+          <span class="badge guard">Preserved</span>
+          <h4>Mis-scoped work is caught before executable planning</h4>
+          <p>
+            Product execution still waits for task planning; reconciliation is
+            not a merge or checkpoint operation.
+          </p>
+        </div>
+      </article>
+
+      <article class="stage-row">
+        <div class="stage-title">
+          <h3>B7. Subfeature Step Policies</h3>
+          <p>Collects how each subfeature planning step should proceed.</p>
+        </div>
+        <div class="cell existing-col">
+          <span class="badge existing">Existing</span>
+          <h4>`_collect_subfeature_step_policies`</h4>
+          <p>
+            Broad planning collects policies that guide PM, design,
+            architecture, and test-planning steps for each subfeature before the
+            subfeature scheduler starts.
+          </p>
+        </div>
+        <div class="cell proposed-col">
+          <span class="badge proposed">Proposed</span>
+          <h4>Policies remain planning scheduler inputs</h4>
+          <p>
+            These policies shape planning behavior. Execution scheduling later
+            uses the approved root DAG, task contracts, and typed overlay state.
+          </p>
+        </div>
+        <div class="cell delta-col">
+          <span class="badge guard">Preserved</span>
+          <h4>Planning policy does not become runtime policy</h4>
+          <p>
+            Runtime sandbox and merge policy must be derived from the approved
+            DAG and contracts, not directly from broad-step planning policy.
+          </p>
+        </div>
+      </article>
+
+      <article class="stage-row">
+        <div class="stage-title">
+          <h3>B8. Subfeature Stage Handoff</h3>
+          <p>Advances planning-control state to subfeature planning.</p>
+        </div>
+        <div class="cell existing-col">
+          <span class="badge existing">Existing</span>
+          <h4>`set_current_stage(control, "subfeature")`</h4>
+          <p>
+            After decomposition, reconciliation, and policy collection, the
+            phase persists planning control with the next stage set to
+            `subfeature`.
+          </p>
+        </div>
+        <div class="cell proposed-col">
+          <span class="badge proposed">Proposed</span>
+          <h4>Stage handoff remains planning-only</h4>
+          <p>
+            This is still planning progress, not a product mutation boundary or
+            execution-control checkpoint.
+          </p>
+        </div>
+        <div class="cell delta-col">
+          <span class="badge guard">Preserved</span>
+          <h4>Stage boundary is explicit</h4>
+          <p>
+            The full page now shows the planning phase transition with the same
+            clarity as the implementation control boundary.
+          </p>
+        </div>
+      </article>
+    </section>
+
+    <section class="section">
+      <h2>Subfeature Planning Phase Flow</h2>
+      <p class="section-intro">
+        `SubfeaturePhase` runs per-subfeature planning steps with dependency-aware
+        scheduling, background completion support, tail passes, and compiled
+        decision mirrors.
+      </p>
+
+      <div class="stage-header" aria-hidden="true">
+        <div class="column-label">Subfeature step</div>
+        <div class="column-label existing-col">Existing flow</div>
+        <div class="column-label proposed-col">Proposed control plane</div>
+        <div class="column-label delta-col">What changes</div>
+      </div>
+
+      <article class="stage-row">
+        <div class="stage-title">
+          <h3>SF1. Resume And Scheduler Setup</h3>
+          <p>Loads decomposition and planning-control scheduler state.</p>
+        </div>
+        <div class="cell existing-col">
+          <span class="badge existing">Existing</span>
+          <h4>Control, stage, threads, locks</h4>
+          <p>
+            The phase loads decomposition, derives the effective resume stage,
+            syncs subfeature threads, resets stale background state, and creates
+            locks plus an active task map for subfeature scheduling.
+          </p>
+        </div>
+        <div class="cell proposed-col">
+          <span class="badge proposed">Proposed</span>
+          <h4>Planning scheduler remains upstream</h4>
+          <p>
+            This scheduler remains for planning artifacts. It is distinct from
+            implementation scheduling, regroup overlays, and merge queue leases.
+          </p>
+        </div>
+        <div class="cell delta-col">
+          <span class="badge guard">Preserved</span>
+          <h4>Do not conflate planning and execution schedulers</h4>
+          <p>
+            The new control plane starts after this planning scheduler produces
+            approved executable intent.
+          </p>
+        </div>
+      </article>
+
+      <article class="stage-row">
+        <div class="stage-title">
+          <h3>SF1A. Thread Sync And Stale Background Reset</h3>
+          <p>Normalizes persisted planning threads before new work starts.</p>
+        </div>
+        <div class="cell existing-col">
+          <span class="badge existing">Existing</span>
+          <h4>`sync_subfeature_threads` and `_reset_stale_background_state`</h4>
+          <p>
+            The phase syncs thread records against the decomposition, repairs
+            legacy reconciliation status where needed, and clears stale
+            background state before dispatching more planning tasks.
+          </p>
+        </div>
+        <div class="cell proposed-col">
+          <span class="badge proposed">Proposed</span>
+          <h4>Planning-thread repair remains upstream</h4>
+          <p>
+            Execution-control resume repair should not consume these planning
+            thread records as task-attempt or merge-queue state.
+          </p>
+        </div>
+        <div class="cell delta-col">
+          <span class="badge guard">Preserved + separated</span>
+          <h4>Resume domains stay distinct</h4>
+          <p>
+            Planning background recovery and implementation crash recovery have
+            different meanings and must remain separate journals.
+          </p>
+        </div>
+      </article>
+
+      <article class="stage-row">
+        <div class="stage-title">
+          <h3>SF2. Step Dispatch</h3>
+          <p>Runs PM, design, architecture, and test-planning steps.</p>
+        </div>
+        <div class="cell existing-col">
+          <span class="badge existing">Existing</span>
+          <h4>`_dispatch_step` chooses per-step runner</h4>
+          <p>
+            Each subfeature step routes to `_run_pm_step`, `_run_design_step`,
+            `_run_architecture_step`, or `_run_test_planning_step`, depending on
+            the current planning-control step.
+          </p>
+        </div>
+        <div class="cell proposed-col">
+          <span class="badge proposed">Proposed</span>
+          <h4>Step outputs remain planning artifacts</h4>
+          <p>
+            PM/design/architecture/test-plan outputs become later contract and
+            verifier context inputs, but this dispatch is not sandboxed product
+            implementation.
+          </p>
+        </div>
+        <div class="cell delta-col">
+          <span class="badge guard">Preserved</span>
+          <h4>Planning agents still produce planning outputs</h4>
+          <p>
+            No implementation queue item is created by subfeature planning.
+          </p>
+        </div>
+      </article>
+
+      <article class="stage-row">
+        <div class="stage-title">
+          <h3>SF2A. Per-Step Locking</h3>
+          <p>Prevents duplicate planning work inside a subfeature step.</p>
+        </div>
+        <div class="cell existing-col">
+          <span class="badge existing">Existing</span>
+          <h4>`control_lock`, `step_locks`, `active_tasks`</h4>
+          <p>
+            The subfeature scheduler uses a shared control lock, per-subfeature
+            step locks, and an active task map so concurrent planning steps do
+            not trample persisted planning-control state.
+          </p>
+        </div>
+        <div class="cell proposed-col">
+          <span class="badge proposed">Proposed</span>
+          <h4>Execution leases are separate and stronger</h4>
+          <p>
+            The merge queue and dispatcher should use typed leases/idempotency,
+            not these in-memory planning task maps, when protecting product
+            mutation and checkpoint authority.
+          </p>
+        </div>
+        <div class="cell delta-col">
+          <span class="badge guard">Preserved + contrasted</span>
+          <h4>Same concurrency concept, different authority</h4>
+          <p>
+            Planning locks protect artifact authoring; execution leases protect
+            canonical product mutation.
+          </p>
+        </div>
+      </article>
+
+      <article class="stage-row">
+        <div class="stage-title">
+          <h3>SF3. Interactive Or Background Mode</h3>
+          <p>Supports user-led planning or agent-fill continuation.</p>
+        </div>
+        <div class="cell existing-col">
+          <span class="badge existing">Existing</span>
+          <h4>`_ensure_step_mode` and background records</h4>
+          <p>
+            A ready step can run interactively or switch to agent-fill. The
+            phase marks background state as active/running and persists planning
+            control before continuing.
+          </p>
+        </div>
+        <div class="cell proposed-col">
+          <span class="badge proposed">Proposed</span>
+          <h4>Background planning remains restart-aware</h4>
+          <p>
+            The execution-control journal should not replace this planning
+            resume mechanism. It should only consume approved outputs once they
+            are finalized.
+          </p>
+        </div>
+        <div class="cell delta-col">
+          <span class="badge guard">Preserved</span>
+          <h4>Mode choice remains planning-local</h4>
+          <p>
+            The control plane must not treat background planning progress as
+            implementation progress.
+          </p>
+        </div>
+      </article>
+
+      <article class="stage-row">
+        <div class="stage-title">
+          <h3>SF3A. Background Completion Persistence</h3>
+          <p>Records active/running/complete/failed background planning work.</p>
+        </div>
+        <div class="cell existing-col">
+          <span class="badge existing">Existing</span>
+          <h4>`set_background_state` and status repair</h4>
+          <p>
+            When background planning finishes or fails, the scheduler clears the
+            active background marker, restores pending status on failure, and
+            persists planning control before continuing.
+          </p>
+        </div>
+        <div class="cell proposed-col">
+          <span class="badge proposed">Proposed</span>
+          <h4>Execution attempts need durable typed rows</h4>
+          <p>
+            Product implementation cannot rely on in-memory task completion or
+            planning-control flags; it needs typed attempts, sandbox manifests,
+            and queue records that survive restarts.
+          </p>
+        </div>
+        <div class="cell delta-col">
+          <span class="badge guard">Preserved + informs</span>
+          <h4>The pattern inspires but does not replace the control plane</h4>
+          <p>
+            The execution design borrows restart-awareness, then strengthens it
+            with database-owned idempotency and recovery.
+          </p>
+        </div>
+      </article>
+
+      <article class="stage-row">
+        <div class="stage-title">
+          <h3>SF4. Dependency-Aware Planning Loop</h3>
+          <p>Launches ready subfeature steps and detects deadlocks.</p>
+        </div>
+        <div class="cell existing-col">
+          <span class="badge existing">Existing</span>
+          <h4>`_step_ready`, active tasks, blocked statuses</h4>
+          <p>
+            The phase checks each subfeature's current step, launches ready
+            tasks, marks blocked steps, waits for active tasks, and raises a
+            deadlock if no work can progress.
+          </p>
+        </div>
+        <div class="cell proposed-col">
+          <span class="badge proposed">Proposed</span>
+          <h4>Planning dependencies remain separate</h4>
+          <p>
+            Implementation dependency enforcement later occurs through DAG
+            contracts and regroup overlay validation, not by reusing this
+            planning loop as execution authority.
+          </p>
+        </div>
+        <div class="cell delta-col">
+          <span class="badge guard">Preserved + separated</span>
+          <h4>Dependency concepts are reused, not authority</h4>
+          <p>
+            Planning dependency readiness informs intent; execution dependency
+            readiness is proven by typed checkpoint/effective-DAG state.
+          </p>
+        </div>
+      </article>
+
+      <article class="stage-row">
+        <div class="stage-title">
+          <h3>SF4A. Blocked And Deadlock Handling</h3>
+          <p>Stops planning when no dependency-ready work can progress.</p>
+        </div>
+        <div class="cell existing-col">
+          <span class="badge existing">Existing</span>
+          <h4>Blocked statuses and scheduler deadlock error</h4>
+          <p>
+            Steps that are not ready are marked blocked. If no task can launch
+            and no active task can complete, the phase raises a deadlock with
+            the blocked subfeature-step list.
+          </p>
+        </div>
+        <div class="cell proposed-col">
+          <span class="badge proposed">Proposed</span>
+          <h4>Execution deadlocks route through failure taxonomy</h4>
+          <p>
+            Implementation deadlocks should become typed `blocked` or
+            `quiesced` states with route decisions, not generic repair loops or
+            silent phase completion.
+          </p>
+        </div>
+        <div class="cell delta-col">
+          <span class="badge delta">Boundary tightened</span>
+          <h4>Blocked means different things by phase</h4>
+          <p>
+            Planning deadlock blocks artifact authoring. Execution blocked state
+            must also preserve sandbox, queue, and checkpoint safety.
+          </p>
+        </div>
+      </article>
+
+      <article class="stage-row">
+        <div class="stage-title">
+          <h3>SF5. Global Tail And Cascades</h3>
+          <p>Runs PRD, design, and architecture tail passes.</p>
+        </div>
+        <div class="cell existing-col">
+          <span class="badge existing">Existing</span>
+          <h4>Tail requests cascade downstream artifacts</h4>
+          <p>
+            PRD tail requests cascade to design, plan, system-design, and
+            test-plan; design tail requests cascade to plan/system-design/test
+            plan; architecture tail requests cascade to test-plan.
+          </p>
+        </div>
+        <div class="cell proposed-col">
+          <span class="badge proposed">Proposed</span>
+          <h4>Artifact cascades stay before executable DAG approval</h4>
+          <p>
+            The control plane relies on these cascades having completed before
+            it compiles contracts from the approved root DAG.
+          </p>
+        </div>
+        <div class="cell delta-col">
+          <span class="badge guard">Preserved</span>
+          <h4>Planning consistency remains upstream</h4>
+          <p>
+            Execution repair should not patch planning cascades silently after
+            implementation starts.
+          </p>
+        </div>
+      </article>
+
+      <article class="stage-row">
+        <div class="stage-title">
+          <h3>SF5A. Tail Cascade Targets</h3>
+          <p>Updates downstream artifacts when tail decisions invalidate them.</p>
+        </div>
+        <div class="cell existing-col">
+          <span class="badge existing">Existing</span>
+          <h4>`_cascade_requests` by artifact prefix</h4>
+          <p>
+            PRD tail requests cascade to design, plan, system-design, and
+            test-plan; design requests cascade to plan/system-design/test-plan;
+            architecture requests cascade to test-plan.
+          </p>
+        </div>
+        <div class="cell proposed-col">
+          <span class="badge proposed">Proposed</span>
+          <h4>Execution consumes cascaded outputs only after approval</h4>
+          <p>
+            Contract compilation should depend on approved, cascaded planning
+            artifacts so stale AC ids, component references, or architecture
+            entities do not enter verifier context.
+          </p>
+        </div>
+        <div class="cell delta-col">
+          <span class="badge guard">Preserved + safer downstream</span>
+          <h4>Stale planning projection risk is made visible</h4>
+          <p>
+            The proposed architecture does not move cascades, but it makes stale
+            inputs a first-class verification/preflight failure later.
+          </p>
+        </div>
+      </article>
+
+      <article class="stage-row">
+        <div class="stage-title">
+          <h3>SF6. Decision Ledger And Mirrors</h3>
+          <p>Compiles decision evidence for plan review and task planning.</p>
+        </div>
+        <div class="cell existing-col">
+          <span class="badge existing">Existing</span>
+          <h4>`compile_decision_ledger` and `sync_compiled_decision_mirrors`</h4>
+          <p>
+            The phase compiles the decision ledger, syncs compiled plan/system
+            design mirrors, advances current stage to `plan-review`, and
+            persists planning control.
+          </p>
+        </div>
+        <div class="cell proposed-col">
+          <span class="badge proposed">Proposed</span>
+          <h4>Decision evidence becomes traceability input</h4>
+          <p>
+            Later execution records should trace task contracts and verification
+            context back to these planning decisions where relevant.
+          </p>
+        </div>
+        <div class="cell delta-col">
+          <span class="badge guard">Preserved + referenced</span>
+          <h4>Traceability improves downstream</h4>
+          <p>
+            The planning output shape remains; typed execution records make the
+            downstream usage more explicit.
+          </p>
+        </div>
+      </article>
+
+      <article class="stage-row">
+        <div class="stage-title">
+          <h3>SF7. Plan-Review Handoff</h3>
+          <p>Advances planning-control state after subfeature planning completes.</p>
+        </div>
+        <div class="cell existing-col">
+          <span class="badge existing">Existing</span>
+          <h4>`set_current_stage(control, "plan-review")`</h4>
+          <p>
+            After decision ledger compilation and mirror sync, the phase
+            persists planning-control state with the next stage set to
+            `plan-review`.
+          </p>
+        </div>
+        <div class="cell proposed-col">
+          <span class="badge proposed">Proposed</span>
+          <h4>Stage handoff remains planning evidence</h4>
+          <p>
+            The control plane later cites plan-reviewed artifacts; it does not
+            skip plan review just because subfeature planning completed.
+          </p>
+        </div>
+        <div class="cell delta-col">
+          <span class="badge guard">Preserved</span>
+          <h4>Feature progression remains visible</h4>
+          <p>
+            The full workflow now shows how subfeature artifacts become inputs
+            to review, then to executable task planning.
+          </p>
+        </div>
+      </article>
+    </section>
+
+    <section class="section">
+      <h2>Plan Review Phase Flow</h2>
+      <p class="section-intro">
+        `PlanReviewPhase` independently reviews compiled planning artifacts,
+        dispatches revisions, reruns reviewers, and gate-approves each major
+        artifact before task planning is allowed to produce the executable DAG.
+      </p>
+
+      <div class="stage-header" aria-hidden="true">
+        <div class="column-label">Plan-review step</div>
+        <div class="column-label existing-col">Existing flow</div>
+        <div class="column-label proposed-col">Proposed control plane</div>
+        <div class="column-label delta-col">What changes</div>
+      </div>
+
+      <article class="stage-row">
+        <div class="stage-title">
+          <h3>PR1. Completion Marker Resume</h3>
+          <p>Skips plan review only when explicit completion evidence exists.</p>
+        </div>
+        <div class="cell existing-col">
+          <span class="badge existing">Existing</span>
+          <h4>`plan-review-complete` marker</h4>
+          <p>
+            The phase checks the DB artifact and filesystem mirror marker. If
+            present, it loads `prd`, `design`, `plan`, and `system-design` into
+            state and syncs compiled decision mirrors.
+          </p>
+        </div>
+        <div class="cell proposed-col">
+          <span class="badge proposed">Proposed</span>
+          <h4>Completion marker remains planning-only</h4>
+          <p>
+            A plan-review completion marker cannot approve implementation
+            execution. It only allows planning to progress toward task planning.
+          </p>
+        </div>
+        <div class="cell delta-col">
+          <span class="badge guard">Preserved</span>
+          <h4>Skip semantics stay bounded</h4>
+          <p>
+            Skipping plan review does not skip execution contracts, verifier
+            gates, merge queue proof, or post-DAG gates.
+          </p>
+        </div>
+      </article>
+
+      <article class="stage-row">
+        <div class="stage-title">
+          <h3>PR1A. Cycle Recovery</h3>
+          <p>Reuses valid prior reports and revised cycles on resume.</p>
+        </div>
+        <div class="cell existing-col">
+          <span class="badge existing">Existing</span>
+          <h4>`plan-review-cycle-{n}` and `-revised` artifacts</h4>
+          <p>
+            Each cycle checks whether a valid report already exists and whether
+            revisions were already applied. Revised cycles advance without
+            rerunning reviewer agents.
+          </p>
+        </div>
+        <div class="cell proposed-col">
+          <span class="badge proposed">Proposed</span>
+          <h4>Cycle recovery stays in planning</h4>
+          <p>
+            Execution-control resume should not reinterpret plan-review cycle
+            artifacts as implementation retries or product repair attempts.
+          </p>
+        </div>
+        <div class="cell delta-col">
+          <span class="badge guard">Preserved + separated</span>
+          <h4>Review retry evidence is not execution retry evidence</h4>
+          <p>
+            The page now distinguishes review-cycle recovery from the later
+            execution-control retry budget.
+          </p>
+        </div>
+      </article>
+
+      <article class="stage-row">
+        <div class="stage-title">
+          <h3>PR2. Parallel Completeness/Security/Edge Reviews</h3>
+          <p>Runs subfeature and dependency-edge review tasks.</p>
+        </div>
+        <div class="cell existing-col">
+          <span class="badge existing">Existing</span>
+          <h4>Reviewer tasks via `asyncio.gather`</h4>
+          <p>
+            For each subfeature, completeness and security reviewers run. For
+            each deduplicated edge, edge reviewers run. Results are gathered with
+            `return_exceptions=True` so successful verdicts survive partial
+            failures.
+          </p>
+        </div>
+        <div class="cell proposed-col">
+          <span class="badge proposed">Proposed</span>
+          <h4>Plan review stays before execution graph</h4>
+          <p>
+            These verdicts remain planning validation. They can inform later
+            contract risk but do not become merge/checkpoint approval nodes.
+          </p>
+        </div>
+        <div class="cell delta-col">
+          <span class="badge guard">Preserved</span>
+          <h4>Review scope remains planning artifacts</h4>
+          <p>
+            Execution verification still happens later against concrete patches
+            and canonical repo state.
+          </p>
+        </div>
+      </article>
+
+      <article class="stage-row">
+        <div class="stage-title">
+          <h3>PR2A. Context Package Construction</h3>
+          <p>Builds bounded review context before dispatching reviewers.</p>
+        </div>
+        <div class="cell existing-col">
+          <span class="badge existing">Existing</span>
+          <h4>`_build_sf_review_context_package` and edge packages</h4>
+          <p>
+            Review prompts prefer context index and manifest files so reviewers
+            can inspect referenced planning artifacts selectively instead of
+            loading every artifact eagerly.
+          </p>
+        </div>
+        <div class="cell proposed-col">
+          <span class="badge proposed">Proposed</span>
+          <h4>Bounded context pattern carries forward</h4>
+          <p>
+            The verification graph should reuse the same principle for product
+            verification: bounded, manifest-backed context with explicit source
+            evidence.
+          </p>
+        </div>
+        <div class="cell delta-col">
+          <span class="badge guard">Preserved + generalized</span>
+          <h4>Context packages become a cross-phase best practice</h4>
+          <p>
+            Planning context packaging stays intact and informs the execution
+            graph's bounded evidence model.
+          </p>
+        </div>
+      </article>
+
+      <article class="stage-row">
+        <div class="stage-title">
+          <h3>PR3. Report, Discussion, And Decisions</h3>
+          <p>Turns review failures into user decisions or revision plans.</p>
+        </div>
+        <div class="cell existing-col">
+          <span class="badge existing">Existing</span>
+          <h4>Cycle reports and hosted discussion</h4>
+          <p>
+            Failing verdicts compile into `plan-review-cycle:{n}` reports.
+            Hosted discussion normalizes approval or builds a revision plan that
+            includes prior decisions and new decisions.
+          </p>
+        </div>
+        <div class="cell proposed-col">
+          <span class="badge proposed">Proposed</span>
+          <h4>Decision provenance remains upstream</h4>
+          <p>
+            Execution-control contracts should cite plan-review decisions when
+            they explain why a task owns or forbids a surface.
+          </p>
+        </div>
+        <div class="cell delta-col">
+          <span class="badge guard">Preserved + referenced</span>
+          <h4>Planning decisions become traceable constraints</h4>
+          <p>
+            The discussion loop remains, while downstream execution evidence can
+            point back to the exact planning decision it enforces.
+          </p>
+        </div>
+      </article>
+
+      <article class="stage-row">
+        <div class="stage-title">
+          <h3>PR3A. Verdict Reconstruction</h3>
+          <p>Converts partial async results into review verdict dictionaries.</p>
+        </div>
+        <div class="cell existing-col">
+          <span class="badge existing">Existing</span>
+          <h4>`_safe_verdict` and label reconstruction</h4>
+          <p>
+            Because review tasks use `asyncio.gather(return_exceptions=True)`,
+            the phase reconstructs subfeature and edge verdict dictionaries and
+            can preserve successful verdicts when another reviewer fails.
+          </p>
+        </div>
+        <div class="cell proposed-col">
+          <span class="badge proposed">Proposed</span>
+          <h4>Execution needs typed partial-failure records</h4>
+          <p>
+            The transactional runner should apply the same idea with stronger
+            typed attempt rows so one runtime failure does not erase successful
+            independent evidence.
+          </p>
+        </div>
+        <div class="cell delta-col">
+          <span class="badge guard">Pattern retained</span>
+          <h4>Partial success handling becomes explicit</h4>
+          <p>
+            This existing planning behavior is valuable, but execution needs it
+            in durable state rather than in local result reconstruction alone.
+          </p>
+        </div>
+      </article>
+
+      <article class="stage-row">
+        <div class="stage-title">
+          <h3>PR4. Revision Dispatch And Recompile</h3>
+          <p>Applies planning revisions and recompiles affected artifacts.</p>
+        </div>
+        <div class="cell existing-col">
+          <span class="badge existing">Existing</span>
+          <h4>`targeted_revision`, `compile_artifacts`, size guard</h4>
+          <p>
+            Affected artifact types dispatch revisions in parallel, then
+            recompile affected compiled artifacts. Size guards reject suspicious
+            shrinkage; blocked reports and notifications are written on failure.
+          </p>
+        </div>
+        <div class="cell proposed-col">
+          <span class="badge proposed">Proposed</span>
+          <h4>Planning revisions stay before product execution</h4>
+          <p>
+            These are planning artifact edits, not canonical product repo
+            mutations. Product-changing work still starts only in
+            implementation.
+          </p>
+        </div>
+        <div class="cell delta-col">
+          <span class="badge guard">Preserved</span>
+          <h4>No merge queue involvement</h4>
+          <p>
+            Planning artifact revision does not use the durable merge queue
+            because it is not product-repo mutation.
+          </p>
+        </div>
+      </article>
+
+      <article class="stage-row">
+        <div class="stage-title">
+          <h3>PR4A. Blocked Report And Notification</h3>
+          <p>Stops plan review cleanly when revisions or compiles fail.</p>
+        </div>
+        <div class="cell existing-col">
+          <span class="badge existing">Existing</span>
+          <h4>Blocked failures, report artifact, and notification</h4>
+          <p>
+            Crashed revisions, failed targeted revisions, compile exceptions,
+            or suspicious shrinkage accumulate blocked failures so the phase can
+            write a report/notification instead of pretending review passed.
+          </p>
+        </div>
+        <div class="cell proposed-col">
+          <span class="badge proposed">Proposed</span>
+          <h4>Execution blocked state follows the same safety posture</h4>
+          <p>
+            The control plane should stop with a typed blocked/quiesced state
+            when required evidence cannot be produced, rather than routing every
+            failure into broad product repair.
+          </p>
+        </div>
+        <div class="cell delta-col">
+          <span class="badge guard">Preserved + strengthened later</span>
+          <h4>Fail-closed behavior is made durable</h4>
+          <p>
+            Planning already fails closed; implementation needs the same
+            property with durable route and retry records.
+          </p>
+        </div>
+      </article>
+
+      <article class="stage-row">
+        <div class="stage-title">
+          <h3>PR5. Test-Plan Cascade</h3>
+          <p>Repairs test plans when PRD/design/architecture changes affect AC coverage.</p>
+        </div>
+        <div class="cell existing-col">
+          <span class="badge existing">Existing</span>
+          <h4>Terminal test-plan targeted revision</h4>
+          <p>
+            PRD, design, plan, or system-design changes can invalidate AC ids.
+            The phase dispatches test-plan cascade revisions, refreshes decision
+            ledgers, and regenerates summaries for affected subfeatures.
+          </p>
+        </div>
+        <div class="cell proposed-col">
+          <span class="badge proposed">Proposed</span>
+          <h4>Test-plan evidence feeds verification contracts</h4>
+          <p>
+            Later verification graph inputs can cite refreshed test-plan
+            evidence, but this cascade remains planning-time consistency work.
+          </p>
+        </div>
+        <div class="cell delta-col">
+          <span class="badge guard">Preserved + referenced</span>
+          <h4>Verifier context gets stronger provenance</h4>
+          <p>
+            The architecture should make it clear which approved test-plan
+            artifact each gate or contract used.
+          </p>
+        </div>
+      </article>
+
+      <article class="stage-row">
+        <div class="stage-title">
+          <h3>PR6. Gate Approval For Compiled Artifacts</h3>
+          <p>Approves PRD, design, plan, and system-design artifacts.</p>
+        </div>
+        <div class="cell existing-col">
+          <span class="badge existing">Existing</span>
+          <h4>`_run_gates` and `plan-review-gate:*` markers</h4>
+          <p>
+            The phase recompiles per-SF sources before gates, then runs
+            interview-based gates for PRD, design, plan, and optionally system
+            design, writing `plan-review-gate:{prefix}` markers.
+          </p>
+        </div>
+        <div class="cell proposed-col">
+          <span class="badge proposed">Proposed</span>
+          <h4>Gate-approved planning artifacts become immutable inputs</h4>
+          <p>
+            Task planning and later execution-control contracts should treat
+            gate-approved planning outputs as the current source of intent.
+          </p>
+        </div>
+        <div class="cell delta-col">
+          <span class="badge guard">Preserved</span>
+          <h4>Planning approval remains mandatory</h4>
+          <p>
+            No implementation shortcut should bypass these planning gates.
+          </p>
+        </div>
+      </article>
+
+      <article class="stage-row">
+        <div class="stage-title">
+          <h3>PR7. Task-Planning Handoff</h3>
+          <p>Returns approved planning artifacts for root DAG creation.</p>
+        </div>
+        <div class="cell existing-col">
+          <span class="badge existing">Existing</span>
+          <h4>State carries approved `prd`, `design`, `plan`, `system-design`</h4>
+          <p>
+            After gates pass, the phase returns state with compiled planning
+            artifacts synchronized and ready for `TaskPlanningPhase` to produce
+            an executable root DAG.
+          </p>
+        </div>
+        <div class="cell proposed-col">
+          <span class="badge proposed">Proposed</span>
+          <h4>Approved planning artifacts seed contracts indirectly</h4>
+          <p>
+            The control plane still waits for task planning to approve a root
+            DAG; it consumes plan-review outputs through that DAG and contract
+            compilation.
+          </p>
+        </div>
+        <div class="cell delta-col">
+          <span class="badge guard">Preserved</span>
+          <h4>Planning approval remains a required upstream gate</h4>
+          <p>
+            The proposed implementation core does not weaken or skip plan
+            review; it depends on it.
+          </p>
+        </div>
+      </article>
+    </section>
+
+    <section class="section">
+      <h2>Task Planning Phase Flow</h2>
+      <p class="section-intro">
+        `TaskPlanningPhase` converts approved planning artifacts into the root
+        `ImplementationDAG`, gate-reviews it, and persists the executable `dag`
+        artifact that implementation consumes.
+      </p>
+
+      <div class="stage-header" aria-hidden="true">
+        <div class="column-label">Task-planning step</div>
+        <div class="column-label existing-col">Existing flow</div>
+        <div class="column-label proposed-col">Proposed control plane</div>
+        <div class="column-label delta-col">What changes</div>
+      </div>
+
+      <article class="stage-row">
+        <div class="stage-title">
+          <h3>TP1. Approved DAG Resume</h3>
+          <p>Skips task planning when a gate-approved root DAG exists.</p>
+        </div>
+        <div class="cell existing-col">
+          <span class="badge existing">Existing</span>
+          <h4>Read `dag`; rebuild JSON if needed</h4>
+          <p>
+            If `dag` exists, the phase skips. If the artifact is compiled
+            markdown rather than JSON, it rebuilds executable `ImplementationDAG`
+            JSON and persists it.
+          </p>
+        </div>
+        <div class="cell proposed-col">
+          <span class="badge proposed">Proposed</span>
+          <h4>Approved root DAG remains the execution handoff</h4>
+          <p>
+            The control plane consumes the approved DAG and compiles contracts
+            from it. It does not silently rewrite planning intent.
+          </p>
+        </div>
+        <div class="cell delta-col">
+          <span class="badge guard">Preserved</span>
+          <h4>Resume semantics stay explicit</h4>
+          <p>
+            An existing root DAG remains the planning/implementation boundary.
+          </p>
+        </div>
+      </article>
+
+      <article class="stage-row">
+        <div class="stage-title">
+          <h3>TP1A. Stale Blocked Artifact Cleanup</h3>
+          <p>Clears obsolete blocked state before fresh task planning.</p>
+        </div>
+        <div class="cell existing-col">
+          <span class="badge existing">Existing</span>
+          <h4>`_clear_stale_blocked_artifact`</h4>
+          <p>
+            If no approved DAG is available, the phase clears stale
+            task-planning blocked artifacts before attempting a new planning run.
+          </p>
+        </div>
+        <div class="cell proposed-col">
+          <span class="badge proposed">Proposed</span>
+          <h4>Planning cleanup remains before execution state exists</h4>
+          <p>
+            The execution-control store should not be initialized until this
+            planning cleanup, DAG approval, and persistence path has succeeded.
+          </p>
+        </div>
+        <div class="cell delta-col">
+          <span class="badge guard">Preserved</span>
+          <h4>Stale planning blockers do not become runtime blockers</h4>
+          <p>
+            Implementation routing should never repair or retry a stale
+            task-planning artifact as if it were a product failure.
+          </p>
+        </div>
+      </article>
+
+      <article class="stage-row">
+        <div class="stage-title">
+          <h3>TP2. Ungated DAG Gate Review</h3>
+          <p>Handles a compiled DAG that exists but has not been gate reviewed.</p>
+        </div>
+        <div class="cell existing-col">
+          <span class="badge existing">Existing</span>
+          <h4>`interview_gate_review` for artifact prefix `dag`</h4>
+          <p>
+            Existing compiled DAG text goes through gate review with transform
+            and revision-plan hooks, then `_persist_approved_root_implementation_dag`
+            writes the approved executable DAG.
+          </p>
+        </div>
+        <div class="cell proposed-col">
+          <span class="badge proposed">Proposed</span>
+          <h4>DAG gate remains before execution-control admission</h4>
+          <p>
+            Typed execution state is initialized only after the root DAG is
+            approved and persisted.
+          </p>
+        </div>
+        <div class="cell delta-col">
+          <span class="badge guard">Preserved</span>
+          <h4>No unapproved DAG execution</h4>
+          <p>
+            The control plane must reject execution from an ungated DAG just as
+            the legacy workflow does.
+          </p>
+        </div>
+      </article>
+
+      <article class="stage-row">
+        <div class="stage-title">
+          <h3>TP2A. Decomposition Load And Sidecar Migration</h3>
+          <p>Prepares structured subfeature inputs for task planning.</p>
+        </div>
+        <div class="cell existing-col">
+          <span class="badge existing">Existing</span>
+          <h4>`_load_decomposition` and `_ensure_planning_sidecar_migration`</h4>
+          <p>
+            Fresh task planning loads the subfeature decomposition and migrates
+            structured planning sidecars before building workstreams.
+          </p>
+        </div>
+        <div class="cell proposed-col">
+          <span class="badge proposed">Proposed</span>
+          <h4>Sidecar migration remains planning input hygiene</h4>
+          <p>
+            Execution contracts should compile from the approved DAG and its
+            resolved planning references, not from partially migrated sidecar
+            state.
+          </p>
+        </div>
+        <div class="cell delta-col">
+          <span class="badge guard">Preserved + made explicit</span>
+          <h4>Input hygiene precedes executable DAG creation</h4>
+          <p>
+            The diagram now shows the migration step that would otherwise be
+            hidden inside task planning.
+          </p>
+        </div>
+      </article>
+
+      <article class="stage-row">
+        <div class="stage-title">
+          <h3>TP3. Workstream Decomposition</h3>
+          <p>Builds task-planning workstreams from the subfeature decomposition.</p>
+        </div>
+        <div class="cell existing-col">
+          <span class="badge existing">Existing</span>
+          <h4>`_get_or_create_workstreams`</h4>
+          <p>
+            The phase loads decomposition, runs sidecar migration, creates
+            workstreams, loads subfeature upstream context, and prepares an
+            execution order for workstream task decomposition.
+          </p>
+        </div>
+        <div class="cell proposed-col">
+          <span class="badge proposed">Proposed</span>
+          <h4>Workstreams remain planning structure</h4>
+          <p>
+            Workstream decomposition informs root DAG construction. Runtime
+            wave scheduling later uses approved DAG dependencies and typed
+            overlays, not raw workstream state alone.
+          </p>
+        </div>
+        <div class="cell delta-col">
+          <span class="badge guard">Preserved</span>
+          <h4>Planning order is not execution authority</h4>
+          <p>
+            Workstreams help build tasks; they do not checkpoint product work.
+          </p>
+        </div>
+      </article>
+
+      <article class="stage-row">
+        <div class="stage-title">
+          <h3>TP3A. Subfeature Upstream Context</h3>
+          <p>Loads upstream artifacts used by workstream decomposers.</p>
+        </div>
+        <div class="cell existing-col">
+          <span class="badge existing">Existing</span>
+          <h4>`_load_sf_upstream`</h4>
+          <p>
+            The phase loads per-subfeature upstream planning context so each
+            workstream decomposition can generate tasks against the right PRD,
+            design, architecture, and test-planning inputs.
+          </p>
+        </div>
+        <div class="cell proposed-col">
+          <span class="badge proposed">Proposed</span>
+          <h4>Context provenance flows into contracts later</h4>
+          <p>
+            The execution control plane should preserve links from tasks back to
+            the approved upstream context used to define them.
+          </p>
+        </div>
+        <div class="cell delta-col">
+          <span class="badge guard">Preserved + referenced</span>
+          <h4>Task origin becomes easier to audit</h4>
+          <p>
+            This planning input remains upstream; typed execution records make
+            the downstream provenance visible.
+          </p>
+        </div>
+      </article>
+
+      <article class="stage-row">
+        <div class="stage-title">
+          <h3>TP4. Parallel Workstream Task Decomposition</h3>
+          <p>Generates subfeature DAG fragments with failure reporting.</p>
+        </div>
+        <div class="cell existing-col">
+          <span class="badge existing">Existing</span>
+          <h4>Round-based parallel `_decompose_workstream`</h4>
+          <p>
+            Workstreams in each execution-order round run in parallel. Failures
+            write `task-planning-blocked`, mirror it, notify the user, and raise
+            before integration review or DAG compilation.
+          </p>
+        </div>
+        <div class="cell proposed-col">
+          <span class="badge proposed">Proposed</span>
+          <h4>Blocked planning remains a planning failure</h4>
+          <p>
+            Control-plane failure routing starts in implementation. Invalid
+            task planning should still stop before execution state exists.
+          </p>
+        </div>
+        <div class="cell delta-col">
+          <span class="badge guard">Preserved</span>
+          <h4>Planning blockers do not become product repair</h4>
+          <p>
+            A failed DAG decomposition should not dispatch implementation agents.
+          </p>
+        </div>
+      </article>
+
+      <article class="stage-row">
+        <div class="stage-title">
+          <h3>TP4A. Blocked Report And Notification</h3>
+          <p>Stops before integration review if DAG fragments are invalid.</p>
+        </div>
+        <div class="cell existing-col">
+          <span class="badge existing">Existing</span>
+          <h4>`task-planning-blocked` artifact and `Notify`</h4>
+          <p>
+            Crashed or invalid workstream decompositions produce a blocked
+            report, mirror write, and notification, then raise before DAG
+            integration review or root compilation.
+          </p>
+        </div>
+        <div class="cell proposed-col">
+          <span class="badge proposed">Proposed</span>
+          <h4>Execution remains uninitialized</h4>
+          <p>
+            Because no approved DAG exists, the control plane must not create
+            task attempts, sandboxes, or merge queue rows for this feature.
+          </p>
+        </div>
+        <div class="cell delta-col">
+          <span class="badge guard">Preserved</span>
+          <h4>Planning failure stays planning failure</h4>
+          <p>
+            The architecture keeps this fail-closed behavior instead of routing
+            invalid DAG planning into implementation repair.
+          </p>
+        </div>
+      </article>
+
+      <article class="stage-row">
+        <div class="stage-title">
+          <h3>TP5. DAG Integration Review And Revision</h3>
+          <p>Reviews the integrated DAG before compilation.</p>
+        </div>
+        <div class="cell existing-col">
+          <span class="badge existing">Existing</span>
+          <h4>`integration_review` plus optional targeted revision</h4>
+          <p>
+            The ordered decomposition goes through DAG integration review. If
+            revision is needed, targeted revisions patch affected subfeatures
+            before compilation continues.
+          </p>
+        </div>
+        <div class="cell proposed-col">
+          <span class="badge proposed">Proposed</span>
+          <h4>Integration review remains pre-execution</h4>
+          <p>
+            The execution control plane assumes the root DAG already passed this
+            planning integration review before contracts are compiled.
+          </p>
+        </div>
+        <div class="cell delta-col">
+          <span class="badge guard">Preserved</span>
+          <h4>Review stays upstream of task contracts</h4>
+          <p>
+            Contracts should be compiled from the reviewed DAG, not from
+            pre-review fragments.
+          </p>
+        </div>
+      </article>
+
+      <article class="stage-row">
+        <div class="stage-title">
+          <h3>TP5A. Revision-Plan Hooks</h3>
+          <p>Allows DAG gate findings to patch affected subfeatures.</p>
+        </div>
+        <div class="cell existing-col">
+          <span class="badge existing">Existing</span>
+          <h4>`_dag_gate_review_hooks` and `targeted_revision`</h4>
+          <p>
+            Integration review and gate review use compiled transforms and
+            revision-plan handlers so DAG findings can be turned into targeted
+            planning revisions before the final root DAG is accepted.
+          </p>
+        </div>
+        <div class="cell proposed-col">
+          <span class="badge proposed">Proposed</span>
+          <h4>Task-definition repair remains pre-execution</h4>
+          <p>
+            Once implementation begins, changing task definitions should require
+            a new approved DAG or explicit overlay, not ad hoc mutation of
+            active execution state.
+          </p>
+        </div>
+        <div class="cell delta-col">
+          <span class="badge delta">Boundary tightened</span>
+          <h4>DAG mutation boundary is explicit</h4>
+          <p>
+            The approved DAG can seed execution; unapproved DAG revisions cannot
+            mutate active task contracts.
+          </p>
+        </div>
+      </article>
+
+      <article class="stage-row">
+        <div class="stage-title">
+          <h3>TP6. DAG Compile, Gate, Persist</h3>
+          <p>Creates the executable DAG consumed by implementation.</p>
+        </div>
+        <div class="cell existing-col">
+          <span class="badge existing">Existing</span>
+          <h4>`compile_artifacts`, `interview_gate_review`, `dag` write</h4>
+          <p>
+            The phase compiles the root DAG, gate-reviews it as
+            `ImplementationDAG`, then writes `dag` to Postgres and the artifact
+            mirror via `_persist_approved_root_implementation_dag`.
+          </p>
+        </div>
+        <div class="cell proposed-col">
+          <span class="badge proposed">Proposed</span>
+          <h4>Root DAG becomes typed execution seed</h4>
+          <p>
+            Implementation starts by loading this immutable root DAG, resolving
+            any active typed overlay, compiling contracts, and creating typed
+            execution records.
+          </p>
+        </div>
+        <div class="cell delta-col">
+          <span class="badge delta">Boundary tightened</span>
+          <h4>Approved DAG no longer equals runnable agent context by itself</h4>
+          <p>
+            The DAG is still the handoff, but the control plane must derive
+            contracts, workspace snapshots, and queue-safe execution state before
+            agents run.
+          </p>
+        </div>
+      </article>
+
+      <article class="stage-row">
+        <div class="stage-title">
+          <h3>TP7. Implementation Handoff</h3>
+          <p>Defines the only normal entry point into execution.</p>
+        </div>
+        <div class="cell existing-col">
+          <span class="badge existing">Existing</span>
+          <h4>`state.dag` returned to `FullDevelopWorkflow`</h4>
+          <p>
+            After `_persist_approved_root_implementation_dag`, the workflow can
+            advance into `ImplementationPhase`, which loads the root `dag` and
+            starts DAG execution.
+          </p>
+        </div>
+        <div class="cell proposed-col">
+          <span class="badge proposed">Proposed</span>
+          <h4>`ExecutionBootstrap` initializes typed records from the DAG</h4>
+          <p>
+            The new architecture starts by validating the approved DAG,
+            resolving any active overlay, compiling task contracts, and creating
+            typed journal seeds before runtime dispatch is allowed.
+          </p>
+        </div>
+        <div class="cell delta-col">
+          <span class="badge delta">Changed</span>
+          <h4>The handoff becomes a typed admission gate</h4>
+          <p>
+            A persisted DAG remains necessary, but no agent runs until the
+            control plane proves workspace, contract, and scheduler readiness.
+          </p>
+        </div>
+      </article>
+    </section>
+
+    <section class="section">
+      <h2>Implementation Phase Flow</h2>
+      <p class="section-intro">
+        This is the changed execution core inside `ImplementationPhase`: the
+        current monolithic DAG loop versus the proposed transactional execution
+        control plane. Compare mode shows both paths side by side; changes-only
+        mode compresses the view to ownership and behavior deltas.
+      </p>
+
+      <div class="stage-header" aria-hidden="true">
+        <div class="column-label">Stage</div>
+        <div class="column-label existing-col">Existing flow</div>
+        <div class="column-label proposed-col">Proposed control plane</div>
+        <div class="column-label delta-col">What changes</div>
+      </div>
+
+      <article class="stage-row">
+        <div class="stage-title">
+          <h3>1. Phase Entry And Quiesce</h3>
+          <p>How a feature enters or resumes implementation.</p>
+        </div>
+        <div class="cell existing-col">
+          <span class="badge existing">Existing</span>
+          <h4>Workflow runner -> `ImplementationPhase.execute`</h4>
+          <p>
+            The runner resolves the feature phase. `ImplementationPhase.execute`
+            loads implementation state, handles DAG execution, persists handover,
+            and later runs post-DAG gates.
+          </p>
+          <div class="note">Current quiesce behavior is preserved: quiesce is a pause boundary, not a phase success.</div>
+        </div>
+        <div class="cell proposed-col">
+          <span class="badge proposed">Proposed</span>
+          <h4>Phase adapter -> `ExecutionControlPlane`</h4>
+          <p>
+            `ImplementationPhase` remains the entrypoint and shim surface, but
+            delegates product-authoritative execution to the control-plane
+            coordinator.
+          </p>
+          <ul>
+            <li>State transitions are typed and idempotent.</li>
+            <li>Quiesce propagates without advancing to the next phase.</li>
+          </ul>
+        </div>
+        <div class="cell delta-col">
+          <span class="badge delta">Changed</span>
+          <h4>Phase behavior stays; authority moves</h4>
+          <p>
+            The phase stops being the owner of every execution decision. It
+            becomes the compatibility adapter around typed services.
+          </p>
+        </div>
+      </article>
+
+      <article class="stage-row">
+        <div class="stage-title">
+          <h3>2. Scheduling And Effective DAG</h3>
+          <p>Which group/wave should run next.</p>
+        </div>
+        <div class="cell existing-col">
+          <span class="badge existing">Existing</span>
+          <h4>`_implement_dag` scans checkpoints</h4>
+          <p>
+            Root `dag`, latest `dag-group:*`, quiesce markers, and active
+            regroup artifacts determine the next group. The root DAG is not
+            overwritten by regroup activation.
+          </p>
+          <div class="risk-note">Risk: effective-DAG knowledge can be uneven across dispatch, resume, dashboard, and post-test readers.</div>
+        </div>
+        <div class="cell proposed-col">
+          <span class="badge proposed">Proposed</span>
+          <h4>`RegroupOverlayService` + effective-DAG resolver</h4>
+          <p>
+            Typed active overlay state defines effective order for dispatch,
+            resume, checkpoint coverage, rollback-before-first-wave, and
+            post-test readiness. `dag-regroup:*` artifacts mirror it for legacy
+            readers.
+          </p>
+        </div>
+        <div class="cell delta-col">
+          <span class="badge delta">Changed</span>
+          <h4>Overlay becomes a typed scheduler input</h4>
+          <p>
+            Scheduler feedback can influence future grouping, but safety
+            constraints still outrank speed: dependency order, write sets,
+            sandbox/merge safety, checkpoint proof, and rollback rules.
+          </p>
+        </div>
+      </article>
+
+      <article class="stage-row">
+        <div class="stage-title">
+          <h3>3. State And Projections</h3>
+          <p>What is durable authority.</p>
+        </div>
+        <div class="cell existing-col">
+          <span class="badge existing">Existing</span>
+          <h4>Postgres artifacts/events are the practical source</h4>
+          <p>
+            `dag`, `dag-task:*`, `dag-verify:*`, `dag-commit-failure:*`,
+            `dag-group:*`, `dag-gate:*`, and events are used for resume,
+            dashboard, supervisor, regroup, and analysis.
+          </p>
+          <div class="risk-note">Risk: artifact key names can blur attempt evidence, verifier evidence, and checkpoint authority.</div>
+        </div>
+        <div class="cell proposed-col">
+          <span class="badge proposed">Proposed</span>
+          <h4>`ExecutionControlStore` / typed journal</h4>
+          <p>
+            Postgres typed rows are canonical. Legacy artifacts are synchronous
+            compatibility projections with projection links, idempotency keys,
+            hashes, and recovery semantics.
+          </p>
+          <ul>
+            <li>No typed success without required projection parity while legacy readers exist.</li>
+            <li>No broad artifact-body scans for default readers.</li>
+          </ul>
+        </div>
+        <div class="cell delta-col">
+          <span class="badge delta">Changed</span>
+          <h4>Artifacts become views, not the source of every decision</h4>
+          <p>
+            The control plane can reconstruct state from typed rows and explain
+            exactly which row produced each legacy artifact projection.
+          </p>
+        </div>
+      </article>
+
+      <article class="stage-row">
+        <div class="stage-title">
+          <h3>4. Workspace And Path Authority</h3>
+          <p>Which repo/path is canonical and writable.</p>
+        </div>
+        <div class="cell existing-col">
+          <span class="badge existing">Existing</span>
+          <h4>Worktree setup and guards inside implementation</h4>
+          <p>
+            `_ensure_task_worktrees`, worktree registry artifacts, alias
+            pre-dispatch guards, and ACL normalization run inside the DAG loop.
+          </p>
+          <div class="risk-note">Risk: agent-user writeability, alias drift, and stale path evidence can still surface late in verification or repair.</div>
+        </div>
+        <div class="cell proposed-col">
+          <span class="badge proposed">Proposed</span>
+          <h4>`WorkspaceAuthority` owns this boundary</h4>
+          <p>
+            Canonical repo identity, alias classification, divergent alias
+            fail-closed behavior, ACL/writeability proof, symlink/outside-root
+            checks, dirty generated-output checks, and workspace snapshots are
+            resolved before dispatch.
+          </p>
+          <div class="note">Metadata-only chmod/chgrp/setgid or identical-content writeability repair may be recorded; product-content mutation waits for merge queue.</div>
+        </div>
+        <div class="cell delta-col">
+          <span class="badge delta">Changed</span>
+          <h4>Workspace failures stop before model work</h4>
+          <p>
+            Resolvable alias/ACL classes route deterministically. They do not
+            become broad RCA loops or operator file-copy tasks.
+          </p>
+        </div>
+      </article>
+
+      <article class="stage-row">
+        <div class="stage-title">
+          <h3>5. Task Contracts And Preflight</h3>
+          <p>What a task is allowed and required to change.</p>
+        </div>
+        <div class="cell existing-col">
+          <span class="badge existing">Existing</span>
+          <h4>Task specs plus preflight checks</h4>
+          <p>
+            DAG tasks include file scopes and acceptance context. `_run_dag_group_preflight`
+            catches structural issues around verifier/checkpoint flow.
+          </p>
+          <div class="risk-note">Risk: no single durable contract owns required, allowed, and forbidden paths across prompts, repair, verify, and commit.</div>
+        </div>
+        <div class="cell proposed-col">
+          <span class="badge proposed">Proposed</span>
+          <h4>`TaskContractCompiler` + deterministic gates</h4>
+          <p>
+            Contracts compile required, allowed, and forbidden paths; acceptance
+            criteria; verification gates; write-set ownership; and merge
+            admission rules.
+          </p>
+        </div>
+        <div class="cell delta-col">
+          <span class="badge delta">Changed</span>
+          <h4>Prompts, sandboxes, gates, repairs, and merge share one contract</h4>
+          <p>
+            Task success is no longer inferred only from a model result or latest
+            artifact. Contract evidence becomes a checkpoint prerequisite.
+          </p>
+        </div>
+      </article>
+
+      <article class="stage-row">
+        <div class="stage-title">
+          <h3>6. Runtime Dispatch</h3>
+          <p>How implementers and repair agents run.</p>
+        </div>
+        <div class="cell existing-col">
+          <span class="badge existing">Existing</span>
+          <h4>Agents run against feature repos</h4>
+          <p>
+            `_make_parallel_actor`, runtime policy helpers, and `runner.run(Ask)`
+            dispatch implementers, verifier actors, RCA, repair, and post-DAG
+            gates. Results are persisted as artifacts such as `dag-task:*`.
+          </p>
+          <div class="risk-note">Risk: successful dispatch can be mistaken for product integration, and agents can mutate canonical repos before merge proof exists.</div>
+        </div>
+        <div class="cell proposed-col">
+          <span class="badge proposed">Proposed</span>
+          <h4>`SandboxRunner` + `RuntimeDispatcher`</h4>
+          <p>
+            Agents run in isolated roots. Runtime dispatch records attempts and
+            runtime failures through a narrow journal facade; it cannot enqueue
+            merge, decide routes, commit, checkpoint, or treat dispatch success
+            as integration success.
+          </p>
+        </div>
+        <div class="cell delta-col">
+          <span class="badge delta">Changed</span>
+          <h4>Runtime output becomes patch evidence</h4>
+          <p>
+            `dag-task:*` remains visible, but only as attempt evidence. Canonical
+            repo mutation waits for durable merge queue admission.
+          </p>
+        </div>
+      </article>
+
+      <article class="stage-row">
+        <div class="stage-title">
+          <h3>7. Verification And Approval</h3>
+          <p>How a candidate becomes mergeable.</p>
+        </div>
+        <div class="cell existing-col">
+          <span class="badge existing">Existing</span>
+          <h4>`_verify_and_fix_group` coordinates verifier flow</h4>
+          <p>
+            Raw verifier, expanded lenses, deterministic preflight, repair, and
+            reverify produce `dag-verify:*` artifacts and gate decisions.
+          </p>
+          <div class="risk-note">Risk: stale context, alias evidence, and product defects can mix inside verifier/RCA loops.</div>
+        </div>
+        <div class="cell proposed-col">
+          <span class="badge proposed">Proposed</span>
+          <h4>`VerificationGraph`, `GateRunner`, `VerificationService`</h4>
+          <p>
+            Candidate manifests, contract ids, workspace snapshots, patch
+            summaries, bounded context packages, raw verifier, lenses, aggregate
+            verdict, `merge_gate`, and `checkpoint_gate` are explicit evidence
+            nodes.
+          </p>
+          <ul>
+            <li>Raw `dag-verify:*` is not authoritative alone.</li>
+            <li>Summary-only or stale evidence cannot approve merge.</li>
+          </ul>
+        </div>
+        <div class="cell delta-col">
+          <span class="badge delta">Changed</span>
+          <h4>Approval becomes graph proof</h4>
+          <p>
+            Merge/checkpoint callers must consume reachable approved graph nodes,
+            not assemble approval from raw artifacts.
+          </p>
+        </div>
+      </article>
+
+      <article class="stage-row">
+        <div class="stage-title">
+          <h3>8. Failure Routing And Repair</h3>
+          <p>What happens when evidence fails.</p>
+        </div>
+        <div class="cell existing-col">
+          <span class="badge existing">Existing</span>
+          <h4>RCA/fix loops live inside implementation flow</h4>
+          <p>
+            `_diagnose_and_fix`, `_single_rca_fix_verify`, direct repair routes,
+            commit-only routes, and artifact repair lanes are coordinated by the
+            implementation phase.
+          </p>
+          <div class="risk-note">Risk: workflow failures can fall into broad product repair or repeat retry loops.</div>
+        </div>
+        <div class="cell proposed-col">
+          <span class="badge proposed">Proposed</span>
+          <h4>`FailureRouter` decides; bounded executors act</h4>
+          <p>
+            The router classifies and selects the route. `RepairService`,
+            dispatcher, merge queue, workspace authority, and GitService execute
+            only selected bounded actions.
+          </p>
+          <div class="note">Routes include product repair, contract repair, canonicalization, workspace repair, commit hygiene, verifier/runtime/merge retry, sandbox cleanup, explicit operator-required, or quiesce.</div>
+        </div>
+        <div class="cell delta-col">
+          <span class="badge delta">Changed</span>
+          <h4>Failure class controls the next step</h4>
+          <p>
+            Commit hygiene, stale projection, workspace/ACL, runtime-provider,
+            queue recovery, and checkpoint contradiction are workflow classes
+            unless typed evidence proves product defect.
+          </p>
+        </div>
+      </article>
+
+      <article class="stage-row">
+        <div class="stage-title">
+          <h3>9. Canonical Merge, Commit, Checkpoint</h3>
+          <p>When product files become authoritative.</p>
+        </div>
+        <div class="cell existing-col">
+          <span class="badge existing">Existing</span>
+          <h4>Direct git helpers and checkpoint artifacts</h4>
+          <p>
+            `_commit_repos`, `_commit_repos_in_root`, `_commit_group`, commit
+            failure artifacts, verifier approval, and repo cleanliness gate
+            `dag-group:*`.
+          </p>
+          <div class="risk-note">Risk: commit-only failures happen after verify success and can re-enter repair/reverify paths.</div>
+        </div>
+        <div class="cell proposed-col">
+          <span class="badge proposed">Proposed</span>
+          <h4>`DurableMergeQueue` + `GitService`</h4>
+          <p>
+            Queue lease, claim, apply, rebase/conflict handling, post-apply
+            gates, commit proof, no-dirty snapshot, queue coverage, checkpoint
+            gate, checkpoint body evidence, and idempotent `dag-group:*`
+            projection happen as one recoverable authority path.
+          </p>
+        </div>
+        <div class="cell delta-col">
+          <span class="badge delta">Changed</span>
+          <h4>Only the queue mutates product content</h4>
+          <p>
+            Checkpoint projection requires merge proof, commit proof, no-dirty
+            proof, approved gate/checkpoint evidence, checkpoint body evidence,
+            and projection/link success.
+          </p>
+        </div>
+      </article>
+
+      <article class="stage-row">
+        <div class="stage-title">
+          <h3>10. Post-DAG Business Gates</h3>
+          <p>Feature-level checks after group checkpoints.</p>
+        </div>
+        <div class="cell existing-col">
+          <span class="badge existing">Existing</span>
+          <h4>Embedded in `ImplementationPhase.execute`</h4>
+          <p>
+            After all DAG groups checkpoint, the phase runs code review,
+            security, test authoring, QA, integration, final verifier,
+            source-repo push, implementation report, backlog report, and
+            notification.
+          </p>
+        </div>
+        <div class="cell proposed-col">
+          <span class="badge proposed">Proposed</span>
+          <h4>`PostDagGateService`</h4>
+          <p>
+            The same business gates are preserved as feature-level typed gate
+            evidence and `dag-gate:*` compatibility projections. Group checkpoint
+            completion is not final implementation approval.
+          </p>
+        </div>
+        <div class="cell delta-col">
+          <span class="badge delta">Preserved + typed</span>
+          <h4>Business logic remains, authority is explicit</h4>
+          <p>
+            These gates cannot be skipped by the new architecture, and failures
+            route through typed verification/router paths before observation can
+            begin.
+          </p>
+        </div>
+      </article>
+
+      <article class="stage-row">
+        <div class="stage-title">
+          <h3>11. Post-Test Readiness</h3>
+          <p>When observation collection may start.</p>
+        </div>
+        <div class="cell existing-col">
+          <span class="badge existing">Existing</span>
+          <h4>Defensive guard checks DAG checkpoints</h4>
+          <p>
+            `PostTestObservationPhase` guards against starting while root DAG
+            checkpoints are incomplete. This was patched after quiesce exposed
+            accidental advancement risk.
+          </p>
+          <div class="risk-note">Risk: root DAG length alone is not enough when an active effective-DAG overlay exists.</div>
+        </div>
+        <div class="cell proposed-col">
+          <span class="badge proposed">Proposed</span>
+          <h4>`PostTestReadinessGuard`</h4>
+          <p>
+            Observation starts only after effective-DAG completion, post-DAG gate
+            approval, no active queue/repair work, and compatible projections.
+            It never relies on root-DAG length alone.
+          </p>
+        </div>
+        <div class="cell delta-col">
+          <span class="badge delta">Changed</span>
+          <h4>Readiness follows effective state</h4>
+          <p>
+            The guard consumes typed completion and effective-DAG resolver
+            evidence, so regroup overlays cannot confuse post-test entry.
+          </p>
+        </div>
+      </article>
+
+      <article class="stage-row">
+        <div class="stage-title">
+          <h3>12. Observability And Supervisor</h3>
+          <p>How humans and automation inspect the run.</p>
+        </div>
+        <div class="cell existing-col">
+          <span class="badge existing">Existing</span>
+          <h4>Dashboard/supervisor read artifacts and events</h4>
+          <p>
+            Bounded summary paths have improved safety, but current visibility
+            still depends heavily on legacy artifact/event interpretation and
+            degraded fallback behavior.
+          </p>
+        </div>
+        <div class="cell proposed-col">
+          <span class="badge proposed">Proposed</span>
+          <h4>Typed snapshots + bounded compatibility fallback</h4>
+          <p>
+            Dashboard, supervisor, and regroup readers use typed snapshots first.
+            Legacy fallback is visibly degraded, bounded, capped, and never
+            hydrates broad artifact bodies.
+          </p>
+          <div class="note">Supervisor has no executor/control-plane/product mutation authority; bounded audit/dedupe/outbox and explicitly configured guarded bridge actions are the documented exceptions.</div>
+        </div>
+        <div class="cell delta-col">
+          <span class="badge delta">Changed</span>
+          <h4>Observability stops being inference-heavy</h4>
+          <p>
+            The operator sees active attempt, failure class, route, queue state,
+            checkpoint proof, and next action from typed evidence rather than
+            heuristic artifact-body scans.
+          </p>
+        </div>
+      </article>
+    </section>
+
+    <section class="section">
+      <h2>Post-Execution And Observation Phase Flow</h2>
+      <p class="section-intro">
+        These rows make the downstream feature progression explicit. The
+        post-DAG business gates and `PostTestObservationPhase` remain part of the
+        workflow; the control plane changes when they are allowed to start and
+        how product-changing follow-up work proves safety.
+      </p>
+
+      <div class="stage-header" aria-hidden="true">
+        <div class="column-label">Post-execution step</div>
+        <div class="column-label existing-col">Existing flow</div>
+        <div class="column-label proposed-col">Proposed control plane</div>
+        <div class="column-label delta-col">What changes</div>
+      </div>
+
+      <article class="stage-row">
+        <div class="stage-title">
+          <h3>P1. Post-DAG Business Gates</h3>
+          <p>Feature-level validation after all implementation groups checkpoint.</p>
+        </div>
+        <div class="cell existing-col">
+          <span class="badge existing">Existing</span>
+          <h4>Tail of `ImplementationPhase.execute`</h4>
+          <p>
+            Once DAG execution succeeds, implementation runs code review,
+            security audit, test authoring, QA, integration testing, final
+            verifier, source-repo push, implementation report, backlog report,
+            and notification.
+          </p>
+        </div>
+        <div class="cell proposed-col">
+          <span class="badge proposed">Proposed</span>
+          <h4>`PostDagGateService` produces typed gate evidence</h4>
+          <p>
+            The same gates run after effective-DAG completion, but their results
+            become feature-level typed evidence and `dag-gate:*` compatibility
+            projections.
+          </p>
+        </div>
+        <div class="cell delta-col">
+          <span class="badge guard">Preserved + typed</span>
+          <h4>Group checkpoints are not final feature approval</h4>
+          <p>
+            Post-DAG gates remain mandatory and must complete before observation
+            can begin.
+          </p>
+        </div>
+      </article>
+
+      <article class="stage-row">
+        <div class="stage-title">
+          <h3>P2. Observation Entry Guard</h3>
+          <p>Determines whether the user-facing observation phase may start.</p>
+        </div>
+        <div class="cell existing-col">
+          <span class="badge existing">Existing</span>
+          <h4>`_raise_if_dag_incomplete_before_post_test`</h4>
+          <p>
+            `PostTestObservationPhase.execute` first blocks entry if a root DAG
+            exists with missing expected `dag-group:*` checkpoints, then restores
+            the feature worktree root for resumed runs.
+          </p>
+        </div>
+        <div class="cell proposed-col">
+          <span class="badge proposed">Proposed</span>
+          <h4>`PostTestReadinessGuard` reads effective completion</h4>
+          <p>
+            Entry requires effective-DAG completion, post-DAG gate approval, no
+            active queue/repair work, and consistent compatibility projections.
+          </p>
+        </div>
+        <div class="cell delta-col">
+          <span class="badge delta">Changed</span>
+          <h4>Readiness follows effective state</h4>
+          <p>
+            Root-DAG checkpoint count is no longer the only readiness signal,
+            especially when regroup overlays or typed queue state exist.
+          </p>
+        </div>
+      </article>
+
+      <article class="stage-row">
+        <div class="stage-title">
+          <h3>P2A. Worktree Root Restore</h3>
+          <p>Restores feature worktree service context on resume.</p>
+        </div>
+        <div class="cell existing-col">
+          <span class="badge existing">Existing</span>
+          <h4>`_get_feature_root` sets `runner.services["worktree_root"]`</h4>
+          <p>
+            Because implementation normally sets worktree context, post-test
+            observation restores it on resume before collecting or dispatching
+            observation fixes.
+          </p>
+        </div>
+        <div class="cell proposed-col">
+          <span class="badge proposed">Proposed</span>
+          <h4>Workspace context comes from `WorkspaceAuthority`</h4>
+          <p>
+            Observation fix dispatch should use the same canonical workspace
+            authority as implementation, including alias and writeability proof.
+          </p>
+        </div>
+        <div class="cell delta-col">
+          <span class="badge delta">Changed</span>
+          <h4>Post-test fixes use canonical workspace proof</h4>
+          <p>
+            The phase still restores context, but product mutation cannot rely
+            on a bare service path without typed workspace validation.
+          </p>
+        </div>
+      </article>
+
+      <article class="stage-row">
+        <div class="stage-title">
+          <h3>P3. Observation Cycle Resume</h3>
+          <p>Restores prior observation cycles after bridge/process restart.</p>
+        </div>
+        <div class="cell existing-col">
+          <span class="badge existing">Existing</span>
+          <h4>Artifact-backed cycle state</h4>
+          <p>
+            The phase reads `observation-cycle-counter`, `observations`,
+            `observation-decisions`, `observation-history`, and
+            `observations-checkpoint:{cycle}` to recover prior reports and
+            clarification decisions.
+          </p>
+        </div>
+        <div class="cell proposed-col">
+          <span class="badge proposed">Proposed</span>
+          <h4>Cycle state remains, linked to typed readiness</h4>
+          <p>
+            Observation artifacts remain compatibility-visible, but entry and
+            product-changing follow-up work are linked to typed implementation
+            completion and gate evidence.
+          </p>
+        </div>
+        <div class="cell delta-col">
+          <span class="badge guard">Preserved</span>
+          <h4>Restart behavior remains explicit</h4>
+          <p>
+            The observation phase keeps restart-safe cycle artifacts while
+            relying on stronger upstream readiness proof.
+          </p>
+        </div>
+      </article>
+
+      <article class="stage-row">
+        <div class="stage-title">
+          <h3>P3A. Checkpointed Interview Recovery</h3>
+          <p>Skips re-interviewing after a crash during dispatch.</p>
+        </div>
+        <div class="cell existing-col">
+          <span class="badge existing">Existing</span>
+          <h4>`observations-checkpoint:{cycle}`</h4>
+          <p>
+            At the start of each cycle, the phase attempts to parse the
+            structured checkpoint report. If it is valid, it skips collection
+            and resumes dispatch from the recovered observations.
+          </p>
+        </div>
+        <div class="cell proposed-col">
+          <span class="badge proposed">Proposed</span>
+          <h4>Checkpoint recovery remains, dispatch proof strengthens</h4>
+          <p>
+            Observation reports can still be checkpointed, but fixes generated
+            from them should enter the same sandbox/verify/merge proof path as
+            implementation repairs.
+          </p>
+        </div>
+        <div class="cell delta-col">
+          <span class="badge guard">Preserved + typed downstream</span>
+          <h4>Observation input recovery is separate from product mutation</h4>
+          <p>
+            Recovering the report does not prove any fix was safely applied.
+          </p>
+        </div>
+      </article>
+
+      <article class="stage-row">
+        <div class="stage-title">
+          <h3>P4. Observation Interview</h3>
+          <p>Collects user observations, or completes if there is nothing to report.</p>
+        </div>
+        <div class="cell existing-col">
+          <span class="badge existing">Existing</span>
+          <h4>`runner.run(Interview(... observation_collector ...))`</h4>
+          <p>
+            The phase asks the user for bugs, missing features, or things that
+            should work differently. If the user says done/nothing to report, the
+            phase exits the cycle loop.
+          </p>
+        </div>
+        <div class="cell proposed-col">
+          <span class="badge proposed">Proposed</span>
+          <h4>User-facing interview stays intact</h4>
+          <p>
+            The collection experience remains the same, but context can point at
+            typed completion/gate evidence instead of inferred artifact state.
+          </p>
+        </div>
+        <div class="cell delta-col">
+          <span class="badge guard">Preserved</span>
+          <h4>The user workflow is unchanged</h4>
+          <p>
+            The architecture does not remove the observation interview; it only
+            prevents premature entry.
+          </p>
+        </div>
+      </article>
+
+      <article class="stage-row">
+        <div class="stage-title">
+          <h3>P4A. Report And Decision Persistence</h3>
+          <p>Writes observations before any fix dispatch occurs.</p>
+        </div>
+        <div class="cell existing-col">
+          <span class="badge existing">Existing</span>
+          <h4>`observations:cycle-{n}`, checkpoint, `D-OBS-*`</h4>
+          <p>
+            Collected observations are rendered, serialized, written as the
+            current `observations`, stored in the cycle checkpoint, and any
+            clarification decisions are written as `D-OBS-*` artifacts.
+          </p>
+        </div>
+        <div class="cell proposed-col">
+          <span class="badge proposed">Proposed</span>
+          <h4>Observation input becomes typed repair context</h4>
+          <p>
+            Product-changing observation fixes should record which observation,
+            decision, and upstream completion/gate evidence they are repairing.
+          </p>
+        </div>
+        <div class="cell delta-col">
+          <span class="badge guard">Preserved + linked</span>
+          <h4>Input durability remains mandatory</h4>
+          <p>
+            The workflow still persists user-reported issues before attempting
+            fixes; the new architecture links those fixes to mutation proof.
+          </p>
+        </div>
+      </article>
+
+      <article class="stage-row">
+        <div class="stage-title">
+          <h3>P4B. Observation Context Package</h3>
+          <p>Builds per-cycle context for all observation dispatches.</p>
+        </div>
+        <div class="cell existing-col">
+          <span class="badge existing">Existing</span>
+          <h4>`_build_observation_context`</h4>
+          <p>
+            The phase combines the report, cycle number, clarification
+            decisions, prior fix summary, and feature root into context used by
+            each observation fix dispatch.
+          </p>
+        </div>
+        <div class="cell proposed-col">
+          <span class="badge proposed">Proposed</span>
+          <h4>Context includes typed implementation readiness</h4>
+          <p>
+            Observation context should include effective completion, post-DAG
+            gate evidence, workspace snapshot, and current no-dirty proof so
+            fixes cannot operate from stale assumptions.
+          </p>
+        </div>
+        <div class="cell delta-col">
+          <span class="badge delta">Changed</span>
+          <h4>Observation fixes inherit the control plane</h4>
+          <p>
+            The dispatch context becomes proof-backed rather than a broad
+            textual summary of prior state.
+          </p>
+        </div>
+      </article>
+
+      <article class="stage-row">
+        <div class="stage-title">
+          <h3>P5. Observation Fix Dispatch</h3>
+          <p>Handles reported issues through category-specific fix pipelines.</p>
+        </div>
+        <div class="cell existing-col">
+          <span class="badge existing">Existing</span>
+          <h4>Priority order, RCA/fix/verify, bounded redispatch</h4>
+          <p>
+            Observations are sorted by priority and dispatched through
+            `_dispatch_observation`. Nonterminal statuses are retried up to
+            `MAX_FIX_ITERATIONS`; `FIXED`, `UNRESOLVED`, `SKIPPED`, `ERROR`, and
+            `BLOCKED` are terminal for that cycle.
+          </p>
+        </div>
+        <div class="cell proposed-col">
+          <span class="badge proposed">Proposed</span>
+          <h4>Fixes respect the same mutation proof rules</h4>
+          <p>
+            Category-specific observation handling remains, but any product
+            mutation must use the control-plane safety boundaries: contracts or
+            bounded repair scope, sandboxed work, verification evidence, merge
+            proof, commit proof, and no-dirty proof.
+          </p>
+        </div>
+        <div class="cell delta-col">
+          <span class="badge delta">Changed</span>
+          <h4>Post-test fixes cannot bypass canonical mutation authority</h4>
+          <p>
+            Observation fixes remain user-driven, but product-changing work does
+            not get a side door around sandbox/merge/checkpoint proof.
+          </p>
+        </div>
+      </article>
+
+      <article class="stage-row">
+        <div class="stage-title">
+          <h3>P5A. Dispatch Failure Classification</h3>
+          <p>Handles prompt-size and runtime exceptions without losing the cycle.</p>
+        </div>
+        <div class="cell existing-col">
+          <span class="badge existing">Existing</span>
+          <h4>Prompt-too-long becomes `BLOCKED`; other exceptions become `ERROR`</h4>
+          <p>
+            `_dispatch_observation` exceptions are caught per observation, so one
+            failed fix dispatch records a terminal status instead of destroying
+            all cycle results.
+          </p>
+        </div>
+        <div class="cell proposed-col">
+          <span class="badge proposed">Proposed</span>
+          <h4>Failures route through typed taxonomy</h4>
+          <p>
+            Observation fix failures should use the same router classes as
+            implementation: runtime retry, context-size blocked, product repair,
+            workspace repair, merge conflict, or explicit operator-required.
+          </p>
+        </div>
+        <div class="cell delta-col">
+          <span class="badge delta">Changed</span>
+          <h4>Terminal statuses become typed route outcomes</h4>
+          <p>
+            The user-facing statuses remain, but internal recovery becomes more
+            precise and less likely to repeat the wrong fix path.
+          </p>
+        </div>
+      </article>
+
+      <article class="stage-row">
+        <div class="stage-title">
+          <h3>P5B. Redispatch Budget</h3>
+          <p>Retries only observations that have not reached terminal status.</p>
+        </div>
+        <div class="cell existing-col">
+          <span class="badge existing">Existing</span>
+          <h4>`MAX_FIX_ITERATIONS` loop</h4>
+          <p>
+            After each dispatch round, the phase keeps only nonterminal
+            observations and retries them until they finish or the cycle-level
+            iteration budget is exhausted.
+          </p>
+        </div>
+        <div class="cell proposed-col">
+          <span class="badge proposed">Proposed</span>
+          <h4>Retry budget aligns with failure class</h4>
+          <p>
+            The control plane should track retry budgets by failure route so a
+            commit-only, workspace, runtime, or product failure does not consume
+            the wrong retry budget.
+          </p>
+        </div>
+        <div class="cell delta-col">
+          <span class="badge delta">Changed</span>
+          <h4>Retries become reason-coded</h4>
+          <p>
+            The bounded loop remains, but route-aware budgets prevent repeated
+            broad repair when deterministic fixes are required.
+          </p>
+        </div>
+      </article>
+
+      <article class="stage-row">
+        <div class="stage-title">
+          <h3>P6. Cycle Persistence And Completion</h3>
+          <p>Records results and decides whether another observation cycle is needed.</p>
+        </div>
+        <div class="cell existing-col">
+          <span class="badge existing">Existing</span>
+          <h4>Artifacts preserve the cycle history</h4>
+          <p>
+            The phase writes `observations`, `observation-cycle-counter`,
+            `observation-decisions`, clears the active checkpoint, and appends
+            `observation-history` before starting another cycle or returning
+            state.
+          </p>
+        </div>
+        <div class="cell proposed-col">
+          <span class="badge proposed">Proposed</span>
+          <h4>Completion remains phase-local, upstream proof remains typed</h4>
+          <p>
+            Observation-cycle artifacts remain readable. Final workflow
+            completion still happens only after the observation loop returns
+            state and shared workflow cleanup runs.
+          </p>
+        </div>
+        <div class="cell delta-col">
+          <span class="badge guard">Preserved</span>
+          <h4>History and resume semantics stay visible</h4>
+          <p>
+            The post-test loop remains restart-safe and auditable while upstream
+            implementation readiness becomes more reliable.
+          </p>
+        </div>
+      </article>
+
+      <article class="stage-row">
+        <div class="stage-title">
+          <h3>P7. Workflow Completion</h3>
+          <p>Returns state only after observation cycles finish.</p>
+        </div>
+        <div class="cell existing-col">
+          <span class="badge existing">Existing</span>
+          <h4>No observations means phase complete</h4>
+          <p>
+            When the observation collector returns no observations, or a cycle
+            finishes and no further report is needed, the phase returns
+            `BuildState` to the workflow runner.
+          </p>
+        </div>
+        <div class="cell proposed-col">
+          <span class="badge proposed">Proposed</span>
+          <h4>Completion still follows observation loop</h4>
+          <p>
+            The control plane strengthens readiness and mutation proof, but it
+            does not remove the final user-observation confirmation step.
+          </p>
+        </div>
+        <div class="cell delta-col">
+          <span class="badge guard">Preserved</span>
+          <h4>The feature still ends at the same business boundary</h4>
+          <p>
+            The proposed workflow becomes safer and more observable without
+            changing the user-facing definition of a completed feature.
+          </p>
+        </div>
+      </article>
+    </section>
+
+    <section class="section">
+      <h2>Authority Boundary Matrix</h2>
+      <p class="section-intro">
+        The proposed flow is easier to reason about because each product-
+        authoritative side effect has one owner.
+      </p>
+      <div class="ownership-grid">
+        <div class="owner-card">
+          <span class="badge state">Canonical state</span>
+          <h3>`ExecutionControlStore`</h3>
+          <p>Typed rows, projection links, idempotency, compatibility artifacts, and resume reconstruction.</p>
+        </div>
+        <div class="owner-card">
+          <span class="badge proposed">Workspace</span>
+          <h3>`WorkspaceAuthority`</h3>
+          <p>Canonical repo identity, alias/ACL decisions, snapshots, symlink/outside-root safety.</p>
+        </div>
+        <div class="owner-card">
+          <span class="badge proposed">Contracts</span>
+          <h3>`TaskContractCompiler`</h3>
+          <p>Required, allowed, forbidden paths, write sets, acceptance criteria, merge admission.</p>
+        </div>
+        <div class="owner-card">
+          <span class="badge proposed">Runtime</span>
+          <h3>`SandboxRunner` + `RuntimeDispatcher`</h3>
+          <p>Isolated execution roots, patch summaries, structured results, provider/runtime failures.</p>
+        </div>
+        <div class="owner-card">
+          <span class="badge proposed">Approval</span>
+          <h3>`VerificationGraph`</h3>
+          <p>Bounded context, raw verifier, expanded lenses, aggregate verdict, merge/checkpoint gates.</p>
+        </div>
+        <div class="owner-card">
+          <span class="badge delta">Routing</span>
+          <h3>`FailureRouter`</h3>
+          <p>Classifies and selects bounded routes. It does not run repair or mutate repos.</p>
+        </div>
+        <div class="owner-card">
+          <span class="badge proposed">Canonical mutation</span>
+          <h3>`DurableMergeQueue` + `GitService`</h3>
+          <p>Applies patches, handles rebase/conflict, commits, proves no-dirty, checkpoints.</p>
+        </div>
+        <div class="owner-card">
+          <span class="badge guard">Feature finish</span>
+          <h3>`PostDagGateService` + `PostTestReadinessGuard`</h3>
+          <p>Preserved business gates and effective-DAG readiness before observation.</p>
+        </div>
+        <div class="owner-card">
+          <span class="badge delta">Atomic landing</span>
+          <h3>Complete bundle only</h3>
+          <p>No per-slice production rollout; no partial product-authoritative mode.</p>
+        </div>
+      </div>
+    </section>
+
+    <section class="section">
+      <h2>Proof Surface Changes</h2>
+      <table class="matrix">
+        <thead>
+          <tr>
+            <th>Surface</th>
+            <th>Existing role</th>
+            <th>Proposed role</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>dag-task:*</code></td>
+            <td>Task result evidence that can be read broadly by later stages.</td>
+            <td>Compatibility projection of typed attempt evidence only; never integration or checkpoint proof.</td>
+          </tr>
+          <tr>
+            <td><code>dag-verify:*</code></td>
+            <td>Verifier/lens artifacts used to decide repair, commit, and checkpoint paths.</td>
+            <td>Projection of verification graph nodes; raw approval alone cannot admit merge or checkpoint.</td>
+          </tr>
+          <tr>
+            <td><code>dag-commit-failure:*</code></td>
+            <td>Commit helper failure evidence that can feed repair loops.</td>
+            <td>Projection of typed commit-hygiene failure with bounded output and a narrow route.</td>
+          </tr>
+          <tr>
+            <td><code>dag-group:*</code></td>
+            <td>Checkpoint artifact used by resume/scheduler to skip completed groups.</td>
+            <td>Written only after queue success, approved gate/checkpoint evidence, merge proof, commit proof, no-dirty proof, checkpoint body evidence, and idempotent projection/link success.</td>
+          </tr>
+          <tr>
+            <td><code>dag-gate:*</code></td>
+            <td>Post-DAG gate checkpoints embedded in implementation phase.</td>
+            <td>Feature-level typed gate projection required before post-test observation.</td>
+          </tr>
+          <tr>
+            <td><code>dag-regroup:*</code></td>
+            <td>Persisted regroup artifacts used by dispatch/resume after activation.</td>
+            <td>Compatibility projection of typed active overlay/effective-DAG resolver state. Root DAG remains immutable.</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+  </main>
+
+  <script>
+    const sectionTitle = (section) =>
+      section.querySelector("h2")?.textContent.trim() || "";
+
+    const blankComparisonCells = (row) => {
+      row.classList.add("no-change");
+      row.querySelectorAll(".cell.proposed-col, .cell.delta-col").forEach((cell) => {
+        cell.replaceChildren();
+        cell.removeAttribute("aria-label");
+      });
+    };
+
+    let beforeImplementation = true;
+    document.querySelectorAll(".section").forEach((section) => {
+      const title = sectionTitle(section);
+      const rows = Array.from(section.querySelectorAll(".stage-row"));
+      if (title === "Implementation Phase Flow") {
+        beforeImplementation = false;
+      }
+
+      if (rows.length && beforeImplementation) {
+        rows.forEach(blankComparisonCells);
+      } else {
+        rows.forEach((row) => {
+          const badge = row.querySelector(".delta-col .badge");
+          if (badge && !badge.classList.contains("delta")) {
+            blankComparisonCells(row);
+          }
+        });
+      }
+
+      if (rows.length && rows.every((row) => row.classList.contains("no-change"))) {
+        section.classList.add("no-change-section");
+      }
+    });
+
+    const buttons = Array.from(document.querySelectorAll("button[data-mode]"));
+    const setMode = (mode) => {
+      document.body.dataset.mode = mode;
+      buttons.forEach((button) => {
+        button.setAttribute("aria-pressed", String(button.dataset.mode === mode));
+      });
+    };
+
+    buttons.forEach((button) => {
+      button.addEventListener("click", () => setMode(button.dataset.mode));
+    });
+  </script>
+</body>
+</html>

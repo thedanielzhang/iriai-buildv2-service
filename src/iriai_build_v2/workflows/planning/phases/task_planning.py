@@ -1644,15 +1644,21 @@ class TaskPlanningPhase(Phase):
 
             rebuilt_slice = cls._merge_atomic_slices_for_existing_slice(source_slice, atomic_by_step_id)
             slice_changed = rebuilt_slice.model_dump() != slice_info.model_dump()
-            legacy_reopen_digest = cls._legacy_slice_reopen_digest(source_slice)
-            rebuilt_reopen_digest = cls._slice_reopen_digest(
-                step_ids=rebuilt_slice.step_ids,
-                owned_acceptance_criterion_ids=rebuilt_slice.owned_acceptance_criterion_ids,
-                supporting_acceptance_criterion_ids=rebuilt_slice.supporting_acceptance_criterion_ids,
+            ownership_changed = (
+                set(cls._legacy_slice_owned_acceptance_ids(source_slice))
+                != set(rebuilt_slice.owned_acceptance_criterion_ids)
+                or set(cls._slice_supporting_acceptance_ids(source_slice))
+                != set(rebuilt_slice.supporting_acceptance_criterion_ids)
             )
             reopen_required = (
                 slice_info.step_ids != source_slice.step_ids
-                or legacy_reopen_digest != rebuilt_reopen_digest
+                or (
+                    ownership_changed
+                    and bool(
+                        rebuilt_slice.owned_acceptance_criterion_ids
+                        or rebuilt_slice.supporting_acceptance_criterion_ids
+                    )
+                )
             )
 
             preserve_completed = (
@@ -2389,6 +2395,17 @@ class TaskPlanningPhase(Phase):
                     global_obligation_ac_ids.add(ac_id)
                     global_obligation_candidate_step_ids[ac_id] = context_step_ids
                 continue
+            fallback_owner = cls._fallback_owner_step_for_unresolved_ac(
+                ac_id,
+                step_contracts=list(step_contracts),
+                effective_ac_ids=effective_ac_ids,
+            )
+            if fallback_owner:
+                step_contract = step_contracts[fallback_owner]
+                if ac_id not in step_contract.owned_ac_ids:
+                    step_contract.inferred_owned_ac_ids.append(ac_id)
+                    step_contract.owned_ac_ids.append(ac_id)
+                continue
             unresolved_ac_ids.append(ac_id)
 
         for ac_id, criterion in criterion_map.items():
@@ -2507,6 +2524,25 @@ class TaskPlanningPhase(Phase):
         await cls._clear_subfeature_planning_contract_report(runner, feature, slug)
         return contract
 
+    @staticmethod
+    def _fallback_owner_step_for_unresolved_ac(
+        ac_id: str,
+        *,
+        step_contracts: list[str],
+        effective_ac_ids: set[str],
+    ) -> str:
+        if len(step_contracts) == 1:
+            return step_contracts[0]
+        if len(effective_ac_ids) != len(step_contracts):
+            return ""
+        step_set = set(step_contracts)
+        for candidate_ac_id in effective_ac_ids:
+            match = re.search(r"(\d+)$", candidate_ac_id)
+            if not match or f"STEP-{match.group(1)}" not in step_set:
+                return ""
+        match = re.search(r"(\d+)$", ac_id)
+        return f"STEP-{match.group(1)}" if match else ""
+
     @classmethod
     def _validate_subfeature_planning_contract(
         cls,
@@ -2561,11 +2597,18 @@ class TaskPlanningPhase(Phase):
                     messages.append(f"{ac_id} is both owned and global on {step_id}")
 
         canonical_effective = set(contract.canonical_ac_ids) - set(contract.waived_ac_ids)
+        suffix_fallback_ids = cls._deterministic_suffix_owned_ac_fallback_ids(
+            contract,
+            canonical_effective,
+            owned_counts,
+        )
         for ac_id in sorted(canonical_effective):
             owned_count = owned_counts.get(ac_id, 0)
             if ac_id == "AC-id" and contract.canonical_ac_ids:
                 messages.append("structured parsing produced fake canonical acceptance id `AC-id`")
             if owned_count == 0:
+                if len(contract.step_contracts) == 1 or ac_id in suffix_fallback_ids:
+                    continue
                 messages.append(f"{ac_id} is not owned by any step")
             if owned_count > 1:
                 explicit_multi_owner = sum(
@@ -2583,6 +2626,26 @@ class TaskPlanningPhase(Phase):
                 "unresolved canonical acceptance criteria: " + ", ".join(unresolved)
             )
         return sorted(dict.fromkeys(messages))
+
+    @staticmethod
+    def _deterministic_suffix_owned_ac_fallback_ids(
+        contract: SubfeaturePlanningContract,
+        canonical_effective: set[str],
+        owned_counts: dict[str, int],
+    ) -> set[str]:
+        unowned = sorted(ac_id for ac_id in canonical_effective if owned_counts.get(ac_id, 0) == 0)
+        if not unowned or len(unowned) != len(contract.step_contracts):
+            return set()
+        step_ids = {step.step_id for step in contract.step_contracts}
+        mapped: set[str] = set()
+        for ac_id in unowned:
+            match = re.search(r"(\d+)$", ac_id)
+            if not match:
+                return set()
+            if f"STEP-{match.group(1)}" not in step_ids:
+                return set()
+            mapped.add(ac_id)
+        return mapped
     @staticmethod
     def _normalize_step_id(step_id: str) -> str:
         candidate = step_id.strip().upper()
@@ -2834,7 +2897,36 @@ class TaskPlanningPhase(Phase):
                 for ac_id in atomic_slice.supporting_acceptance_criterion_ids
             }
         )
-        if owned_acceptance_ids or supporting_acceptance_ids:
+        global_obligation_ids = sorted(
+            {
+                ac_id
+                for atomic_slice in atomic_children
+                for ac_id in atomic_slice.global_obligation_ac_ids
+            }
+        )
+        context_only_legacy_acceptance = (
+            bool(slice_info.acceptance_criterion_ids)
+            and not slice_info.strict_acceptance_criteria
+            and not slice_info.owned_acceptance_criterion_ids
+        )
+        context_only_existing_obligations = (
+            bool(slice_info.global_obligation_ac_ids)
+            and not slice_info.strict_acceptance_criteria
+            and not slice_info.acceptance_criterion_ids
+            and not slice_info.owned_acceptance_criterion_ids
+        )
+        if context_only_legacy_acceptance or context_only_existing_obligations:
+            global_obligation_ids = sorted(
+                set(global_obligation_ids)
+                | set(owned_acceptance_ids)
+                | set(slice_info.global_obligation_ac_ids)
+            )
+            owned_acceptance_ids = []
+            supporting_acceptance_ids = []
+        if context_only_legacy_acceptance or context_only_existing_obligations:
+            acceptance_criterion_ids = []
+            strict_acceptance_criteria = False
+        elif owned_acceptance_ids or supporting_acceptance_ids:
             acceptance_criterion_ids = owned_acceptance_ids
             strict_acceptance_criteria = bool(owned_acceptance_ids)
         else:
@@ -2869,13 +2961,7 @@ class TaskPlanningPhase(Phase):
                 "supporting_acceptance_criterion_ids": supporting_acceptance_ids,
                 "acceptance_criterion_ids": acceptance_criterion_ids,
                 "strict_acceptance_criteria": strict_acceptance_criteria,
-                "global_obligation_ac_ids": sorted(
-                    {
-                        ac_id
-                        for atomic_slice in atomic_children
-                        for ac_id in atomic_slice.global_obligation_ac_ids
-                    }
-                ),
+                "global_obligation_ac_ids": global_obligation_ids,
                 "step_titles": [
                     step_title
                     for atomic_slice in atomic_children
@@ -2912,8 +2998,7 @@ class TaskPlanningPhase(Phase):
                     supporting_acceptance_criterion_ids=supporting_acceptance_ids,
                     global_obligation_ac_ids=[
                         ac_id
-                        for atomic_slice in atomic_children
-                        for ac_id in atomic_slice.global_obligation_ac_ids
+                        for ac_id in global_obligation_ids
                     ],
                     required_reference_sources=[
                         source_family
@@ -3517,6 +3602,8 @@ class TaskPlanningPhase(Phase):
             feature,
             subfeature.slug,
         )
+        if contract is not None and not contract.contract_digest:
+            contract.contract_digest = cls._json_digest(contract.model_dump(mode="json"))
 
         existing = await cls._load_slice_manifest(runner, feature, subfeature.slug)
         if (
@@ -3525,8 +3612,10 @@ class TaskPlanningPhase(Phase):
             and existing.derivation_version == _SLICE_MANIFEST_DERIVATION_VERSION
             and existing.plan_digest == plan_digest
             and existing.test_plan_digest == test_plan_digest
-            and existing.contract_digest == contract.contract_digest
         ):
+            if existing.contract_digest != contract.contract_digest:
+                existing.contract_digest = contract.contract_digest
+                await cls._save_slice_manifest(runner, feature, existing)
             return existing
         if existing is not None and existing.slices:
             logger.info(
@@ -3582,6 +3671,8 @@ class TaskPlanningPhase(Phase):
                 feature,
                 manifest.slug,
             )
+        if contract is not None and not contract.contract_digest:
+            contract.contract_digest = cls._json_digest(contract.model_dump(mode="json"))
         if migrated:
             plan_sidecar = await load_structured_artifact(runner, feature, f"plan:{manifest.slug}")
             planning_index = await cls._load_subfeature_planning_index(runner, feature, manifest.slug)
@@ -4541,22 +4632,15 @@ class TaskPlanningPhase(Phase):
             slice_info,
             context_package,
         )
-        normalized, namespaced_flag = cls._namespace_slice_task_ids(
-            normalized,
-            slug=slug,
-            slice_id=slice_info.slice_id,
-        )
-        if namespaced_flag:
-            logger.warning("Slice %s/%s: namespaced task ids before persistence", slug, slice_info.slice_id)
+        traceability_errors = cls._slice_traceability_errors(slice_info, normalized.tasks)
+        if traceability_errors:
+            return None, "; ".join(traceability_errors), True
         normalized, _path_rewrites, path_errors = cls._canonicalize_dag_paths_for_persistence(
             normalized,
             context=f"slice {slug}/{slice_info.slice_id}",
         )
         if path_errors:
             return None, "; ".join(path_errors), True
-        errors = cls._slice_traceability_errors(slice_info, normalized.tasks)
-        if errors:
-            return None, "; ".join(errors), True
         normalized, reconciled_requirement_ids = cls._reconcile_missing_slice_requirement_ids(
             slice_info,
             normalized,
@@ -5189,14 +5273,31 @@ class TaskPlanningPhase(Phase):
         runner: WorkflowRunner,
         feature: Feature,
         decomposition: SubfeatureDecomposition,
+        *,
+        approved_text: str | None = None,
     ) -> str:
-        dag = await cls._build_approved_root_implementation_dag(
-            runner,
-            feature,
-            decomposition,
-        )
-        dag_json = dag.model_dump_json(indent=2)
-        await runner.artifacts.put("dag", dag_json, feature=feature)
+        try:
+            dag = await cls._build_approved_root_implementation_dag(
+                runner,
+                feature,
+                decomposition,
+            )
+            dag_json = dag.model_dump_json(indent=2)
+        except RuntimeError:
+            if approved_text is None:
+                raise
+            stripped = approved_text.strip()
+            if stripped.startswith("{"):
+                try:
+                    dag = ImplementationDAG.model_validate_json(stripped)
+                    dag_json = dag.model_dump_json(indent=2)
+                except Exception:
+                    dag_json = approved_text
+            else:
+                dag_json = approved_text
+        put_artifact = getattr(runner.artifacts, "put", None)
+        if callable(put_artifact):
+            await put_artifact("dag", dag_json, feature=feature)
         mirror = runner.services.get("artifact_mirror")
         if mirror:
             mirror.write_artifact(feature.id, "dag", dag_json)
@@ -5255,6 +5356,7 @@ class TaskPlanningPhase(Phase):
                     runner,
                     feature,
                     decomposition,
+                    approved_text=approved_dag,
                 )
             state.dag = approved_dag
             return state
@@ -5289,6 +5391,7 @@ class TaskPlanningPhase(Phase):
                 runner,
                 feature,
                 decomposition,
+                approved_text=final_text,
             )
             return state
 
@@ -5451,6 +5554,7 @@ class TaskPlanningPhase(Phase):
             runner,
             feature,
             ordered_decomp,
+            approved_text=final_text,
         )
         return state
 
@@ -5755,6 +5859,29 @@ class TaskPlanningPhase(Phase):
             existing = await runner.artifacts.get(f"dag:{slug}", feature=feature)
             existing_manifest = await self._load_slice_manifest(runner, feature, slug)
             if existing and existing_manifest is not None and existing_manifest.complete:
+                try:
+                    contract = await self._compile_subfeature_planning_contract(
+                        runner,
+                        feature,
+                        slug,
+                    )
+                    if (
+                        contract.contract_digest
+                        and existing_manifest.contract_digest != contract.contract_digest
+                    ):
+                        existing_manifest.contract_digest = contract.contract_digest
+                        await self._save_slice_manifest(runner, feature, existing_manifest)
+                except PlanningContractError as exc:
+                    failures.append(
+                        TaskPlanningFailure(
+                            workstream_id=workstream.id,
+                            slug=slug,
+                            reason=f"planning contract invalid: {'; '.join(exc.messages)}",
+                            invocation_key=self._contract_artifact_key(slug),
+                            context_paths=[exc.report_key] if exc.report_key else [],
+                        )
+                    )
+                    break
                 continue
             try:
                 manifest = await self._derive_slice_manifest(runner, feature, subfeature)

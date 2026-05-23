@@ -1,0 +1,54 @@
+{
+  "collection_policy": {
+    "bounded_reads": true,
+    "forbidden_paths": [
+      "live_workflow_mutation",
+      "live_store_mutation",
+      "broad_artifact_hydration",
+      "feature_mutating_query"
+    ],
+    "live_mutation": false,
+    "summary_only": true
+  },
+  "feature_id": "8ac124d6",
+  "high_water_artifact_id": "art_8ac124d6_000021",
+  "high_water_event_id": "evt_8ac124d6_000016",
+  "inspected_groups": [
+    "active",
+    "commit",
+    "dispatch",
+    "preflight",
+    "regroup",
+    "verify",
+    "workspace"
+  ],
+  "inspected_range": {
+    "artifact_ids": {
+      "end": "art_8ac124d6_000021",
+      "start": "art_8ac124d6_000001"
+    },
+    "event_ids": {
+      "end": "evt_8ac124d6_000016",
+      "start": "evt_8ac124d6_000001"
+    }
+  },
+  "required_failure_classes": [
+    "acl_writeability",
+    "broad_read_legacy_consumer",
+    "checkpoint_contradiction",
+    "commit_only_routing",
+    "commit_hygiene",
+    "product_contract_drift",
+    "queue_recovery",
+    "regroup_overlay_readiness",
+    "runtime_provider",
+    "stale_projection",
+    "worktree_alias"
+  ],
+  "root_dag_artifact": {
+    "id": "art_8ac124d6_000001",
+    "key": "dag-task:8ac124d6:root",
+    "sha256": "0f1e2d3c4b5a69788796a5b4c3d2e1f00112233445566778899aabbccddeeff0"
+  },
+  "schema_version": 1
+}

@@ -83,6 +83,9 @@ class SlackInteractionRuntime(InteractionRuntime):
         # feature_id ↔ channel bidirectional mapping
         self._feature_channels: dict[str, str] = {}
         self._channel_features: dict[str, str] = {}
+        # (feature_id, delivery_id) values already accepted for posting
+        self._notification_delivery_ids: set[tuple[str, str]] = set()
+        self._notification_delivery_lock = asyncio.Lock()
 
         # Turn persistence: set by orchestrator when a runtime is available
         self._session_store: Any = None
@@ -187,21 +190,66 @@ class SlackInteractionRuntime(InteractionRuntime):
         feature_id: str,
         phase_name: str,
         message: str,
+        delivery_id: str | None = None,
     ) -> None:
         channel = self._feature_channels.get(feature_id)
         if not channel:
+            if delivery_id:
+                raise RuntimeError(
+                    "Slack notification delivery failed: no Slack channel "
+                    f"registered for feature {feature_id} "
+                    f"(delivery_id={delivery_id})"
+                )
             logger.warning(
                 "No Slack channel registered for feature %s; dropping notification",
                 feature_id,
             )
             return
-        await self._adapter.post_message(channel, message)
+        delivery_key: tuple[str, str] | None = None
+        if delivery_id:
+            delivery_key = (feature_id, delivery_id)
+            async with self._notification_delivery_lock:
+                if delivery_key in self._notification_delivery_ids:
+                    self._schedule_feature_log(
+                        feature_id,
+                        "slack_notification_deduped",
+                        source="slack-interaction",
+                        content=phase_name or "notification",
+                        metadata={
+                            "message": message[:1000],
+                            "channel": channel,
+                            "delivery_id": delivery_id,
+                            "feature_id": feature_id,
+                            "phase_name": phase_name,
+                        },
+                    )
+                    return
+                self._notification_delivery_ids.add(delivery_key)
+        try:
+            message_ts = await self._adapter.post_message(channel, message)
+        except Exception:
+            if delivery_key is not None:
+                async with self._notification_delivery_lock:
+                    self._notification_delivery_ids.discard(delivery_key)
+            raise
+        if delivery_key is not None and not message_ts:
+            async with self._notification_delivery_lock:
+                self._notification_delivery_ids.discard(delivery_key)
+            raise RuntimeError(
+                "Slack notification delivery failed: no Slack message timestamp "
+                f"returned for feature {feature_id} in channel {channel} "
+                f"(delivery_id={delivery_id})"
+            )
         self._schedule_feature_log(
             feature_id,
             "slack_notification_posted",
             source="slack-interaction",
             content=phase_name or "notification",
-            metadata={"message": message[:1000], "channel": channel},
+            metadata={
+                "message": message[:1000],
+                "channel": channel,
+                "delivery_id": delivery_id,
+            },
         )
 
     async def resolve(self, pending: Pending) -> str | bool | GateRejection:

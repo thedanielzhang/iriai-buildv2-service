@@ -194,8 +194,9 @@ class ThreadAwareTerminalInteractionRuntime(InteractionRuntime):
         feature_id: str,
         phase_name: str,
         message: str,
+        delivery_id: str | None = None,
     ) -> None:
-        del feature_id
+        del feature_id, delivery_id
         header = _format_header(phase_name or "notification", self._thread_label)
         print(f"\n{header}")
         print(message)

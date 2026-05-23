@@ -12,9 +12,12 @@ import re
 import shutil
 import stat
 import subprocess
+import tempfile
 import time
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Callable
 from uuid import uuid4
 
@@ -26,6 +29,224 @@ except ImportError:  # pragma: no cover - non-Unix fallback.
 from iriai_compose import AgentActor, Ask, Feature, Phase, WorkflowRunner, to_str
 from iriai_compose.actors import Role
 from pydantic import BaseModel, Field
+
+try:
+    from ..execution.workspace_authority import (
+        PathTarget as WorkspaceAuthorityPathTarget,
+        WorkspaceAuthority,
+        WorkspaceSnapshot as WorkspaceAuthoritySnapshot,
+    )
+except ImportError:  # pragma: no cover - Slice 02 module may be absent in old installs.
+    WorkspaceAuthority = None  # type: ignore[assignment]
+    WorkspaceAuthorityPathTarget = None  # type: ignore[assignment]
+    WorkspaceAuthoritySnapshot = None  # type: ignore[assignment]
+
+try:
+    from ..execution.task_contracts import (
+        ContractCompileError,
+        ContractCompiler,
+        ContractGroupCompileRequest,
+        ContractVerdict as CompiledContractVerdict,
+        PatchSummary as CompiledPatchSummary,
+        TaskDeliverableContract as CompiledTaskDeliverableContract,
+    )
+except ImportError:  # pragma: no cover - Slice 03 module may be absent in old installs.
+    ContractCompileError = None  # type: ignore[assignment]
+    ContractCompiler = None  # type: ignore[assignment]
+    ContractGroupCompileRequest = None  # type: ignore[assignment]
+    CompiledContractVerdict = None  # type: ignore[assignment]
+    CompiledPatchSummary = None  # type: ignore[assignment]
+    CompiledTaskDeliverableContract = None  # type: ignore[assignment]
+
+try:
+    from ..execution.sandbox import (
+        PatchCaptureResult as SandboxPatchCaptureResult,
+        RuntimeWorkspaceBinding as RuntimeSandboxBinding,
+        SandboxError,
+        SandboxRunner,
+        SandboxSpec,
+    )
+except ImportError:  # pragma: no cover - Slice 04 module may be absent in old installs.
+    SandboxPatchCaptureResult = None  # type: ignore[assignment]
+    RuntimeSandboxBinding = None  # type: ignore[assignment]
+    SandboxError = None  # type: ignore[assignment]
+    SandboxRunner = None  # type: ignore[assignment]
+    SandboxSpec = None  # type: ignore[assignment]
+
+try:
+    from ..execution.dispatcher import (
+        ActorMetadata as DispatcherActorMetadata,
+        DispatchAttemptRecord as DispatcherAttemptRecord,
+        DispatchIdempotencyConflict as DispatcherDispatchIdempotencyConflict,
+        DispatchOutcome as DispatcherOutcome,
+        DispatchRequest as DispatcherDispatchRequest,
+        PatchCaptureRecord as DispatcherPatchCaptureRecord,
+        PromptBuildResult as DispatcherPromptBuildResult,
+        PromptContextBundle as DispatcherPromptContextBundle,
+        DispatchRetryIdentity as DispatcherRetryIdentity,
+        RuntimeDispatcher,
+        RuntimeFailureRecord as DispatcherRuntimeFailureRecord,
+        RuntimeInvocationResponse as DispatcherRuntimeInvocationResponse,
+        StructuredOutputRecord as DispatcherStructuredOutputRecord,
+        actor_metadata_digest as dispatcher_actor_metadata_digest,
+        dispatch_idempotency_key as dispatcher_idempotency_key,
+        dispatch_request_digest as dispatcher_request_digest,
+        stable_digest as dispatcher_stable_digest,
+    )
+except ImportError:  # pragma: no cover - Slice 05 module may be absent in old installs.
+    DispatcherActorMetadata = None  # type: ignore[assignment]
+    DispatcherAttemptRecord = None  # type: ignore[assignment]
+    DispatcherDispatchIdempotencyConflict = None  # type: ignore[assignment]
+    DispatcherOutcome = None  # type: ignore[assignment]
+    DispatcherDispatchRequest = None  # type: ignore[assignment]
+    DispatcherPatchCaptureRecord = None  # type: ignore[assignment]
+    DispatcherPromptBuildResult = None  # type: ignore[assignment]
+    DispatcherPromptContextBundle = None  # type: ignore[assignment]
+    DispatcherRetryIdentity = None  # type: ignore[assignment]
+    DispatcherRuntimeFailureRecord = None  # type: ignore[assignment]
+    DispatcherRuntimeInvocationResponse = None  # type: ignore[assignment]
+    DispatcherStructuredOutputRecord = None  # type: ignore[assignment]
+    RuntimeDispatcher = None  # type: ignore[assignment]
+    dispatcher_actor_metadata_digest = None  # type: ignore[assignment]
+    dispatcher_idempotency_key = None  # type: ignore[assignment]
+    dispatcher_request_digest = None  # type: ignore[assignment]
+    dispatcher_stable_digest = None  # type: ignore[assignment]
+
+try:
+    from ..execution.runtime_client import RunnerRuntimeClient
+except ImportError:  # pragma: no cover - Slice 05 module may be absent in old installs.
+    RunnerRuntimeClient = None  # type: ignore[assignment]
+
+try:
+    from ..execution.verification import (
+        BoundedQuery as VerifyBoundedQuery,
+        EvidenceEdge as VerifyEvidenceEdge,
+        EvidenceNode as VerifyEvidenceNode,
+        GraphApprovalError as VerifyGraphApprovalError,
+        ReadBudgetReport as VerifyReadBudgetReport,
+        VerificationGraphAttempt,
+        VerifierCompatibilityLinks as VerifyVerifierCompatibilityLinks,
+        build_graph_approval_proof as build_verify_graph_approval_proof,
+        map_verifier_failure as verify_graph_map_failure,
+        stable_digest as verify_graph_stable_digest,
+    )
+except ImportError:  # pragma: no cover - Slice 06 module may be absent in old installs.
+    VerifyGraphApprovalError = None  # type: ignore[assignment]
+    VerifyBoundedQuery = None  # type: ignore[assignment]
+    VerifyEvidenceEdge = None  # type: ignore[assignment]
+    VerifyEvidenceNode = None  # type: ignore[assignment]
+    VerifyReadBudgetReport = None  # type: ignore[assignment]
+    VerificationGraphAttempt = None  # type: ignore[assignment]
+    VerifyVerifierCompatibilityLinks = None  # type: ignore[assignment]
+    build_verify_graph_approval_proof = None  # type: ignore[assignment]
+    verify_graph_map_failure = None  # type: ignore[assignment]
+    verify_graph_stable_digest = None  # type: ignore[assignment]
+
+try:
+    from ..execution.failure_router import (
+        FailureObservation as RouterFailureObservation,
+        FailureRouter as RouterFailureRouter,
+        InMemoryFailureRouterPort as RouterInMemoryFailureRouterPort,
+        RouteDecision as RouterRouteDecision,
+    )
+except ImportError:  # pragma: no cover - Slice 07 module may be absent in old installs.
+    RouterFailureObservation = None  # type: ignore[assignment]
+    RouterFailureRouter = None  # type: ignore[assignment]
+    RouterInMemoryFailureRouterPort = None  # type: ignore[assignment]
+    RouterRouteDecision = None  # type: ignore[assignment]
+
+try:
+    from iriai_build_v2.execution_control.merge_queue_store import (
+        LeaseFencedError as MergeQueueLeaseFencedError,
+        MergeQueueError as MergeQueueStoreError,
+        MergeQueueItemCreate,
+        MergeQueueStore,
+        RepoTargetCreate,
+        TaskCoverageCreate,
+    )
+    from ..execution.merge_queue_wiring import (
+        GateDecision as MergeQueueGateDecision,
+        MergeQueueWiringError,
+        build_apply_input_provider as build_merge_queue_apply_input_provider,
+        build_checkpoint_projector as build_merge_queue_checkpoint_projector,
+        build_gate_runner as build_merge_queue_gate_runner,
+        build_no_dirty_recorder as build_merge_queue_no_dirty_recorder,
+        verify_merge_queue_production_ready,
+    )
+    from ..execution.merge_queue import (
+        GroupMergeCoordinator as MergeQueueGroupCoordinator,
+        LeaseToken as MergeQueueLeaseToken,
+        MergeQueue as MergeQueueWorker,
+    )
+    from ..execution import git_service as merge_queue_git_service
+except ImportError:  # pragma: no cover - Slice 08 modules may be absent in old installs.
+    MergeQueueItemCreate = None  # type: ignore[assignment]
+    MergeQueueStore = None  # type: ignore[assignment]
+    MergeQueueStoreError = None  # type: ignore[assignment]
+    MergeQueueLeaseFencedError = None  # type: ignore[assignment]
+    RepoTargetCreate = None  # type: ignore[assignment]
+    TaskCoverageCreate = None  # type: ignore[assignment]
+    MergeQueueWiringError = None  # type: ignore[assignment]
+    MergeQueueGateDecision = None  # type: ignore[assignment]
+    build_merge_queue_apply_input_provider = None  # type: ignore[assignment]
+    build_merge_queue_checkpoint_projector = None  # type: ignore[assignment]
+    build_merge_queue_gate_runner = None  # type: ignore[assignment]
+    build_merge_queue_no_dirty_recorder = None  # type: ignore[assignment]
+    verify_merge_queue_production_ready = None  # type: ignore[assignment]
+    MergeQueueGroupCoordinator = None  # type: ignore[assignment]
+    MergeQueueLeaseToken = None  # type: ignore[assignment]
+    MergeQueueWorker = None  # type: ignore[assignment]
+    merge_queue_git_service = None  # type: ignore[assignment]
+
+try:
+    from iriai_build_v2.execution_control import (
+        ContractVerdict as StoredContractVerdict,
+        DispatchAttemptRequest as StoredDispatchAttemptRequest,
+        DispatchOutcome as StoredDispatchOutcome,
+        ExecutionControlStore,
+        GroupCheckpointProjection as StoredGroupCheckpointProjection,
+        IdempotencyConflict as StoredIdempotencyConflict,
+        PatchSummary as StoredPatchSummary,
+        PromptContextEvidence as StoredPromptContextEvidence,
+        RawOutputEvidence as StoredRawOutputEvidence,
+        RuntimeFailureEvidence as StoredRuntimeFailureEvidence,
+        RuntimeInvocationEvidence as StoredRuntimeInvocationEvidence,
+        StructuredOutputEvidence as StoredStructuredOutputEvidence,
+        TaskResultProjectionFromAttempt as StoredTaskResultProjectionFromAttempt,
+        TaskDeliverableContract as StoredTaskDeliverableContract,
+        WorkspaceSnapshotEvidence as StoredWorkspaceSnapshotEvidence,
+    )
+except ImportError:  # pragma: no cover - typed store may be absent in old installs.
+    StoredDispatchAttemptRequest = None  # type: ignore[assignment]
+    StoredDispatchOutcome = None  # type: ignore[assignment]
+    ExecutionControlStore = None  # type: ignore[assignment]
+    StoredGroupCheckpointProjection = None  # type: ignore[assignment]
+    StoredContractVerdict = None  # type: ignore[assignment]
+    StoredIdempotencyConflict = None  # type: ignore[assignment]
+    StoredPatchSummary = None  # type: ignore[assignment]
+    StoredPromptContextEvidence = None  # type: ignore[assignment]
+    StoredRawOutputEvidence = None  # type: ignore[assignment]
+    StoredRuntimeFailureEvidence = None  # type: ignore[assignment]
+    StoredRuntimeInvocationEvidence = None  # type: ignore[assignment]
+    StoredStructuredOutputEvidence = None  # type: ignore[assignment]
+    StoredTaskResultProjectionFromAttempt = None  # type: ignore[assignment]
+    StoredTaskDeliverableContract = None  # type: ignore[assignment]
+    StoredWorkspaceSnapshotEvidence = None  # type: ignore[assignment]
+
+try:
+    # Slice 09c-2 — the typed regroup-overlay dispatch resolver. The resolver
+    # reads typed overlay state first and quiesces FAIL-CLOSED on any
+    # id/hash/status/digest/projection-link mismatch; the legacy G45-G73
+    # marker path remains as the no-typed-overlay fallback (doc 09
+    # § "Refactoring Steps" 2 — legacy projection aliases support existing
+    # G45-G73 artifacts during the same atomic landing).
+    from iriai_build_v2.execution_control.regroup_overlay_store import (
+        RegroupOverlayStore,
+    )
+    from ..execution.regroup_overlay_resolver import RegroupOverlayResolver
+except ImportError:  # pragma: no cover - Slice 09 modules may be absent in old installs.
+    RegroupOverlayStore = None  # type: ignore[assignment]
+    RegroupOverlayResolver = None  # type: ignore[assignment]
 
 from ....config import BUDGET_TIERS
 from ....runtime_policy import (
@@ -39,6 +260,7 @@ from ....models.outputs import (
     BugFixAttempt,
     BugGroup,
     BugTriage,
+    DerivedDAGArtifact,
     EnhancementBacklog,
     EnhancementDecomposition,
     EnhancementItem,
@@ -55,6 +277,7 @@ from ....models.outputs import (
     ReviewOutcome,
     RootCauseAnalysis,
     SubfeatureDecomposition,
+    TaskFileScope,
     Verdict,
     envelope_done,
 )
@@ -73,13 +296,552 @@ from ....roles import (
     verifier,
 )
 from ....services.markdown import to_markdown
+from ..._runner import WorkflowQuiesced
 from ..._common import Gate, Notify
 from ..._common._helpers import (
     PROMPT_FILE_THRESHOLD,
     ContextPackage,
     ContextPackageItem,
+    _context_dir,
     _offload_if_large,
+    _write_context_text,
     build_context_package,
+)
+
+# --- Slice-11a types shim ---------------------------------------------------
+# Per docs/execution-control-plane/11-refactor-map.md § "Boundary-level API
+# contracts" row 1, the cross-module Pydantic/dataclass request/outcome
+# types + typed failure signal sentinels + bounded-output serialization
+# helpers live in `workflows/develop/execution/types.py`. This shim re-
+# exports every moved name so every existing
+# `from iriai_build_v2.workflows.develop.phases.implementation import X`
+# and every `monkeypatch.setattr(implementation_module, "X", ...)` keeps
+# resolving to the SAME object as the canonical definition in
+# `execution/types.py`.
+from ..execution.types import (
+    COMMIT_FAILURE_OUTPUT_LIMIT,
+    CommitFailureLocation,
+    CommitForbiddenPathMatch,
+    CommitRepoOutcome,
+    DagAuthorityGateOutcome,
+    DagContradictionHandoffOutcome,
+    DagContradictionResolution,
+    DagContradictionResolutionValidation,
+    DagDirectRepairRoute,
+    DagExecutionOutcome,
+    DagTaskDriftRoute,
+    DagTaskReconcileOutcome,
+    DagTaskSpecReconcileOutcome,
+    DagVerifyLensSpec,
+    PlannedBugDispatch,
+    PlannedBugGroup,
+    RuntimeSandboxTaskBinding,
+    SandboxWorkflowBlocker,
+    TaskContractCommitGuardOutcome,
+    TaskContractCompileOutcome,
+    WorkflowCommitError,
+    WorkspaceAuthorityCompatibilityOutcome,
+    WorktreeAliasPathInfo,
+    WorktreeRegistry,
+    WorktreeRegistryRepo,
+    _MergeQueueCheckpointResult,
+    _MergeQueueDrainResult,
+    _MergeQueueEnqueueError,
+    _MergeQueueResumeRecovery,
+    _RepoNeed,
+    _SANDBOX_WORKFLOW_BLOCKER_MARKER,
+    _bounded_commit_output,
+)
+# --- Slice-11b git_service shim ---------------------------------------------
+# Per docs/execution-control-plane/11-refactor-map.md § "Boundary-level API
+# contracts" row 12, the git subprocess wrappers used by the legacy commit
+# path + the commit-failure parsing family (parse_commit_failure) live in
+# `workflows/develop/execution/git_service.py`. This shim re-exports every
+# moved name so every existing
+# `from iriai_build_v2.workflows.develop.phases.implementation import X`
+# and every `monkeypatch.setattr(implementation_module, "X", ...)` keeps
+# resolving to the SAME object as the canonical definition in
+# `execution/git_service.py`. The companion Slice-08b durable-merge-queue
+# git layer (`run_git`, `apply_patch`, etc.) is not re-exported here —
+# those names are imported directly by callers under their own canonical
+# path.
+from ..execution.git_service import (
+    _commit_deletion_only_status_paths,
+    _commit_failure_manifest_entries,
+    _commit_failure_output,
+    _commit_path_matches_forbidden_entry,
+    _commit_repo_relative_path,
+    _commit_status_paths,
+    _git_status_for_commit,
+    _is_repo_hygiene_outcome,
+    _looks_like_file_path,
+    _normalize_commit_failure_path,
+    _parse_commit_failure_location,
+    _parse_commit_failure_locations,
+    _run_git_for_commit,
+)
+# --- Slice-11c task_contracts shim ------------------------------------------
+# Per docs/execution-control-plane/11-refactor-map.md § "Boundary-level API
+# contracts" row for execution/task_contracts.py, the pure task-contract
+# projection-key + contract-key sanitization primitives live in
+# `workflows/develop/execution/task_contracts.py` (extending the Slice-03
+# ContractCompiler surface). This shim re-exports every moved name so every
+# existing `from iriai_build_v2.workflows.develop.phases.implementation
+# import X` and every `monkeypatch.setattr(implementation_module, "X", ...)`
+# keeps resolving to the SAME object as the canonical definition in
+# `execution/task_contracts.py`. The companion Slice-03 surface
+# (`ContractCompiler`, `ContractGroupCompileRequest`, etc.) is imported
+# under its existing `Compiled*` aliases at `:44-59`; these projection-key
+# helpers are re-exported under their `implementation.py`-historical names.
+from ..execution.task_contracts import (
+    _contract_stage_sandbox_id,
+    _safe_contract_key_fragment,
+    _task_contract_projection_key,
+)
+# --- Slice-11d sandbox shim -------------------------------------------------
+# Per docs/execution-control-plane/11-refactor-map.md § "Boundary-level API
+# contracts" row for execution/sandbox.py, the pure sandbox-lifecycle
+# helpers (the blocker factory, the terminal-attempt classifier, the
+# manifest-for-binding reader, the repair repo-id derivation, and the
+# prompt-context dir validator + exclude writer) live in
+# `workflows/develop/execution/sandbox.py` (extending the Slice-04
+# SandboxRunner surface). This shim re-exports every moved name so every
+# existing `from iriai_build_v2.workflows.develop.phases.implementation
+# import X` and every `monkeypatch.setattr(implementation_module, "X", ...)`
+# keeps resolving to the SAME object as the canonical definition in
+# `execution/sandbox.py`. The companion Slice-04 surface (`SandboxRunner`,
+# `SandboxSpec`, `SandboxLease`, etc.) is imported under its existing
+# `Sandbox*` aliases at `:61-74`; these lifecycle helpers are re-exported
+# under their `implementation.py`-historical names. The phase-level sandbox
+# port (the `_ImplementationSandboxPort` adapter class + the six async
+# orchestrators that take `runner`+`feature`+`task_contract`) STAYS in
+# `implementation.py` per the prompt hard rule against splitting non-pure
+# helpers.
+from ..execution.sandbox import (
+    _exclude_sandbox_prompt_context_from_capture,
+    _is_terminal_sandbox_attempt_blocker,
+    _repair_repo_id_for_sandbox,
+    _sandbox_blocker,
+    _sandbox_manifest_for_binding,
+    _sandbox_prompt_context_dir,
+)
+# --- Slice-11e dispatcher shim ----------------------------------------------
+# Per docs/execution-control-plane/11-refactor-map.md § "Compatibility Shims"
+# row 3 (Dispatcher/runtime) + § "Boundary-level API contracts" row for
+# execution/dispatcher.py, the pure runtime-selection / parallel-actor
+# primitives (the static role→runtime map, the per-group / per-stage
+# runtime-pair selectors, the diagnostic-runtime selector, and the
+# parallel-safe actor factory) live in
+# `workflows/develop/execution/dispatcher.py` alongside the Slice-05
+# `RuntimeDispatcher` primitive surface. This shim re-exports every moved
+# name so every existing
+# `from iriai_build_v2.workflows.develop.phases.implementation import X`
+# and every `monkeypatch.setattr(implementation_module, "X", ...)` keeps
+# resolving to the SAME object as the canonical definition in
+# `execution/dispatcher.py`. The Slice-05 dispatcher SDK
+# (`RuntimeDispatcher`, the typed `Dispatch*` request/response models,
+# the digest helpers) is imported via aliases at `:75-113` (the
+# `Dispatcher*` namespace) — those names are NOT re-exported under their
+# original module-level names here because the legacy implementation.py
+# importers always referred to them by the `Dispatcher*` alias. The
+# phase-level dispatcher PORT surface (the
+# `_dispatch_task_attempt_via_runtime_dispatcher` orchestrator + the
+# `_ImplementationSandboxPort` / `_ImplementationRuntimeClient` /
+# `_ImplementationPromptBuilder` / `_ImplementationOutputNormalizer` /
+# `_ExecutionControlDispatchJournalPort` / `_ArtifactDispatchJournalPort`
+# adapter classes + `_dispatcher_request_for_task` /
+# `_dispatcher_actor_metadata` / `_runner_runtime_policy` /
+# `_runtime_instance_name_for_hint`) STAYS in `implementation.py` per
+# the prompt hard rule against splitting non-pure helpers.
+from ..execution.dispatcher import (
+    DAG_REPAIR_ROLE_RUNTIMES,
+    _dag_group_runtime_pair,
+    _dag_repair_runtime_for,
+    _diagnostic_runtime_for_policy,
+    _make_parallel_actor,
+    _post_dag_runtime_pair,
+)
+# --- Slice-11f gates shim ---------------------------------------------------
+# Per docs/execution-control-plane/11-refactor-map.md § "Boundary-level API
+# contracts" row 9 (execution/gates.py: "GateRunner.run_preflight,
+# run_raw_gate, run_checkpoint_gate. Deterministic preflight gates, raw-
+# gate ordering, stale-context blockers, gate evidence shape."), the
+# Slice-06 GateRunner + GateRequest + the 22 typed gate models +
+# ContextPackageBuilder + InMemoryEvidenceRecorder + gate validators +
+# bounded-context reader already live in `workflows/develop/execution/
+# gates.py`. Slice 11f EXTENDS that module with 6 pure DAG-authority
+# routing constants and 7 pure helpers (the path-problem-route
+# classifier, the preflight-key formatter, the blocked-verdict factory,
+# the synthetic-result factory, the reconcile-target-coverage
+# projection, the post-DAG-gate-proof-key formatter, and the notify-
+# gate-proof-extra transform) moved byte-for-byte from this module. The
+# shim below re-exports every moved name so every existing
+# `from iriai_build_v2.workflows.develop.phases.implementation import X`
+# and every `monkeypatch.setattr(implementation_module, "X", ...)` keeps
+# resolving to the SAME object as the canonical definition in
+# `execution/gates.py`. The phase-level gate PORT surface (the async
+# runner+feature-coupled `_attempt_dag_authority_gate_repair` /
+# `_dag_authority_load_preflight_report` / `_record_dag_authority_gate`,
+# the `_execution_control_store_for_runner`-coupled `_record_typed_
+# verification_gate_node` / `_typed_verification_gate_node_is_fresh`,
+# the merge-queue-PORT-coupled `_merge_queue_post_apply_gate_decision`,
+# the `_get_feature_root`+subprocess-coupled `_post_dag_gate_tree_digest`
+# family, the `_record_post_dag_gate_proof` / `_record_dag_checkpoint_
+# gate_proof` / `_checkpoint_gate_graph_projection_is_fresh` /
+# `_checkpoint_gate_proof_is_fresh` artifact recorders) STAYS in
+# `implementation.py` per the prompt hard rule against splitting non-
+# pure helpers, and the `_is_dag_task_artifact_key`-coupled
+# `_dag_authority_applied_dag_task_updates` /
+# `_dag_authority_task_refs_from_path_problems` are deferred until
+# their impl.py-local dependency utilities migrate.
+from ..execution.gates import (
+    _DAG_AUTHORITY_DB_TASK_RESULT_ROUTE,
+    _DAG_AUTHORITY_PRODUCT_WORKSPACE_ROUTE,
+    _DAG_AUTHORITY_REPO_BLOCKER_ROUTE,
+    _DAG_AUTHORITY_SEMANTIC_ROUTE,
+    _DAG_AUTHORITY_SOURCE_ARTIFACT_ROUTE,
+    _DAG_AUTHORITY_TASK_SPEC_PROJECTION_ROUTE,
+    _dag_authority_blocked_verdict,
+    _dag_authority_path_problem_route,
+    _dag_authority_preflight_key,
+    _dag_authority_reconcile_target_coverage,
+    _dag_authority_synthetic_result,
+    _notify_gate_proof_extra_from_delivery,
+    _post_dag_gate_proof_key,
+)
+# --- Slice-11g verification shim --------------------------------------------
+# Per docs/execution-control-plane/11-refactor-map.md § "Boundary-level API
+# contracts" row for execution/verification.py ("Model verifier
+# orchestration, expanded lenses, bounded verify context, verifier outcome
+# typing"), the pure verification-domain primitives (the projection-key
+# parser + artifact-key formatter + Pydantic-json dumper + synthetic-
+# verdict-id factory + the durable-projection digest cluster + the
+# projection/lineage payload builders + the lens-prefix issue/gap helpers)
+# live in `workflows/develop/execution/verification.py` alongside the
+# pre-existing verification-graph orchestration surface (the
+# `VerificationGraphAttempt`, `EvidenceNode`, `EvidenceEdge`,
+# `ReadBudgetReport`, `VerifierCompatibilityLinks`,
+# `AggregateBuildResult`, `GraphApprovalProof`, etc. types + the
+# `normalize_raw_verifier_result`/`normalize_lens_verifier_result`/
+# `merge_verdicts_deterministically`/`build_aggregate_verdict`/
+# `build_graph_approval_proof`/`map_verifier_failure` factories + the
+# canonical `stable_digest`). Slice 11g EXTENDS that module with 19 pure
+# helpers moved byte-for-byte from `implementation.py`. This shim re-
+# exports every moved name so every existing
+# `from iriai_build_v2.workflows.develop.phases.implementation import X`
+# and every `monkeypatch.setattr(implementation_module, "X", ...)` keeps
+# resolving to the SAME object as the canonical definition in
+# `execution/verification.py`. The phase-level verification PORT surface
+# (the async runner+feature-coupled artifact/store helpers
+# `_get_artifact_text`, `_load_verified_dag_verification_graph_
+# projection`, `_recover_dag_verification_graph_payload_from_store`,
+# `_persist_dag_verification_graph_payload`,
+# `_record_dag_verification_graph_artifact`, `_put_dag_verify_artifact`,
+# `_validate_dag_verification_graph_payload`,
+# `_validate_dag_verification_graph_rejected_payload`,
+# `_record_dag_verifier_runtime_failure`,
+# `_run_checkpoint_required_dag_verify_lenses`,
+# `_require_dag_verification_graph_approval`, `_verify_and_fix_group`,
+# `_run_expanded_dag_verify_lenses`, `_merge_dag_expanded_verify_
+# verdicts`, `_verify`, `_verify_enhancements`, `_single_rca_fix_
+# verify`; the env-coupled `_dag_expanded_verify_enabled` +
+# `_dag_verify_lens_specs` + `_dag_verify_required_lens_slugs` +
+# `_dag_verify_read_budget_for_projection`; the
+# `_dag_verification_graph_blocker_route_payload` consumer of the
+# impl.py-local `_json_object_from_text`; and the
+# `_dag_verification_graph_attempt_from_payload` consumer of the
+# impl.py-local `VerifyEvidenceNode`/`VerifyEvidenceEdge`/
+# `VerificationGraphAttempt` rename aliases) STAYS in
+# `implementation.py` per the prompt hard rule against splitting non-
+# pure helpers.
+from ..execution.verification import (
+    _dag_verify_graph_artifact_key,
+    _dag_verify_graph_digest,
+    _dag_verify_graph_durable_metadata_from_reload,
+    _dag_verify_graph_edge_ids,
+    _dag_verify_graph_int,
+    _dag_verify_graph_lineage_payload,
+    _dag_verify_graph_payload_covers_projection,
+    _dag_verify_graph_payload_digest_for_proof,
+    _dag_verify_graph_payload_for_projection,
+    _dag_verify_graph_payload_has_durable_projection,
+    _dag_verify_graph_payload_without_durable,
+    _dag_verify_graph_projection_metadata,
+    _dag_verify_graph_ref,
+    _dag_verify_graph_store_payload_digest,
+    _dag_verify_stage_from_projection_key,
+    _prefix_lens_gap,
+    _prefix_lens_issue,
+    _pydantic_json,
+    _synthetic_verification_verdict_id,
+)
+# --- Slice-11h repair shim --------------------------------------------------
+# Per docs/execution-control-plane/11-refactor-map.md § "Boundary-level API
+# contracts" row for execution/repair.py ("`RouteExecutor.build_route_request`,
+# `build_repair_request`, `build_retry_request`, `RepairService.execute`,
+# `RepairService.resume`, `RepairService.summarize_outcome`"), the pure
+# repair-domain primitives (direct-route classification cluster + pure
+# artifact-key classifiers + repair-misc primitives + the 7 route constants)
+# live in `workflows/develop/execution/repair.py` alongside the pre-existing
+# `RouteExecutor` + `RepairRequest`/`RetryRequest` typed-request surface. Slice
+# 11h EXTENDS that module with 24 pure helpers + constants moved byte-for-byte
+# from `implementation.py`. This shim re-exports every moved name so every
+# existing `from iriai_build_v2.workflows.develop.phases.implementation import
+# X` and every `monkeypatch.setattr(implementation_module, "X", ...)` keeps
+# resolving to the SAME object as the canonical definition in
+# `execution/repair.py`. The phase-level repair PORT surface (the async
+# runner+feature/store-coupled `_record_dag_direct_repair_route` /
+# `_attempt_parallel_dag_repair` / `_attempt_dag_authority_gate_repair` /
+# `_run_dag_artifact_repair_lane` / `_apply_dag_artifact_repair_updates` /
+# `_bind_repair_sandbox`; the env-coupled `_dag_parallel_repair_enabled` /
+# `_dag_preflight_repair_enabled`; the impl.py-local
+# `_dedupe_preserving_order`-coupled `_dag_artifact_repair_refs_from_text` /
+# `_dag_artifact_repair_refs_from_planned` / `_dag_artifact_repair_target_refs`
+# text-scanner cluster; the impl.py-local `_safe_context_stem` /
+# `_workflow_blocker_text`-coupled `_dag_artifact_repair_synthetic_result` /
+# `_dag_repair_task_failed_result` factories; the impl.py-local
+# `_classify_dag_repair_path` / `_sanitize_dag_repair_result` /
+# `_sanitize_dag_repair_results` path-classifier cluster; the
+# `_repair_task_for_rca` / `_normalize_repair_contract_path` /
+# `_repair_contract_for_paths` repair-task factories; the
+# `_repair_sandbox_required` runner-services-coupled predicate; and the
+# `_contract_guard_results_for_repair` results-rewriter) STAYS in
+# `implementation.py` per the prompt hard rule against splitting non-pure
+# helpers.
+from ..execution.repair import (
+    _COMMIT_HYGIENE_ROUTE,
+    _DAG_CONTRADICTION_MIXED_REPAIR_KIND,
+    _MANIFEST_FORBIDDEN_CLEANUP_ROUTE,
+    _MANIFEST_FORBIDDEN_MARKER,
+    _NORMAL_VERIFY_ROUTE,
+    _OPERATOR_REQUIRED_MARKER,
+    _REPO_HYGIENE_ROUTE,
+    _classify_dag_direct_repair_route,
+    _commit_failure_issue_kind,
+    _dag_contradiction_fix_guidance,
+    _dag_contradiction_needs_artifact_repair,
+    _dag_product_cleanup_ready_for_artifact_repair,
+    _direct_route_failure_pair,
+    _direct_route_issue_operator_required,
+    _direct_route_target,
+    _direct_route_target_paths,
+    _is_dag_artifact_repair_key,
+    _is_dag_artifact_repair_path,
+    _is_dag_task_artifact_key,
+    _is_derived_dag_artifact_key,
+    _is_deterministic_dag_preflight_issue,
+    _normalize_dag_artifact_repair_ref,
+    _normalize_direct_route_signature,
+    _post_dag_repair_group_idx,
+)
+# --- Slice-11i failure_router shim ------------------------------------------
+# Per docs/execution-control-plane/11-refactor-map.md § "Boundary-level API
+# contracts" row for execution/failure_router.py ("FailureRouter.decide(
+# failure_id) -> RouteDecision. Typed failure taxonomy, retry budgets,
+# deterministic route selection, quiesce/escalation decisions."), the pure
+# typed→legacy `RouteDecision`-to-dict adapter helpers
+# (`_route_decision_retry_budget_payload` builds the nested `retry_budget`
+# dict; `_route_decision_compat_payload` builds the full
+# `route_decision`/`retry_budget` payload that the legacy callers consume,
+# and that gets persisted on every `runtime_failure_context` evidence row as
+# the REAL typed budget source the Slice 10c-2 `_typed_retry_budgets` reads)
+# live in `workflows/develop/execution/failure_router.py` alongside the
+# pre-existing Slice-07 `FailureRouter` + `RouteDecision` + `FailureObservation`
+# + `InMemoryFailureRouterPort` + `ROUTE_TABLE` surface. Slice 11i EXTENDS
+# that module with the 2 pure helpers moved byte-for-byte from
+# `implementation.py`. This shim re-exports both names so every existing
+# `from iriai_build_v2.workflows.develop.phases.implementation import X` and
+# every `monkeypatch.setattr(implementation_module, "X", ...)` keeps resolving
+# to the SAME object as the canonical definition in
+# `execution/failure_router.py`.
+#
+# The phase-level failure-router PORT surface
+# (`_failure_router_for_runner(runner)` -- resolves the router from
+# `runner.services` / `runner._failure_router_port` so the in-memory
+# in-process router is reused across DAG dispatches;
+# `_typed_direct_route_payload(runner, feature, group_idx, retry, route, ...)`
+# -- builds a typed FailureObservation around the direct-route classifier
+# output; `_route_merge_queue_drain_failure(runner, feature, *, ..., item_id,
+# failure_class, ...)` + `_MERGE_QUEUE_DRAIN_FAILURE_PAIRS` -- maps a
+# `MergeQueue` worker `failure_class` to the Slice 07 router
+# `(failure_class, failure_type)` pair, this stays with the merge-queue drain
+# surface and is properly Slice 11j territory; the impl.py-local
+# `runtime_provider` retry-route adapter at `implementation.py:13190` that
+# wraps the router for the dispatcher-retry path -- runner.services-coupled
+# via `_failure_router_for_runner` and tightly coupled to the
+# `_dispatch_runtime_failure_route_payload` orchestrator) STAYS in
+# `implementation.py` per the prompt hard rule against splitting non-pure
+# helpers.
+#
+# Slice 11i does NOT carry the P3-6 contract change (the
+# `MergeApplyResult.escaped_paths` structured field that lets
+# `FailureRouter._allows_product_repair` preserve the `contract_violation`
+# route instead of downgrading to `quiesce`). Per the P3-6 fold-in plan
+# (recorded in the Slice 11a STARTING journal entry), the producer + consumer
+# change land together inside the SAME atomic chunk in Slice 11j, which owns
+# `execution/merge_queue.py`. 11i is purely refactor-only.
+from ..execution.failure_router import (
+    _route_decision_compat_payload,
+    _route_decision_retry_budget_payload,
+)
+# --- Slice-11k regroup_overlay shim -----------------------------------------
+# Per docs/execution-control-plane/11-refactor-map.md § "Boundary-level API
+# contracts" row for execution/regroup_overlay.py
+# ("`RegroupOverlayService.validate, activate, resolve_active,
+# rollback_before_first_wave`. Derived DAG overlay validation, active marker
+# resolution, activation and rollback records. Must not own: scheduler speed
+# decisions that bypass dependencies/write sets, queue commits."), the pure
+# `DerivedDAGArtifact`-validator cluster (the synchronous parser + validator
+# entry-point + the pure regroup-vs-base contract validator + the
+# `model_dump`-minus-dependencies projection + the barrier-by-task index
+# builder + the pairwise write-set overlap builder + the write-set aggregator
+# + the declared-write-paths reader) lives in `workflows/develop/execution/
+# regroup_overlay.py` alongside the Slice-09a typed overlay schema + models +
+# deterministic identifier derivations (the canonical home created by Slice
+# 09a). Slice 11k EXTENDS that module with the 7 pure helpers moved byte-for-
+# byte from `implementation.py`. This shim re-exports every moved name so
+# every existing
+# `from iriai_build_v2.workflows.develop.phases.implementation import X` and
+# every `monkeypatch.setattr(implementation_module, "X", ...)` keeps resolving
+# to the SAME object as the canonical definition in
+# `execution/regroup_overlay.py`.
+#
+# The phase-level regroup-overlay PORT surface (the async
+# runner+feature/store-coupled `_resolve_active_regroup_before_group_dispatch`
+# at `implementation.py:15561`, `_resolve_active_regroup_typed_overlay` at
+# `:15620`, `_write_typed_regroup_observation` at `:15730`,
+# `_typed_regroup_active_overlay_probe` at `:15777`,
+# `_typed_regroup_active_overlay_offset` at `:15807`,
+# `_resolve_active_regroup_legacy_marker` at `:15858`, and
+# `_load_regroup_validation_context` at `:22176` -- each one takes
+# `runner: WorkflowRunner` + `feature: Feature` and/or uses
+# `_execution_control_store_for_runner` + `_merge_queue_connection` +
+# `RegroupOverlayStore`/`RegroupOverlayResolver` + `_log_feature_event` +
+# `_dag_artifact_record_for_key` + `runner.artifacts`) STAYS in
+# `implementation.py` per the prompt hard rule against splitting non-pure
+# helpers. The `DAG_REGROUP_*` constants at `implementation.py:723-727`
+# (`DAG_REGROUP_FROM_GROUP`, `DAG_REGROUP_TO_GROUP`,
+# `DAG_REGROUP_CANONICAL_KEY`, `DAG_REGROUP_ACTIVE_KEY`,
+# `DAG_REGROUP_OBSERVATION_KEY`) are imported by `phases/post_test_
+# observation.py:38-39` via the legacy `from .implementation import …` path
+# and represent the legacy G45-G73 compatibility keys; they live near the
+# resolver orchestrators they support and STAY in `implementation.py`.
+from ..execution.regroup_overlay import (
+    _derived_dag_task_write_sets,
+    _derived_dag_write_set_conflicts,
+    _regroup_hard_barrier_by_task,
+    _regroup_task_declared_write_paths,
+    _regroup_task_definition_for_compare,
+    _validate_derived_dag_artifact_update,
+    _validate_regroup_against_base_dag,
+)
+# --- Slice-11l post_dag_gates shim ------------------------------------------
+# Per docs/execution-control-plane/11-refactor-map.md § "Boundary-level API
+# contracts" row for execution/post_dag_gates.py
+# ("`PostDagGateService.run, resume, record_gate_result,
+# assert_feature_ready_for_observation`. Feature-level code review, security,
+# test authoring, QA, integration, final verifier, source push, implementation
+# report, backlog report, and completion notification orchestration. Must not
+# own: Group dispatch, sandbox patch generation, merge queue internals, root
+# DAG mutation."), the pure post-DAG-gate proof primitives (the
+# implementation-report metadata builder + the notify-delivery ID hasher + the
+# source-push proof-key constant + the source-push base-proof builder + the
+# source-push proof-digest hasher + the source-push proof finalizer + the
+# source-push prior-proof matcher + the source-push proof-records self-
+# consistency validator) live in `workflows/develop/execution/post_dag_gates.py`
+# (CREATED by Slice 11l — mirrors the Slice-11a `types.py` CREATE pattern; no
+# pre-existing surface to preserve). This shim re-exports every moved name so
+# every existing `from iriai_build_v2.workflows.develop.phases.implementation
+# import X` and every `monkeypatch.setattr(implementation_module, "X", ...)`
+# keeps resolving to the SAME object as the canonical definition in
+# `execution/post_dag_gates.py`.
+#
+# The phase-level post-DAG-gates PORT surface (the
+# `_get_feature_root`+subprocess-coupled `_post_dag_gate_tree_digest` /
+# `_current_post_dag_gate_tree_digest` tree-digest pair; the
+# `_record_typed_verification_gate_node` / `_execution_control_store_for_runner`
+# / `_feature_requires_execution_control_proofs` / `_typed_verification_gate_
+# node_is_fresh`-coupled async `_post_dag_gate_is_fresh` +
+# `_record_post_dag_gate_proof` artifact recorders; the `_workflow_blocker_
+# text`-coupled `_record_source_push_workflow_blocker` /
+# `_record_implementation_report_workflow_blocker` /
+# `_record_notify_workflow_blocker` blocker recorders; the
+# `runner.artifacts.put`-coupled `_put_implementation_report_metadata` /
+# `_put_notify_delivery_record` artifact writers; the `_json_object_from_text`-
+# coupled (impl.py-local per the Slice 11g comment at `implementation.py:551`)
+# `_load_implementation_report_metadata` / `_source_push_proof_payload` /
+# `_notify_delivery_durable_proof_is_fresh` /
+# `_implementation_report_durable_proof_is_fresh` /
+# `_source_push_durable_proof_is_fresh` durable-proof readers; the
+# `_normalize_git_remote_reference` / `_local_git_remote_path_without_resolving`
+# / `_path_has_symlink_component_between` / `_gitdir_from_file` /
+# `_git_common_dir`-coupled (all impl.py-local git helpers) source-push origin
+# matchers `_source_push_origin_matches` / `_source_push_origin_within_root` /
+# `_source_push_origin_git_metadata_problem` /
+# `_source_push_expected_origin_within_root`; the
+# `_run_git`-coupled async `_source_push_authorized_push_target`; the
+# `runner.services` + `_load_worktree_registries_for_authority`-coupled async
+# `_source_push_expected_origins`; the full
+# `_generate_and_publish_implementation_report` feature-level orchestrator;
+# the sandbox-coupled `_bind_post_dag_product_repair_sandbox`; and the
+# `Callable`-callback-coupled async `_persist_source_push_proof`) STAYS in
+# `implementation.py` per the prompt hard rule against splitting non-pure
+# helpers.
+#
+# Additionally, three post-DAG-gate primitives that already moved in earlier
+# Slice 11 sub-slices STAY in their canonical homes and 11l does not touch
+# them: `_post_dag_gate_proof_key` (the gate-proof artifact-key formatter) +
+# `_notify_gate_proof_extra_from_delivery` (the notify-gate proof-extra
+# builder) live in `execution/gates.py` (Slice 11f);
+# `_post_dag_repair_group_idx` (the post-DAG repair group-index formatter)
+# lives in `execution/repair.py` (Slice 11h).
+from ..execution.post_dag_gates import (
+    _finalize_source_push_proof,
+    _implementation_report_metadata,
+    _notify_delivery_id,
+    _source_push_base_proof,
+    _source_push_prior_proof_matches,
+    _source_push_proof_digest,
+    _source_push_proof_key,
+    _source_push_proof_records_are_self_consistent,
+)
+# --- Slice-12a-1 control_plane shim -----------------------------------------
+# Per docs/execution-control-plane/11-refactor-map.md § "Boundary-level API
+# contracts" row for execution/control_plane.py ("`ExecutionControlPlane.run(
+# feature, state, runner, adapter) -> DagExecutionOutcome`. State-machine
+# orchestration, wave/group sequencing, transition ordering, quiesce
+# propagation. Must not own: Git commands, provider calls, direct artifact
+# body scans, legacy key construction."), the pure quiesce-propagation
+# primitives (the central workflow-blocker text marker formatter + predicate,
+# the env-driven quiesce-after-group config getter + its 2 constants, and
+# the pure quiesce-marker identity matcher) live in
+# `workflows/develop/execution/control_plane.py` (CREATED by Slice 12a-1 —
+# mirrors the Slice 11a `types.py` / Slice 11l `post_dag_gates.py` / Slice
+# 11m `post_test_guard.py` CREATE pattern; no pre-existing surface to
+# preserve). This shim re-exports every moved name so every existing
+# `from iriai_build_v2.workflows.develop.phases.implementation import X`
+# and every `monkeypatch.setattr(implementation_module, "X", ...)` keeps
+# resolving to the SAME object as the canonical definition in
+# `execution/control_plane.py`.
+#
+# Slice 12a-1 is the FIRST sub-slice of PR 11.12 (the deferred-final
+# refactor extraction). The orchestration-glue surface
+# (`ImplementationPhase` class + `_implement_dag` +
+# `_maybe_quiesce_before_group_dispatch` +
+# `_resolve_active_regroup_before_group_dispatch` + the post-DAG gate inner
+# sequence inside `ImplementationPhase.execute`) is PHASE-COUPLED and STAYS
+# in `implementation.py` in Slice 12a-1. The follow-on Slice 12a-2 owns the
+# orchestration glue move into a typed `ExecutionControlPlane` facade;
+# Slice 12a-3 owns the `ImplementationPhase.execute` shrink to phase
+# adaptation + service assembly + quiesce propagation + post-DAG gate
+# delegation + compatibility wrapper exports per doc 11 § "PR 11.12".
+from ..execution.control_plane import (
+    DAG_QUIESCE_AFTER_GROUP_ENV,
+    DEFAULT_DAG_QUIESCE_AFTER_GROUP,
+    _dag_quiesce_after_group,
+    _is_workflow_blocker_text,
+    _quiesce_marker_matches,
+    _workflow_blocker_text,
 )
 from ..._common._dag_paths import (
     canonicalize_dag_path,
@@ -102,29 +864,33 @@ DAG_PARALLEL_REPAIR_ENV = "IRIAI_DAG_PARALLEL_REPAIR"
 DAG_PREFLIGHT_REPAIR_ENV = "IRIAI_DAG_PREFLIGHT_REPAIR"
 DAG_AUTO_RESOLVE_CONTRADICTIONS_ENV = "IRIAI_DAG_AUTO_RESOLVE_CONTRADICTIONS"
 DAG_WORKSPACE_PERMISSION_REPAIR_ENV = "IRIAI_DAG_WORKSPACE_PERMISSION_REPAIR"
+# `DAG_QUIESCE_AFTER_GROUP_ENV` is shimmed from `..execution.control_plane`
+# (Slice 12a-1).
 AGENT_SHARED_GROUP_ENV = "IRIAI_AGENT_SHARED_GROUP"
 DEFAULT_AGENT_SHARED_GROUP = "iriai-agents"
 CONTRADICTION_DECISIONS_KEY = "contradiction-decisions"
-COMMIT_FAILURE_OUTPUT_LIMIT = 12000
+CONTRADICTION_DECISION_CURRENT_PACK_MAX_CHARS = int(
+    os.environ.get("IRIAI_CONTRADICTION_DECISION_CURRENT_PACK_MAX_CHARS", "120000")
+)
+CONTRADICTION_DECISION_FULL_ITEM_MAX_CHARS = int(
+    os.environ.get("IRIAI_CONTRADICTION_DECISION_FULL_ITEM_MAX_CHARS", "24000")
+)
+CONTRADICTION_DECISION_RECENT_INDEX_COUNT = int(
+    os.environ.get("IRIAI_CONTRADICTION_DECISION_RECENT_INDEX_COUNT", "8")
+)
+# `COMMIT_FAILURE_OUTPUT_LIMIT` is shimmed from `..execution.types` (Slice 11a).
+# `DEFAULT_DAG_QUIESCE_AFTER_GROUP` is shimmed from `..execution.control_plane`
+# (Slice 12a-1).
+DAG_REGROUP_FROM_GROUP = 45
+DAG_REGROUP_TO_GROUP = 73
+DAG_REGROUP_CANONICAL_KEY = "dag-regroup:g45-g73"
+DAG_REGROUP_ACTIVE_KEY = "dag-regroup-active:g45-g73"
+DAG_REGROUP_OBSERVATION_KEY = "dag-regroup-observation:g45-g73"
 
-DAG_REPAIR_ROLE_RUNTIMES: dict[str, str] = {
-    # Under --bridge-claude-pool-codex-review, primary=Claude pool and
-    # secondary=Codex. Keep this intentionally static so runtime balance is
-    # role-based rather than a fragile per-run counter.
-    "dag-normal-verify": "secondary",
-    "dag-final-verify": "secondary",
-    "dag-triage": "primary",
-    "dag-rca": "primary",
-    "dag-fix": "primary",
-    "dag-focused-reverify": "primary",
-    "dag-contradiction-resolve": "secondary",
-    "lens:acceptance-coverage": "secondary",
-    "lens:contract-protocol": "secondary",
-    "lens:build-dependency": "primary",
-    "lens:runtime-composition": "primary",
-    "lens:security-boundary": "primary",
-    "lens:regression-downstream": "primary",
-}
+# `DAG_REPAIR_ROLE_RUNTIMES` is shimmed from `..execution.dispatcher`
+# (Slice 11e — see the shim re-export block above). It remains accessible
+# under the legacy `implementation.DAG_REPAIR_ROLE_RUNTIMES` name via the
+# shim so every existing reader continues to work.
 
 
 def _env_flag_enabled(name: str, *, default: bool = True) -> bool:
@@ -146,372 +912,152 @@ def _dag_auto_resolve_contradictions_enabled() -> bool:
     return _env_flag_enabled(DAG_AUTO_RESOLVE_CONTRADICTIONS_ENV, default=True)
 
 
-def _dag_repair_runtime_for(
-    role_or_lens: str,
-    fallback: str | None = None,
-) -> str | None:
-    return DAG_REPAIR_ROLE_RUNTIMES.get(role_or_lens, fallback)
+# `_dag_repair_runtime_for` is shimmed from `..execution.dispatcher`
+# (Slice 11e — see the shim re-export block above). Pure role→runtime
+# lookup over `DAG_REPAIR_ROLE_RUNTIMES`.
 
 
-def _bounded_commit_output(value: str, *, limit: int = COMMIT_FAILURE_OUTPUT_LIMIT) -> str:
-    if len(value) <= limit:
-        return value
-    omitted = len(value) - limit
-    return f"{value[:limit]}\n\n[... truncated {omitted} chars ...]"
+# `_bounded_commit_output`, `CommitRepoOutcome`, `WorkflowCommitError`,
+# `CommitFailureLocation`, `CommitForbiddenPathMatch`, `DagDirectRepairRoute`
+# are shimmed from `..execution.types` (Slice 11a — see the import block
+# above).
 
 
-@dataclass(slots=True)
-class CommitRepoOutcome:
-    repo_path: str
-    repo_name: str
-    message: str
-    status_before: str = ""
-    status_after: str = ""
-    dirty: bool = False
-    command: list[str] = field(default_factory=list)
-    exit_code: int = 0
-    stdout: str = ""
-    stderr: str = ""
-    commit_hash: str = ""
-    error: str = ""
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "repo_path": self.repo_path,
-            "repo_name": self.repo_name,
-            "message": self.message,
-            "status_before": _bounded_commit_output(self.status_before),
-            "status_after": _bounded_commit_output(self.status_after),
-            "dirty": self.dirty,
-            "command": self.command,
-            "exit_code": self.exit_code,
-            "stdout": _bounded_commit_output(self.stdout),
-            "stderr": _bounded_commit_output(self.stderr),
-            "commit_hash": self.commit_hash,
-            "error": self.error,
-        }
+# `_COMMIT_HYGIENE_ROUTE`, `_MANIFEST_FORBIDDEN_CLEANUP_ROUTE`,
+# `_REPO_HYGIENE_ROUTE`, `_NORMAL_VERIFY_ROUTE`, `_MANIFEST_FORBIDDEN_MARKER`,
+# `_OPERATOR_REQUIRED_MARKER`, `_DAG_CONTRADICTION_MIXED_REPAIR_KIND` are
+# shimmed from `..execution.repair` (Slice 11h — see the Slice-11h shim
+# re-export block at the head of this module). The literal values match the
+# pre-11h impl.py-local constants byte-for-byte.
+#
+# `_DAG_AUTHORITY_*` route constants are shimmed from `..execution.gates`
+# (Slice 11f -- see the Slice-11f shim re-export block at the head of this
+# module). They remain accessible under their legacy `implementation.
+# _DAG_AUTHORITY_*` names via the shim so every existing reader continues
+# to work.
 
 
-class WorkflowCommitError(RuntimeError):
-    """Raised when a dirty workflow repo cannot be committed."""
-
-    def __init__(self, message: str, outcomes: list[CommitRepoOutcome]) -> None:
-        self.outcomes = outcomes
-        self.successful_hashes = [
-            outcome.commit_hash for outcome in outcomes if outcome.commit_hash
-        ]
-        failed = [outcome for outcome in outcomes if outcome.error or outcome.exit_code]
-        failed_repos = ", ".join(
-            outcome.repo_name or outcome.repo_path for outcome in failed
-        ) or "unknown repo"
-        super().__init__(f"{message}: commit failed for {failed_repos}")
-
-    @property
-    def failed_outcomes(self) -> list[CommitRepoOutcome]:
-        return [
-            outcome for outcome in self.outcomes
-            if outcome.error or outcome.exit_code
-        ]
-
-    def to_payload(self) -> dict[str, Any]:
-        return {
-            "error": str(self),
-            "failed_repo_count": len(self.failed_outcomes),
-            "successful_commit_hashes": self.successful_hashes,
-            "outcomes": [outcome.to_dict() for outcome in self.outcomes],
-        }
-
-
-@dataclass(slots=True)
-class CommitFailureLocation:
-    file: str = ""
-    line: int = 0
-
-
-@dataclass(slots=True)
-class CommitForbiddenPathMatch:
-    path: str
-    repo_path: str
-    repo_name: str
-    manifest_rule: str
-    config_path: str
-    source: str
-    git_state: str = ""
-    line: int = 0
-    operator_required: bool = False
-    operator_reasons: list[str] = field(default_factory=list)
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "path": self.path,
-            "repo_path": self.repo_path,
-            "repo_name": self.repo_name,
-            "manifest_rule": self.manifest_rule,
-            "config_path": self.config_path,
-            "source": self.source,
-            "git_state": self.git_state,
-            "line": self.line,
-            "operator_required": self.operator_required,
-            "operator_reasons": self.operator_reasons,
-        }
-
-
-@dataclass(slots=True)
-class DagDirectRepairRoute:
-    route: str
-    reason: str
-    signature: str
-    target_files: list[str] = field(default_factory=list)
-    skip_expanded_verify: bool = False
-    skip_parallel_repair: bool = False
-    skip_rca: bool = False
-    operator_required: bool = False
-    workspace_permission_repair: dict[str, Any] = field(default_factory=dict)
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "route": self.route,
-            "reason": self.reason,
-            "signature": self.signature,
-            "target_files": self.target_files,
-            "skip_expanded_verify": self.skip_expanded_verify,
-            "skip_parallel_repair": self.skip_parallel_repair,
-            "skip_rca": self.skip_rca,
-            "operator_required": self.operator_required,
-            "workspace_permission_repair": self.workspace_permission_repair,
-        }
-
-
-_COMMIT_HYGIENE_ROUTE = "commit_hygiene_focused"
-_MANIFEST_FORBIDDEN_CLEANUP_ROUTE = "manifest_forbidden_product_cleanup"
-_REPO_HYGIENE_ROUTE = "repo_hygiene_operator"
-_NORMAL_VERIFY_ROUTE = "normal_verify_repair"
-_MANIFEST_FORBIDDEN_MARKER = "manifest-forbidden product cleanup"
-_OPERATOR_REQUIRED_MARKER = "operator_required=true"
-_DAG_AUTHORITY_SEMANTIC_ROUTE = "semantic_verify_needed"
-_DAG_AUTHORITY_DB_TASK_RESULT_ROUTE = "db_task_result_drift"
-_DAG_AUTHORITY_TASK_SPEC_PROJECTION_ROUTE = "task_spec_projection_drift"
-_DAG_AUTHORITY_SOURCE_ARTIFACT_ROUTE = "source_dag_artifact_drift"
-_DAG_AUTHORITY_PRODUCT_WORKSPACE_ROUTE = "product_workspace_drift"
-_DAG_AUTHORITY_REPO_BLOCKER_ROUTE = "repo_or_permission_blocker"
-
-
-@dataclass(slots=True)
-class DagAuthorityGateOutcome:
-    route: str = _DAG_AUTHORITY_SEMANTIC_ROUTE
-    status: str = "not_applicable"
-    reason: str = ""
-    repair_results: list[ImplementationResult] = field(default_factory=list)
-    blocked_verdict: Verdict | None = None
-    report: dict[str, Any] = field(default_factory=dict)
-
-    @property
-    def handled(self) -> bool:
-        return bool(self.repair_results or self.blocked_verdict is not None)
-
-
-def _commit_failure_output(outcome: CommitRepoOutcome | None) -> str:
-    if outcome is None:
-        return ""
-    return outcome.stderr.strip() or outcome.stdout.strip() or outcome.error.strip()
-
-
-def _looks_like_file_path(value: str) -> bool:
-    if not value or "://" in value:
-        return False
-    normalized = value.replace("\\", "/")
-    if normalized.startswith(("/", "../", "./")):
-        return True
-    if "/" in normalized:
-        return True
-    return bool(re.search(r"\.[A-Za-z0-9]{1,8}$", normalized))
-
-
-def _normalize_commit_failure_path(
-    raw_path: str,
-    outcome: CommitRepoOutcome,
-) -> str:
-    path_text = raw_path.strip().strip("`'\"")
-    while path_text.startswith("./"):
-        path_text = path_text[2:]
-    if not path_text:
-        return ""
-    repo_path = Path(outcome.repo_path)
-    try:
-        path_obj = Path(path_text).expanduser()
-        if path_obj.is_absolute():
-            try:
-                path_text = path_obj.relative_to(repo_path).as_posix()
-            except ValueError:
-                return path_obj.as_posix()
-    except (OSError, RuntimeError, ValueError):
-        pass
-    path_text = path_text.replace("\\", "/")
-    repo_name = outcome.repo_name.strip()
-    if repo_name and path_text != repo_name and not path_text.startswith(f"{repo_name}/"):
-        return f"{repo_name}/{path_text}"
-    return path_text
-
-
-def _parse_commit_failure_location(
-    outcome: CommitRepoOutcome | None,
-) -> CommitFailureLocation:
-    locations = _parse_commit_failure_locations(outcome)
-    return locations[0] if locations else CommitFailureLocation()
-
-
-def _parse_commit_failure_locations(
-    outcome: CommitRepoOutcome | None,
-) -> list[CommitFailureLocation]:
-    if outcome is None:
-        return []
-    output = "\n".join(
-        part
-        for part in [
-            outcome.stderr,
-            outcome.stdout,
-            outcome.error,
-            outcome.status_after,
-            outcome.status_before,
-        ]
-        if part
-    )
-    locations: list[CommitFailureLocation] = []
-    seen: set[tuple[str, int]] = set()
-    patterns = [
-        re.compile(r"(?P<path>[^\n()]+?)\((?P<line>\d+),(?P<column>\d+)\)"),
-        re.compile(r"(?P<path>[^\s:\n][^:\n]*?):(?P<line>\d+):(?P<column>\d+)(?::|\s|$)"),
-        re.compile(r"(?P<path>[^\s:\n][^:\n]*?):(?P<line>\d+)(?::|\s|$)"),
-    ]
-    for pattern in patterns:
-        for match in pattern.finditer(output):
-            path = match.group("path").strip()
-            if not _looks_like_file_path(path):
-                continue
-            normalized = _normalize_commit_failure_path(path, outcome)
-            if not normalized:
-                continue
-            line = int(match.group("line") or 0)
-            key = (normalized, line)
-            if key in seen:
-                continue
-            seen.add(key)
-            locations.append(CommitFailureLocation(file=normalized, line=line))
-    return locations
-
-
-def _commit_failure_manifest_entries(
-    outcome: CommitRepoOutcome | None,
-) -> list[dict[str, str]]:
-    if outcome is None or not outcome.repo_path:
-        return []
-    config_path = (
-        Path(outcome.repo_path)
-        / "scripts"
-        / "verify-file-scope.expected-files.json"
-    )
-    try:
-        data = json.loads(config_path.read_text(encoding="utf-8"))
-    except Exception:
-        return []
-    entries: list[dict[str, str]] = []
-    for item in data.get("forbidden_files", []):
-        path = ""
-        source = ""
-        if isinstance(item, str):
-            path = item
-        elif isinstance(item, dict):
-            raw_path = item.get("path")
-            raw_source = item.get("source")
-            path = raw_path if isinstance(raw_path, str) else ""
-            source = raw_source if isinstance(raw_source, str) else ""
-        path = path.strip().replace("\\", "/").strip("/")
-        if not path:
-            continue
-        entries.append({
-            "path": path,
-            "source": source.strip(),
-            "config_path": str(config_path),
-        })
-    return entries
-
-
-def _commit_repo_relative_path(path: str, outcome: CommitRepoOutcome) -> str:
-    normalized = path.strip().strip("`'\"").replace("\\", "/").strip("/")
-    repo_path = Path(outcome.repo_path)
-    if normalized:
+def _failure_router_for_runner(runner: WorkflowRunner | object) -> Any | None:
+    if RouterFailureRouter is None or RouterInMemoryFailureRouterPort is None:
+        return None
+    services = getattr(runner, "services", None)
+    if isinstance(services, dict):
+        existing = services.get("failure_router")
+        if existing is not None and all(
+            hasattr(existing, name)
+            for name in ("record", "decide", "mark_route_started")
+        ):
+            return existing
+        port = services.get("failure_router_port")
+        if port is None:
+            port = RouterInMemoryFailureRouterPort()
+            services["failure_router_port"] = port
+        router = RouterFailureRouter(port=port)
+        services["failure_router"] = router
+        return router
+    port = getattr(runner, "_failure_router_port", None)
+    if port is None:
+        port = RouterInMemoryFailureRouterPort()
         try:
-            path_obj = Path(normalized).expanduser()
-            if path_obj.is_absolute():
-                normalized = path_obj.relative_to(repo_path).as_posix()
+            setattr(runner, "_failure_router_port", port)
         except Exception:
-            pass
-    repo_name = outcome.repo_name.strip().strip("/")
-    if repo_name and normalized.startswith(f"{repo_name}/"):
-        normalized = normalized[len(repo_name) + 1:]
-    return normalized.strip("/")
+            return RouterFailureRouter()
+    return RouterFailureRouter(port=port)
 
 
-def _commit_path_matches_forbidden_entry(
-    path: str,
-    entry: dict[str, str],
-) -> bool:
-    normalized = path.strip().replace("\\", "/").strip("/")
-    forbidden = str(entry.get("path", "")).strip().replace("\\", "/").strip("/")
-    if not normalized or not forbidden:
-        return False
-    return (
-        normalized == forbidden
-        or normalized.startswith(f"{forbidden}/")
-        or forbidden.endswith(f"/{normalized}")
-    )
+# `_route_decision_retry_budget_payload` and `_route_decision_compat_payload`
+# are shimmed from `..execution.failure_router` (Slice 11i -- see the Slice-11i
+# shim block at the head of this module). Both are pure typed→legacy adapter
+# helpers (read a `RouteDecision`-shaped object via `getattr`; return a flat
+# dict payload). They remain accessible under their legacy
+# `implementation._route_decision_*` names via the shim so every existing
+# reader keeps working.
 
 
-def _commit_status_paths(
-    status_text: str,
+# `_direct_route_target_paths`, `_direct_route_failure_pair` are shimmed
+# from `..execution.repair` (Slice 11h — see the Slice-11h shim block).
+
+
+def _typed_direct_route_payload(
+    runner: WorkflowRunner,
+    feature: Feature,
+    group_idx: int,
+    retry: int | str,
+    route: DagDirectRepairRoute,
     *,
-    source: str,
-) -> list[dict[str, str]]:
-    paths: list[dict[str, str]] = []
-    for raw_line in status_text.splitlines():
-        line = raw_line.rstrip()
-        if not line:
-            continue
-        if len(line) < 4:
-            continue
-        xy = line[:2]
-        path_text = line[3:].strip()
-        if not path_text:
-            continue
-        deletion_only = "D" in xy and all(char in {" ", "D"} for char in xy)
-        if deletion_only:
-            continue
-        if " -> " in path_text:
-            _, path_text = path_text.rsplit(" -> ", 1)
-        paths.append({
-            "path": path_text.strip().strip('"'),
-            "git_state": xy.strip() or xy,
+    dag_sha256: str,
+    source_verdict_key: str,
+    status: str,
+) -> dict[str, Any]:
+    if RouterFailureObservation is None:
+        return {}
+    router = _failure_router_for_runner(runner)
+    if router is None:
+        return {}
+    failure_class, failure_type, source = _direct_route_failure_pair(route)
+    target_paths = _direct_route_target_paths(route)
+    observation = RouterFailureObservation(
+        feature_id=str(feature.id),
+        dag_sha256=dag_sha256 or "",
+        group_idx=group_idx,
+        task_id=None,
+        attempt_id=int(retry) if isinstance(retry, int) else None,
+        source=source,
+        failure_class=failure_class,
+        failure_type=failure_type,
+        deterministic=True,
+        retryable=True,
+        operator_required=route.operator_required,
+        evidence_ids=[],
+        payload={
+            "idempotency_key": (
+                f"failure:{feature.id}:dag-direct-route:g{group_idx}:"
+                f"retry-{retry}:{route.route}:{route.signature or status}"
+            ),
+            "legacy_route": route.route,
+            "source_verdict_key": source_verdict_key,
+            "status": status,
+            "paths": target_paths,
+            "target_paths": target_paths,
+        },
+    )
+    failure_id = router.record(observation)
+    decision = router.mark_route_started(router.decide(failure_id))
+    typed_decision = _route_decision_compat_payload(
+        decision,
+        failure_class=failure_class,
+        failure_type=failure_type,
+        legacy_route=route.route,
+    )
+    return {
+        "typed_failure": {
+            "failure_id": failure_id,
+            "failure_class": failure_class,
+            "failure_type": failure_type,
             "source": source,
-        })
-    return paths
+        },
+        "typed_failure_id": failure_id,
+        "typed_failure_class": failure_class,
+        "typed_failure_type": failure_type,
+        "typed_route_action": typed_decision["route"],
+        "route_decision": typed_decision,
+        "retry_budget": typed_decision["retry_budget"],
+    }
 
 
-def _commit_deletion_only_status_paths(status_text: str) -> set[str]:
-    paths: set[str] = set()
-    for raw_line in status_text.splitlines():
-        line = raw_line.rstrip()
-        if len(line) < 4:
-            continue
-        xy = line[:2]
-        if "D" not in xy or not all(char in {" ", "D"} for char in xy):
-            continue
-        path_text = line[3:].strip()
-        if not path_text:
-            continue
-        if " -> " in path_text:
-            _, path_text = path_text.rsplit(" -> ", 1)
-        paths.add(path_text.strip().strip('"'))
-    return paths
+# `DagAuthorityGateOutcome` is shimmed from `..execution.types` (Slice 11a).
+
+
+# The commit-failure parsing family (`_commit_failure_output`,
+# `_looks_like_file_path`, `_normalize_commit_failure_path`,
+# `_parse_commit_failure_location`, `_parse_commit_failure_locations`,
+# `_commit_failure_manifest_entries`, `_commit_repo_relative_path`,
+# `_commit_path_matches_forbidden_entry`, `_commit_status_paths`,
+# `_commit_deletion_only_status_paths`) and `_is_repo_hygiene_outcome`
+# now live in `workflows/develop/execution/git_service.py` (Slice 11b);
+# the shim block at the head of this module re-exports them so every
+# legacy import + every `monkeypatch.setattr` target keeps resolving to
+# the SAME object.
 
 
 def _feature_workspace_agent_owner_write_is_trustworthy(repo_path: Path) -> bool:
@@ -525,8 +1071,13 @@ def _path_agent_writable(path: Path, *, repo_path: Path) -> bool:
     except OSError:
         return False
     mode = st.st_mode
-    if mode & (stat.S_IWGRP | stat.S_IWOTH):
+    if mode & stat.S_IWOTH:
         return True
+    if mode & stat.S_IWGRP:
+        shared_gid = _agent_shared_gid()
+        if shared_gid is None:
+            return _feature_workspace_agent_owner_write_is_trustworthy(repo_path)
+        return st.st_gid == shared_gid
     if (
         st.st_uid == os.getuid()
         and mode & stat.S_IWUSR
@@ -627,17 +1178,8 @@ def _commit_forbidden_path_matches(
     return matches
 
 
-def _is_repo_hygiene_outcome(outcome: CommitRepoOutcome | None) -> bool:
-    if outcome is None:
-        return False
-    if outcome.command == ["workflow-repo-hygiene-check"]:
-        return True
-    text = f"{outcome.error}\n{outcome.stderr}\n{outcome.stdout}".lower()
-    return (
-        "workflow repos with hygiene blockers" in text
-        or "embedded .git" in text
-        or "gitlink" in text
-    )
+# `_is_repo_hygiene_outcome` is shimmed from `..execution.git_service`
+# (Slice 11b).
 
 
 def _commit_failure_issue(exc: WorkflowCommitError, *, stage: str) -> Issue:
@@ -797,197 +1339,14 @@ async def _record_dag_commit_failure(
     )
 
 
-def _commit_failure_issue_kind(issue: Issue) -> str:
-    text = f"{issue.description}\n{issue.file}".lower()
-    if _MANIFEST_FORBIDDEN_MARKER in text:
-        return _MANIFEST_FORBIDDEN_CLEANUP_ROUTE
-    if (
-        "workflow repo hygiene blocker" in text
-        or "workflow repos with hygiene blockers" in text
-        or "embedded .git" in text
-        or "gitlink" in text
-    ):
-        return _REPO_HYGIENE_ROUTE
-    if (
-        "pre-commit/husky failed" in text
-        or ("commit failed" in text and ("pre-commit" in text or "husky" in text))
-    ):
-        return _COMMIT_HYGIENE_ROUTE
-    return _NORMAL_VERIFY_ROUTE
+# `_commit_failure_issue_kind`, `_is_deterministic_dag_preflight_issue`,
+# `_direct_route_target`, `_direct_route_issue_operator_required`, and
+# `_normalize_direct_route_signature` are shimmed from `..execution.repair`
+# (Slice 11h — see the Slice-11h shim block at the head of this module).
 
 
-def _is_deterministic_dag_preflight_issue(issue: Issue) -> bool:
-    text = f"{issue.description}\n{issue.file}".lower()
-    return bool(
-        _MANIFEST_FORBIDDEN_MARKER in text
-        or "dag-task:" in text
-        or "source artifact:" in text
-        or "source artifacts:" in text
-        or "manifest-forbidden/stale path" in text
-        or "reports changed file that is missing from the feature workspace" in text
-        or "repair stale task metadata" in text
-        or "programmatic dag preflight" in text
-    )
-
-
-def _direct_route_target(issue: Issue) -> str:
-    if not issue.file:
-        return ""
-    if issue.line:
-        return f"{issue.file}:{issue.line}"
-    return issue.file
-
-
-def _direct_route_issue_operator_required(issue: Issue) -> bool:
-    return _OPERATOR_REQUIRED_MARKER in issue.description
-
-
-def _normalize_direct_route_signature(verdict: Verdict, route: str) -> str:
-    parts = [route]
-    for issue in sorted(
-        verdict.concerns,
-        key=lambda item: (
-            item.file,
-            item.line,
-            re.sub(r"\s+", " ", item.description.strip().lower()),
-        ),
-    ):
-        description = re.sub(r"\s+", " ", issue.description.strip().lower())
-        description = re.sub(r"retry-\d+", "retry-N", description)
-        description = re.sub(r"attempt \d+", "attempt N", description)
-        parts.append(f"{issue.file}:{issue.line}:{description[:500]}")
-    return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()
-
-
-def _classify_dag_direct_repair_route(verdict: object) -> DagDirectRepairRoute:
-    if not isinstance(verdict, Verdict) or verdict.approved:
-        return DagDirectRepairRoute(
-            route=_NORMAL_VERIFY_ROUTE,
-            reason="not_a_failed_verdict",
-            signature="",
-        )
-    if verdict.gaps:
-        return DagDirectRepairRoute(
-            route=_NORMAL_VERIFY_ROUTE,
-            reason="verdict_has_gaps",
-            signature="",
-        )
-    failed_checks = [check for check in verdict.checks if check.result == "FAIL"]
-    if failed_checks:
-        return DagDirectRepairRoute(
-            route=_NORMAL_VERIFY_ROUTE,
-            reason="verdict_has_failed_checks",
-            signature="",
-        )
-    if not verdict.concerns:
-        return DagDirectRepairRoute(
-            route=_NORMAL_VERIFY_ROUTE,
-            reason="verdict_has_no_concerns",
-            signature="",
-        )
-
-    kinds = [_commit_failure_issue_kind(issue) for issue in verdict.concerns]
-    if any(kind == _MANIFEST_FORBIDDEN_CLEANUP_ROUTE for kind in kinds) and all(
-        kind == _MANIFEST_FORBIDDEN_CLEANUP_ROUTE
-        or _is_deterministic_dag_preflight_issue(issue)
-        for kind, issue in zip(kinds, verdict.concerns)
-    ):
-        targets = sorted({
-            target
-            for kind, issue in zip(kinds, verdict.concerns)
-            if kind == _MANIFEST_FORBIDDEN_CLEANUP_ROUTE
-            if (target := _direct_route_target(issue))
-        })
-        operator_required = any(
-            _direct_route_issue_operator_required(issue)
-            for issue in verdict.concerns
-        )
-        return DagDirectRepairRoute(
-            route=_MANIFEST_FORBIDDEN_CLEANUP_ROUTE,
-            reason=(
-                "manifest_forbidden_cleanup_operator_required"
-                if operator_required
-                else "manifest_forbidden_cleanup"
-            ),
-            signature=_normalize_direct_route_signature(
-                verdict,
-                _MANIFEST_FORBIDDEN_CLEANUP_ROUTE,
-            ),
-            target_files=targets,
-            skip_expanded_verify=True,
-            skip_parallel_repair=True,
-            skip_rca=True,
-            operator_required=operator_required,
-        )
-    if any(kind == _NORMAL_VERIFY_ROUTE for kind in kinds):
-        return DagDirectRepairRoute(
-            route=_NORMAL_VERIFY_ROUTE,
-            reason="verdict_has_non_commit_concerns",
-            signature="",
-        )
-    if all(kind == _REPO_HYGIENE_ROUTE for kind in kinds):
-        targets = sorted({
-            target
-            for issue in verdict.concerns
-            if (target := _direct_route_target(issue))
-        })
-        return DagDirectRepairRoute(
-            route=_REPO_HYGIENE_ROUTE,
-            reason="repo_hygiene_only_verdict",
-            signature=_normalize_direct_route_signature(verdict, _REPO_HYGIENE_ROUTE),
-            target_files=targets,
-            skip_expanded_verify=True,
-            skip_parallel_repair=True,
-            skip_rca=True,
-            operator_required=True,
-        )
-    if all(kind == _COMMIT_HYGIENE_ROUTE for kind in kinds):
-        targets = sorted({
-            target
-            for issue in verdict.concerns
-            if (target := _direct_route_target(issue))
-        })
-        return DagDirectRepairRoute(
-            route=_COMMIT_HYGIENE_ROUTE,
-            reason="commit_hygiene_only_verdict",
-            signature=_normalize_direct_route_signature(verdict, _COMMIT_HYGIENE_ROUTE),
-            target_files=targets,
-            skip_expanded_verify=True,
-            skip_parallel_repair=True,
-            skip_rca=True,
-        )
-    if all(kind == _MANIFEST_FORBIDDEN_CLEANUP_ROUTE for kind in kinds):
-        targets = sorted({
-            target
-            for issue in verdict.concerns
-            if (target := _direct_route_target(issue))
-        })
-        operator_required = any(
-            _direct_route_issue_operator_required(issue)
-            for issue in verdict.concerns
-        )
-        return DagDirectRepairRoute(
-            route=_MANIFEST_FORBIDDEN_CLEANUP_ROUTE,
-            reason=(
-                "manifest_forbidden_commit_failure_operator_required"
-                if operator_required
-                else "manifest_forbidden_commit_failure"
-            ),
-            signature=_normalize_direct_route_signature(
-                verdict,
-                _MANIFEST_FORBIDDEN_CLEANUP_ROUTE,
-            ),
-            target_files=targets,
-            skip_expanded_verify=True,
-            skip_parallel_repair=True,
-            skip_rca=True,
-            operator_required=operator_required,
-        )
-    return DagDirectRepairRoute(
-        route=_NORMAL_VERIFY_ROUTE,
-        reason="mixed_deterministic_routes",
-        signature="",
-    )
+# `_classify_dag_direct_repair_route` is shimmed from `..execution.repair`
+# (Slice 11h — see the Slice-11h shim block at the head of this module).
 
 
 async def _record_dag_direct_repair_route(
@@ -1000,6 +1359,7 @@ async def _record_dag_direct_repair_route(
     status: str,
     source_verdict_key: str,
     guardrail_decision: str,
+    dag_sha256: str = "",
 ) -> None:
     payload = route.to_dict()
     payload.update({
@@ -1009,8 +1369,54 @@ async def _record_dag_direct_repair_route(
         "source_verdict_key": source_verdict_key,
         "guardrail_decision": guardrail_decision,
     })
+    payload.update(_typed_direct_route_payload(
+        runner,
+        feature,
+        group_idx,
+        retry,
+        route,
+        dag_sha256=dag_sha256,
+        source_verdict_key=source_verdict_key,
+        status=status,
+    ))
     await runner.artifacts.put(
         f"dag-direct-repair-route:g{group_idx}:retry-{retry}",
+        json.dumps(payload, indent=2),
+        feature=feature,
+    )
+
+
+async def _record_dag_checkpoint_direct_repair_route(
+    runner: WorkflowRunner,
+    feature: Feature,
+    group_idx: int,
+    route: DagDirectRepairRoute,
+    *,
+    status: str,
+    source_verdict_key: str,
+    guardrail_decision: str,
+    dag_sha256: str = "",
+) -> None:
+    payload = route.to_dict()
+    payload.update({
+        "group_idx": group_idx,
+        "retry": "checkpoint-commit",
+        "status": status,
+        "source_verdict_key": source_verdict_key,
+        "guardrail_decision": guardrail_decision,
+    })
+    payload.update(_typed_direct_route_payload(
+        runner,
+        feature,
+        group_idx,
+        "checkpoint-commit",
+        route,
+        dag_sha256=dag_sha256,
+        source_verdict_key=source_verdict_key,
+        status=status,
+    ))
+    await runner.artifacts.put(
+        f"dag-direct-repair-route:g{group_idx}:checkpoint-commit",
         json.dumps(payload, indent=2),
         feature=feature,
     )
@@ -1024,8 +1430,6 @@ async def _direct_route_repeated_signature(
     route: DagDirectRepairRoute,
 ) -> bool:
     if retry <= 0 or not route.signature:
-        return False
-    if route.route == _MANIFEST_FORBIDDEN_CLEANUP_ROUTE and retry <= 1:
         return False
     previous = await runner.artifacts.get(
         f"dag-direct-repair-route:g{group_idx}:retry-{retry - 1}",
@@ -1061,15 +1465,18 @@ def _repeated_direct_route_verdict(
     return Verdict(
         approved=False,
         summary=(
-            f"Group {group_idx} cannot continue: deterministic {route.route} "
-            f"blocker repeated after focused repair attempt retry-{retry - 1}."
+            _workflow_blocker_text(
+                f"Group {group_idx} cannot continue: deterministic {route.route} "
+                f"blocker repeated after focused repair attempt retry-{retry - 1}."
+            )
         ),
         concerns=[
             Issue(
                 severity="blocker",
                 description=(
+                    f"{_workflow_blocker_text('Repeated deterministic direct-route blocker')}. "
                     "The same deterministic commit/worktree blocker repeated "
-                    "after a focused repair attempt; operator review is required "
+                    "after a focused repair attempt; the workflow must quiesce "
                     "before another broad repair cycle."
                 ),
                 file=file,
@@ -1205,39 +1612,10 @@ def _runner_runtime_policy(runner: WorkflowRunner) -> RuntimePolicy:
         return DEFAULT_RUNTIME_POLICY
 
 
-def _dag_group_runtime_pair(
-    group_idx: int,
-    runtime_policy: RuntimePolicy,
-) -> tuple[str, str]:
-    """Return ``(implementation_runtime, review_runtime)`` for a DAG group."""
-    if runtime_policy == PRIMARY_IMPL_SECONDARY_REVIEW_POLICY:
-        return "primary", "secondary"
-    return (
-        ("primary", "secondary")
-        if group_idx % 2 == 0
-        else ("secondary", "primary")
-    )
-
-
-def _post_dag_runtime_pair(
-    last_group_idx: int,
-    runtime_policy: RuntimePolicy,
-) -> tuple[str, str]:
-    """Return ``(gate_runtime, fix_runtime)`` for post-DAG gates."""
-    if runtime_policy == PRIMARY_IMPL_SECONDARY_REVIEW_POLICY:
-        return "secondary", "primary"
-    return (
-        ("secondary", "primary")
-        if last_group_idx % 2 == 0
-        else ("primary", "secondary")
-    )
-
-
-def _diagnostic_runtime_for_policy(runtime_policy: RuntimePolicy) -> str | None:
-    """Return the runtime for RCA/triage/regression analysis under a policy."""
-    if runtime_policy == PRIMARY_IMPL_SECONDARY_REVIEW_POLICY:
-        return "secondary"
-    return None
+# `_dag_group_runtime_pair`, `_post_dag_runtime_pair`, and
+# `_diagnostic_runtime_for_policy` are shimmed from `..execution.dispatcher`
+# (Slice 11e — see the shim re-export block above). Pure runtime-selection
+# primitives over `RuntimePolicy`.
 
 
 # ── Inline triage role (lightweight, no tools) ───────────────────────────────
@@ -1256,40 +1634,12 @@ _triage_role = Role(
 )
 
 
-@dataclass(slots=True)
-class PlannedBugGroup:
-    group: BugGroup
-    rca: RootCauseAnalysis
-    issue_text: str
-    rca_key: str
-
-
-@dataclass(slots=True)
-class PlannedBugDispatch:
-    attempt_number: int
-    triage: BugTriage
-    groups: list[PlannedBugGroup]
-    fixable_groups: list[PlannedBugGroup]
-    contradiction_groups: list[PlannedBugGroup]
-    schedule: list[list[str]]
-    dispatch_key: str
-    strategy_mode: str = "ordinary_retry"
-    strategy_reason: str = ""
-    required_checks: list[str] = field(default_factory=list)
-    required_files: list[str] = field(default_factory=list)
-    stable_blocker_summary: str = ""
-    similar_cluster_hints: list[str] = field(default_factory=list)
-
-
-@dataclass(slots=True)
-class DagTaskDriftRoute:
-    task_id: str
-    artifact_key: str
-    route: str
-    reason: str
-    path_problems: list[dict[str, Any]] = field(default_factory=list)
-    forbidden_workspace_paths: list[dict[str, Any]] = field(default_factory=list)
-    candidate_evidence: list[dict[str, Any]] = field(default_factory=list)
+# `PlannedBugGroup`, `PlannedBugDispatch`, `DagTaskDriftRoute` are shimmed
+# from `..execution.types` (Slice 11a). `DagArtifactClosureScan` (below)
+# remains here because its `target_refs()` method depends on
+# `_dedupe_preserving_order` — a private helper that lives in this module
+# and has many other call sites; moving the helper too would broaden the
+# 11a sub-slice scope into non-type code.
 
 
 @dataclass(slots=True)
@@ -1329,25 +1679,12 @@ class DagArtifactClosureScan:
         }
 
 
-class DagContradictionResolution(BaseModel):
-    """Autonomous adjudication of a DAG repair spec contradiction."""
-
-    resolution: str
-    resolution_kind: str = "decision_only"
-    authoritative_sources: list[str] = Field(default_factory=list)
-    artifact_paths: list[str] = Field(default_factory=list)
-    superseded_expectation: str = ""
-    implementation_direction: str = ""
-    requires_code_change: bool = False
-    needs_human: bool = False
-    confidence: str = "medium"  # high | medium | low
-    rationale: str = ""
-
-
-@dataclass(slots=True)
-class DagContradictionResolutionValidation:
-    resolution: DagContradictionResolution | None
-    rejection_reasons: list[str] = field(default_factory=list)
+# `DagContradictionResolution`, `DagContradictionResolutionValidation`,
+# `DagContradictionHandoffOutcome`, `WorktreeRegistryRepo`, `WorktreeRegistry`,
+# `WorkspaceAuthorityCompatibilityOutcome`, `TaskContractCompileOutcome`,
+# `TaskContractCommitGuardOutcome`, `_RepoNeed` are shimmed from
+# `..execution.types` (Slice 11a — see the import block at the head of this
+# module).
 
 
 # ── Worktree management ─────────────────────────────────────────────────────
@@ -1376,9 +1713,14 @@ def _normalize_workspace_repo_path(
     repo boundaries; treating them as new repos creates embedded .git directories
     in the feature worktree.
     """
-    normalized = str(Path((repo_path or "").strip().replace("\\", "/").strip("/")))
+    raw_repo_path = (repo_path or "").strip().replace("\\", "/")
+    if Path(raw_repo_path).is_absolute():
+        return "", raw_repo_path
+    normalized = str(Path(raw_repo_path.strip("/")))
     if not normalized or normalized == ".":
         return "", None
+    if any(part in {"..", ""} for part in Path(normalized).parts):
+        return "", normalized
 
     if (workspace_root / normalized / ".git").exists():
         return normalized, None
@@ -1406,7 +1748,7 @@ def _repo_action_rank(action: str) -> int:
 
 
 def _remember_repo_needed(
-    repos_needed: dict[str, str],
+    repos_needed: dict[str, _RepoNeed],
     repo_path: str,
     action: str,
     *,
@@ -1434,8 +1776,24 @@ def _remember_repo_needed(
         action = "extend"
 
     existing = repos_needed.get(safe_repo_path)
-    if existing is None or _repo_action_rank(action) > _repo_action_rank(existing):
-        repos_needed[safe_repo_path] = action
+    if existing is None:
+        existing = _RepoNeed(action=action)
+        repos_needed[safe_repo_path] = existing
+    elif _repo_action_rank(action) > _repo_action_rank(existing.action):
+        existing.action = action
+    if task_id:
+        for tid in [part.strip() for part in task_id.split(",") if part.strip()]:
+            if tid not in existing.task_ids:
+                existing.task_ids.append(tid)
+            target = (
+                existing.read_only_task_ids
+                if action == "read_only"
+                else existing.writable_task_ids
+            )
+            if tid not in target:
+                target.append(tid)
+    if nested_request and nested_request not in existing.nested_requests:
+        existing.nested_requests.append(nested_request)
     return safe_repo_path
 
 
@@ -1472,10 +1830,2189 @@ def _infer_new_repo_from_tasks(
     return new_repos
 
 
+def _worktree_registry_repo(
+    ws_rel_path: str,
+    need: _RepoNeed,
+    *,
+    workspace_root: Path,
+    feature_root: Path,
+) -> WorktreeRegistryRepo:
+    source_path = workspace_root / ws_rel_path
+    worktree_dest = feature_root / ws_rel_path
+    source_meta = _git_identity_metadata(source_path)
+    dest_meta = _git_identity_metadata(worktree_dest)
+    return WorktreeRegistryRepo(
+        repo_path=ws_rel_path,
+        action=need.action,
+        repo_id=_stable_repo_id(ws_rel_path, source_meta.get("remote_url", "")),
+        role="execution" if need.action != "read_only" else "source",
+        task_ids=need.task_ids,
+        writable_task_ids=need.writable_task_ids,
+        read_only_task_ids=need.read_only_task_ids,
+        nested_requests=need.nested_requests,
+        source_path=str(source_path),
+        destination_path=str(worktree_dest),
+        canonical_path=str(worktree_dest),
+        remote_url=dest_meta.get("remote_url") or source_meta.get("remote_url", ""),
+        branch=dest_meta.get("branch") or source_meta.get("branch", ""),
+        head_sha=dest_meta.get("head_sha") or source_meta.get("head_sha", ""),
+        git_common_dir=dest_meta.get("git_common_dir") or source_meta.get("git_common_dir", ""),
+        writable=os.access(worktree_dest, os.W_OK) if worktree_dest.exists() else False,
+        dirty_summary=dest_meta.get("dirty_summary", []),
+        source_git_exists=(source_path / ".git").exists(),
+        destination_exists_before=worktree_dest.exists(),
+        destination_is_symlink_before=worktree_dest.is_symlink(),
+        destination_isolated_before=_is_isolated_repo_copy(
+            worktree_dest,
+            feature_root=feature_root,
+        ),
+    )
+
+
+async def _record_worktree_registry(
+    runner: WorkflowRunner,
+    feature: Feature,
+    registry: WorktreeRegistry,
+    *,
+    group_idx: int | None = None,
+) -> None:
+    artifacts = getattr(runner, "artifacts", None)
+    put = getattr(artifacts, "put", None)
+    if not callable(put):
+        return
+    key = (
+        f"worktree-registry:g{group_idx}"
+        if group_idx is not None
+        else "worktree-registry"
+    )
+    await put(key, registry.model_dump_json(indent=2), feature=feature)
+
+
+async def _maybe_await_workspace_authority(value: Any) -> Any:
+    if hasattr(value, "__await__"):
+        return await value
+    return value
+
+
+def _workspace_authority_artifact_key(
+    kind: str,
+    group_idx: int | None,
+    stage: str | None = None,
+) -> str:
+    group = f"g{group_idx}" if group_idx is not None else "global"
+    suffix = f":{stage}" if stage else ""
+    return f"workspace-authority-{kind}:{group}{suffix}"
+
+
+def _workspace_authority_jsonable(
+    value: Any,
+    *,
+    list_limit: int = 50,
+    string_limit: int = 4000,
+    depth: int = 0,
+) -> Any:
+    if depth > 8:
+        return {"bounded": "max_depth"}
+    if hasattr(value, "model_dump"):
+        value = value.model_dump(mode="json")
+    if isinstance(value, SimpleNamespace):
+        value = vars(value)
+    if isinstance(value, dict):
+        return {
+            str(key): _workspace_authority_jsonable(
+                item,
+                list_limit=list_limit,
+                string_limit=string_limit,
+                depth=depth + 1,
+            )
+            for key, item in sorted(value.items(), key=lambda item: str(item[0]))
+        }
+    if isinstance(value, (list, tuple, set, frozenset)):
+        items = sorted(value, key=str) if isinstance(value, (set, frozenset)) else list(value)
+        bounded = [
+            _workspace_authority_jsonable(
+                item,
+                list_limit=list_limit,
+                string_limit=string_limit,
+                depth=depth + 1,
+            )
+            for item in items[:list_limit]
+        ]
+        if len(items) > list_limit:
+            bounded.append({
+                "bounded": "list_truncated",
+                "omitted": len(items) - list_limit,
+            })
+        return bounded
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, str) and len(value) > string_limit:
+        return value[:string_limit] + f"...[truncated {len(value) - string_limit} chars]"
+    return value
+
+
+def _workspace_authority_json(value: Any) -> str:
+    return json.dumps(_workspace_authority_jsonable(value), indent=2, sort_keys=True)
+
+
+async def _workspace_authority_put_json(
+    runner: WorkflowRunner,
+    feature: Feature,
+    key: str,
+    value: Any,
+) -> None:
+    artifacts = getattr(runner, "artifacts", None)
+    put = getattr(artifacts, "put", None)
+    if callable(put):
+        await put(key, _workspace_authority_json(value), feature=feature)
+
+
+async def _load_worktree_registry_for_group(
+    runner: WorkflowRunner,
+    feature: Feature,
+    group_idx: int | None,
+) -> WorktreeRegistry | None:
+    keys = (
+        [f"worktree-registry:g{group_idx}", "worktree-registry"]
+        if group_idx is not None
+        else ["worktree-registry"]
+    )
+    for key in keys:
+        registry = await _load_worktree_registry_artifact(runner, feature, key)
+        if registry is not None:
+            return registry
+    return None
+
+
+async def _load_worktree_registry_artifact(
+    runner: WorkflowRunner,
+    feature: Feature,
+    key: str,
+) -> WorktreeRegistry | None:
+    artifacts = getattr(runner, "artifacts", None)
+    get = getattr(artifacts, "get", None)
+    if not callable(get):
+        return None
+    try:
+        raw = await get(key, feature=feature)
+    except Exception:
+        raw = None
+    if not raw:
+        return None
+    try:
+        return WorktreeRegistry.model_validate_json(str(raw))
+    except Exception:
+        logger.debug("Invalid worktree registry artifact %s", key, exc_info=True)
+    return None
+
+
+async def _load_worktree_registries_for_authority(
+    runner: WorkflowRunner,
+    feature: Feature,
+    *,
+    group_idx: int | None = None,
+) -> list[WorktreeRegistry]:
+    artifacts = getattr(runner, "artifacts", None)
+    registries: list[WorktreeRegistry] = []
+    seen_keys: set[str] = set()
+
+    async def add_key(key: str) -> None:
+        if key in seen_keys:
+            return
+        seen_keys.add(key)
+        registry = await _load_worktree_registry_artifact(runner, feature, key)
+        if registry is not None:
+            registries.append(registry)
+
+    if group_idx is not None:
+        await add_key(f"worktree-registry:g{group_idx}")
+        if registries:
+            return registries
+        await add_key("worktree-registry")
+        return registries
+
+    await add_key("worktree-registry")
+    store = getattr(artifacts, "store", None)
+    if isinstance(store, dict):
+        for key in sorted(str(item) for item in store if str(item).startswith("worktree-registry:g")):
+            await add_key(key)
+
+    list_records = getattr(artifacts, "list_records", None)
+    if callable(list_records):
+        try:
+            records = await list_records(
+                feature_id=str(feature.id),
+                prefixes=("worktree-registry:g",),
+                limit=500,
+                order="asc",
+                max_total_value_bytes=1_000_000,
+            )
+        except TypeError:
+            try:
+                records = await list_records(
+                    feature_id=str(feature.id),
+                    prefixes=("worktree-registry:g",),
+                    limit=500,
+                    order="asc",
+                )
+            except Exception:
+                records = []
+        except Exception:
+            records = []
+        for record in records or []:
+            key = str(record.get("key") or "")
+            if not key or key in seen_keys:
+                continue
+            seen_keys.add(key)
+            raw = record.get("value")
+            if not raw:
+                continue
+            try:
+                registries.append(WorktreeRegistry.model_validate_json(str(raw)))
+            except Exception:
+                logger.debug("Invalid worktree registry artifact %s", key, exc_info=True)
+    return registries
+
+
+def _workspace_authority_make(
+    *,
+    workspace_root: Path,
+    feature_root: Path,
+    legacy_registry: WorktreeRegistry | None,
+) -> Any | None:
+    if WorkspaceAuthority is None:
+        return None
+    kwargs = {
+        "workspace_root": workspace_root,
+        "feature_root": feature_root,
+        "legacy_registry": legacy_registry,
+    }
+    try:
+        return WorkspaceAuthority(**kwargs)
+    except TypeError:
+        kwargs.pop("legacy_registry", None)
+        try:
+            return WorkspaceAuthority(**kwargs)
+        except TypeError:
+            return WorkspaceAuthority()
+
+
+async def _workspace_authority_build_registry_projection(
+    runner: WorkflowRunner,
+    feature: Feature,
+    tasks: list[ImplementationTask],
+    *,
+    workspace_root: Path,
+    feature_root: Path,
+    group_idx: int | None,
+    legacy_registry: WorktreeRegistry | None,
+    record: bool = True,
+) -> tuple[Any | None, Any | None, str]:
+    authority = _workspace_authority_make(
+        workspace_root=workspace_root,
+        feature_root=feature_root,
+        legacy_registry=legacy_registry,
+    )
+    if authority is None:
+        return None, None, "workspace_authority_unavailable"
+    feature_id = str(getattr(feature, "id", "") or getattr(feature, "slug", ""))
+    try:
+        registry = await _maybe_await_workspace_authority(
+            authority.build_registry(
+                feature_id,
+                tasks,
+                feature_root=feature_root,
+                feature_slug=getattr(feature, "slug", ""),
+                workspace_root=workspace_root,
+                legacy_registry=legacy_registry,
+            )
+        )
+    except TypeError:
+        registry = await _maybe_await_workspace_authority(
+            authority.build_registry(feature_id, tasks)
+        )
+    if record:
+        await _workspace_authority_put_json(
+            runner,
+            feature,
+            _workspace_authority_artifact_key("registry", group_idx),
+            {
+                "artifact_schema": "workspace-authority-compatibility-projection-v1",
+                "authoritative_mode": "compatibility_projection",
+                "registry": registry,
+            },
+        )
+    return authority, registry, ""
+
+
+async def _record_workspace_authority_registry_projection(
+    runner: WorkflowRunner,
+    feature: Feature,
+    tasks: list[ImplementationTask],
+    *,
+    workspace_root: Path,
+    feature_root: Path,
+    group_idx: int | None,
+    legacy_registry: WorktreeRegistry,
+) -> None:
+    try:
+        await _workspace_authority_build_registry_projection(
+            runner,
+            feature,
+            tasks,
+            workspace_root=workspace_root,
+            feature_root=feature_root,
+            group_idx=group_idx,
+            legacy_registry=legacy_registry,
+        )
+    except Exception:
+        logger.debug("WorkspaceAuthority registry projection failed", exc_info=True)
+
+
+def _workspace_authority_task_targets(
+    tasks: list[ImplementationTask],
+) -> list[Any]:
+    if WorkspaceAuthorityPathTarget is None:
+        return []
+    targets: list[Any] = []
+    seen: set[tuple[str, str, str]] = set()
+    for task in tasks:
+        repo_path = str(task.repo_path or "").strip().replace("\\", "/").strip("/")
+        scopes = list(task.file_scope or [])
+        if not scopes:
+            scopes = [
+                TaskFileScope(path=path, action="modify")
+                for path in getattr(task, "files", [])
+                if path
+            ]
+        for scope in scopes:
+            raw_path = str(scope.path or "").strip().replace("\\", "/")
+            if not raw_path:
+                continue
+            if repo_path and not Path(raw_path).is_absolute():
+                normalized = raw_path.strip("/")
+                if normalized != repo_path and not normalized.startswith(f"{repo_path}/"):
+                    raw_path = f"{repo_path}/{normalized}"
+            action = "read" if scope.action == "read_only" else str(scope.action or "modify")
+            if action not in {"read", "create", "modify", "delete", "stage"}:
+                action = "modify"
+            key = (raw_path, action, task.id)
+            if key in seen:
+                continue
+            seen.add(key)
+            targets.append(WorkspaceAuthorityPathTarget(
+                raw_path=raw_path,
+                action=action,
+                task_id=task.id,
+                source="task",
+            ))
+    return targets
+
+
+def _workspace_authority_operator_blockers(preflight: Any) -> list[dict[str, Any]]:
+    blockers = list(getattr(preflight, "blockers", []) or [])
+    return [
+        blocker for blocker in blockers
+        if str(blocker.get("failure_class", "")) == "operator_required"
+        or str(blocker.get("route", "")) == "operator_required"
+    ]
+
+
+def _workspace_authority_routes_operator_required(routes: list[Any]) -> bool:
+    return any(bool(getattr(route, "operator_required", False)) for route in routes)
+
+
+def _workspace_authority_dirty_snapshot_routes(snapshots: list[Any]) -> list[Any]:
+    routes: list[Any] = []
+    for snapshot in snapshots:
+        dirty_paths = list(getattr(snapshot, "dirty_paths", []) or [])
+        if bool(getattr(snapshot, "no_dirty", True)) and not dirty_paths:
+            continue
+        repo_id = str(getattr(snapshot, "repo_id", "") or "-")
+        digest = hashlib.sha256(
+            json.dumps(
+                {
+                    "repo_id": repo_id,
+                    "stage": getattr(snapshot, "stage", ""),
+                    "dirty_paths": dirty_paths,
+                },
+                sort_keys=True,
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest()
+        routes.append(SimpleNamespace(
+            feature_id=str(getattr(snapshot, "feature_id", "")),
+            dag_sha256=str(getattr(snapshot, "dag_sha256", "")),
+            group_idx=getattr(snapshot, "group_idx", None),
+            attempt_id=getattr(snapshot, "attempt_id", None),
+            source="workspace_authority",
+            failure_class="workspace_dirty",
+            failure_type="dirty_snapshot_before_dispatch",
+            severity="error",
+            status="blocked",
+            deterministic=True,
+            deterministic_workflow_blocker=True,
+            blocked_before_dispatch=True,
+            retryable=True,
+            operator_required=False,
+            evidence_ids=[],
+            route="quiesce",
+            signature_hash=digest,
+            idempotency_key=(
+                f"workspace-route:{getattr(snapshot, 'feature_id', '')}:"
+                f"{getattr(snapshot, 'dag_sha256', '')}:"
+                f"g{getattr(snapshot, 'group_idx', '-')}:"
+                f"{getattr(snapshot, 'stage', '')}:{repo_id}:dirty:{digest}"
+            ),
+            payload={
+                "repo_id": repo_id,
+                "canonical_path": str(getattr(snapshot, "canonical_path", "") or ""),
+                "dirty_paths": dirty_paths[:50],
+                "dirty_path_count": len(dirty_paths),
+                "status": "blocked",
+                "route": "quiesce",
+                "deterministic_workflow_blocker": True,
+                "blocked_before_dispatch": True,
+            },
+        ))
+    return routes
+
+
+def _workspace_authority_blocks_dispatch(
+    outcome: WorkspaceAuthorityCompatibilityOutcome,
+) -> bool:
+    """Any unresolved typed WorkspaceAuthority route preempts runtime dispatch."""
+    return not outcome.approved
+
+
+async def _persist_workspace_authority_snapshots(
+    runner: WorkflowRunner,
+    snapshots: list[Any],
+    *,
+    registry: Any | None,
+) -> list[Any]:
+    store = _execution_control_store_for_runner(runner)
+    if store is None or StoredWorkspaceSnapshotEvidence is None:
+        return snapshots
+    persisted: list[Any] = []
+    registry_digest = str(
+        getattr(registry, "registry_digest", "")
+        or _model_json_dict(registry).get("registry_digest", "")
+        or ""
+    )
+    for snapshot in snapshots:
+        payload = _model_json_dict(snapshot)
+        if registry_digest:
+            payload["registry_digest"] = registry_digest
+        evidence = StoredWorkspaceSnapshotEvidence(
+            feature_id=str(payload.get("feature_id") or ""),
+            payload=payload,
+            dag_sha256=str(payload.get("dag_sha256") or ""),
+            group_idx=payload.get("group_idx"),
+            attempt_id=payload.get("attempt_id"),
+            stage=str(payload.get("stage") or ""),
+            repo_id=str(payload.get("repo_id") or ""),
+            canonical_path=str(payload.get("canonical_path") or ""),
+            registry_digest=registry_digest,
+            head_sha=str(payload.get("head_sha") or ""),
+            index_digest=str(payload.get("index_digest") or ""),
+            worktree_status_digest=str(payload.get("worktree_status_digest") or ""),
+            idempotency_key=str(payload.get("idempotency_key") or ""),
+            actor="workspace_authority",
+        )
+        result = await store.record_workspace_snapshot(evidence)
+        snapshot_id = int(getattr(result.snapshot, "id"))
+        if hasattr(snapshot, "model_copy"):
+            persisted.append(snapshot.model_copy(update={"id": snapshot_id}))
+        else:
+            data = dict(payload)
+            data["id"] = snapshot_id
+            persisted.append(data)
+    return persisted
+
+
+def _model_json_dict(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return dict(value)
+    model_dump = getattr(value, "model_dump", None)
+    if model_dump is not None:
+        try:
+            dumped = model_dump(mode="json")
+        except TypeError:
+            dumped = model_dump()
+        return dict(dumped) if isinstance(dumped, dict) else {"value": dumped}
+    if dataclasses.is_dataclass(value):
+        dumped = dataclasses.asdict(value)
+        return dict(dumped) if isinstance(dumped, dict) else {"value": dumped}
+    return {"value": value}
+
+
+def _execution_control_store_for_runner(runner: WorkflowRunner) -> Any | None:
+    services = getattr(runner, "services", {}) or {}
+    if not isinstance(services, dict):
+        services = {}
+    for key in ("execution_control_store", "execution_control"):
+        store = services.get(key)
+        if store is not None and hasattr(store, "put_task_contract"):
+            return store
+    if ExecutionControlStore is None:
+        return None
+    pool = None
+    for key in ("pool", "db_pool", "database_pool"):
+        candidate = services.get(key)
+        if _execution_control_pool_is_usable(candidate):
+            pool = candidate
+            break
+    if pool is None:
+        feature_store = getattr(runner, "feature_store", None)
+        for key in ("_pool", "pool"):
+            candidate = getattr(feature_store, key, None)
+            if _execution_control_pool_is_usable(candidate):
+                pool = candidate
+                break
+    if pool is None:
+        artifacts = getattr(runner, "artifacts", None)
+        for key in ("_pool", "pool"):
+            candidate = getattr(artifacts, key, None)
+            if _execution_control_pool_is_usable(candidate):
+                pool = candidate
+                break
+    if pool is None:
+        return None
+    try:
+        store = ExecutionControlStore(pool)
+    except Exception:
+        logger.debug("Failed to construct ExecutionControlStore from runner pool", exc_info=True)
+        return None
+    if not hasattr(store, "put_task_contract"):
+        return None
+    if isinstance(getattr(runner, "services", None), dict):
+        runner.services["execution_control_store"] = store
+    return store
+
+
+def _execution_control_pool_is_usable(pool: Any) -> bool:
+    if pool is None:
+        return False
+    return any(callable(getattr(pool, name, None)) for name in (
+        "acquire",
+        "fetch",
+        "fetchrow",
+        "execute",
+    ))
+
+
+def _feature_metadata_bool(feature: Feature, keys: tuple[str, ...]) -> bool:
+    metadata = getattr(feature, "metadata", {}) or {}
+    return isinstance(metadata, dict) and any(bool(metadata.get(key)) for key in keys)
+
+
+def _runner_services_bool(runner: WorkflowRunner, keys: tuple[str, ...]) -> bool:
+    services = getattr(runner, "services", {}) or {}
+    return any(bool(services.get(key)) for key in keys)
+
+
+async def _feature_requires_execution_control_proofs(
+    runner: WorkflowRunner,
+    feature: Feature,
+) -> bool:
+    feature_id = str(getattr(feature, "id", "") or "")
+    if not feature_id:
+        return False
+    marker = await _execution_control_marker_payload(
+        runner,
+        feature,
+        (f"execution-control-adoption:{feature_id}",),
+    )
+    return _execution_control_marker_is_valid(
+        marker,
+        feature_id=feature_id,
+        valid_statuses={
+            "active",
+            "adopted",
+            "adoption-complete",
+            "adoption_complete",
+            "complete",
+            "execution-control-adopted",
+        },
+    )
+
+
+async def _feature_has_execution_control_legacy_marker(
+    runner: WorkflowRunner,
+    feature: Feature,
+) -> bool:
+    if await _feature_requires_execution_control_proofs(runner, feature):
+        return False
+    feature_id = str(getattr(feature, "id", "") or "")
+    if not feature_id:
+        return False
+    marker = await _execution_control_marker_payload(
+        runner,
+        feature,
+        (
+            f"execution-control-legacy:{feature_id}",
+            f"execution-control-legacy-inflight:{feature_id}",
+        ),
+    )
+    return _execution_control_marker_is_valid(
+        marker,
+        feature_id=feature_id,
+        valid_statuses={
+            "active",
+            "in-flight",
+            "in_flight",
+            "legacy",
+            "legacy-in-flight",
+            "legacy_in_flight",
+        },
+    )
+
+
+async def _execution_control_marker_payload(
+    runner: WorkflowRunner,
+    feature: Feature,
+    keys: tuple[str, ...],
+) -> dict[str, Any]:
+    for key in keys:
+        try:
+            raw = await runner.artifacts.get(key, feature=feature)
+        except Exception:
+            continue
+        payload = _json_object_from_text(raw)
+        if payload:
+            return payload
+    return {}
+
+
+def _execution_control_marker_is_valid(
+    marker: dict[str, Any],
+    *,
+    feature_id: str,
+    valid_statuses: set[str],
+) -> bool:
+    if not isinstance(marker, dict) or not marker:
+        return False
+    marker_feature_id = str(marker.get("feature_id") or "").strip()
+    if marker_feature_id and marker_feature_id != feature_id:
+        return False
+    status = str(marker.get("status") or "").strip().lower()
+    return status in valid_statuses
+
+
+async def _artifact_exists(
+    runner: WorkflowRunner,
+    feature: Feature,
+    key: str,
+) -> bool:
+    try:
+        return bool(await runner.artifacts.get(key, feature=feature))
+    except Exception:
+        return False
+
+
+async def _dag_group_has_control_plane_checkpoint_proof(
+    runner: WorkflowRunner,
+    feature: Feature,
+    group_idx: int,
+) -> bool:
+    return (
+        await _artifact_exists(runner, feature, f"dag-group-commit-proof:{group_idx}")
+        or await _artifact_exists(
+            runner,
+            feature,
+            f"dag-checkpoint-gate-proof:{group_idx}",
+        )
+    )
+
+
+async def _record_typed_verification_gate_node(
+    runner: WorkflowRunner,
+    feature: Feature,
+    *,
+    kind: str,
+    name: str,
+    stage: str,
+    payload: dict[str, Any],
+    dag_sha256: str = "",
+    group_idx: int | None = None,
+    status: str = "approved",
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    store = _execution_control_store_for_runner(runner)
+    recorder = getattr(store, "record_verification_graph_node", None)
+    if not callable(recorder):
+        return {
+            "persisted": False,
+            "failure_class": "verification_graph_store_unavailable",
+            "failure_type": "missing_execution_control_store",
+        }
+    node_payload = dict(payload)
+    digest = _dag_verify_graph_digest({
+        "dag_sha256": dag_sha256,
+        "feature_id": str(feature.id),
+        "group_idx": group_idx,
+        "kind": kind,
+        "name": name,
+        "payload": node_payload,
+        "stage": stage,
+        "status": status,
+    })
+    try:
+        result = await recorder({
+            "feature_id": str(feature.id),
+            "dag_sha256": dag_sha256 or "",
+            "group_idx": group_idx,
+            "stage": stage,
+            "kind": kind,
+            "name": name,
+            "status": status,
+            "deterministic": True,
+            "idempotency_key": (
+                f"verify-gate:{feature.id}:{dag_sha256 or 'no-dag'}:"
+                f"{group_idx if group_idx is not None else 'post'}:{stage}:{name}:{digest}"
+            ),
+            "payload": node_payload,
+            "content_hash": digest,
+            "metadata": metadata or {},
+        })
+    except Exception as exc:
+        return {
+            "persisted": False,
+            "failure_class": "verification_graph_persistence",
+            "failure_type": type(exc).__name__,
+            "error": str(exc)[:1000],
+        }
+    evidence = getattr(result, "evidence", None)
+    return {
+        "persisted": True,
+        "evidence_node_id": getattr(evidence, "id", None),
+        "content_hash": getattr(evidence, "content_hash", digest),
+        "kind": getattr(evidence, "kind", kind),
+        "stage": getattr(evidence, "stage", stage),
+        "group_idx": getattr(evidence, "group_idx", group_idx),
+        "status": getattr(evidence, "status", status),
+    }
+
+
+async def _typed_verification_gate_node_is_fresh(
+    runner: WorkflowRunner,
+    feature: Feature,
+    *,
+    proof: dict[str, Any],
+    kind: str,
+    stage: str,
+    dag_sha256: str = "",
+    group_idx: int | None = None,
+) -> bool:
+    if proof.get("persisted") is not True:
+        return False
+    evidence_node_id = proof.get("evidence_node_id")
+    content_hash = str(proof.get("content_hash") or "")
+    if evidence_node_id is None or not content_hash:
+        return False
+    store = _execution_control_store_for_runner(runner)
+    lister = getattr(store, "list_verification_graph_nodes", None)
+    if not callable(lister):
+        return False
+    try:
+        nodes = await lister(
+            str(feature.id),
+            dag_sha256=dag_sha256 or "",
+            group_idx=group_idx,
+            stage=stage,
+            limit=100,
+        )
+    except Exception:
+        return False
+    for node in nodes:
+        if getattr(node, "id", None) != evidence_node_id:
+            continue
+        return (
+            getattr(node, "kind", "") == kind
+            and getattr(node, "stage", "") == stage
+            and getattr(node, "status", "") == "approved"
+            and getattr(node, "content_hash", "") == content_hash
+        )
+    return False
+
+
+def _task_contract_projection_summary(contract: Any) -> dict[str, Any]:
+    payload = _model_json_dict(contract)
+
+    def _items(name: str) -> list[Any]:
+        value = payload.get(name, [])
+        return value if isinstance(value, list) else []
+
+    return {
+        "artifact_schema": "dag-task-contract-compatibility-v1",
+        "authoritative_mode": "typed_task_contract",
+        "contract_id": payload.get("id"),
+        "contract_digest": payload.get("contract_digest", ""),
+        "dag_sha256": payload.get("dag_sha256", ""),
+        "group_idx": payload.get("group_idx"),
+        "task_id": payload.get("task_id", ""),
+        "repo_id": payload.get("repo_id", ""),
+        "path_counts": {
+            "required_paths": len(_items("required_paths")),
+            "allowed_paths": len(_items("allowed_paths")),
+            "read_only_paths": len(_items("read_only_paths")),
+            "forbidden_paths": len(_items("forbidden_paths")),
+            "generated_outputs": len(_items("generated_outputs")),
+        },
+        "unknown_write_set": bool(payload.get("unknown_write_set")),
+        "execution_policy": payload.get("execution_policy", {}),
+        "gates": [
+            {
+                "id": str(gate.get("id", "")),
+                "gate_kind": str(gate.get("gate_kind", "")),
+                "name": str(gate.get("name", "")),
+                "blocks_merge": bool(gate.get("blocks_merge", True)),
+            }
+            for gate in _items("verification_gates")[:20]
+            if isinstance(gate, dict)
+        ],
+        "compile_warnings": _items("compile_warnings")[:20],
+    }
+
+
+def _task_contract_digest(contract: Any | None) -> str:
+    if contract is None:
+        return ""
+    return str(getattr(contract, "contract_digest", "") or _model_json_dict(contract).get("contract_digest", ""))
+
+
+def _task_contract_id(contract: Any | None) -> int | None:
+    if contract is None:
+        return None
+    raw = getattr(contract, "id", None)
+    if raw is None:
+        raw = _model_json_dict(contract).get("id")
+    try:
+        return int(raw) if raw is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+async def _persist_task_contracts(
+    runner: WorkflowRunner,
+    feature: Feature,
+    contracts: list[Any],
+) -> dict[str, Any]:
+    store = _execution_control_store_for_runner(runner)
+    persisted: dict[str, Any] = {}
+    for contract in contracts:
+        payload = _model_json_dict(contract)
+        task_id = str(payload.get("task_id", ""))
+        if not task_id:
+            continue
+        stored_contract = contract
+        if store is not None and StoredTaskDeliverableContract is not None:
+            result = await store.put_task_contract(StoredTaskDeliverableContract(**payload))
+            contract_id = getattr(result.contract, "id", None)
+            if hasattr(contract, "model_copy"):
+                stored_contract = contract.model_copy(update={"id": contract_id})
+            else:
+                payload["id"] = contract_id
+                stored_contract = payload
+        else:
+            await runner.artifacts.put(
+                _task_contract_projection_key(task_id),
+                _workspace_authority_json(_task_contract_projection_summary(contract)),
+                feature=feature,
+            )
+        persisted[task_id] = stored_contract
+    return persisted
+
+
+async def _task_contract_projection_matches(
+    runner: WorkflowRunner,
+    feature: Feature,
+    contract: Any | None,
+    *,
+    preexisting_digest: str | None = None,
+) -> bool:
+    digest = _task_contract_digest(contract)
+    task_id = str(getattr(contract, "task_id", "") or _model_json_dict(contract).get("task_id", ""))
+    if not digest or not task_id:
+        return False
+    if preexisting_digest is not None:
+        return preexisting_digest == digest
+    raw = await runner.artifacts.get(_task_contract_projection_key(task_id), feature=feature)
+    if not raw:
+        return False
+    try:
+        payload = json.loads(str(raw))
+    except Exception:
+        return False
+    return str(payload.get("contract_digest", "")) == digest
+
+
+def _task_contract_prompt_block(contract: Any | None) -> str:
+    if contract is None:
+        return ""
+    payload = _model_json_dict(contract)
+
+    def _rule_lines(name: str, limit: int = 40) -> list[str]:
+        raw = payload.get(name, [])
+        rules = raw if isinstance(raw, list) else []
+        lines: list[str] = []
+        for rule in rules[:limit]:
+            if not isinstance(rule, dict):
+                continue
+            flags = [
+                flag
+                for flag in ("allow_create", "allow_modify", "allow_delete", "required")
+                if bool(rule.get(flag))
+            ]
+            suffix = f" ({', '.join(flags)})" if flags else ""
+            lines.append(
+                f"- `{rule.get('repo_id', payload.get('repo_id', ''))}:{rule.get('path', '')}` "
+                f"[{rule.get('intent', 'unknown')}/{rule.get('match_kind', 'file')}]{suffix}"
+            )
+        if len(rules) > limit:
+            lines.append(f"- ... {len(rules) - limit} more")
+        return lines
+
+    sections = [
+        "## Deliverable Contract",
+        f"- Contract ID: `{payload.get('id') or 'pending'}`",
+        f"- Contract digest: `{payload.get('contract_digest', '')}`",
+        f"- Repo: `{payload.get('repo_id', '')}` (`{payload.get('repo_path', '')}`)",
+        f"- Write-set mode: `{(payload.get('execution_policy') or {}).get('write_set_mode', '')}`",
+        "",
+        "Required paths:",
+        *(_rule_lines("required_paths") or ["- None"]),
+        "",
+        "Allowed writes:",
+        *(_rule_lines("allowed_paths") or ["- None"]),
+        "",
+        "Read-only paths:",
+        *(_rule_lines("read_only_paths") or ["- None"]),
+        "",
+        "Forbidden paths:",
+        *(_rule_lines("forbidden_paths") or ["- None"]),
+    ]
+    generated = _rule_lines("generated_outputs")
+    if generated:
+        sections.extend(["", "Generated outputs:", *generated])
+    criteria = payload.get("acceptance_criteria", [])
+    if isinstance(criteria, list) and criteria:
+        sections.extend(["", "Contract acceptance criteria:"])
+        for criterion in criteria[:30]:
+            if isinstance(criterion, dict):
+                sections.append(f"- `{criterion.get('id', '')}` {criterion.get('text', '')}")
+        if len(criteria) > 30:
+            sections.append(f"- ... {len(criteria) - 30} more")
+    sections.append(
+        "\nOnly change paths allowed by this contract. Task result file lists are evidence, not authority."
+    )
+    return "\n".join(sections)
+
+
+async def _compile_task_contracts_for_group(
+    runner: WorkflowRunner,
+    feature: Feature,
+    dag: ImplementationDAG,
+    group_idx: int,
+    group_tasks: list[ImplementationTask],
+    *,
+    registry: Any | None,
+    feature_root: Path | None,
+    dag_sha256: str,
+) -> TaskContractCompileOutcome:
+    if ContractCompiler is None or ContractGroupCompileRequest is None:
+        return TaskContractCompileOutcome(
+            approved=False,
+            failure="Task contract compiler is unavailable before dispatch.",
+            failure_class="contract_compile",
+            failure_type="contract_compiler_unavailable",
+            route="quiesce",
+        )
+    if registry is None:
+        return TaskContractCompileOutcome(
+            approved=False,
+            failure="Task contract compiler has no workspace registry before dispatch.",
+            failure_class="contract_compile",
+            failure_type="contract_missing_workspace_registry",
+            route="quiesce",
+        )
+    preexisting_digests: dict[str, str] = {}
+    for task in group_tasks:
+        raw = await runner.artifacts.get(
+            _task_contract_projection_key(task.id),
+            feature=feature,
+        )
+        if not raw:
+            continue
+        try:
+            payload = json.loads(str(raw))
+        except Exception:
+            continue
+        digest = str(payload.get("contract_digest") or "")
+        if digest:
+            preexisting_digests[task.id] = digest
+    source_record = await _dag_artifact_record_for_key(runner, feature, "dag")
+    source_dag_artifact_id = 0
+    if source_record and source_record.get("id") is not None:
+        try:
+            source_dag_artifact_id = int(source_record["id"])
+        except (TypeError, ValueError):
+            source_dag_artifact_id = 0
+    source_dag_sha256 = str(source_record.get("sha256") if source_record else "") or dag_sha256
+    manifest_entries = _dag_manifest_path_entries(_dag_candidate_file_roots(feature_root))
+    try:
+        contracts = ContractCompiler().compile_group(
+            ContractGroupCompileRequest(
+                feature_id=str(getattr(feature, "id", "")),
+                dag_sha256=dag_sha256,
+                source_dag_artifact_id=source_dag_artifact_id,
+                source_dag_sha256=source_dag_sha256,
+                group_idx=group_idx,
+                tasks=group_tasks,
+                all_task_ids=[task.id for task in dag.tasks],
+                workspace_registry=registry,
+                manifest_expected_files=manifest_entries.get("expected_files", []),
+                manifest_forbidden_files=manifest_entries.get("forbidden_files", []),
+            )
+        )
+        persisted = await _persist_task_contracts(runner, feature, contracts)
+    except Exception as exc:
+        failure_class = "contract_compile"
+        failure_type = "contract_compile_failed"
+        route = "run_contract_repair"
+        if ContractCompileError is not None and isinstance(exc, ContractCompileError):
+            failure_class = str(getattr(exc, "failure_class", failure_class))
+            failure_type = str(getattr(exc, "failure_type", failure_type))
+            route = str(getattr(exc, "route", route))
+        artifact_key = f"dag-task-contract:compile-failure:g{group_idx}"
+        await runner.artifacts.put(
+            artifact_key,
+            _workspace_authority_json({
+                "artifact_schema": "dag-task-contract-compile-failure-v1",
+                "group_idx": group_idx,
+                "approved": False,
+                "failure_class": failure_class,
+                "failure_type": failure_type,
+                "route": route,
+                "error": str(exc),
+                "task_ids": [task.id for task in group_tasks],
+            }),
+            feature=feature,
+        )
+        return TaskContractCompileOutcome(
+            approved=False,
+            failure=(
+                "Task deliverable contract compilation failed before dispatch. "
+                f"{failure_class}/{failure_type}: {exc}"
+            ),
+            failure_class=failure_class,
+            failure_type=failure_type,
+            route=route,
+            artifact_key=artifact_key,
+        )
+    return TaskContractCompileOutcome(
+        approved=True,
+        contracts_by_task_id=persisted,
+        preexisting_contract_digests=preexisting_digests,
+    )
+
+
+def _contract_repo_id(contract: Any) -> str:
+    return str(getattr(contract, "repo_id", "") or _model_json_dict(contract).get("repo_id", ""))
+
+
+def _contract_repo_path(contract: Any) -> str:
+    return str(
+        getattr(contract, "repo_path", "")
+        or _model_json_dict(contract).get("repo_path", "")
+    ).strip("/")
+
+
+def _contract_verdict_projection_key(
+    contract: Any,
+    *,
+    group_idx: int,
+    stage: str,
+) -> str:
+    task_id = str(getattr(contract, "task_id", "") or _model_json_dict(contract).get("task_id", ""))
+    repo_id = _contract_repo_id(contract)
+    return (
+        f"dag-contract-verdict:g{group_idx}:{task_id}:"
+        f"{_contract_stage_sandbox_id(group_idx, stage, repo_id)}"
+    )
+
+
+async def _task_contract_approved_verdict_exists(
+    runner: WorkflowRunner,
+    feature: Feature,
+    contract: Any | None,
+    *,
+    group_idx: int,
+    stage: str,
+    patch_summary_id: int | None = None,
+) -> bool:
+    if contract is None:
+        return False
+    raw = await runner.artifacts.get(
+        _contract_verdict_projection_key(contract, group_idx=group_idx, stage=stage),
+        feature=feature,
+    )
+    if not raw:
+        return False
+    try:
+        payload = json.loads(str(raw))
+    except Exception:
+        return False
+    if not bool(payload.get("approved")):
+        return False
+    expected_id = _task_contract_id(contract)
+    projected_id = payload.get("contract_id")
+    if expected_id is not None and projected_id not in {None, 0, expected_id}:
+        return False
+    projected_digest = str(payload.get("contract_digest") or "")
+    if projected_digest and projected_digest != _task_contract_digest(contract):
+        return False
+    if patch_summary_id is not None:
+        try:
+            projected_patch_summary_id = int(payload.get("patch_summary_id") or 0)
+        except (TypeError, ValueError):
+            return False
+        if projected_patch_summary_id != patch_summary_id:
+            return False
+    return True
+
+
+async def _completed_task_marker_has_current_lineage(
+    runner: WorkflowRunner,
+    feature: Feature,
+    contract: Any | None,
+    *,
+    group_idx: int,
+    preexisting_digest: str | None,
+) -> bool:
+    if contract is None:
+        return False
+    if not await _task_contract_projection_matches(
+        runner,
+        feature,
+        contract,
+        preexisting_digest=preexisting_digest,
+    ):
+        return False
+    return await _task_contract_approved_verdict_exists(
+        runner,
+        feature,
+        contract,
+        group_idx=group_idx,
+        stage="implementation",
+    )
+
+
+def _dedupe_contract_items(values: list[Any]) -> list[Any]:
+    seen: set[str] = set()
+    items: list[Any] = []
+    for value in values:
+        key = json.dumps(_workspace_authority_jsonable(value), sort_keys=True)
+        if key in seen:
+            continue
+        seen.add(key)
+        items.append(value)
+    return items
+
+
+def _combined_contract_for_repo(contracts: list[Any]) -> Any | None:
+    if not contracts:
+        return None
+    base = contracts[0]
+    update: dict[str, Any] = {
+        "id": None,
+        "task_id": "+".join(
+            sorted(
+                str(getattr(contract, "task_id", "") or _model_json_dict(contract).get("task_id", ""))
+                for contract in contracts
+            )
+        ),
+    }
+    for field_name in (
+        "required_paths",
+        "allowed_paths",
+        "read_only_paths",
+        "forbidden_paths",
+        "generated_outputs",
+        "acceptance_criteria",
+        "verification_gates",
+        "non_goals",
+        "dependency_task_ids",
+        "compile_warnings",
+    ):
+        merged: list[Any] = []
+        for contract in contracts:
+            value = getattr(contract, field_name, None)
+            if value is None:
+                value = _model_json_dict(contract).get(field_name, [])
+            merged.extend(list(value or []))
+        update[field_name] = _dedupe_contract_items(merged)
+    update["unknown_write_set"] = any(
+        bool(getattr(contract, "unknown_write_set", False)
+             or _model_json_dict(contract).get("unknown_write_set", False))
+        for contract in contracts
+    )
+    if hasattr(base, "model_copy"):
+        return base.model_copy(update=update)
+    payload = _model_json_dict(base)
+    payload.update(update)
+    return payload
+
+
+def _result_paths_for_contracts(
+    results: list[object],
+    contracts_by_task_id: dict[str, Any],
+    repo_id: str,
+) -> tuple[list[str], list[str]]:
+    created: list[str] = []
+    modified: list[str] = []
+    for result in results:
+        if not isinstance(result, ImplementationResult):
+            continue
+        contract = contracts_by_task_id.get(result.task_id)
+        if contract is None or _contract_repo_id(contract) != repo_id:
+            continue
+        created.extend(str(path) for path in result.files_created if str(path).strip())
+        modified.extend(str(path) for path in result.files_modified if str(path).strip())
+    return _dedupe_preserving_order(created), _dedupe_preserving_order(modified)
+
+
+def _contract_relative_observed_path(contract: Any, path: str) -> str:
+    text = str(path or "").strip().replace("\\", "/").strip("/")
+    repo_path = _contract_repo_path(contract)
+    if repo_path and text.startswith(f"{repo_path}/"):
+        return text[len(repo_path) + 1:]
+    return text
+
+
+def _reported_paths_by_repo(
+    contracts_by_task_id: dict[str, Any],
+    results: list[object],
+) -> dict[str, set[str]]:
+    reported: dict[str, set[str]] = collections.defaultdict(set)
+    for result in results:
+        if not isinstance(result, ImplementationResult):
+            continue
+        contract = contracts_by_task_id.get(result.task_id)
+        if contract is None:
+            continue
+        repo_id = _contract_repo_id(contract)
+        if not repo_id:
+            continue
+        for path in [*result.files_created, *result.files_modified]:
+            rel = _contract_relative_observed_path(contract, path)
+            if rel:
+                reported[repo_id].add(rel)
+    return reported
+
+
+def _contract_rule_matches_observed_path(contract: Any, path: str) -> bool:
+    rel = _contract_relative_observed_path(contract, path)
+    if not rel:
+        return False
+    payload = _model_json_dict(contract)
+    for field_name in (
+        "allowed_paths",
+        "required_paths",
+        "read_only_paths",
+        "forbidden_paths",
+        "generated_outputs",
+    ):
+        for rule in payload.get(field_name, []) or []:
+            if not isinstance(rule, dict):
+                rule = _model_json_dict(rule)
+            rule_path = str(rule.get("path", "") or "")
+            if not rule_path:
+                continue
+            if str(rule.get("match_kind", "file")) == "directory":
+                if rel.startswith(rule_path.rstrip("/") + "/"):
+                    return True
+            elif rel == rule_path:
+                return True
+    return False
+
+
+def _contract_guard_results_for_repair(
+    results: list[object],
+    contracts_by_task_id: dict[str, Any] | None,
+) -> list[object]:
+    if not contracts_by_task_id:
+        return list(results)
+    guarded: list[object] = []
+    for result in results:
+        if not isinstance(result, ImplementationResult):
+            guarded.append(result)
+            continue
+        if result.task_id in contracts_by_task_id:
+            guarded.append(result)
+            continue
+        changed_paths = [*result.files_created, *result.files_modified]
+        if not changed_paths and len(contracts_by_task_id) == 1:
+            inferred = next(iter(contracts_by_task_id))
+            guarded.append(result.model_copy(update={"task_id": inferred}))
+            continue
+        matching_task_ids = [
+            task_id
+            for task_id, contract in contracts_by_task_id.items()
+            if changed_paths
+            and all(
+                _contract_rule_matches_observed_path(contract, path)
+                for path in changed_paths
+            )
+        ]
+        if len(matching_task_ids) == 1:
+            guarded.append(result.model_copy(update={"task_id": matching_task_ids[0]}))
+        else:
+            guarded.append(result)
+    return guarded
+
+
+def _parse_git_status_patch_paths(
+    status_text: str,
+) -> tuple[list[str], list[str], list[str], dict[str, str]]:
+    created: list[str] = []
+    modified: list[str] = []
+    deleted: list[str] = []
+    renamed: dict[str, str] = {}
+    for line in status_text.splitlines():
+        if len(line) < 4:
+            continue
+        xy = line[:2]
+        raw_path = line[3:].strip().strip('"')
+        if not raw_path:
+            continue
+        if " -> " in raw_path:
+            old_path, new_path = raw_path.split(" -> ", 1)
+            renamed[old_path.strip().strip('"')] = new_path.strip().strip('"')
+            continue
+        if xy == "??" or "A" in xy:
+            created.append(raw_path)
+        elif "D" in xy:
+            deleted.append(raw_path)
+        elif "M" in xy or "R" in xy or "C" in xy or "T" in xy:
+            modified.append(raw_path)
+    return (
+        _dedupe_preserving_order(created),
+        _dedupe_preserving_order(modified),
+        _dedupe_preserving_order(deleted),
+        dict(sorted(renamed.items())),
+    )
+
+
+async def _git_patch_evidence(
+    repo_dir: Path,
+) -> tuple[bool, str, list[str], list[str], list[str], dict[str, str], str, str]:
+    status_rc, status_stdout, status_stderr = await _run_git_for_commit(
+        repo_dir,
+        "status",
+        "--porcelain=v1",
+        "-uall",
+    )
+    if status_rc != 0:
+        digest = hashlib.sha256(status_stderr.encode("utf-8")).hexdigest()
+        return False, digest, [], [], [], {}, "", status_stderr
+    created, modified, deleted, renamed = _parse_git_status_patch_paths(status_stdout)
+    diff_rc, diff_stdout, diff_stderr = await _run_git_for_commit(
+        repo_dir, "diff", "--binary", "HEAD", "--",
+    )
+    diff_material = {
+        "status": status_stdout,
+        "diff": diff_stdout if diff_rc == 0 else "",
+        "diff_error": diff_stderr if diff_rc != 0 else "",
+    }
+    digest = hashlib.sha256(
+        json.dumps(diff_material, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    return True, digest, created, modified, deleted, renamed, status_stdout, diff_stderr
+
+
+def _contract_workspace_snapshot(
+    feature: Feature,
+    dag_sha256: str,
+    group_idx: int,
+    stage: str,
+    repo_id: str,
+    repo_path: str,
+    repo_dir: Path,
+    paths: list[str],
+) -> Any:
+    if WorkspaceAuthoritySnapshot is None:
+        return None
+    return WorkspaceAuthoritySnapshot(
+        feature_id=str(getattr(feature, "id", "")),
+        dag_sha256=dag_sha256,
+        group_idx=group_idx,
+        stage=stage,
+        repo_id=repo_id,
+        role="execution",
+        canonical_path=str(repo_dir),
+        workspace_relative_path=repo_path,
+        case_sensitivity="unknown",
+        dirty_paths=paths,
+        present_paths=paths,
+        no_dirty=not paths,
+        captured_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        validated_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    )
+
+
+async def _record_contract_patch_summary(
+    runner: WorkflowRunner,
+    feature: Feature,
+    patch: Any,
+    *,
+    feature_id: str,
+    dag_sha256: str,
+    group_idx: int,
+    stage: str,
+    task_ids: list[str],
+    metadata: dict[str, Any],
+) -> tuple[int | None, list[str]]:
+    repo_id = str(getattr(patch, "repo_id", "") or _model_json_dict(patch).get("repo_id", ""))
+    sandbox_id = str(getattr(patch, "sandbox_id", "") or _model_json_dict(patch).get("sandbox_id", ""))
+    projection_key = (
+        f"dag-sandbox-patch:g{group_idx}:attempt-0:repo-{_safe_contract_key_fragment(repo_id)}"
+    )
+    store = _execution_control_store_for_runner(runner)
+    if store is not None and StoredPatchSummary is not None:
+        contract_id_digest = hashlib.sha256(
+            json.dumps(
+                sorted(
+                    int(contract_id)
+                    for contract_id in list(getattr(patch, "contract_ids", []) or [])
+                    if contract_id is not None
+                ),
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()
+        result = await store.record_patch_summary(StoredPatchSummary(
+            feature_id=feature_id,
+            dag_sha256=dag_sha256,
+            group_idx=group_idx,
+            attempt_no=0,
+            sandbox_id=sandbox_id,
+            task_id=",".join(task_ids),
+            contract_ids=[
+                int(contract_id)
+                for contract_id in list(getattr(patch, "contract_ids", []) or [])
+                if contract_id is not None
+            ],
+            repo_id=repo_id,
+            base_commit=str(getattr(patch, "base_commit", "") or "") or None,
+            changed_paths=list(getattr(patch, "changed_paths", []) or []),
+            created_paths=list(getattr(patch, "created_paths", []) or []),
+            modified_paths=list(getattr(patch, "modified_paths", []) or []),
+            deleted_paths=list(getattr(patch, "deleted_paths", []) or []),
+            renamed_paths=dict(getattr(patch, "renamed_paths", {}) or {}),
+            diff_sha256=str(getattr(patch, "diff_sha256", "") or ""),
+            stage=stage,
+            metadata=metadata,
+            payload={**_model_json_dict(patch), **{
+                key: value
+                for key, value in {
+                    "workspace_snapshot_id": metadata.get("workspace_snapshot_id"),
+                    "base_snapshot_id": metadata.get("base_snapshot_id"),
+                    "base_snapshot_ids": list(metadata.get("base_snapshot_ids") or []),
+                }.items()
+                if value not in (None, [], "")
+            }},
+            idempotency_key=(
+                f"idem:sandbox-patch:{feature_id}:{dag_sha256}:g{group_idx}:"
+                f"{stage}:repo-{repo_id}:{sandbox_id}:{contract_id_digest}:"
+                f"{getattr(patch, 'diff_sha256', '')}"
+            ),
+        ))
+        return getattr(result.evidence, "id", None), [projection_key]
+
+    await runner.artifacts.put(
+        projection_key,
+        _workspace_authority_json({
+            "artifact_schema": "dag-sandbox-patch-compatibility-v1",
+            "authoritative_mode": "typed_task_contract",
+            "group_idx": group_idx,
+            "stage": stage,
+            "sandbox_id": sandbox_id,
+            "repo_id": repo_id,
+            "contract_ids": list(getattr(patch, "contract_ids", []) or []),
+            "path_counts": {
+                "changed_paths": len(list(getattr(patch, "changed_paths", []) or [])),
+                "created_paths": len(list(getattr(patch, "created_paths", []) or [])),
+                "modified_paths": len(list(getattr(patch, "modified_paths", []) or [])),
+                "deleted_paths": len(list(getattr(patch, "deleted_paths", []) or [])),
+                "renamed_paths": len(dict(getattr(patch, "renamed_paths", {}) or {})),
+            },
+            "changed_paths": list(getattr(patch, "changed_paths", []) or [])[:50],
+            "diff_sha256": str(getattr(patch, "diff_sha256", "") or ""),
+            "workspace_snapshot_id": metadata.get("workspace_snapshot_id"),
+            "base_snapshot_id": metadata.get("base_snapshot_id"),
+            "base_snapshot_ids": list(metadata.get("base_snapshot_ids") or []),
+            "metadata": metadata,
+        }),
+        feature=feature,
+    )
+    return None, [projection_key]
+
+
+async def _record_contract_verdict_projection(
+    runner: WorkflowRunner,
+    feature: Feature,
+    contract: Any,
+    verdict: Any,
+    *,
+    feature_id: str,
+    dag_sha256: str,
+    group_idx: int,
+    stage: str,
+    sandbox_id: str,
+    patch_summary_id: int | None,
+    metadata: dict[str, Any],
+) -> str:
+    task_id = str(getattr(contract, "task_id", "") or _model_json_dict(contract).get("task_id", ""))
+    contract_id = _task_contract_id(contract) or 0
+    projection_key = (
+        f"dag-contract-verdict:g{group_idx}:{task_id}:"
+        f"{_safe_contract_key_fragment(sandbox_id)}"
+    )
+    approved = bool(getattr(verdict, "approved", False))
+    violations = list(getattr(verdict, "violations", []) or [])
+    violation_codes = list(getattr(verdict, "violation_codes", []) or [])
+    projection_payload = {
+        "artifact_schema": "dag-contract-verdict-compatibility-v1",
+        "authoritative_mode": "typed_task_contract",
+        "group_idx": group_idx,
+        "stage": stage,
+        "task_id": task_id,
+        "contract_id": contract_id,
+        "contract_digest": _task_contract_digest(contract),
+        "patch_summary_id": patch_summary_id,
+        "sandbox_id": sandbox_id,
+        "approved": approved,
+        "violation_codes": violation_codes,
+        "violations": violations[:50],
+        "metadata": metadata,
+    }
+    store = _execution_control_store_for_runner(runner)
+    if store is not None and StoredContractVerdict is not None:
+        await store.record_contract_verdict(StoredContractVerdict(
+            feature_id=feature_id,
+            dag_sha256=dag_sha256,
+            group_idx=group_idx,
+            task_id=task_id,
+            sandbox_id=sandbox_id,
+            contract_id=contract_id,
+            patch_summary_id=patch_summary_id or 0,
+            approved=approved,
+            violation_codes=violation_codes,
+            violations=violations,
+            required_evidence_node_ids=list(
+                getattr(verdict, "required_evidence_node_ids", []) or []
+            ),
+            stage=stage,
+            summary="approved" if approved else "; ".join(violation_codes[:8]),
+            metadata=metadata,
+            payload=_model_json_dict(verdict),
+            idempotency_key=(
+                f"idem:contract-verdict:{feature_id}:{dag_sha256}:g{group_idx}:"
+                f"{task_id}:{sandbox_id}:{contract_id}:{patch_summary_id or 0}:"
+                f"{hashlib.sha256(json.dumps(violation_codes, sort_keys=True).encode('utf-8')).hexdigest()}"
+            ),
+        ))
+        return projection_key
+
+    await runner.artifacts.put(
+        projection_key,
+        _workspace_authority_json(projection_payload),
+        feature=feature,
+    )
+    return projection_key
+
+
+async def _record_precommit_contract_verdicts(
+    runner: WorkflowRunner,
+    feature: Feature,
+    *,
+    dag_sha256: str,
+    group_idx: int,
+    stage: str,
+    feature_root: Path | None,
+    contracts_by_task_id: dict[str, Any],
+    results: list[object],
+    workspace_snapshots: list[Any] | None = None,
+) -> TaskContractCommitGuardOutcome:
+    if not results or not contracts_by_task_id:
+        return TaskContractCommitGuardOutcome()
+    if ContractCompiler is None or CompiledPatchSummary is None or WorkspaceAuthoritySnapshot is None:
+        return TaskContractCommitGuardOutcome(
+            approved=False,
+            failure="Task contract pre-commit validation is unavailable.",
+            violation_codes=["contract_validator_unavailable"],
+        )
+    if feature_root is None:
+        return TaskContractCommitGuardOutcome(
+            approved=False,
+            failure="Task contract pre-commit validation has no canonical feature repo root.",
+            violation_codes=["contract_missing_workspace_root"],
+        )
+
+    compiler = ContractCompiler()
+    all_violation_codes: list[str] = []
+    artifact_keys: list[str] = []
+    failure_lines: list[str] = []
+    feature_id = str(getattr(feature, "id", ""))
+    reported_by_repo = _reported_paths_by_repo(contracts_by_task_id, results)
+    status_by_repo: dict[str, dict[str, Any]] = {}
+    workspace_snapshots = list(workspace_snapshots or [])
+
+    for repo_dir in _discover_repo_roots_under(feature_root):
+        try:
+            repo_key = repo_dir.relative_to(feature_root).as_posix()
+        except Exception:
+            continue
+        (
+            status_ok,
+            diff_sha256,
+            status_created,
+            status_modified,
+            status_deleted,
+            status_renamed,
+            status_text,
+            status_error,
+        ) = await _git_patch_evidence(repo_dir)
+        changed_paths = _dedupe_preserving_order(
+            status_created
+            + status_modified
+            + status_deleted
+            + list(status_renamed)
+            + list(status_renamed.values())
+        )
+        if changed_paths:
+            status_by_repo[repo_key] = {
+                "repo_dir": repo_dir,
+                "status_ok": status_ok,
+                "diff_sha256": diff_sha256,
+                "created": status_created,
+                "modified": status_modified,
+                "deleted": status_deleted,
+                "renamed": status_renamed,
+                "changed": set(changed_paths),
+                "status_text": status_text,
+                "status_error": status_error,
+            }
+
+    contracted_repo_ids = {
+        _contract_repo_id(contract)
+        for result in results
+        if isinstance(result, ImplementationResult)
+        for contract in [contracts_by_task_id.get(result.task_id)]
+        if contract is not None and _contract_repo_id(contract)
+    }
+
+    for repo_key, status in sorted(status_by_repo.items()):
+        matching_repo_ids = {
+            repo_id for repo_id in contracted_repo_ids
+            if repo_id == repo_key
+            or any(
+                _contract_repo_path(contract) == repo_key
+                for contract in contracts_by_task_id.values()
+                if _contract_repo_id(contract) == repo_id
+            )
+        }
+        if not matching_repo_ids:
+            all_violation_codes.append("uncontracted_dirty_repo")
+            failure_lines.append(
+                f"{repo_key}: dirty repo has no active task contract"
+            )
+            continue
+        for repo_id in matching_repo_ids:
+            unreported = sorted(set(status["changed"]) - reported_by_repo.get(repo_id, set()))
+            if unreported:
+                all_violation_codes.append("unreported_dirty_paths")
+                failure_lines.append(
+                    f"{repo_id}: unreported dirty paths {', '.join(unreported[:10])}"
+                )
+
+    relevant_results = [
+        result
+        for result in results
+        if isinstance(result, ImplementationResult)
+        and result.task_id in contracts_by_task_id
+    ]
+    missing_contract_results = [
+        result.task_id
+        for result in results
+        if isinstance(result, ImplementationResult)
+        and result.task_id not in contracts_by_task_id
+        and (result.files_created or result.files_modified)
+    ]
+    if missing_contract_results:
+        all_violation_codes.append("result_without_active_contract")
+        failure_lines.append(
+            "results without active contracts: "
+            + ", ".join(sorted(set(missing_contract_results))[:10])
+        )
+
+    for result in relevant_results:
+        contract = contracts_by_task_id[result.task_id]
+        repo_id = _contract_repo_id(contract)
+        repo_path = _contract_repo_path(contract)
+        repo_dir = feature_root / repo_path if repo_path else feature_root
+        sandbox_id = _contract_stage_sandbox_id(group_idx, stage, repo_id)
+        reported_created = [
+            _contract_relative_observed_path(contract, path)
+            for path in result.files_created
+            if str(path).strip()
+        ]
+        reported_modified = [
+            _contract_relative_observed_path(contract, path)
+            for path in result.files_modified
+            if str(path).strip()
+        ]
+        repo_status = next(
+            (
+                status
+                for key, status in status_by_repo.items()
+                if key == repo_path
+                or key == repo_id
+                or key == repo_dir.name
+            ),
+            {},
+        )
+        status_created_list = list(repo_status.get("created", []) or [])
+        status_modified_list = list(repo_status.get("modified", []) or [])
+        status_deleted_list = list(repo_status.get("deleted", []) or [])
+        status_renamed = dict(repo_status.get("renamed", {}) or {})
+        status_created = set(status_created_list)
+        status_modified = set(status_modified_list)
+        status_deleted = set(status_deleted_list)
+        reported_paths = _dedupe_preserving_order(reported_created + reported_modified)
+        reported_path_set = set(reported_paths)
+        actual_changed_paths = (
+            status_created
+            | status_modified
+            | status_deleted
+            | set(status_renamed)
+            | set(status_renamed.values())
+        )
+        if reported_path_set and not actual_changed_paths:
+            all_violation_codes.append("missing_patch_evidence")
+            failure_lines.append(
+                f"{result.task_id}: reported paths have no git patch evidence"
+            )
+            continue
+        missing_patch_paths = sorted(reported_path_set - actual_changed_paths)
+        if missing_patch_paths:
+            all_violation_codes.append("reported_path_without_patch_evidence")
+            failure_lines.append(
+                f"{result.task_id}: reported paths lack patch evidence "
+                + ", ".join(missing_patch_paths[:10])
+            )
+            continue
+        created_paths = _dedupe_preserving_order([
+            path for path in status_created_list if path in reported_path_set
+        ])
+        modified_paths = _dedupe_preserving_order([
+            path for path in status_modified_list if path in reported_path_set
+        ])
+        deleted_paths = _dedupe_preserving_order([
+            path for path in status_deleted_list if path in reported_path_set
+        ])
+        renamed_paths = {
+            old_path: new_path
+            for old_path, new_path in status_renamed.items()
+            if old_path in reported_path_set or new_path in reported_path_set
+        }
+        changed_paths = _dedupe_preserving_order(
+            created_paths
+            + modified_paths
+            + deleted_paths
+            + list(renamed_paths)
+            + list(renamed_paths.values())
+        )
+        diff_sha256 = str(repo_status.get("diff_sha256") or "")
+        if changed_paths and diff_sha256 == hashlib.sha256(b"").hexdigest():
+            diff_sha256 = hashlib.sha256(
+                json.dumps(
+                    {
+                        "created": created_paths,
+                        "modified": modified_paths,
+                        "deleted": deleted_paths,
+                        "renamed": renamed_paths,
+                        "status": repo_status.get("status_text", ""),
+                    },
+                    sort_keys=True,
+                ).encode("utf-8")
+            ).hexdigest()
+        if not diff_sha256:
+            diff_sha256 = hashlib.sha256(
+                json.dumps(changed_paths, sort_keys=True).encode("utf-8")
+            ).hexdigest()
+        contract_id = _task_contract_id(contract)
+        contract_ids = [contract_id] if contract_id is not None else []
+        repo_dir = feature_root / repo_path if repo_path else feature_root
+        snapshot = _contract_workspace_snapshot(
+            feature,
+            dag_sha256,
+            group_idx,
+            stage,
+            repo_id,
+            repo_path,
+            repo_dir,
+            changed_paths,
+        )
+        if snapshot is None:
+            all_violation_codes.append("contract_validation_unavailable")
+            failure_lines.append(f"{result.task_id}: contract validation unavailable")
+            continue
+        workspace_snapshot_id = _snapshot_id_for_repo(workspace_snapshots, repo_id)
+        snapshot_metadata = (
+            {
+                "workspace_snapshot_id": workspace_snapshot_id,
+                "base_snapshot_id": workspace_snapshot_id,
+                "base_snapshot_ids": [workspace_snapshot_id],
+            }
+            if workspace_snapshot_id
+            else {}
+        )
+        patch = CompiledPatchSummary(
+            sandbox_id=sandbox_id,
+            contract_ids=contract_ids,
+            repo_id=repo_id,
+            base_commit=str(
+                getattr(contract, "source_dag_sha256", "")
+                or _model_json_dict(contract).get("source_dag_sha256", "")
+            ) or None,
+            changed_paths=changed_paths,
+            created_paths=created_paths,
+            modified_paths=modified_paths,
+            deleted_paths=deleted_paths,
+            renamed_paths=renamed_paths,
+            diff_sha256=diff_sha256,
+        )
+        metadata = {
+            "status_ok": bool(repo_status.get("status_ok", False)),
+            "status_error": str(repo_status.get("status_error", ""))[:1000],
+            "task_ids": [result.task_id],
+            "stage": stage,
+            "reported_created": list(result.files_created),
+            "reported_modified": list(result.files_modified),
+            **snapshot_metadata,
+        }
+        patch_summary_id, patch_keys = await _record_contract_patch_summary(
+            runner,
+            feature,
+            patch,
+            feature_id=feature_id,
+            dag_sha256=dag_sha256,
+            group_idx=group_idx,
+            stage=stage,
+            task_ids=metadata["task_ids"],
+            metadata=metadata,
+        )
+        artifact_keys.extend(patch_keys)
+        if await _task_contract_approved_verdict_exists(
+            runner,
+            feature,
+            contract,
+            group_idx=group_idx,
+            stage=stage,
+            patch_summary_id=patch_summary_id,
+        ):
+            artifact_keys.append(
+                _contract_verdict_projection_key(
+                    contract,
+                    group_idx=group_idx,
+                    stage=stage,
+                )
+            )
+            continue
+        patch_for_validation = patch.model_copy(update={"id": patch_summary_id})
+        verdict = compiler.validate_patch(contract, patch_for_validation, snapshot)
+        key = await _record_contract_verdict_projection(
+            runner,
+            feature,
+            contract,
+            verdict,
+            feature_id=feature_id,
+            dag_sha256=dag_sha256,
+            group_idx=group_idx,
+            stage=stage,
+            sandbox_id=sandbox_id,
+            patch_summary_id=patch_summary_id,
+            metadata=metadata,
+        )
+        artifact_keys.append(key)
+        if not bool(getattr(verdict, "approved", False)):
+            codes = list(getattr(verdict, "violation_codes", []) or [])
+            all_violation_codes.extend(codes)
+            failure_lines.append(
+                f"{result.task_id}: {', '.join(codes[:10]) or 'contract violation'}"
+            )
+
+    if failure_lines:
+        return TaskContractCommitGuardOutcome(
+            approved=False,
+            failure=(
+                "Task deliverable contract verdict blocked commit before merge. "
+                + "; ".join(failure_lines)
+            ),
+            violation_codes=_dedupe_preserving_order(all_violation_codes),
+            artifact_keys=artifact_keys,
+        )
+    return TaskContractCommitGuardOutcome(artifact_keys=artifact_keys)
+
+
+async def _run_workspace_authority_pre_dispatch_adapter(
+    runner: WorkflowRunner,
+    feature: Feature,
+    group_idx: int,
+    group_tasks: list[ImplementationTask],
+    *,
+    workspace_root: Path,
+    feature_root: Path,
+    stage: str = "initial-dispatch",
+    dag_sha256: str = "",
+    attempt_id: int | None = None,
+) -> WorkspaceAuthorityCompatibilityOutcome:
+    """Run Slice 02 authority as a bounded compatibility projection.
+
+    The legacy worktree registry and existing pre-dispatch guards remain in
+    place. This helper delegates canonical registry/path/ACL/snapshot decisions
+    to WorkspaceAuthority and persists the result under Slice 02 artifact keys.
+    """
+    legacy_registry = await _load_worktree_registry_for_group(
+        runner,
+        feature,
+        group_idx,
+    )
+    authority, registry, unavailable = await _workspace_authority_build_registry_projection(
+        runner,
+        feature,
+        group_tasks,
+        workspace_root=workspace_root,
+        feature_root=feature_root,
+        group_idx=group_idx,
+        legacy_registry=legacy_registry,
+    )
+    feature_id = str(getattr(feature, "id", "") or getattr(feature, "slug", ""))
+    artifact_keys = {
+        "registry": _workspace_authority_artifact_key("registry", group_idx),
+        "preflight": _workspace_authority_artifact_key("preflight", group_idx, stage),
+        "acl": _workspace_authority_artifact_key("acl", group_idx, stage),
+        "routes": _workspace_authority_artifact_key("routes", group_idx, stage),
+        "snapshot": _workspace_authority_artifact_key("snapshot", group_idx, stage),
+    }
+    if authority is None or registry is None:
+        reason = unavailable or "workspace_authority_unavailable"
+        route = SimpleNamespace(
+            feature_id=feature_id,
+            dag_sha256=dag_sha256,
+            group_idx=group_idx,
+            attempt_id=attempt_id,
+            source="workspace_authority",
+            failure_class="workspace_authority",
+            failure_type="workspace_authority_unavailable",
+            severity="error",
+            status="blocked",
+            deterministic=True,
+            deterministic_workflow_blocker=True,
+            blocked_before_dispatch=True,
+            retryable=True,
+            operator_required=False,
+            evidence_ids=[],
+            route="quiesce_workflow",
+            signature_hash=hashlib.sha256(reason.encode("utf-8")).hexdigest(),
+            idempotency_key=(
+                f"workspace-route:{feature_id}:{dag_sha256}:"
+                f"g{group_idx}:{stage}:authority-unavailable"
+            ),
+            payload={
+                "status": "blocked",
+                "reason": reason,
+                "route": "quiesce_workflow",
+                "deterministic_workflow_blocker": True,
+                "blocked_before_dispatch": True,
+            },
+        )
+        await _workspace_authority_put_json(
+            runner,
+            feature,
+            artifact_keys["preflight"],
+            {
+                "artifact_schema": "workspace-authority-compatibility-preflight-v1",
+                "authoritative_mode": "compatibility_projection",
+                "approved": False,
+                "status": "failed",
+                "failure_class": "workspace_authority",
+                "failure_type": "workspace_authority_unavailable",
+                "deterministic_workflow_blocker": True,
+                "blocked_before_dispatch": True,
+                "reason": reason,
+                "task_ids": [task.id for task in group_tasks],
+            },
+        )
+        await _workspace_authority_put_json(
+            runner,
+            feature,
+            artifact_keys["routes"],
+            {
+                "artifact_schema": "workspace-authority-compatibility-routes-v1",
+                "authoritative_mode": "compatibility_projection",
+                "approved": False,
+                "status": "blocked",
+                "failure_class": "workspace_authority",
+                "failure_type": "workspace_authority_unavailable",
+                "deterministic_workflow_blocker": True,
+                "routes": [route],
+            },
+        )
+        await _workspace_authority_put_json(
+            runner,
+            feature,
+            artifact_keys["snapshot"],
+            {
+                "artifact_schema": "workspace-authority-compatibility-snapshot-v1",
+                "authoritative_mode": "compatibility_projection",
+                "approved": False,
+                "status": "blocked",
+                "failure_class": "workspace_authority",
+                "failure_type": "workspace_authority_unavailable",
+                "deterministic_workflow_blocker": True,
+                "snapshots": [],
+                "reason": reason,
+            },
+        )
+        return WorkspaceAuthorityCompatibilityOutcome(
+            approved=False,
+            operator_required=False,
+            routes=[route],
+            artifact_keys=artifact_keys,
+            unavailable_reason=reason,
+        )
+
+    targets = _workspace_authority_task_targets(group_tasks)
+    preflight = await _maybe_await_workspace_authority(
+        authority.preflight_targets(
+            targets,
+            registry,
+            feature_id=feature_id,
+            dag_sha256=dag_sha256,
+            group_idx=group_idx,
+            attempt_id=attempt_id,
+            stage=stage,
+        )
+    )
+
+    acl_normalization = None
+    if (
+        list(getattr(preflight, "acl_targets", []) or [])
+        and not _workspace_authority_operator_blockers(preflight)
+    ):
+        acl_normalization = await _maybe_await_workspace_authority(
+            authority.normalize_acl(preflight)
+        )
+        if bool(getattr(acl_normalization, "approved", False)):
+            preflight = await _maybe_await_workspace_authority(
+                authority.preflight_targets(
+                    targets,
+                    registry,
+                    feature_id=feature_id,
+                    dag_sha256=dag_sha256,
+                    group_idx=group_idx,
+                    attempt_id=attempt_id,
+                    stage=stage,
+                )
+            )
+
+    routes = list(await _maybe_await_workspace_authority(
+        authority.route_preflight(preflight)
+    ) or [])
+    snapshots: list[Any] = []
+    if bool(getattr(preflight, "snapshot_required", False)):
+        snapshots = list(await _maybe_await_workspace_authority(
+            authority.snapshot(
+                feature_id,
+                dag_sha256,
+                group_idx,
+                stage,
+                attempt_id,
+                registry,
+                targets,
+                task_ids=[task.id for task in group_tasks],
+            )
+        ) or [])
+        snapshots = await _persist_workspace_authority_snapshots(
+            runner,
+            snapshots,
+            registry=registry,
+        )
+        routes.extend(_workspace_authority_dirty_snapshot_routes(snapshots))
+
+    await _workspace_authority_put_json(
+        runner,
+        feature,
+        artifact_keys["preflight"],
+        {
+            "artifact_schema": "workspace-authority-compatibility-preflight-v1",
+            "authoritative_mode": "compatibility_projection",
+            "targets": targets,
+            "preflight": preflight,
+        },
+    )
+    if acl_normalization is not None:
+        await _workspace_authority_put_json(
+            runner,
+            feature,
+            artifact_keys["acl"],
+            {
+                "artifact_schema": "workspace-authority-compatibility-acl-v1",
+                "authoritative_mode": "compatibility_projection",
+                "acl_normalization": acl_normalization,
+            },
+        )
+    await _workspace_authority_put_json(
+        runner,
+        feature,
+        artifact_keys["routes"],
+        {
+            "artifact_schema": "workspace-authority-compatibility-routes-v1",
+            "authoritative_mode": "compatibility_projection",
+            "routes": routes,
+        },
+    )
+    await _workspace_authority_put_json(
+        runner,
+        feature,
+        artifact_keys["snapshot"],
+        {
+            "artifact_schema": "workspace-authority-compatibility-snapshot-v1",
+            "authoritative_mode": "compatibility_projection",
+            "snapshots": snapshots,
+        },
+    )
+    return WorkspaceAuthorityCompatibilityOutcome(
+        approved=bool(getattr(preflight, "approved", False)) and not routes,
+        operator_required=_workspace_authority_routes_operator_required(routes),
+        registry=registry,
+        preflight=preflight,
+        acl_normalization=acl_normalization,
+        routes=routes,
+        snapshots=snapshots,
+        artifact_keys=artifact_keys,
+    )
+
+
 async def _ensure_task_worktrees(
     runner: WorkflowRunner,
     feature: Feature,
     tasks: list[ImplementationTask],
+    *,
+    group_idx: int | None = None,
 ) -> None:
     """Ensure worktrees exist for all repos referenced by a group of tasks.
 
@@ -1493,9 +4030,11 @@ async def _ensure_task_worktrees(
 
     workspace_root: Path = workspace_mgr._base
     feature_root = workspace_root / ".iriai" / "features" / feature.slug / "repos"
+    _ensure_safe_feature_repos_root(workspace_root, feature_root)
     feature_root.mkdir(parents=True, exist_ok=True)
+    _ensure_safe_feature_repos_root(workspace_root, feature_root)
 
-    repos_needed: dict[str, str] = {}  # ws_rel_path → action
+    repos_needed: dict[str, _RepoNeed] = {}  # ws_rel_path -> preflight metadata
 
     for task in tasks:
         # 1. Explicit repo_path from task planner
@@ -1552,13 +4091,42 @@ async def _ensure_task_worktrees(
                 task_id=",".join(new_repos.get(repo_path, [])),
             )
 
+    for ws_rel_path in repos_needed:
+        _ensure_safe_worktree_destination(feature_root, feature_root / ws_rel_path)
+        _ensure_safe_workspace_source_path(workspace_root, workspace_root / ws_rel_path)
+
+    registry = WorktreeRegistry(
+        feature_id=getattr(feature, "id", ""),
+        feature_slug=feature.slug,
+        workspace_root=str(workspace_root),
+        feature_root=str(feature_root),
+        repos=[
+            _worktree_registry_repo(
+                ws_rel_path,
+                need,
+                workspace_root=workspace_root,
+                feature_root=feature_root,
+            )
+            for ws_rel_path, need in sorted(repos_needed.items())
+        ],
+    )
+    registry_by_path = {repo.repo_path: repo for repo in registry.repos}
+
     # 4. Create feature-local repo copies
-    for ws_rel_path, action in repos_needed.items():
+    for ws_rel_path, need in repos_needed.items():
+        action = need.action
+        registry_repo = registry_by_path.get(ws_rel_path)
         worktree_dest = feature_root / ws_rel_path
-        if _is_isolated_repo_copy(worktree_dest):
+        _ensure_safe_worktree_destination(feature_root, worktree_dest)
+        if _is_isolated_repo_copy(worktree_dest, feature_root=feature_root):
+            if registry_repo is not None:
+                registry_repo.preflight_status = "reused"
+                registry_repo.destination_isolated_after = True
+                _refresh_worktree_registry_repo(registry_repo, worktree_dest)
             continue
         if worktree_dest.exists():
-            _remove_repo_path(worktree_dest)
+            _remove_repo_path(worktree_dest, feature_root=feature_root)
+            _ensure_safe_worktree_destination(feature_root, worktree_dest)
 
         source_path = workspace_root / ws_rel_path
 
@@ -1574,8 +4142,17 @@ async def _ensure_task_worktrees(
                     f"{nested_request!r} inside existing repo {safe_repo_path!r}"
                 )
             logger.info("Scaffolding new feature-local repo at %s", worktree_dest)
+            _ensure_safe_worktree_destination(feature_root, worktree_dest)
             worktree_dest.parent.mkdir(parents=True, exist_ok=True)
+            _ensure_safe_worktree_destination(feature_root, worktree_dest)
             await _scaffold_repo(worktree_dest)
+            if registry_repo is not None:
+                registry_repo.preflight_status = "scaffolded"
+                registry_repo.destination_isolated_after = _is_isolated_repo_copy(
+                    worktree_dest,
+                    feature_root=feature_root,
+                )
+                _refresh_worktree_registry_repo(registry_repo, worktree_dest)
             continue
 
         if not (source_path / ".git").exists():
@@ -1590,13 +4167,30 @@ async def _ensure_task_worktrees(
                     f"{nested_request!r} inside existing repo {safe_repo_path!r}"
                 )
             logger.info("Scaffolding feature-local repo at %s", worktree_dest)
+            _ensure_safe_worktree_destination(feature_root, worktree_dest)
             worktree_dest.parent.mkdir(parents=True, exist_ok=True)
+            _ensure_safe_worktree_destination(feature_root, worktree_dest)
             await _scaffold_repo(worktree_dest)
+            if registry_repo is not None:
+                registry_repo.preflight_status = "scaffolded_missing_source"
+                registry_repo.destination_isolated_after = _is_isolated_repo_copy(
+                    worktree_dest,
+                    feature_root=feature_root,
+                )
+                _refresh_worktree_registry_repo(registry_repo, worktree_dest)
             continue
 
         branch = None if action == "read_only" else f"feature/{feature.slug}"
+        _ensure_safe_worktree_destination(feature_root, worktree_dest)
         await _clone_repo(source_path, worktree_dest, branch=branch)
         logger.info("Cloned %s → %s (branch: %s)", ws_rel_path, worktree_dest, branch or "default")
+        if registry_repo is not None:
+            registry_repo.preflight_status = "cloned"
+            registry_repo.destination_isolated_after = _is_isolated_repo_copy(
+                worktree_dest,
+                feature_root=feature_root,
+            )
+            _refresh_worktree_registry_repo(registry_repo, worktree_dest)
 
     # Set the worktree root as a service so ALL agents in this phase
     # automatically get cwd=repos/ via TrackedWorkflowRunner.resolve().
@@ -1606,15 +4200,228 @@ async def _ensure_task_worktrees(
     # Filesystem isolation is enforced by ClaudeAgentOptions.sandbox
     # (OS-level Seatbelt/bubblewrap), not by soft instructions.
     runner.services["worktree_root"] = feature_root
+    registry.complete = all(
+        repo.destination_isolated_after for repo in registry.repos
+    )
+    for repo in registry.repos:
+        if not repo.destination_isolated_after:
+            repo.preflight_errors.append("destination_not_isolated_repo_copy")
+            if repo.preflight_status == "pending":
+                repo.preflight_status = "failed"
+    await _record_worktree_registry(
+        runner,
+        feature,
+        registry,
+        group_idx=group_idx,
+    )
+    await _record_workspace_authority_registry_projection(
+        runner,
+        feature,
+        tasks,
+        workspace_root=workspace_root,
+        feature_root=feature_root,
+        group_idx=group_idx,
+        legacy_registry=registry,
+    )
 
 
-def _is_isolated_repo_copy(path: Path) -> bool:
+def _ensure_safe_feature_repos_root(workspace_root: Path, feature_root: Path) -> None:
+    workspace_root = Path(workspace_root)
+    feature_root = Path(feature_root)
+    try:
+        rel_parts = feature_root.relative_to(workspace_root).parts
+    except ValueError as exc:
+        raise RuntimeError(
+            "Refusing to prepare workflow repos root outside workspace root: "
+            f"{feature_root}"
+        ) from exc
+    cursor = workspace_root
+    for part in rel_parts:
+        cursor = cursor / part
+        if cursor.exists() and cursor.is_symlink():
+            raise RuntimeError(
+                "Refusing to prepare workflow repos root with symlink ancestor: "
+                f"{cursor}"
+            )
+    workspace_resolved = workspace_root.resolve()
+    try:
+        feature_root.resolve(strict=False).relative_to(workspace_resolved)
+    except ValueError as exc:
+        raise RuntimeError(
+            "Refusing to prepare workflow repos root outside workspace root: "
+            f"{feature_root}"
+        ) from exc
+    guard_problems = _workflow_repos_root_guard_problems(feature_root)
+    if guard_problems:
+        reasons = ", ".join(
+            str(problem.get("reason") or "unsafe_root")
+            for problem in guard_problems[:5]
+        )
+        raise RuntimeError(
+            "Refusing to prepare workflow repos root with symlink ancestor or unsafe root guard: "
+            f"{reasons}"
+        )
+
+
+def _ensure_safe_worktree_destination(feature_root: Path, destination: Path) -> None:
+    feature_root = Path(feature_root)
+    destination = Path(destination)
+    try:
+        destination.relative_to(feature_root)
+    except ValueError as exc:
+        raise RuntimeError(
+            "Refusing to prepare workflow repo path outside feature repos root: "
+            f"{destination}"
+        ) from exc
+    try:
+        feature_root_resolved = feature_root.resolve(strict=False)
+        has_symlink_ancestor = _repo_path_has_symlink_ancestor(
+            destination,
+            stop_at=feature_root_resolved,
+        )
+    except (OSError, RuntimeError) as exc:
+        raise RuntimeError(
+            "Refusing to prepare workflow repo path with unverifiable ancestry: "
+            f"{destination}"
+        ) from exc
+    if has_symlink_ancestor:
+        raise RuntimeError(
+            "Refusing to prepare workflow repo path with symlink ancestor: "
+            f"{destination}"
+        )
+    try:
+        destination.resolve(strict=False).relative_to(feature_root_resolved)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise RuntimeError(
+            "Refusing to prepare workflow repo path outside feature repos root: "
+            f"{destination}"
+        ) from exc
+
+
+def _ensure_safe_workspace_source_path(workspace_root: Path, source_path: Path) -> None:
+    """Fail closed when a requested source repo would resolve outside workspace."""
+    workspace_root = Path(workspace_root)
+    source_path = Path(source_path)
+    try:
+        source_path.relative_to(workspace_root)
+    except ValueError as exc:
+        raise RuntimeError(
+            "Refusing to use workflow source repo outside workspace root: "
+            f"{source_path}"
+        ) from exc
+    workspace_root_resolved = workspace_root.resolve(strict=False)
+    try:
+        has_symlink_ancestor = _repo_path_has_symlink_ancestor(
+            source_path,
+            stop_at=workspace_root_resolved,
+        )
+    except (OSError, RuntimeError) as exc:
+        raise RuntimeError(
+            "Refusing to use workflow source repo with unverifiable ancestry: "
+            f"{source_path}"
+        ) from exc
+    if has_symlink_ancestor:
+        raise RuntimeError(
+            "Refusing to use workflow source repo with symlink ancestor: "
+            f"{source_path}"
+        )
+    try:
+        source_path.resolve(strict=False).relative_to(workspace_root_resolved)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise RuntimeError(
+            "Refusing to use workflow source repo outside workspace root: "
+            f"{source_path}"
+        ) from exc
+
+
+def _refresh_worktree_registry_repo(repo: WorktreeRegistryRepo, path: Path) -> None:
+    metadata = _git_identity_metadata(path)
+    repo.canonical_path = str(path)
+    repo.remote_url = metadata.get("remote_url") or repo.remote_url
+    repo.branch = metadata.get("branch") or repo.branch
+    repo.head_sha = metadata.get("head_sha") or repo.head_sha
+    repo.git_common_dir = metadata.get("git_common_dir") or repo.git_common_dir
+    repo.dirty_summary = metadata.get("dirty_summary", [])
+    repo.writable = os.access(path, os.W_OK)
+
+
+def _git_identity_metadata(path: Path) -> dict[str, Any]:
+    if not path.exists() or not (path / ".git").exists():
+        return {}
+
+    def git(*args: str) -> str:
+        try:
+            proc = subprocess.run(
+                ["git", *args],
+                cwd=path,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                timeout=3,
+            )
+        except Exception:
+            return ""
+        if proc.returncode != 0:
+            return ""
+        return proc.stdout.strip()
+
+    return {
+        "remote_url": git("config", "--get", "remote.origin.url"),
+        "branch": git("branch", "--show-current"),
+        "head_sha": git("rev-parse", "HEAD"),
+        "git_common_dir": git("rev-parse", "--git-common-dir"),
+        "dirty_summary": [
+            line for line in git("status", "--short").splitlines() if line.strip()
+        ][:200],
+    }
+
+
+def _stable_repo_id(repo_path: str, remote_url: str) -> str:
+    seed = f"{remote_url or '<no-remote>'}:{repo_path}"
+    return hashlib.sha256(seed.encode("utf-8")).hexdigest()[:16]
+
+
+def _repo_path_has_symlink_ancestor(path: Path, *, stop_at: Path | None = None) -> bool:
+    current = path
+    stop_resolved = stop_at.resolve(strict=False) if stop_at is not None else None
+    while True:
+        if current.is_symlink():
+            return True
+        if stop_resolved is not None and current.resolve(strict=False) == stop_resolved:
+            return False
+        parent = current.parent
+        if parent == current:
+            return False
+        current = parent
+
+
+def _is_isolated_repo_copy(path: Path, *, feature_root: Path | None = None) -> bool:
     """Return true when *path* is a standalone git clone, not a linked path."""
-    return path.exists() and not path.is_symlink() and (path / ".git").is_dir()
+    if not path.exists() or not path.is_dir() or path.is_symlink():
+        return False
+    feature_root_resolved = feature_root.resolve(strict=False) if feature_root else None
+    if feature_root_resolved is not None:
+        try:
+            path.resolve(strict=False).relative_to(feature_root_resolved)
+        except ValueError:
+            return False
+    if _repo_path_has_symlink_ancestor(path, stop_at=feature_root_resolved):
+        return False
+    git_marker = path / ".git"
+    return git_marker.is_dir() and not git_marker.is_symlink()
 
 
-def _remove_repo_path(path: Path) -> None:
+def _remove_repo_path(path: Path, *, feature_root: Path | None = None) -> None:
     """Remove an existing feature repo path so it can be recreated safely."""
+    feature_root_resolved = feature_root.resolve(strict=False) if feature_root else None
+    if _repo_path_has_symlink_ancestor(path, stop_at=feature_root_resolved):
+        raise RuntimeError(f"Refusing to remove repo path with symlink ancestor: {path}")
+    if feature_root_resolved is not None:
+        try:
+            path.resolve(strict=False).relative_to(feature_root_resolved)
+        except ValueError as exc:
+            raise RuntimeError(f"Refusing to remove repo path outside feature root: {path}") from exc
     if path.is_symlink() or path.is_file():
         path.unlink()
         return
@@ -1760,33 +4567,4013 @@ async def _run_git(cwd: Path, *args: str) -> str:
 # ── Parallel actor helpers ──────────────────────────────────────────────────
 
 
-def _make_parallel_actor(
-    base: AgentActor,
-    suffix: str,
+# `_make_parallel_actor` is shimmed from `..execution.dispatcher`
+# (Slice 11e — see the shim re-export block above). Pure data
+# transformation: takes an `AgentActor`, returns a parallel-safe copy
+# with a unique name + optionally rebound runtime / workspace / sandbox
+# metadata. No runner / feature / store dependency.
+
+
+def _runtime_instance_name_for_hint(runner: WorkflowRunner, runtime: str | None) -> str:
+    hint = str(runtime or "").lower()
+    if hint == "secondary":
+        instance = getattr(runner, "secondary_runtime", None)
+    elif hint in {"", "primary"}:
+        instance = getattr(runner, "agent_runtime", None)
+    else:
+        instance = None
+    return str(getattr(instance, "name", "") or "")
+
+
+def _sandbox_runtime_name(runtime: str | None, runner: WorkflowRunner | None = None) -> str:
+    concrete = _runtime_instance_name_for_hint(runner, runtime) if runner is not None else ""
+    if concrete:
+        runtime = concrete
+    text = str(runtime or "").lower()
+    if "pool" in text:
+        return "claude_pool"
+    if "codex" in text or text == "secondary":
+        return "codex"
+    return "claude"
+
+
+def _git_text(args: list[str], *, cwd: Path) -> str:
+    proc = subprocess.run(
+        ["git", *args],
+        cwd=str(cwd),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"git {' '.join(args)} failed in {cwd}: {proc.stderr.strip()}"
+        )
+    return proc.stdout.strip()
+
+
+def _snapshot_id_for_repo(snapshots: list[Any], repo_id: str) -> int:
+    for snapshot in snapshots:
+        if str(getattr(snapshot, "repo_id", "")) != str(repo_id):
+            continue
+        snapshot_id = getattr(snapshot, "id", None)
+        if snapshot_id is not None:
+            return int(snapshot_id)
+    return 0
+
+
+def _contract_runtime_roots(contract: Any | None, *, repo_id: str) -> tuple[list[str], list[str], list[int]]:
+    if contract is None:
+        return ([repo_id], [], [])
+    writable = [
+        f"{getattr(rule, 'repo_id', repo_id)}:{getattr(rule, 'path', '')}"
+        for rule in getattr(contract, "allowed_paths", []) or []
+        if str(getattr(rule, "path", "")).strip()
+    ]
+    readonly = [
+        f"{getattr(rule, 'repo_id', repo_id)}:{getattr(rule, 'path', '')}"
+        for rule in getattr(contract, "read_only_paths", []) or []
+        if str(getattr(rule, "path", "")).strip()
+    ]
+    contract_id = getattr(contract, "id", None)
+    contract_ids = [int(contract_id)] if contract_id is not None else []
+    return (writable or [repo_id], readonly, contract_ids)
+
+
+# `_workflow_blocker_text` and `_is_workflow_blocker_text` are shimmed from
+# `..execution.control_plane` (Slice 12a-1 — see the shim re-export block
+# at `:798-845` above). They remain accessible under the legacy
+# `implementation._workflow_blocker_text` / `implementation._is_workflow_
+# blocker_text` names via the shim so every existing reader continues to
+# work.
+
+
+_PENDING_DURABLE_MERGE_QUEUE_NOTE = "canonical_mutation=pending_durable_merge_queue"
+
+
+def _append_note_once(notes: str, note: str) -> str:
+    text = str(notes or "")
+    if note in text:
+        return text
+    return f"{text}\n{note}" if text else note
+
+
+def _result_requires_durable_merge_queue(result: ImplementationResult) -> bool:
+    return _PENDING_DURABLE_MERGE_QUEUE_NOTE in str(result.notes)
+
+
+def _pending_merge_queue_marker_key(task_id: str) -> str:
+    return f"dag-task-pending-merge:{task_id}"
+
+
+def _durable_merge_queue_blocker_for_results(
+    results: list[ImplementationResult],
     *,
-    runtime: str | None = None,
-    workspace_path: str | None = None,
-) -> AgentActor:
-    """Create a parallel-safe copy of an AgentActor with a unique name.
+    enhancement: bool = False,
+) -> str:
+    scope = "enhancement contract verdict" if enhancement else "contract verdict"
+    return _workflow_blocker_text(
+        "Sandbox patch captured as evidence only; canonical mutation "
+        f"requires the durable merge queue before {scope}, commit, "
+        "verification, or checkpoint can proceed. Patch evidence ids: "
+        + ", ".join(str(r.notes) for r in results[:10])
+    )
 
-    When *runtime* is set (``"primary"`` or ``"secondary"``), the actor's
-    role metadata is updated so ``TrackedWorkflowRunner.resolve()`` routes
-    it to the correct runtime for adversarial multi-model execution.
 
-    When *workspace_path* is set, it overrides the agent's ``cwd`` so
-    it operates within a specific repo worktree (not the main workspace).
+# `_MergeQueueEnqueueError` is shimmed from `..execution.types` (Slice 11a).
+
+
+def _parse_patch_evidence_ids_from_notes(notes: Any) -> list[int]:
+    """Extract sandbox ``patch_summary_ids`` evidence ids from a result note.
+
+    The dispatcher records each succeeded implementation result's note as
+    ``dispatcher_attempt_id=...; patch_summary_ids=<csv>`` (see
+    ``_dispatch_implementation_task``). Those ids are the immutable
+    ``sandbox_patch_summary`` ``evidence_nodes`` ids the merge queue applies.
     """
-    metadata = dict(base.role.metadata)
-    if runtime:
-        metadata["runtime"] = runtime
-    if workspace_path:
-        metadata["workspace_override"] = workspace_path
-    role = base.role.model_copy(update={"metadata": metadata})
-    return AgentActor(
-        name=f"{base.name}-{suffix}",
-        role=role,
-        context_keys=base.context_keys,
-        persistent=base.persistent,
+
+    text = str(notes or "")
+    ids: list[int] = []
+    for chunk in text.replace("\n", ";").split(";"):
+        token = chunk.strip()
+        if not token.startswith("patch_summary_ids="):
+            continue
+        for raw in token.split("=", 1)[1].split(","):
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                ids.append(int(raw))
+            except ValueError:
+                continue
+    # Stable + de-duplicated so the enqueue request digest is deterministic.
+    return sorted(set(ids))
+
+
+@asynccontextmanager
+async def _merge_queue_connection(store: Any):
+    """Yield an asyncpg connection from an ``ExecutionControlStore`` pool.
+
+    ``MergeQueueStore`` and ``verify_merge_queue_production_ready`` are
+    connection-bound; ``ExecutionControlStore`` is pool-bound. This mirrors
+    ``ExecutionControlStore._connection`` without depending on that private
+    contextmanager: it acquires from ``store._pool``, or yields the object
+    directly when the "pool" is itself a bare connection.
+    """
+
+    pool = getattr(store, "_pool", None)
+    if pool is None:
+        raise _MergeQueueEnqueueError(
+            "durable merge queue enqueue has no database pool"
+        )
+    acquire_method = getattr(pool, "acquire", None)
+    if acquire_method is None:
+        # The "pool" is already a bare connection.
+        yield pool
+        return
+    acquired = acquire_method()
+    if hasattr(acquired, "__aenter__"):
+        async with acquired as conn:
+            yield conn
+        return
+    conn = await acquired
+    try:
+        yield conn
+    finally:
+        release = getattr(pool, "release", None)
+        if release is not None:
+            await release(conn)
+
+
+def _coerce_jsonb(value: Any) -> dict[str, Any]:
+    """Coerce an asyncpg JSONB column (dict or JSON string) into a dict."""
+
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, (str, bytes)):
+        try:
+            decoded = json.loads(value)
+        except (json.JSONDecodeError, ValueError):
+            return {}
+        return decoded if isinstance(decoded, dict) else {}
+    return {}
+
+
+async def _resolve_merge_queue_lane_inputs(
+    conn: Any,
+    pending_results: list[ImplementationResult],
+    *,
+    feature_id: str,
+    contracts_by_task_id: dict[str, Any],
+    feature_root: Path,
+) -> list[dict[str, Any]]:
+    """Resolve each sandbox result into the inputs for one merge-queue lane.
+
+    Reads the immutable ``sandbox_patch_summary`` evidence nodes (the same
+    evidence the queue's ``apply_input_provider`` consumes) to recover the
+    repo id and per-repo base commit. Fails closed on any missing contract,
+    missing/foreign/wrong-kind patch evidence node, cross-repo evidence on a
+    single task lane, a non-git canonical repo, or an unresolvable base
+    commit — the queue must never receive an unscoped or unresolved lane.
+    """
+
+    lanes: list[dict[str, Any]] = []
+    for result in pending_results:
+        task_id = str(getattr(result, "task_id", "") or "")
+        if not task_id:
+            raise _MergeQueueEnqueueError(
+                "durable merge queue enqueue saw a sandbox result with no "
+                "task id"
+            )
+        # Slice 08e-2 P3a fix: fail closed for a non-`completed` result.
+        # The dispatcher only sets `validate_contract=True` at sandbox patch
+        # capture when `response.status == "completed"` (see `capture_patch`),
+        # so a `partial` result's deliverable contract was NEVER validated
+        # against its captured patch. The pre-queue gate node would otherwise
+        # be stamped `approved` for work that skipped capture-time contract
+        # validation — a silent degradation. The merge queue owns CANONICAL
+        # commit; it must only receive fully-completed, contract-validated
+        # lanes. A refused `partial` task is recoverable: the per-task resume
+        # loop only short-circuits a `completed` `dag-task:*` marker, so a
+        # `partial` task simply re-runs on the next resume.
+        result_status = str(getattr(result, "status", "") or "")
+        if result_status != "completed":
+            raise _MergeQueueEnqueueError(
+                f"durable merge queue enqueue: task {task_id!r} result status "
+                f"is {result_status!r}, not 'completed' — its deliverable "
+                "contract was not validated at sandbox patch capture, so it "
+                "must not be enqueued for canonical integration (the legacy "
+                "canonical commit is disabled and is not a fallback)"
+            )
+        contract = contracts_by_task_id.get(task_id)
+        if contract is None:
+            raise _MergeQueueEnqueueError(
+                f"durable merge queue enqueue has no active task contract for "
+                f"task {task_id!r}"
+            )
+        contract_id = _task_contract_id(contract)
+        if contract_id is None:
+            raise _MergeQueueEnqueueError(
+                f"durable merge queue enqueue: contract for task {task_id!r} "
+                "is not persisted (no contract id)"
+            )
+        patch_evidence_ids = _parse_patch_evidence_ids_from_notes(
+            getattr(result, "notes", "")
+        )
+        if not patch_evidence_ids:
+            raise _MergeQueueEnqueueError(
+                f"durable merge queue enqueue: task {task_id!r} carries no "
+                "immutable sandbox patch evidence ids"
+            )
+
+        repo_id = ""
+        base_commit = ""
+        for evidence_id in patch_evidence_ids:
+            node = await conn.fetchrow(
+                "SELECT id, feature_id, kind, payload FROM evidence_nodes "
+                "WHERE id = $1",
+                evidence_id,
+            )
+            if node is None:
+                raise _MergeQueueEnqueueError(
+                    f"durable merge queue enqueue: patch evidence node "
+                    f"{evidence_id} for task {task_id!r} does not exist"
+                )
+            if str(node["feature_id"]) != feature_id:
+                raise _MergeQueueEnqueueError(
+                    f"durable merge queue enqueue: patch evidence node "
+                    f"{evidence_id} belongs to a different feature"
+                )
+            if str(node["kind"]) != "sandbox_patch_summary":
+                raise _MergeQueueEnqueueError(
+                    f"durable merge queue enqueue: evidence node {evidence_id} "
+                    f"for task {task_id!r} is kind {node['kind']!r}, not "
+                    "sandbox_patch_summary"
+                )
+            payload = _coerce_jsonb(node["payload"])
+            node_repo_id = str(payload.get("repo_id") or "")
+            node_base = str(payload.get("base_commit") or "")
+            if not node_repo_id:
+                raise _MergeQueueEnqueueError(
+                    f"durable merge queue enqueue: patch evidence node "
+                    f"{evidence_id} carries no repo_id"
+                )
+            if repo_id and node_repo_id != repo_id:
+                # A single-task lane is single-repo. Cross-repo evidence on one
+                # task is a contract-isolation violation — fail closed.
+                raise _MergeQueueEnqueueError(
+                    f"durable merge queue enqueue: task {task_id!r} has patch "
+                    f"evidence for multiple repos ({repo_id!r}, "
+                    f"{node_repo_id!r})"
+                )
+            repo_id = node_repo_id
+            if node_base and not base_commit:
+                base_commit = node_base
+
+        contract_repo_id = _contract_repo_id(contract)
+        repo_rel_path = _contract_repo_path(contract)
+        # The contract is the authority for repo identity; the patch evidence
+        # must agree with it.
+        if contract_repo_id and repo_id and contract_repo_id != repo_id:
+            raise _MergeQueueEnqueueError(
+                f"durable merge queue enqueue: task {task_id!r} patch evidence "
+                f"repo {repo_id!r} disagrees with its contract repo "
+                f"{contract_repo_id!r}"
+            )
+        repo_id = repo_id or contract_repo_id or "repo"
+        repo_dir = feature_root / repo_rel_path if repo_rel_path else feature_root
+        # Defense-in-depth queue-layer containment guard (doc 08 § Tests:
+        # "noncanonical repo paths, outside-root paths fail in the enqueue
+        # transaction"). Slice 03 `task_contracts.py` already validates
+        # `repo_path` at contract-compile time, so a `..`/absolute escape is
+        # not reachable today — but the merge queue OWNS canonical mutation, so
+        # it independently asserts the resolved repo dir is contained within
+        # the canonical feature root before it is enqueued as a lane repo
+        # target. A noncanonical or outside-root path fails the enqueue closed.
+        try:
+            resolved_repo_dir = repo_dir.resolve()
+            resolved_feature_root = feature_root.resolve()
+        except (OSError, RuntimeError) as exc:
+            raise _MergeQueueEnqueueError(
+                f"durable merge queue enqueue: canonical repo path for task "
+                f"{task_id!r} could not be resolved: {exc}"
+            ) from exc
+        if not (
+            resolved_repo_dir == resolved_feature_root
+            or resolved_repo_dir.is_relative_to(resolved_feature_root)
+        ):
+            raise _MergeQueueEnqueueError(
+                f"durable merge queue enqueue: canonical repo for task "
+                f"{task_id!r} resolves to {resolved_repo_dir} which is outside "
+                f"the canonical feature root {resolved_feature_root} — a "
+                "noncanonical or outside-root repo path is refused (the legacy "
+                "canonical commit is disabled and is not a fallback)"
+            )
+        if not (repo_dir / ".git").exists():
+            raise _MergeQueueEnqueueError(
+                f"durable merge queue enqueue: canonical repo for task "
+                f"{task_id!r} is not a git repo at {repo_dir}"
+            )
+        if not base_commit:
+            # Patch evidence omitted base_commit; the canonical HEAD is the
+            # apply base (the queue worker rebases on drift).
+            try:
+                base_commit = _git_text(["rev-parse", "HEAD"], cwd=repo_dir)
+            except RuntimeError as exc:
+                raise _MergeQueueEnqueueError(
+                    f"durable merge queue enqueue: cannot resolve base commit "
+                    f"for task {task_id!r} repo {repo_id!r}: {exc}"
+                ) from exc
+        if not base_commit:
+            raise _MergeQueueEnqueueError(
+                f"durable merge queue enqueue: no base commit for task "
+                f"{task_id!r} repo {repo_id!r}"
+            )
+        lanes.append({
+            "task_id": task_id,
+            "contract_id": int(contract_id),
+            "patch_evidence_ids": patch_evidence_ids,
+            "repo_id": repo_id,
+            "repo_path": str(repo_dir),
+            "base_commit": base_commit,
+            "unknown_write_set": bool(
+                getattr(contract, "unknown_write_set", False)
+            ),
+        })
+    return lanes
+
+
+async def _enqueue_durable_merge_queue_for_results(
+    runner: WorkflowRunner,
+    feature: Feature,
+    pending_results: list[ImplementationResult],
+    *,
+    dag_sha256: str,
+    group_idx: int,
+    contracts_by_task_id: dict[str, Any] | None,
+    feature_root: Path | None,
+    stage: str,
+) -> list[int]:
+    """Slice 08e-2: enqueue sandbox-captured lanes onto the durable merge queue.
+
+    Replaces the legacy canonical commit on the implementation worker path.
+    Each sandbox result already carries immutable ``sandbox_patch_summary``
+    patch evidence (the dispatcher captured the diff into ``artifacts`` and
+    recorded the evidence node); this records a pre-queue gate evidence node
+    and enqueues one ``merge_queue_items`` lane per task. The durable merge
+    queue worker (Slice 08e-3) — never the implementer/repair agents — owns
+    canonical repo mutation from here.
+
+    Fails closed (``_MergeQueueEnqueueError``) — never silently falls back to
+    the legacy commit — when the merge-queue modules, the typed store, the
+    readiness guard, the contracts, the patch evidence, or the repo base
+    commits are unavailable. The post-DAG verify gates and the post-test
+    guard are preserved: this only records the integration *intent*; the
+    queue worker runs the post-apply gates and the verifier still runs.
+
+    Returns the enqueued ``merge_queue_items`` ids (one per covered task).
+    """
+
+    if (
+        MergeQueueStore is None
+        or MergeQueueItemCreate is None
+        or TaskCoverageCreate is None
+        or RepoTargetCreate is None
+        or verify_merge_queue_production_ready is None
+    ):
+        raise _MergeQueueEnqueueError(
+            "durable merge queue modules are unavailable — cannot enqueue "
+            "sandbox patch lanes (legacy canonical commit is disabled on the "
+            "implementation worker path)"
+        )
+    store = _execution_control_store_for_runner(runner)
+    if store is None:
+        raise _MergeQueueEnqueueError(
+            "durable merge queue enqueue requires the typed execution control "
+            "store; no usable database pool is configured"
+        )
+    if feature_root is None:
+        raise _MergeQueueEnqueueError(
+            "durable merge queue enqueue has no canonical feature repo root"
+        )
+    contracts_by_task_id = contracts_by_task_id or {}
+    feature_id = str(getattr(feature, "id", ""))
+
+    # ── Phase 1: readiness guard + lane-input resolution (one connection) ──
+    # Fail closed: the Slice 08e-1 production readiness guard must pass before
+    # the queue may own any canonical mutation. Never silently degrade.
+    async with _merge_queue_connection(store) as conn:
+        readiness = await verify_merge_queue_production_ready(conn)
+        if not getattr(readiness, "ready", False):
+            raise _MergeQueueEnqueueError(
+                "durable merge queue is not production-ready — refusing to "
+                "enqueue (and refusing to fall back to the legacy canonical "
+                "commit). Missing dependencies: "
+                + (
+                    ", ".join(getattr(readiness, "missing", []) or [])
+                    or "unknown"
+                )
+            )
+        lanes = await _resolve_merge_queue_lane_inputs(
+            conn,
+            pending_results,
+            feature_id=feature_id,
+            contracts_by_task_id=contracts_by_task_id,
+            feature_root=feature_root,
+        )
+
+    # ── Phase 2: record one pre-queue gate evidence node per lane ──────────
+    # The per-task contract verdict was already validated at sandbox capture /
+    # promotion time; this records the durable typed gate node the enqueue
+    # requires (the store rejects an enqueue without pre_queue_gate_evidence_id)
+    # WITHOUT holding the merge-queue connection — `_record_typed_verification_
+    # gate_node` acquires its own pool connection, so no two are held at once.
+    for lane in lanes:
+        task_id = lane["task_id"]
+        gate_proof = await _record_typed_verification_gate_node(
+            runner,
+            feature,
+            kind="aggregate_verdict",
+            name=f"merge_queue_pre_queue:g{group_idx}:{task_id}",
+            stage=f"merge_queue_pre_queue:{stage}",
+            dag_sha256=dag_sha256,
+            group_idx=group_idx,
+            status="approved",
+            payload={
+                "scope": "merge_queue_pre_queue",
+                "group_idx": group_idx,
+                "task_id": task_id,
+                "contract_id": lane["contract_id"],
+                "repo_id": lane["repo_id"],
+                "base_commit": lane["base_commit"],
+                "patch_evidence_ids": lane["patch_evidence_ids"],
+                "unknown_write_set": lane["unknown_write_set"],
+            },
+            metadata={"scope": "merge_queue_pre_queue", "stage": stage},
+        )
+        if gate_proof.get("persisted") is not True:
+            raise _MergeQueueEnqueueError(
+                f"durable merge queue enqueue: pre-queue gate evidence for "
+                f"task {task_id!r} was not persisted "
+                f"({gate_proof.get('failure_type') or 'unknown'})"
+            )
+        pre_queue_gate_evidence_id = gate_proof.get("evidence_node_id")
+        if pre_queue_gate_evidence_id is None:
+            raise _MergeQueueEnqueueError(
+                f"durable merge queue enqueue: pre-queue gate evidence for "
+                f"task {task_id!r} has no evidence node id"
+            )
+        lane["pre_queue_gate_evidence_id"] = int(pre_queue_gate_evidence_id)
+
+    # ── Phase 3: enqueue every lane ATOMICALLY (one connection, one tx) ────
+    # Slice 08e-2 P2 fix: the whole per-task loop runs inside ONE outer
+    # `conn.transaction()`. `MergeQueueStore.enqueue` opens its own
+    # `conn.transaction()` per call, but asyncpg nests an inner transaction on
+    # an already-open connection as a SAVEPOINT — so each per-task enqueue is a
+    # savepoint inside this outer transaction, not an independent commit. If
+    # task N of M fails mid-loop the exception escapes this `async with`, which
+    # issues ROLLBACK and undoes tasks 1..N: ZERO lanes are persisted. The
+    # feature then blocks cleanly and a resume re-drives the whole enqueue from
+    # scratch (no orphaned lanes, fail-closed, recoverable). The existing
+    # single-call `enqueue` API is unchanged — savepoint nesting is automatic.
+    enqueued: list[dict[str, Any]] = []
+    async with _merge_queue_connection(store) as conn:
+        async with conn.transaction():
+            queue_store = MergeQueueStore(conn)
+            for lane in lanes:
+                task_id = lane["task_id"]
+                contract_id = lane["contract_id"]
+                repo_id = lane["repo_id"]
+                base_commit = lane["base_commit"]
+                gate_id = lane["pre_queue_gate_evidence_id"]
+                # One queue item per task = one integration lane. A per-task
+                # lane is always isolation-safe (it never combines tasks);
+                # unknown_write_set contracts REQUIRE this and the store
+                # enforces single-task coverage for a task: lane.
+                create = MergeQueueItemCreate(
+                    feature_id=feature_id,
+                    dag_sha256=dag_sha256,
+                    group_idx=group_idx,
+                    base_commit=base_commit,
+                    repo_id=repo_id,
+                    repo_path=lane["repo_path"],
+                    head_commit="",
+                    contract_ids=[contract_id],
+                    patch_evidence_ids=lane["patch_evidence_ids"],
+                    gate_evidence_ids=[gate_id],
+                    pre_queue_gate_evidence_id=gate_id,
+                    integration_lane=f"task:{task_id}",
+                    task_coverage=[
+                        TaskCoverageCreate(
+                            task_id=task_id, contract_id=contract_id
+                        )
+                    ],
+                    repo_targets=[
+                        RepoTargetCreate(
+                            repo_id=repo_id,
+                            repo_path=lane["repo_path"],
+                            base_commit=base_commit,
+                        )
+                    ],
+                    payload={
+                        "stage": stage,
+                        "task_ids": [task_id],
+                        "source": "implementation_worker",
+                    },
+                )
+                try:
+                    item = await queue_store.enqueue(create)
+                except _MergeQueueEnqueueError:
+                    raise
+                except Exception as exc:  # MergeQueueError/IdempotencyConflict.
+                    # Escapes the outer `async with conn.transaction()` →
+                    # ROLLBACK → every prior lane in this loop is undone.
+                    raise _MergeQueueEnqueueError(
+                        f"durable merge queue enqueue failed for task "
+                        f"{task_id!r}: {type(exc).__name__}: {exc}"
+                    ) from exc
+                enqueued.append(
+                    {
+                        "item_id": int(item.id),
+                        "task_id": task_id,
+                        "status": str(getattr(item, "status", "")),
+                        "repo_id": repo_id,
+                        "patch_evidence_ids": lane["patch_evidence_ids"],
+                    }
+                )
+    # Event logging is deferred until AFTER the transaction commits so a
+    # rolled-back partial enqueue never emits a spurious "enqueued" event.
+    enqueued_ids: list[int] = []
+    for record in enqueued:
+        enqueued_ids.append(record["item_id"])
+        await _log_feature_event(
+            runner,
+            feature.id,
+            "dag_merge_queue_enqueued",
+            "implementation",
+            content=f"g{group_idx}:{record['task_id']}",
+            metadata={
+                "group_idx": group_idx,
+                "task_id": record["task_id"],
+                "stage": stage,
+                "merge_queue_item_id": record["item_id"],
+                "merge_queue_status": record["status"],
+                "integration_lane": f"task:{record['task_id']}",
+                "repo_id": record["repo_id"],
+                "patch_evidence_ids": record["patch_evidence_ids"],
+            },
+        )
+    return enqueued_ids
+
+
+# ── Slice 08e-3a — durable merge queue DRAIN worker ─────────────────────────
+#
+# 08e-2 (above) is the ENQUEUE side: the implementation worker captures sandbox
+# patch evidence and enqueues one `task:{id}` `merge_queue_items` lane per task
+# (status `queued`), then returns `workflow_blocked` — the workflow halts with
+# lanes sitting in the queue. 08e-3a is the DRAIN side: a worker that claims
+# each `queued`/expired-`leased` lane and runs it through the Slice 08d
+# `MergeQueue` worker methods `apply_candidate -> run_required_gates ->
+# commit_and_prove_clean -> mark_integrated`, so the durable queue actually
+# applies the patch to the canonical repo, runs the post-apply gates, commits,
+# proves clean, and leaves the lane `integrated`. The post-DAG checkpoint
+# splice that turns `integrated` lanes into a `dag-group:*` projection via
+# `GroupMergeCoordinator` is 08e-3b (the next iteration) — this sub-chunk wires
+# and verifies the drain only, and does not modify `_implement_dag`'s control
+# flow. Drain-path apply/gate/commit failures route through the Slice 07
+# `failure_router` (never the legacy `_commit_group`/direct commit).
+
+
+# Map a `MergeQueue` worker `failure_class` (the strings its `_fail` /
+# `run_required_gates` / `commit_and_prove_clean` paths emit) to the Slice 07
+# router `(failure_class, failure_type)` pair the route table knows. Every pair
+# below is present in `failure_router.ROUTE_TABLE`. The drain path can only
+# produce these classes — `apply_candidate` emits `merge_conflict` /
+# `stale_projection` / `contract_violation` / `checkpoint_contradiction`;
+# `run_required_gates` emits `verifier_provider` / `verifier_context` /
+# `checkpoint_contradiction`; `commit_and_prove_clean` emits `commit_hygiene` /
+# `checkpoint_contradiction`. `sandbox_isolation` / `worktree_alias` /
+# `acl_workability` are NOT reachable from the drain path (they are workspace /
+# sandbox classes routed before enqueue), so they are intentionally absent.
+_MERGE_QUEUE_DRAIN_FAILURE_PAIRS: dict[str, tuple[str, str]] = {
+    "merge_conflict": ("merge_conflict", "patch_apply_conflict"),
+    "stale_projection": ("stale_projection", "workspace_snapshot_stale"),
+    "contract_violation": ("contract_violation", "outside_allowed_paths"),
+    "commit_hygiene": ("commit_hygiene", "commit_hook_failed"),
+    "checkpoint_contradiction": (
+        "checkpoint_contradiction",
+        "checkpoint_after_failed_gate",
+    ),
+    "verifier_provider": ("verifier_provider", "verifier_provider_crash"),
+    "verifier_context": ("verifier_context", "verifier_context_stale"),
+}
+
+
+def _route_merge_queue_drain_failure(
+    runner: WorkflowRunner,
+    feature: Feature,
+    *,
+    dag_sha256: str,
+    group_idx: int,
+    item_id: int,
+    failure_class: str,
+    detail: str,
+    stage: str,
+    cause: str = "",
+    escaped_paths: list[str] | None = None,
+    target_contract_ids: list[int] | None = None,
+) -> dict[str, Any]:
+    """Route one drain-path queue failure through the Slice 07 failure router.
+
+    Mirrors the existing `_typed_direct_route_payload` router-usage pattern:
+    resolve the router from the runner, build a typed `FailureObservation`,
+    `record` it, `decide` the route, and `mark_route_started`. Returns a bounded
+    dict describing the typed failure + route action (empty when the Slice 07
+    router module is unavailable — the drain still records the lane `failed`
+    via the worker's own `_fail`, so routing being absent never loses the
+    typed terminal state).
+
+    The merge queue's typed `failure_class` strings are mapped to the router's
+    `(failure_class, failure_type)` route-table pairs via
+    :data:`_MERGE_QUEUE_DRAIN_FAILURE_PAIRS`. An unmapped class falls back to
+    `("unknown", "unclassified")` (the router quiesces it) — fail closed, never
+    silently drop a failure.
+
+    *cause* (Slice 08f P3-7): an optional sub-cause discriminator folded into
+    the router idempotency key. Per-lane drain callers pass a real ``item_id``
+    that already disambiguates the key and leave ``cause`` empty (their keys
+    are byte-for-byte unchanged). The group-checkpoint ``_route`` has no queue
+    item id (``item_id=0``) and its two distinct failure causes
+    (coverage-not-approved vs. ``checkpoint_group``-declined) share a
+    ``failure_class``; passing a distinct ``cause`` keeps their router dedup
+    keys distinct without misrepresenting a real queue item id.
+
+    *escaped_paths* / *target_contract_ids* (Slice 11j P3-6 fold-in): the
+    structured list of contract-escaping paths and the queue item's contract
+    ids that the apply-step ``contract_violation`` raise sites in
+    :class:`MergeQueue.apply_candidate` produce
+    (:attr:`MergeApplyResult.escaped_paths` +
+    :attr:`MergeQueueItem.contract_ids`). When provided, the observation
+    payload carries them as ``target_paths`` + ``target_contract_ids`` so the
+    :meth:`FailureRouter._repair_scope` reader harvests them into the
+    :class:`RouteDecision.repair_scope` mapping; the consumer-side
+    :meth:`FailureRouter._allows_product_repair` then no longer downgrades the
+    ``contract_violation`` route to ``quiesce``. Default ``None`` preserves
+    the pre-11j fail-closed-to-``quiesce`` behavior for every drain caller
+    that does not yet thread the structured signal -- ADDITIVE, no regression
+    on Slice 08 acceptance criteria.
+    """
+
+    if RouterFailureObservation is None:
+        return {}
+    router = _failure_router_for_runner(runner)
+    if router is None:
+        return {}
+    mapped = _MERGE_QUEUE_DRAIN_FAILURE_PAIRS.get(failure_class)
+    if mapped is None:
+        mapped = ("unknown", "unclassified")
+    routed_class, routed_type = mapped
+    payload: dict[str, Any] = {
+        "idempotency_key": (
+            f"failure:{feature.id}:merge-queue-drain:g{group_idx}:"
+            f"item-{item_id}:{routed_class}:{routed_type}"
+            + (f":{cause}" if cause else "")
+        ),
+        "merge_queue_item_id": item_id,
+        "queue_item_id": item_id,
+        "group_idx": group_idx,
+        "stage": stage,
+        "detail": str(detail)[:1000],
+    }
+    # Slice 11j P3-6 fold-in: surface the structured `escaped_paths` +
+    # `target_contract_ids` for the producer-side fix. The Slice 07
+    # `FailureRouter._repair_scope` reader (`execution/failure_router.py:
+    # 1670-1737`) harvests `payload["target_paths"]` /
+    # `payload["target_contract_ids"]` into the typed `RouteDecision.
+    # repair_scope`; once both are present + non-empty, the consumer-side
+    # `_allows_product_repair` (`failure_router.py:1739-1777`) preserves
+    # `run_product_repair` instead of downgrading to `quiesce`. The
+    # fail-closed safety net stays in place when EITHER is missing.
+    if escaped_paths:
+        payload["target_paths"] = sorted({str(p) for p in escaped_paths if p})
+    if target_contract_ids:
+        payload["target_contract_ids"] = sorted(
+            {int(cid) for cid in target_contract_ids if cid is not None}
+        )
+    observation = RouterFailureObservation(
+        feature_id=str(feature.id),
+        dag_sha256=dag_sha256 or "",
+        group_idx=group_idx,
+        task_id=None,
+        attempt_id=None,
+        source="merge_queue",
+        failure_class=routed_class,
+        failure_type=routed_type,
+        deterministic=True,
+        retryable=routed_class in ("merge_conflict", "commit_hygiene"),
+        operator_required=False,
+        evidence_ids=[],
+        payload=payload,
+    )
+    try:
+        failure_id = router.record(observation)
+        decision = router.mark_route_started(router.decide(failure_id))
+    except Exception as exc:  # pragma: no cover - router is in-memory + simple.
+        return {
+            "routed": False,
+            "failure_class": routed_class,
+            "failure_type": routed_type,
+            "error": f"{type(exc).__name__}: {exc}"[:500],
+        }
+    return {
+        "routed": True,
+        "typed_failure_id": failure_id,
+        "failure_class": routed_class,
+        "failure_type": routed_type,
+        "route_action": str(getattr(decision, "action", "") or ""),
+        "route_decision_id": getattr(decision, "route_decision_id", None),
+        "budget_exhausted": bool(getattr(decision, "budget_exhausted", False)),
+        "reason": str(getattr(decision, "reason", "") or ""),
+    }
+
+
+async def _merge_queue_post_apply_gate_decision(
+    item: Any,
+) -> Any:
+    """Deterministic post-apply gate decision for a drained merge-queue lane.
+
+    `MergeQueue.run_required_gates` (Slice 08d) takes an injected `gate_runner`
+    that runs the post-apply gates against the applied canonical state and
+    records the aggregate gate evidence. The Slice 08e-1 `build_gate_runner`
+    wraps a caller-supplied `GateDecisionProvider`; this is that provider for
+    the drain path.
+
+    The check is intentionally DETERMINISTIC (doc 08 § Patch Apply step 11
+    re-runs "required deterministic gates against the applied canonical
+    state"): for each repo target it runs `git diff --check HEAD`. The `HEAD`
+    rev-arg is load-bearing — `apply_candidate` applies via `git apply --index`
+    (`git_service.apply_patch`), which STAGES the applied hunks, so a bare
+    `git diff --check` (worktree-vs-index) would miss conflict markers in the
+    STAGED content and falsely approve. `git diff --check HEAD` diffs HEAD
+    against the combined worktree+index, so it sees both staged and unstaged
+    leftover conflict markers / whitespace errors that would block a clean
+    commit (this mirrors `git_service.working_tree_clean`, which deliberately
+    checks BOTH `git diff --quiet` and `git diff --cached --quiet`).
+    `apply_candidate`'s own `git apply --3way --check` explicitly does NOT
+    catch conflict markers from a 3-way merge (see `git_service.apply_check`'s
+    docstring), so this gate adds a real, non-redundant post-apply safety
+    check. Applied-path contract scope was already validated inside
+    `apply_candidate` before the lane reached `verifying`, so it is not
+    re-checked here.
+
+    This deterministic gate does NOT replace, bypass, or reorder the post-DAG
+    verify gates or the post-test guard — those run later in `execute()` after
+    the whole DAG completes and are entirely separate from per-lane drain.
+
+    Returns a `MergeQueueGateDecision` (approved / rejected). A rejection
+    carries `failure_class="merge_conflict"` so the drain routes it through the
+    failure router as a merge conflict.
+    """
+
+    rejected_repos: list[str] = []
+    for target in getattr(item, "repo_targets", []) or []:
+        repo_path = Path(target.repo_path)
+        # `HEAD` is required: `apply_candidate` stages the applied patch via
+        # `git apply --index`, so a bare `git diff --check` (worktree-vs-index)
+        # would not see staged conflict markers. `git diff --check HEAD` diffs
+        # HEAD vs the combined staged+unstaged tree and catches both.
+        check = await merge_queue_git_service.run_git(
+            repo_path, "diff", "--check", "HEAD", check=False
+        )
+        if not check.ok:
+            rejected_repos.append(target.repo_id)
+    if rejected_repos:
+        return MergeQueueGateDecision(
+            approved=False,
+            failure_class="merge_conflict",
+            detail=(
+                "post-apply git diff --check HEAD found conflict markers or "
+                f"whitespace errors in repos {sorted(rejected_repos)}"
+            ),
+            verdict_payload={
+                "gate": "merge_queue_post_apply_diff_check",
+                "rejected_repo_ids": sorted(rejected_repos),
+            },
+        )
+    return MergeQueueGateDecision(
+        approved=True,
+        verdict_payload={"gate": "merge_queue_post_apply_diff_check"},
+    )
+
+
+# `_MergeQueueDrainResult` is shimmed from `..execution.types` (Slice 11a).
+
+
+async def _drain_one_merge_queue_lane(
+    runner: WorkflowRunner,
+    feature: Feature,
+    worker: Any,
+    item: Any,
+    *,
+    dag_sha256: str,
+    stage: str,
+) -> _MergeQueueDrainResult:
+    """Drive ONE claimed (`leased`) merge-queue lane to `integrated` or failure.
+
+    Runs the Slice 08d `MergeQueue` worker methods in the doc-08 order:
+    `apply_candidate -> run_required_gates -> commit_and_prove_clean ->
+    mark_integrated`. Each method is lease-fenced and rolls the canonical repo
+    back on its own failure (see `merge_queue.py`); this function never mutates
+    canonical repos itself. The lane's `task:{id}` integration lane and its
+    repo target / task coverage child rows are the worker methods' inputs — the
+    drain only sequences the calls and routes the typed failure.
+
+    On any worker-method failure the lane is already recorded `failed` by the
+    worker's `_fail`; this function additionally routes the typed
+    `failure_class` through the Slice 07 failure router. It never falls back to
+    the legacy `_commit_group` / direct commit (standing no-silent-degradation
+    non-negotiable).
+
+    A worker method can also *raise* (not return a typed failure): the Slice
+    08d `MergeQueue` methods catch only their own `_ApplyFailure`, so a
+    `LeaseFencedError` / `MergeQueueError` raised from a lease-fenced
+    `transition` / `advance_repo_target` / `record_*_proof` — or any asyncpg
+    error — propagates out. Every worker call below is therefore wrapped in a
+    try/except that funnels a raised exception into the SAME `_fail_result`
+    route-and-record path a returned failure uses. This keeps a raised failure
+    confined to its own lane: the caller's drain loop sees a returned
+    `_MergeQueueDrainResult`, never an escaping exception, so a transient
+    fault on one lane never strands its still-`queued` siblings.
+    """
+
+    token = MergeQueueLeaseToken.for_item(item)
+    item_id = int(item.id)
+    task_ids = [c.task_id for c in getattr(item, "task_coverage", []) or []]
+    group_idx = int(item.group_idx)
+    # Slice 11j P3-6 fold-in: snapshot the queue item's contract_ids so the
+    # apply-step `contract_violation` route through the failure router gets
+    # `target_contract_ids` populated alongside `target_paths`. The
+    # `MergeQueueItem.contract_ids` field is the typed lane-contract id list
+    # the queue persists (see `merge_queue_store.py:186`); pulling it once
+    # here keeps `_fail_result` decoupled from a possible later `item`
+    # reload (the `_fail_result` closure captures the original list).
+    initial_contract_ids = list(getattr(item, "contract_ids", []) or [])
+
+    async def _fail_result(
+        failure_class: str,
+        detail: str,
+        *,
+        escaped_paths: list[str] | None = None,
+    ) -> _MergeQueueDrainResult:
+        # Slice 11j P3-6 fold-in: when the apply step's
+        # `contract_violation` raise produced a structured
+        # `escaped_paths` list on `MergeApplyResult.escaped_paths`, surface
+        # it (and the queue item's `contract_ids`) to the router observation
+        # payload so the consumer-side `_allows_product_repair` preserves
+        # the `run_product_repair` route instead of downgrading to
+        # `quiesce`. The route mapping in
+        # `_MERGE_QUEUE_DRAIN_FAILURE_PAIRS` maps `contract_violation` ->
+        # (`contract_violation`, `outside_allowed_paths`) which IS in
+        # `_SCOPED_CONTRACT_PRODUCT_TYPES` and routes to
+        # `run_product_repair`; once both `target_paths` and
+        # `target_contract_ids` are present, the route is preserved.
+        contract_ids_for_route: list[int] | None = (
+            initial_contract_ids if (escaped_paths and initial_contract_ids) else None
+        )
+        routed = _route_merge_queue_drain_failure(
+            runner,
+            feature,
+            dag_sha256=dag_sha256,
+            group_idx=group_idx,
+            item_id=item_id,
+            failure_class=failure_class,
+            detail=detail,
+            stage=stage,
+            escaped_paths=list(escaped_paths) if escaped_paths else None,
+            target_contract_ids=contract_ids_for_route,
+        )
+        # The worker method already recorded the lane terminal via its own
+        # `_fail` (`failed`). Reload the authoritative status rather than
+        # assuming it — a recovery worker could have moved the row in a race,
+        # and a *raised* worker exception may leave the row mid-flight
+        # (`applying`/`verifying`/`committing`) for `recover_expired` to drive.
+        terminal = await worker.get(item_id)
+        terminal_status = (
+            str(getattr(terminal, "status", "failed"))
+            if terminal is not None
+            else "failed"
+        )
+        return _MergeQueueDrainResult(
+            item_id=item_id,
+            task_ids=task_ids,
+            terminal_status=terminal_status,
+            failure_class=failure_class,
+            detail=detail,
+            routed_failure=routed,
+        )
+
+    # Step 1: apply the immutable sandbox patch evidence to the canonical repo.
+    # A raised worker exception (a fenced `transition`/`advance_repo_target`, an
+    # asyncpg error) is funnelled into the same fail-and-route path as a
+    # returned `applied=False`, so it fails ONLY this lane and the drain loop
+    # continues to its siblings.
+    try:
+        apply_result = await worker.apply_candidate(item, token)
+    except (MergeQueueStoreError, MergeQueueLeaseFencedError, Exception) as exc:
+        return await _fail_result(
+            "checkpoint_contradiction",
+            f"merge queue lane {item_id} apply raised "
+            f"{type(exc).__name__}: {exc}",
+        )
+    if not apply_result.applied:
+        # Slice 11j P3-6 fold-in: extract the structured `escaped_paths`
+        # from `MergeApplyResult` so `_fail_result` can surface them to the
+        # router observation payload. ADDITIVE -- a non-contract-violation
+        # failure carries an empty `escaped_paths` list (the default) and
+        # the consumer-side fail-closed `quiesce` downgrade path is
+        # preserved unchanged.
+        apply_escaped_paths = list(
+            getattr(apply_result, "escaped_paths", []) or []
+        )
+        return await _fail_result(
+            apply_result.failure_class or "merge_conflict",
+            apply_result.detail or "merge queue apply failed",
+            escaped_paths=apply_escaped_paths or None,
+        )
+
+    # Reload the lane: `apply_candidate` advanced it to `verifying` and stamped
+    # the merge proof — the worker methods need the fresh row + lease version.
+    item = await worker.get(item_id)
+    if item is None:
+        return await _fail_result(
+            "checkpoint_contradiction",
+            f"merge queue lane {item_id} vanished after apply",
+        )
+    token = MergeQueueLeaseToken.for_item(item)
+
+    # Step 2: run the deterministic post-apply gates against the applied state.
+    try:
+        gate_result = await worker.run_required_gates(item, token)
+    except (MergeQueueStoreError, MergeQueueLeaseFencedError, Exception) as exc:
+        return await _fail_result(
+            "checkpoint_contradiction",
+            f"merge queue lane {item_id} post-apply gates raised "
+            f"{type(exc).__name__}: {exc}",
+        )
+    if not gate_result.approved:
+        return await _fail_result(
+            gate_result.failure_class or "verifier_provider",
+            gate_result.detail or "merge queue post-apply gates rejected",
+        )
+
+    item = await worker.get(item_id)
+    if item is None:
+        return await _fail_result(
+            "checkpoint_contradiction",
+            f"merge queue lane {item_id} vanished after post-apply gates",
+        )
+    token = MergeQueueLeaseToken.for_item(item)
+
+    # Step 3: commit the applied changes and prove the canonical repo is clean.
+    try:
+        commit_result = await worker.commit_and_prove_clean(item, token)
+    except (MergeQueueStoreError, MergeQueueLeaseFencedError, Exception) as exc:
+        return await _fail_result(
+            "checkpoint_contradiction",
+            f"merge queue lane {item_id} commit raised "
+            f"{type(exc).__name__}: {exc}",
+        )
+    if not commit_result.committed:
+        return await _fail_result(
+            commit_result.failure_class or "commit_hygiene",
+            commit_result.detail or "merge queue commit failed",
+        )
+
+    item = await worker.get(item_id)
+    if item is None:
+        return await _fail_result(
+            "checkpoint_contradiction",
+            f"merge queue lane {item_id} vanished after commit",
+        )
+    token = MergeQueueLeaseToken.for_item(item)
+
+    # Step 4: mark the committed, clean lane `integrated`. The group checkpoint
+    # (integrated -> done via GroupMergeCoordinator) is 08e-3b, NOT here. A
+    # raised exception (fenced `transition`, asyncpg error) is funnelled into
+    # the same fail-and-route path so it fails only this lane.
+    try:
+        integrated = await worker.mark_integrated(item, token, commit_result)
+    except (MergeQueueStoreError, MergeQueueLeaseFencedError, Exception) as exc:
+        return await _fail_result(
+            "checkpoint_contradiction",
+            f"merge queue lane {item_id} could not be marked integrated: "
+            f"{type(exc).__name__}: {exc}",
+        )
+    return _MergeQueueDrainResult(
+        item_id=item_id,
+        task_ids=task_ids,
+        terminal_status=str(getattr(integrated, "status", "integrated")),
+        result_commit=str(getattr(integrated, "result_commit", "") or ""),
+    )
+
+
+async def _recover_one_crashed_merge_queue_lane(
+    runner: WorkflowRunner,
+    feature: Feature,
+    worker: Any,
+    item: Any,
+    *,
+    dag_sha256: str,
+    stage: str,
+) -> _MergeQueueDrainResult:
+    """Deterministically recover ONE crashed merge-queue lane.
+
+    `MergeQueueStore.recover_expired` (doc 08 § Lease Semantics) is the ONLY
+    path that may re-take a lane stuck in `applying`/`verifying`/`committing`/
+    `checkpointing` after the drain process died mid-flight — normal `claim`
+    skips those states by design. `recover_expired` has already acquired the
+    feature advisory lock for this pick, bumped `lease_version` (so this worker
+    now holds a valid fencing token), and appended the recovery to
+    `payload.recovery_history`; after `MAX_RECOVERIES` it returns a `poisoned`
+    row instead.
+
+    The doc 08 "Rollback And Recovery Table" prescribes a DIFFERENT recovery
+    action per crashed status, so this function branches on `item.status`:
+
+    * `checkpointing` — the doc-08 row says "rerun the idempotent group
+      checkpoint transaction" -> terminal `done` or `poisoned`. A
+      `checkpointing` lane has already committed + proved clean (it is past
+      `integrated`); resetting its canonical repo would DESTROY a real commit.
+      Recovery therefore delegates to
+      :func:`_recover_one_crashed_checkpointing_group`, which re-drives the
+      idempotent `GroupMergeCoordinator` checkpoint; see that helper.
+    * `applying`/`verifying`/`committing` — the doc-08 rows permit "reset each
+      repo to `merge_queue_repo_targets.pre_apply_head` … then reapply OR fail
+      typed". This drain takes the deterministic *fail typed* option
+      (re-applying a recovered partial apply is not modelled in 08e-3a): it
+      resets every touched canonical repo to its recorded `pre_apply_head`,
+      cleans the merge proof's `patch_path_set` residue, proves no-dirty, then
+      fails the lane closed —
+
+        - a repo that resets clean -> the lane transitions to `failed` with
+          `checkpoint_contradiction` (routed through the Slice 07 router so a
+          retry goes through a router-created replacement queue item, never
+          the legacy commit);
+        - a repo with irreconcilable residue (untracked files outside the
+          patch path set — doc 08 step 7 forbids auto-deleting those) -> the
+          lane is `poisoned`, the doc-mandated fail-closed terminal for an
+          ambiguous repo.
+
+    An already-`poisoned` recovered row (recovery limit exhausted) is returned
+    as-is — it is terminal and needs no further mutation. Returns a
+    `_MergeQueueDrainResult` describing the terminal state; never raises into
+    the drain loop (a recovery fault fails only this lane).
+    """
+
+    token = MergeQueueLeaseToken.for_item(item)
+    item_id = int(item.id)
+    task_ids = [c.task_id for c in getattr(item, "task_coverage", []) or []]
+    group_idx = int(item.group_idx)
+    status = str(getattr(item, "status", "") or "")
+
+    # `recover_expired` poisons a row past MAX_RECOVERIES — already terminal.
+    if status == "poisoned":
+        routed = _route_merge_queue_drain_failure(
+            runner, feature, dag_sha256=dag_sha256, group_idx=group_idx,
+            item_id=item_id, failure_class="checkpoint_contradiction",
+            detail=f"merge queue lane {item_id} poisoned by recovery limit",
+            stage=stage,
+        )
+        return _MergeQueueDrainResult(
+            item_id=item_id, task_ids=task_ids, terminal_status="poisoned",
+            failure_class="checkpoint_contradiction",
+            detail="recovery limit exceeded", routed_failure=routed,
+        )
+
+    # A crashed `checkpointing` lane is past `integrated` — it has ALREADY
+    # committed + proved clean, so its `pre_apply_head` reset path below would
+    # destroy a real canonical commit. Doc 08 § "Rollback And Recovery Table"
+    # (the `checkpointing` row) prescribes "rerun the idempotent group
+    # checkpoint transaction", terminating at `done` or `poisoned` — never a
+    # repo reset. Delegate to the dedicated checkpoint-recovery helper.
+    if status == "checkpointing":
+        return await _recover_one_crashed_checkpointing_group(
+            runner, feature, worker, item, dag_sha256=dag_sha256, stage=stage
+        )
+
+    # Reset every touched repo to its recorded pre-apply HEAD. The merge proof
+    # (present once the lane reached `verifying`) carries the patch path set
+    # used to clean untracked apply residue.
+    patch_paths: list[str] = []
+    merge_proof_id = getattr(item, "merge_proof_evidence_id", None)
+    if merge_proof_id is not None:
+        try:
+            proof = await worker._store.load_proof(int(merge_proof_id))
+        except Exception:  # pragma: no cover - proof load is best effort.
+            proof = None
+        if proof:
+            patch_paths = list(proof.get("patch_path_set") or [])
+
+    irreconcilable: list[str] = []
+    for target in getattr(item, "repo_targets", []) or []:
+        pre = str(getattr(target, "pre_apply_head", "") or "")
+        repo_path = Path(target.repo_path)
+        target_status = str(getattr(target, "status", "") or "")
+        # 08g P3-iv: a repo target already in `committed`/`clean` has a REAL
+        # `result_commit` on the canonical repo. Doc 08 § "Rollback And
+        # Recovery Table" (the `committing` row) says "if result commit
+        # exists, record it" — and doc 08 commit step 9 forbids resetting a
+        # real commit. So a `reset --hard` to `pre_apply_head` here would
+        # DESTROY canonical history. Never reset such a target; only prove it
+        # is clean (a dirty-after-commit repo is still irreconcilable —
+        # `checkpoint_contradiction` per doc 08 step 9). Latent today (per-task
+        # lanes are single-repo, so a `committing`-crashed lane's single repo
+        # is never already committed), but a defense-in-depth guard.
+        if target_status in ("committed", "clean"):
+            if not await merge_queue_git_service.working_tree_clean(repo_path):
+                irreconcilable.append(target.repo_id)
+            continue
+        if not pre:
+            # No pre-apply HEAD recorded — the crash predates any mutation of
+            # this repo; nothing to reset, but it cannot be proven clean here.
+            if not await merge_queue_git_service.working_tree_clean(repo_path):
+                irreconcilable.append(target.repo_id)
+            continue
+        try:
+            await merge_queue_git_service.reset_hard(repo_path, pre)
+            if patch_paths:
+                await merge_queue_git_service.clean_untracked(
+                    repo_path, patch_paths
+                )
+        except merge_queue_git_service.GitError:
+            irreconcilable.append(target.repo_id)
+            continue
+        if not await merge_queue_git_service.working_tree_clean(repo_path):
+            # Residue outside the patch path set — doc 08 step 7 forbids
+            # auto-deleting it; the lane must fail closed to `poisoned`.
+            irreconcilable.append(target.repo_id)
+
+    terminal_status = "poisoned" if irreconcilable else "failed"
+    detail = (
+        f"merge queue lane {item_id} crashed in {status!r}; "
+        + (
+            f"repos {sorted(irreconcilable)} have irreconcilable apply "
+            f"residue — poisoned"
+            if irreconcilable
+            else "canonical repos reset to pre-apply HEAD — failed closed"
+        )
+    )
+    routed = _route_merge_queue_drain_failure(
+        runner, feature, dag_sha256=dag_sha256, group_idx=group_idx,
+        item_id=item_id, failure_class="checkpoint_contradiction",
+        detail=detail, stage=stage,
+    )
+    # Fail/poison the recovered lane via its (recovery-bumped) lease token.
+    # `applying`/`verifying`/`committing` all permit `-> failed`/`-> poisoned`.
+    try:
+        await worker._store.transition(
+            item_id, token.lease_owner, token.lease_version, terminal_status,
+            last_error=f"checkpoint_contradiction: {detail}"[:2000],
+        )
+    except (MergeQueueStoreError, MergeQueueLeaseFencedError, Exception):
+        # A concurrent recovery worker re-took the lane — reload authoritative.
+        pass
+    reloaded = await worker.get(item_id)
+    if reloaded is not None:
+        terminal_status = str(getattr(reloaded, "status", terminal_status))
+    return _MergeQueueDrainResult(
+        item_id=item_id,
+        task_ids=task_ids,
+        terminal_status=terminal_status,
+        failure_class="checkpoint_contradiction",
+        detail=detail,
+        routed_failure=routed,
+    )
+
+
+async def _recover_one_crashed_checkpointing_group(
+    runner: WorkflowRunner,
+    feature: Feature,
+    worker: Any,
+    item: Any,
+    *,
+    dag_sha256: str,
+    stage: str,
+) -> _MergeQueueDrainResult:
+    """Recover a lane crashed in `checkpointing` by re-running the checkpoint.
+
+    Doc 08 § "Rollback And Recovery Table" — the `checkpointing` row — says a
+    crashed `checkpointing` lane must "Require all covered lanes, result
+    commits, merge proof, post-apply gate proof, commit proof, and no-dirty
+    snapshots, then rerun the idempotent group checkpoint transaction" with
+    allowed terminal `done` or `poisoned`. A `checkpointing` lane has already
+    committed + proved clean (it is strictly past `integrated`); the
+    `pre_apply_head` reset path :func:`_recover_one_crashed_merge_queue_lane`
+    uses for `applying`/`verifying`/`committing` would DESTROY that real
+    canonical commit, so `checkpointing` recovery never touches the repo.
+
+    Recovery re-drives the idempotent group checkpoint via
+    :func:`_checkpoint_durable_merge_queue_group` (the same coordinator path
+    the post-DAG checkpoint splice and the resume re-drive use). That path:
+
+    * `GroupMergeCoordinator.coverage` recomputes coverage under the feature
+      advisory lock from the typed `merge_queue_task_coverage` rows;
+    * `checkpoint_group` — if the group is already checkpointed it is an
+      idempotent no-op success; if coverage is approved it re-projects
+      `dag-group:*` and `complete_checkpoint` advances every
+      `integrated`/`checkpointing` lane to `done` in one transaction.
+
+    The group's expected task ids are reconstructed from EVERY lane's
+    `merge_queue_task_coverage` rows for this `(feature, dag, group)` — the
+    08e-2 enqueue produces exactly one `task:{id}` lane per task, so the union
+    of lane coverage IS the group's effective-DAG expected set. The per-task
+    `ImplementationResult`s are reconstructed from the durable `dag-task:*`
+    attempt markers when `runner.artifacts` is available; the coordinator's
+    `task_results_provider` synthesizes a minimal `completed` result for any
+    task whose marker is absent, so a missing marker degrades only the
+    reconstructed body's `results` quality, never the recovery.
+
+    Outcome (always a `_MergeQueueDrainResult`, never a raise into the drain
+    loop): if the re-driven checkpoint completed, the lane is now `done` and
+    this returns a terminal `done` result (the drain logs it as a recovered
+    lane). If the checkpoint could not complete (coverage not approved — e.g. a
+    sibling lane is `failed`/`poisoned` — or the coordinator declined/raised),
+    the lane is driven to terminal `poisoned` via the recovery-bumped lease
+    token (the `checkpointing -> poisoned` transition the 08g remediation added
+    to `_LEASE_TRANSITIONS`) and the typed failure is routed through Slice 07.
+    Either way the lane reaches a terminal state, so the drain's
+    `recover_expired` pass cannot re-recover it and loop.
+    """
+
+    token = MergeQueueLeaseToken.for_item(item)
+    item_id = int(item.id)
+    task_ids = [c.task_id for c in getattr(item, "task_coverage", []) or []]
+    group_idx = int(item.group_idx)
+
+    # Reconstruct the group's expected task ids from EVERY lane's coverage rows
+    # (08e-2 enqueues one `task:{id}` lane per task — the union of lane coverage
+    # is the group's effective-DAG expected set). Authoritative typed rows, not
+    # payload mirrors.
+    try:
+        group_items = await worker._store.list_group_items(
+            str(feature.id), dag_sha256, group_idx
+        )
+    except Exception as exc:  # pragma: no cover - defensive store fault.
+        detail = (
+            f"merge queue lane {item_id} crashed in 'checkpointing'; the "
+            f"group lane scan failed: {type(exc).__name__}: {exc}"
+        )
+        return await _poison_unrecoverable_checkpointing_lane(
+            runner, feature, worker, token, item_id, task_ids,
+            dag_sha256=dag_sha256, group_idx=group_idx, detail=detail,
+            stage=stage,
+        )
+    expected_task_ids = sorted(
+        {
+            c.task_id
+            for gi in group_items
+            for c in getattr(gi, "task_coverage", []) or []
+            if c.task_id
+        }
+    )
+    if not expected_task_ids:
+        detail = (
+            f"merge queue lane {item_id} crashed in 'checkpointing'; no task "
+            f"coverage rows exist for group {group_idx} — cannot reconstruct "
+            "the checkpoint coverage set"
+        )
+        return await _poison_unrecoverable_checkpointing_lane(
+            runner, feature, worker, token, item_id, task_ids,
+            dag_sha256=dag_sha256, group_idx=group_idx, detail=detail,
+            stage=stage,
+        )
+
+    # Reconstruct the per-task `ImplementationResult`s from the durable
+    # `dag-task:*` attempt markers when the runner exposes artifacts. The
+    # coordinator's `task_results_provider` synthesizes a minimal `completed`
+    # result for any task whose marker is missing, so this is best-effort: a
+    # missing marker degrades only the reconstructed body's `results` quality.
+    task_results: list[ImplementationResult] = []
+    artifacts = getattr(runner, "artifacts", None)
+    if artifacts is not None:
+        for tid in expected_task_ids:
+            try:
+                marker = await artifacts.get(f"dag-task:{tid}", feature=feature)
+            except Exception:  # pragma: no cover - marker read is best effort.
+                marker = None
+            if not marker:
+                continue
+            try:
+                result = ImplementationResult.model_validate_json(marker)
+            except Exception:
+                continue
+            if result.status == "completed" and result.task_id:
+                task_results.append(result)
+
+    # Re-drive the idempotent group checkpoint. `_checkpoint_durable_merge_
+    # queue_group` runs `GroupMergeCoordinator.checkpoint_group` under the
+    # feature advisory lock: an already-checkpointed group is a no-op success;
+    # an approved `integrated`/`checkpointing` group is re-projected and every
+    # covered lane advances to `done`. It NEVER falls back to a legacy commit.
+    try:
+        checkpoint_result = await _checkpoint_durable_merge_queue_group(
+            runner,
+            feature,
+            dag_sha256=dag_sha256,
+            group_idx=group_idx,
+            expected_task_ids=expected_task_ids,
+            task_results=task_results,
+            stage=stage,
+        )
+    except _MergeQueueEnqueueError as exc:
+        detail = (
+            f"merge queue lane {item_id} crashed in 'checkpointing'; the "
+            f"idempotent checkpoint re-drive failed: {exc}"
+        )
+        return await _poison_unrecoverable_checkpointing_lane(
+            runner, feature, worker, token, item_id, task_ids,
+            dag_sha256=dag_sha256, group_idx=group_idx, detail=detail,
+            stage=stage,
+        )
+
+    reloaded = await worker.get(item_id)
+    final_status = str(getattr(reloaded, "status", "")) if reloaded else ""
+    if checkpoint_result.checkpointed and final_status == "done":
+        # The idempotent checkpoint re-run converged the crashed lane to the
+        # doc-08 `done` terminal — the `dag-group:*` projection now exists.
+        return _MergeQueueDrainResult(
+            item_id=item_id,
+            task_ids=task_ids,
+            terminal_status="done",
+            result_commit=str(checkpoint_result.result_commit or ""),
+        )
+
+    # The checkpoint could not complete (coverage not approved, or the
+    # coordinator declined). Doc 08's `checkpointing` recovery row allows
+    # `poisoned` as the other terminal — drive the lane there so the drain's
+    # `recover_expired` pass cannot re-recover it and loop.
+    detail = (
+        f"merge queue lane {item_id} crashed in 'checkpointing'; the "
+        f"idempotent checkpoint re-drive did not complete group {group_idx}: "
+        f"{checkpoint_result.detail or 'coordinator declined'}"
+    )
+    return await _poison_unrecoverable_checkpointing_lane(
+        runner, feature, worker, token, item_id, task_ids,
+        dag_sha256=dag_sha256, group_idx=group_idx, detail=detail, stage=stage,
+    )
+
+
+async def _poison_unrecoverable_checkpointing_lane(
+    runner: WorkflowRunner,
+    feature: Feature,
+    worker: Any,
+    token: Any,
+    item_id: int,
+    task_ids: list[str],
+    *,
+    dag_sha256: str,
+    group_idx: int,
+    detail: str,
+    stage: str,
+) -> _MergeQueueDrainResult:
+    """Drive a `checkpointing` lane whose checkpoint cannot complete to terminal.
+
+    Doc 08 § "Rollback And Recovery Table" allows a crashed `checkpointing`
+    lane to terminate at `done` OR `poisoned`. When the idempotent checkpoint
+    re-drive (:func:`_recover_one_crashed_checkpointing_group`) cannot reach
+    `done`, this drives the lane to `poisoned` via the recovery-bumped lease
+    token — the `checkpointing -> poisoned` transition the 08g remediation
+    added to `merge_queue_store._LEASE_TRANSITIONS`. The lane has already
+    committed + proved clean, so its canonical commit is preserved untouched;
+    only the queue row moves to the terminal failure state. The typed failure
+    is routed through the Slice 07 router exactly as other drain failures are.
+    Reaching a terminal state is what stops the drain's `recover_expired` pass
+    from re-recovering this row every drain pass (the silent-loop P2-A closed).
+    """
+
+    routed = _route_merge_queue_drain_failure(
+        runner, feature, dag_sha256=dag_sha256, group_idx=group_idx,
+        item_id=item_id, failure_class="checkpoint_contradiction",
+        detail=detail, stage=stage,
+    )
+    try:
+        await worker._store.transition(
+            item_id, token.lease_owner, token.lease_version, "poisoned",
+            last_error=f"checkpoint_contradiction: {detail}"[:2000],
+        )
+    except (MergeQueueStoreError, MergeQueueLeaseFencedError, Exception):
+        # A concurrent recovery worker re-took the lane, or the checkpoint
+        # re-drive already advanced it to `done` (the `checkpointing -> done`
+        # via `complete_checkpoint` races this `-> poisoned`). Reload the
+        # authoritative status rather than assuming `poisoned`.
+        pass
+    reloaded = await worker.get(item_id)
+    terminal_status = (
+        str(getattr(reloaded, "status", "poisoned")) if reloaded else "poisoned"
+    )
+    return _MergeQueueDrainResult(
+        item_id=item_id,
+        task_ids=task_ids,
+        terminal_status=terminal_status,
+        failure_class="checkpoint_contradiction",
+        detail=detail,
+        routed_failure=routed,
+    )
+
+
+async def _drain_durable_merge_queue_for_feature(
+    runner: WorkflowRunner,
+    feature: Feature,
+    *,
+    dag_sha256: str,
+    stage: str = "implementation",
+    lease_owner: str = "implementation_worker_drain",
+    max_lanes: int = 256,
+) -> list[_MergeQueueDrainResult]:
+    """Slice 08e-3a: drain every claimable durable merge-queue lane of a feature.
+
+    08e-2 enqueues `task:{id}` lanes (status `queued`) and halts the workflow;
+    this drains them. It wires the Slice 08e-1 production collaborators
+    (`build_apply_input_provider`, `build_gate_runner`,
+    `build_no_dirty_recorder`) and the deterministic post-apply gate decision
+    provider above into the Slice 08d `MergeQueue` worker, then loops:
+    `claim` one claimable lane (the store's atomic `FOR UPDATE SKIP LOCKED`
+    claim picks `queued` or expired-`leased` rows), drive it to `integrated`
+    via :func:`_drain_one_merge_queue_lane`, and repeat until nothing is
+    claimable. Canonical repos are mutated ONLY by the `MergeQueue` worker
+    methods — the drain only sequences them.
+
+    When `claim` is exhausted the loop falls through to a `recover_expired`
+    pass: `claim`'s predicate (`queued` / expired-`leased`) deliberately NEVER
+    re-takes a lane stuck in `applying`/`verifying`/`committing`/
+    `checkpointing` after the drain crashed mid-canonical-apply. Doc 08
+    § Lease Semantics + the "Rollback And Recovery Table" require those states
+    to be recovered through `MergeQueueStore.recover_expired`; each recovered
+    lane is driven to a deterministic fail-closed terminal by
+    :func:`_recover_one_crashed_merge_queue_lane` (canonical repos reset to
+    their recorded pre-apply HEAD, lane `failed`/`poisoned`, routed). Without
+    this pass a crashed-mid-apply lane would be invisible to every re-drive and
+    stranded forever.
+
+    Fails closed (`_MergeQueueEnqueueError`) when the merge-queue / worker /
+    collaborator modules or the typed store are unavailable — it NEVER falls
+    back to the legacy `_commit_group` / direct commit (standing
+    no-silent-degradation non-negotiable). A per-lane apply/gate/commit failure
+    is NOT fatal to the drain: the lane is recorded `failed` and routed through
+    the Slice 07 failure router, and the drain continues with the next
+    claimable lane (a sibling lane's conflict must not strand the others).
+
+    The post-DAG verify gates and the post-test guard are untouched: this
+    function does not run them and is not on their code path; they run later in
+    `execute()` after the whole DAG completes. This function also does NOT
+    project the `dag-group:*` checkpoint — that splice (integrated lanes ->
+    `GroupMergeCoordinator` checkpoint success) is Slice 08e-3b.
+
+    Returns one :class:`_MergeQueueDrainResult` per drained lane (in claim
+    order). A connection is held for the whole drain; the per-lane feature
+    advisory lock + lane lease (acquired/released inside the worker methods)
+    are what actually serialize canonical mutation.
+    """
+
+    if (
+        MergeQueueStore is None
+        or MergeQueueWorker is None
+        or MergeQueueLeaseToken is None
+        or build_merge_queue_apply_input_provider is None
+        or build_merge_queue_gate_runner is None
+        or build_merge_queue_no_dirty_recorder is None
+        or MergeQueueGateDecision is None
+        or merge_queue_git_service is None
+        or ExecutionControlStore is None
+    ):
+        raise _MergeQueueEnqueueError(
+            "durable merge queue worker/collaborator modules are unavailable "
+            "— cannot drain enqueued sandbox patch lanes (the legacy "
+            "_commit_group / direct commit is disabled and is not a fallback)"
+        )
+    store = _execution_control_store_for_runner(runner)
+    if store is None:
+        raise _MergeQueueEnqueueError(
+            "durable merge queue drain requires the typed execution control "
+            "store; no usable database pool is configured"
+        )
+    feature_id = str(getattr(feature, "id", ""))
+
+    drained: list[_MergeQueueDrainResult] = []
+    async with _merge_queue_connection(store) as conn:
+        # The collaborators and the queue store are connection-bound (the
+        # wiring builders take a bare connection / a connection-bound
+        # ExecutionControlStore); MergeQueueStore is connection-bound too.
+        queue_store = MergeQueueStore(conn)
+        control_store = ExecutionControlStore(conn)
+        apply_input_provider = build_merge_queue_apply_input_provider(conn)
+        gate_runner = build_merge_queue_gate_runner(
+            control_store, _merge_queue_post_apply_gate_decision
+        )
+        no_dirty_recorder = build_merge_queue_no_dirty_recorder(control_store)
+        worker = MergeQueueWorker(
+            queue_store,
+            apply_input_provider,
+            gate_runner=gate_runner,
+            no_dirty_recorder=no_dirty_recorder,
+        )
+
+        for _ in range(max_lanes):
+            item = await queue_store.claim(feature_id, lease_owner)
+            recovered = False
+            if item is None:
+                # `claim` is exhausted (no `queued` / expired-`leased` lane).
+                # Fall through to recover one lane stranded mid-canonical-apply
+                # (`applying`/`verifying`/`committing`/`checkpointing` with an
+                # expired lease) — `claim` can never re-take those (doc 08
+                # § Lease Semantics + Rollback And Recovery Table).
+                item = await queue_store.recover_expired(
+                    feature_id, lease_owner
+                )
+                if item is None:
+                    break
+                recovered = True
+            if recovered:
+                result = await _recover_one_crashed_merge_queue_lane(
+                    runner,
+                    feature,
+                    worker,
+                    item,
+                    dag_sha256=dag_sha256,
+                    stage=stage,
+                )
+            else:
+                result = await _drain_one_merge_queue_lane(
+                    runner,
+                    feature,
+                    worker,
+                    item,
+                    dag_sha256=dag_sha256,
+                    stage=stage,
+                )
+            drained.append(result)
+            integration_lane = str(
+                (item.payload or {}).get("integration_lane") or ""
+            )
+            if not integration_lane:
+                integration_lane = (
+                    f"task:{result.task_ids[0]}"
+                    if result.task_ids
+                    else "task"
+                )
+            metadata: dict[str, Any] = {
+                "group_idx": int(item.group_idx),
+                "stage": stage,
+                "merge_queue_item_id": result.item_id,
+                "task_ids": result.task_ids,
+                "merge_queue_status": result.terminal_status,
+                "integration_lane": integration_lane,
+                "recovered": recovered,
+            }
+            if result.succeeded:
+                metadata["result_commit"] = result.result_commit
+                # A lane recovered from a crashed `checkpointing` state (08g
+                # P2-A) reaches `done`, not `integrated` — the idempotent group
+                # checkpoint re-run completed. Log it as a recovery success,
+                # distinct from a normally-drained `integrated` lane.
+                await _log_feature_event(
+                    runner,
+                    feature.id,
+                    (
+                        "dag_merge_queue_lane_recovered"
+                        if recovered
+                        else "dag_merge_queue_integrated"
+                    ),
+                    "implementation",
+                    content=f"g{item.group_idx}:item-{result.item_id}",
+                    metadata=metadata,
+                )
+            else:
+                metadata["failure_class"] = result.failure_class
+                metadata["detail"] = result.detail[:500]
+                if result.routed_failure:
+                    metadata["route_action"] = result.routed_failure.get(
+                        "route_action"
+                    )
+                    metadata["typed_failure_id"] = result.routed_failure.get(
+                        "typed_failure_id"
+                    )
+                # A crashed lane recovered to a fail-closed terminal is a
+                # distinct event from a normal apply/gate/commit failure.
+                await _log_feature_event(
+                    runner,
+                    feature.id,
+                    (
+                        "dag_merge_queue_lane_recovered"
+                        if recovered
+                        else "dag_merge_queue_drain_failed"
+                    ),
+                    "implementation",
+                    content=f"g{item.group_idx}:item-{result.item_id}",
+                    metadata=metadata,
+                )
+    return drained
+
+
+# ── Slice 08e-3b — durable merge queue post-DAG CHECKPOINT splice ───────────
+#
+# 08e-2 enqueues `task:{id}` lanes; 08e-3a (above) drains them so each lane is
+# `integrated` (committed to the canonical repo + clean). 08e-3b is the final
+# 08e integration piece: the post-DAG group checkpoint. It REPLACES the legacy
+# checkpoint commit/projection — `_commit_group` /
+# `_record_dag_group_commit_proof` / `_project_dag_group_checkpoint` (the
+# `dag-group:*` projection = `ExecutionControlStore.project_group_checkpoint`)
+# — with `GroupMergeCoordinator.checkpoint_group`, which consumes the
+# `integrated` lanes the drain produced and projects the SAME single
+# `dag-group:{group_idx}` checkpoint (the wiring's `checkpoint_projector` writes
+# it via `ExecutionControlStore.project_group_checkpoint` with
+# `projection_owner='merge_queue'`). `_commit_group` /
+# `_record_dag_group_commit_proof` stay as doc-08-step-7 compat shims — the
+# queue-driven flow simply no longer calls them; the legacy non-queue flow in
+# `_verify_and_fix_group` is untouched. Checkpoint/coordinator failures route
+# through the Slice 07 `failure_router` the same typed way drain failures do.
+
+
+# `_MergeQueueCheckpointResult` is shimmed from `..execution.types` (Slice 11a).
+
+
+async def _checkpoint_durable_merge_queue_group(
+    runner: WorkflowRunner,
+    feature: Feature,
+    *,
+    dag_sha256: str,
+    group_idx: int,
+    expected_task_ids: list[str],
+    task_results: list[ImplementationResult] | None = None,
+    dag_ordered_task_ids: list[str] | None = None,
+    stage: str = "implementation",
+) -> _MergeQueueCheckpointResult:
+    """Slice 08e-3b: project the post-DAG group checkpoint from drained lanes.
+
+    Replaces the legacy `_commit_group` / `_record_dag_group_commit_proof` /
+    `_project_dag_group_checkpoint` path for the queue-driven flow. Runs the
+    Slice 08d `GroupMergeCoordinator`:
+
+    1. `coverage(feature, dag_sha256, group_idx)` recomputes — from the typed
+       `merge_queue_task_coverage` rows, NOT payload mirrors — whether every
+       `expected_task_id` is covered exactly once by an `integrated` lane (the
+       drain above leaves each `task:{id}` lane `integrated`).
+    2. `checkpoint_group(coverage, token)` runs the doc-08 checkpoint
+       transaction under the feature advisory lock: it reconstructs the legacy
+       `dag-group:*` body from typed rows, the wiring's `checkpoint_projector`
+       writes the single `dag-group:{group_idx}` projection via
+       `ExecutionControlStore.project_group_checkpoint` (owner `merge_queue`)
+       behind an approved `checkpoint_gate` evidence node, and every covered
+       lane is advanced `integrated -> done`. Re-running is an idempotent
+       no-op success (doc-08 step-3 checkpoint key).
+
+    `task_results` is the per-task `ImplementationResult` set for this group
+    (08e-3b P1 remediation). The coordinator's `task_results_provider` threads
+    these model-dumps into the reconstructed legacy `dag-group:*` body's
+    `results` list, which the legacy resume freshness gate
+    (`_checkpoint_results_match_tasks`) and the post-test guard hard-require —
+    a queue checkpoint body with `results: []` was rejected as stale, breaking
+    resume past and post-test completion of every queue-checkpointed group.
+
+    `dag_ordered_task_ids` is the DAG/wave-ordered group task id list — the
+    SAME order `_dag_group_checkpoint_is_fresh` receives as `group_task_ids`
+    (`dag.execution_order[g]`) (08e-3b REMEDIATION 2). The coordinator's
+    `body_task_ids_provider` threads it into the reconstructed legacy
+    `dag-group:*` body's `task_ids`, because that gate compares the body's
+    `task_ids` ORDER-SENSITIVELY against the DAG/wave order. Without it the
+    body's `task_ids` defaults to `coverage.expected_task_ids`, which the 08d
+    `coverage()` builds as `sorted(expected)` for its set-based coverage logic
+    — so a group whose DAG order is not already lexical (e.g. `["UI-C",
+    "BACKEND-D"]` vs sorted `["BACKEND-D", "UI-C"]`) had its queue checkpoint
+    body lexically ordered and the gate rejected it as stale. The 08d
+    set-based coverage (`expected_task_ids`) is left `sorted` deliberately;
+    only the legacy BODY's `task_ids` artifact must carry the DAG order. When
+    `dag_ordered_task_ids` is `None` the body falls back to the sorted
+    `expected_task_ids` (08d unit-test behavior, unchanged).
+
+    The checkpoint gate decision provider here is DETERMINISTIC: each covered
+    lane already passed its post-apply gates inside the drain
+    (`run_required_gates` -> the deterministic `git diff --check HEAD` gate) and
+    reached `integrated` only with a committed + proven-clean canonical repo, so
+    a group whose coverage is approved is checkpoint-gate approved. This mirrors
+    the deterministic drain post-apply gate; it does NOT replace, bypass, or
+    reorder the post-DAG verify gates (code review / QA / verifier) or the
+    post-test guard — those run later in `execute()` after `_implement_dag`
+    returns and are entirely separate from this per-group checkpoint.
+
+    Fails closed (`_MergeQueueEnqueueError`) when the merge-queue / coordinator
+    / wiring modules or the typed store are unavailable — it NEVER falls back to
+    the legacy `_commit_group` / direct checkpoint (standing
+    no-silent-degradation non-negotiable). A coverage-not-approved or a
+    coordinator-reported checkpoint failure is returned as
+    `checkpointed=False` and routed through the Slice 07 failure router (typed
+    `checkpoint_contradiction`), exactly as drain failures route.
+    """
+
+    if (
+        MergeQueueStore is None
+        or MergeQueueGroupCoordinator is None
+        or MergeQueueLeaseToken is None
+        or build_merge_queue_checkpoint_projector is None
+        or MergeQueueGateDecision is None
+        or ExecutionControlStore is None
+    ):
+        raise _MergeQueueEnqueueError(
+            "durable merge queue coordinator/wiring modules are unavailable — "
+            "cannot checkpoint the drained group (the legacy _commit_group / "
+            "direct checkpoint is disabled and is not a fallback)"
+        )
+    store = _execution_control_store_for_runner(runner)
+    if store is None:
+        raise _MergeQueueEnqueueError(
+            "durable merge queue checkpoint requires the typed execution "
+            "control store; no usable database pool is configured"
+        )
+    feature_id = str(getattr(feature, "id", ""))
+    expected_task_id_set = {str(t) for t in expected_task_ids if str(t)}
+    ordered_expected = sorted(expected_task_id_set)
+
+    # 08e-3b REMEDIATION 2: the DAG/wave-ordered task id list for the legacy
+    # `dag-group:*` body's `task_ids`. `_dag_group_checkpoint_is_fresh` (the
+    # resume reconstruction loop AND the post-test guard) compares the body's
+    # `task_ids` ORDER-SENSITIVELY against `group_task_ids` = the wave order
+    # `dag.execution_order[g]` — exactly as the legacy `_verify_and_fix_group`
+    # body's `[t.id for t in group_tasks]` is in DAG order. The 08d `coverage()`
+    # builds `expected_task_ids` as `sorted(expected)` for its set-based
+    # coverage logic; reusing that for the body's `task_ids` lexically orders
+    # it, so a non-lexically-sorted group's checkpoint was rejected as stale.
+    # `dag_ordered_task_ids` carries that DAG order from the caller; we filter
+    # it to the expected set (preserving DAG order) so the body matches the
+    # coverage's covered task set even on a defensive partial-overlap edge. If
+    # `dag_ordered_task_ids` is `None`, or it does not fully cover the expected
+    # set, fall back to `ordered_expected` (sorted) — fail-soft only to the
+    # pre-remediation body shape, never to a legacy commit.
+    ordered_dag_body_task_ids: list[str] | None = None
+    if dag_ordered_task_ids is not None:
+        seen: set[str] = set()
+        filtered: list[str] = []
+        for raw in dag_ordered_task_ids:
+            tid = str(raw)
+            if tid and tid in expected_task_id_set and tid not in seen:
+                seen.add(tid)
+                filtered.append(tid)
+        if seen == expected_task_id_set:
+            ordered_dag_body_task_ids = filtered
+
+    # 08e-3b P1 remediation: index the per-task `ImplementationResult`s by task
+    # id so the coordinator's `task_results_provider` can thread them into the
+    # reconstructed legacy `dag-group:*` body's `results` list. The legacy
+    # resume freshness gate (`_checkpoint_results_match_tasks`) and the
+    # post-test guard hard-require one validatable `ImplementationResult` dump
+    # per expected task id; a body with `results: []` is rejected as stale.
+    results_by_task_id: dict[str, dict[str, Any]] = {}
+    for _result in task_results or []:
+        if isinstance(_result, ImplementationResult) and _result.task_id:
+            results_by_task_id[str(_result.task_id)] = _result.model_dump(
+                mode="json"
+            )
+
+    def _route(detail: str, *, cause: str) -> dict[str, Any]:
+        # Checkpoint/coordinator failures route the SAME typed way drain
+        # failures do — through the Slice 07 router as `checkpoint_contradiction`
+        # (mapped to `checkpoint_after_failed_gate`). Never a legacy fallback.
+        # 08f P3-7: the group checkpoint has no queue item id (`item_id=0`); a
+        # distinct `cause` keeps each checkpoint-failure cause's router dedup
+        # key distinct (they share the `checkpoint_contradiction` class).
+        return _route_merge_queue_drain_failure(
+            runner,
+            feature,
+            dag_sha256=dag_sha256,
+            group_idx=group_idx,
+            item_id=0,
+            failure_class="checkpoint_contradiction",
+            detail=detail,
+            stage=stage,
+            cause=cause,
+        )
+
+    async def _expected_provider(
+        _feature_id: str, _dag_sha256: str, _group_idx: int
+    ) -> list[str]:
+        # The effective-DAG expected task ids for this group. The drain enqueued
+        # one `task:{id}` lane per task; the coordinator confirms each is
+        # covered exactly once by an `integrated` lane.
+        return list(ordered_expected)
+
+    async def _checkpoint_gate_decision(coverage: Any) -> Any:
+        # Deterministic: an approved coverage means every expected task is
+        # covered by exactly one `integrated` lane, each of which already
+        # committed + proved clean + passed its post-apply gates inside the
+        # drain. A non-approved coverage never reaches the projector
+        # (`checkpoint_group` short-circuits), so this is only consulted for an
+        # approved group.
+        return MergeQueueGateDecision(
+            approved=True,
+            verdict_payload={
+                "gate": "merge_queue_group_checkpoint",
+                "group_idx": group_idx,
+                "expected_task_ids": list(ordered_expected),
+                "integrated_queue_item_ids": sorted(
+                    getattr(coverage, "integrated_queue_item_ids", []) or []
+                ),
+            },
+        )
+
+    async def _task_results_provider(
+        _feature_id: str, _dag_sha256: str, _group_idx: int
+    ) -> list[dict[str, Any]]:
+        # 08e-3b P1 remediation: the per-task `ImplementationResult` model-dumps
+        # for the reconstructed legacy `dag-group:*` body's `results` list. The
+        # coordinator calls this only AFTER it has recomputed an approved
+        # coverage under the feature advisory lock — an approved coverage means
+        # every expected task is covered exactly once, so `ordered_expected`
+        # equals the covered task set and `results_by_task_id` has a dump for
+        # each. We emit exactly one dump per expected task id, in expected-id
+        # order, so the body matches the legacy
+        # `_checkpoint_results_match_tasks` shape (one validatable
+        # `ImplementationResult` per task id, no duplicates). A defensive
+        # fallback synthesizes a minimal `completed` result if a dump is
+        # genuinely missing — never fabricated work, just the typed task id.
+        dumps: list[dict[str, Any]] = []
+        for task_id in ordered_expected:
+            dump = results_by_task_id.get(task_id)
+            if dump is None:
+                dump = ImplementationResult(
+                    task_id=task_id,
+                    summary="Integrated via the durable merge queue.",
+                    status="completed",
+                ).model_dump(mode="json")
+            dumps.append(dump)
+        return dumps
+
+    async def _body_task_ids_provider(
+        _feature_id: str, _dag_sha256: str, _group_idx: int
+    ) -> list[str]:
+        # 08e-3b REMEDIATION 2: the DAG/wave-ordered task id list for the
+        # reconstructed legacy `dag-group:*` body's `task_ids`. The legacy
+        # resume freshness gate `_dag_group_checkpoint_is_fresh` compares the
+        # body's `task_ids` ORDER-SENSITIVELY against `dag.execution_order[g]`
+        # (wave order, NOT lexical). The coordinator calls this only AFTER it
+        # has recomputed an approved coverage under the feature advisory lock,
+        # so the covered task set equals the expected set. When the caller
+        # supplied the DAG order and it fully covers the expected set we return
+        # it; otherwise we return the sorted `ordered_expected` (the
+        # pre-remediation body shape) — fail-soft, never a legacy fallback.
+        if ordered_dag_body_task_ids is not None:
+            return list(ordered_dag_body_task_ids)
+        return list(ordered_expected)
+
+    async with _merge_queue_connection(store) as conn:
+        queue_store = MergeQueueStore(conn)
+        control_store = ExecutionControlStore(conn)
+        checkpoint_projector = build_merge_queue_checkpoint_projector(
+            control_store, _checkpoint_gate_decision
+        )
+        coordinator = MergeQueueGroupCoordinator(
+            queue_store,
+            _expected_provider,
+            checkpoint_projector,
+            _task_results_provider,
+            _body_task_ids_provider,
+        )
+        coverage = await coordinator.coverage(
+            feature_id, dag_sha256, group_idx
+        )
+        if not coverage.approved:
+            detail = (
+                f"durable merge queue group {group_idx} checkpoint coverage is "
+                f"not approved (missing={coverage.missing_task_ids}, "
+                f"duplicate={coverage.duplicate_task_ids}, "
+                f"failed={coverage.failed_queue_item_ids})"
+            )
+            return _MergeQueueCheckpointResult(
+                group_idx=group_idx,
+                checkpointed=False,
+                detail=detail,
+                routed_failure=_route(detail, cause="coverage_not_approved"),
+            )
+        # The lane lease tokens are spent — the group checkpoint runs under the
+        # coordinator-held feature advisory lock, which is what serializes the
+        # checkpoint transaction (doc 08 § Checkpoint Transaction).
+        token = MergeQueueLeaseToken(
+            item_id=0, lease_owner=f"{stage}_group_checkpoint", lease_version=0
+        )
+        try:
+            merge_result = await coordinator.checkpoint_group(coverage, token)
+        except (
+            MergeQueueStoreError,
+            MergeQueueLeaseFencedError,
+            MergeQueueWiringError,
+            Exception,
+        ) as exc:
+            detail = (
+                f"durable merge queue group {group_idx} checkpoint raised "
+                f"{type(exc).__name__}: {exc}"
+            )
+            return _MergeQueueCheckpointResult(
+                group_idx=group_idx,
+                checkpointed=False,
+                detail=detail,
+                routed_failure=_route(detail, cause="checkpoint_raised"),
+            )
+
+    if not merge_result.checkpointed:
+        detail = (
+            f"durable merge queue group {group_idx} checkpoint did not "
+            f"complete: {merge_result.detail or 'coordinator declined'}"
+        )
+        return _MergeQueueCheckpointResult(
+            group_idx=group_idx,
+            checkpointed=False,
+            detail=detail,
+            routed_failure=_route(detail, cause="checkpoint_declined"),
+        )
+    return _MergeQueueCheckpointResult(
+        group_idx=group_idx,
+        checkpointed=True,
+        result_commit=str(merge_result.result_commit or ""),
+        done_queue_item_ids=list(merge_result.done_queue_item_ids or []),
+    )
+
+
+# `_MergeQueueResumeRecovery` is shimmed from `..execution.types` (Slice 11a).
+
+
+async def _resume_recover_durable_merge_queue_group(
+    runner: WorkflowRunner,
+    feature: Feature,
+    *,
+    dag_sha256: str,
+    group_idx: int,
+    group_task_ids: list[str],
+) -> _MergeQueueResumeRecovery:
+    """Slice 08e-3b P2-a: re-drive a queue group's idempotent drain+checkpoint.
+
+    08e-3b's `if pending_merge_queue:` block writes a per-task
+    `_pending_merge_queue_marker_key` marker, then drains + checkpoints. If the
+    drain succeeded but `_checkpoint_durable_merge_queue_group` then crashed
+    (vector 6), the lanes are `integrated`, no `dag-group:*` projection exists,
+    and the markers survive. On the next resume the per-task resume block sees
+    a surviving marker and returns `workflow_blocked` WITHOUT completing the
+    idempotent checkpoint — doc 08 § Rollback And Recovery Table says
+    `integrated`/`checkpointing` groups must be driven to the idempotent
+    checkpoint on recovery.
+
+    This re-drives that exact idempotent path: `_drain_durable_merge_queue_for_
+    feature` (a no-op for already-`integrated` lanes — `claim` cannot re-take
+    them, so no double-apply) then `_checkpoint_durable_merge_queue_group` (an
+    idempotent no-op success for an already-checkpointed group). It is safe to
+    call whenever a pending marker is present: if the drain never ran the lanes
+    are still `queued` and get drained now; if a lane crashed mid-apply
+    `recover_expired` fails it closed and this returns `recovered=False`.
+
+    The per-task `ImplementationResult`s are reconstructed from the durable
+    `dag-task:{tid}` attempt markers (the dispatcher's typed task evidence) so
+    the projected `dag-group:*` body carries the `results` list the legacy
+    resume freshness gate requires (08e-3b P1). Fail closed: any drain/
+    checkpoint failure — or a missing module/store — returns `recovered=False`
+    and the caller blocks on a typed `workflow_blocked` exactly as before. It
+    NEVER falls back to the legacy `_commit_group` / direct checkpoint.
+    """
+
+    # Reconstruct the per-task results from the durable `dag-task:*` attempt
+    # markers — only the tasks whose marker carries the durable-merge-queue
+    # note are queue lanes (and they are exactly the tasks the 08e-2 enqueue
+    # produced a `task:{id}` lane + a pending marker for).
+    task_results: list[ImplementationResult] = []
+    for tid in group_task_ids:
+        marker = await runner.artifacts.get(f"dag-task:{tid}", feature=feature)
+        if not marker:
+            continue
+        try:
+            result = ImplementationResult.model_validate_json(marker)
+        except Exception:
+            continue
+        if (
+            result.status == "completed"
+            and _result_requires_durable_merge_queue(result)
+        ):
+            task_results.append(result)
+    expected_task_ids = [r.task_id for r in task_results if r.task_id]
+    if not expected_task_ids:
+        # No reconstructable queue lanes — let the caller block as before.
+        return _MergeQueueResumeRecovery(
+            recovered=False,
+            detail=(
+                f"durable merge queue resume for group {group_idx} could not "
+                "reconstruct the per-task results from the dag-task markers"
+            ),
+        )
+
+    # ── Re-drive the drain. Idempotent: already-`integrated`/`done` lanes are
+    #    never re-claimed (no double-apply); only `queued`/expired lanes move.
+    try:
+        drain_results = await _drain_durable_merge_queue_for_feature(
+            runner, feature, dag_sha256=dag_sha256, stage="resume",
+        )
+    except _MergeQueueEnqueueError as exc:
+        return _MergeQueueResumeRecovery(
+            recovered=False,
+            detail=(
+                f"durable merge queue resume drain failed for group "
+                f"{group_idx}: {exc}"
+            ),
+        )
+    # A lane recovered from a crashed `checkpointing` state reaches `done`
+    # (08g P2-A) — `succeeded` counts both `integrated` and `done` so a
+    # recovered-`done` lane is NOT mistaken for a failure here.
+    failed_lanes = [r for r in drain_results if not r.succeeded]
+    if failed_lanes:
+        detail = "; ".join(
+            f"item {r.item_id} ({r.terminal_status}): "
+            f"{r.failure_class or 'failed'}"
+            for r in failed_lanes[:10]
+        )
+        return _MergeQueueResumeRecovery(
+            recovered=False,
+            detail=(
+                f"durable merge queue resume drain could not integrate every "
+                f"lane of group {group_idx}: {detail}"
+            ),
+        )
+
+    # ── Re-drive the checkpoint. Idempotent: an already-checkpointed group is
+    #    a no-op success (doc-08 step-3 checkpoint key).
+    try:
+        checkpoint_result = await _checkpoint_durable_merge_queue_group(
+            runner,
+            feature,
+            dag_sha256=dag_sha256,
+            group_idx=group_idx,
+            expected_task_ids=expected_task_ids,
+            task_results=task_results,
+            # 08e-3b REMEDIATION 2: `group_task_ids` is the caller's
+            # `list(group)` = `dag.execution_order[group_idx]`, the DAG/wave
+            # order the resume freshness gate compares the body's `task_ids`
+            # against. Threading it makes the re-driven checkpoint body's
+            # `task_ids` carry the DAG order so a later plain resume of this
+            # recovered group is not re-staled by the order-sensitive gate.
+            dag_ordered_task_ids=list(group_task_ids),
+            stage="resume",
+        )
+    except _MergeQueueEnqueueError as exc:
+        return _MergeQueueResumeRecovery(
+            recovered=False,
+            detail=(
+                f"durable merge queue resume checkpoint failed for group "
+                f"{group_idx}: {exc}"
+            ),
+        )
+    if not checkpoint_result.checkpointed:
+        return _MergeQueueResumeRecovery(
+            recovered=False,
+            detail=(
+                f"durable merge queue resume checkpoint did not complete for "
+                f"group {group_idx}: {checkpoint_result.detail}"
+            ),
+        )
+    return _MergeQueueResumeRecovery(
+        recovered=True,
+        done_queue_item_ids=list(checkpoint_result.done_queue_item_ids),
+        result_commit=checkpoint_result.result_commit,
+    )
+
+
+def _workspace_root_for_feature_root(
+    runner: WorkflowRunner,
+    feature_root: Path | None,
+) -> Path | None:
+    services = getattr(runner, "services", {}) or {}
+    workspace_mgr = services.get("workspace_manager")
+    if workspace_mgr is not None:
+        return Path(workspace_mgr._base)
+    if feature_root is None:
+        return None
+    parts = feature_root.resolve(strict=False).parts
+    for idx in range(0, len(parts) - 1):
+        if parts[idx] == ".iriai" and parts[idx + 1] == "features" and idx > 0:
+            return Path(*parts[:idx])
+    return None
+
+
+def _repair_sandbox_required(
+    runner: WorkflowRunner,
+    feature_root: Path | None,
+) -> bool:
+    services = getattr(runner, "services", {}) or {}
+    if services.get("workspace_manager") is not None:
+        return True
+    if feature_root is None:
+        return False
+    parts = feature_root.resolve(strict=False).parts
+    return any(
+        parts[idx] == ".iriai" and idx + 1 < len(parts) and parts[idx + 1] == "features"
+        for idx in range(len(parts))
+    )
+
+
+# `_post_dag_repair_group_idx` is shimmed from `..execution.repair` (Slice 11h).
+
+
+async def _current_dag_sha256(runner: WorkflowRunner, feature: Feature) -> str:
+    try:
+        raw = await runner.artifacts.get("dag", feature=feature)
+    except Exception:
+        raw = ""
+    if not raw:
+        return ""
+    try:
+        dag = ImplementationDAG.model_validate_json(raw)
+        raw = dag.model_dump_json()
+    except Exception:
+        pass
+    return hashlib.sha256(str(raw).encode("utf-8")).hexdigest()
+
+
+def _repair_task_for_rca(
+    repair_id: str,
+    repo_id: str,
+    affected_files: list[str],
+) -> ImplementationTask:
+    scope_paths = list(_dedupe_preserving_order(affected_files)) or ["."]
+    return ImplementationTask(
+        id=repair_id,
+        name=f"DAG repair {repair_id}",
+        description="Sandboxed DAG verification repair attempt.",
+        repo_path="" if repo_id == "repo" else repo_id,
+        file_scope=[
+            TaskFileScope(path=path, action="modify")
+            for path in scope_paths
+        ],
+    )
+
+
+def _normalize_repair_contract_path(
+    raw_path: str,
+    *,
+    repo_id: str,
+    repo_root: Path | None,
+) -> str:
+    text = str(raw_path or "").strip().replace("\\", "/")
+    if not text:
+        return ""
+    if repo_root is not None:
+        try:
+            raw_absolute = Path(text).expanduser()
+            if raw_absolute.is_absolute():
+                return raw_absolute.resolve(strict=False).relative_to(
+                    repo_root.resolve(strict=False)
+                ).as_posix()
+        except Exception:
+            pass
+    for marker in (f"/repos/{repo_id}/", f"repos/{repo_id}/"):
+        if marker in text:
+            text = text.split(marker, 1)[1]
+            break
+    if repo_id and repo_id != "repo":
+        prefix = f"{repo_id}/"
+        if text == repo_id:
+            return ""
+        if text.startswith(prefix):
+            text = text[len(prefix):]
+    text = text.lstrip("/")
+    if text in {"", ".", "./"}:
+        return ""
+    parts = [part for part in text.split("/") if part not in {"", "."}]
+    if any(part == ".." for part in parts):
+        return ""
+    return "/".join(parts)
+
+
+def _repair_contract_for_paths(
+    *,
+    feature: Feature,
+    dag_sha256: str,
+    group_idx: int,
+    repair_id: str,
+    repo_id: str,
+    repo_path: str,
+    affected_paths: list[str],
+    repo_root: Path | None,
+) -> Any:
+    normalized = _dedupe_preserving_order([
+        path
+        for path in (
+            _normalize_repair_contract_path(path, repo_id=repo_id, repo_root=repo_root)
+            for path in affected_paths
+        )
+        if path
+    ])
+    if not normalized:
+        raise _sandbox_blocker(
+            f"Repair sandbox requires RCA affected file evidence for {repair_id}.",
+            task_id=repair_id,
+        )
+    allowed_paths = [
+        SimpleNamespace(
+            repo_id=repo_id,
+            path=path,
+            match_kind="directory" if path.endswith("/") else "file",
+            intent="repair",
+            required=False,
+            allow_modify=True,
+            allow_create=True,
+            allow_delete=False,
+            source="repair_rca",
+        )
+        for path in normalized
+    ]
+    payload = {
+        "feature_id": str(getattr(feature, "id", "")),
+        "dag_sha256": dag_sha256,
+        "group_idx": group_idx,
+        "task_id": repair_id,
+        "repo_id": repo_id,
+        "repo_path": repo_path,
+        "allowed_paths": [
+            {
+                "repo_id": rule.repo_id,
+                "path": rule.path,
+                "match_kind": rule.match_kind,
+                "intent": rule.intent,
+                "required": rule.required,
+                "allow_modify": rule.allow_modify,
+                "allow_create": rule.allow_create,
+                "allow_delete": rule.allow_delete,
+                "source": rule.source,
+            }
+            for rule in allowed_paths
+        ],
+    }
+    digest = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return SimpleNamespace(
+        id=None,
+        feature_id=payload["feature_id"],
+        dag_sha256=dag_sha256,
+        source_dag_artifact_id=0,
+        source_dag_sha256=dag_sha256,
+        group_idx=group_idx,
+        task_id=repair_id,
+        repo_id=repo_id,
+        repo_path=repo_path,
+        required_paths=[],
+        allowed_paths=allowed_paths,
+        read_only_paths=[],
+        forbidden_paths=[],
+        generated_outputs=[],
+        acceptance_criteria=[],
+        verification_gates=[],
+        execution_policy=SimpleNamespace(
+            write_set_mode="explicit",
+            sandbox_isolation="task",
+            merge_admission="contract_verdict",
+            requires_contract_verdict=True,
+            repair_may_broaden_scope=False,
+            phased_rollout_allowed=False,
+        ),
+        non_goals=[],
+        dependency_task_ids=[],
+        unknown_write_set=False,
+        compile_warnings=[],
+        normalized_contract_json=payload,
+        contract_digest=digest,
+        status="active",
+        idempotency_key=f"idem:repair-contract:{payload['feature_id']}:{dag_sha256}:g{group_idx}:{repair_id}",
+    )
+
+
+async def _bind_repair_sandbox(
+    runner: WorkflowRunner,
+    feature: Feature,
+    *,
+    workspace_root: Path | None,
+    feature_root: Path | None,
+    dag_sha256: str,
+    group_idx: int,
+    retry: int,
+    repair_idx: int,
+    repair_id: str,
+    group_tasks: list[ImplementationTask],
+    contracts_by_task_id: dict[str, Any] | None,
+    ws_path: str | None,
+    snapshots: list[Any],
+    runtime: str | None,
+) -> RuntimeSandboxTaskBinding | None:
+    if not _repair_sandbox_required(runner, feature_root):
+        services = getattr(runner, "services", {}) or {}
+        if services.get("test_allow_legacy_repair_without_sandbox") is True:
+            return None
+        raise _sandbox_blocker(
+            f"Repair sandbox binding is required for {repair_id}; "
+            "legacy canonical repair mutation is disabled.",
+            task_id=repair_id,
+        )
+    effective_dag_sha256 = dag_sha256 or hashlib.sha256(
+        f"{getattr(feature, 'id', '')}:{group_idx}:repair".encode("utf-8")
+    ).hexdigest()
+    repo_id = _repair_repo_id_for_sandbox(
+        group_tasks,
+        contracts_by_task_id,
+        feature_root=feature_root,
+        ws_path=ws_path,
+    )
+    affected_paths: list[str] = []
+    for task in group_tasks:
+        affected_paths.extend(
+            str(scope.path)
+            for scope in list(getattr(task, "file_scope", []) or [])
+            if str(getattr(scope, "path", "") or "").strip()
+        )
+    repair_task = _repair_task_for_rca(repair_id, repo_id, affected_paths)
+    if not snapshots and workspace_root is not None and feature_root is not None:
+        authority_tasks = group_tasks if _workspace_authority_task_targets(group_tasks) else [repair_task]
+        authority_guard = await _run_workspace_authority_pre_dispatch_adapter(
+            runner,
+            feature,
+            group_idx,
+            authority_tasks,
+            workspace_root=workspace_root,
+            feature_root=feature_root,
+            stage="repair-dispatch",
+            dag_sha256=effective_dag_sha256,
+            attempt_id=(retry * 1000) + repair_idx,
+        )
+        if _workspace_authority_blocks_dispatch(authority_guard):
+            evidence = "; ".join(
+                f"{getattr(route, 'failure_class', '')}/"
+                f"{getattr(route, 'failure_type', '')}: "
+                f"{getattr(route, 'route', '')}"
+                for route in authority_guard.routes[:10]
+            )
+            raise _sandbox_blocker(
+                "WorkspaceAuthority pre-dispatch guard blocked repair "
+                f"{repair_id}. Evidence: "
+                f"{evidence or 'see workspace-authority-routes artifact'}",
+                task_id=repair_id,
+        )
+        snapshots = list(authority_guard.snapshots)
+    repo_root = Path(ws_path) if ws_path else None
+    repair_contract = _repair_contract_for_paths(
+        feature=feature,
+        dag_sha256=effective_dag_sha256,
+        group_idx=group_idx,
+        repair_id=repair_id,
+        repo_id=repo_id,
+        repo_path="" if repo_id == "repo" else repo_id,
+        affected_paths=affected_paths,
+        repo_root=repo_root,
+    )
+    return await _bind_task_sandbox(
+        runner,
+        feature,
+        workspace_root=workspace_root,
+        feature_root=feature_root,
+        dag_sha256=effective_dag_sha256,
+        group_idx=group_idx,
+        task_idx=repair_idx,
+        attempt=(retry + 100) * 1000,
+        task=repair_task,
+        task_contract=repair_contract,
+        ws_path=ws_path,
+        snapshots=snapshots,
+        runtime=runtime,
+        sandbox_mode="repair",
+    )
+
+
+async def _sandbox_git_bytes(
+    repo_path: Path,
+    args: list[str],
+    *,
+    input_bytes: bytes | None = None,
+    env: dict[str, str] | None = None,
+) -> bytes:
+    merged_env = os.environ.copy()
+    if env:
+        merged_env.update(env)
+    proc = await _asyncio.create_subprocess_exec(
+        "git",
+        *args,
+        cwd=str(repo_path),
+        env=merged_env,
+        stdin=_asyncio.subprocess.PIPE if input_bytes is not None else None,
+        stdout=_asyncio.subprocess.PIPE,
+        stderr=_asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await proc.communicate(input_bytes)
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"git {' '.join(args)} failed in {repo_path}: "
+            f"{stderr.decode(errors='replace').strip()}"
+        )
+    return stdout
+
+
+async def _promote_sandbox_capture_to_feature_worktree(
+    capture: Any,
+    binding: RuntimeSandboxTaskBinding,
+    *,
+    task_id: str,
+) -> None:
+    manifest = _sandbox_manifest_for_binding(binding)
+    repo_roots = {
+        str(repo_id): str(path)
+        for repo_id, path in dict(manifest.get("repo_roots", {})).items()
+    }
+    repo_sources = {
+        str(repo_id): str(path)
+        for repo_id, path in dict(manifest.get("repo_sources", {})).items()
+    }
+    for repo_patch in getattr(capture, "repo_patches", []) or []:
+        repo_id = str(getattr(repo_patch, "repo_id", ""))
+        changed_paths = list(getattr(repo_patch, "changed_paths", []) or [])
+        if not changed_paths:
+            continue
+        outside = list(getattr(repo_patch, "outside_contract_paths", []) or [])
+        if outside:
+            raise _sandbox_blocker(
+                "Sandbox patch changed paths outside the task contract for "
+                f"{task_id}/{repo_id}: {', '.join(outside[:10])}",
+                task_id=task_id,
+            )
+        sandbox_repo_text = str(repo_roots.get(repo_id) or "").strip()
+        target_repo_text = str(repo_sources.get(repo_id) or "").strip()
+        expected_sandbox_text = str(
+            dict(getattr(binding.lease, "repo_roots", {}) or {}).get(repo_id) or ""
+        ).strip()
+        expected_target_text = str(
+            dict(getattr(binding.runner, "repo_sources", {}) or {}).get(repo_id) or ""
+        ).strip()
+        if not all([sandbox_repo_text, target_repo_text, expected_sandbox_text, expected_target_text]):
+            raise _sandbox_blocker(
+                f"Sandbox patch promotion missing repo authority for {task_id}/{repo_id}",
+                task_id=task_id,
+            )
+        sandbox_repo = Path(sandbox_repo_text)
+        target_repo = Path(target_repo_text)
+        if not sandbox_repo.exists() or not target_repo.exists():
+            raise _sandbox_blocker(
+                f"Sandbox patch promotion missing repo root for {task_id}/{repo_id}",
+                task_id=task_id,
+            )
+        expected_sandbox_repo = Path(expected_sandbox_text)
+        expected_target_repo = Path(expected_target_text)
+        try:
+            sandbox_resolved = sandbox_repo.resolve(strict=True)
+            target_resolved = target_repo.resolve(strict=True)
+            expected_sandbox_resolved = expected_sandbox_repo.resolve(strict=True)
+            expected_target_resolved = expected_target_repo.resolve(strict=True)
+            lease_root_resolved = Path(str(binding.lease.root)).resolve(strict=True)
+        except Exception as exc:
+            raise _sandbox_blocker(
+                f"Sandbox patch promotion could not validate repo roots for "
+                f"{task_id}/{repo_id}: {exc}",
+                task_id=task_id,
+            ) from exc
+        if sandbox_resolved != expected_sandbox_resolved:
+            raise _sandbox_blocker(
+                f"Sandbox patch promotion manifest repo root drift for {task_id}/{repo_id}",
+                task_id=task_id,
+            )
+        if target_resolved != expected_target_resolved:
+            raise _sandbox_blocker(
+                f"Sandbox patch promotion target root drift for {task_id}/{repo_id}",
+                task_id=task_id,
+            )
+        if _path_relative_to(target_resolved, lease_root_resolved) is not None:
+            raise _sandbox_blocker(
+                f"Sandbox patch promotion target resolves inside sandbox for {task_id}/{repo_id}",
+                task_id=task_id,
+            )
+        validator = getattr(binding.runner, "_validate_repo_root", None)
+        if callable(validator):
+            try:
+                validator(
+                    sandbox_resolved,
+                    sandbox_root=lease_root_resolved,
+                    expected_commit=None,
+                )
+            except Exception as exc:
+                raise _sandbox_blocker(
+                    f"Sandbox patch promotion repo validation failed for "
+                    f"{task_id}/{repo_id}: {exc}",
+                    task_id=task_id,
+                ) from exc
+        base_commit = str(getattr(repo_patch, "base_commit", "") or "")
+        try:
+            target_head = _git_text(["rev-parse", "HEAD"], cwd=target_repo)
+            if base_commit and target_head != base_commit:
+                raise RuntimeError(
+                    f"target HEAD {target_head} does not match sandbox base {base_commit}"
+                )
+            target_status = _git_text(["status", "--porcelain=v1"], cwd=target_repo)
+            if target_status.strip():
+                raise RuntimeError("target repo is dirty before sandbox patch promotion")
+            with tempfile.TemporaryDirectory(prefix="iriai-sandbox-promote-index-") as temp_dir:
+                index_env = {"GIT_INDEX_FILE": str(Path(temp_dir) / "index")}
+                await _sandbox_git_bytes(
+                    sandbox_repo,
+                    ["read-tree", base_commit],
+                    env=index_env,
+                )
+                await _sandbox_git_bytes(
+                    sandbox_repo,
+                    ["add", "-A", "--", "."],
+                    env=index_env,
+                )
+                diff_bytes = await _sandbox_git_bytes(
+                    sandbox_repo,
+                    [
+                        "diff",
+                        "--cached",
+                        "--binary",
+                        "--find-renames",
+                        "--full-index",
+                        base_commit,
+                        "--",
+                    ],
+                    env=index_env,
+                )
+            diff_sha = hashlib.sha256(diff_bytes).hexdigest()
+            if diff_sha != str(getattr(repo_patch, "diff_sha256", "") or ""):
+                raise RuntimeError("sandbox diff digest changed after capture")
+            if not diff_bytes:
+                continue
+            await _sandbox_git_bytes(
+                target_repo,
+                ["apply", "--binary", "--whitespace=nowarn", "-"],
+                input_bytes=diff_bytes,
+            )
+        except Exception as exc:
+            raise _sandbox_blocker(
+                f"Sandbox patch promotion failed for {task_id}/{repo_id}: {exc}",
+                task_id=task_id,
+            ) from exc
+
+
+async def _validate_sandbox_capture_against_contract(
+    runner: WorkflowRunner,
+    feature: Feature,
+    capture: Any,
+    *,
+    task_id: str,
+    task_contract: Any,
+    feature_root: Path,
+    dag_sha256: str,
+    group_idx: int,
+    stage: str,
+    result: ImplementationResult | None,
+    snapshots: list[Any] | None = None,
+) -> None:
+    if ContractCompiler is None or CompiledPatchSummary is None or WorkspaceAuthoritySnapshot is None:
+        raise _sandbox_blocker(
+            "Task contract validation is unavailable before sandbox patch promotion.",
+            task_id=task_id,
+        )
+    compiler = ContractCompiler()
+    snapshots = list(snapshots or [])
+    feature_id = str(getattr(feature, "id", ""))
+    repo_id = _contract_repo_id(task_contract)
+    repo_path = _contract_repo_path(task_contract)
+    repo_patches = list(getattr(capture, "repo_patches", []) or [])
+    patch_summary_ids = list(getattr(capture, "patch_summary_ids", []) or [])
+    matching = [
+        (idx, repo_patch)
+        for idx, repo_patch in enumerate(repo_patches)
+        if str(getattr(repo_patch, "repo_id", "") or "") == repo_id
+    ]
+    if not matching:
+        raise _sandbox_blocker(
+            f"Task contract validation could not find captured patch evidence "
+            f"for task {task_id} repo {repo_id}.",
+            task_id=task_id,
+        )
+
+    for idx, repo_patch in matching:
+        captured_patch_summary_id: int | None = None
+        if idx < len(patch_summary_ids):
+            try:
+                captured_patch_summary_id = int(patch_summary_ids[idx])
+            except (TypeError, ValueError):
+                captured_patch_summary_id = None
+        contract_id = _task_contract_id(task_contract)
+        contract_ids = [contract_id] if contract_id is not None else []
+        changed_paths = list(getattr(repo_patch, "changed_paths", []) or [])
+        created_paths = list(getattr(repo_patch, "created_paths", []) or [])
+        modified_paths = list(getattr(repo_patch, "modified_paths", []) or [])
+        deleted_paths = list(getattr(repo_patch, "deleted_paths", []) or [])
+        renamed_paths = dict(getattr(repo_patch, "renamed_paths", []) or [])
+        diff_artifact_id = getattr(repo_patch, "diff_artifact_id", None)
+        patch = CompiledPatchSummary(
+            id=captured_patch_summary_id,
+            sandbox_id=str(getattr(capture, "sandbox_id", "") or ""),
+            contract_ids=contract_ids,
+            repo_id=repo_id,
+            base_commit=str(getattr(repo_patch, "base_commit", "") or "") or None,
+            changed_paths=changed_paths,
+            created_paths=created_paths,
+            modified_paths=modified_paths,
+            deleted_paths=deleted_paths,
+            renamed_paths=renamed_paths,
+            diff_sha256=str(getattr(repo_patch, "diff_sha256", "") or ""),
+            diff_artifact_id=diff_artifact_id,
+        )
+        repo_dir = feature_root / repo_path if repo_path else feature_root
+        snapshot = _contract_workspace_snapshot(
+            feature,
+            dag_sha256,
+            group_idx,
+            stage,
+            repo_id,
+            repo_path,
+            repo_dir,
+            changed_paths,
+        )
+        if snapshot is None:
+            raise _sandbox_blocker(
+                f"Task contract validation unavailable for task {task_id} before promotion.",
+                task_id=task_id,
+            )
+        verdict = compiler.validate_patch(task_contract, patch, snapshot)
+        projection_sandbox_id = _contract_stage_sandbox_id(group_idx, stage, repo_id)
+        workspace_snapshot_id = _snapshot_id_for_repo(snapshots, repo_id)
+        snapshot_metadata = (
+            {
+                "workspace_snapshot_id": workspace_snapshot_id,
+                "base_snapshot_id": workspace_snapshot_id,
+                "base_snapshot_ids": [workspace_snapshot_id],
+            }
+            if workspace_snapshot_id
+            else {}
+        )
+        metadata = {
+            "stage": stage,
+            "task_ids": [task_id],
+            "actual_sandbox_id": str(getattr(capture, "sandbox_id", "") or ""),
+            "projection_sandbox_id": projection_sandbox_id,
+            "captured_patch_summary_id": captured_patch_summary_id,
+            "diff_artifact_id": diff_artifact_id,
+            "diff_sha256": str(getattr(repo_patch, "diff_sha256", "") or ""),
+            "capture_validated_before_promotion": True,
+            "promotion_order": "verdict_before_promotion",
+            "reported_status": getattr(result, "status", None),
+            "reported_created": list(getattr(result, "files_created", []) or []),
+            "reported_modified": list(getattr(result, "files_modified", []) or []),
+            "changed_paths": changed_paths[:50],
+            "outside_contract_paths": list(
+                getattr(repo_patch, "outside_contract_paths", []) or []
+            )[:50],
+            **snapshot_metadata,
+        }
+        if _execution_control_store_for_runner(runner) is None:
+            await _record_contract_patch_summary(
+                runner,
+                feature,
+                patch,
+                feature_id=feature_id,
+                dag_sha256=dag_sha256,
+                group_idx=group_idx,
+                stage=stage,
+                task_ids=[task_id],
+                metadata=metadata,
+            )
+        await _record_contract_verdict_projection(
+            runner,
+            feature,
+            task_contract,
+            verdict,
+            feature_id=feature_id,
+            dag_sha256=dag_sha256,
+            group_idx=group_idx,
+            stage=stage,
+            sandbox_id=projection_sandbox_id,
+            patch_summary_id=captured_patch_summary_id,
+            metadata=metadata,
+        )
+        if not bool(getattr(verdict, "approved", False)):
+            codes = list(getattr(verdict, "violation_codes", []) or [])
+            raise _sandbox_blocker(
+                "Task contract validation failed before sandbox promotion "
+                f"for {task_id}: {', '.join(codes[:10]) or 'contract violation'}",
+                task_id=task_id,
+            )
+
+
+async def _capture_and_promote_sandbox_patch(
+    binding: RuntimeSandboxTaskBinding,
+    *,
+    task_id: str,
+    promote: bool,
+    runner: WorkflowRunner | None = None,
+    feature: Feature | None = None,
+    dag_sha256: str = "",
+    group_idx: int | None = None,
+    stage: str = "",
+    feature_root: Path | None = None,
+    task_contract: Any | None = None,
+    result: ImplementationResult | None = None,
+    validate_contract: bool = False,
+) -> Any:
+    capture = None
+    try:
+        runner = runner or binding.workflow_runner or getattr(binding.runner, "workflow_runner", None)
+        feature = feature or binding.feature
+        task_contract = task_contract if task_contract is not None else binding.task_contract
+        feature_root = feature_root or binding.feature_root
+        dag_sha256 = dag_sha256 or binding.dag_sha256
+        group_idx = group_idx if group_idx is not None else binding.group_idx
+        stage = stage or binding.stage or "implementation"
+        capture = await binding.runner.capture_patch(binding.lease)
+        if promote or validate_contract:
+            if isinstance(result, ImplementationResult) and result.status == "blocked":
+                raise _sandbox_blocker(
+                    f"Task {task_id} returned blocked status before sandbox capture approval.",
+                    task_id=task_id,
+                )
+            if task_contract is not None:
+                if runner is None or feature is None or feature_root is None or group_idx is None:
+                    raise _sandbox_blocker(
+                        f"Task contract validation missing promotion context for {task_id}.",
+                        task_id=task_id,
+                    )
+                await _validate_sandbox_capture_against_contract(
+                    runner,
+                    feature,
+                    capture,
+                    task_id=task_id,
+                    task_contract=task_contract,
+                    feature_root=feature_root,
+                    dag_sha256=dag_sha256,
+                    group_idx=group_idx,
+                    stage=stage,
+                    result=result,
+                    snapshots=list(getattr(binding, "snapshots", []) or []),
+                )
+        if promote:
+            services = getattr(runner, "services", {}) if runner is not None else {}
+            if not isinstance(services, dict):
+                services = {}
+            if services.get("test_allow_sandbox_patch_promotion_bridge") is not True:
+                raise _sandbox_blocker(
+                    "Sandbox patch captured as evidence only; canonical mutation "
+                    "requires the durable merge queue.",
+                    task_id=task_id,
+                )
+            await _promote_sandbox_capture_to_feature_worktree(
+                capture,
+                binding,
+                task_id=task_id,
+            )
+        await binding.runner.release(binding.lease, "release" if promote else "retain")
+        return capture
+    except SandboxWorkflowBlocker:
+        if capture is not None:
+            try:
+                await binding.runner.release(binding.lease, "retain")
+            except Exception:
+                logger.warning(
+                    "Sandbox %s: failed to retain lease after workflow blocker",
+                    getattr(binding.lease, "sandbox_id", ""),
+                    exc_info=True,
+                )
+        raise
+    except Exception as exc:
+        if SandboxError is not None and isinstance(exc, SandboxError):
+            raise _sandbox_blocker(
+                f"Sandbox patch capture failed for {task_id}: {exc}",
+                task_id=task_id,
+            ) from exc
+        raise
+
+
+async def _bind_task_sandbox(
+    runner: WorkflowRunner,
+    feature: Feature,
+    *,
+    workspace_root: Path | None,
+    feature_root: Path | None,
+    dag_sha256: str,
+    group_idx: int,
+    task_idx: int,
+    attempt: int,
+    task: ImplementationTask,
+    task_contract: Any | None,
+    ws_path: str | None,
+    snapshots: list[Any],
+    runtime: str | None,
+    sandbox_mode: str = "task",
+) -> RuntimeSandboxTaskBinding | None:
+    if SandboxRunner is None or SandboxSpec is None:
+        raise _sandbox_blocker(
+            "SandboxRunner is unavailable for write-producing implementation dispatch.",
+            task_id=task.id,
+        )
+    if workspace_root is None or feature_root is None or not ws_path:
+        raise _sandbox_blocker(
+            f"Sandbox binding is missing workspace roots for task {task.id}.",
+            task_id=task.id,
+        )
+    repo_id = str(getattr(task_contract, "repo_id", "") or task.repo_path or "repo")
+    source = Path(ws_path)
+    if not source.exists():
+        raise _sandbox_blocker(
+            f"Sandbox binding source path is missing for task {task.id}: {source}",
+            task_id=task.id,
+        )
+    if not (source / ".git").exists():
+        raise _sandbox_blocker(
+            f"Sandbox binding source path is not a Git worktree for task {task.id}: {source}",
+            task_id=task.id,
+        )
+    try:
+        inside_work_tree = _git_text(["rev-parse", "--is-inside-work-tree"], cwd=source)
+    except RuntimeError as exc:
+        raise _sandbox_blocker(
+            f"Sandbox binding could not prove Git worktree for task {task.id}: {exc}",
+            task_id=task.id,
+        ) from exc
+    if inside_work_tree.strip().lower() != "true":
+        raise _sandbox_blocker(
+            f"Sandbox binding source is outside a Git worktree for task {task.id}: {source}",
+            task_id=task.id,
+        )
+    base_commit = _git_text(["rev-parse", "HEAD"], cwd=source)
+    writable_roots, readonly_roots, contract_ids = _contract_runtime_roots(
+        task_contract,
+        repo_id=repo_id,
+    )
+    spec = SandboxSpec(
+        feature_id=feature.id,
+        dag_sha256=dag_sha256,
+        group_idx=group_idx,
+        attempt_no=(attempt * 1000) + task_idx,
+        task_ids=[task.id],
+        repo_ids=[repo_id],
+        base_snapshot_ids=[_snapshot_id_for_repo(snapshots, repo_id)],
+        base_commits={repo_id: base_commit},
+        mode=sandbox_mode,  # type: ignore[arg-type]
+        writable_roots=writable_roots,
+        readonly_roots=readonly_roots,
+        contract_ids=contract_ids,
+    )
+    sandbox_runner = SandboxRunner(
+        workspace_root=workspace_root,
+        repo_sources={repo_id: source},
+        store=_execution_control_store_for_runner(runner),
+        artifact_writer=getattr(runner, "artifacts", None),
+        owner=f"workflow:{feature.id}:g{group_idx}:t{task.id}:a{attempt}",
+        allowed_source_roots=[feature_root],
+        blocked_roots=[feature_root],
+    )
+    try:
+        lease = await sandbox_runner.allocate(spec)
+        binding = await sandbox_runner.bind_runtime(
+            lease,
+            _sandbox_runtime_name(runtime, runner),
+        )
+    except SandboxWorkflowBlocker:
+        raise
+    except Exception as exc:
+        if SandboxError is not None and isinstance(exc, SandboxError):
+            raise _sandbox_blocker(
+                f"Sandbox binding failed for task {task.id}: {exc}",
+                task_id=task.id,
+            ) from exc
+        raise
+    return RuntimeSandboxTaskBinding(
+        runner=sandbox_runner,
+        lease=lease,
+        binding=binding,
+        workflow_runner=runner,
+        feature=feature,
+        task_contract=task_contract,
+        feature_root=feature_root,
+        dag_sha256=dag_sha256,
+        group_idx=group_idx,
+        stage=sandbox_mode,
+        snapshots=list(snapshots),
+    )
+
+
+def _sha256_text(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _runtime_policy_digest_for_dispatch(runtime_policy: RuntimePolicy) -> str:
+    if dispatcher_stable_digest is not None:
+        return dispatcher_stable_digest(str(runtime_policy))
+    return _sha256_text(str(runtime_policy))
+
+
+def _task_contract_ids_for_dispatch(task_contract: Any | None) -> list[int]:
+    contract_id = _task_contract_id(task_contract)
+    return [contract_id if contract_id is not None else 0]
+
+
+def _workspace_snapshot_ids_for_dispatch(snapshots: list[Any], repo_id: str) -> list[int]:
+    snapshot_id = _snapshot_id_for_repo(snapshots, repo_id)
+    return [snapshot_id] if snapshot_id else []
+
+
+def _base_commit_for_dispatch(ws_path: str | None, repo_id: str) -> dict[str, str]:
+    if not ws_path:
+        return {}
+    try:
+        return {repo_id: _git_text(["rev-parse", "HEAD"], cwd=Path(ws_path))}
+    except Exception:
+        return {}
+
+
+def _dispatcher_actor_metadata(
+    *,
+    runner: WorkflowRunner,
+    actor_suffix: str,
+    runtime_hint: str | None,
+    runtime_policy: RuntimePolicy,
+) -> Any:
+    concrete_runtime = _sandbox_runtime_name(runtime_hint, runner)
+    runtime_policy_text = str(runtime_policy)
+    runtime_policy_digest = _runtime_policy_digest_for_dispatch(runtime_policy)
+    material = {
+        "actor_id": f"implementer-{actor_suffix}",
+        "actor_name": f"{implementer.name}-{actor_suffix}",
+        "actor_role": "implementer",
+        "runtime": concrete_runtime,
+        "runtime_policy": runtime_policy_text,
+        "runtime_policy_digest": runtime_policy_digest,
+        "model": getattr(getattr(implementer, "role", None), "model", None),
+        "tool_profile": "implementation-write-tools",
+        "sandbox_required": True,
+        "approval_profile": "no_canonical_writes",
+        "metadata_digest": "pending",
+        "role_metadata": {
+            "runtime": runtime_hint,
+            "sandbox_required": True,
+            "write_producing": True,
+        },
+    }
+    if dispatcher_actor_metadata_digest is not None:
+        material["metadata_digest"] = dispatcher_actor_metadata_digest(material)
+    else:
+        material["metadata_digest"] = _sha256_text(
+            json.dumps(material, sort_keys=True, default=str)
+        )
+    return DispatcherActorMetadata.model_validate(material)
+
+
+def _dispatcher_request_for_task(
+    *,
+    runner: WorkflowRunner,
+    feature: Feature,
+    dag_sha256: str,
+    group_idx: int,
+    task_idx: int,
+    attempt: int,
+    task: ImplementationTask,
+    task_contract: Any | None,
+    snapshots: list[Any],
+    ws_path: str | None,
+    runtime_hint: str | None,
+    runtime_policy: RuntimePolicy,
+    actor_suffix: str,
+    stage: str,
+    inline_prompt: str = "",
+    handover_context: str = "",
+) -> Any:
+    if (
+        DispatcherDispatchRequest is None
+        or DispatcherRetryIdentity is None
+        or DispatcherActorMetadata is None
+        or dispatcher_request_digest is None
+        or dispatcher_idempotency_key is None
+    ):
+        raise _sandbox_blocker(
+            "RuntimeDispatcher is unavailable for implementation dispatch.",
+            task_id=task.id,
+        )
+    repo_id = _contract_repo_id(task_contract) or task.repo_path or "repo"
+    retry_identity = DispatcherRetryIdentity(
+        retry=attempt,
+        dispatch_retry_id=(
+            f"dispatch:{feature.id}:g{group_idx}:t{task_idx}:"
+            f"{task.id}:a{attempt}:{stage}"
+        ),
+    )
+    actor_metadata = _dispatcher_actor_metadata(
+        runner=runner,
+        actor_suffix=actor_suffix,
+        runtime_hint=runtime_hint,
+        runtime_policy=runtime_policy,
+    )
+    data: dict[str, Any] = {
+        "feature_id": feature.id,
+        "dag_sha256": dag_sha256 or "unknown-dag",
+        "group_idx": group_idx,
+        "task_id": task.id,
+        "task_name": task.name,
+        "retry": attempt,
+        "retry_identity": retry_identity,
+        "contract_ids": _task_contract_ids_for_dispatch(task_contract),
+        "sandbox_id": (
+            f"dispatch-sandbox:{feature.id}:g{group_idx}:"
+            f"t{task_idx}:a{attempt}:{stage}"
+        ),
+        "workspace_snapshot_ids": _workspace_snapshot_ids_for_dispatch(snapshots, repo_id),
+        "base_commit_by_repo": _base_commit_for_dispatch(ws_path, repo_id),
+        "runtime_policy": str(runtime_policy),
+        "runtime_policy_digest": _runtime_policy_digest_for_dispatch(runtime_policy),
+        "actor_role": "implementer",
+        "actor_metadata": actor_metadata,
+        "prior_evidence_ids": [],
+        "cancellation_token": None,
+        "prompt_material_digest": _sha256_text(
+            json.dumps(
+                {
+                    "handover_sha256": _sha256_text(handover_context),
+                    "inline_prompt_sha256": _sha256_text(inline_prompt),
+                    "output_schema": "ImplementationResult",
+                    "stage": stage,
+                    "task_id": task.id,
+                },
+                sort_keys=True,
+            )
+        ),
+        "output_schema_digest": (
+            dispatcher_stable_digest("ImplementationResult")
+            if dispatcher_stable_digest is not None
+            else _sha256_text("ImplementationResult")
+        ),
+        "request_digest": "pending",
+        "idempotency_key": "pending",
+    }
+    data["request_digest"] = dispatcher_request_digest(data)
+    data["idempotency_key"] = dispatcher_idempotency_key(data)
+    return DispatcherDispatchRequest.model_validate(data)
+
+
+class _ImplementationPromptBuilder:
+    def __init__(
+        self,
+        *,
+        task: ImplementationTask,
+        repo_prefix: str,
+        task_contract: Any | None,
+        handover_context: str,
+        inline_prompt: str,
+        log_label: str,
+    ) -> None:
+        self._task = task
+        self._repo_prefix = repo_prefix
+        self._task_contract = task_contract
+        self._handover_context = handover_context
+        self._inline_prompt = inline_prompt
+        self._log_label = log_label
+
+    async def build_prompt_context(self, _request: Any, binding: Any | None = None) -> Any:
+        context_base = None
+        context_read_base = None
+        if binding is not None:
+            context_base_text = str(
+                _model_json_dict(getattr(binding, "env", {})).get("IRIAI_SANDBOX_ROOT")
+                or getattr(binding, "manifest_path", "")
+                or ""
+            )
+            if context_base_text and Path(context_base_text).name == "sandbox-manifest.json":
+                context_base_text = str(Path(context_base_text).parent)
+            if not context_base_text:
+                context_base_text = str(
+                    getattr(binding, "cwd", "")
+                    or getattr(binding, "workspace_override", "")
+                    or ""
+                )
+            context_base = Path(context_base_text) if context_base_text else None
+            context_read_base_text = str(
+                getattr(binding, "cwd", "")
+                or getattr(binding, "workspace_override", "")
+                or ""
+            )
+            context_read_base = Path(context_read_base_text) if context_read_base_text else context_base
+        prompt = _build_task_prompt_with_optional_sandbox_context(
+            self._task,
+            repo_prefix=self._repo_prefix,
+            task_contract=self._task_contract,
+            handover_context=self._handover_context,
+            inline_prompt=self._inline_prompt,
+            context_base=context_base,
+            context_read_base=context_read_base,
+            log_label=self._log_label,
+        )
+        context_paths: list[str] = []
+        context_sha_material: list[str] = []
+        if context_base is not None:
+            segment = _prompt_context_segment_for_task(self._task.id)
+            context_dir = context_base / ".iriai-context" / segment
+            if context_dir.exists() and context_dir.is_dir():
+                for path in sorted(context_dir.rglob("*")):
+                    if path.is_file():
+                        rel = str(path.relative_to(context_base))
+                        context_paths.append(rel)
+                        try:
+                            context_sha_material.append(
+                                f"{rel}:{_sha256_text(path.read_text(encoding='utf-8'))}"
+                            )
+                        except OSError:
+                            context_sha_material.append(f"{rel}:unreadable")
+        prompt_sha = _sha256_text(prompt)
+        context_sha = _sha256_text("\n".join(context_sha_material))
+        bundle = DispatcherPromptContextBundle(
+            prompt_ref=0,
+            prompt_sha256=prompt_sha,
+            prompt_summary=f"task prompt for {self._task.id}",
+            context_file_refs=[],
+            context_file_paths=context_paths,
+            context_sha256=context_sha,
+            included_contract_ids=_task_contract_ids_for_dispatch(self._task_contract),
+            included_evidence_ids=[],
+            excluded_evidence_ids=[],
+            truncation_notes=[],
+        )
+        return DispatcherPromptBuildResult(prompt=prompt, bundle=bundle)
+
+
+class _ImplementationRuntimeClient:
+    def __init__(
+        self,
+        *,
+        runner: WorkflowRunner,
+        feature: Feature,
+        runtime_hint: str | None,
+        actor_suffix: str,
+    ) -> None:
+        self._runner = _RuntimeStartedRunnerProxy(runner)
+        self._feature = feature
+        self._runtime_hint = runtime_hint
+        self._actor_suffix = actor_suffix
+        self.last_response: Any | None = None
+        self._client = RunnerRuntimeClient(
+            actor_factory=self._actor_for_invocation,
+            ask_factory=self._ask_for_invocation,
+        )
+
+    async def invoke(self, invocation: Any) -> Any:
+        self.last_response = await self._client.invoke(
+            invocation,
+            runner=self._runner,
+            feature=self._feature,
+            phase_name="implementation",
+        )
+        return self.last_response
+
+    async def _actor_for_invocation(self, invocation: Any) -> AgentActor:
+        binding = getattr(invocation, "workspace_binding", None)
+        cwd = str(getattr(binding, "cwd", "") or getattr(binding, "workspace_override", "") or "")
+        return _make_parallel_actor(
+            implementer,
+            self._actor_suffix,
+            runtime=self._runtime_hint,
+            workspace_path=cwd,
+            runtime_workspace_binding=binding,
+            sandbox_required=True,
+        )
+
+    async def _ask_for_invocation(self, invocation: Any, actor: AgentActor) -> Ask:
+        return Ask(
+            actor=actor,
+            prompt=str(getattr(invocation, "prompt", "") or ""),
+            output_type=ImplementationResult,
+        )
+
+
+class _RuntimeStartedRunnerProxy:
+    def __init__(self, runner: WorkflowRunner) -> None:
+        self._runner = runner
+        self._observer: Any | None = None
+
+    def bind_invocation_observer(self, observer: Any) -> Any:
+        proxy = self
+
+        class _ObserverContext:
+            def __enter__(self) -> "_ObserverContext":
+                proxy._observer = observer
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                proxy._observer = None
+
+        return _ObserverContext()
+
+    async def run(self, *args: Any, **kwargs: Any) -> Any:
+        observer = self._observer
+        if observer is not None:
+            handler = getattr(observer, "on_invocation_start", None)
+            if callable(handler):
+                handler("workflow-dispatch-invocation")
+        return await self._runner.run(*args, **kwargs)
+
+
+class _ImplementationSandboxPort:
+    def __init__(
+        self,
+        *,
+        runner: WorkflowRunner,
+        feature: Feature,
+        workspace_root: Path | None,
+        feature_root: Path | None,
+        dag_sha256: str,
+        group_idx: int,
+        task_idx: int,
+        attempt: int,
+        task: ImplementationTask,
+        task_contract: Any | None,
+        ws_path: str | None,
+        snapshots: list[Any],
+        runtime: str | None,
+        stage: str,
+    ) -> None:
+        self._runner = runner
+        self._feature = feature
+        self._workspace_root = workspace_root
+        self._feature_root = feature_root
+        self._dag_sha256 = dag_sha256
+        self._group_idx = group_idx
+        self._task_idx = task_idx
+        self._attempt = attempt
+        self._task = task
+        self._task_contract = task_contract
+        self._ws_path = ws_path
+        self._snapshots = snapshots
+        self._runtime = runtime
+        self._stage = stage
+        self.task_binding: RuntimeSandboxTaskBinding | None = None
+        self.last_failure_message = ""
+
+    async def bind_runtime(self, _request: Any, _attempt_id: int) -> Any:
+        try:
+            self.task_binding = await _bind_task_sandbox(
+                self._runner,
+                self._feature,
+                workspace_root=self._workspace_root,
+                feature_root=self._feature_root,
+                dag_sha256=self._dag_sha256,
+                group_idx=self._group_idx,
+                task_idx=self._task_idx,
+                attempt=self._attempt,
+                task=self._task,
+                task_contract=self._task_contract,
+                ws_path=self._ws_path,
+                snapshots=self._snapshots,
+                runtime=self._runtime,
+            )
+        except Exception as exc:
+            self.last_failure_message = str(exc)
+            raise
+        if self.task_binding is None:
+            raise _sandbox_blocker(
+                f"Sandbox binding did not produce a runtime workspace for {self._task.id}.",
+                task_id=self._task.id,
+            )
+        return self.task_binding.binding
+
+    async def capture_patch(
+        self,
+        _request: Any,
+        _attempt_id: int,
+        _binding: Any,
+        response: Any,
+        *,
+        idempotency_key: str,
+    ) -> Any:
+        del idempotency_key
+        if self.task_binding is None:
+            raise _sandbox_blocker(
+                f"Sandbox patch capture missing binding for {self._task.id}.",
+                task_id=self._task.id,
+            )
+        try:
+            capture = await _capture_and_promote_sandbox_patch(
+                self.task_binding,
+                task_id=self._task.id,
+                promote=False,
+                runner=self._runner,
+                feature=self._feature,
+                dag_sha256=self._dag_sha256,
+                group_idx=self._group_idx,
+                stage=self._stage,
+                feature_root=self._feature_root,
+                task_contract=self._task_contract,
+                result=None,
+                validate_contract=str(getattr(response, "status", "")) == "completed",
+            )
+        except Exception as exc:
+            self.last_failure_message = str(exc)
+            raise
+        return DispatcherPatchCaptureRecord(
+            sandbox_id=str(getattr(capture, "sandbox_id", "") or getattr(self.task_binding.lease, "sandbox_id", "")),
+            captured=True,
+            patch_summary_ids=[
+                int(item)
+                for item in list(getattr(capture, "patch_summary_ids", []) or [])
+                if item is not None
+            ],
+            compatibility_artifact_ids=[],
+            empty=bool(getattr(capture, "empty", False)),
+            diagnostic_only=str(getattr(response, "status", "")) != "completed",
+            changed_paths=[
+                path
+                for repo_patch in list(getattr(capture, "repo_patches", []) or [])
+                for path in list(getattr(repo_patch, "changed_paths", []) or [])
+            ],
+        )
+
+
+class _ImplementationOutputNormalizer:
+    def __init__(self, *, task: ImplementationTask, repo_prefix: str) -> None:
+        self._task = task
+        self._repo_prefix = repo_prefix.rstrip("/")
+        self.result: ImplementationResult | None = None
+
+    def normalize(
+        self,
+        *,
+        request: Any,
+        response: Any,
+        schema_name: str,
+        schema_digest: str,
+        patch_capture: Any,
+    ) -> Any:
+        del request
+        payload = getattr(response, "structured_output", None)
+        validation_errors: list[str] = []
+        original_payload = dict(payload) if isinstance(payload, dict) else None
+        try:
+            result = ImplementationResult.model_validate(payload)
+            valid = True
+        except Exception as exc:
+            result = None
+            valid = False
+            validation_errors.append(f"{type(exc).__name__}: {exc}")
+        corrected_fields: dict[str, Any] = {}
+        task_id_matches = bool(result is not None and result.task_id == self._task.id)
+        if result is not None and result.task_id != self._task.id:
+            corrected_fields["task_id"] = self._task.id
+            result.task_id = self._task.id
+        if result is not None and not result.files_created and not result.files_modified:
+            changed_paths = list(getattr(patch_capture, "changed_paths", []) or [])
+            if changed_paths:
+                prefix = f"{self._repo_prefix}/" if self._repo_prefix else ""
+                result.files_modified = [f"{prefix}{path}" for path in changed_paths[:50]]
+                corrected_fields["files_modified"] = result.files_modified
+        if result is not None:
+            result.notes = _append_note_once(
+                result.notes,
+                _PENDING_DURABLE_MERGE_QUEUE_NOTE,
+            )
+        self.result = result
+        normalized_payload = result.model_dump(mode="json") if result is not None else None
+        projection_body = result.model_dump_json() if result is not None and valid else None
+        return DispatcherStructuredOutputRecord(
+            evidence_id=0,
+            schema_name=schema_name,
+            schema_digest=schema_digest,
+            valid=valid,
+            original_payload=original_payload,
+            normalized_payload=normalized_payload,
+            validation_errors=validation_errors,
+            corrected_fields=corrected_fields,
+            task_id_matches_request=task_id_matches,
+            projection_body=projection_body,
+            raw_text_ref=getattr(response, "raw_text_ref", None),
+            raw_artifact_id=getattr(response, "raw_artifact_id", None),
+        )
+
+
+class _ExecutionControlDispatchJournalPort:
+    def __init__(self, store: Any) -> None:
+        self._store = store
+
+    async def start_dispatch_attempt(self, request: Any) -> Any:
+        try:
+            result = await self._store.start_dispatch_attempt(
+                StoredDispatchAttemptRequest(
+                    feature_id=request.feature_id,
+                    dag_sha256=request.dag_sha256,
+                    group_idx=request.group_idx,
+                    task_id=request.task_id,
+                    task_name=request.task_name,
+                    retry=request.retry,
+                    retry_identity=_model_json_dict(request.retry_identity),
+                    contract_ids=list(request.contract_ids),
+                    sandbox_id=request.sandbox_id,
+                    workspace_snapshot_ids=list(request.workspace_snapshot_ids),
+                    base_commit_by_repo=dict(request.base_commit_by_repo),
+                    runtime_policy=request.runtime_policy,
+                    runtime_policy_digest=request.runtime_policy_digest,
+                    actor_role=request.actor_role,
+                    actor_metadata=_model_json_dict(request.actor_metadata),
+                    prior_evidence_ids=list(request.prior_evidence_ids),
+                    cancellation_token=request.cancellation_token,
+                    request_digest=request.request_digest,
+                    idempotency_key=request.idempotency_key,
+                )
+            )
+        except Exception as exc:
+            if (
+                StoredIdempotencyConflict is not None
+                and DispatcherDispatchIdempotencyConflict is not None
+                and isinstance(exc, StoredIdempotencyConflict)
+            ):
+                raise DispatcherDispatchIdempotencyConflict(
+                    request.idempotency_key,
+                    "stored-dispatch-digest",
+                    request.request_digest,
+                ) from exc
+            raise
+        row = result.attempt
+        terminal = None
+        terminal_needs_finish = False
+        if row.status in {"succeeded", "failed", "cancelled", "incomplete"}:
+            outcome_payload = _model_json_dict(row.payload.get("dispatch_outcome"))
+            if outcome_payload:
+                terminal = DispatcherOutcome.model_validate(outcome_payload)
+        elif row.status == "started" and str(row.dispatcher_state) == "evidence_recording":
+            structured_id = row.payload.get("structured_result_evidence_id")
+            failure_id = row.payload.get("runtime_failure_id") or row.payload.get("typed_failure_id")
+            if structured_id is not None:
+                terminal = DispatcherOutcome(
+                    attempt_id=result.attempt_id,
+                    state="succeeded",
+                    status="succeeded",
+                    runtime_terminal_reason=row.payload.get("runtime_terminal_reason") or "completed",
+                    structured_result_evidence_id=int(structured_id),
+                    raw_text_ref=(
+                        row.payload.get("raw_text_ref")
+                        or row.payload.get("last_raw_output_evidence_id")
+                    ),
+                    patch_summary_ids=[
+                        int(item)
+                        for item in list(row.payload.get("patch_summary_ids") or [])
+                        if item is not None
+                    ],
+                    compatibility_artifact_ids=[
+                        int(item)
+                        for item in list(row.payload.get("compatibility_artifact_ids") or [])
+                        if item is not None
+                    ],
+                    runtime_failure_id=None,
+                    typed_failure_id=None,
+                    idempotency_key=request.idempotency_key,
+                )
+                terminal_needs_finish = True
+            elif failure_id is not None:
+                terminal = DispatcherOutcome(
+                    attempt_id=result.attempt_id,
+                    state="failed",
+                    status="failed",
+                    runtime_terminal_reason=row.payload.get("runtime_terminal_reason") or "process_failed",
+                    structured_result_evidence_id=None,
+                    raw_text_ref=(
+                        row.payload.get("raw_text_ref")
+                        or row.payload.get("last_raw_output_evidence_id")
+                    ),
+                    patch_summary_ids=[],
+                    compatibility_artifact_ids=[],
+                    runtime_failure_id=int(failure_id),
+                    typed_failure_id=int(failure_id),
+                    idempotency_key=request.idempotency_key,
+                )
+                terminal_needs_finish = True
+        return DispatcherAttemptRecord(
+            attempt_id=result.attempt_id,
+            state=str(row.dispatcher_state or "attempt_started"),
+            request_digest=row.request_digest,
+            created=result.created,
+            terminal_outcome=terminal,
+            terminal_outcome_needs_finish=terminal_needs_finish,
+            duplicate_replay_recovery_evidence=(
+                _dispatch_attempt_duplicate_replay_recovery_evidence(row.payload)
+            ),
+        )
+
+    async def record_start_idempotency_conflict(self, request: Any, failure: Any) -> tuple[int, Any]:
+        existing = await self._store.get_by_idempotency_key(
+            request.feature_id,
+            request.idempotency_key,
+        )
+        if existing is None:
+            raise DispatcherDispatchIdempotencyConflict(
+                request.idempotency_key,
+                "missing-existing-dispatch-attempt",
+                request.request_digest,
+            )
+        attempt_id = int(existing.row.id)
+        result = await self._store.record_runtime_failure(
+            StoredRuntimeFailureEvidence(
+                attempt_id=attempt_id,
+                failure_class=failure.failure_class,
+                failure_type=failure.failure_type,
+                retryable=bool(failure.retryable),
+                deterministic=bool(failure.deterministic),
+                operator_required=bool(failure.operator_required),
+                provider_request_id=failure.provider_request_id,
+                evidence_ids=list(failure.evidence_ids),
+                signature_hash=failure.signature_hash,
+                runtime=str(getattr(failure, "runtime", "") or ""),
+                provider_error_code=getattr(failure, "provider_error_code", None),
+                terminal_reason=getattr(failure, "terminal_reason", None),
+                summary=str(getattr(failure, "summary", "") or ""),
+                payload={
+                    "details": _model_json_dict(getattr(failure, "details", {}) or {}),
+                },
+            )
+        )
+        return attempt_id, failure.model_copy(update={"failure_id": result.failure_id})
+
+    async def record_prompt_context(
+        self,
+        attempt_id: int,
+        _request: Any,
+        _prompt: str,
+        bundle: Any,
+    ) -> int:
+        result = await self._store.record_prompt_context(
+            StoredPromptContextEvidence(
+                attempt_id=attempt_id,
+                prompt_ref=int(getattr(bundle, "prompt_ref", 0) or 0),
+                prompt_sha256=str(getattr(bundle, "prompt_sha256", "") or ""),
+                prompt_summary=str(getattr(bundle, "prompt_summary", "") or ""),
+                context_file_refs=list(getattr(bundle, "context_file_refs", []) or []),
+                context_file_paths=list(getattr(bundle, "context_file_paths", []) or []),
+                context_sha256=str(getattr(bundle, "context_sha256", "") or ""),
+                included_contract_ids=list(getattr(bundle, "included_contract_ids", []) or []),
+                included_evidence_ids=list(getattr(bundle, "included_evidence_ids", []) or []),
+                excluded_evidence_ids=list(getattr(bundle, "excluded_evidence_ids", []) or []),
+                truncation_notes=list(getattr(bundle, "truncation_notes", []) or []),
+            )
+        )
+        return result.evidence.id
+
+    async def record_runtime_invocation(
+        self,
+        attempt_id: int,
+        invocation: Any,
+        response: Any | None = None,
+    ) -> int:
+        binding = getattr(invocation, "workspace_binding", None)
+        evidence = StoredRuntimeInvocationEvidence(
+            attempt_id=attempt_id,
+            invocation_id=str(getattr(invocation, "invocation_id", "") or ""),
+            runtime=str(getattr(invocation, "runtime", "") or ""),
+            phase="response" if response is not None else "request",
+            actor_name=str(getattr(invocation, "actor_name", "") or ""),
+            actor_role=str(getattr(invocation, "actor_role", "") or ""),
+            actor_metadata=_model_json_dict(getattr(invocation, "actor_metadata", {})),
+            runtime_workspace_binding_id=getattr(binding, "id", None),
+            prompt_ref=getattr(invocation, "prompt_ref", None),
+            prompt_sha256=str(_model_json_dict(getattr(invocation, "metadata", {})).get("prompt_sha256") or ""),
+            output_schema=str(getattr(invocation, "output_schema", "") or ""),
+            output_schema_digest=str(getattr(invocation, "output_schema_digest", "") or ""),
+            output_type_name=str(getattr(invocation, "output_type_name", "") or ""),
+            timeout_seconds=getattr(invocation, "timeout_seconds", None),
+            retry_within_invocation=bool(getattr(invocation, "retry_within_invocation", True)),
+            cancellation_token=getattr(invocation, "cancellation_token", None),
+            status=str(getattr(response, "status", "running") if response is not None else "running"),
+            terminal_reason=getattr(response, "terminal_reason", None) if response is not None else None,
+            process_started=bool(getattr(response, "process_started", False)) if response is not None else False,
+            raw_text_ref=getattr(response, "raw_text_ref", None) if response is not None else None,
+            raw_artifact_id=getattr(response, "raw_artifact_id", None) if response is not None else None,
+            provider_request_id=getattr(response, "provider_request_id", None) if response is not None else None,
+            provider_error_code=getattr(response, "provider_error_code", None) if response is not None else None,
+            stdout_artifact_id=getattr(response, "stdout_artifact_id", None) if response is not None else None,
+            stderr_artifact_id=getattr(response, "stderr_artifact_id", None) if response is not None else None,
+            adapter_retry_ids=list(getattr(response, "adapter_retry_ids", []) or []) if response is not None else [],
+            adapter_retry_count=int(getattr(response, "adapter_retry_count", 0) or 0) if response is not None else 0,
+            usage=dict(getattr(response, "usage", {}) or {}) if response is not None else {},
+            elapsed_ms=getattr(response, "elapsed_ms", None) if response is not None else None,
+            metadata=_model_json_dict(getattr(invocation, "metadata", {})),
+        )
+        result = await self._store.record_runtime_invocation(evidence)
+        return result.evidence.id
+
+    async def record_raw_output(
+        self,
+        attempt_id: int,
+        invocation: Any,
+        response: Any,
+    ) -> int | None:
+        raw_text = str(getattr(response, "raw_text", "") or "")
+        raw_artifact_id = getattr(response, "raw_artifact_id", None)
+        if not raw_text and raw_artifact_id is None:
+            return None
+        if StoredRawOutputEvidence is None or not hasattr(self._store, "record_raw_output"):
+            return raw_artifact_id
+        result = await self._store.record_raw_output(
+            StoredRawOutputEvidence(
+                attempt_id=attempt_id,
+                invocation_id=str(getattr(invocation, "invocation_id", "") or ""),
+                runtime=str(getattr(invocation, "runtime", "") or ""),
+                status=str(getattr(response, "status", "failed") or "failed"),
+                terminal_reason=getattr(response, "terminal_reason", None),
+                raw_text=raw_text,
+                raw_artifact_id=raw_artifact_id,
+                provider_request_id=getattr(response, "provider_request_id", None),
+                provider_error_code=getattr(response, "provider_error_code", None),
+                metadata=_model_json_dict(getattr(invocation, "metadata", {})),
+            )
+        )
+        return result.evidence.id
+
+    async def record_structured_output(self, attempt_id: int, record: Any) -> Any:
+        result = await self._store.record_structured_output(
+            StoredStructuredOutputEvidence(
+                attempt_id=attempt_id,
+                schema_name=str(getattr(record, "schema_name", "") or ""),
+                schema_digest=str(getattr(record, "schema_digest", "") or ""),
+                valid=bool(getattr(record, "valid", False)),
+                original_payload=getattr(record, "original_payload", None),
+                normalized_payload=getattr(record, "normalized_payload", None),
+                validation_errors=list(getattr(record, "validation_errors", []) or []),
+                corrected_fields=dict(getattr(record, "corrected_fields", {}) or {}),
+                task_id_matches_request=bool(getattr(record, "task_id_matches_request", False)),
+                projection_body=getattr(record, "projection_body", None),
+                raw_text_ref=getattr(record, "raw_text_ref", None),
+                raw_artifact_id=getattr(record, "raw_artifact_id", None),
+            )
+        )
+        return record.model_copy(update={"evidence_id": result.evidence.id})
+
+    async def record_runtime_failure(self, attempt_id: int, failure: Any) -> Any:
+        details = _model_json_dict(getattr(failure, "details", {}) or {})
+        payload = {"details": details}
+        for key in ("route", "retry_budget", "route_decision"):
+            if key in details:
+                payload[key] = details[key]
+        for key in DISPATCH_ATTEMPT_RECOVERY_EVIDENCE_FIELDS:
+            if key in details:
+                payload[key] = details[key]
+        result = await self._store.record_runtime_failure(
+            StoredRuntimeFailureEvidence(
+                attempt_id=attempt_id,
+                failure_class=failure.failure_class,
+                failure_type=failure.failure_type,
+                retryable=bool(failure.retryable),
+                deterministic=bool(failure.deterministic),
+                operator_required=bool(failure.operator_required),
+                provider_request_id=failure.provider_request_id,
+                evidence_ids=list(failure.evidence_ids),
+                signature_hash=failure.signature_hash,
+                runtime=str(getattr(failure, "runtime", "") or ""),
+                provider_error_code=getattr(failure, "provider_error_code", None),
+                terminal_reason=getattr(failure, "terminal_reason", None),
+                summary=str(getattr(failure, "summary", "") or ""),
+                payload=payload,
+            )
+        )
+        return failure.model_copy(update={"failure_id": result.failure_id})
+
+    async def project_task_result_from_attempt(
+        self,
+        attempt_id: int,
+        _request: Any,
+        structured_output: Any,
+        _patch_capture: Any,
+    ) -> list[int]:
+        result = await self._store.project_task_result_from_attempt(
+            StoredTaskResultProjectionFromAttempt(
+                attempt_id=attempt_id,
+                structured_result_evidence_id=structured_output.evidence_id,
+            )
+        )
+        return [
+            link.artifact_id
+            for link in result.projection_links
+            if link.projection_key.startswith("dag-task:")
+        ]
+
+    async def finish_dispatch_attempt(self, outcome: Any) -> Any:
+        result = await self._store.finish_dispatch_attempt(
+            StoredDispatchOutcome(
+                attempt_id=outcome.attempt_id,
+                state=outcome.state,
+                status=outcome.status,
+                runtime_terminal_reason=outcome.runtime_terminal_reason,
+                structured_result_evidence_id=outcome.structured_result_evidence_id,
+                raw_text_ref=outcome.raw_text_ref,
+                patch_summary_ids=list(outcome.patch_summary_ids),
+                compatibility_artifact_ids=list(outcome.compatibility_artifact_ids),
+                runtime_failure_id=outcome.runtime_failure_id,
+                typed_failure_id=outcome.typed_failure_id,
+                idempotency_key=outcome.idempotency_key,
+            )
+        )
+        return outcome.model_copy(
+            update={
+                "compatibility_artifact_ids": list(result.compatibility_artifact_ids),
+                "raw_text_ref": result.raw_text_ref,
+                "runtime_failure_id": result.runtime_failure_id,
+                "typed_failure_id": result.typed_failure_id,
+            }
+        )
+
+
+DISPATCH_ATTEMPT_RECOVERY_EVIDENCE_FIELDS = (
+    "duplicate_replay_recovery_evidence",
+    "runtime_recovery_evidence",
+    "stale_recovery_evidence",
+    "recovery_evidence",
+)
+
+
+def _dispatch_attempt_duplicate_replay_recovery_evidence(
+    payload: Any,
+) -> Any:
+    data = _model_json_dict(payload)
+    if not isinstance(data, dict):
+        return None
+    candidates: list[Any] = [
+        data[field]
+        for field in DISPATCH_ATTEMPT_RECOVERY_EVIDENCE_FIELDS
+        if data.get(field) is not None
+    ]
+    for container_key in ("metadata", "details", "recovery"):
+        container = data.get(container_key)
+        if not isinstance(container, dict):
+            continue
+        candidates.extend(
+            container[field]
+            for field in DISPATCH_ATTEMPT_RECOVERY_EVIDENCE_FIELDS
+            if container.get(field) is not None
+        )
+    if not candidates:
+        return None
+    return candidates[0] if len(candidates) == 1 else candidates
+
+
+class _ArtifactDispatchJournalPort:
+    def __init__(self, runner: WorkflowRunner, feature: Feature) -> None:
+        self._runner = runner
+        self._feature = feature
+        self._attempts: dict[int, dict[str, Any]] = {}
+        self._next_attempt_id = 1
+        self._structured: dict[int, Any] = {}
+        self._next_evidence_id = 1000
+
+    async def start_dispatch_attempt(self, request: Any) -> Any:
+        attempt_id = self._next_attempt_id
+        self._next_attempt_id += 1
+        self._attempts[attempt_id] = {
+            "request": request,
+            "request_digest": request.request_digest,
+        }
+        return DispatcherAttemptRecord(
+            attempt_id=attempt_id,
+            state="attempt_started",
+            request_digest=request.request_digest,
+            created=True,
+            terminal_outcome=None,
+        )
+
+    async def record_prompt_context(self, *_args: Any, **_kwargs: Any) -> int:
+        self._next_evidence_id += 1
+        return self._next_evidence_id
+
+    async def record_runtime_invocation(self, *_args: Any, **_kwargs: Any) -> int:
+        self._next_evidence_id += 1
+        return self._next_evidence_id
+
+    async def record_raw_output(self, *_args: Any, **_kwargs: Any) -> int | None:
+        self._next_evidence_id += 1
+        return self._next_evidence_id
+
+    async def record_structured_output(self, _attempt_id: int, record: Any) -> Any:
+        self._next_evidence_id += 1
+        stored = record.model_copy(update={"evidence_id": self._next_evidence_id})
+        self._structured[self._next_evidence_id] = stored
+        return stored
+
+    async def record_runtime_failure(self, _attempt_id: int, failure: Any) -> Any:
+        self._next_evidence_id += 1
+        return failure.model_copy(update={"failure_id": self._next_evidence_id})
+
+    async def project_task_result_from_attempt(
+        self,
+        attempt_id: int,
+        request: Any,
+        structured_output: Any,
+        _patch_capture: Any,
+    ) -> list[int]:
+        del attempt_id
+        body = getattr(structured_output, "projection_body", None)
+        if body is None:
+            body = json.dumps(
+                getattr(structured_output, "normalized_payload", {}) or {},
+                sort_keys=True,
+            )
+        await self._runner.artifacts.put(
+            f"dag-task:{request.task_id}",
+            body,
+            feature=self._feature,
+        )
+        return []
+
+    async def finish_dispatch_attempt(self, outcome: Any) -> Any:
+        if getattr(outcome, "status", "") == "succeeded":
+            structured = self._structured.get(
+                int(getattr(outcome, "structured_result_evidence_id", 0) or 0)
+            )
+            request = self._attempts.get(
+                int(getattr(outcome, "attempt_id", 0) or 0),
+                {},
+            ).get("request")
+            if structured is not None and request is not None:
+                await self.project_task_result_from_attempt(
+                    int(getattr(outcome, "attempt_id", 0) or 0),
+                    request,
+                    structured,
+                    None,
+                )
+        return outcome
+
+
+def _dispatch_journal_port_for_runner(
+    runner: WorkflowRunner,
+    feature: Feature,
+) -> Any:
+    store = _execution_control_store_for_runner(runner)
+    if store is None or StoredDispatchAttemptRequest is None:
+        return _ArtifactDispatchJournalPort(runner, feature)
+    return _ExecutionControlDispatchJournalPort(store)
+
+
+async def _dispatch_task_attempt_via_runtime_dispatcher(
+    *,
+    runner: WorkflowRunner,
+    feature: Feature,
+    workspace_root: Path | None,
+    feature_root: Path | None,
+    dag_sha256: str,
+    group_idx: int,
+    task_idx: int,
+    attempt: int,
+    task: ImplementationTask,
+    task_contract: Any | None,
+    ws_path: str | None,
+    snapshots: list[Any],
+    runtime_hint: str | None,
+    runtime_policy: RuntimePolicy,
+    repo_prefix: str,
+    inline_prompt: str,
+    handover_context: str,
+    stage: str,
+    actor_suffix: str,
+    log_label: str,
+) -> tuple[ImplementationResult, Any]:
+    if RuntimeDispatcher is None or RunnerRuntimeClient is None:
+        raise _sandbox_blocker(
+            "RuntimeDispatcher boundary is unavailable for implementation dispatch.",
+            task_id=task.id,
+        )
+    request = _dispatcher_request_for_task(
+        runner=runner,
+        feature=feature,
+        dag_sha256=dag_sha256,
+        group_idx=group_idx,
+        task_idx=task_idx,
+        attempt=attempt,
+        task=task,
+        task_contract=task_contract,
+        snapshots=snapshots,
+        ws_path=ws_path,
+        runtime_hint=runtime_hint,
+        runtime_policy=runtime_policy,
+        actor_suffix=actor_suffix,
+        stage=stage,
+        inline_prompt=inline_prompt,
+        handover_context=handover_context,
+    )
+    sandbox_port = _ImplementationSandboxPort(
+        runner=runner,
+        feature=feature,
+        workspace_root=workspace_root,
+        feature_root=feature_root,
+        dag_sha256=dag_sha256,
+        group_idx=group_idx,
+        task_idx=task_idx,
+        attempt=attempt,
+        task=task,
+        task_contract=task_contract,
+        ws_path=ws_path,
+        snapshots=snapshots,
+        runtime=runtime_hint,
+        stage=stage,
+    )
+    normalizer = _ImplementationOutputNormalizer(task=task, repo_prefix=repo_prefix)
+    runtime_client = _ImplementationRuntimeClient(
+        runner=runner,
+        feature=feature,
+        runtime_hint=runtime_hint,
+        actor_suffix=actor_suffix,
+    )
+    dispatcher = RuntimeDispatcher(
+        store=_dispatch_journal_port_for_runner(runner, feature),
+        sandbox=sandbox_port,
+        runtime=runtime_client,
+        prompt_builder=_ImplementationPromptBuilder(
+            task=task,
+            repo_prefix=f"{repo_prefix}/" if repo_prefix else "",
+            task_contract=task_contract,
+            handover_context=handover_context,
+            inline_prompt=inline_prompt,
+            log_label=log_label,
+        ),
+        output_normalizer=normalizer,
+    )
+    outcome = await dispatcher.dispatch(request)
+    result = normalizer.result
+    if outcome.status == "succeeded" and result is None:
+        try:
+            legacy_result = await runner.artifacts.get(f"dag-task:{task.id}", feature=feature)
+        except Exception:
+            legacy_result = None
+        if legacy_result:
+            try:
+                result = ImplementationResult.model_validate_json(str(legacy_result))
+            except Exception:
+                result = None
+    if outcome.status == "succeeded" and result is not None:
+        evidence_note = (
+            f"dispatcher_attempt_id={outcome.attempt_id}; "
+            f"patch_summary_ids={','.join(str(item) for item in outcome.patch_summary_ids)}"
+        )
+        result.notes = _append_note_once(
+            _append_note_once(result.notes, evidence_note),
+            _PENDING_DURABLE_MERGE_QUEUE_NOTE,
+        )
+        return result, outcome
+    response_text = ""
+    if runtime_client.last_response is not None:
+        response_text = str(getattr(runtime_client.last_response, "raw_text", "") or "")
+    message = sandbox_port.last_failure_message or response_text or (
+        f"Runtime dispatch {outcome.status}"
+        f" ({outcome.runtime_terminal_reason or 'unknown'})."
+    )
+    evidence_summary = (
+        f" typed_failure_id={getattr(outcome, 'typed_failure_id', None)}"
+        f" runtime_failure_id={getattr(outcome, 'runtime_failure_id', None)}"
+        f" dispatcher_attempt_id={getattr(outcome, 'attempt_id', None)}"
+    )
+    if outcome.status in {"failed", "incomplete"} and _is_terminal_sandbox_attempt_blocker(message):
+        raise SandboxWorkflowBlocker(message, task_id=task.id)
+    return (
+        ImplementationResult(
+            task_id=task.id,
+            summary=_workflow_blocker_text(f"{message}{evidence_summary}"),
+            status="blocked",
+            notes=evidence_summary.strip(),
+        ),
+        outcome,
     )
 
 
@@ -1846,6 +8633,1736 @@ async def _load_test_plan_section(
     return f"\n\n## Test Plan\n\n{body}"
 
 
+def _workflow_blocker_from_attempts(attempts: list[BugFixAttempt]) -> str:
+    for attempt in attempts:
+        text = "\n".join([
+            str(getattr(attempt, "fix_applied", "") or ""),
+            str(getattr(attempt, "root_cause", "") or ""),
+            str(getattr(attempt, "description", "") or ""),
+        ])
+        if _is_workflow_blocker_text(text):
+            return text
+    return ""
+
+
+def _workflow_blocker_from_verdict(verdict: object) -> str:
+    if isinstance(verdict, Verdict):
+        text_parts = [
+            str(getattr(verdict, "summary", "") or ""),
+            *[
+                str(getattr(item, "description", "") or "")
+                for item in list(getattr(verdict, "concerns", []) or [])
+            ],
+            *[
+                str(getattr(item, "description", "") or "")
+                for item in list(getattr(verdict, "gaps", []) or [])
+            ],
+        ]
+        text = "\n".join(part for part in text_parts if part)
+    else:
+        text = to_str(verdict)
+    return text if _is_workflow_blocker_text(text) else ""
+
+
+async def _quiesce_on_workflow_blocker_verdict(
+    runner: WorkflowRunner,
+    feature: Feature,
+    verdict: object,
+    *,
+    phase_name: str,
+    source: str,
+) -> None:
+    blocker = _workflow_blocker_from_verdict(verdict)
+    if not blocker:
+        return
+    await runner.artifacts.put(
+        f"workflow-blocker:{source}",
+        json.dumps({
+            "source": source,
+            "reason": blocker,
+            "deterministic_workflow_blocker": True,
+            "operator_required": False,
+        }, indent=2, sort_keys=True),
+        feature=feature,
+    )
+    raise WorkflowQuiesced(
+        phase_name=phase_name,
+        reason=blocker,
+        metadata={
+            "terminal_state": "workflow_blocked",
+            "deterministic_workflow_blocker": True,
+            "operator_required": False,
+            "source": source,
+        },
+    )
+
+
+async def _store_attempts_or_quiesce_on_workflow_blocker(
+    runner: WorkflowRunner,
+    feature: Feature,
+    attempts: list[BugFixAttempt],
+    *,
+    phase_name: str,
+    source: str,
+) -> None:
+    await _store_attempts(runner, feature, attempts)
+    blocker = _workflow_blocker_from_attempts(attempts)
+    if blocker:
+        raise WorkflowQuiesced(
+            phase_name=phase_name,
+            reason=blocker,
+            metadata={
+                "terminal_state": "workflow_blocked",
+                "deterministic_workflow_blocker": True,
+                "operator_required": False,
+                "source": source,
+            },
+        )
+
+
+# `_post_dag_gate_proof_key` is shimmed from `..execution.gates`
+# (Slice 11f -- see the Slice-11f shim re-export block at the head of this
+# module).
+
+
+def _repo_command_digest(repo_dir: Path, *args: str) -> dict[str, Any]:
+    try:
+        result = subprocess.run(
+            ["git", *args],
+            cwd=repo_dir,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=10,
+        )
+    except Exception as exc:
+        return {"error": f"{type(exc).__name__}: {exc}"}
+    return {
+        "returncode": result.returncode,
+        "stdout_sha256": hashlib.sha256(result.stdout or b"").hexdigest(),
+        "stderr": (result.stderr or b"").decode("utf-8", errors="replace")[:1000],
+    }
+
+
+def _repo_untracked_content_digest(repo_dir: Path) -> list[dict[str, Any]]:
+    try:
+        result = subprocess.run(
+            ["git", "ls-files", "--others", "--exclude-standard", "-z"],
+            cwd=repo_dir,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=10,
+        )
+    except Exception as exc:
+        return [{"error": f"{type(exc).__name__}: {exc}"}]
+    if result.returncode != 0:
+        return [{
+            "error": (result.stderr or b"").decode("utf-8", errors="replace")[:1000],
+        }]
+    records: list[dict[str, Any]] = []
+    for raw_name in (result.stdout or b"").split(b"\0"):
+        if not raw_name:
+            continue
+        name = raw_name.decode("utf-8", errors="surrogateescape")
+        path = repo_dir / name
+        record: dict[str, Any] = {"path": name}
+        try:
+            if path.is_symlink():
+                record.update({"kind": "symlink", "target": os.readlink(path)})
+            elif path.is_file():
+                digest = hashlib.sha256()
+                with path.open("rb") as handle:
+                    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                        digest.update(chunk)
+                record.update({
+                    "kind": "file",
+                    "mode": stat.S_IMODE(path.lstat().st_mode),
+                    "sha256": digest.hexdigest(),
+                })
+            elif path.is_dir():
+                record.update({"kind": "dir"})
+            else:
+                record.update({"kind": "missing"})
+        except Exception as exc:
+            record["error"] = f"{type(exc).__name__}: {exc}"
+        records.append(record)
+    return records
+
+
+def _post_dag_gate_tree_digest(
+    runner: WorkflowRunner,
+    feature: Feature,
+    *,
+    authorized_repos: set[str] | None = None,
+    authorized_source_roots: dict[str, str] | None = None,
+) -> str:
+    feature_root = _get_feature_root(runner, feature)
+    payload: dict[str, Any] = {
+        "feature_id": str(getattr(feature, "id", "")),
+        "feature_root": str(feature_root) if feature_root is not None else "",
+        "repos": [],
+    }
+    if feature_root is not None and feature_root.exists():
+        if authorized_repos is not None or authorized_source_roots is not None:
+            repo_dirs, discovery_failures = _direct_source_push_repos(
+                feature_root,
+                authorized_repos=authorized_repos,
+                authorized_source_roots=authorized_source_roots,
+            )
+            if discovery_failures:
+                payload["repo_discovery_failures"] = discovery_failures[:50]
+        else:
+            repo_dirs = _discover_repo_roots_under(feature_root)
+        for repo_dir in repo_dirs:
+            repo_record: dict[str, Any] = {
+                "path": str(repo_dir.relative_to(feature_root)),
+            }
+            try:
+                head = subprocess.run(
+                    ["git", "rev-parse", "HEAD"],
+                    cwd=repo_dir,
+                    check=False,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=5,
+                )
+                repo_record.update(
+                    {
+                        "head": (head.stdout or "").strip() if head.returncode == 0 else "",
+                        "head_error": (head.stderr or "").strip() if head.returncode else "",
+                        "status": _repo_command_digest(
+                            repo_dir,
+                            "status",
+                            "--porcelain=v1",
+                            "-z",
+                        ),
+                        "diff_head": _repo_command_digest(
+                            repo_dir,
+                            "diff",
+                            "--binary",
+                            "HEAD",
+                            "--",
+                        ),
+                        "diff_index": _repo_command_digest(
+                            repo_dir,
+                            "diff",
+                            "--cached",
+                            "--binary",
+                            "HEAD",
+                            "--",
+                        ),
+                        "untracked": _repo_untracked_content_digest(repo_dir),
+                    }
+                )
+            except Exception as exc:
+                repo_record["error"] = f"{type(exc).__name__}: {exc}"
+            payload["repos"].append(repo_record)
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+async def _current_post_dag_gate_tree_digest(
+    runner: WorkflowRunner,
+    feature: Feature,
+) -> str:
+    feature_root = _get_feature_root(runner, feature)
+    authorized_sources = await _checkpoint_authorized_repo_sources(
+        runner,
+        feature,
+        feature_root,
+    )
+    return _post_dag_gate_tree_digest(
+        runner,
+        feature,
+        authorized_repos=(
+            set(authorized_sources) if authorized_sources is not None else None
+        ),
+        authorized_source_roots=authorized_sources,
+    )
+
+
+async def _post_dag_gate_is_fresh(
+    runner: WorkflowRunner,
+    feature: Feature,
+    gate_name: str,
+    tree_digest: str,
+) -> bool:
+    legacy = await runner.artifacts.get(f"dag-gate:{gate_name}", feature=feature)
+    if not legacy:
+        return False
+    proof = await runner.artifacts.get(
+        _post_dag_gate_proof_key(gate_name),
+        feature=feature,
+    )
+    if not proof:
+        return False
+    try:
+        payload = json.loads(str(proof))
+    except Exception:
+        return False
+    generic_fresh = (
+        str(payload.get("artifact_schema") or "") == "dag-post-gate-proof-v1"
+        and str(payload.get("gate") or "") == gate_name
+        and bool(payload.get("approved"))
+        and str(payload.get("tree_digest")) == tree_digest
+    )
+    if not generic_fresh:
+        return False
+    typed_gate = payload.get("typed_gate")
+    typed_store = _execution_control_store_for_runner(runner)
+    control_plane_required = await _feature_requires_execution_control_proofs(
+        runner,
+        feature,
+    )
+    if control_plane_required and typed_store is None:
+        return False
+    legacy_missing_store_gate = (
+        isinstance(typed_gate, dict)
+        and typed_gate.get("persisted") is False
+        and typed_gate.get("failure_type") == "missing_execution_control_store"
+    )
+    if legacy_missing_store_gate:
+        if control_plane_required:
+            return False
+        typed_gate = None
+    if control_plane_required and not isinstance(typed_gate, dict):
+        return False
+    if control_plane_required and typed_gate.get("persisted") is not True:
+        return False
+    if typed_gate is None and (typed_store is None or legacy_missing_store_gate):
+        typed_gate = None
+    elif not isinstance(typed_gate, dict):
+        return False
+    if typed_gate is not None and not await _typed_verification_gate_node_is_fresh(
+        runner,
+        feature,
+        proof=typed_gate,
+        kind="deterministic_gate",
+        stage=f"post_dag:{gate_name}",
+    ):
+        return False
+    if typed_gate is not None:
+        graph_approval = payload.get("graph_approval")
+        if not isinstance(graph_approval, dict):
+            return False
+        if graph_approval.get("persisted") is not True:
+            return False
+        if not await _typed_verification_gate_node_is_fresh(
+            runner,
+            feature,
+            proof=graph_approval,
+            kind="aggregate_verdict",
+            stage=f"post_dag:{gate_name}",
+        ):
+            return False
+    if gate_name == "source-push":
+        return await _source_push_durable_proof_is_fresh(runner, feature, tree_digest)
+    if gate_name == "implementation-report":
+        return await _implementation_report_durable_proof_is_fresh(
+            runner,
+            feature,
+            tree_digest,
+        )
+    if gate_name == "notify":
+        return await _notify_delivery_durable_proof_is_fresh(
+            runner,
+            feature,
+            tree_digest,
+            payload,
+        )
+    return True
+
+
+async def _record_post_dag_gate_proof(
+    runner: WorkflowRunner,
+    feature: Feature,
+    gate_name: str,
+    tree_digest: str,
+    *,
+    extra: dict[str, Any] | None = None,
+) -> None:
+    payload: dict[str, Any] = {
+        "artifact_schema": "dag-post-gate-proof-v1",
+        "gate": gate_name,
+        "approved": True,
+        "tree_digest": tree_digest,
+    }
+    if extra:
+        payload.update(extra)
+    payload["typed_gate"] = await _record_typed_verification_gate_node(
+        runner,
+        feature,
+        kind="deterministic_gate",
+        name=f"post_dag:{gate_name}",
+        stage=f"post_dag:{gate_name}",
+        payload={
+            "gate": gate_name,
+            "tree_digest": tree_digest,
+            "extra": extra or {},
+        },
+        metadata={"gate": gate_name, "scope": "post_dag"},
+    )
+    if isinstance(payload["typed_gate"], dict) and payload["typed_gate"].get("persisted") is True:
+        payload["graph_approval"] = await _record_typed_verification_gate_node(
+            runner,
+            feature,
+            kind="aggregate_verdict",
+            name=f"post_dag_aggregate:{gate_name}",
+            stage=f"post_dag:{gate_name}",
+            payload={
+                "gate": gate_name,
+                "source_kind": "deterministic_gate",
+                "source_evidence_node_id": payload["typed_gate"].get("evidence_node_id"),
+                "source_content_hash": payload["typed_gate"].get("content_hash"),
+                "tree_digest": tree_digest,
+            },
+            metadata={
+                "gate": gate_name,
+                "scope": "post_dag",
+                "source_kind": "deterministic_gate",
+            },
+        )
+    await runner.artifacts.put(
+        _post_dag_gate_proof_key(gate_name),
+        json.dumps(payload, sort_keys=True),
+        feature=feature,
+    )
+
+
+async def _record_source_push_workflow_blocker(
+    runner: WorkflowRunner,
+    feature: Feature,
+    *,
+    reason: str,
+    tree_digest_before: str,
+    tree_digest_after: str | None = None,
+    failure_type: str = "source_push_failed",
+) -> str:
+    message = _workflow_blocker_text(
+        "Source-push gate failed before post-DAG checkpoint advancement: "
+        f"{reason}"
+    )
+    await runner.artifacts.put(
+        "dag-runtime-failure:source-push",
+        json.dumps(
+            {
+                "artifact_schema": "dag-source-push-failure-v1",
+                "failure_class": "runtime_context",
+                "failure_type": failure_type,
+                "route": "quiesce_workflow",
+                "operator_required": False,
+                "retryable": False,
+                "deterministic": True,
+                "tree_digest_before": tree_digest_before,
+                "tree_digest_after": tree_digest_after,
+                "error": reason,
+                "phase": "implementation",
+                "blocked_before_checkpoint": True,
+            },
+            sort_keys=True,
+        ),
+        feature=feature,
+    )
+    return message
+
+
+async def _record_implementation_report_workflow_blocker(
+    runner: WorkflowRunner,
+    feature: Feature,
+    *,
+    reason: str,
+    tree_digest: str,
+    failure_type: str = "implementation_report_failed",
+) -> str:
+    message = _workflow_blocker_text(
+        "Implementation-report gate failed before post-DAG checkpoint advancement: "
+        f"{reason}"
+    )
+    await runner.artifacts.put(
+        "dag-runtime-failure:implementation-report",
+        json.dumps(
+            {
+                "artifact_schema": "dag-implementation-report-failure-v1",
+                "failure_class": "runtime_context",
+                "failure_type": failure_type,
+                "route": "quiesce_workflow",
+                "operator_required": False,
+                "retryable": False,
+                "deterministic": True,
+                "tree_digest": tree_digest,
+                "error": reason,
+                "phase": "implementation",
+                "blocked_before_checkpoint": True,
+            },
+            sort_keys=True,
+        ),
+        feature=feature,
+    )
+    return message
+
+
+async def _record_dag_verification_graph_workflow_blocker(
+    runner: WorkflowRunner,
+    feature: Feature,
+    group_idx: int,
+    projection_key: str | None,
+    reason: str,
+    *,
+    dag_sha256: str,
+) -> None:
+    stage = _dag_verify_stage_from_projection_key(projection_key)
+    graph_payload: dict[str, Any] = {}
+    if projection_key:
+        graph_key = _dag_verify_graph_artifact_key(group_idx, stage)
+        graph_payload = _json_object_from_text(
+            await _get_artifact_text(runner, feature, graph_key)
+        )
+        if not graph_payload:
+            graph_payload, _recover_error = await _recover_dag_verification_graph_payload_from_store(
+                runner,
+                feature,
+                projection_key=projection_key,
+                group_idx=group_idx,
+                dag_sha256s=[dag_sha256],
+                stage=stage,
+                require_approved_graph=False,
+            )
+            graph_payload = graph_payload or {}
+    route_payload = _dag_verification_graph_blocker_route_payload(graph_payload)
+    payload = {
+        "artifact_schema": "dag-verification-graph-workflow-blocker-v1",
+        "failure_class": route_payload["failure_class"],
+        "failure_type": route_payload["failure_type"],
+        "route": route_payload["route"],
+        "operator_required": False,
+        "retryable": route_payload["retryable"],
+        "deterministic": route_payload["deterministic"],
+        "deterministic_workflow_blocker": route_payload["deterministic_workflow_blocker"],
+        "group_idx": group_idx,
+        "stage": stage,
+        "projection_key": projection_key or "",
+        "dag_sha256": dag_sha256,
+        "error": reason,
+        "aggregate_blocking_failure_class": route_payload.get(
+            "aggregate_blocking_failure_class"
+        ),
+        "route_decision": route_payload,
+        "phase": "implementation",
+        "blocked_before_checkpoint": True,
+    }
+    await runner.artifacts.put(
+        f"workflow-blocker:g{group_idx}:verification-graph-{stage}",
+        json.dumps(payload, sort_keys=True),
+        feature=feature,
+    )
+
+
+def _dag_verification_graph_blocker_route_payload(
+    graph_payload: dict[str, Any] | None,
+) -> dict[str, Any]:
+    default = {
+        "aggregate_blocking_failure_class": None,
+        "failure_class": "verification_graph",
+        "failure_type": "missing_typed_graph_approval",
+        "route": "quiesce_workflow",
+        "retryable": False,
+        "deterministic": True,
+        "deterministic_workflow_blocker": True,
+        "operator_required": False,
+    }
+    payload = graph_payload if isinstance(graph_payload, dict) else {}
+    if not payload:
+        return default
+    durable_projection = _json_object_from_text(payload.get("durable_projection"))
+    if durable_projection.get("persisted") is not True:
+        return default
+    aggregate = _json_object_from_text(payload.get("aggregate"))
+    aggregate_node = _json_object_from_text(payload.get("aggregate_node"))
+    aggregate_metadata = _json_object_from_text(aggregate_node.get("metadata"))
+    blocking = str(
+        aggregate.get("blocking_failure_class")
+        or aggregate_metadata.get("blocking_failure_class")
+        or ""
+    )
+    matched_metadata: dict[str, Any] = {}
+    for node in list(payload.get("nodes") or []):
+        if not isinstance(node, dict):
+            continue
+        metadata = _json_object_from_text(node.get("metadata"))
+        node_failure_class = str(metadata.get("failure_class") or "")
+        node_blocking_class = str(metadata.get("blocking_failure_class") or "")
+        if blocking and blocking in {node_failure_class, node_blocking_class}:
+            matched_metadata = metadata
+            break
+        if blocking == "aggregate.conflict" and node_failure_class == "evidence_corruption":
+            matched_metadata = metadata
+            break
+    failure_class = str(matched_metadata.get("failure_class") or "")
+    if not failure_class:
+        failure_class = "evidence_corruption" if blocking == "aggregate.conflict" else blocking
+    if not failure_class:
+        failure_class = "verification_graph"
+    failure_type = str(matched_metadata.get("failure_type") or "")
+    if not failure_type:
+        failure_type = (
+            "projection_body_conflict"
+            if failure_class == "evidence_corruption"
+            else "missing_typed_graph_approval"
+        )
+    route = str(matched_metadata.get("route") or "")
+    if not route:
+        if failure_class == "product_defect":
+            route = "run_product_repair"
+        elif failure_class in {"verifier_provider", "verifier_context"}:
+            route = "retry_verifier"
+        else:
+            route = "quiesce_workflow"
+    retryable = route in {"retry_verifier", "retry_dispatch", "run_product_repair"}
+    deterministic = failure_class not in {
+        "product_defect",
+        "runtime_provider",
+        "verifier_provider",
+    }
+    return {
+        "aggregate_blocking_failure_class": blocking or None,
+        "failure_class": failure_class,
+        "failure_type": failure_type,
+        "route": route,
+        "retryable": retryable,
+        "deterministic": deterministic,
+        "deterministic_workflow_blocker": deterministic,
+        "operator_required": False,
+    }
+
+
+def _json_object_from_text(raw: str | None) -> dict[str, Any]:
+    if isinstance(raw, dict):
+        return dict(raw)
+    if not raw:
+        return {}
+    try:
+        data = json.loads(str(raw))
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+# `_implementation_report_metadata` is shimmed from
+# `..execution.post_dag_gates` (Slice 11l).
+
+
+async def _put_implementation_report_metadata(
+    runner: WorkflowRunner,
+    feature: Feature,
+    *,
+    tree_digest: str,
+    report_url: str,
+    backlog_url: str,
+    backlog: "EnhancementBacklog",
+    report_body_sha256: str = "",
+    publish_status: str = "complete",
+) -> None:
+    await runner.artifacts.put(
+        "implementation-report-metadata",
+        json.dumps(
+            _implementation_report_metadata(
+                tree_digest=tree_digest,
+                report_url=report_url,
+                backlog_url=backlog_url,
+                backlog=backlog,
+                report_body_sha256=report_body_sha256,
+                publish_status=publish_status,
+            ),
+            sort_keys=True,
+        ),
+        feature=feature,
+    )
+
+
+def _load_implementation_report_metadata(
+    raw: str | None,
+) -> tuple[str, str, EnhancementBacklog, str, str, str]:
+    data = _json_object_from_text(raw)
+    report_url = str(data.get("report_url") or "")
+    backlog_url = str(data.get("backlog_url") or "")
+    tree_digest = str(data.get("tree_digest") or "")
+    report_body_sha256 = str(data.get("report_body_sha256") or "")
+    publish_status = str(data.get("publish_status") or "")
+    backlog = EnhancementBacklog()
+    try:
+        backlog_items = data.get("backlog_items") or []
+        if isinstance(backlog_items, list):
+            backlog = EnhancementBacklog(
+                items=[item for item in backlog_items if isinstance(item, dict)]
+            )
+    except Exception:
+        backlog = EnhancementBacklog()
+    return report_url, backlog_url, backlog, tree_digest, report_body_sha256, publish_status
+
+
+# `_notify_delivery_id` is shimmed from
+# `..execution.post_dag_gates` (Slice 11l).
+
+
+async def _put_notify_delivery_record(
+    runner: WorkflowRunner,
+    feature: Feature,
+    *,
+    delivery_id: str,
+    tree_digest: str,
+    notification: str,
+    status: str,
+) -> None:
+    await runner.artifacts.put(
+        "dag-notify-delivery",
+        json.dumps(
+            {
+                "artifact_schema": "dag-notify-delivery-v1",
+                "delivery_id": delivery_id,
+                "tree_digest": tree_digest,
+                "notification_sha256": hashlib.sha256(
+                    notification.encode("utf-8")
+                ).hexdigest(),
+                "status": status,
+            },
+            sort_keys=True,
+        ),
+        feature=feature,
+    )
+
+
+async def _notify_delivery_durable_proof_is_fresh(
+    runner: WorkflowRunner,
+    feature: Feature,
+    tree_digest: str,
+    gate_proof: dict[str, Any],
+) -> bool:
+    delivery = _json_object_from_text(
+        await runner.artifacts.get("dag-notify-delivery", feature=feature)
+    )
+    if str(delivery.get("artifact_schema") or "") != "dag-notify-delivery-v1":
+        return False
+    if str(delivery.get("tree_digest") or "") != tree_digest:
+        return False
+    if str(delivery.get("status") or "") != "sent":
+        return False
+    delivery_id = str(delivery.get("delivery_id") or "")
+    notification_sha256 = str(delivery.get("notification_sha256") or "")
+    if not delivery_id or not notification_sha256:
+        return False
+    if str(gate_proof.get("delivery_id") or "") != delivery_id:
+        return False
+    if str(gate_proof.get("notification_sha256") or "") != notification_sha256:
+        return False
+    return True
+
+
+# `_notify_gate_proof_extra_from_delivery` is shimmed from
+# `..execution.gates` (Slice 11f -- see the Slice-11f shim re-export
+# block at the head of this module).
+
+
+async def _record_notify_workflow_blocker(
+    runner: WorkflowRunner,
+    feature: Feature,
+    *,
+    reason: str,
+    tree_digest: str,
+    delivery_id: str,
+    failure_type: str = "notify_delivery_ambiguous",
+) -> str:
+    message = _workflow_blocker_text(
+        "Notify gate failed before post-DAG checkpoint advancement: "
+        f"{reason}"
+    )
+    await runner.artifacts.put(
+        "dag-runtime-failure:notify",
+        json.dumps(
+            {
+                "artifact_schema": "dag-notify-failure-v1",
+                "failure_class": "runtime_context",
+                "failure_type": failure_type,
+                "route": "quiesce_workflow",
+                "operator_required": False,
+                "retryable": False,
+                "deterministic": True,
+                "tree_digest": tree_digest,
+                "delivery_id": delivery_id,
+                "error": reason,
+                "phase": "implementation",
+                "blocked_before_checkpoint": True,
+            },
+            sort_keys=True,
+        ),
+        feature=feature,
+    )
+    return message
+
+
+# `_source_push_proof_key` is shimmed from
+# `..execution.post_dag_gates` (Slice 11l).
+
+
+def _source_push_proof_payload(raw: str | None) -> dict[str, Any]:
+    data = _json_object_from_text(raw)
+    if str(data.get("artifact_schema") or "") != "dag-source-push-proof-v1":
+        return {}
+    proof_digest = str(data.get("proof_digest") or "")
+    if proof_digest and proof_digest != _source_push_proof_digest(data):
+        return {}
+    if raw and not proof_digest:
+        return {}
+    repos = data.get("repos")
+    if not isinstance(repos, dict):
+        data["repos"] = {}
+    return data
+
+
+# `_source_push_base_proof`, `_source_push_proof_digest`, and
+# `_finalize_source_push_proof` are shimmed from
+# `..execution.post_dag_gates` (Slice 11l).
+
+
+async def _persist_source_push_proof(
+    callback: Callable[[dict[str, Any]], Any] | None,
+    payload: dict[str, Any],
+) -> None:
+    if callback is None:
+        return
+    result = callback(_finalize_source_push_proof(payload))
+    if hasattr(result, "__await__"):
+        await result
+
+
+def _looks_like_local_git_remote(value: str) -> bool:
+    text = str(value or "").strip()
+    if not text:
+        return False
+    if text.startswith("file://"):
+        return True
+    if "://" in text:
+        return False
+    if re.match(r"^[^/\s]+@[^:\s]+:.+$", text):
+        return False
+    return True
+
+
+def _normalize_git_remote_reference(
+    value: str,
+    *,
+    repo_dir: Path | None = None,
+) -> tuple[str, str]:
+    text = str(value or "").strip()
+    if text.startswith("file://"):
+        return ("path", Path(text[7:]).expanduser().resolve(strict=False).as_posix())
+    if _looks_like_local_git_remote(text):
+        path = Path(text).expanduser()
+        if not path.is_absolute() and repo_dir is not None:
+            path = repo_dir / path
+        return ("path", path.resolve(strict=False).as_posix())
+    return ("url", text)
+
+
+def _local_git_remote_path_without_resolving(
+    value: str,
+    *,
+    repo_dir: Path | None = None,
+) -> Path | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if text.startswith("file://"):
+        path = Path(text[7:]).expanduser()
+    elif _looks_like_local_git_remote(text):
+        path = Path(text).expanduser()
+    else:
+        return None
+    if not path.is_absolute() and repo_dir is not None:
+        path = repo_dir / path
+    return path.absolute()
+
+
+def _source_push_origin_matches(
+    actual_origin: str,
+    expected_origin: str,
+    *,
+    repo_dir: Path,
+) -> bool:
+    if not actual_origin or not expected_origin:
+        return False
+    return _normalize_git_remote_reference(actual_origin, repo_dir=repo_dir) == (
+        _normalize_git_remote_reference(expected_origin, repo_dir=repo_dir)
+    )
+
+
+def _source_push_origin_within_root(
+    actual_origin: str,
+    *,
+    allowed_origin_root: Path,
+    repos_root: Path,
+    repo_dir: Path,
+) -> bool:
+    kind, normalized = _normalize_git_remote_reference(actual_origin, repo_dir=repo_dir)
+    if kind != "path":
+        return False
+    origin_path = Path(normalized).resolve(strict=False)
+    allowed_root = allowed_origin_root.resolve(strict=False)
+    feature_root = repos_root.resolve(strict=False)
+    try:
+        origin_path.relative_to(allowed_root)
+    except ValueError:
+        return False
+    try:
+        origin_path.relative_to(feature_root)
+        return False
+    except ValueError:
+        return True
+
+
+def _path_has_symlink_component_between(root: Path, path: Path) -> bool:
+    root_resolved = root.resolve(strict=False)
+    candidate = path.expanduser()
+    if not candidate.is_absolute():
+        candidate = root_resolved / candidate
+    candidate = candidate.absolute()
+    try:
+        relative = candidate.relative_to(root_resolved)
+    except ValueError:
+        return True
+    cursor = root_resolved
+    for part in relative.parts:
+        cursor = cursor / part
+        try:
+            if cursor.is_symlink():
+                return True
+        except OSError:
+            return True
+    return False
+
+
+def _path_has_any_symlink_component(path: Path) -> bool:
+    candidate = path.expanduser()
+    if not candidate.is_absolute():
+        candidate = candidate.absolute()
+    cursor = Path(candidate.anchor) if candidate.anchor else Path()
+    parts = candidate.parts[1:] if candidate.anchor else candidate.parts
+    for part in parts:
+        cursor = cursor / part
+        try:
+            if cursor.is_symlink():
+                return True
+        except OSError:
+            return True
+    return False
+
+
+def _gitdir_from_file(marker: Path) -> Path | None:
+    try:
+        text = marker.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    first = text.splitlines()[0].strip() if text.splitlines() else ""
+    if not first.lower().startswith("gitdir:"):
+        return None
+    raw = first.split(":", 1)[1].strip()
+    if not raw:
+        return None
+    git_dir = Path(raw).expanduser()
+    if not git_dir.is_absolute():
+        git_dir = marker.parent / git_dir
+    return git_dir
+
+
+def _git_worktree_backlink(git_dir: Path) -> Path | None:
+    backlink_file = git_dir / "gitdir"
+    if not backlink_file.exists() or backlink_file.is_symlink():
+        return None
+    try:
+        raw = backlink_file.read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return None
+    if not raw:
+        return None
+    backlink = Path(raw).expanduser()
+    if not backlink.is_absolute():
+        backlink = git_dir / backlink
+    return backlink
+
+
+def _feature_authority_root_for_path(path: Path) -> Path | None:
+    resolved = path.expanduser().resolve(strict=False)
+    parts = resolved.parts
+    for idx in range(len(parts) - 2):
+        if parts[idx] == ".iriai" and parts[idx + 1] == "features":
+            return Path(*parts[:idx + 3])
+    return None
+
+
+def _git_worktree_metadata_roots_for_repos_root(repos_root: Path) -> list[Path]:
+    roots = [repos_root]
+    authority_root = _feature_authority_root_for_path(repos_root)
+    if authority_root is not None:
+        roots.append(authority_root)
+    return roots
+
+
+def _git_worktree_external_metadata_roots(
+    authorized_source_roots: dict[str, str] | None,
+    *,
+    repo_rel: str | None = None,
+) -> list[Path]:
+    if not authorized_source_roots or not repo_rel:
+        return []
+    normalized_rel = str(repo_rel).strip().strip("/")
+    source = None
+    for raw_rel, raw_source in authorized_source_roots.items():
+        if str(raw_rel).strip().strip("/") == normalized_rel:
+            source = raw_source
+            break
+    if not source:
+        return []
+    source_path = Path(str(source)).expanduser()
+    return [source_path, source_path / ".git"]
+
+
+def _path_is_under(path: Path, root: Path) -> bool:
+    try:
+        path.expanduser().resolve(strict=False).relative_to(
+            root.expanduser().resolve(strict=False)
+        )
+        return True
+    except ValueError:
+        return False
+
+
+def _path_is_under_allowed_metadata_root(path: Path, roots: list[Path]) -> bool:
+    for root in roots:
+        if not _path_is_under(path, root):
+            continue
+        if _path_has_symlink_component_between(root, path):
+            continue
+        return True
+    return False
+
+
+def _is_git_worktree_file(
+    marker: Path,
+    *,
+    allowed_metadata_roots: list[Path] | None = None,
+    allowed_external_metadata_roots: list[Path] | None = None,
+) -> bool:
+    if marker.is_symlink() or not marker.exists() or marker.is_dir():
+        return False
+    git_dir = _gitdir_from_file(marker)
+    if git_dir is None:
+        return False
+    metadata_roots = allowed_metadata_roots or [marker.parent]
+    try:
+        if (
+            not git_dir.exists()
+            or not git_dir.is_dir()
+            or git_dir.is_symlink()
+            or _path_has_any_symlink_component(git_dir)
+        ):
+            return False
+        backlink = _git_worktree_backlink(git_dir)
+        if (
+            backlink is None
+            or backlink.resolve(strict=False) != marker.resolve(strict=False)
+            or not backlink.exists()
+            or backlink.is_dir()
+            or backlink.is_symlink()
+        ):
+            return False
+        common_dir = _git_common_dir(git_dir)
+        if (
+            common_dir is None
+            or not common_dir.exists()
+            or not common_dir.is_dir()
+            or common_dir.is_symlink()
+            or _path_has_any_symlink_component(common_dir)
+        ):
+            return False
+        if (
+            _path_is_under_allowed_metadata_root(git_dir, metadata_roots)
+            and _path_is_under_allowed_metadata_root(common_dir, metadata_roots)
+        ):
+            return True
+        external_metadata_roots = allowed_external_metadata_roots or []
+        return (
+            _is_git_managed_external_worktree_metadata(
+                git_dir,
+                common_dir,
+                marker=marker,
+            )
+            and _path_is_under_allowed_metadata_root(git_dir, external_metadata_roots)
+            and _path_is_under_allowed_metadata_root(common_dir, external_metadata_roots)
+        )
+    except OSError:
+        return False
+
+
+def _is_git_managed_external_worktree_metadata(
+    git_dir: Path,
+    common_dir: Path,
+    *,
+    marker: Path,
+) -> bool:
+    try:
+        git_dir_resolved = git_dir.expanduser().resolve(strict=False)
+        common_dir_resolved = common_dir.expanduser().resolve(strict=False)
+        git_dir_resolved.relative_to(common_dir_resolved / "worktrees")
+    except ValueError:
+        return False
+    if git_dir_resolved.parent.name != "worktrees":
+        return False
+    if _path_has_symlink_component_between(common_dir_resolved, git_dir_resolved):
+        return False
+    if not (common_dir_resolved / "HEAD").exists() or not (common_dir_resolved / "objects").is_dir():
+        return False
+    try:
+        listed = subprocess.run(
+            [
+                "git",
+                f"--git-dir={common_dir_resolved}",
+                "worktree",
+                "list",
+                "--porcelain",
+            ],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=5,
+        )
+    except Exception:
+        return False
+    if listed.returncode != 0:
+        return False
+    marker_parent = marker.parent.expanduser().resolve(strict=False)
+    for line in listed.stdout.splitlines():
+        if not line.startswith("worktree "):
+            continue
+        worktree_path = Path(line.split(" ", 1)[1]).expanduser().resolve(strict=False)
+        if worktree_path == marker_parent:
+            return True
+    return False
+
+
+def _git_common_dir(git_dir: Path) -> Path | None:
+    common_dir_file = git_dir / "commondir"
+    if not common_dir_file.exists():
+        return None
+    try:
+        raw = common_dir_file.read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return None
+    if not raw:
+        return None
+    common_dir = Path(raw).expanduser()
+    if not common_dir.is_absolute():
+        common_dir = git_dir / common_dir
+    return common_dir
+
+
+def _source_push_origin_git_metadata_problem(
+    actual_origin: str,
+    *,
+    allowed_origin_root: Path | None,
+    repos_root: Path,
+    repo_dir: Path,
+) -> str:
+    if allowed_origin_root is None:
+        return ""
+    kind, normalized = _normalize_git_remote_reference(actual_origin, repo_dir=repo_dir)
+    if kind != "path":
+        return "origin is not a local canonical source path"
+    allowed_root = allowed_origin_root.resolve(strict=False)
+    feature_root = repos_root.resolve(strict=False)
+    raw_origin_path = _local_git_remote_path_without_resolving(
+        actual_origin,
+        repo_dir=repo_dir,
+    )
+    origin_path = Path(normalized).resolve(strict=False)
+    try:
+        origin_path.relative_to(allowed_root)
+    except ValueError:
+        return "origin is not under canonical workspace source root"
+    if raw_origin_path is None:
+        raw_origin_path = origin_path
+    try:
+        raw_origin_path.relative_to(allowed_root)
+    except ValueError:
+        return "origin path contains a symlinked component"
+    try:
+        origin_path.relative_to(feature_root)
+        return "origin must not point back into feature clone root"
+    except ValueError:
+        pass
+    if _path_has_symlink_component_between(allowed_root, raw_origin_path):
+        return "origin path contains a symlinked component"
+    git_marker = origin_path / ".git"
+    git_dir: Path | None = None
+    git_dir_raw: Path | None = None
+    if git_marker.is_symlink():
+        return "origin .git must not be a symlink"
+    if git_marker.is_dir():
+        git_dir_raw = git_marker
+    elif git_marker.is_file():
+        git_dir_raw = _gitdir_from_file(git_marker)
+        if git_dir_raw is None:
+            return "origin .git file has no valid gitdir"
+    elif (origin_path / "HEAD").exists() and (origin_path / "objects").is_dir():
+        git_dir_raw = raw_origin_path
+    if git_dir_raw is None:
+        return ""
+    git_dir = git_dir_raw.resolve(strict=False)
+    try:
+        git_dir.relative_to(allowed_root)
+    except ValueError:
+        return "origin git metadata escapes canonical workspace source root"
+    try:
+        git_dir.relative_to(feature_root)
+        return "origin git metadata must not point into feature clone root"
+    except ValueError:
+        pass
+    if _path_has_symlink_component_between(allowed_root, git_dir_raw):
+        return "origin git metadata path contains a symlinked component"
+    common_dir_raw = _git_common_dir(git_dir_raw)
+    if common_dir_raw is None:
+        return ""
+    common_dir = common_dir_raw.resolve(strict=False)
+    try:
+        common_dir.relative_to(allowed_root)
+    except ValueError:
+        return "origin git common-dir escapes canonical workspace source root"
+    try:
+        common_dir.relative_to(feature_root)
+        return "origin git common-dir must not point into feature clone root"
+    except ValueError:
+        pass
+    if _path_has_symlink_component_between(allowed_root, common_dir_raw):
+        return "origin git common-dir path contains a symlinked component"
+    return ""
+
+
+def _source_push_expected_origin_within_root(
+    expected_origin: str,
+    *,
+    allowed_origin_root: Path | None,
+    repos_root: Path,
+    repo_dir: Path,
+) -> bool:
+    if allowed_origin_root is None:
+        return True
+    return _source_push_origin_within_root(
+        expected_origin,
+        allowed_origin_root=allowed_origin_root,
+        repos_root=repos_root,
+        repo_dir=repo_dir,
+    )
+
+
+def _git_remote_url_lines(output: str) -> list[str]:
+    return [line.strip() for line in str(output or "").splitlines() if line.strip()]
+
+
+async def _source_push_authorized_push_target(
+    repo_dir: Path,
+    *,
+    actual_origin: str,
+    expected_origin: str,
+    allowed_origin_root: Path | None,
+    repos_root: Path,
+) -> tuple[str, str]:
+    if not expected_origin and allowed_origin_root is None:
+        return "", "source push requires canonical source authority"
+    raw_push_urls = await _run_git(
+        repo_dir,
+        "remote",
+        "get-url",
+        "--push",
+        "--all",
+        "origin",
+    )
+    push_targets = _git_remote_url_lines(raw_push_urls)
+    if not push_targets:
+        return "", "push URL is missing"
+
+    normalized_targets: set[tuple[str, str]] = set()
+    for push_target in push_targets:
+        if expected_origin and not _source_push_origin_matches(
+            push_target,
+            expected_origin,
+            repo_dir=repo_dir,
+        ):
+            return "", "push URL does not match canonical source authority"
+        if allowed_origin_root is not None:
+            if not _source_push_origin_within_root(
+                push_target,
+                allowed_origin_root=allowed_origin_root,
+                repos_root=repos_root,
+                repo_dir=repo_dir,
+            ):
+                return "", "push URL is not under canonical workspace source root"
+            metadata_problem = _source_push_origin_git_metadata_problem(
+                push_target,
+                allowed_origin_root=allowed_origin_root,
+                repos_root=repos_root,
+                repo_dir=repo_dir,
+            )
+            if metadata_problem:
+                return "", f"push URL {metadata_problem}"
+        normalized_targets.add(
+            _normalize_git_remote_reference(push_target, repo_dir=repo_dir)
+        )
+
+    if len(normalized_targets) != 1:
+        return "", "push URL has multiple canonical destinations"
+    if actual_origin and not _source_push_origin_matches(
+        actual_origin,
+        push_targets[0],
+        repo_dir=repo_dir,
+    ):
+        if expected_origin:
+            return "", "push URL does not match canonical source authority"
+        return "", "push URL does not match current origin"
+    return push_targets[0], ""
+
+
+# `_source_push_prior_proof_matches` is shimmed from
+# `..execution.post_dag_gates` (Slice 11l).
+
+
+async def _source_push_expected_origins(
+    runner: WorkflowRunner,
+    feature: Feature,
+    feature_root: Path,
+    *,
+    group_idx: int | None = None,
+) -> tuple[dict[str, str] | None, set[str], Path | None]:
+    workspace_mgr = runner.services.get("workspace_manager")
+    workspace_root = Path(getattr(workspace_mgr, "_base", "")) if workspace_mgr else None
+    expected: dict[str, str] = {}
+    writeable_by_rel: dict[str, bool] = {}
+    registries = await _load_worktree_registries_for_authority(
+        runner,
+        feature,
+        group_idx=group_idx,
+    )
+    if registries:
+        feature_root_resolved = feature_root.resolve(strict=False)
+        for registry in registries:
+            registry_feature_root = str(getattr(registry, "feature_root", "") or "")
+            if registry_feature_root:
+                try:
+                    if Path(registry_feature_root).expanduser().resolve(strict=False) != feature_root_resolved:
+                        continue
+                except Exception:
+                    continue
+            for repo in registry.repos:
+                source_path = str(getattr(repo, "source_path", "") or "")
+                if not source_path:
+                    continue
+                dest_text = (
+                    str(getattr(repo, "destination_path", "") or "")
+                    or str(getattr(repo, "canonical_path", "") or "")
+                    or str(feature_root / getattr(repo, "repo_path", ""))
+                )
+                try:
+                    rel = Path(dest_text).expanduser().resolve(strict=False).relative_to(
+                        feature_root_resolved
+                    ).as_posix()
+                except Exception:
+                    rel = str(getattr(repo, "repo_path", "") or "").strip().strip("/")
+                if not rel:
+                    continue
+                resolved_source = str(Path(source_path).expanduser().resolve(strict=False))
+                if rel not in expected:
+                    expected[rel] = resolved_source
+                action = str(getattr(repo, "action", "") or "")
+                role = str(getattr(repo, "role", "") or "")
+                writable_task_ids = list(getattr(repo, "writable_task_ids", []) or [])
+                writable = action != "read_only" and role != "source" and bool(writable_task_ids)
+                writeable_by_rel[rel] = writeable_by_rel.get(rel, False) or writable
+        optional_noop_repos = {
+            rel for rel in expected if not writeable_by_rel.get(rel, False)
+        }
+        return dict(sorted(expected.items())), optional_noop_repos, workspace_root
+
+    registry = await _load_worktree_registry_for_group(runner, feature, None)
+    if registry is not None:
+        optional_noop_repos: set[str] = set()
+        for repo in registry.repos:
+            source_path = str(getattr(repo, "source_path", "") or "")
+            if not source_path:
+                continue
+            dest_text = (
+                str(getattr(repo, "destination_path", "") or "")
+                or str(getattr(repo, "canonical_path", "") or "")
+                or str(feature_root / getattr(repo, "repo_path", ""))
+            )
+            try:
+                rel = Path(dest_text).expanduser().resolve(strict=False).relative_to(
+                    feature_root.resolve(strict=False)
+                ).as_posix()
+            except Exception:
+                rel = str(getattr(repo, "repo_path", "") or "").strip().strip("/")
+            if rel:
+                expected[rel] = str(Path(source_path).expanduser().resolve(strict=False))
+                action = str(getattr(repo, "action", "") or "")
+                role = str(getattr(repo, "role", "") or "")
+                writable_task_ids = list(getattr(repo, "writable_task_ids", []) or [])
+                if action == "read_only" or role == "source" or not writable_task_ids:
+                    optional_noop_repos.add(rel)
+        return dict(sorted(expected.items())), optional_noop_repos, workspace_root
+    return None, set(), workspace_root
+
+
+async def _checkpoint_authorized_repos(
+    runner: WorkflowRunner,
+    feature: Feature,
+    feature_root: Path | None,
+    *,
+    group_idx: int | None = None,
+) -> set[str] | None:
+    if feature_root is None:
+        return None
+    expected_origins, _, _ = await _source_push_expected_origins(
+        runner,
+        feature,
+        feature_root,
+        group_idx=group_idx,
+    )
+    if expected_origins is None:
+        return None
+    return set(expected_origins)
+
+
+async def _checkpoint_authorized_repo_sources(
+    runner: WorkflowRunner,
+    feature: Feature,
+    feature_root: Path | None,
+    *,
+    group_idx: int | None = None,
+) -> dict[str, str] | None:
+    if feature_root is None:
+        return None
+    expected_origins, _, _ = await _source_push_expected_origins(
+        runner,
+        feature,
+        feature_root,
+        group_idx=group_idx,
+    )
+    return expected_origins
+
+
+async def _source_push_durable_proof_is_fresh(
+    runner: WorkflowRunner,
+    feature: Feature,
+    tree_digest: str,
+) -> bool:
+    proof = _source_push_proof_payload(
+        await runner.artifacts.get(_source_push_proof_key(), feature=feature)
+    )
+    if str(proof.get("tree_digest") or "") != tree_digest:
+        return False
+    feature_root = _get_feature_root(runner, feature)
+    if feature_root is None:
+        return False
+    expected_origins, optional_noop_repos, allowed_origin_root = (
+        await _source_push_expected_origins(runner, feature, feature_root)
+    )
+    proof_repos_root = str(proof.get("repos_root") or "")
+    if proof_repos_root and (
+        Path(proof_repos_root).expanduser().resolve(strict=False)
+        != feature_root.resolve(strict=False)
+    ):
+        return False
+    if expected_origins is not None and proof.get("expected_origins") != dict(
+        sorted(expected_origins.items())
+    ):
+        return False
+    repo_dirs, discovery_failures = _direct_source_push_repos(
+        feature_root,
+        authorized_repos=(
+            set(expected_origins) if expected_origins is not None else None
+        ),
+        authorized_source_roots=expected_origins,
+    )
+    if discovery_failures:
+        return False
+    repos = proof.get("repos")
+    if not isinstance(repos, dict) or not repos:
+        return False
+    repo_names = {repo.relative_to(feature_root).as_posix() for repo in repo_dirs}
+    if set(repos) != repo_names:
+        return False
+    for repo_dir in repo_dirs:
+        rel = repo_dir.relative_to(feature_root).as_posix()
+        record = repos.get(rel)
+        if not isinstance(record, dict):
+            return False
+        try:
+            branch = await _run_git(repo_dir, "branch", "--show-current")
+            status_text = await _run_git(repo_dir, "status", "--porcelain")
+            local_head = await _run_git(repo_dir, "rev-parse", "HEAD")
+            actual_origin = ""
+            push_target = "origin"
+            if expected_origins is not None:
+                expected_origin = str(expected_origins.get(rel) or "")
+                if not expected_origin:
+                    return False
+                actual_origin = await _run_git(repo_dir, "remote", "get-url", "origin")
+                if not _source_push_origin_matches(
+                    actual_origin,
+                    expected_origin,
+                    repo_dir=repo_dir,
+                ):
+                    return False
+                if not _source_push_expected_origin_within_root(
+                    expected_origin,
+                    allowed_origin_root=allowed_origin_root,
+                    repos_root=feature_root,
+                    repo_dir=repo_dir,
+                ):
+                    return False
+                if _source_push_origin_git_metadata_problem(
+                    actual_origin,
+                    allowed_origin_root=allowed_origin_root,
+                        repos_root=feature_root,
+                        repo_dir=repo_dir,
+                    ):
+                        return False
+                push_target, push_problem = await _source_push_authorized_push_target(
+                    repo_dir,
+                    actual_origin=actual_origin,
+                    expected_origin=expected_origin,
+                    allowed_origin_root=allowed_origin_root,
+                    repos_root=feature_root,
+                )
+                if push_problem:
+                    return False
+            else:
+                expected_origin = ""
+                if allowed_origin_root is not None:
+                    actual_origin = await _run_git(repo_dir, "remote", "get-url", "origin")
+                    if not _source_push_origin_within_root(
+                        actual_origin,
+                        allowed_origin_root=allowed_origin_root,
+                        repos_root=feature_root,
+                        repo_dir=repo_dir,
+                    ):
+                        return False
+                    if _source_push_origin_git_metadata_problem(
+                        actual_origin,
+                        allowed_origin_root=allowed_origin_root,
+                        repos_root=feature_root,
+                        repo_dir=repo_dir,
+                    ):
+                        return False
+                    push_target, push_problem = await _source_push_authorized_push_target(
+                        repo_dir,
+                        actual_origin=actual_origin,
+                        expected_origin=expected_origin,
+                        allowed_origin_root=allowed_origin_root,
+                        repos_root=feature_root,
+                    )
+                    if push_problem:
+                        return False
+            remote_ref = f"refs/heads/{branch}"
+            remote_head = _parse_ls_remote_head(
+                await _run_git(repo_dir, "ls-remote", push_target, remote_ref)
+            )
+        except Exception:
+            return False
+        if status_text or not branch or not local_head:
+            return False
+        if str(record.get("branch") or "") != branch:
+            return False
+        if str(record.get("local_head") or "") != local_head:
+            return False
+        if str(record.get("remote_ref") or "") != remote_ref:
+            return False
+        if str(record.get("expected_origin") or "") != expected_origin:
+            return False
+        if str(record.get("actual_origin") or "") != actual_origin:
+            return False
+        if str(record.get("remote_after") or "") != local_head:
+            return False
+        if remote_head != local_head:
+            return False
+        status = str(record.get("status") or "")
+        if status in {"pushed", "recovered"}:
+            continue
+        if (
+            status == "unchanged"
+            and rel in optional_noop_repos
+            and record.get("mutation_required") is False
+        ):
+            continue
+        return False
+    return True
+
+
+# `_source_push_proof_records_are_self_consistent` is shimmed from
+# `..execution.post_dag_gates` (Slice 11l).
+
+
+async def _implementation_report_durable_proof_is_fresh(
+    runner: WorkflowRunner,
+    feature: Feature,
+    tree_digest: str,
+) -> bool:
+    report_raw = await runner.artifacts.get("implementation-report", feature=feature)
+    meta_raw = await runner.artifacts.get("implementation-report-metadata", feature=feature)
+    (
+        _report_url,
+        _backlog_url,
+        _backlog,
+        metadata_tree_digest,
+        report_body_sha256,
+        publish_status,
+    ) = _load_implementation_report_metadata(meta_raw)
+    if not report_raw or metadata_tree_digest != tree_digest:
+        return False
+    if publish_status != "complete" or not report_body_sha256:
+        return False
+    return report_body_sha256 == hashlib.sha256(
+        str(report_raw).encode("utf-8")
+    ).hexdigest()
+
+
+async def _generate_and_publish_implementation_report(
+    runner: WorkflowRunner,
+    feature: Feature,
+    *,
+    tree_digest: str,
+    handover: "HandoverDoc",
+    verdicts: dict[str, object],
+    prior_attempts: list[Any],
+    test_result: object,
+) -> tuple[str, str, "EnhancementBacklog"]:
+    from ....services.implementation_report import (
+        render_implementation_report,
+        validate_report,
+    )
+
+    report_url = ""
+    backlog_url = ""
+    backlog = EnhancementBacklog()
+    artifact_urls = _collect_artifact_urls(runner)
+    screenshot_paths = _collect_screenshots(feature, runner)
+    report_html = render_implementation_report(
+        feature_name=feature.name,
+        handover=handover,
+        verdicts=verdicts,
+        bug_fix_attempts=prior_attempts,
+        test_result=test_result,
+        artifact_urls=artifact_urls,
+        screenshot_paths=screenshot_paths,
+    )
+    validation_errors = validate_report(report_html, handover, verdicts)
+    if validation_errors:
+        logger.warning(
+            "Report validation: %d issues: %s",
+            len(validation_errors),
+            "; ".join(validation_errors[:5]),
+        )
+
+    report_body_sha256 = hashlib.sha256(report_html.encode("utf-8")).hexdigest()
+    await runner.artifacts.put("implementation-report", report_html, feature=feature)
+    await runner.artifacts.put(
+        "implementation-report-publish-intent",
+        json.dumps(
+            {
+                "artifact_schema": "implementation-report-publish-intent-v1",
+                "tree_digest": tree_digest,
+                "report_body_sha256": report_body_sha256,
+                "status": "publishing",
+            },
+            sort_keys=True,
+        ),
+        feature=feature,
+    )
+
+    hosting = runner.services.get("hosting")
+    if hosting:
+        report_url = await hosting.push_qa(
+            feature.id,
+            "implementation-report",
+            report_html,
+            "Implementation Report",
+        )
+        logger.info("Implementation report hosted at %s", report_url)
+        await _put_implementation_report_metadata(
+            runner,
+            feature,
+            tree_digest=tree_digest,
+            report_url=report_url,
+            backlog_url=backlog_url,
+            backlog=backlog,
+            report_body_sha256=report_body_sha256,
+            publish_status="report_published",
+        )
+
+    backlog_json = await runner.artifacts.get("enhancement-backlog", feature=feature)
+    if backlog_json:
+        try:
+            backlog = EnhancementBacklog.model_validate_json(backlog_json)
+        except Exception:
+            backlog = EnhancementBacklog()
+        if backlog.items:
+            backlog_html = _render_enhancement_backlog_html(backlog, feature.name)
+            if hosting:
+                backlog_url = await hosting.push_qa(
+                    feature.id,
+                    "enhancement-backlog",
+                    backlog_html,
+                    "Enhancement Backlog",
+                )
+                await _put_implementation_report_metadata(
+                    runner,
+                    feature,
+                    tree_digest=tree_digest,
+                    report_url=report_url,
+                    backlog_url=backlog_url,
+                    backlog=backlog,
+                    report_body_sha256=report_body_sha256,
+                    publish_status="backlog_published",
+                )
+            await runner.artifacts.put(
+                "enhancement-backlog-report",
+                backlog_html,
+                feature=feature,
+            )
+    await _put_implementation_report_metadata(
+        runner,
+        feature,
+        tree_digest=tree_digest,
+        report_url=report_url,
+        backlog_url=backlog_url,
+        backlog=backlog,
+        report_body_sha256=report_body_sha256,
+        publish_status="complete",
+    )
+    await runner.artifacts.put(
+        "dag-gate:implementation-report",
+        "approved",
+        feature=feature,
+    )
+    await _record_post_dag_gate_proof(
+        runner,
+        feature,
+        "implementation-report",
+        tree_digest,
+    )
+    return report_url, backlog_url, backlog
+
+
 class ImplementationPhase(Phase):
     name = "implementation"
 
@@ -1886,7 +10403,10 @@ class ImplementationPhase(Phase):
                 )
 
             # ── Step 1: Implementation ───────────────────────────────────
-            impl_text, dag_failure, handover = await _implement_dag(runner, feature, dag)
+            dag_outcome = await _implement_dag(runner, feature, dag)
+            impl_text = dag_outcome.implementation_text
+            dag_failure = dag_outcome.failure
+            handover = dag_outcome.handover
 
             await runner.artifacts.put("implementation", impl_text, feature=feature)
             await runner.artifacts.put("handover", to_str(handover), feature=feature)
@@ -1903,8 +10423,31 @@ class ImplementationPhase(Phase):
             state.implementation = impl_text
             state.handover = to_str(handover)
 
+            if dag_outcome.terminal_state == "quiesced":
+                logger.info("DAG execution quiesced cleanly: %s", dag_failure)
+                raise WorkflowQuiesced(
+                    phase_name=self.name,
+                    reason=dag_failure or "DAG execution quiesced.",
+                    metadata={
+                        "terminal_state": dag_outcome.terminal_state,
+                        "dag_failure": dag_failure[:1000],
+                    },
+                )
+            if dag_outcome.terminal_state == "workflow_blocked":
+                logger.info("DAG execution stopped on typed workflow blocker: %s", dag_failure)
+                raise WorkflowQuiesced(
+                    phase_name=self.name,
+                    reason=dag_failure or "DAG execution stopped on typed workflow blocker.",
+                    metadata={
+                        "terminal_state": dag_outcome.terminal_state,
+                        "dag_failure": dag_failure[:1000],
+                        "deterministic_workflow_blocker": True,
+                        "operator_required": False,
+                    },
+                )
+
             # If the DAG stopped early on a verify failure, go through RCA
-            if dag_failure:
+            if dag_failure and dag_outcome.terminal_state == "verify_failed":
                 runtime_policy = _runner_runtime_policy(runner)
                 diagnostic_runtime = _dag_repair_runtime_for(
                     "dag-rca",
@@ -1927,6 +10470,13 @@ class ImplementationPhase(Phase):
                     "dag-failure-fix",
                     runtime=_dag_repair_runtime_for("dag-fix", "primary"),
                 )
+                await _quiesce_on_workflow_blocker_verdict(
+                    runner,
+                    feature,
+                    dag_failure,
+                    phase_name=self.name,
+                    source="verify",
+                )
                 attempts = await _diagnose_and_fix(
                     runner, feature, dag_failure, "verify",
                     diagnostic_reviewer, diagnostic_fixer, prior_attempts, bug_counter,
@@ -1934,9 +10484,17 @@ class ImplementationPhase(Phase):
                     rca_runtime=diagnostic_runtime,
                 )
                 prior_attempts.extend(attempts)
-                await _store_attempts(runner, feature, prior_attempts)
+                await _store_attempts_or_quiesce_on_workflow_blocker(
+                    runner,
+                    feature,
+                    prior_attempts,
+                    phase_name=self.name,
+                    source="verify",
+                )
                 cycle += 1
                 continue
+            if dag_failure:
+                raise RuntimeError(dag_failure)
 
             # Compress handover before passing to review/QA gates
             handover.compress()
@@ -1965,7 +10523,10 @@ class ImplementationPhase(Phase):
                     pass
 
             contradiction_decisions = await _format_contradiction_decisions_context(
-                runner, feature,
+                runner,
+                feature,
+                context_text=handover_context,
+                file_stem="post-dag-gates",
             )
             if contradiction_decisions:
                 handover_context += "\n\n" + contradiction_decisions
@@ -2002,9 +10563,18 @@ class ImplementationPhase(Phase):
                 gate_runtime, fix_runtime, diagnostic_runtime,
                 last_group_idx, runtime_policy,
             )
+            post_dag_gate_tree_digest = await _current_post_dag_gate_tree_digest(
+                runner,
+                feature,
+            )
 
             # ── Step 2: Code Review (static) ─────────────────────────────
-            if await runner.artifacts.get("dag-gate:code-review", feature=feature):
+            if await _post_dag_gate_is_fresh(
+                runner,
+                feature,
+                "code-review",
+                post_dag_gate_tree_digest,
+            ):
                 logger.info("Code review gate already passed — skipping")
                 review_verdict = Verdict(approved=True, summary="Previously approved")
             else:
@@ -2044,8 +10614,21 @@ class ImplementationPhase(Phase):
                 await runner.artifacts.put(
                     "dag-gate:code-review", "approved", feature=feature
                 )
+                await _record_post_dag_gate_proof(
+                    runner,
+                    feature,
+                    "code-review",
+                    post_dag_gate_tree_digest,
+                )
 
             if not _is_approved(review_verdict):
+                await _quiesce_on_workflow_blocker_verdict(
+                    runner,
+                    feature,
+                    review_verdict,
+                    phase_name=self.name,
+                    source="code_reviewer",
+                )
                 attempts = await _diagnose_and_fix(
                     runner, feature, review_verdict, "code_reviewer",
                     _make_parallel_actor(reviewer, "recheck", runtime=gate_runtime),
@@ -2055,12 +10638,23 @@ class ImplementationPhase(Phase):
                     rca_runtime=diagnostic_runtime,
                 )
                 prior_attempts.extend(attempts)
-                await _store_attempts(runner, feature, prior_attempts)
+                await _store_attempts_or_quiesce_on_workflow_blocker(
+                    runner,
+                    feature,
+                    prior_attempts,
+                    phase_name=self.name,
+                    source="code_reviewer",
+                )
                 cycle += 1
                 continue
 
             # ── Step 3: Security Audit (static) ──────────────────────────
-            if await runner.artifacts.get("dag-gate:security", feature=feature):
+            if await _post_dag_gate_is_fresh(
+                runner,
+                feature,
+                "security",
+                post_dag_gate_tree_digest,
+            ):
                 logger.info("Security gate already passed — skipping")
                 security_verdict = Verdict(approved=True, summary="Previously approved")
             else:
@@ -2100,8 +10694,21 @@ class ImplementationPhase(Phase):
                 await runner.artifacts.put(
                     "dag-gate:security", "approved", feature=feature
                 )
+                await _record_post_dag_gate_proof(
+                    runner,
+                    feature,
+                    "security",
+                    post_dag_gate_tree_digest,
+                )
 
             if not _is_approved(security_verdict):
+                await _quiesce_on_workflow_blocker_verdict(
+                    runner,
+                    feature,
+                    security_verdict,
+                    phase_name=self.name,
+                    source="security_auditor",
+                )
                 attempts = await _diagnose_and_fix(
                     runner, feature, security_verdict, "security_auditor",
                     _make_parallel_actor(security_auditor, "recheck", runtime=gate_runtime),
@@ -2111,18 +10718,35 @@ class ImplementationPhase(Phase):
                     rca_runtime=diagnostic_runtime,
                 )
                 prior_attempts.extend(attempts)
-                await _store_attempts(runner, feature, prior_attempts)
+                await _store_attempts_or_quiesce_on_workflow_blocker(
+                    runner,
+                    feature,
+                    prior_attempts,
+                    phase_name=self.name,
+                    source="security_auditor",
+                )
                 cycle += 1
                 continue
 
             # ── Step 4: Test Authoring ────────────────────────────────────
-            test_checkpoint = await runner.artifacts.get(
-                "dag-gate:test-authoring", feature=feature,
+            test_checkpoint = (
+                await runner.artifacts.get(
+                    "dag-gate:test-authoring",
+                    feature=feature,
+                )
+                if await _post_dag_gate_is_fresh(
+                    runner,
+                    feature,
+                    "test-authoring",
+                    post_dag_gate_tree_digest,
+                )
+                else ""
             )
             if test_checkpoint:
                 logger.info("Test authoring gate already passed — skipping")
                 test_result = ImplementationResult.model_validate_json(test_checkpoint)
             else:
+                test_authoring_tree_digest_before = post_dag_gate_tree_digest
                 test_result = await runner.run(
                     Ask(
                         actor=_make_parallel_actor(
@@ -2147,11 +10771,6 @@ class ImplementationPhase(Phase):
                     phase_name=self.name,
                 )
                 await runner.artifacts.put("test-authoring", to_str(test_result), feature=feature)
-                await runner.artifacts.put(
-                    "dag-gate:test-authoring",
-                    test_result.model_dump_json(),
-                    feature=feature,
-                )
                 await _commit_repos(
                     runner,
                     feature,
@@ -2159,9 +10778,36 @@ class ImplementationPhase(Phase):
                     failure_key="dag-commit-failure:test-authoring:commit",
                     failure_metadata={"stage": "test-authoring"},
                 )
+                post_dag_gate_tree_digest = await _current_post_dag_gate_tree_digest(
+                    runner,
+                    feature,
+                )
+                await runner.artifacts.put(
+                    "dag-gate:test-authoring",
+                    test_result.model_dump_json(),
+                    feature=feature,
+                )
+                await _record_post_dag_gate_proof(
+                    runner,
+                    feature,
+                    "test-authoring",
+                    post_dag_gate_tree_digest,
+                )
+                if post_dag_gate_tree_digest != test_authoring_tree_digest_before:
+                    logger.info(
+                        "Test authoring changed the post-DAG tree; restarting post-DAG "
+                        "gates so code-review/security proofs are regenerated."
+                    )
+                    cycle += 1
+                    continue
 
             # ── Step 5: Full QA (dynamic) ─────────────────────────────────
-            if await runner.artifacts.get("dag-gate:qa", feature=feature):
+            if await _post_dag_gate_is_fresh(
+                runner,
+                feature,
+                "qa",
+                post_dag_gate_tree_digest,
+            ):
                 logger.info("QA gate already passed — skipping")
                 qa_verdict = Verdict(approved=True, summary="Previously approved")
             else:
@@ -2200,8 +10846,21 @@ class ImplementationPhase(Phase):
 
             if _is_approved(qa_verdict):
                 await runner.artifacts.put("dag-gate:qa", "approved", feature=feature)
+                await _record_post_dag_gate_proof(
+                    runner,
+                    feature,
+                    "qa",
+                    post_dag_gate_tree_digest,
+                )
 
             if not _is_approved(qa_verdict):
+                await _quiesce_on_workflow_blocker_verdict(
+                    runner,
+                    feature,
+                    qa_verdict,
+                    phase_name=self.name,
+                    source="qa_engineer",
+                )
                 attempts = await _diagnose_and_fix(
                     runner, feature, qa_verdict, "qa_engineer",
                     _make_parallel_actor(qa_engineer, "recheck", runtime=gate_runtime),
@@ -2212,12 +10871,23 @@ class ImplementationPhase(Phase):
                     rca_runtime=diagnostic_runtime,
                 )
                 prior_attempts.extend(attempts)
-                await _store_attempts(runner, feature, prior_attempts)
+                await _store_attempts_or_quiesce_on_workflow_blocker(
+                    runner,
+                    feature,
+                    prior_attempts,
+                    phase_name=self.name,
+                    source="qa_engineer",
+                )
                 cycle += 1
                 continue
 
             # ── Step 6: Integration Test (dynamic) ────────────────────────
-            if await runner.artifacts.get("dag-gate:integration", feature=feature):
+            if await _post_dag_gate_is_fresh(
+                runner,
+                feature,
+                "integration",
+                post_dag_gate_tree_digest,
+            ):
                 logger.info("Integration gate already passed — skipping")
                 integration_verdict = Verdict(approved=True, summary="Previously approved")
             else:
@@ -2260,8 +10930,21 @@ class ImplementationPhase(Phase):
                 await runner.artifacts.put(
                     "dag-gate:integration", "approved", feature=feature
                 )
+                await _record_post_dag_gate_proof(
+                    runner,
+                    feature,
+                    "integration",
+                    post_dag_gate_tree_digest,
+                )
 
             if not _is_approved(integration_verdict):
+                await _quiesce_on_workflow_blocker_verdict(
+                    runner,
+                    feature,
+                    integration_verdict,
+                    phase_name=self.name,
+                    source="integration_tester",
+                )
                 attempts = await _diagnose_and_fix(
                     runner, feature, integration_verdict, "integration_tester",
                     _make_parallel_actor(integration_tester, "recheck", runtime=gate_runtime),
@@ -2272,12 +10955,23 @@ class ImplementationPhase(Phase):
                     rca_runtime=diagnostic_runtime,
                 )
                 prior_attempts.extend(attempts)
-                await _store_attempts(runner, feature, prior_attempts)
+                await _store_attempts_or_quiesce_on_workflow_blocker(
+                    runner,
+                    feature,
+                    prior_attempts,
+                    phase_name=self.name,
+                    source="integration_tester",
+                )
                 cycle += 1
                 continue
 
             # ── Step 7: Verifier — confirm all journeys work ─────────────
-            if await runner.artifacts.get("dag-gate:verifier", feature=feature):
+            if await _post_dag_gate_is_fresh(
+                runner,
+                feature,
+                "verifier",
+                post_dag_gate_tree_digest,
+            ):
                 logger.info("Verifier gate already passed — skipping")
                 verifier_verdict = Verdict(approved=True, summary="Previously approved")
             else:
@@ -2331,8 +11025,21 @@ class ImplementationPhase(Phase):
                 await runner.artifacts.put(
                     "dag-gate:verifier", "approved", feature=feature
                 )
+                await _record_post_dag_gate_proof(
+                    runner,
+                    feature,
+                    "verifier",
+                    post_dag_gate_tree_digest,
+                )
 
             if not _is_approved(verifier_verdict):
+                await _quiesce_on_workflow_blocker_verdict(
+                    runner,
+                    feature,
+                    verifier_verdict,
+                    phase_name=self.name,
+                    source="verifier",
+                )
                 attempts = await _diagnose_and_fix(
                     runner, feature, verifier_verdict, "verifier",
                     _make_parallel_actor(verifier, "recheck", runtime=gate_runtime),
@@ -2343,90 +11050,181 @@ class ImplementationPhase(Phase):
                     rca_runtime=diagnostic_runtime,
                 )
                 prior_attempts.extend(attempts)
-                await _store_attempts(runner, feature, prior_attempts)
+                await _store_attempts_or_quiesce_on_workflow_blocker(
+                    runner,
+                    feature,
+                    prior_attempts,
+                    phase_name=self.name,
+                    source="verifier",
+                )
                 cycle += 1
                 continue
 
             # ── Push clones back to source repos ───────────────────────
-            await _push_clones_to_source(runner, feature)
+            if await _post_dag_gate_is_fresh(
+                runner,
+                feature,
+                "source-push",
+                post_dag_gate_tree_digest,
+            ):
+                logger.info("Source push gate already passed — skipping")
+            else:
+                source_push_tree_digest = post_dag_gate_tree_digest
+                try:
+                    await _push_clones_to_source(
+                        runner,
+                        feature,
+                        tree_digest=source_push_tree_digest,
+                    )
+                except Exception as exc:
+                    blocker = await _record_source_push_workflow_blocker(
+                        runner,
+                        feature,
+                        reason=f"{type(exc).__name__}: {exc}",
+                        tree_digest_before=source_push_tree_digest,
+                        failure_type="source_push_failed",
+                    )
+                    raise WorkflowQuiesced(
+                        phase_name=self.name,
+                        reason=blocker,
+                        metadata={
+                            "terminal_state": "workflow_blocked",
+                            "deterministic_workflow_blocker": True,
+                            "operator_required": False,
+                            "source": "source-push",
+                            "failure_class": "runtime_context",
+                            "failure_type": "source_push_failed",
+                            "route": "quiesce_workflow",
+                        },
+                    ) from exc
+                post_push_tree_digest = await _current_post_dag_gate_tree_digest(
+                    runner,
+                    feature,
+                )
+                if post_push_tree_digest != source_push_tree_digest:
+                    blocker = await _record_source_push_workflow_blocker(
+                        runner,
+                        feature,
+                        reason="source push changed the post-DAG tree digest",
+                        tree_digest_before=source_push_tree_digest,
+                        tree_digest_after=post_push_tree_digest,
+                        failure_type="source_push_stale_gate_digest",
+                    )
+                    raise WorkflowQuiesced(
+                        phase_name=self.name,
+                        reason=blocker,
+                        metadata={
+                            "terminal_state": "workflow_blocked",
+                            "deterministic_workflow_blocker": True,
+                            "operator_required": False,
+                            "source": "source-push",
+                            "failure_class": "runtime_context",
+                            "failure_type": "source_push_stale_gate_digest",
+                            "route": "quiesce_workflow",
+                        },
+                    )
+                await runner.artifacts.put(
+                    "dag-gate:source-push", "approved", feature=feature
+                )
+                await _record_post_dag_gate_proof(
+                    runner,
+                    feature,
+                    "source-push",
+                    post_dag_gate_tree_digest,
+                )
 
             # ── Step 8: Implementation Report ────────────────────────────
-            from ....services.implementation_report import (
-                render_implementation_report,
-                validate_report,
-            )
-
-            # Collect artifact URLs from hosting service
-            artifact_urls = _collect_artifact_urls(runner)
-
-            # Collect any Playwright screenshots from the workspace
-            screenshot_paths = _collect_screenshots(feature, runner)
-
-            all_verdicts = {
-                "qa": qa_verdict,
-                "integration": integration_verdict,
-                "code_review": review_verdict,
-                "security": security_verdict,
-                "verifier": verifier_verdict,
-            }
-
-            report_html = render_implementation_report(
-                feature_name=feature.name,
-                handover=handover,
-                verdicts=all_verdicts,
-                bug_fix_attempts=prior_attempts,
-                test_result=test_result,
-                artifact_urls=artifact_urls,
-                screenshot_paths=screenshot_paths,
-            )
-
-            # Validate the report
-            validation_errors = validate_report(report_html, handover, all_verdicts)
-            if validation_errors:
-                logger.warning(
-                    "Report validation: %d issues: %s",
-                    len(validation_errors),
-                    "; ".join(validation_errors[:5]),
-                )
-
-            # Host the report
             report_url = ""
-            hosting = runner.services.get("hosting")
-            if hosting:
-                report_url = await hosting.push_qa(
-                    feature.id, "implementation-report",
-                    report_html, "Implementation Report",
-                )
-                logger.info("Implementation report hosted at %s", report_url)
-
-            # Store as artifact
-            await runner.artifacts.put(
-                "implementation-report", report_html, feature=feature
-            )
-
-            # Host enhancement backlog as separate artifact
             backlog_url = ""
-            backlog_json = await runner.artifacts.get(
-                "enhancement-backlog", feature=feature,
+            backlog = EnhancementBacklog()
+            existing_report_raw = await runner.artifacts.get(
+                "implementation-report", feature=feature
             )
-            if backlog_json:
-                try:
-                    backlog = EnhancementBacklog.model_validate_json(backlog_json)
-                except Exception:
-                    backlog = EnhancementBacklog()
-                if backlog.items:
-                    backlog_html = _render_enhancement_backlog_html(
-                        backlog, feature.name,
-                    )
-                    if hosting:
-                        backlog_url = await hosting.push_qa(
-                            feature.id, "enhancement-backlog",
-                            backlog_html, "Enhancement Backlog",
-                        )
+            existing_report_meta_raw = await runner.artifacts.get(
+                "implementation-report-metadata", feature=feature
+            )
+            report_gate_fresh = await _post_dag_gate_is_fresh(
+                runner,
+                feature,
+                "implementation-report",
+                post_dag_gate_tree_digest,
+            )
+            (
+                existing_report_url,
+                existing_backlog_url,
+                existing_backlog,
+                existing_report_tree_digest,
+                existing_report_body_sha256,
+                existing_report_publish_status,
+            ) = _load_implementation_report_metadata(existing_report_meta_raw)
+            existing_report_body_digest = (
+                hashlib.sha256(str(existing_report_raw).encode("utf-8")).hexdigest()
+                if existing_report_raw
+                else ""
+            )
+            report_metadata_matches_current_tree = (
+                bool(existing_report_raw)
+                and bool(existing_report_meta_raw)
+                and existing_report_tree_digest == post_dag_gate_tree_digest
+                and existing_report_publish_status == "complete"
+                and bool(existing_report_body_sha256)
+                and existing_report_body_sha256 == existing_report_body_digest
+            )
+            if report_gate_fresh or report_metadata_matches_current_tree:
+                logger.info("Implementation report gate already passed — skipping")
+                report_url = existing_report_url
+                backlog_url = existing_backlog_url
+                backlog = existing_backlog
+                if not report_gate_fresh:
                     await runner.artifacts.put(
-                        "enhancement-backlog-report", backlog_html,
-                        feature=feature,
+                        "dag-gate:implementation-report", "approved", feature=feature
                     )
+                    await _record_post_dag_gate_proof(
+                        runner,
+                        feature,
+                        "implementation-report",
+                        post_dag_gate_tree_digest,
+                    )
+            else:
+                all_verdicts = {
+                    "qa": qa_verdict,
+                    "integration": integration_verdict,
+                    "code_review": review_verdict,
+                    "security": security_verdict,
+                    "verifier": verifier_verdict,
+                }
+                try:
+                    report_url, backlog_url, backlog = (
+                        await _generate_and_publish_implementation_report(
+                            runner,
+                            feature,
+                            tree_digest=post_dag_gate_tree_digest,
+                            handover=handover,
+                            verdicts=all_verdicts,
+                            prior_attempts=prior_attempts,
+                            test_result=test_result,
+                        )
+                    )
+                except Exception as exc:
+                    blocker = await _record_implementation_report_workflow_blocker(
+                        runner,
+                        feature,
+                        reason=f"{type(exc).__name__}: {exc}",
+                        tree_digest=post_dag_gate_tree_digest,
+                    )
+                    raise WorkflowQuiesced(
+                        phase_name=self.name,
+                        reason=blocker,
+                        metadata={
+                            "terminal_state": "workflow_blocked",
+                            "deterministic_workflow_blocker": True,
+                            "operator_required": False,
+                            "source": "implementation-report",
+                            "failure_class": "runtime_context",
+                            "failure_type": "implementation_report_failed",
+                            "route": "quiesce_workflow",
+                        },
+                    ) from exc
 
             # Notify user via Slack with report link
             notification = "All quality gates passed. Implementation complete."
@@ -2442,17 +11240,123 @@ class ImplementationPhase(Phase):
                     f"\n\n**[View Enhancement Backlog]({backlog_url})** "
                     f"({len(backlog.items)} items deferred)"
                 )
-            await runner.run(
-                Notify(message=notification),
+            if await _post_dag_gate_is_fresh(
+                runner,
                 feature,
-                phase_name=self.name,
-            )
+                "notify",
+                post_dag_gate_tree_digest,
+            ):
+                logger.info("Notify gate already passed — skipping")
+            else:
+                delivery_id = _notify_delivery_id(
+                    feature,
+                    post_dag_gate_tree_digest,
+                    notification,
+                )
+                existing_delivery = _json_object_from_text(
+                    await runner.artifacts.get("dag-notify-delivery", feature=feature)
+                )
+                delivery_matches = (
+                    existing_delivery.get("delivery_id") == delivery_id
+                    and existing_delivery.get("tree_digest") == post_dag_gate_tree_digest
+                )
+                if delivery_matches and existing_delivery.get("status") == "sent":
+                    logger.info("Notify delivery already marked sent — recording gate proof")
+                    notify_gate_extra = _notify_gate_proof_extra_from_delivery(
+                        existing_delivery
+                    )
+                elif delivery_matches and existing_delivery.get("status") == "pending":
+                    blocker = await _record_notify_workflow_blocker(
+                        runner,
+                        feature,
+                        reason=(
+                            "previous notify delivery is pending; external Slack "
+                            "send outcome cannot be proven after restart"
+                        ),
+                        tree_digest=post_dag_gate_tree_digest,
+                        delivery_id=delivery_id,
+                    )
+                    raise WorkflowQuiesced(
+                        phase_name=self.name,
+                        reason=blocker,
+                        metadata={
+                            "terminal_state": "workflow_blocked",
+                            "deterministic_workflow_blocker": True,
+                            "operator_required": False,
+                            "source": "notify",
+                            "failure_class": "runtime_context",
+                            "failure_type": "notify_delivery_ambiguous",
+                            "route": "quiesce_workflow",
+                        },
+                    )
+                else:
+                    await _put_notify_delivery_record(
+                        runner,
+                        feature,
+                        delivery_id=delivery_id,
+                        tree_digest=post_dag_gate_tree_digest,
+                        notification=notification,
+                        status="pending",
+                    )
+                    try:
+                        await runner.run(
+                            Notify(message=notification, delivery_id=delivery_id),
+                            feature,
+                            phase_name=self.name,
+                        )
+                    except Exception as exc:
+                        blocker = await _record_notify_workflow_blocker(
+                            runner,
+                            feature,
+                            reason=f"{type(exc).__name__}: {exc}",
+                            tree_digest=post_dag_gate_tree_digest,
+                            delivery_id=delivery_id,
+                            failure_type="notify_delivery_failed",
+                        )
+                        raise WorkflowQuiesced(
+                            phase_name=self.name,
+                            reason=blocker,
+                            metadata={
+                                "terminal_state": "workflow_blocked",
+                                "deterministic_workflow_blocker": True,
+                                "operator_required": False,
+                                "source": "notify",
+                                "failure_class": "runtime_context",
+                                "failure_type": "notify_delivery_failed",
+                                "route": "quiesce_workflow",
+                            },
+                        ) from exc
+                    await _put_notify_delivery_record(
+                        runner,
+                        feature,
+                        delivery_id=delivery_id,
+                        tree_digest=post_dag_gate_tree_digest,
+                        notification=notification,
+                        status="sent",
+                    )
+                    notify_gate_extra = {
+                        "delivery_id": delivery_id,
+                        "notification_sha256": hashlib.sha256(
+                            notification.encode("utf-8")
+                        ).hexdigest(),
+                    }
+                await runner.artifacts.put("dag-gate:notify", "approved", feature=feature)
+                await _record_post_dag_gate_proof(
+                    runner,
+                    feature,
+                    "notify",
+                    post_dag_gate_tree_digest,
+                    extra=notify_gate_extra,
+                )
 
             return state
 
 
 async def _push_clones_to_source(
-    runner: WorkflowRunner, feature: Feature,
+    runner: WorkflowRunner,
+    feature: Feature,
+    *,
+    tree_digest: str = "",
 ) -> None:
     """Push commits from all cloned repos back to their source repos.
 
@@ -2461,44 +11365,447 @@ async def _push_clones_to_source(
     """
     workspace_mgr = runner.services.get("workspace_manager")
     if not workspace_mgr:
-        return
+        raise RuntimeError("source push requires workspace_manager service")
 
     feature_root = _get_feature_root(runner, feature)
     if not feature_root:
-        return
+        raise RuntimeError("source push requires a resolvable feature root")
 
-    await _push_clones_to_source_root(feature_root)
+    expected_origins, optional_noop_repos, allowed_origin_root = (
+        await _source_push_expected_origins(runner, feature, feature_root)
+    )
+    prior_proof = _source_push_proof_payload(
+        await runner.artifacts.get(_source_push_proof_key(), feature=feature)
+    )
+
+    async def _persist(payload: dict[str, Any]) -> None:
+        await runner.artifacts.put(
+            _source_push_proof_key(),
+            json.dumps(payload, sort_keys=True),
+            feature=feature,
+        )
+
+    await _push_clones_to_source_root(
+        feature_root,
+        tree_digest=tree_digest,
+        expected_origins=expected_origins,
+        optional_noop_repos=optional_noop_repos,
+        allowed_origin_root=allowed_origin_root,
+        prior_proof=prior_proof,
+        proof_callback=_persist,
+    )
 
 
-async def _push_clones_to_source_root(repos_root: Path) -> None:
+def _parse_ls_remote_head(output: str) -> str:
+    for line in str(output or "").splitlines():
+        parts = line.strip().split()
+        if len(parts) >= 2:
+            return parts[0]
+    return ""
+
+
+def _direct_source_push_repos(
+    repos_root: Path,
+    *,
+    authorized_repos: set[str] | None = None,
+    authorized_source_roots: dict[str, str] | None = None,
+) -> tuple[list[Path], list[str]]:
+    failures: list[str] = []
+    repo_dirs: list[Path] = []
+    root = repos_root.resolve()
+    guard_problems = _workflow_repos_root_guard_problems(
+        repos_root,
+        authorized_source_roots=authorized_source_roots,
+    )
+    if guard_problems:
+        return [], [
+            f"{problem.get('path', repos_root)}: {problem.get('reason', 'unsafe source push root')}"
+            for problem in guard_problems
+        ]
+    try:
+        git_dirs = sorted(repos_root.rglob(".git"), key=lambda path: path.as_posix())
+    except Exception as exc:
+        return [], [f"{repos_root}: unable to list repos root: {exc}"]
+    candidates: list[Path] = []
+    allowed_metadata_roots = _git_worktree_metadata_roots_for_repos_root(repos_root)
+    for git_dir in git_dirs:
+        try:
+            rel_git = git_dir.relative_to(repos_root).as_posix()
+        except ValueError:
+            rel_git = str(git_dir)
+        if git_dir.is_symlink():
+            failures.append(f"{rel_git}: .git must not be a symlink for source push")
+            continue
+        try:
+            resolved = git_dir.resolve()
+            resolved.relative_to(root)
+        except Exception:
+            failures.append(f"{git_dir}: repo path escapes source push root")
+            continue
+        repo_dir = git_dir.parent
+        try:
+            rel = repo_dir.relative_to(repos_root).as_posix()
+        except ValueError:
+            rel = str(repo_dir)
+        if authorized_repos is None and "/" in rel:
+            failures.append(
+                f"{rel}/.git: nested or stray git repository is not authorized "
+                "without workspace registry authority"
+            )
+            continue
+        if authorized_repos is not None and rel not in authorized_repos:
+            failures.append(
+                f"{rel}/.git: git repository is not registered in canonical "
+                "workspace authority"
+            )
+            continue
+        if repo_dir == repos_root:
+            failures.append(".git: nested or stray git repository is not authorized")
+            continue
+        if git_dir.exists() and (
+            git_dir.is_dir()
+            or _is_git_worktree_file(
+                git_dir,
+                allowed_metadata_roots=allowed_metadata_roots,
+                allowed_external_metadata_roots=_git_worktree_external_metadata_roots(
+                    authorized_source_roots,
+                    repo_rel=rel,
+                ),
+            )
+        ):
+            path_cursor = repo_dir
+            symlink_component: Path | None = None
+            while True:
+                if path_cursor.exists() and path_cursor.is_symlink():
+                    symlink_component = path_cursor
+                    break
+                if path_cursor == repos_root or path_cursor == path_cursor.parent:
+                    break
+                path_cursor = path_cursor.parent
+            if symlink_component is not None:
+                failures.append(f"{rel}: repo path component must not be a symlink")
+                continue
+            candidates.append(repo_dir)
+        elif git_dir.exists():
+            failures.append(f"{rel}: .git must be a directory for source push")
+    candidate_resolved = {repo.resolve(strict=False): repo for repo in candidates}
+    for repo_dir in candidates:
+        try:
+            rel = repo_dir.relative_to(repos_root).as_posix()
+        except Exception:
+            rel = str(repo_dir)
+        parent = repo_dir.parent.resolve(strict=False)
+        nested_under_repo = False
+        while True:
+            if parent in candidate_resolved:
+                nested_under_repo = True
+                break
+            if parent == root or parent == parent.parent:
+                break
+            parent = parent.parent
+        if nested_under_repo:
+            failures.append(f"{rel}/.git: nested or stray git repository is not authorized")
+            continue
+        repo_dirs.append(repo_dir)
+    return repo_dirs, failures
+
+
+async def _push_clones_to_source_root(
+    repos_root: Path,
+    *,
+    tree_digest: str = "",
+    expected_origins: dict[str, str] | None = None,
+    optional_noop_repos: set[str] | None = None,
+    allowed_origin_root: Path | None = None,
+    prior_proof: dict[str, Any] | None = None,
+    proof_callback: Callable[[dict[str, Any]], Any] | None = None,
+) -> dict[str, Any]:
     """Push commits from all repo clones rooted under *repos_root*."""
     if not repos_root.exists():
-        return
+        raise RuntimeError(f"source push repos root does not exist: {repos_root}")
 
-    for git_dir in repos_root.rglob(".git"):
-        if not git_dir.is_dir():
-            continue  # Skip worktree .git files (shouldn't exist with clones)
-        repo_dir = git_dir.parent
-        if repo_dir == repos_root:
-            continue
-
+    failures: list[str] = []
+    skipped_count = 0
+    authorized_repos = set(expected_origins) if expected_origins is not None else None
+    repo_dirs, discovery_failures = _direct_source_push_repos(
+        repos_root,
+        authorized_repos=authorized_repos,
+        authorized_source_roots=expected_origins,
+    )
+    failures.extend(discovery_failures)
+    if failures:
+        raise RuntimeError(
+            "failed to push cloned repos to source: " + "; ".join(failures)
+        )
+    if expected_origins is None and allowed_origin_root is None:
+        raise RuntimeError(
+            "failed to push cloned repos to source: "
+            "source push requires canonical source authority"
+        )
+    proof = _source_push_base_proof(
+        prior_proof,
+        repos_root=repos_root,
+        tree_digest=tree_digest,
+        expected_origins=expected_origins,
+    )
+    proof_repos = proof["repos"]
+    optional_noop_repos = set(optional_noop_repos or set())
+    ready_records: list[tuple[str, dict[str, Any]]] = []
+    mutation_plans: list[dict[str, Any]] = []
+    for repo_dir in repo_dirs:
+        rel = repo_dir.relative_to(repos_root).as_posix()
         try:
             branch = await _run_git(repo_dir, "branch", "--show-current")
             if not branch:
+                skipped_count += 1
+                failures.append(f"{rel}: no current branch")
                 continue
             # Check if there are commits to push
             status = await _run_git(repo_dir, "status", "--porcelain")
             if status:
-                # Uncommitted changes — commit them first
-                await _run_git(repo_dir, "add", "-A")
-                await _run_git(repo_dir, "commit", "-m", "feat: final uncommitted changes")
+                skipped_count += 1
+                failures.append(
+                    f"{rel}: dirty worktree before source push"
+                )
+                continue
 
-            await _run_git(repo_dir, "push", "origin", branch)
-            rel = repo_dir.relative_to(repos_root)
-            logger.info("Pushed %s (branch: %s) to source", rel, branch)
+            local_head = await _run_git(repo_dir, "rev-parse", "HEAD")
+            if not local_head:
+                skipped_count += 1
+                failures.append(f"{rel}: missing local HEAD")
+                continue
+            actual_origin = ""
+            push_target = "origin"
+            if expected_origins is not None:
+                expected_origin = str(expected_origins.get(rel) or "")
+                if not expected_origin:
+                    skipped_count += 1
+                    failures.append(f"{rel}: missing canonical source origin authority")
+                    continue
+                actual_origin = await _run_git(repo_dir, "remote", "get-url", "origin")
+                if not _source_push_origin_matches(
+                    actual_origin,
+                    expected_origin,
+                    repo_dir=repo_dir,
+                ):
+                    skipped_count += 1
+                    failures.append(
+                        f"{rel}: origin does not match canonical source authority"
+                    )
+                    continue
+                if not _source_push_expected_origin_within_root(
+                    expected_origin,
+                    allowed_origin_root=allowed_origin_root,
+                    repos_root=repos_root,
+                    repo_dir=repo_dir,
+                ):
+                    skipped_count += 1
+                    failures.append(
+                        f"{rel}: origin is not under canonical workspace source root"
+                    )
+                    continue
+                origin_metadata_problem = _source_push_origin_git_metadata_problem(
+                    actual_origin,
+                    allowed_origin_root=allowed_origin_root,
+                    repos_root=repos_root,
+                    repo_dir=repo_dir,
+                )
+                if origin_metadata_problem:
+                    skipped_count += 1
+                    failures.append(f"{rel}: {origin_metadata_problem}")
+                    continue
+                push_target, push_problem = await _source_push_authorized_push_target(
+                    repo_dir,
+                    actual_origin=actual_origin,
+                    expected_origin=expected_origin,
+                    allowed_origin_root=allowed_origin_root,
+                    repos_root=repos_root,
+                )
+                if push_problem:
+                    skipped_count += 1
+                    failures.append(f"{rel}: {push_problem}")
+                    continue
+            else:
+                expected_origin = ""
+                if allowed_origin_root is not None:
+                    actual_origin = await _run_git(repo_dir, "remote", "get-url", "origin")
+                    if not _source_push_origin_within_root(
+                        actual_origin,
+                        allowed_origin_root=allowed_origin_root,
+                        repos_root=repos_root,
+                        repo_dir=repo_dir,
+                    ):
+                        skipped_count += 1
+                        failures.append(
+                            f"{rel}: origin is not under canonical workspace source root"
+                        )
+                        continue
+                    origin_metadata_problem = _source_push_origin_git_metadata_problem(
+                        actual_origin,
+                        allowed_origin_root=allowed_origin_root,
+                        repos_root=repos_root,
+                        repo_dir=repo_dir,
+                    )
+                    if origin_metadata_problem:
+                        skipped_count += 1
+                        failures.append(f"{rel}: {origin_metadata_problem}")
+                        continue
+                    push_target, push_problem = await _source_push_authorized_push_target(
+                        repo_dir,
+                        actual_origin=actual_origin,
+                        expected_origin=expected_origin,
+                        allowed_origin_root=allowed_origin_root,
+                        repos_root=repos_root,
+                    )
+                    if push_problem:
+                        skipped_count += 1
+                        failures.append(f"{rel}: {push_problem}")
+                        continue
+                else:
+                    actual_origin = ""
+            remote_ref = f"refs/heads/{branch}"
+            remote_before = _parse_ls_remote_head(
+                await _run_git(repo_dir, "ls-remote", push_target, remote_ref)
+            )
+            if remote_before == local_head:
+                prior_record = proof_repos.get(rel)
+                if _source_push_prior_proof_matches(
+                    prior_record,
+                    repo=rel,
+                    tree_digest=tree_digest,
+                    branch=branch,
+                    local_head=local_head,
+                    remote_ref=remote_ref,
+                    expected_origin=expected_origin,
+                    actual_origin=actual_origin,
+                ):
+                    ready_records.append((rel, {
+                        **prior_record,
+                        "status": "recovered",
+                        "remote_after": local_head,
+                        "recovered_from_remote_head": True,
+                    }))
+                    continue
+                if rel in optional_noop_repos:
+                    ready_records.append((rel, {
+                        "status": "unchanged",
+                        "tree_digest": tree_digest,
+                        "repo": rel,
+                        "branch": branch,
+                        "local_head": local_head,
+                        "remote_ref": remote_ref,
+                        "remote_before": remote_before,
+                        "remote_after": remote_before,
+                        "expected_origin": expected_origin,
+                        "actual_origin": actual_origin,
+                        "push_target": push_target,
+                        "mutation_required": False,
+                    }))
+                    continue
+                skipped_count += 1
+                failures.append(
+                    f"{rel}: remote already at local HEAD; "
+                    "source push produced no mutation proof"
+                )
+                continue
+            if rel in optional_noop_repos:
+                skipped_count += 1
+                failures.append(
+                    f"{rel}: read-only source push proof requires unchanged "
+                    "remote HEAD; refusing to push optional-noop repo"
+                )
+                continue
+            mutation_plans.append({
+                "repo_dir": repo_dir,
+                "rel": rel,
+                "branch": branch,
+                "local_head": local_head,
+                "remote_ref": remote_ref,
+                "remote_before": remote_before,
+                "expected_origin": expected_origin,
+                "actual_origin": actual_origin,
+                "push_target": push_target,
+            })
         except Exception as e:
-            rel = repo_dir.relative_to(repos_root)
             logger.warning("Failed to push %s: %s", rel, e)
+            failures.append(f"{rel}: {e}")
+    if failures:
+        raise RuntimeError(
+            "failed to push cloned repos to source: " + "; ".join(failures)
+        )
+
+    pushed_count = 0
+    for rel, record in ready_records:
+        proof_repos[rel] = record
+        await _persist_source_push_proof(proof_callback, proof)
+        pushed_count += 1
+        if record.get("status") == "recovered":
+            logger.info(
+                "Recovered prior source push proof for %s (branch: %s)",
+                rel,
+                record.get("branch"),
+            )
+        else:
+            logger.info("Source push skipped unchanged read-only repo %s", rel)
+
+    for plan in mutation_plans:
+        rel = str(plan["rel"])
+        branch = str(plan["branch"])
+        local_head = str(plan["local_head"])
+        remote_ref = str(plan["remote_ref"])
+        push_target = str(plan["push_target"])
+        repo_dir = Path(plan["repo_dir"])
+        proof_repos[rel] = {
+            "status": "intent",
+            "tree_digest": tree_digest,
+            "repo": rel,
+            "branch": branch,
+            "local_head": local_head,
+            "remote_ref": remote_ref,
+            "remote_before": str(plan["remote_before"]),
+            "remote_after": "",
+            "expected_origin": str(plan["expected_origin"]),
+            "actual_origin": str(plan["actual_origin"]),
+            "push_target": push_target,
+        }
+        await _persist_source_push_proof(proof_callback, proof)
+        try:
+            if push_target == "origin":
+                await _run_git(repo_dir, "push", "origin", branch)
+            else:
+                await _run_git(repo_dir, "push", push_target, f"HEAD:{remote_ref}")
+            remote_after = _parse_ls_remote_head(
+                await _run_git(repo_dir, "ls-remote", push_target, remote_ref)
+            )
+        except Exception as e:
+            logger.warning("Failed to push %s: %s", rel, e)
+            failures.append(f"{rel}: {e}")
+            continue
+        if remote_after != local_head:
+            skipped_count += 1
+            failures.append(
+                f"{rel}: remote HEAD proof mismatch "
+                f"after push ({remote_after or '<missing>'} != {local_head})"
+            )
+            continue
+        proof_repos[rel] = {
+            **proof_repos[rel],
+            "status": "pushed",
+            "remote_after": remote_after,
+        }
+        await _persist_source_push_proof(proof_callback, proof)
+        pushed_count += 1
+        logger.info("Pushed %s (branch: %s) to source", rel, branch)
+    if failures:
+        raise RuntimeError(
+            "failed to push cloned repos to source: " + "; ".join(failures)
+        )
+    if pushed_count == 0:
+        reason = "no cloned git repos found"
+        if skipped_count:
+            reason = "no pushable cloned git repos found"
+        raise RuntimeError(f"source push produced no push proof: {reason}")
+    return _finalize_source_push_proof(proof)
 
 
 # ── DAG execution ────────────────────────────────────────────────────────────
@@ -2534,6 +11841,8 @@ def _build_task_prompt(
     *,
     repo_prefix: str = "",
     context_dir: Path | None = None,
+    context_rel_dir: str | None = None,
+    contract: Any | None = None,
 ) -> str:
     """Construct a rich prompt from an ImplementationTask's structured fields.
 
@@ -2559,8 +11868,14 @@ def _build_task_prompt(
             "Your cwd is the root of the repository you're working in."
         )
 
+    contract_block = _task_contract_prompt_block(contract)
+    if contract_block:
+        parts.append(contract_block)
+
     # ── File Scope ────────────────────────────────────────────────────
-    if task.file_scope:
+    if contract_block:
+        pass
+    elif task.file_scope:
         lines = []
         for fs in task.file_scope:
             path = fs.path
@@ -2620,11 +11935,12 @@ def _build_task_prompt(
 
         if context_dir is not None:
             refs_path = context_dir / "refs.md"
-            refs_path.write_text(
+            _write_context_text(
+                refs_path,
                 f"# Reference Material — {task.name}\n\n{ref_content}",
-                encoding="utf-8",
             )
-            rel_path = f".iriai-context/{task.id}/refs.md"
+            rel_dir = (context_rel_dir or f".iriai-context/{task.id}").strip("/")
+            rel_path = f"{rel_dir}/refs.md"
             parts.append(
                 f"## Reference Material\n"
                 f"Reference material for this task is in `{rel_path}`.\n"
@@ -2647,6 +11963,1576 @@ def _build_task_prompt(
     return "\n\n".join(parts)
 
 
+def _prompt_context_segment_for_task(task_id: str) -> str:
+    raw = str(task_id or "").strip() or "task"
+    if re.fullmatch(r"[A-Za-z0-9_-]+", raw):
+        return raw
+    stem = re.sub(r"[^A-Za-z0-9_-]+", "-", raw).strip("-")[:48] or "task"
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12]
+    return f"{stem}-{digest}"
+
+
+def _build_task_prompt_with_optional_sandbox_context(
+    task: ImplementationTask,
+    *,
+    repo_prefix: str,
+    task_contract: Any | None,
+    handover_context: str,
+    inline_prompt: str,
+    context_base: Path | None,
+    log_label: str,
+    context_read_base: Path | None = None,
+) -> str:
+    if len(inline_prompt) <= PROMPT_FILE_THRESHOLD or context_base is None:
+        return inline_prompt
+
+    context_segment = _prompt_context_segment_for_task(task.id)
+    context_dir = _sandbox_prompt_context_dir(
+        context_base,
+        task_id=task.id,
+        context_segment=context_segment,
+    )
+    read_base = context_read_base or context_base
+    try:
+        context_rel_dir = Path(
+            os.path.relpath(context_dir, start=read_base)
+        ).as_posix()
+    except ValueError:
+        context_rel_dir = str(context_dir)
+    context_dir.mkdir(parents=True, exist_ok=True)
+    _exclude_sandbox_prompt_context_from_capture(
+        context_base,
+        context_segment=context_segment,
+    )
+
+    task_prompt = _build_task_prompt(
+        task,
+        repo_prefix=repo_prefix,
+        context_dir=context_dir,
+        context_rel_dir=context_rel_dir,
+        contract=task_contract,
+    )
+    if handover_context:
+        handover_path = context_dir / "handover.md"
+        _write_context_text(handover_path, handover_context.lstrip())
+        rel_handover = f"{context_rel_dir}/handover.md"
+        task_prompt += (
+            f"\n\n## Handover — Prior Work\n"
+            f"Prior work context is in `{rel_handover}`.\n"
+            f"**Read that file to understand what has been completed.**"
+        )
+    else:
+        task_prompt += handover_context
+
+    logger.info(
+        "%s: prompt side files written in sandbox context (%d → %d chars)",
+        log_label,
+        len(inline_prompt),
+        len(task_prompt),
+    )
+    return task_prompt
+
+
+# `_dag_verify_stage_from_projection_key`, `_dag_verify_graph_artifact_key`,
+# `_pydantic_json`, `_synthetic_verification_verdict_id` are shimmed from
+# `..execution.verification` (Slice 11g -- see the Slice-11g shim re-export
+# block at the head of this module).
+
+
+def _dag_verify_required_lens_slugs() -> list[str]:
+    if not _dag_expanded_verify_enabled():
+        return []
+    return [spec.slug for spec in _dag_verify_lens_specs()]
+
+
+def _dag_verify_read_budget_for_projection(
+    projection_key: str,
+    verdict: object,
+    *,
+    tasks: list[ImplementationTask] | None = None,
+    results: list[object] | None = None,
+    contracts_by_task_id: dict[str, Any] | None = None,
+    workspace_snapshots: list[Any] | None = None,
+) -> Any:
+    if VerifyReadBudgetReport is None:
+        return None
+    bounded_queries = []
+    if VerifyBoundedQuery is not None:
+        bounded_queries.append(
+            VerifyBoundedQuery(
+                source="artifact",
+                lookup_kind="exact_key",
+                ids=[projection_key],
+                limit=1,
+                deterministic_order="projection_key",
+            )
+        )
+        for result in results or []:
+            if not isinstance(result, ImplementationResult):
+                continue
+            bounded_queries.append(
+                VerifyBoundedQuery(
+                    source="artifact",
+                    lookup_kind="id",
+                    ids=[f"task-result:{result.task_id}"],
+                    limit=1,
+                    deterministic_order="task_id",
+                )
+            )
+        for task in tasks or []:
+            bounded_queries.append(
+                VerifyBoundedQuery(
+                    source="artifact",
+                    lookup_kind="id",
+                    ids=[f"task-spec:{task.id}"],
+                    limit=1,
+                    deterministic_order="task_id",
+                )
+            )
+        for task_id, contract in sorted((contracts_by_task_id or {}).items()):
+            ref = _dag_verify_graph_ref(contract)
+            bounded_queries.append(
+                VerifyBoundedQuery(
+                    source="contract",
+                    lookup_kind="id",
+                    ids=[ref.get("id") or ref.get("contract_id") or str(task_id)],
+                    limit=1,
+                    deterministic_order="task_id",
+                )
+            )
+        for index, snapshot in enumerate(workspace_snapshots or []):
+            ref = _dag_verify_graph_ref(snapshot)
+            bounded_queries.append(
+                VerifyBoundedQuery(
+                    source="snapshot",
+                    lookup_kind="id",
+                    ids=[ref.get("id") or ref.get("snapshot_id") or f"snapshot:{index}"],
+                    limit=1,
+                    deterministic_order="snapshot_id",
+                )
+            )
+    aggregate_bytes = len(
+        _dag_verify_graph_digest(
+            {
+                "projection_key": projection_key,
+                "tasks": [task.id for task in tasks or []],
+                "results": [
+                    result.task_id
+                    for result in results or []
+                    if isinstance(result, ImplementationResult)
+                ],
+                "contracts": sorted((contracts_by_task_id or {}).keys()),
+                "workspace_snapshots": len(workspace_snapshots or []),
+            }
+        ).encode("utf-8")
+    )
+    return VerifyReadBudgetReport(
+        bounded_queries=bounded_queries,
+        artifact_count=1,
+        event_count=0,
+        file_count=0,
+        aggregate_bytes=aggregate_bytes,
+    )
+
+
+async def _get_artifact_text(
+    runner: WorkflowRunner,
+    feature: Feature,
+    key: str,
+) -> str:
+    get = getattr(getattr(runner, "artifacts", None), "get", None)
+    if not callable(get):
+        return ""
+    try:
+        return str(await get(key, feature=feature) or "")
+    except Exception:
+        logger.debug(
+            "Unable to read artifact %s while checking verification graph",
+            key,
+            exc_info=True,
+        )
+        return ""
+
+
+# `_dag_verify_graph_payload_covers_projection` is shimmed from
+# `..execution.verification` (Slice 11g).
+
+
+def _dag_verification_graph_attempt_from_payload(
+    payload: dict[str, Any] | None,
+    *,
+    feature_id: str,
+    dag_sha256: str,
+    group_idx: int,
+    stage: str,
+) -> Any:
+    if VerificationGraphAttempt is None:
+        return None
+    nodes = []
+    edges = []
+    if isinstance(payload, dict):
+        for raw_node in payload.get("nodes") or []:
+            if VerifyEvidenceNode is None or not isinstance(raw_node, dict):
+                continue
+            try:
+                nodes.append(VerifyEvidenceNode.model_validate(raw_node))
+            except Exception:
+                continue
+        for raw_edge in payload.get("edges") or []:
+            if VerifyEvidenceEdge is None or not isinstance(raw_edge, dict):
+                continue
+            try:
+                edges.append(VerifyEvidenceEdge.model_validate(raw_edge))
+            except Exception:
+                continue
+    return VerificationGraphAttempt(
+        feature_id=feature_id,
+        dag_sha256=dag_sha256,
+        group_idx=group_idx,
+        stage=stage,
+        attempt=0,
+        nodes=nodes,
+        edges=edges,
+    )
+
+
+# `_dag_verify_graph_payload_has_durable_projection`,
+# `_dag_verify_graph_digest`, `_dag_verify_graph_projection_metadata`,
+# `_dag_verify_graph_payload_without_durable`,
+# `_dag_verify_graph_store_payload_digest`,
+# `_dag_verify_graph_payload_digest_for_proof`,
+# `_dag_verify_graph_int`, `_dag_verify_graph_edge_ids`,
+# `_dag_verify_graph_durable_metadata_from_reload` are shimmed from
+# `..execution.verification` (Slice 11g).
+
+
+async def _load_verified_dag_verification_graph_projection(
+    runner: WorkflowRunner,
+    payload: dict[str, Any],
+    *,
+    projection_key: str,
+    feature_id: str,
+    group_idx: int,
+    dag_sha256: str,
+    stage: str,
+) -> tuple[dict[str, Any] | None, str]:
+    proof = payload.get("proof")
+    if not isinstance(proof, dict):
+        return None, "verification graph proof is missing"
+    proof_digest = str(proof.get("proof_digest") or "")
+    if not proof_digest:
+        return None, "verification graph proof digest is missing"
+    store = _execution_control_store_for_runner(runner)
+    loader = getattr(store, "get_verified_verification_graph_projection", None)
+    if not callable(loader):
+        return None, "verification graph durable reload API is unavailable"
+    try:
+        verified = await loader(
+            feature_id=feature_id,
+            projection_key=projection_key,
+            dag_sha256=dag_sha256,
+            group_idx=group_idx,
+            stage=stage,
+            proof_digest=proof_digest,
+        )
+    except Exception as exc:
+        return None, str(exc)
+    if not isinstance(verified, dict):
+        return None, "verification graph durable reload returned no typed proof"
+    graph = verified.get("graph")
+    if not isinstance(graph, dict):
+        return None, "verification graph durable reload is missing graph metadata"
+    stored_digest = str(graph.get("graph_payload_digest") or "")
+    if stored_digest and stored_digest != _dag_verify_graph_store_payload_digest(payload):
+        return None, "verification graph artifact payload differs from typed graph proof"
+    if str(graph.get("proof_digest") or "") != proof_digest:
+        return None, "verification graph durable reload proof digest mismatch"
+    if str(graph.get("projection_key") or "") != projection_key:
+        return None, "verification graph durable reload projection key mismatch"
+    if str(graph.get("dag_sha256") or "") != str(dag_sha256 or ""):
+        return None, "verification graph durable reload DAG digest mismatch"
+    if _dag_verify_graph_int(graph.get("group_idx")) != int(group_idx):
+        return None, "verification graph durable reload group mismatch"
+    if str(graph.get("stage") or "") != stage:
+        return None, "verification graph durable reload stage mismatch"
+    return verified, ""
+
+
+async def _recover_dag_verification_graph_payload_from_store(
+    runner: WorkflowRunner,
+    feature: Feature,
+    *,
+    projection_key: str,
+    group_idx: int,
+    dag_sha256s: list[str],
+    stage: str,
+    proof_digest: str = "",
+    require_approved_graph: bool = True,
+) -> tuple[dict[str, Any] | None, str]:
+    store = _execution_control_store_for_runner(runner)
+    if store is None:
+        return None, "verification graph projection store is unavailable"
+    exact_loader = getattr(store, "get_verified_verification_graph_projection", None)
+    latest_loader = getattr(store, "get_latest_verified_verification_graph_projection", None)
+    if proof_digest and not callable(exact_loader):
+        return None, "verification graph durable reload API is unavailable"
+    if not proof_digest and not callable(latest_loader):
+        return None, "verification graph latest durable reload API is unavailable"
+    errors: list[str] = []
+    graph_key = _dag_verify_graph_artifact_key(group_idx, stage)
+    for candidate_dag_sha256 in dict.fromkeys(str(value or "") for value in dag_sha256s if str(value or "")):
+        try:
+            if proof_digest:
+                verified = await exact_loader(
+                    feature_id=str(feature.id),
+                    projection_key=projection_key,
+                    dag_sha256=candidate_dag_sha256,
+                    group_idx=group_idx,
+                    stage=stage,
+                    proof_digest=proof_digest,
+                )
+            else:
+                verified = await latest_loader(
+                    feature_id=str(feature.id),
+                    projection_key=projection_key,
+                    dag_sha256=candidate_dag_sha256,
+                    group_idx=group_idx,
+                    stage=stage,
+                )
+        except Exception as exc:
+            errors.append(str(exc))
+            continue
+        if not isinstance(verified, dict):
+            errors.append("verification graph durable reload returned no typed proof")
+            continue
+        graph = _json_object_from_text(verified.get("graph"))
+        payload = _json_object_from_text(graph.get("payload"))
+        if not payload:
+            errors.append("verification graph durable reload did not include graph payload")
+            continue
+        proof = _json_object_from_text(payload.get("proof"))
+        if proof_digest and str(proof.get("proof_digest") or "") != proof_digest:
+            errors.append("verification graph durable reload proof digest mismatch")
+            continue
+        payload = dict(payload)
+        payload["durable_projection"] = _dag_verify_graph_durable_metadata_from_reload(
+            None,
+            verified,
+        )
+        if require_approved_graph:
+            validation_error = _validate_dag_verification_graph_payload(
+                payload,
+                projection_key=projection_key,
+                feature_id=str(feature.id),
+                group_idx=group_idx,
+                dag_sha256=candidate_dag_sha256,
+            )
+        else:
+            validation_error = _validate_dag_verification_graph_rejected_payload(
+                payload,
+                projection_key=projection_key,
+                feature_id=str(feature.id),
+                group_idx=group_idx,
+                dag_sha256=candidate_dag_sha256,
+                stage=stage,
+            )
+        if validation_error:
+            errors.append(validation_error)
+            continue
+        await runner.artifacts.put(
+            graph_key,
+            json.dumps(payload, sort_keys=True),
+            feature=feature,
+        )
+        return payload, ""
+    return None, errors[-1] if errors else "verification graph durable reload returned no typed proof"
+
+
+async def _persist_dag_verification_graph_payload(
+    runner: WorkflowRunner,
+    payload: dict[str, Any],
+) -> tuple[dict[str, Any], str]:
+    store = _execution_control_store_for_runner(runner)
+    record_graph = getattr(store, "record_verification_graph_projection", None)
+    if not callable(record_graph):
+        updated = dict(payload)
+        updated["durable_projection"] = {
+            "persisted": False,
+            "failure_class": "verification_graph_store_unavailable",
+            "failure_type": "missing_execution_control_store",
+        }
+        updated["approved"] = False
+        return updated, "verification graph projection store is unavailable"
+    projection_payload = _dag_verify_graph_payload_without_durable(payload)
+    try:
+        result = await record_graph(projection_payload)
+    except Exception as exc:
+        logger.warning(
+            "Failed to persist verification graph projection %s",
+            payload.get("projection_key"),
+            exc_info=True,
+        )
+        updated = dict(payload)
+        updated["durable_projection"] = {
+            "persisted": False,
+            "failure_class": "verification_graph_persistence",
+            "failure_type": type(exc).__name__,
+            "error": str(exc)[:1000],
+        }
+        updated["approved"] = False
+        return updated, str(exc)
+    updated = dict(payload)
+    stage = str(updated.get("stage") or "")
+    parsed_group_idx = _dag_verify_graph_int(updated.get("group_idx"))
+    if parsed_group_idx is None:
+        updated["durable_projection"] = {
+            "persisted": False,
+            "failure_class": "verification_graph_reload",
+            "failure_type": "invalid_group_idx",
+        }
+        updated["approved"] = False
+        return updated, "verification graph projection has invalid group_idx"
+    if updated.get("approved") is not True:
+        durable_projection = _dag_verify_graph_projection_metadata(result)
+        if not durable_projection.get("graph_payload_digest"):
+            durable_projection["graph_payload_digest"] = (
+                _dag_verify_graph_store_payload_digest(projection_payload)
+            )
+        updated["durable_projection"] = durable_projection
+        return updated, ""
+    verified, reload_error = await _load_verified_dag_verification_graph_projection(
+        runner,
+        projection_payload,
+        projection_key=str(updated.get("projection_key") or ""),
+        feature_id=str(updated.get("feature_id") or ""),
+        group_idx=parsed_group_idx,
+        dag_sha256=str(updated.get("dag_sha256") or ""),
+        stage=stage,
+    )
+    if reload_error or verified is None:
+        updated["durable_projection"] = {
+            "persisted": False,
+            "failure_class": "verification_graph_reload",
+            "failure_type": "missing_typed_graph_reload",
+            "error": reload_error[:1000],
+        }
+        updated["approved"] = False
+        return updated, reload_error
+    updated["durable_projection"] = _dag_verify_graph_durable_metadata_from_reload(
+        result,
+        verified,
+    )
+    return updated, ""
+
+
+def _validate_dag_verification_graph_payload(
+    payload: dict[str, Any],
+    *,
+    projection_key: str,
+    feature_id: str,
+    group_idx: int,
+    dag_sha256: str,
+) -> str:
+    if payload.get("projection_key") != projection_key:
+        return f"Verification graph proof does not match {projection_key}."
+    if str(payload.get("feature_id") or "") != str(feature_id):
+        return f"Verification graph proof for {projection_key} has the wrong feature."
+    payload_group_idx = _dag_verify_graph_int(payload.get("group_idx"))
+    if payload_group_idx is None or payload_group_idx != int(group_idx):
+        return f"Verification graph proof for {projection_key} has the wrong group."
+    if dag_sha256 and str(payload.get("dag_sha256") or "") != str(dag_sha256):
+        return (
+            f"Verification graph proof for {projection_key} is stale for the "
+            "current DAG digest."
+        )
+    proof = payload.get("proof")
+    aggregate = payload.get("aggregate")
+    aggregate_node = payload.get("aggregate_node")
+    if not isinstance(proof, dict) or not isinstance(aggregate, dict):
+        return f"Verification graph proof for {projection_key} is incomplete."
+    if not isinstance(aggregate_node, dict):
+        return f"Verification graph aggregate node for {projection_key} is missing."
+    nodes = payload.get("nodes")
+    edges = payload.get("edges")
+    if not isinstance(nodes, list) or not isinstance(edges, list):
+        return f"Verification graph proof for {projection_key} is missing nodes or edges."
+    node_status_by_id: dict[int, str] = {}
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        try:
+            node_status_by_id[int(node.get("id"))] = str(node.get("status") or "")
+        except Exception:
+            continue
+    required_ids: list[int] = []
+    for key in ("required_gate_node_ids", "required_lens_node_ids"):
+        for node_id in list(aggregate.get(key) or []):
+            parsed_node_id = _dag_verify_graph_int(node_id)
+            if parsed_node_id is None:
+                return f"Verification graph proof for {projection_key} has invalid node ids."
+            required_ids.append(parsed_node_id)
+    raw_node_id = aggregate.get("raw_verdict_node_id")
+    parsed_raw_node_id = _dag_verify_graph_int(raw_node_id)
+    if parsed_raw_node_id is None:
+        return f"Verification graph proof for {projection_key} is missing raw verifier evidence."
+    required_ids.append(parsed_raw_node_id)
+    for node_id in list(proof.get("required_lineage_node_ids") or []):
+        parsed_node_id = _dag_verify_graph_int(node_id)
+        if parsed_node_id is None:
+            return f"Verification graph proof for {projection_key} has invalid lineage node ids."
+        required_ids.append(parsed_node_id)
+    required_ids = sorted(set(required_ids))
+    missing_status = [
+        node_id
+        for node_id in required_ids
+        if node_status_by_id.get(node_id) != "approved"
+    ]
+    if missing_status:
+        return (
+            f"Verification graph proof for {projection_key} has non-approved "
+            f"required nodes: {missing_status[:10]}"
+        )
+    if _dag_expanded_verify_enabled():
+        required_lens_slugs = set(_dag_verify_required_lens_slugs())
+        aggregate_required_lenses = set(
+            aggregate_node.get("metadata", {}).get("required_lens_slugs") or []
+        )
+        if required_lens_slugs and aggregate_required_lenses != required_lens_slugs:
+            return (
+                f"Verification graph proof for {projection_key} does not include "
+                "the required expanded verifier lenses."
+            )
+        if required_lens_slugs and len(list(aggregate.get("required_lens_node_ids") or [])) < len(required_lens_slugs):
+            return (
+                f"Verification graph proof for {projection_key} has missing "
+                "expanded verifier lens nodes."
+            )
+    status_digest = _dag_verify_graph_digest(
+        [
+            {"node_id": node_id, "status": node_status_by_id[node_id]}
+            for node_id in sorted(required_ids)
+        ]
+    )
+    if str(proof.get("required_node_status_digest") or "") != status_digest:
+        return (
+            f"Verification graph proof for {projection_key} has a stale required "
+            "node status digest."
+        )
+    proof_projection_keys = proof.get("projection_keys")
+    if not isinstance(proof_projection_keys, list) or projection_key not in proof_projection_keys:
+        return (
+            f"Verification graph proof for {projection_key} does not cite the "
+            "compatibility projection it is gating."
+        )
+    for field_name, expected in (
+        ("feature_id", str(feature_id)),
+        ("dag_sha256", str(dag_sha256 or "")),
+        ("group_idx", str(group_idx)),
+        ("stage", str(payload.get("stage") or "")),
+    ):
+        actual = proof.get(field_name)
+        if actual is None or str(actual) != expected:
+            return (
+                f"Verification graph proof for {projection_key} is not bound to "
+                f"the current {field_name}."
+            )
+    proof_graph_payload_digest = str(proof.get("graph_payload_digest") or "")
+    if not proof_graph_payload_digest:
+        return (
+            f"Verification graph proof for {projection_key} is missing graph "
+            "payload digest."
+        )
+    if proof_graph_payload_digest != _dag_verify_graph_payload_digest_for_proof(payload):
+        return (
+            f"Verification graph proof for {projection_key} has a stale graph "
+            "payload digest."
+        )
+    proof_payload = {
+        "feature_id": str(payload.get("feature_id") or ""),
+        "dag_sha256": str(payload.get("dag_sha256") or ""),
+        "group_idx": payload_group_idx,
+        "stage": str(payload.get("stage") or ""),
+        "aggregate_node_id": proof.get("aggregate_node_id"),
+        "aggregate_verdict_id": proof.get("aggregate_verdict_id"),
+        "required_edge_ids": sorted(proof.get("required_edge_ids") or []),
+        "required_lineage_node_ids": required_ids,
+        "required_node_status_digest": proof.get("required_node_status_digest"),
+        "raw_verifier_node_id": proof.get("raw_verifier_node_id"),
+        "required_lens_node_ids": proof.get("required_lens_node_ids") or [],
+        "projection_keys": sorted(set(proof_projection_keys)),
+        "verifier_compatibility_links": proof.get("verifier_compatibility_links") or {},
+        "graph_payload_digest": proof_graph_payload_digest,
+    }
+    if str(proof.get("proof_digest") or "") != _dag_verify_graph_digest(proof_payload):
+        return f"Verification graph proof digest for {projection_key} does not recompute."
+    if payload.get("compatibility_projection", {}).get("source_kind") != "aggregate_verdict":
+        return (
+            f"Verification graph proof for {projection_key} is not sourced from "
+            "an aggregate verdict node."
+        )
+    durable = payload.get("durable_projection")
+    if not isinstance(durable, dict) or durable.get("persisted") is not True:
+        return (
+            f"Verification graph proof for {projection_key} is not durably "
+            "backed by typed graph evidence."
+        )
+    if str(durable.get("proof_digest") or "") and str(durable.get("proof_digest")) != str(proof.get("proof_digest") or ""):
+        return (
+            f"Verification graph proof for {projection_key} durable proof digest "
+            "does not match the aggregate proof."
+        )
+    durable_graph_digest = str(durable.get("graph_payload_digest") or "")
+    if durable_graph_digest and durable_graph_digest != _dag_verify_graph_store_payload_digest(payload):
+        return (
+            f"Verification graph proof for {projection_key} durable graph payload "
+            "digest does not match the artifact."
+        )
+    durable_edge_ids = durable.get("evidence_edge_ids")
+    if not isinstance(durable_edge_ids, list) or not durable_edge_ids:
+        return (
+            f"Verification graph proof for {projection_key} is missing durable "
+            "edge lineage."
+        )
+    required_edge_ids = proof.get("required_edge_ids") or []
+    if sorted(_dag_verify_graph_edge_ids(durable_edge_ids)) != sorted(
+        _dag_verify_graph_edge_ids(required_edge_ids)
+    ):
+        return (
+            f"Verification graph proof for {projection_key} durable edges do not "
+            "match the aggregate proof."
+        )
+    return ""
+
+
+def _validate_dag_verification_graph_rejected_payload(
+    payload: dict[str, Any],
+    *,
+    projection_key: str,
+    feature_id: str,
+    group_idx: int,
+    dag_sha256: str,
+    stage: str,
+) -> str:
+    if payload.get("projection_key") != projection_key:
+        return f"Verification graph projection does not match {projection_key}."
+    if str(payload.get("feature_id") or "") != str(feature_id):
+        return f"Verification graph projection for {projection_key} has the wrong feature."
+    payload_group_idx = _dag_verify_graph_int(payload.get("group_idx"))
+    if payload_group_idx is None or payload_group_idx != int(group_idx):
+        return f"Verification graph projection for {projection_key} has the wrong group."
+    if dag_sha256 and str(payload.get("dag_sha256") or "") != str(dag_sha256):
+        return (
+            f"Verification graph projection for {projection_key} is stale for the "
+            "current DAG digest."
+        )
+    if str(payload.get("stage") or "") != stage:
+        return f"Verification graph projection for {projection_key} has the wrong stage."
+    if not isinstance(payload.get("aggregate"), dict):
+        return f"Verification graph projection for {projection_key} is missing aggregate state."
+    if not isinstance(payload.get("nodes"), list):
+        return f"Verification graph projection for {projection_key} is missing graph nodes."
+    durable = payload.get("durable_projection")
+    if not isinstance(durable, dict) or durable.get("persisted") is not True:
+        return (
+            f"Verification graph projection for {projection_key} is not durably "
+            "backed by typed graph evidence."
+        )
+    durable_graph_digest = str(durable.get("graph_payload_digest") or "")
+    if durable_graph_digest and durable_graph_digest != _dag_verify_graph_store_payload_digest(payload):
+        return (
+            f"Verification graph projection for {projection_key} durable graph "
+            "payload digest does not match the artifact."
+        )
+    return ""
+
+
+# `_dag_verify_graph_payload_for_projection`, `_dag_verify_graph_ref`,
+# `_dag_verify_graph_lineage_payload` are shimmed from
+# `..execution.verification` (Slice 11g).
+
+
+async def _put_dag_verify_artifact(
+    runner: WorkflowRunner,
+    feature: Feature,
+    projection_key: str,
+    verdict: object,
+    *,
+    group_idx: int,
+    dag_sha256: str,
+    lens_verdicts: list[tuple[object, Verdict]] | None = None,
+    required_lens_slugs: list[str] | None = None,
+    lens_failures: list[dict[str, Any]] | None = None,
+    tasks: list[ImplementationTask] | None = None,
+    results: list[object] | None = None,
+    contracts_by_task_id: dict[str, Any] | None = None,
+    workspace_snapshots: list[Any] | None = None,
+    raw_verifier_verdict: object | None = None,
+    deterministic_preflight_failed: bool = False,
+) -> None:
+    prior_projection = await _get_artifact_text(runner, feature, projection_key)
+    graph_payload = await _record_dag_verification_graph_artifact(
+        runner,
+        feature,
+        group_idx,
+        projection_key,
+        verdict,
+        dag_sha256=dag_sha256,
+        lens_verdicts=lens_verdicts or [],
+        required_lens_slugs=required_lens_slugs,
+        lens_failures=lens_failures or [],
+        tasks=tasks,
+        results=results,
+        contracts_by_task_id=contracts_by_task_id,
+        workspace_snapshots=workspace_snapshots,
+        raw_verifier_verdict=raw_verifier_verdict,
+        deterministic_preflight_failed=deterministic_preflight_failed,
+    )
+    if not (
+        isinstance(graph_payload, dict)
+        and _dag_verify_graph_payload_has_durable_projection(graph_payload)
+        and not prior_projection
+    ):
+        await runner.artifacts.put(projection_key, to_str(verdict), feature=feature)
+
+
+async def _record_dag_verification_graph_artifact(
+    runner: WorkflowRunner,
+    feature: Feature,
+    group_idx: int,
+    projection_key: str,
+    verdict: object,
+    *,
+    dag_sha256: str,
+    lens_verdicts: list[tuple[object, Verdict]] | None = None,
+    required_lens_slugs: list[str] | None = None,
+    lens_failures: list[dict[str, Any]] | None = None,
+    tasks: list[ImplementationTask] | None = None,
+    results: list[object] | None = None,
+    contracts_by_task_id: dict[str, Any] | None = None,
+    workspace_snapshots: list[Any] | None = None,
+    raw_verifier_verdict: object | None = None,
+    deterministic_preflight_failed: bool = False,
+) -> dict[str, Any] | None:
+    if (
+        VerificationGraphAttempt is None
+        or VerifyReadBudgetReport is None
+        or build_verify_graph_approval_proof is None
+    ):
+        return None
+    if not str(projection_key).startswith("dag-verify:"):
+        return None
+    stage = _dag_verify_stage_from_projection_key(projection_key)
+    graph_key = _dag_verify_graph_artifact_key(group_idx, stage)
+    existing = await _get_artifact_text(runner, feature, graph_key)
+    existing_payload = _dag_verify_graph_payload_for_projection(
+        existing, projection_key
+    )
+
+    verifier_verdict = raw_verifier_verdict if raw_verifier_verdict is not None else verdict
+    read_budget = _dag_verify_read_budget_for_projection(
+        projection_key,
+        verifier_verdict,
+        tasks=tasks,
+        results=results,
+        contracts_by_task_id=contracts_by_task_id,
+        workspace_snapshots=workspace_snapshots,
+    )
+    if read_budget is None:
+        read_budget = VerifyReadBudgetReport()
+    lineage = _dag_verify_graph_lineage_payload(
+        feature_id=str(feature.id),
+        projection_key=projection_key,
+        dag_sha256=dag_sha256 or "",
+        group_idx=group_idx,
+        stage=stage,
+        tasks=tasks,
+        results=results,
+        contracts_by_task_id=contracts_by_task_id,
+        workspace_snapshots=workspace_snapshots,
+    )
+    lens_verdicts = list(lens_verdicts or [])
+    if required_lens_slugs is None:
+        required_lens_slugs = [
+            str(getattr(spec, "slug", spec)) for spec, _verdict in lens_verdicts
+        ]
+        if _is_approved(verifier_verdict):
+            required_lens_slugs = _dag_verify_required_lens_slugs()
+    required_lens_slugs = sorted(set(required_lens_slugs))
+    failure_source = None
+    runtime_failure_reason = None
+    if isinstance(verifier_verdict, Verdict) and not _is_approved(verifier_verdict):
+        verdict_text = _format_feedback("Verify", verifier_verdict)
+        if "Verifier provider/runtime failed before product repair dispatch" in verdict_text:
+            failure_source = "provider"
+            runtime_failure_reason = "crash"
+    attempt = _dag_verification_graph_attempt_from_payload(
+        existing_payload,
+        feature_id=str(feature.id),
+        dag_sha256=dag_sha256 or "",
+        group_idx=group_idx,
+        stage=stage,
+    )
+    candidate_node = attempt.upsert_node(
+        kind="candidate_manifest",
+        name="candidate_manifest",
+        input_payload={
+            "dag_sha256": dag_sha256 or "",
+            "group_idx": group_idx,
+            "lineage": lineage,
+            "projection_key": projection_key,
+            "stage": stage,
+        },
+        status="approved",
+        deterministic=True,
+        output_payload={
+            "manifest_digest": _dag_verify_graph_digest({
+                "dag_sha256": dag_sha256 or "",
+                "group_idx": group_idx,
+                "lineage_digest": lineage["lineage_digest"],
+                "projection_key": projection_key,
+                "stage": stage,
+            })
+        },
+        metadata={"source": "slice06_checkpoint_preflight"},
+    )
+    gate_request_node = attempt.upsert_node(
+        kind="gate_request",
+        name="gate_request",
+        input_payload={
+            "candidate_manifest_node_id": candidate_node.id,
+            "lineage_digest": lineage["lineage_digest"],
+            "projection_key": projection_key,
+            "stage": stage,
+        },
+        status="approved",
+        deterministic=True,
+        output_payload={"dispatch_verifier": True},
+        metadata={"source": "slice06_checkpoint_preflight"},
+    )
+    attempt.require(candidate_node, gate_request_node)
+    deterministic_preflight_nodes = []
+    previous_preflight_node = gate_request_node
+    for gate_name, gate_payload in (
+        (
+            "workspace_snapshot_freshness",
+            {
+                "lineage_digest": lineage["lineage_digest"],
+                "workspace_snapshot_refs": lineage["workspace_snapshot_refs"],
+            },
+        ),
+        (
+            "contract_closure",
+            {
+                "contract_refs": lineage["contract_refs"],
+                "lineage_digest": lineage["lineage_digest"],
+                "task_ids": lineage["task_ids"],
+            },
+        ),
+        (
+            "artifact_freshness",
+            {
+                "projection_key": projection_key,
+                "dag_sha256": dag_sha256 or "",
+                "lineage_digest": lineage["lineage_digest"],
+                "result_refs": lineage["result_refs"],
+            },
+        ),
+        (
+            "path_scope_and_projection",
+            {
+                "lineage_digest": lineage["lineage_digest"],
+                "projection_key": projection_key,
+                "task_ids": lineage["task_ids"],
+                "visibility": "legacy_dag_verify",
+            },
+        ),
+        (
+            "patch_integrity",
+            {
+                "lineage_digest": lineage["lineage_digest"],
+                "projection_key": projection_key,
+                "result_refs": lineage["result_refs"],
+                "stage": stage,
+            },
+        ),
+    ):
+        preflight_node = attempt.upsert_node(
+            kind="deterministic_gate",
+            name=gate_name,
+            input_payload=gate_payload,
+            status="approved",
+            deterministic=True,
+            output_payload={"approved": True},
+            metadata={"gate": gate_name, "source": "slice06_checkpoint_preflight"},
+        )
+        attempt.require(previous_preflight_node, preflight_node)
+        deterministic_preflight_nodes.append(preflight_node)
+        previous_preflight_node = preflight_node
+    if deterministic_preflight_failed:
+        preflight_failure_node = attempt.upsert_node(
+            kind="deterministic_gate",
+            name="programmatic_dag_preflight",
+            input_payload={
+                "projection_key": projection_key,
+                "verdict": (
+                    verifier_verdict.model_dump(mode="json")
+                    if isinstance(verifier_verdict, Verdict)
+                    else to_str(verifier_verdict)
+                ),
+            },
+            status="rejected",
+            deterministic=True,
+            output_payload={
+                "approved": False,
+                "dispatch_verifier": False,
+                "reason": "deterministic_preflight_failed",
+            },
+            metadata={
+                "gate": "programmatic_dag_preflight",
+                "source": "slice06_checkpoint_preflight",
+            },
+        )
+        attempt.require(previous_preflight_node, preflight_failure_node)
+        deterministic_preflight_nodes.append(preflight_failure_node)
+        previous_preflight_node = preflight_failure_node
+    gate_node = attempt.upsert_node(
+        kind="deterministic_gate",
+        name="raw_gate_approval_requirements",
+        input_payload={
+            "is_structured_verdict": isinstance(verifier_verdict, Verdict),
+            "projection_key": projection_key,
+            "verdict_type": type(verifier_verdict).__name__,
+        },
+        status="approved" if isinstance(verifier_verdict, Verdict) else "rejected",
+        deterministic=True,
+        output_payload={"required": ["structured_verdict", "aggregate_graph"]},
+        metadata={"gate": "structured_verdict_required"},
+    )
+    attempt.require(previous_preflight_node, gate_node)
+    context_node = attempt.upsert_node(
+        kind="context_package",
+        name="bounded_verifier_context",
+        input_payload={
+            "projection_key": projection_key,
+            "read_budget": read_budget.model_dump(mode="json"),
+        },
+        status=(
+            "approved"
+            if not read_budget.omitted_required_refs
+            and not read_budget.blocked_unbounded_read_count
+            else "rejected"
+        ),
+        deterministic=True,
+        output_payload={"read_budget_digest": read_budget.budget_digest},
+        metadata={
+            "read_budget_digest": read_budget.budget_digest,
+            "context_refs": [{"kind": "artifact", "projection_key": projection_key}],
+        },
+    )
+    attempt.require(gate_node, context_node)
+    raw_verdict_id = _synthetic_verification_verdict_id(
+        projection_key,
+        verifier_verdict,
+        suffix="raw",
+    )
+    raw_outcome = None
+    if not deterministic_preflight_failed:
+        raw_probe = attempt.upsert_node(
+            kind="raw_verifier",
+            name="raw_verifier",
+            input_payload={
+                "context_node_id": context_node.id,
+                "verdict_id": raw_verdict_id,
+                "verdict_digest": (
+                    verify_graph_stable_digest(verifier_verdict.model_dump(mode="json"))
+                    if isinstance(verifier_verdict, Verdict) and verify_graph_stable_digest is not None
+                    else None
+                ),
+                "read_budget": read_budget.model_dump(mode="json"),
+                "provider_failure_id": None,
+                "failure_source": (
+                    failure_source
+                    if isinstance(verifier_verdict, Verdict)
+                    else "parse"
+                ),
+                "runtime_failure_reason": (
+                    runtime_failure_reason
+                    if isinstance(verifier_verdict, Verdict)
+                    else "parse_failed"
+                ),
+            },
+            status="running",
+            deterministic=False,
+            verdict_id=raw_verdict_id,
+        )
+        raw_compatibility = (
+            VerifyVerifierCompatibilityLinks(
+                raw_output_verifier_node_id=raw_probe.id,
+                parsed_verdict_verifier_node_id=raw_probe.id,
+                projection_verifier_node_id=raw_probe.id,
+                context_package_node_id=context_node.id,
+            )
+            if VerifyVerifierCompatibilityLinks is not None
+            else None
+        )
+        raw_outcome = attempt.record_raw_verifier(
+            context_node=context_node,
+            verdict=verifier_verdict if isinstance(verifier_verdict, Verdict) else None,
+            verdict_id=raw_verdict_id,
+            read_budget=read_budget,
+            failure_source=(
+                failure_source
+                if isinstance(verifier_verdict, Verdict)
+                else "parse"
+            ),
+            runtime_failure_reason=(
+                runtime_failure_reason
+                if isinstance(verifier_verdict, Verdict)
+                else "parse_failed"
+            ),
+            compatibility=raw_compatibility,
+        )
+    lens_outcomes = []
+    if raw_outcome is None and (lens_verdicts or lens_failures):
+        lens_verdicts = []
+        lens_failures = []
+    for spec, lens_verdict in lens_verdicts or []:
+        lens_slug = str(getattr(spec, "slug", spec))
+        lens_verdict_id = _synthetic_verification_verdict_id(
+            projection_key,
+            lens_verdict,
+            suffix=f"lens:{lens_slug}",
+        )
+        lens_probe = attempt.upsert_node(
+            kind="expanded_lens",
+            name=f"expanded_lens:{lens_slug}",
+            input_payload={
+                "lens_slug": lens_slug,
+                "context_node_id": context_node.id,
+                "raw_verifier_node_id": raw_outcome.node.id,
+                "verdict_id": lens_verdict_id,
+                "verdict_digest": verify_graph_stable_digest(
+                    lens_verdict.model_dump(mode="json")
+                ) if verify_graph_stable_digest is not None else None,
+                "read_budget": read_budget.model_dump(mode="json"),
+                "provider_failure_id": None,
+                "failure_source": None,
+                "runtime_failure_reason": None,
+            },
+            status="running",
+            deterministic=False,
+            verdict_id=lens_verdict_id,
+            metadata={
+                "lens_slug": lens_slug,
+                "raw_verdict_node_id": raw_outcome.node.id,
+            },
+        )
+        lens_compatibility = (
+            VerifyVerifierCompatibilityLinks(
+                raw_output_verifier_node_id=lens_probe.id,
+                parsed_verdict_verifier_node_id=lens_probe.id,
+                projection_verifier_node_id=lens_probe.id,
+                context_package_node_id=context_node.id,
+            )
+            if VerifyVerifierCompatibilityLinks is not None
+            else None
+        )
+        lens_outcomes.append(
+            attempt.record_lens_verifier(
+                lens_slug=lens_slug,
+                context_node=context_node,
+                raw_outcome=raw_outcome,
+                verdict=lens_verdict,
+                verdict_id=lens_verdict_id,
+                read_budget=read_budget,
+                compatibility=lens_compatibility,
+            )
+        )
+    for failure in lens_failures or []:
+        lens_slug = str(failure.get("lens") or failure.get("slug") or "unknown")
+        lens_failure_verdict_id = _synthetic_verification_verdict_id(
+            projection_key,
+            failure,
+            suffix=f"lens:{lens_slug}:failure",
+        )
+        lens_failure_probe = attempt.upsert_node(
+            kind="expanded_lens",
+            name=f"expanded_lens:{lens_slug}",
+            input_payload={
+                "lens_slug": lens_slug,
+                "context_node_id": context_node.id,
+                "raw_verifier_node_id": raw_outcome.node.id,
+                "verdict_id": lens_failure_verdict_id,
+                "verdict_digest": None,
+                "read_budget": read_budget.model_dump(mode="json"),
+                "provider_failure_id": None,
+                "failure_source": "provider",
+                "runtime_failure_reason": "crash",
+            },
+            status="running",
+            deterministic=False,
+            verdict_id=lens_failure_verdict_id,
+            metadata={
+                "lens_slug": lens_slug,
+                "raw_verdict_node_id": raw_outcome.node.id,
+            },
+        )
+        lens_failure_compatibility = (
+            VerifyVerifierCompatibilityLinks(
+                raw_output_verifier_node_id=lens_failure_probe.id,
+                parsed_verdict_verifier_node_id=lens_failure_probe.id,
+                projection_verifier_node_id=lens_failure_probe.id,
+                context_package_node_id=context_node.id,
+            )
+            if VerifyVerifierCompatibilityLinks is not None
+            else None
+        )
+        lens_outcomes.append(
+            attempt.record_lens_verifier(
+                lens_slug=lens_slug,
+                context_node=context_node,
+                raw_outcome=raw_outcome,
+                verdict=None,
+                verdict_id=lens_failure_verdict_id,
+                read_budget=read_budget,
+                failure_source="provider",
+                runtime_failure_reason="crash",
+                compatibility=lens_failure_compatibility,
+            )
+        )
+    aggregate = attempt.aggregate(
+        required_gate_nodes=[
+            candidate_node,
+            gate_request_node,
+            *deterministic_preflight_nodes,
+            gate_node,
+            context_node,
+        ],
+        raw_outcome=raw_outcome,
+        lens_outcomes=lens_outcomes,
+        required_lens_slugs=required_lens_slugs,
+        merged_verdict_id=_synthetic_verification_verdict_id(
+            projection_key,
+            verdict,
+            suffix="aggregate",
+        ),
+        projection_keys=[projection_key],
+    )
+    proof_error = ""
+    aggregate_payload = aggregate.aggregate.model_dump(mode="json")
+    aggregate_payload["verifier_compatibility_links"] = (
+        aggregate.verifier_compatibility_links
+    )
+    payload = {
+        "schema_version": "slice06.verification_graph.v1",
+        "feature_id": str(feature.id),
+        "dag_sha256": dag_sha256 or "",
+        "group_idx": group_idx,
+        "stage": stage,
+        "projection_key": projection_key,
+        "compatibility_projection": {
+            "key": projection_key,
+            "source_kind": "aggregate_verdict",
+            "visibility": "legacy_dag_verify",
+        },
+        "approved": bool(aggregate.aggregate.approved),
+        "lineage": lineage,
+        "read_budget": read_budget.model_dump(mode="json"),
+        "verifier_compatibility_links": aggregate.verifier_compatibility_links,
+        "nodes": [node.model_dump(mode="json") for node in attempt.nodes],
+        "edges": [edge.model_dump(mode="json") for edge in attempt.edges],
+        "aggregate": aggregate_payload,
+        "aggregate_node": aggregate.node.model_dump(mode="json"),
+        "merged_verdict": aggregate.verdict.model_dump(mode="json"),
+        "proof": None,
+        "proof_error": proof_error,
+    }
+    proof_payload: dict[str, Any] | None = None
+    if aggregate.aggregate.approved:
+        try:
+            proof = build_verify_graph_approval_proof(
+                aggregate,
+                required_node_statuses=attempt.node_statuses(),
+                raw_compat_projection_key=projection_key,
+                feature_id=str(feature.id),
+                dag_sha256=dag_sha256 or "",
+                group_idx=group_idx,
+                stage=stage,
+                graph_payload_digest="",
+            )
+            payload["proof"] = proof.model_dump(mode="json")
+            graph_payload_digest = _dag_verify_graph_payload_digest_for_proof(payload)
+            proof = build_verify_graph_approval_proof(
+                aggregate,
+                required_node_statuses=attempt.node_statuses(),
+                raw_compat_projection_key=projection_key,
+                feature_id=str(feature.id),
+                dag_sha256=dag_sha256 or "",
+                group_idx=group_idx,
+                stage=stage,
+                graph_payload_digest=graph_payload_digest,
+            )
+            proof_payload = proof.model_dump(mode="json")
+            payload["proof"] = proof_payload
+        except Exception as exc:
+            proof_error = str(exc)
+            payload["proof_error"] = proof_error
+    payload["approved"] = bool(aggregate.aggregate.approved and proof_payload)
+    payload, durable_error = await _persist_dag_verification_graph_payload(
+        runner,
+        payload,
+    )
+    if durable_error and not payload.get("proof_error"):
+        payload["proof_error"] = durable_error
+    await runner.artifacts.put(
+        graph_key,
+        json.dumps(payload, sort_keys=True),
+        feature=feature,
+    )
+    return payload
+
+
+async def _record_dag_verifier_runtime_failure(
+    runner: WorkflowRunner,
+    feature: Feature,
+    group_idx: int,
+    stage: str,
+    exc: Exception,
+    *,
+    runtime: str | None,
+    dag_sha256: str,
+    projection_key: str,
+) -> Verdict:
+    failure_class = "verifier_provider"
+    failure_type = "verifier_provider_crash"
+    route = "retry_verifier"
+    if verify_graph_map_failure is not None:
+        typed = verify_graph_map_failure(
+            "raw",
+            "provider",
+            reason="crash",
+        )
+        failure_class = str(getattr(typed, "failure_class", failure_class))
+        failure_type = str(getattr(typed, "failure_type", failure_type))
+        route = str(getattr(typed, "route", route))
+    message = _workflow_blocker_text(
+        "Verifier provider/runtime failed before product repair dispatch; "
+        f"runtime={runtime or '<default>'} group={group_idx} "
+        f"stage={stage}: {type(exc).__name__}: {exc}"
+    )
+    await runner.artifacts.put(
+        f"dag-runtime-failure:g{group_idx}:verify-{stage}",
+        json.dumps(
+            {
+                "group_idx": group_idx,
+                "stage": stage,
+                "runtime": runtime,
+                "failure_class": failure_class,
+                "failure_type": failure_type,
+                "route": route,
+                "operator_required": False,
+                "dag_sha256": dag_sha256,
+                "projection_key": projection_key,
+                "error": str(exc),
+                "phase": "implementation",
+                "blocked_before_product_repair": True,
+            },
+            sort_keys=True,
+        ),
+        feature=feature,
+    )
+    return Verdict(
+        approved=False,
+        summary=message,
+        concerns=[
+            Issue(
+                severity="blocker",
+                description=message,
+            )
+        ],
+    )
+
+
+def _typed_runtime_provider_route_payload(
+    *,
+    group_idx: int,
+    retry: int | str,
+    runtime: str | None,
+    error: Exception,
+    context: str,
+    source: str = "",
+) -> dict[str, Any]:
+    retry_key = str(retry)
+    stable_signature = _dag_verify_graph_digest({
+        "context": context,
+        "error_type": type(error).__name__,
+        "group_idx": group_idx,
+        "retry": retry_key,
+        "runtime": runtime or "",
+        "source": source,
+    })
+    legacy_failure_type = "provider_crash"
+    failure_type = "provider_internal_error"
+    route_decision: dict[str, Any]
+    if RouterFailureObservation is not None and RouterFailureRouter is not None:
+        observation = RouterFailureObservation(
+            feature_id=f"dag-runtime:g{group_idx}",
+            dag_sha256="",
+            group_idx=group_idx,
+            source="dispatcher",
+            failure_class="runtime_provider",
+            failure_type=failure_type,
+            deterministic=False,
+            retryable=True,
+            operator_required=False,
+            evidence_ids=[],
+            payload={
+                "idempotency_key": (
+                    f"failure:dag-runtime-provider:g{group_idx}:"
+                    f"{context}:{retry_key}:{stable_signature}"
+                ),
+                "context": context,
+                "error_type": type(error).__name__,
+                "legacy_failure_type": legacy_failure_type,
+                "runtime": runtime or "",
+                "source": source,
+            },
+        )
+        # The router is used here as a pure routing function. Durable retry
+        # budget for this path is the journal-backed DAG group `retry` counter
+        # (re-read on resume), not the throwaway in-memory port — see
+        # 07-typed-failure-router.md § Persistence And Artifact Compatibility.
+        router = RouterFailureRouter()
+        failure_id = router.record(observation)
+        decision = router.mark_route_started(router.decide(failure_id))
+        max_attempts = max(
+            int(getattr(decision, "budget_remaining", 0) or 0)
+            + int(getattr(decision, "reservation_ordinal", 0) or 0),
+            0,
+        )
+        retry_index = int(retry) if isinstance(retry, int) else 0
+        remaining = max(0, max_attempts - retry_index - 1)
+        if retry_index >= max_attempts:
+            decision = decision.model_copy(update={
+                "action": "quiesce",
+                "budget_remaining": 0,
+                "budget_exhausted": True,
+                "reason": "retry budget exhausted for runtime_provider/provider_internal_error",
+                "reservation_ordinal": retry_index,
+                "route_decision_id": None,
+                "idempotency_key": (
+                    f"route:dag-runtime-provider:g{group_idx}:"
+                    f"{context}:{stable_signature}:quiesce:n{retry_index}"
+                ),
+            })
+        elif remaining <= 0 and retry_index + 1 >= max_attempts:
+            decision = decision.model_copy(update={
+                "budget_remaining": remaining,
+                "budget_exhausted": retry_index + 1 > max_attempts,
+                "reservation_ordinal": retry_index + 1,
+                "route_decision_id": None if retry_index else decision.route_decision_id,
+                "idempotency_key": (
+                    f"route:dag-runtime-provider:g{group_idx}:"
+                    f"{context}:{stable_signature}:retry_dispatch:n{retry_index + 1}"
+                ),
+            })
+        else:
+            decision = decision.model_copy(update={
+                "budget_remaining": remaining,
+                "reservation_ordinal": retry_index + 1,
+                "route_decision_id": None if retry_index else decision.route_decision_id,
+                "idempotency_key": (
+                    f"route:dag-runtime-provider:g{group_idx}:"
+                    f"{context}:{stable_signature}:retry_dispatch:n{retry_index + 1}"
+                ),
+            })
+        route_decision = _route_decision_compat_payload(
+            decision,
+            failure_class="runtime_provider",
+            failure_type=failure_type,
+            max_attempts=max_attempts,
+            legacy_failure_type=legacy_failure_type,
+        )
+    else:
+        route_decision = {
+            "failure_class": "runtime_provider",
+            "failure_type": failure_type,
+            "legacy_failure_type": legacy_failure_type,
+            "operator_required": False,
+            "route": "retry_dispatch",
+            "retry_budget": {
+                "budget_key": f"runtime_provider:{context}:g{group_idx}:r{retry_key}",
+                "max_retries": VERIFY_RETRIES,
+                "max_attempts": VERIFY_RETRIES,
+                "remaining_attempts": max(0, VERIFY_RETRIES - int(retry if isinstance(retry, int) else 0) - 1),
+            },
+            "stable_signature_hash": stable_signature,
+        }
+    return {
+        "artifact_schema": "dag-runtime-failure-v2",
+        "group_idx": group_idx,
+        "retry": retry,
+        "runtime": runtime,
+        "failure_class": "runtime_provider",
+        "failure_type": failure_type,
+        "legacy_failure_type": legacy_failure_type,
+        "route": route_decision["route"],
+        "route_decision": route_decision,
+        "retry_budget": route_decision["retry_budget"],
+        "stable_signature_hash": stable_signature,
+        "error": str(error),
+        "phase": "implementation",
+        "source": source,
+    }
+
+
+async def _run_checkpoint_required_dag_verify_lenses(
+    runner: WorkflowRunner,
+    feature: Feature,
+    group_idx: int,
+    stage_label: str,
+    verdict: object,
+    results: list[object],
+    files: list[str],
+    tasks: list[ImplementationTask],
+    *,
+    runtime: str | None,
+    feature_root: Path | None,
+    projection_key: str,
+    dag_sha256: str,
+) -> tuple[object, list[tuple[object, Verdict]], list[dict[str, Any]]]:
+    if not isinstance(verdict, Verdict) or not _is_approved(verdict):
+        return verdict, [], []
+    required_slugs = _dag_verify_required_lens_slugs()
+    if not required_slugs:
+        return verdict, [], []
+    lens_verdicts: list[tuple[object, Verdict]] = []
+    lens_failures: list[dict[str, Any]] = []
+    merged = await _run_expanded_dag_verify_lenses(
+        runner,
+        feature,
+        group_idx,
+        stage_label,
+        verdict,
+        results,
+        files,
+        tasks,
+        runtime=runtime,
+        feature_root=feature_root,
+        projection_key=projection_key,
+        dag_sha256=dag_sha256,
+        record_graph=False,
+        lens_collector=lens_verdicts,
+        lens_failure_collector=lens_failures,
+    )
+    return merged, lens_verdicts, lens_failures
+
+
+async def _require_dag_verification_graph_approval(
+    runner: WorkflowRunner,
+    feature: Feature,
+    group_idx: int,
+    projection_key: str | None,
+    verdict: object,
+    *,
+    dag_sha256: str,
+) -> str:
+    if not _is_approved(verdict):
+        return ""
+    if not projection_key or not str(projection_key).startswith("dag-verify:"):
+        return _workflow_blocker_text(
+            "Verification graph proof missing: approved checkpoint has no "
+            "dag-verify compatibility projection key. Summary-only approval "
+            "cannot checkpoint."
+        )
+    stage = _dag_verify_stage_from_projection_key(projection_key)
+    graph_key = _dag_verify_graph_artifact_key(group_idx, stage)
+    raw_payload = await _get_artifact_text(runner, feature, graph_key)
+    payload: dict[str, Any] | None = None
+    if not raw_payload:
+        payload, recover_error = await _recover_dag_verification_graph_payload_from_store(
+            runner,
+            feature,
+            projection_key=projection_key,
+            group_idx=group_idx,
+            dag_sha256s=[dag_sha256],
+            stage=stage,
+        )
+        if payload is None:
+            return _workflow_blocker_text(
+                f"Verification graph proof missing for {projection_key}; raw "
+                "dag-verify compatibility projection alone cannot approve checkpoint. "
+                f"Typed store recovery failed: {recover_error}"
+            )
+    if payload is None:
+        payload = _json_object_from_text(raw_payload)
+        if not payload:
+            payload, recover_error = await _recover_dag_verification_graph_payload_from_store(
+                runner,
+                feature,
+                projection_key=projection_key,
+                group_idx=group_idx,
+                dag_sha256s=[dag_sha256],
+                stage=stage,
+            )
+            if payload is None:
+                return _workflow_blocker_text(
+                    f"Verification graph proof for {projection_key} is unreadable or empty; "
+                    f"typed store recovery failed: {recover_error}"
+                )
+    proof = payload.get("proof")
+    if (
+        not payload.get("approved")
+        or not isinstance(proof, dict)
+        or not proof.get("proof_digest")
+    ):
+        return _workflow_blocker_text(
+            f"Verification graph aggregate for {projection_key} is not approved; "
+            "checkpoint requires aggregate graph proof, not summary-only approval."
+        )
+    if not _dag_verify_graph_payload_has_durable_projection(payload):
+        return _workflow_blocker_text(
+            f"Verification graph proof for {projection_key} is not durably "
+            "persisted before checkpoint."
+        )
+    verified, reload_error = await _load_verified_dag_verification_graph_projection(
+        runner,
+        payload,
+        projection_key=projection_key,
+        feature_id=str(feature.id),
+        group_idx=group_idx,
+        dag_sha256=dag_sha256,
+        stage=stage,
+    )
+    if reload_error or verified is None:
+        return _workflow_blocker_text(
+            f"Verification graph proof for {projection_key} is not backed by "
+            f"typed store reload evidence: {reload_error}"
+        )
+    payload = dict(payload)
+    payload["durable_projection"] = _dag_verify_graph_durable_metadata_from_reload(
+        None,
+        verified,
+    )
+    await runner.artifacts.put(
+        graph_key,
+        json.dumps(payload, sort_keys=True),
+        feature=feature,
+    )
+    validation_error = _validate_dag_verification_graph_payload(
+        payload,
+        projection_key=projection_key,
+        feature_id=str(feature.id),
+        group_idx=group_idx,
+        dag_sha256=dag_sha256,
+    )
+    if validation_error:
+        return _workflow_blocker_text(
+            validation_error
+        )
+    return ""
+
+
 async def _verify_and_fix_group(
     runner: WorkflowRunner,
     feature: Feature,
@@ -2665,6 +13551,9 @@ async def _verify_and_fix_group(
     known_task_ids: set[str] | None = None,
     initial_verdict: object | None = None,
     initial_verdict_key: str | None = None,
+    dag_sha256: str = "",
+    contracts_by_task_id: dict[str, Any] | None = None,
+    workspace_snapshots: list[Any] | None = None,
 ) -> tuple[bool, str]:
     """Verify a group's implementation and fix issues via RCA → fix → re-verify.
 
@@ -2698,6 +13587,13 @@ async def _verify_and_fix_group(
         _dag_repair_runtime_for("dag-rca", rca_runtime)
         if verify_fn is None else rca_runtime
     )
+    workspace_root = (
+        feature_root.parents[3]
+        if feature_root is not None and len(feature_root.parents) >= 4
+        else None
+    )
+    workspace_snapshots = list(workspace_snapshots or [])
+    current_verify_projection_key = initial_verdict_key
 
     # ── Initial verify ────────────────────────────────────────────────
     verify_results_context = list(results)
@@ -2763,21 +13659,38 @@ async def _verify_and_fix_group(
                 "result_count": len(results),
             },
         )
-        if verify_fn is None:
-            verdict = await _run_dag_group_preflight(
+        current_verify_projection_key = f"dag-verify:g{group_idx}:initial"
+        initial_preflight_failed = False
+        try:
+            if verify_fn is None:
+                preflight_verdict = await _run_dag_group_preflight(
+                    runner,
+                    feature,
+                    group_idx,
+                    "initial",
+                    group_tasks,
+                    verify_results_context,
+                    feature_root=feature_root,
+                    known_task_ids=known_task_ids,
+                )
+                if preflight_verdict is not None:
+                    verdict = preflight_verdict
+                    initial_preflight_failed = True
+            if verdict is None:
+                verdict = await _do_verify(
+                    runner, feature, verify_results_context, group_files, group_tasks,
+                    runtime=dag_review_runtime,
+                )
+        except Exception as exc:
+            verdict = await _record_dag_verifier_runtime_failure(
                 runner,
                 feature,
                 group_idx,
                 "initial",
-                group_tasks,
-                verify_results_context,
-                feature_root=feature_root,
-                known_task_ids=known_task_ids,
-            )
-        if verdict is None:
-            verdict = await _do_verify(
-                runner, feature, verify_results_context, group_files, group_tasks,
+                exc,
                 runtime=dag_review_runtime,
+                dag_sha256=dag_sha256,
+                projection_key=current_verify_projection_key,
             )
         logger.info(
             "DAG group verify finished group=%d attempt=initial approved=%s",
@@ -2797,10 +13710,48 @@ async def _verify_and_fix_group(
                 "runtime": dag_review_runtime,
             },
         )
-        await runner.artifacts.put(
-            f"dag-verify:g{group_idx}:initial",
-            to_str(verdict),
-            feature=feature,
+        initial_lens_verdicts: list[tuple[object, Verdict]] = []
+        initial_lens_failures: list[dict[str, Any]] = []
+        initial_raw_verifier_verdict = verdict
+        if (
+            not initial_preflight_failed
+            and isinstance(initial_raw_verifier_verdict, Verdict)
+            and _is_approved(initial_raw_verifier_verdict)
+        ):
+            verdict, initial_lens_verdicts, initial_lens_failures = await _run_checkpoint_required_dag_verify_lenses(
+                runner,
+                feature,
+                group_idx,
+                "initial",
+                verdict,
+                verify_results_context,
+                group_files,
+                group_tasks,
+                runtime=dag_final_review_runtime,
+                feature_root=feature_root,
+                projection_key=current_verify_projection_key,
+                dag_sha256=dag_sha256,
+            )
+        await _put_dag_verify_artifact(
+            runner,
+            feature,
+            current_verify_projection_key,
+            verdict,
+            group_idx=group_idx,
+            dag_sha256=dag_sha256,
+            lens_verdicts=initial_lens_verdicts,
+            required_lens_slugs=(
+                _dag_verify_required_lens_slugs()
+                if _is_approved(initial_raw_verifier_verdict)
+                else None
+            ),
+            lens_failures=initial_lens_failures,
+            tasks=group_tasks,
+            results=verify_results_context,
+            contracts_by_task_id=contracts_by_task_id or {},
+            workspace_snapshots=workspace_snapshots,
+            raw_verifier_verdict=initial_raw_verifier_verdict,
+            deterministic_preflight_failed=initial_preflight_failed,
         )
         # Ledger dedup + severity partition
         if isinstance(verdict, Verdict):
@@ -2823,6 +13774,22 @@ async def _verify_and_fix_group(
             initial_verdict_key or "<unknown>",
             _is_approved(verdict),
         )
+        if initial_verdict_key:
+            await _put_dag_verify_artifact(
+                runner,
+                feature,
+                initial_verdict_key,
+                verdict,
+                group_idx=group_idx,
+                dag_sha256=dag_sha256,
+                tasks=group_tasks,
+                results=verify_results_context,
+                contracts_by_task_id=contracts_by_task_id or {},
+                workspace_snapshots=workspace_snapshots,
+            )
+    initial_workflow_blocker = _workflow_blocker_from_verdict(verdict)
+    if initial_workflow_blocker:
+        return False, initial_workflow_blocker
 
     # ── RCA → fix → re-verify loop ───────────────────────────────────
     for retry in range(VERIFY_RETRIES):
@@ -2849,7 +13816,18 @@ async def _verify_and_fix_group(
             reason="not_classified",
             signature="",
         )
-        if verify_fn is None and isinstance(verdict, Verdict):
+        direct_route_verdict_allowed = (
+            isinstance(verdict, Verdict)
+            and (
+                verify_fn is None
+                or (
+                    retry == 0
+                    and bool(initial_verdict_key)
+                    and "commit" in str(initial_verdict_key).lower()
+                )
+            )
+        )
+        if direct_route_verdict_allowed:
             source_verdict_key = (
                 initial_verdict_key
                 if retry == 0 and initial_verdict_key
@@ -2891,11 +13869,20 @@ async def _verify_and_fix_group(
                             "same deterministic route signature repeated; "
                             "expanded verify and broad repair skipped"
                         ),
+                        dag_sha256=dag_sha256,
                     )
-                    await runner.artifacts.put(
-                        f"dag-verify:g{group_idx}:retry-{retry}",
-                        to_str(verdict),
-                        feature=feature,
+                    current_verify_projection_key = f"dag-verify:g{group_idx}:retry-{retry}"
+                    await _put_dag_verify_artifact(
+                        runner,
+                        feature,
+                        current_verify_projection_key,
+                        verdict,
+                        group_idx=group_idx,
+                        dag_sha256=dag_sha256,
+                        tasks=group_tasks,
+                        results=verify_results_context,
+                        contracts_by_task_id=contracts_by_task_id or {},
+                        workspace_snapshots=workspace_snapshots,
                     )
                     break
                 await _record_dag_direct_repair_route(
@@ -2915,6 +13902,7 @@ async def _verify_and_fix_group(
                         if direct_route.operator_required
                         else "deterministic route selected before expanded verify"
                     ),
+                    dag_sha256=dag_sha256,
                 )
                 if direct_route.operator_required:
                     logger.warning(
@@ -2923,12 +13911,70 @@ async def _verify_and_fix_group(
                         retry,
                         direct_route.route,
                     )
-                    await runner.artifacts.put(
-                        f"dag-verify:g{group_idx}:retry-{retry}",
-                        to_str(verdict),
-                        feature=feature,
+                    current_verify_projection_key = f"dag-verify:g{group_idx}:retry-{retry}"
+                    await _put_dag_verify_artifact(
+                        runner,
+                        feature,
+                        current_verify_projection_key,
+                        verdict,
+                        group_idx=group_idx,
+                        dag_sha256=dag_sha256,
+                        tasks=group_tasks,
+                        results=verify_results_context,
+                        contracts_by_task_id=contracts_by_task_id or {},
+                        workspace_snapshots=workspace_snapshots,
                     )
-                    break
+                    failure = _workspace_acl_operator_required_failure(
+                        group_idx=group_idx,
+                        context=f"direct-route-retry-{retry}",
+                        report=direct_route.workspace_permission_repair or {
+                            "operator_required": True,
+                            "operator_reasons": [
+                                direct_route.reason,
+                                *direct_route.target_files,
+                            ],
+                            "failed": [],
+                        },
+                    )
+                    return False, failure
+
+        if verify_fn is None and isinstance(verdict, Verdict):
+            repair_acl_targets = _dedupe_preserving_order([
+                *_dag_task_permission_targets(group_tasks),
+                *_dag_verdict_permission_targets(verdict, group_tasks),
+            ])
+            acl_report = await _normalize_dag_workspace_acl(
+                runner,
+                feature,
+                group_idx,
+                feature_root,
+                repair_acl_targets,
+                context=f"repair-dispatch-retry-{retry}",
+            )
+            writeability_problems = _dag_workspace_writeability_problems(
+                feature_root,
+                group_tasks,
+            )
+            if acl_report.get("operator_required") or writeability_problems:
+                await runner.artifacts.put(
+                    f"dag-writeability-preflight:g{group_idx}:retry-{retry}",
+                    json.dumps({
+                        "group_idx": group_idx,
+                        "retry": retry,
+                        "approved": False,
+                        "operator_required": True,
+                        "acl_normalization": acl_report,
+                        "problems": writeability_problems,
+                    }, indent=2),
+                    feature=feature,
+                )
+                failure = _workspace_acl_operator_required_failure(
+                    group_idx=group_idx,
+                    context=f"repair-dispatch-retry-{retry}",
+                    report=acl_report,
+                    problems=writeability_problems,
+                )
+                return False, failure
 
         feedback = _format_feedback("Verify", verdict)
         authority_gate = DagAuthorityGateOutcome()
@@ -2954,10 +14000,44 @@ async def _verify_and_fix_group(
             )
             if authority_gate.blocked_verdict is not None:
                 verdict = authority_gate.blocked_verdict
-                await runner.artifacts.put(
-                    f"dag-verify:g{group_idx}:retry-{retry}",
-                    to_str(verdict),
-                    feature=feature,
+                current_verify_projection_key = f"dag-verify:g{group_idx}:retry-{retry}"
+                final_lens_verdicts: list[tuple[object, Verdict]] = []
+                final_lens_failures: list[dict[str, Any]] = []
+                final_raw_verifier_verdict = verdict
+                if isinstance(final_raw_verifier_verdict, Verdict) and _is_approved(final_raw_verifier_verdict):
+                    verdict, final_lens_verdicts, final_lens_failures = await _run_checkpoint_required_dag_verify_lenses(
+                        runner,
+                        feature,
+                        group_idx,
+                        f"retry-{retry}",
+                        verdict,
+                        verify_results_context,
+                        group_files,
+                        group_tasks,
+                        runtime=dag_final_review_runtime,
+                        feature_root=feature_root,
+                        projection_key=current_verify_projection_key,
+                        dag_sha256=dag_sha256,
+                    )
+                await _put_dag_verify_artifact(
+                    runner,
+                    feature,
+                    current_verify_projection_key,
+                    verdict,
+                    group_idx=group_idx,
+                    dag_sha256=dag_sha256,
+                    lens_verdicts=final_lens_verdicts,
+                    required_lens_slugs=(
+                        _dag_verify_required_lens_slugs()
+                        if _is_approved(final_raw_verifier_verdict)
+                        else None
+                    ),
+                    lens_failures=final_lens_failures,
+                    tasks=group_tasks,
+                    results=verify_results_context,
+                    contracts_by_task_id=contracts_by_task_id or {},
+                    workspace_snapshots=workspace_snapshots,
+                    raw_verifier_verdict=final_raw_verifier_verdict,
                 )
                 break
             if not authority_gate.repair_results:
@@ -3029,6 +14109,9 @@ async def _verify_and_fix_group(
                         rca_runtime=dag_rca_runtime,
                         feedback=feedback,
                         fix_context=fix_context,
+                        dag_sha256=dag_sha256,
+                        contracts_by_task_id=contracts_by_task_id or {},
+                        workspace_snapshots=workspace_snapshots,
                     )
             except WorkflowCommitError as exc:
                 await _record_dag_commit_failure(
@@ -3044,13 +14127,55 @@ async def _verify_and_fix_group(
                     group_idx=group_idx,
                     stage=f"retry-{retry}",
                 )
-                await runner.artifacts.put(
-                    f"dag-verify:g{group_idx}:retry-{retry}",
-                    to_str(verdict),
-                    feature=feature,
+                current_verify_projection_key = f"dag-verify:g{group_idx}:retry-{retry}"
+                final_lens_verdicts: list[tuple[object, Verdict]] = []
+                final_lens_failures: list[dict[str, Any]] = []
+                final_raw_verifier_verdict = verdict
+                if isinstance(final_raw_verifier_verdict, Verdict) and _is_approved(final_raw_verifier_verdict):
+                    verdict, final_lens_verdicts, final_lens_failures = await _run_checkpoint_required_dag_verify_lenses(
+                        runner,
+                        feature,
+                        group_idx,
+                        f"retry-{retry}",
+                        verdict,
+                        verify_results_context,
+                        group_files,
+                        group_tasks,
+                        runtime=dag_final_review_runtime,
+                        feature_root=feature_root,
+                        projection_key=current_verify_projection_key,
+                        dag_sha256=dag_sha256,
+                    )
+                await _put_dag_verify_artifact(
+                    runner,
+                    feature,
+                    current_verify_projection_key,
+                    verdict,
+                    group_idx=group_idx,
+                    dag_sha256=dag_sha256,
+                    lens_verdicts=final_lens_verdicts,
+                    required_lens_slugs=(
+                        _dag_verify_required_lens_slugs()
+                        if _is_approved(final_raw_verifier_verdict)
+                        else None
+                    ),
+                    lens_failures=final_lens_failures,
+                    tasks=group_tasks,
+                    results=verify_results_context,
+                    contracts_by_task_id=contracts_by_task_id or {},
+                    workspace_snapshots=workspace_snapshots,
+                    raw_verifier_verdict=final_raw_verifier_verdict,
                 )
                 continue
             if parallel_fix_results:
+                sandbox_blocked = [
+                    result
+                    for result in parallel_fix_results
+                    if result.status == "blocked"
+                    and _is_workflow_blocker_text(str(result.summary))
+                ]
+                if sandbox_blocked:
+                    return False, "\n\n".join(str(result.summary) for result in sandbox_blocked)
                 all_results.extend(parallel_fix_results)
                 parallel_fix_task_ids = {result.task_id for result in parallel_fix_results}
                 verify_results_context = [
@@ -3191,26 +14316,40 @@ async def _verify_and_fix_group(
                         "authority_repair": authority_repair,
                     },
                 )
-                preflight_verdict = await _run_dag_group_preflight(
-                    runner,
-                    feature,
-                    group_idx,
-                    str(retry),
-                    group_tasks,
-                    verify_results_context,
-                    feature_root=feature_root,
-                    known_task_ids=known_task_ids,
-                )
-                if preflight_verdict is not None:
-                    verdict = preflight_verdict
-                else:
-                    verdict = await _do_verify(
+                final_preflight_failed = False
+                try:
+                    preflight_verdict = await _run_dag_group_preflight(
                         runner,
                         feature,
-                        verify_results_context,
-                        group_files,
+                        group_idx,
+                        str(retry),
                         group_tasks,
+                        verify_results_context,
+                        feature_root=feature_root,
+                        known_task_ids=known_task_ids,
+                    )
+                    if preflight_verdict is not None:
+                        verdict = preflight_verdict
+                        final_preflight_failed = True
+                    else:
+                        verdict = await _do_verify(
+                            runner,
+                            feature,
+                            verify_results_context,
+                            group_files,
+                            group_tasks,
+                            runtime=dag_final_review_runtime,
+                        )
+                except Exception as exc:
+                    verdict = await _record_dag_verifier_runtime_failure(
+                        runner,
+                        feature,
+                        group_idx,
+                        f"retry-{retry}",
+                        exc,
                         runtime=dag_final_review_runtime,
+                        dag_sha256=dag_sha256,
+                        projection_key=f"dag-verify:g{group_idx}:retry-{retry}",
                     )
                 logger.info(
                     "DAG group verify finished group=%d attempt=retry-%d approved=%s",
@@ -3233,10 +14372,45 @@ async def _verify_and_fix_group(
                         "authority_repair": authority_repair,
                     },
                 )
-                await runner.artifacts.put(
-                    f"dag-verify:g{group_idx}:retry-{retry}",
-                    to_str(verdict),
-                    feature=feature,
+                current_verify_projection_key = f"dag-verify:g{group_idx}:retry-{retry}"
+                final_lens_verdicts: list[tuple[object, Verdict]] = []
+                final_lens_failures: list[dict[str, Any]] = []
+                final_raw_verifier_verdict = verdict
+                if isinstance(final_raw_verifier_verdict, Verdict) and _is_approved(final_raw_verifier_verdict):
+                    verdict, final_lens_verdicts, final_lens_failures = await _run_checkpoint_required_dag_verify_lenses(
+                        runner,
+                        feature,
+                        group_idx,
+                        f"retry-{retry}",
+                        verdict,
+                        verify_results_context,
+                        group_files,
+                        group_tasks,
+                        runtime=dag_final_review_runtime,
+                        feature_root=feature_root,
+                        projection_key=current_verify_projection_key,
+                        dag_sha256=dag_sha256,
+                    )
+                await _put_dag_verify_artifact(
+                    runner,
+                    feature,
+                    current_verify_projection_key,
+                    verdict,
+                    group_idx=group_idx,
+                    dag_sha256=dag_sha256,
+                    lens_verdicts=final_lens_verdicts,
+                    required_lens_slugs=(
+                        _dag_verify_required_lens_slugs()
+                        if _is_approved(final_raw_verifier_verdict)
+                        else None
+                    ),
+                    lens_failures=final_lens_failures,
+                    tasks=group_tasks,
+                    results=verify_results_context,
+                    contracts_by_task_id=contracts_by_task_id or {},
+                    workspace_snapshots=workspace_snapshots,
+                    raw_verifier_verdict=final_raw_verifier_verdict,
+                    deterministic_preflight_failed=final_preflight_failed,
                 )
                 if isinstance(verdict, Verdict):
                     ledger = await _load_ledger(runner, feature)
@@ -3352,6 +14526,29 @@ async def _verify_and_fix_group(
                 )
             except Exception as rca_err:
                 logger.warning("DAG verify RCA failed: %s", rca_err)
+                failure = _workflow_blocker_text(
+                    "RCA runtime failed before product repair dispatch; "
+                    f"runtime={dag_rca_runtime or '<default>'} "
+                    f"group={group_idx} retry={retry}: {rca_err}"
+                )
+                await runner.artifacts.put(
+                    f"dag-runtime-failure:g{group_idx}:rca-retry-{retry}",
+                    json.dumps(
+                        {
+                            **_typed_runtime_provider_route_payload(
+                                group_idx=group_idx,
+                                retry=retry,
+                                runtime=dag_rca_runtime,
+                                error=rca_err,
+                                context="dag-rca",
+                            ),
+                            "blocked_before_product_repair": True,
+                        },
+                        sort_keys=True,
+                    ),
+                    feature=feature,
+                )
+                return False, failure
 
             if isinstance(rca_result, RootCauseAnalysis):
                 await runner.artifacts.put(
@@ -3362,25 +14559,145 @@ async def _verify_and_fix_group(
 
         # If RCA found a contradiction, escalate and use resolution
         fix_direction = ""
+        skip_product_fix = False
+        contradiction_fix_result: ImplementationResult | None = None
         if isinstance(rca_result, RootCauseAnalysis) and rca_result.confidence == "contradiction":
             logger.warning(
                 "DAG verify RCA detected contradiction in group %d: %s",
                 group_idx, rca_result.contradiction_detail[:200],
             )
-            resolution = await _escalate_contradiction(
-                runner, feature, "implementation", "verify",
-                BugGroup(
-                    group_id=f"dag-g{group_idx}-r{retry}",
-                    likely_root_cause=rca_result.hypothesis,
-                    severity="blocker",
-                ),
-                rca_result,
+            contradiction_group = BugGroup(
+                group_id=f"dag-g{group_idx}-r{retry}",
+                likely_root_cause=rca_result.hypothesis,
+                severity="blocker",
             )
-            fix_direction = (
-                f"\n\n## User Decision (from contradiction resolution)\n"
-                f"{resolution}\n\n"
-                f"Apply this direction — it overrides any conflicting spec.\n"
-            )
+            if (
+                _dag_auto_resolve_contradictions_enabled()
+                and autonomous_remainder_enabled(
+                    runner,
+                    feature,
+                    phase_name="implementation",
+                )
+            ):
+                planned = PlannedBugGroup(
+                    group=contradiction_group,
+                    rca=rca_result,
+                    issue_text=feedback,
+                    rca_key=f"dag-verify-rca:g{group_idx}:retry-{retry}",
+                )
+                resolver_runtime = _dag_repair_runtime_for(
+                    "dag-contradiction-resolve",
+                    dag_rca_runtime,
+                )
+                handoff = await _resolve_or_recover_dag_contradiction(
+                    runner,
+                    feature,
+                    group_idx,
+                    retry,
+                    planned,
+                    group_tasks=group_tasks,
+                    feature_root=feature_root,
+                    runtime=resolver_runtime,
+                    feedback=feedback,
+                )
+                if handoff.resolution is None:
+                    resolution_text = await _escalate_contradiction(
+                        runner,
+                        feature,
+                        "implementation",
+                        "verify",
+                        contradiction_group,
+                        rca_result,
+                    )
+                    fix_direction = (
+                        f"\n\n## User Decision (from contradiction resolution)\n"
+                        f"{resolution_text}\n\n"
+                        f"Apply this direction — it overrides any conflicting spec.\n"
+                    )
+                else:
+                    resolution = handoff.resolution
+                    record = handoff.resolution_record or {}
+                    if _dag_contradiction_needs_artifact_repair(resolution):
+                        _artifact_result, synthetic_result, artifact_record = (
+                            await _run_dag_artifact_repair_lane(
+                                runner,
+                                feature,
+                                group_idx,
+                                retry,
+                                planned,
+                                resolution,
+                                record,
+                                group_tasks=group_tasks,
+                                feature_root=feature_root,
+                                runtime=dag_impl_runtime,
+                                feedback=feedback,
+                                fix_context=fix_context,
+                                closure_path_problems=_dag_closure_path_problems_for_planned(
+                                    planned,
+                                    _dag_path_problems_from_verdict(verdict, group_tasks),
+                                    group_tasks,
+                                ),
+                            )
+                        )
+                        contradiction_fix_result = synthetic_result
+                        if _dag_contradiction_needs_product_fix(resolution):
+                            all_results.append(synthetic_result)
+                            verify_results_context = [
+                                *verify_results_context,
+                                synthetic_result,
+                            ]
+                        await _persist_dag_contradiction_handoff(
+                            runner,
+                            feature,
+                            group_idx,
+                            retry,
+                            planned,
+                            resolution,
+                            status="artifact_repair_dispatched",
+                            decision_source=handoff.decision_source,
+                            resolution_record=record,
+                            dispatches=[
+                                "artifact_repair",
+                                *(
+                                    ["product_code_fix"]
+                                    if _dag_contradiction_needs_product_fix(resolution)
+                                    else []
+                                ),
+                            ],
+                            skipped_lead_review_reason=(
+                                "typed_or_recovered_contradiction_handoff_consumed"
+                            ),
+                            decision_metadata=handoff.decision_metadata,
+                        )
+                    if _dag_contradiction_needs_product_fix(resolution):
+                        fix_direction = (
+                            f"\n\n## Accepted Contradiction Handoff\n"
+                            f"{_dag_contradiction_fix_guidance(resolution)}\n\n"
+                            f"Apply this direction — it overrides any conflicting spec.\n"
+                        )
+                    else:
+                        skip_product_fix = True
+                        contradiction_fix_result = (
+                            contradiction_fix_result
+                            or _dag_contradiction_synthetic_result(
+                                group_idx,
+                                retry,
+                                planned,
+                                resolution,
+                                record,
+                            )
+                        )
+            else:
+                resolution_text = await _escalate_contradiction(
+                    runner, feature, "implementation", "verify",
+                    contradiction_group,
+                    rca_result,
+                )
+                fix_direction = (
+                    f"\n\n## User Decision (from contradiction resolution)\n"
+                    f"{resolution_text}\n\n"
+                    f"Apply this direction — it overrides any conflicting spec.\n"
+                )
 
         fix_ws_path = str(feature_root) if feature_root else None
         logger.info(
@@ -3433,22 +14750,67 @@ async def _verify_and_fix_group(
                 f"{targets if targets else '- (from hook output/git status)'}\n"
             )
 
+        repair_binding: RuntimeSandboxTaskBinding | None = None
+        if not (skip_product_fix and contradiction_fix_result is not None):
+            try:
+                repair_binding = await _bind_repair_sandbox(
+                    runner,
+                    feature,
+                    workspace_root=workspace_root,
+                    feature_root=feature_root,
+                    dag_sha256=dag_sha256,
+                    group_idx=group_idx,
+                    retry=retry,
+                    repair_idx=0,
+                    repair_id=f"DAG-REPAIR-g{group_idx}-r{retry}",
+                    group_tasks=group_tasks,
+                    contracts_by_task_id=contracts_by_task_id,
+                    ws_path=fix_ws_path,
+                    snapshots=workspace_snapshots,
+                    runtime=dag_impl_runtime,
+                )
+            except SandboxWorkflowBlocker as exc:
+                return False, str(exc)
         fix_actor = _make_parallel_actor(
             implementer, f"g{group_idx}-fix-{retry}",
             runtime=dag_impl_runtime,
-            workspace_path=fix_ws_path,
+            workspace_path=(
+                str(repair_binding.binding.cwd)
+                if repair_binding is not None
+                else fix_ws_path
+            ),
+            runtime_workspace_binding=(
+                repair_binding.binding if repair_binding is not None else None
+            ),
+            sandbox_required=repair_binding is not None,
         )
         workspace_ctx = ""
-        if fix_ws_path:
+        fix_actor_ws_path = (
+            str(repair_binding.binding.cwd)
+            if repair_binding is not None
+            else fix_ws_path
+        )
+        if fix_actor_ws_path:
             workspace_ctx = (
                 f"\n\n## Workspace\n"
-                f"Your working directory is: `{fix_ws_path}`\n"
+                f"Your working directory is: `{fix_actor_ws_path}`\n"
                 f"All file reads and writes MUST use paths within this directory.\n"
                 f"Do NOT use absolute paths from search results that point to "
                 f"other copies of the same repo.\n"
             )
         contradiction_context = await _format_contradiction_decisions_context(
-            runner, feature,
+            runner,
+            feature,
+            group_idx=group_idx,
+            retry=retry,
+            group_tasks=group_tasks,
+            context_text="\n\n".join([
+                feedback,
+                rca_guidance,
+                fix_direction,
+                fix_context,
+            ]),
+            file_stem=f"g{group_idx}-fix-{retry}",
         )
 
         fix_context_package = await _build_prompt_context_package(
@@ -3483,15 +14845,68 @@ async def _verify_and_fix_group(
             "3. Apply targeted fixes — do NOT rewrite files unnecessarily\n"
             "4. Verify your fix addresses the specific concern/gap described"
         )
-        fix_result = await runner.run(
-            Ask(
-                actor=fix_actor,
-                prompt=fix_prompt,
-                output_type=ImplementationResult,
-            ),
-            feature,
-            phase_name="implementation",
-        )
+        if skip_product_fix and contradiction_fix_result is not None:
+            fix_result = contradiction_fix_result
+        else:
+            try:
+                fix_result = await runner.run(
+                    Ask(
+                        actor=fix_actor,
+                        prompt=fix_prompt,
+                        output_type=ImplementationResult,
+                    ),
+                    feature,
+                    phase_name="implementation",
+                )
+                if repair_binding is not None:
+                    await _capture_and_promote_sandbox_patch(
+                        repair_binding,
+                        task_id=f"DAG-REPAIR-g{group_idx}-r{retry}",
+                        promote=True,
+                        result=fix_result if isinstance(fix_result, ImplementationResult) else None,
+                    )
+            except SandboxWorkflowBlocker as exc:
+                return False, str(exc)
+            except Exception as fix_err:
+                if repair_binding is not None:
+                    try:
+                        await _capture_and_promote_sandbox_patch(
+                            repair_binding,
+                            task_id=f"DAG-REPAIR-g{group_idx}-r{retry}",
+                            promote=False,
+                        )
+                    except SandboxWorkflowBlocker as capture_blocker:
+                        return False, str(capture_blocker)
+                    except Exception:
+                        logger.warning(
+                            "DAG repair %s/%s failed to capture sandbox crash evidence",
+                            group_idx,
+                            retry,
+                            exc_info=True,
+                        )
+                failure = _workflow_blocker_text(
+                    "Repair runtime failed before product repair completion; "
+                    f"runtime={dag_impl_runtime or '<default>'} "
+                    f"group={group_idx} retry={retry}: {fix_err}"
+                )
+                await runner.artifacts.put(
+                    f"dag-runtime-failure:g{group_idx}:fix-retry-{retry}",
+                    json.dumps(
+                        {
+                            **_typed_runtime_provider_route_payload(
+                                group_idx=group_idx,
+                                retry=retry,
+                                runtime=dag_impl_runtime,
+                                error=fix_err,
+                                context="dag-fix",
+                            ),
+                            "blocked_during_product_repair": True,
+                        },
+                        sort_keys=True,
+                    ),
+                    feature=feature,
+                )
+                return False, failure
         if isinstance(fix_result, ImplementationResult):
             sanitized = await _sanitize_dag_repair_results(
                 runner,
@@ -3522,6 +14937,12 @@ async def _verify_and_fix_group(
                 feature=feature,
             )
         all_results.append(fix_result)
+        if (
+            isinstance(fix_result, ImplementationResult)
+            and fix_result.status == "blocked"
+                    and _is_workflow_blocker_text(str(fix_result.summary))
+        ):
+            return False, str(fix_result.summary)
         verify_results_context = [*verify_results_context, fix_result]
         verify_results_context = await _sanitize_dag_repair_results(
             runner,
@@ -3556,17 +14977,41 @@ async def _verify_and_fix_group(
                     retry=retry,
                     problems=remaining,
                 )
-                await runner.artifacts.put(
-                    f"dag-verify:g{group_idx}:retry-{retry}",
-                    to_str(verdict),
-                    feature=feature,
+                current_verify_projection_key = f"dag-verify:g{group_idx}:retry-{retry}"
+                await _put_dag_verify_artifact(
+                    runner,
+                    feature,
+                    current_verify_projection_key,
+                    verdict,
+                    group_idx=group_idx,
+                    dag_sha256=dag_sha256,
+                    tasks=group_tasks,
+                    results=verify_results_context,
+                    contracts_by_task_id=contracts_by_task_id or {},
+                    workspace_snapshots=workspace_snapshots,
                 )
                 continue
+        contract_guard = await _record_precommit_contract_verdicts(
+            runner,
+            feature,
+            dag_sha256=dag_sha256,
+            group_idx=group_idx,
+            stage=f"retry-{retry}",
+            feature_root=feature_root,
+            contracts_by_task_id=contracts_by_task_id or {},
+            results=_contract_guard_results_for_repair(
+                [fix_result],
+                contracts_by_task_id,
+            ),
+        )
+        if not contract_guard.approved:
+            return False, _workflow_blocker_text(contract_guard.failure)
         try:
             await _commit_repos(
                 runner,
                 feature,
                 f"fix: group {group_idx} verify retry {retry + 1}",
+                group_idx=group_idx,
                 failure_key=f"dag-commit-failure:g{group_idx}:retry-{retry}",
                 failure_metadata={
                     "group_idx": group_idx,
@@ -3589,10 +15034,18 @@ async def _verify_and_fix_group(
                 group_idx=group_idx,
                 stage=f"retry-{retry}",
             )
-            await runner.artifacts.put(
-                f"dag-verify:g{group_idx}:retry-{retry}",
-                to_str(verdict),
-                feature=feature,
+            current_verify_projection_key = f"dag-verify:g{group_idx}:retry-{retry}"
+            await _put_dag_verify_artifact(
+                runner,
+                feature,
+                current_verify_projection_key,
+                verdict,
+                group_idx=group_idx,
+                dag_sha256=dag_sha256,
+                tasks=group_tasks,
+                results=verify_results_context,
+                contracts_by_task_id=contracts_by_task_id or {},
+                workspace_snapshots=workspace_snapshots,
             )
             if isinstance(verdict, Verdict):
                 ledger = await _load_ledger(runner, feature)
@@ -3655,24 +15108,39 @@ async def _verify_and_fix_group(
                 "parallel_repair": False,
             },
         )
+        current_verify_projection_key = f"dag-verify:g{group_idx}:retry-{retry}"
         preflight_verdict = None
-        if verify_fn is None:
-            preflight_verdict = await _run_dag_group_preflight(
+        retry_preflight_failed = False
+        try:
+            if verify_fn is None:
+                preflight_verdict = await _run_dag_group_preflight(
+                    runner,
+                    feature,
+                    group_idx,
+                    str(retry),
+                    group_tasks,
+                    verify_results_context,
+                    feature_root=feature_root,
+                    known_task_ids=known_task_ids,
+                )
+            if preflight_verdict is not None:
+                verdict = preflight_verdict
+                retry_preflight_failed = True
+            else:
+                verdict = await _do_verify(
+                    runner, feature, verify_results_context, group_files, group_tasks,
+                    runtime=dag_final_review_runtime,
+                )
+        except Exception as exc:
+            verdict = await _record_dag_verifier_runtime_failure(
                 runner,
                 feature,
                 group_idx,
-                str(retry),
-                group_tasks,
-                verify_results_context,
-                feature_root=feature_root,
-                known_task_ids=known_task_ids,
-            )
-        if preflight_verdict is not None:
-            verdict = preflight_verdict
-        else:
-            verdict = await _do_verify(
-                runner, feature, verify_results_context, group_files, group_tasks,
+                f"retry-{retry}",
+                exc,
                 runtime=dag_final_review_runtime,
+                dag_sha256=dag_sha256,
+                projection_key=current_verify_projection_key,
             )
         logger.info(
             "DAG group verify finished group=%d attempt=retry-%d approved=%s",
@@ -3694,10 +15162,44 @@ async def _verify_and_fix_group(
                 "parallel_repair": False,
             },
         )
-        await runner.artifacts.put(
-            f"dag-verify:g{group_idx}:retry-{retry}",
-            to_str(verdict),
-            feature=feature,
+        retry_lens_verdicts: list[tuple[object, Verdict]] = []
+        retry_lens_failures: list[dict[str, Any]] = []
+        retry_raw_verifier_verdict = verdict
+        if isinstance(retry_raw_verifier_verdict, Verdict) and _is_approved(retry_raw_verifier_verdict):
+            verdict, retry_lens_verdicts, retry_lens_failures = await _run_checkpoint_required_dag_verify_lenses(
+                runner,
+                feature,
+                group_idx,
+                f"retry-{retry}",
+                verdict,
+                verify_results_context,
+                group_files,
+                group_tasks,
+                runtime=dag_final_review_runtime,
+                feature_root=feature_root,
+                projection_key=current_verify_projection_key,
+                dag_sha256=dag_sha256,
+            )
+        await _put_dag_verify_artifact(
+            runner,
+            feature,
+            current_verify_projection_key,
+            verdict,
+            group_idx=group_idx,
+            dag_sha256=dag_sha256,
+            lens_verdicts=retry_lens_verdicts,
+            required_lens_slugs=(
+                _dag_verify_required_lens_slugs()
+                if _is_approved(retry_raw_verifier_verdict)
+                else None
+            ),
+            lens_failures=retry_lens_failures,
+            tasks=group_tasks,
+            results=verify_results_context,
+            contracts_by_task_id=contracts_by_task_id or {},
+            workspace_snapshots=workspace_snapshots,
+            raw_verifier_verdict=retry_raw_verifier_verdict,
+            deterministic_preflight_failed=retry_preflight_failed,
         )
 
         # Ledger dedup + severity partition for re-verify
@@ -3714,13 +15216,58 @@ async def _verify_and_fix_group(
             await _append_enhancements(runner, feature, _enhancements)
             ledger = _update_ledger(ledger, ledger_verdict, "verify", 0)
             await _save_ledger(runner, feature, ledger)
+        retry_workflow_blocker = _workflow_blocker_from_verdict(verdict)
+        if retry_workflow_blocker:
+            return False, retry_workflow_blocker
 
     # ── Record outcomes + checkpoint ──────────────────────────────────
     if _is_approved(verdict):
+        graph_failure = await _require_dag_verification_graph_approval(
+            runner,
+            feature,
+            group_idx,
+            current_verify_projection_key,
+            verdict,
+            dag_sha256=dag_sha256,
+        )
+        if graph_failure:
+            await _record_dag_verification_graph_workflow_blocker(
+                runner,
+                feature,
+                group_idx,
+                current_verify_projection_key,
+                graph_failure,
+                dag_sha256=dag_sha256,
+            )
+            return False, graph_failure
+
         for r in results:
             if isinstance(r, ImplementationResult):
                 handover.record_success(r)
 
+        contract_guard = await _record_precommit_contract_verdicts(
+            runner,
+            feature,
+            dag_sha256=dag_sha256,
+            group_idx=group_idx,
+            stage="checkpoint",
+            feature_root=feature_root,
+            contracts_by_task_id=contracts_by_task_id or {},
+            results=_contract_guard_results_for_repair(
+                results,
+                contracts_by_task_id,
+            ),
+        )
+        if not contract_guard.approved:
+            return False, _workflow_blocker_text(contract_guard.failure)
+
+        await _record_dag_group_commit_intent(
+            runner,
+            feature,
+            group_idx,
+            group_tasks,
+            dag_sha256=dag_sha256,
+        )
         try:
             commit_hash = await _commit_group(runner, feature, group_idx, group_tasks)
         except WorkflowCommitError as exc:
@@ -3738,11 +15285,46 @@ async def _verify_and_fix_group(
                 group_idx=group_idx,
                 stage="checkpoint",
             )
-            await runner.artifacts.put(
+            await _put_dag_verify_artifact(
+                runner,
+                feature,
                 f"dag-verify:g{group_idx}:checkpoint-commit",
-                to_str(verdict),
-                feature=feature,
+                verdict,
+                group_idx=group_idx,
+                dag_sha256=dag_sha256,
+                tasks=group_tasks,
+                results=verify_results_context,
+                contracts_by_task_id=contracts_by_task_id or {},
+                workspace_snapshots=workspace_snapshots,
             )
+            direct_route = _classify_dag_direct_repair_route(verdict)
+            if direct_route.route != _NORMAL_VERIFY_ROUTE:
+                direct_route = await _normalize_direct_route_workspace_permissions(
+                    runner,
+                    feature,
+                    group_idx,
+                    VERIFY_RETRIES,
+                    feature_root,
+                    direct_route,
+                )
+                await _record_dag_checkpoint_direct_repair_route(
+                    runner,
+                    feature,
+                    group_idx,
+                    direct_route,
+                    status=(
+                        "operator_blocked"
+                        if direct_route.operator_required
+                        else "selected"
+                    ),
+                    source_verdict_key=f"dag-verify:g{group_idx}:checkpoint-commit",
+                    guardrail_decision=(
+                        "operator/worktree blocker detected after verifier approval"
+                        if direct_route.operator_required
+                        else "deterministic commit route selected after verifier approval"
+                    ),
+                    dag_sha256=dag_sha256,
+                )
             for r in results:
                 if isinstance(r, ImplementationResult):
                     handover.record_failure(
@@ -3750,37 +15332,90 @@ async def _verify_and_fix_group(
                         r.summary,
                         _format_feedback("Commit", verdict),
                     )
-            return False, _format_feedback("Commit", verdict)
+            return False, _workflow_blocker_text(_format_feedback("Commit", verdict))
+        if not commit_hash:
+            authorized_sources = await _checkpoint_authorized_repo_sources(
+                runner,
+                feature,
+                feature_root,
+                group_idx=group_idx,
+            )
+            commit_hash = _current_feature_repo_heads(
+                runner,
+                feature,
+                feature_root=feature_root,
+                authorized_repos=set(authorized_sources) if authorized_sources is not None else None,
+                authorized_source_roots=authorized_sources,
+            )
+        await _record_dag_group_commit_proof(
+            runner,
+            feature,
+            group_idx,
+            group_tasks,
+            dag_sha256=dag_sha256,
+            commit_hash=commit_hash,
+            feature_root=feature_root,
+        )
+
+        checkpoint_results = [
+            r.model_dump()
+            for r in results
+            if isinstance(r, ImplementationResult)
+        ]
+        checkpoint_gate_proof = await _record_dag_checkpoint_gate_proof(
+            runner,
+            feature,
+            group_idx,
+            group_tasks,
+            dag_sha256=dag_sha256,
+            projection_key=current_verify_projection_key or f"dag-verify:g{group_idx}:checkpoint",
+            commit_hash=commit_hash,
+            checkpoint_results=checkpoint_results,
+            feature_root=feature_root,
+        )
+        await runner.artifacts.put(
+            f"dag-checkpoint-gate-proof:{group_idx}",
+            _json.dumps(checkpoint_gate_proof, sort_keys=True),
+            feature=feature,
+        )
+        if checkpoint_gate_proof.get("persisted") is not True:
+            route_bits = [
+                f"failure_class={checkpoint_gate_proof.get('failure_class') or 'checkpoint_gate'}",
+                f"failure_type={checkpoint_gate_proof.get('failure_type') or 'missing_checkpoint_gate_evidence'}",
+                f"route={checkpoint_gate_proof.get('route') or 'merge_queue'}",
+                f"retryable={checkpoint_gate_proof.get('retryable')}",
+                f"operator_required={checkpoint_gate_proof.get('operator_required')}",
+            ]
+            no_dirty_proof = checkpoint_gate_proof.get("no_dirty_proof")
+            if isinstance(no_dirty_proof, dict) and no_dirty_proof.get("reason"):
+                route_bits.append(f"no_dirty_reason={no_dirty_proof.get('reason')}")
+            return False, _workflow_blocker_text(
+                "Checkpoint gate proof is not durably backed by typed merge "
+                f"and checkpoint evidence for group {group_idx}; "
+                + " ".join(route_bits)
+            )
 
         checkpoint = {
             "group_idx": group_idx,
             "task_ids": [t.id for t in group_tasks],
-            "results": [
-                r.model_dump()
-                for r in results
-                if isinstance(r, ImplementationResult)
-            ],
+            "results": checkpoint_results,
             "verdict": "approved",
             "commit_hash": commit_hash,
+            "dag_sha256": dag_sha256,
         }
-        await runner.artifacts.put(
-            f"dag-group:{group_idx}",
-            _json.dumps(checkpoint),
-            feature=feature,
-        )
-        await _log_feature_event(
+        checkpoint_projected, checkpoint_projection_error = await _project_dag_group_checkpoint(
             runner,
-            feature.id,
-            "dag_group_checkpoint",
-            "implementation",
-            content=f"group {group_idx}",
-            metadata={
-                "group_idx": group_idx,
-                "task_ids": [t.id for t in group_tasks],
-                "commit_hash": commit_hash,
-                "result_count": len(checkpoint["results"]),
-            },
+            feature,
+            group_idx,
+            checkpoint,
+            dag_sha256=dag_sha256,
+            checkpoint_gate_proof=checkpoint_gate_proof,
         )
+        if not checkpoint_projected:
+            return False, _workflow_blocker_text(
+                "Group checkpoint projection is not durably backed by the typed "
+                f"execution journal for group {group_idx}: {checkpoint_projection_error}"
+            )
         await enqueue_public_exhibit_refresh(
             runner,
             feature,
@@ -3801,9 +15436,693 @@ async def _verify_and_fix_group(
         return False, _format_feedback("Verify", verdict)
 
 
+# `_dag_quiesce_after_group` is shimmed from `..execution.control_plane`
+# (Slice 12a-1 — see the shim re-export block at `:798-845` above). It
+# remains accessible under the legacy `implementation._dag_quiesce_after_
+# group` name via the shim so every existing reader continues to work.
+
+
+async def _maybe_quiesce_before_group_dispatch(
+    runner: WorkflowRunner,
+    feature: Feature,
+    dag: ImplementationDAG,
+    *,
+    group_idx: int,
+) -> str:
+    after_group = _dag_quiesce_after_group()
+    if after_group is None or group_idx != after_group + 1:
+        return ""
+
+    marker_key = f"dag-quiesce:g{after_group}-before-g{group_idx}"
+    artifacts = getattr(runner, "artifacts", None)
+    get_artifact = getattr(artifacts, "get", None)
+    put_artifact = getattr(artifacts, "put", None)
+    previous_checkpoint = ""
+    if callable(get_artifact):
+        previous_checkpoint = await get_artifact(
+            f"dag-group:{after_group}",
+            feature=feature,
+        )
+    if not previous_checkpoint:
+        return ""
+    dag_json = dag.model_dump_json()
+    next_group_task_ids = list(dag.execution_order[group_idx]) if group_idx < len(dag.execution_order) else []
+    expected_identity = {
+        "dag_sha256": hashlib.sha256(dag_json.encode("utf-8")).hexdigest(),
+        "prior_checkpoint_sha256": hashlib.sha256(str(previous_checkpoint).encode("utf-8")).hexdigest(),
+        "next_group_task_ids": next_group_task_ids,
+        "completed_checkpoint_range": list(range(0, after_group + 1)),
+    }
+    latest_summary = getattr(artifacts, "latest_summary", None)
+    if callable(latest_summary):
+        try:
+            feature_obj = feature
+            summary = await latest_summary("dag", feature=feature_obj)
+            if summary and summary.get("id") is not None:
+                expected_identity["active_dag_artifact_id"] = summary.get("id")
+        except Exception:
+            pass
+    if callable(get_artifact):
+        existing = await get_artifact(marker_key, feature=feature)
+        if existing:
+            try:
+                existing_payload = json.loads(existing)
+            except (TypeError, ValueError):
+                existing_payload = {}
+            if (
+                str(existing_payload.get("status", "")).lower() == "complete"
+                and _quiesce_marker_matches(existing_payload, expected_identity)
+            ):
+                return ""
+
+    payload: dict[str, Any] = {
+        "status": "started",
+        "after_group_idx": after_group,
+        "before_group_idx": group_idx,
+        "prior_checkpoint_key": f"dag-group:{after_group}",
+        "next_group_task_ids": next_group_task_ids,
+        "active_dag_task_count": len(dag.tasks),
+        **expected_identity,
+        "created_at": time.time(),
+    }
+    if callable(put_artifact):
+        await put_artifact(marker_key, json.dumps(payload, indent=2), feature=feature)
+    await _log_feature_event(
+        runner,
+        feature.id,
+        "dag_quiesce_before_dispatch",
+        "implementation",
+        content=f"g{after_group}->g{group_idx}",
+        metadata={
+            "after_group_idx": after_group,
+            "before_group_idx": group_idx,
+            "marker_key": marker_key,
+        },
+    )
+
+    services = getattr(runner, "services", {}) or {}
+    hook = services.get("dag_quiesce_hook") or services.get("quiesce_hook")
+    hook_result: Any = None
+    if callable(hook):
+        try:
+            hook_result = hook(
+                runner=runner,
+                feature=feature,
+                payload=dict(payload),
+                after_group_idx=after_group,
+                before_group_idx=group_idx,
+            )
+        except TypeError:
+            hook_result = hook(dict(payload))
+        if _asyncio.iscoroutine(hook_result):
+            hook_result = await hook_result
+
+    payload["status"] = "complete"
+    if isinstance(hook_result, dict):
+        payload["hook_result"] = hook_result
+        status = str(hook_result.get("status", "")).lower()
+        approved = hook_result.get("approved")
+        if approved is False or status in {"blocked", "rejected", "paused"}:
+            payload["status"] = status or "blocked"
+            if callable(put_artifact):
+                await put_artifact(
+                    marker_key,
+                    json.dumps(payload, indent=2),
+                    feature=feature,
+                )
+            return (
+                "DAG dispatch paused by quiesce hook after group "
+                f"{after_group} before group {group_idx}: "
+                f"{hook_result.get('reason') or hook_result.get('summary') or status}"
+            )
+    elif hook_result is False:
+        payload["status"] = "blocked"
+        if callable(put_artifact):
+            await put_artifact(marker_key, json.dumps(payload, indent=2), feature=feature)
+        return (
+            "DAG dispatch paused by quiesce hook after group "
+            f"{after_group} before group {group_idx}."
+        )
+
+    if callable(put_artifact):
+        await put_artifact(marker_key, json.dumps(payload, indent=2), feature=feature)
+    return ""
+
+
+async def _resolve_active_regroup_before_group_dispatch(
+    runner: WorkflowRunner,
+    feature: Feature,
+    dag: ImplementationDAG,
+    *,
+    group_idx: int,
+) -> tuple[ImplementationDAG | None, str, dict[str, Any]]:
+    """Resolve the active regroup overlay before a group is dispatched.
+
+    Slice 09c-2 dispatch-resolution swap (doc 09 § "Refactoring Steps" 2). The
+    typed :class:`RegroupOverlayResolver` reads typed overlay state FIRST and
+    quiesces FAIL-CLOSED on ANY id / hash / status / digest / projection-link
+    mismatch; a stale or orphaned typed overlay can never make an invalid
+    overlay executable. The return shape — ``(effective_dag, failure_text,
+    observation)`` — is unchanged, so the three ``_implement_dag`` call sites
+    are not touched:
+
+    - ``effective_dag is not None and effective_dag is not dag`` → the resolved
+      overlay; the caller swaps to it.
+    - ``failure_text`` non-empty → dispatch quiesces.
+    - ``effective_dag is dag`` and no failure → no overlay applies; dispatch
+      proceeds unchanged.
+
+    Resolution order:
+
+    1. The typed :class:`RegroupOverlayResolver`. When an ``active`` typed
+       overlay row exists, the resolver is authoritative — it either applies
+       the overlay (returns the derived effective DAG) or quiesces fail-closed
+       (a ``regroup_invalid`` failure). The typed resolver is NOT scoped to
+       ``DAG_REGROUP_FROM_GROUP`` — it resolves an overlay at its own typed
+       ``group_idx_offset``, so a typed regroup at any offset is supported.
+    2. When NO typed overlay row exists (``has_typed_overlay=False``), the
+       resolver makes no decision and this function falls through to the
+       UNCHANGED legacy G45-G73 marker path
+       (:func:`_resolve_active_regroup_legacy_marker`). doc 09
+       § "Refactoring Steps" 2: the legacy projection aliases remain readable
+       "to support existing G45-G73 artifacts during the same atomic landing".
+
+    A feature with NO active overlay (neither a typed row nor a legacy marker)
+    dispatches EXACTLY as before — the legacy path's
+    ``missing_active_regroup_marker`` / ``not_regroup_boundary`` returns are
+    preserved byte-for-byte.
+    """
+
+    # ── (1) the typed RegroupOverlayResolver (Slice 09c-2) ──────────────────
+    typed = await _resolve_active_regroup_typed_overlay(
+        runner, feature, dag, group_idx=group_idx
+    )
+    if typed is not None:
+        # The typed resolver found an `active` typed overlay row and is
+        # authoritative for this dispatch group (apply OR fail-closed quiesce).
+        return typed
+
+    # ── (2) no typed overlay — the UNCHANGED legacy G45-G73 marker path ─────
+    return await _resolve_active_regroup_legacy_marker(
+        runner, feature, dag, group_idx=group_idx
+    )
+
+
+async def _resolve_active_regroup_typed_overlay(
+    runner: WorkflowRunner,
+    feature: Feature,
+    dag: ImplementationDAG,
+    *,
+    group_idx: int,
+) -> tuple[ImplementationDAG | None, str, dict[str, Any]] | None:
+    """Run the typed :class:`RegroupOverlayResolver` for a dispatch group.
+
+    Returns ``None`` when there is NO ``active`` typed overlay row (the caller
+    then falls through to the legacy G45-G73 marker path) — this is the
+    no-typed-overlay signal, and it is also returned when the Slice 09 modules
+    or an execution-control store are unavailable so the legacy path stays the
+    behavior in old installs / store-less runs.
+
+    Otherwise returns the ``(effective_dag, failure_text, observation)`` tuple:
+
+    - **applied** → ``(effective_dag, "", observation)`` with ``effective_dag``
+      the base DAG carrying the overlay's derived effective execution order.
+    - **quiesce** → ``(None, failure_text, observation)`` — dispatch fails
+      closed on a stale / orphaned / mismatched typed overlay.
+
+    FAIL-CLOSED is the core property: a typed overlay that exists but does not
+    pass every resolver check produces a quiesce, NEVER an executable result.
+    A store / DB error while a typed overlay is KNOWN to exist is itself a
+    fail-closed quiesce (the resolver cannot prove the overlay safe).
+    """
+
+    if RegroupOverlayResolver is None or RegroupOverlayStore is None:
+        # Slice 09 modules absent (old install) — defer to the legacy path.
+        return None
+    store = _execution_control_store_for_runner(runner)
+    if store is None:
+        # No execution-control store/pool — the typed overlay tables cannot be
+        # read. Defer to the legacy artifact-store marker path.
+        return None
+    feature_id = str(getattr(feature, "id", "") or "")
+    if not feature_id:
+        return None
+
+    try:
+        async with _merge_queue_connection(store) as conn:
+            resolution = await RegroupOverlayResolver(
+                RegroupOverlayStore(conn)
+            ).resolve(feature_id, group_idx)
+    except Exception as exc:  # noqa: BLE001
+        # A store/DB error. We do not yet know whether a typed overlay exists,
+        # so this cannot be silently downgraded to the legacy path — but it
+        # also must not crash dispatch. Probe once more with a fresh connection
+        # ONLY to learn whether an active typed overlay row exists; if it does,
+        # fail closed; if not (or the probe also errors), defer to legacy.
+        logger.debug(
+            "Typed regroup resolver errored for feature %s group %d",
+            feature_id,
+            group_idx,
+            exc_info=True,
+        )
+        active_exists = await _typed_regroup_active_overlay_probe(
+            store, feature_id
+        )
+        if not active_exists:
+            return None
+        return None, (
+            "DAG dispatch paused before group "
+            f"{group_idx}: typed regroup overlay state could not be read "
+            f"({type(exc).__name__})."
+        ), {
+            "applied": False,
+            "reason": "regroup_invalid_resolver_error",
+            "error": str(exc),
+        }
+
+    if not resolution.has_typed_overlay:
+        # No active typed overlay row — defer to the legacy G45-G73 path.
+        return None
+
+    if not resolution.applied or resolution.effective_execution_order is None:
+        # has_typed_overlay and not applied → fail-closed quiesce.
+        return None, (
+            "DAG dispatch paused before group "
+            f"{group_idx}: active typed regroup overlay failed validation "
+            f"({resolution.quiesce_reason})."
+        ), {
+            "applied": False,
+            "reason": resolution.quiesce_reason or "regroup_invalid",
+            "overlay_id": resolution.overlay_id,
+            "validation": resolution.details[:20],
+        }
+
+    # Applied: record the diagnostic observation + the typed `applied` event
+    # (doc 09 § "Refactoring Steps" 9 — the resolver observation path). This
+    # runs whether or not the effective order differs from the base DAG: the
+    # resolver DID run and select a typed overlay.
+    observation = dict(resolution.observation)
+    await _write_typed_regroup_observation(
+        runner, feature, feature_id, group_idx, observation
+    )
+    # The root `dag` is never overwritten. When the effective order equals the
+    # current dag's order there is nothing to swap — return the same `dag`
+    # object so the caller's `is not dag` check treats it as a no-op; otherwise
+    # a deep copy carries the overlay's derived effective execution order.
+    if list(dag.execution_order) == resolution.effective_execution_order:
+        return dag, "", observation
+    effective_dag = dag.model_copy(deep=True)
+    effective_dag.execution_order = [
+        list(group) for group in resolution.effective_execution_order
+    ]
+    return effective_dag, "", observation
+
+
+async def _write_typed_regroup_observation(
+    runner: WorkflowRunner,
+    feature: Feature,
+    feature_id: str,
+    group_idx: int,
+    observation: dict[str, Any],
+) -> None:
+    """Write the typed-resolver diagnostic observation artifact + event.
+
+    doc 09 § "Refactoring Steps" 9: "a resolver observation path that records
+    which overlay was applied, which evidence ids justified it". The
+    observation artifact is keyed ``dag-regroup-observation:{overlay_slug}``;
+    it is a DIAGNOSTIC projection and can never make an invalid overlay
+    executable (the resolver already decided the overlay is executable). The
+    artifact write is best-effort — a failure to record the diagnostic must
+    not fail an otherwise-valid dispatch.
+    """
+
+    put_artifact = getattr(getattr(runner, "artifacts", None), "put", None)
+    if callable(put_artifact):
+        slug = str(observation.get("overlay_slug") or "")
+        obs_key = (
+            f"dag-regroup-observation:{slug}"
+            if slug
+            else DAG_REGROUP_OBSERVATION_KEY
+        )
+        try:
+            await put_artifact(
+                obs_key,
+                json.dumps(observation, indent=2, sort_keys=True),
+                feature=feature,
+            )
+        except Exception:  # noqa: BLE001 - observation is diagnostic only
+            logger.debug(
+                "Failed to write typed regroup observation artifact",
+                exc_info=True,
+            )
+    await _log_feature_event(
+        runner,
+        feature_id,
+        "dag_regroup_overlay_applied",
+        "implementation",
+        content=f"g{group_idx}",
+        metadata=observation,
+    )
+
+
+async def _typed_regroup_active_overlay_probe(
+    store: Any, feature_id: str
+) -> bool:
+    """Whether an ``active`` ``execution_regroup_overlays`` row exists.
+
+    Used only after the resolver itself errored: it learns whether a typed
+    overlay is present so the caller can decide between a fail-closed quiesce
+    (a typed overlay exists but could not be proven safe) and deferring to the
+    legacy path (no typed overlay). Any error here is treated as "not present"
+    so a transient DB blip cannot block a feature that never had a typed
+    overlay.
+    """
+
+    try:
+        async with _merge_queue_connection(store) as conn:
+            found = await conn.fetchval(
+                "SELECT 1 FROM execution_regroup_overlays "
+                "WHERE feature_id = $1 AND status = 'active' LIMIT 1",
+                feature_id,
+            )
+            return found is not None
+    except Exception:  # noqa: BLE001 - probe failure → treat as not present.
+        logger.debug(
+            "Typed regroup active-overlay probe failed for feature %s",
+            feature_id,
+            exc_info=True,
+        )
+        return False
+
+
+async def _typed_regroup_active_overlay_offset(
+    runner: WorkflowRunner, feature_id: str
+) -> int | None:
+    """The ``group_idx_offset`` of the active typed regroup overlay, or None.
+
+    Slice 09e-1b P3-D re-gating. The 3 ``_implement_dag`` regroup call sites
+    were gated on the legacy ``dag-regroup-active:g45-g73`` artifact marker, so
+    the typed :class:`RegroupOverlayResolver` was in practice reachable ONLY
+    for an offset-45 overlay. Slice 09e-1b's ``command_activate`` rewire makes
+    a typed overlay at ANY ``group_idx_offset`` activatable, so the call sites
+    must also learn the typed overlay's offset to gate / probe at the right
+    group.
+
+    This is a bounded read-only probe — ``SELECT group_idx_offset`` from the
+    single ``active`` ``execution_regroup_overlays`` row (the
+    ``uniq_regroup_overlay_active`` partial unique index guarantees at most
+    one). Returns ``None`` when there is no active typed overlay, when the
+    Slice 09 modules / an execution-control store are unavailable, or when the
+    probe errors — i.e. ``None`` means "no typed regroup overlay is in play",
+    so a feature with no typed overlay keeps its legacy / non-overlay behavior
+    EXACTLY (the gating then falls back to the legacy ``DAG_REGROUP_FROM_GROUP``
+    constant). A transient DB error must not block dispatch, so an error here
+    is treated as "not present" — the typed resolver's own fail-closed path
+    (:func:`_resolve_active_regroup_typed_overlay`) still quiesces if a typed
+    overlay genuinely exists but cannot be proven safe.
+    """
+
+    if RegroupOverlayResolver is None or RegroupOverlayStore is None:
+        return None
+    if not feature_id:
+        return None
+    store = _execution_control_store_for_runner(runner)
+    if store is None:
+        return None
+    try:
+        async with _merge_queue_connection(store) as conn:
+            offset = await conn.fetchval(
+                "SELECT group_idx_offset FROM execution_regroup_overlays "
+                "WHERE feature_id = $1 AND status = 'active' LIMIT 1",
+                feature_id,
+            )
+            return None if offset is None else int(offset)
+    except Exception:  # noqa: BLE001 - probe failure → treat as not present.
+        logger.debug(
+            "Typed regroup active-overlay offset probe failed for feature %s",
+            feature_id,
+            exc_info=True,
+        )
+        return None
+
+
+async def _resolve_active_regroup_legacy_marker(
+    runner: WorkflowRunner,
+    feature: Feature,
+    dag: ImplementationDAG,
+    *,
+    group_idx: int,
+) -> tuple[ImplementationDAG | None, str, dict[str, Any]]:
+    """Load and validate a persisted regroup marker for G45+ execution.
+
+    The UNCHANGED legacy G45-G73 marker path. Slice 09c-2 keeps this exactly as
+    it was — it is the no-typed-overlay fallback of
+    :func:`_resolve_active_regroup_before_group_dispatch` (doc 09
+    § "Refactoring Steps" 2: legacy projection aliases stay readable during the
+    atomic landing). When a typed overlay row exists the typed
+    :class:`RegroupOverlayResolver` is authoritative and this path is not run.
+    """
+
+    if group_idx < DAG_REGROUP_FROM_GROUP:
+        return dag, "", {"applied": False, "reason": "not_regroup_boundary"}
+    artifacts = getattr(runner, "artifacts", None)
+    get_artifact = getattr(artifacts, "get", None)
+    put_artifact = getattr(artifacts, "put", None)
+    if not callable(get_artifact):
+        return None, (
+            "DAG dispatch paused before group "
+            f"{group_idx}: artifact store cannot load persisted regroup state."
+        ), {"applied": False, "reason": "missing_artifact_get"}
+
+    active_text = await get_artifact(DAG_REGROUP_ACTIVE_KEY, feature=feature)
+    if not active_text:
+        return None, (
+            "DAG dispatch paused before group "
+            f"{group_idx}: {DAG_REGROUP_ACTIVE_KEY} is missing."
+        ), {"applied": False, "reason": "missing_active_regroup_marker"}
+    try:
+        active_marker = json.loads(active_text)
+    except (TypeError, ValueError) as exc:
+        return None, (
+            "DAG dispatch paused before group "
+            f"{group_idx}: {DAG_REGROUP_ACTIVE_KEY} is not valid JSON ({exc})."
+        ), {"applied": False, "reason": "invalid_active_regroup_marker"}
+    if not isinstance(active_marker, dict):
+        return None, (
+            "DAG dispatch paused before group "
+            f"{group_idx}: {DAG_REGROUP_ACTIVE_KEY} must be a JSON object."
+        ), {
+            "applied": False,
+            "reason": "invalid_active_regroup_marker_type",
+            "marker_type": type(active_marker).__name__,
+        }
+    if str(active_marker.get("status", "")).lower() != "active":
+        return None, (
+            "DAG dispatch paused before group "
+            f"{group_idx}: {DAG_REGROUP_ACTIVE_KEY} is not active."
+        ), {
+            "applied": False,
+            "reason": "inactive_active_regroup_marker",
+            "status": active_marker.get("status"),
+        }
+
+    canonical_key = str(active_marker.get("canonical_artifact_key") or "").strip()
+    expected_canonical_sha = str(
+        active_marker.get("regroup_sha256")
+        or active_marker.get("canonical_sha256")
+        or ""
+    ).strip()
+    required_marker_fields = {
+        "canonical_artifact_key": canonical_key,
+        "regroup_sha256": expected_canonical_sha,
+        "rollback_artifact_key": str(active_marker.get("rollback_artifact_key") or "").strip(),
+        "base_dag_artifact_id": active_marker.get("base_dag_artifact_id"),
+        "base_dag_sha256": str(active_marker.get("base_dag_sha256") or "").strip(),
+    }
+    missing_marker_fields = sorted(
+        field_name for field_name, value in required_marker_fields.items() if not value
+    )
+    if missing_marker_fields:
+        return None, (
+            "DAG dispatch paused before group "
+            f"{group_idx}: active regroup marker is missing activation proof fields."
+        ), {
+            "applied": False,
+            "reason": "active_regroup_marker_incomplete",
+            "missing_fields": missing_marker_fields,
+        }
+    if canonical_key != DAG_REGROUP_CANONICAL_KEY:
+        return None, (
+            "DAG dispatch paused before group "
+            f"{group_idx}: active marker points at unexpected regroup key {canonical_key!r}."
+        ), {
+            "applied": False,
+            "reason": "unexpected_canonical_regroup_key",
+            "canonical_artifact_key": canonical_key,
+        }
+
+    canonical_record = await _dag_artifact_record_for_key(
+        runner,
+        feature,
+        canonical_key,
+    )
+    if canonical_record is None:
+        return None, (
+            "DAG dispatch paused before group "
+            f"{group_idx}: canonical regroup artifact {canonical_key} is missing."
+        ), {"applied": False, "reason": "missing_canonical_regroup"}
+    canonical_text = str(canonical_record.get("value") or "")
+    canonical_sha = str(canonical_record.get("sha256") or "")
+    if expected_canonical_sha != canonical_sha:
+        return None, (
+            "DAG dispatch paused before group "
+            f"{group_idx}: canonical regroup hash does not match active marker."
+        ), {
+            "applied": False,
+            "reason": "canonical_regroup_hash_mismatch",
+            "expected_sha256": expected_canonical_sha,
+            "actual_sha256": canonical_sha,
+        }
+
+    try:
+        derived = DerivedDAGArtifact.model_validate_json(str(canonical_text))
+    except Exception as exc:
+        return None, (
+            "DAG dispatch paused before group "
+            f"{group_idx}: canonical regroup artifact is invalid ({exc})."
+        ), {"applied": False, "reason": "invalid_canonical_regroup"}
+    if derived.group_idx_offset != DAG_REGROUP_FROM_GROUP:
+        return None, (
+            "DAG dispatch paused before group "
+            f"{group_idx}: regroup offset is {derived.group_idx_offset}."
+        ), {"applied": False, "reason": "regroup_offset_mismatch"}
+
+    base_record = await _dag_artifact_record_for_key(
+        runner,
+        feature,
+        derived.source_dag_key or "dag",
+    )
+    if base_record is None:
+        return None, (
+            "DAG dispatch paused before group "
+            f"{group_idx}: source DAG {derived.source_dag_key!r} is missing."
+        ), {"applied": False, "reason": "missing_source_dag"}
+    base_dag_json = str(base_record.get("value") or "")
+    try:
+        base_dag = ImplementationDAG.model_validate_json(base_dag_json)
+    except Exception as exc:
+        return None, (
+            "DAG dispatch paused before group "
+            f"{group_idx}: source DAG cannot be parsed ({exc})."
+        ), {"applied": False, "reason": "invalid_source_dag"}
+    base_dag_artifact_id = base_record.get("id")
+    if not isinstance(base_dag_artifact_id, int):
+        base_dag_artifact_id = None
+    base_dag_sha256 = hashlib.sha256(base_dag_json.encode("utf-8")).hexdigest()
+    marker_base_dag_id = active_marker.get("base_dag_artifact_id")
+    if marker_base_dag_id != base_dag_artifact_id:
+        return None, (
+            "DAG dispatch paused before group "
+            f"{group_idx}: active marker base DAG id does not match current root DAG."
+        ), {
+            "applied": False,
+            "reason": "active_marker_base_dag_id_mismatch",
+            "expected_base_dag_artifact_id": base_dag_artifact_id,
+            "actual_base_dag_artifact_id": marker_base_dag_id,
+        }
+    marker_base_dag_sha = str(active_marker.get("base_dag_sha256") or "")
+    if marker_base_dag_sha != base_dag_sha256:
+        return None, (
+            "DAG dispatch paused before group "
+            f"{group_idx}: active marker base DAG hash does not match current root DAG."
+        ), {
+            "applied": False,
+            "reason": "active_marker_base_dag_hash_mismatch",
+            "expected_base_dag_sha256": base_dag_sha256,
+            "actual_base_dag_sha256": marker_base_dag_sha,
+        }
+    boundary_record = await _dag_artifact_record_for_key(
+        runner,
+        feature,
+        f"dag-group:{DAG_REGROUP_FROM_GROUP}",
+    )
+    validation_candidate, reason, details = _validate_derived_dag_artifact_update(
+        canonical_key,
+        str(canonical_text),
+        base_dag=base_dag,
+        base_dag_artifact_id=base_dag_artifact_id,
+        base_dag_sha256=base_dag_sha256,
+        boundary_checkpoint_exists=(
+            boundary_record is not None and group_idx == DAG_REGROUP_FROM_GROUP
+        ),
+        require_regroup_context=True,
+    )
+    if validation_candidate is None:
+        return None, (
+            "DAG dispatch paused before group "
+            f"{group_idx}: persisted regroup failed validation ({reason})."
+        ), {
+            "applied": False,
+            "reason": reason,
+            "validation": details[:20],
+        }
+
+    prior_group_idx = group_idx - 1
+    prior_checkpoint = await get_artifact(
+        f"dag-group:{prior_group_idx}",
+        feature=feature,
+    )
+    if not prior_checkpoint:
+        return None, (
+            "DAG dispatch paused before group "
+            f"{group_idx}: prior checkpoint dag-group:{prior_group_idx} is missing."
+        ), {"applied": False, "reason": "missing_prior_checkpoint"}
+
+    effective_dag = base_dag.model_copy(deep=True)
+    effective_dag.execution_order = (
+        [list(group) for group in base_dag.execution_order[:DAG_REGROUP_FROM_GROUP]]
+        + [list(group) for group in validation_candidate.dag.execution_order]
+    )
+    observation = {
+        "status": "applied",
+        "active_marker_key": DAG_REGROUP_ACTIVE_KEY,
+        "canonical_artifact_key": canonical_key,
+        "canonical_sha256": canonical_sha,
+        "source_dag_key": derived.source_dag_key,
+        "base_dag_artifact_id": base_dag_artifact_id,
+        "base_dag_sha256": base_dag_sha256,
+        "group_idx_offset": DAG_REGROUP_FROM_GROUP,
+        "resume_group_idx": group_idx,
+        "derived_group_count": len(validation_candidate.dag.execution_order),
+        "effective_group_count": len(effective_dag.execution_order),
+        "created_at": time.time(),
+    }
+    if callable(put_artifact):
+        await put_artifact(
+            DAG_REGROUP_OBSERVATION_KEY,
+            json.dumps(observation, indent=2, sort_keys=True),
+            feature=feature,
+        )
+    await _log_feature_event(
+        runner,
+        feature.id,
+        "dag_regroup_overlay_applied",
+        "implementation",
+        content=f"g{group_idx}",
+        metadata=observation,
+    )
+    return effective_dag, "", observation
+
+
+# `_quiesce_marker_matches` is shimmed from `..execution.control_plane`
+# (Slice 12a-1 — see the shim re-export block at `:798-845` above). It
+# remains accessible under the legacy `implementation._quiesce_marker_
+# matches` name via the shim so every existing reader continues to work.
+
+
 async def _implement_dag(
     runner: WorkflowRunner, feature: Feature, dag: ImplementationDAG
-) -> tuple[str, str, HandoverDoc]:
+) -> DagExecutionOutcome:
     """Execute the full DAG with per-group verification, checkpointing, and
     handover tracking.
 
@@ -3820,19 +16139,131 @@ async def _implement_dag(
     tasks_by_id = {t.id: t for t in dag.tasks}
     all_results: list[object] = []
     handover = HandoverDoc()
+    regroup_overlay_applied = False
+    base_dag_sha256 = hashlib.sha256(
+        dag.model_dump_json().encode("utf-8"),
+    ).hexdigest()
+
+    active_marker = await runner.artifacts.get(
+        DAG_REGROUP_ACTIVE_KEY,
+        feature=feature,
+    )
+    # Slice 09e-1b P3-D re-gating. The legacy ``dag-regroup-active:g45-g73``
+    # artifact marker is the offset-45 compatibility marker. Slice 09e-1b's
+    # ``command_activate`` rewire makes a typed regroup overlay activatable at
+    # ANY ``group_idx_offset``, so the regroup dispatch gates must ALSO trigger
+    # on an active TYPED overlay row and use ITS offset. ``typed_regroup_offset``
+    # is the active typed overlay's ``group_idx_offset`` (or ``None`` — no typed
+    # overlay / Slice 09 modules or a store unavailable / a transient probe
+    # error). ``regroup_offset`` is the EFFECTIVE offset: the typed overlay's
+    # offset when one is active, else the legacy ``DAG_REGROUP_FROM_GROUP``
+    # constant — so a feature with no typed overlay keeps EXACTLY its legacy /
+    # non-overlay behavior. ``regroup_in_play`` is true when a legacy marker OR
+    # a typed overlay is present; when false, all three regroup gates below are
+    # skipped and dispatch proceeds byte-for-byte as before.
+    typed_regroup_offset = await _typed_regroup_active_overlay_offset(
+        runner, str(getattr(feature, "id", "") or "")
+    )
+    regroup_offset = (
+        typed_regroup_offset
+        if typed_regroup_offset is not None
+        else DAG_REGROUP_FROM_GROUP
+    )
+    regroup_in_play = bool(active_marker) or typed_regroup_offset is not None
+    regroup_boundary_checkpoint = await runner.artifacts.get(
+        f"dag-group:{regroup_offset}",
+        feature=feature,
+    )
+    if regroup_in_play:
+        regroup_probe_group = (
+            regroup_offset + 1
+            if regroup_boundary_checkpoint
+            else regroup_offset
+        )
+        effective_dag, regroup_failure, _regroup_observation = (
+            await _resolve_active_regroup_before_group_dispatch(
+                runner,
+                feature,
+                dag,
+                group_idx=regroup_probe_group,
+            )
+        )
+        if regroup_failure:
+            return DagExecutionOutcome(
+                implementation_text="",
+                failure=regroup_failure,
+                handover=handover,
+                terminal_state="quiesced",
+            )
+        if effective_dag is not None and effective_dag is not dag:
+            dag = effective_dag
+            tasks_by_id = {t.id: t for t in dag.tasks}
+            regroup_overlay_applied = True
+    dag_sha256 = hashlib.sha256(
+        dag.model_dump_json().encode("utf-8"),
+    ).hexdigest()
 
     # ── Resume: reconstruct state from checkpointed groups ──────────
     start_group = 0
     for g_idx in range(len(dag.execution_order)):
+        group_task_ids = list(dag.execution_order[g_idx])
+        accepted_dag_sha256s = []
+        if regroup_overlay_applied and g_idx < regroup_offset:
+            accepted_dag_sha256s.append(base_dag_sha256)
         checkpoint_json = await runner.artifacts.get(
             f"dag-group:{g_idx}", feature=feature,
         )
         if not checkpoint_json:
+            data = await _recover_dag_group_checkpoint_from_proofs(
+                runner,
+                feature,
+                group_idx=g_idx,
+                group_task_ids=group_task_ids,
+                dag_sha256=dag_sha256,
+                accepted_dag_sha256s=accepted_dag_sha256s,
+            )
+            if data is None:
+                break
+        else:
+            try:
+                data = _json.loads(checkpoint_json)
+            except (ValueError, TypeError):
+                break
+        if not await _dag_group_checkpoint_is_fresh(
+            runner,
+            feature,
+            group_idx=g_idx,
+            group_task_ids=group_task_ids,
+            dag_sha256=dag_sha256,
+            checkpoint=data,
+            accepted_dag_sha256s=accepted_dag_sha256s,
+        ):
+            logger.warning(
+                "Group %d checkpoint marker is stale or lacks durable proof — re-running",
+                g_idx,
+            )
             break
-        try:
-            data = _json.loads(checkpoint_json)
-        except (ValueError, TypeError):
-            break
+        projected, projection_error = await _ensure_dag_group_checkpoint_projection_for_resume(
+            runner,
+            feature,
+            g_idx,
+            data,
+            dag_sha256=dag_sha256,
+            group_task_ids=group_task_ids,
+            accepted_dag_sha256s=accepted_dag_sha256s,
+        )
+        if not projected:
+            impl_text = "\n\n".join(to_str(r) for r in all_results)
+            return DagExecutionOutcome(
+                implementation_text=impl_text,
+                failure=_workflow_blocker_text(
+                    f"Fresh checkpoint dag-group:{g_idx} cannot skip without "
+                    "durable group_checkpoint projection evidence: "
+                    f"{projection_error or 'projection unavailable'}"
+                ),
+                handover=handover,
+                terminal_state="workflow_blocked",
+            )
         for r_data in data.get("results", []):
             try:
                 result = ImplementationResult.model_validate(r_data)
@@ -3846,10 +16277,85 @@ async def _implement_dag(
             g_idx, data.get("commit_hash", "?"),
         )
 
+    # Slice 09e-1b P3-D re-gating: gate on ``regroup_in_play`` (a legacy marker
+    # OR an active typed overlay) and the EFFECTIVE ``regroup_offset`` (the
+    # typed overlay's ``group_idx_offset`` when one is active, else the legacy
+    # constant). Non-overlay behavior is unchanged: with no regroup in play
+    # ``regroup_in_play`` is False and this block is skipped exactly as before.
+    if start_group > regroup_offset and regroup_in_play and not regroup_overlay_applied:
+        effective_dag, regroup_failure, _regroup_observation = (
+            await _resolve_active_regroup_before_group_dispatch(
+                runner,
+                feature,
+                dag,
+                group_idx=start_group,
+            )
+        )
+        if regroup_failure:
+            impl_text = "\n\n".join(to_str(r) for r in all_results)
+            return DagExecutionOutcome(
+                implementation_text=impl_text,
+                failure=regroup_failure,
+                handover=handover,
+                terminal_state="quiesced",
+            )
+        if effective_dag is not None and effective_dag is not dag:
+            dag = effective_dag
+            tasks_by_id = {t.id: t for t in dag.tasks}
+            dag_sha256 = hashlib.sha256(
+                dag.model_dump_json().encode("utf-8"),
+            ).hexdigest()
+
     # ── Execute remaining groups ────────────────────────────────────
-    for group_idx, group in enumerate(dag.execution_order):
-        if group_idx < start_group:
-            continue
+    group_idx = start_group
+    while group_idx < len(dag.execution_order):
+        group = dag.execution_order[group_idx]
+
+        quiesce_failure = await _maybe_quiesce_before_group_dispatch(
+            runner,
+            feature,
+            dag,
+            group_idx=group_idx,
+        )
+        if quiesce_failure:
+            impl_text = "\n\n".join(to_str(r) for r in all_results)
+            return DagExecutionOutcome(
+                implementation_text=impl_text,
+                failure=quiesce_failure,
+                handover=handover,
+                terminal_state="quiesced",
+            )
+
+        # Slice 09e-1b P3-D re-gating: the dispatch loop reaches the EFFECTIVE
+        # regroup offset (the typed overlay's ``group_idx_offset`` when one is
+        # active, else the legacy ``DAG_REGROUP_FROM_GROUP``); gate on
+        # ``regroup_in_play``. With no regroup in play this block is skipped
+        # exactly as before.
+        if group_idx == regroup_offset and regroup_in_play and not regroup_overlay_applied:
+            effective_dag, regroup_failure, _regroup_observation = (
+                await _resolve_active_regroup_before_group_dispatch(
+                    runner,
+                    feature,
+                    dag,
+                    group_idx=group_idx,
+                )
+            )
+            if regroup_failure:
+                impl_text = "\n\n".join(to_str(r) for r in all_results)
+                return DagExecutionOutcome(
+                    implementation_text=impl_text,
+                    failure=regroup_failure,
+                    handover=handover,
+                    terminal_state="quiesced",
+                )
+            if effective_dag is not None and effective_dag is not dag:
+                dag = effective_dag
+                tasks_by_id = {t.id: t for t in dag.tasks}
+                dag_sha256 = hashlib.sha256(
+                    dag.model_dump_json().encode("utf-8"),
+                ).hexdigest()
+                group = dag.execution_order[group_idx]
+                regroup_overlay_applied = True
 
         group_tasks = [tasks_by_id[tid] for tid in group]
         if dag_path_canonicalization_enabled():
@@ -3864,7 +16370,12 @@ async def _implement_dag(
         group_tasks_by_id = {task.id: task for task in group_tasks}
 
         # Ensure worktrees exist for all repos this group touches
-        await _ensure_task_worktrees(runner, feature, group_tasks)
+        await _ensure_task_worktrees(
+            runner,
+            feature,
+            group_tasks,
+            group_idx=group_idx,
+        )
 
         # Adversarial runtime routing.
         runtime_policy = _runner_runtime_policy(runner)
@@ -3881,6 +16392,111 @@ async def _implement_dag(
             group_idx, impl_runtime, review_runtime, diagnostic_runtime,
             runtime_policy,
         )
+        workspace_mgr = runner.services.get("workspace_manager")
+        feature_root = (
+            Path(workspace_mgr._base) / ".iriai" / "features" / feature.slug / "repos"
+            if workspace_mgr
+            else None
+        )
+        authority_guard = WorkspaceAuthorityCompatibilityOutcome()
+        if workspace_mgr and feature_root is not None:
+            authority_guard = await _run_workspace_authority_pre_dispatch_adapter(
+                runner,
+                feature,
+                group_idx,
+                group_tasks,
+                workspace_root=Path(workspace_mgr._base),
+                feature_root=feature_root,
+                stage="initial-dispatch",
+                dag_sha256=dag_sha256,
+            )
+            if _workspace_authority_blocks_dispatch(authority_guard):
+                evidence = "; ".join(
+                    f"{getattr(route, 'failure_class', '')}/"
+                    f"{getattr(route, 'failure_type', '')}: "
+                    f"{getattr(route, 'route', '')}"
+                    for route in authority_guard.routes[:10]
+                )
+                return DagExecutionOutcome(
+                    implementation_text="\n\n".join(to_str(r) for r in all_results),
+                    failure=(
+                        "WorkspaceAuthority pre-dispatch guard blocked normal "
+                        f"group {group_idx} implementation using typed "
+                        "deterministic evidence. Run the typed workflow remediation "
+                        "route for repairable blockers before dispatch; quiesce only "
+                        "for operator-required safety ambiguity. "
+                        f"Evidence: {evidence or 'see workspace-authority-routes artifact'}"
+                    ),
+                    handover=handover,
+                    terminal_state=(
+                        "quiesced" if authority_guard.operator_required else "workflow_blocked"
+                    ),
+                )
+        alias_guard_ok, alias_guard_report = await _run_worktree_alias_pre_dispatch_guard(
+            runner,
+            feature,
+            group_idx,
+            group_tasks,
+            feature_root=feature_root,
+        )
+        if not alias_guard_ok:
+            details = "; ".join(
+                f"{problem.get('task_id')}: {problem.get('path')} -> "
+                f"{problem.get('canonical_path') or problem.get('canonical_repo')}"
+                for problem in alias_guard_report.get("blockers", [])[:10]
+            )
+            return DagExecutionOutcome(
+                implementation_text="\n\n".join(to_str(r) for r in all_results),
+                failure=(
+                    "Canonical worktree alias pre-dispatch guard blocked normal "
+                    f"group {group_idx} implementation before model dispatch. "
+                    "This is a workflow-resolved deterministic unblock, not an "
+                    "operator-required action. Run focused canonical repair against "
+                    f"the canonical repo paths. Alias blockers: {details}"
+                ),
+                handover=handover,
+                terminal_state="workflow_blocked",
+            )
+        if workspace_mgr and not authority_guard.approved:
+            evidence = "; ".join(
+                f"{getattr(route, 'failure_class', '')}/"
+                f"{getattr(route, 'failure_type', '')}: "
+                f"{getattr(route, 'route', '')}"
+                for route in authority_guard.routes[:10]
+            )
+            return DagExecutionOutcome(
+                implementation_text="\n\n".join(to_str(r) for r in all_results),
+                failure=(
+                    "WorkspaceAuthority pre-dispatch guard found deterministic "
+                    f"repairable blockers for group {group_idx}. Run the typed "
+                    "workflow repair route before implementer dispatch. "
+                    f"Evidence: {evidence or 'see workspace-authority-routes artifact'}"
+                ),
+                handover=handover,
+                terminal_state="workflow_blocked",
+            )
+
+        contract_outcome = await _compile_task_contracts_for_group(
+            runner,
+            feature,
+            dag,
+            group_idx,
+            group_tasks,
+            registry=authority_guard.registry,
+            feature_root=feature_root,
+            dag_sha256=dag_sha256,
+        )
+        if not contract_outcome.approved:
+            return DagExecutionOutcome(
+                implementation_text="\n\n".join(to_str(r) for r in all_results),
+                failure=(
+                    contract_outcome.failure
+                    or "Task deliverable contract compilation failed before dispatch."
+                ),
+                handover=handover,
+                terminal_state="workflow_blocked",
+            )
+        contracts_by_task_id = contract_outcome.contracts_by_task_id
 
         # Build prompts with handover context from prior groups
         handover_context = ""
@@ -3888,47 +16504,190 @@ async def _implement_dag(
             handover.compress()
             handover_context = f"\n\n## Handover — Prior Work\n\n{to_markdown(handover)}"
 
+        # ── Slice 08e-3b P2-a: resume re-drive of a checkpoint-crashed group ──
+        # If the 08e-3b `if pending_merge_queue:` block enqueued + drained this
+        # group's lanes but the checkpoint then crashed (vector 6), the lanes
+        # sit `integrated`, no `dag-group:*` projection exists, and the
+        # per-task `_pending_merge_queue_marker_key` markers survive. Doc 08
+        # § Rollback And Recovery Table requires `integrated`/`checkpointing`
+        # groups to be driven to the IDEMPOTENT checkpoint on recovery. When
+        # any marker is present, re-drive the idempotent drain + checkpoint
+        # (no double-apply — `claim` cannot re-take `integrated` lanes). On
+        # success the group is `done`; advance. On failure fall through to the
+        # existing fail-closed per-task pending-marker block below.
+        group_has_pending_merge_marker = False
+        for tid in group:
+            if await runner.artifacts.get(
+                _pending_merge_queue_marker_key(tid), feature=feature,
+            ):
+                group_has_pending_merge_marker = True
+                break
+        if group_has_pending_merge_marker:
+            resume_recovery = await _resume_recover_durable_merge_queue_group(
+                runner,
+                feature,
+                dag_sha256=dag_sha256,
+                group_idx=group_idx,
+                group_task_ids=list(group),
+            )
+            if resume_recovery.recovered:
+                # The group landed via the idempotent durable queue re-drive.
+                # Mirror the `if pending_merge_queue:` success tail: reconstruct
+                # handover from the durable `dag-task:*` markers, clear the
+                # now-stale pending markers, log, refresh the exhibit, advance.
+                for tid in group:
+                    marker = await runner.artifacts.get(
+                        f"dag-task:{tid}", feature=feature,
+                    )
+                    if not marker:
+                        continue
+                    try:
+                        recovered_result = ImplementationResult.model_validate_json(
+                            marker
+                        )
+                    except Exception:
+                        continue
+                    if recovered_result.status == "completed":
+                        all_results.append(recovered_result)
+                        handover.record_success(recovered_result)
+                for tid in group:
+                    try:
+                        await runner.artifacts.delete(
+                            _pending_merge_queue_marker_key(tid),
+                            feature=feature,
+                        )
+                    except Exception:  # pragma: no cover - best effort.
+                        pass
+                await _log_feature_event(
+                    runner,
+                    feature.id,
+                    "dag_merge_queue_group_checkpointed",
+                    "implementation",
+                    content=f"g{group_idx}:resume",
+                    metadata={
+                        "group_idx": group_idx,
+                        "stage": "resume",
+                        "task_ids": list(group),
+                        "done_queue_item_ids": resume_recovery.done_queue_item_ids,
+                        "result_commit": resume_recovery.result_commit,
+                    },
+                )
+                await enqueue_public_exhibit_refresh(
+                    runner,
+                    feature,
+                    reason=f"dag-group-{group_idx}-checkpoint",
+                    group_idx=group_idx,
+                    priority=20,
+                )
+                logger.info(
+                    "Group %d checkpointed on resume via the durable merge "
+                    "queue re-drive (commit %s, lanes %s)",
+                    group_idx,
+                    resume_recovery.result_commit or "<none>",
+                    resume_recovery.done_queue_item_ids,
+                )
+                group_idx += 1
+                continue
+            # The idempotent re-drive could not complete the group — fall
+            # through to the fail-closed per-task pending-marker block; the
+            # routed `checkpoint_contradiction`/drain failure already recorded
+            # a typed failure. `_resume_recover_durable_merge_queue_group`
+            # never falls back to the legacy `_commit_group`.
+            logger.warning(
+                "Group %d durable merge queue resume re-drive did not "
+                "complete — failing closed on the pending marker: %s",
+                group_idx,
+                resume_recovery.detail,
+            )
+
         # ── Per-task resume: check which tasks already completed ─────
         pending_tasks: list[ImplementationTask] = []
         completed_results: list[ImplementationResult] = []
+        stable_task_indices = {tid: idx for idx, tid in enumerate(group)}
         for tid in group:
             task_marker = await runner.artifacts.get(
                 f"dag-task:{tid}", feature=feature,
             )
+            pending_merge_marker = await runner.artifacts.get(
+                _pending_merge_queue_marker_key(tid),
+                feature=feature,
+            )
+            if pending_merge_marker:
+                marker_result = ImplementationResult(
+                    task_id=tid,
+                    summary="Sandbox patch pending durable merge queue.",
+                    status="completed",
+                    notes=str(pending_merge_marker),
+                )
+                return DagExecutionOutcome(
+                    implementation_text="\n\n".join(to_str(r) for r in all_results),
+                    failure=_durable_merge_queue_blocker_for_results([marker_result]),
+                    handover=handover,
+                    terminal_state="workflow_blocked",
+                )
             if task_marker:
                 try:
                     result = ImplementationResult.model_validate_json(task_marker)
                     # Only skip if the task actually completed successfully
                     if result.status == "completed":
-                        completed_results.append(result)
-                        logger.info("Task %s already complete — skipping", tid)
-                        continue
-                    logger.warning(
-                        "Task %s has status %r — re-running", tid, result.status,
-                    )
+                        if _result_requires_durable_merge_queue(result):
+                            return DagExecutionOutcome(
+                                implementation_text="\n\n".join(to_str(r) for r in all_results),
+                                failure=_durable_merge_queue_blocker_for_results([result]),
+                                handover=handover,
+                                terminal_state="workflow_blocked",
+                            )
+                        if workspace_mgr is None or feature_root is None:
+                            completed_results.append(result)
+                            all_results.append(result)
+                            handover.record_success(result)
+                            continue
+                        if await _completed_task_marker_has_current_lineage(
+                            runner,
+                            feature,
+                            contracts_by_task_id.get(tid),
+                            group_idx=group_idx,
+                            preexisting_digest=contract_outcome.preexisting_contract_digests.get(tid),
+                        ):
+                            completed_results.append(result)
+                            all_results.append(result)
+                            handover.record_success(result)
+                            continue
+                        logger.warning(
+                            "Task %s completed marker must be revalidated with "
+                            "current contract, patch, and workspace lineage before "
+                            "canonical workspace resume — re-running",
+                            tid,
+                        )
+                    else:
+                        logger.warning(
+                            "Task %s has status %r — re-running", tid, result.status,
+                        )
                 except Exception:
                     pass
             pending_tasks.append(group_tasks_by_id[tid])
 
-        # ── Resolve worktree paths for each task ────────────────────
-        workspace_mgr = runner.services.get("workspace_manager")
-        feature_root = (
-            Path(workspace_mgr._base) / ".iriai" / "features" / feature.slug / "repos"
-            if workspace_mgr
-            else None
-        )
-
         if pending_tasks:
+            acl_report = await _normalize_dag_workspace_acl(
+                runner,
+                feature,
+                group_idx,
+                feature_root,
+                _dag_task_permission_targets(pending_tasks),
+                context="initial-dispatch",
+            )
             writeability_problems = _dag_workspace_writeability_problems(
                 feature_root,
                 pending_tasks,
             )
-            if writeability_problems:
+            if writeability_problems or acl_report.get("operator_required"):
                 await runner.artifacts.put(
                     f"dag-writeability-preflight:g{group_idx}:initial",
                     _json.dumps({
                         "group_idx": group_idx,
                         "approved": False,
+                        "operator_required": True,
+                        "acl_normalization": acl_report,
                         "problems": writeability_problems,
                     }),
                     feature=feature,
@@ -3961,7 +16720,19 @@ async def _implement_dag(
                     "Fix canonical target permissions instead of allowing agents to "
                     f"park _pending_* fallbacks. Problems: {details}"
                 )
-                return "\n\n".join(to_str(r) for r in all_results), failure, handover
+                if acl_report.get("operator_required"):
+                    failure = _workspace_acl_operator_required_failure(
+                        group_idx=group_idx,
+                        context="initial-dispatch",
+                        report=acl_report,
+                        problems=writeability_problems,
+                    )
+                return DagExecutionOutcome(
+                    implementation_text="\n\n".join(to_str(r) for r in all_results),
+                    failure=failure,
+                    handover=handover,
+                    terminal_state="quiesced",
+                )
 
         # ── Dispatch pending tasks with retry on crash ──────────────
         TASK_MAX_RETRIES = 5
@@ -3997,38 +16768,14 @@ async def _implement_dag(
 
                 # ── Build prompt, offloading to files if too large ──
                 prefix = f"{repo_prefix}/" if repo_prefix else ""
-                inline_prompt = _build_task_prompt(t, repo_prefix=prefix) + handover_context
-
-                context_base = ws_path or (str(feature_root) if feature_root else None)
-                if len(inline_prompt) > PROMPT_FILE_THRESHOLD and context_base:
-                    context_dir = Path(context_base) / ".iriai-context" / t.id
-                    context_dir.mkdir(parents=True, exist_ok=True)
-
-                    task_prompt = _build_task_prompt(
-                        t, repo_prefix=prefix, context_dir=context_dir,
-                    )
-                    if handover_context:
-                        handover_path = context_dir / "handover.md"
-                        handover_path.write_text(
-                            handover_context.lstrip(), encoding="utf-8",
-                        )
-                        rel_handover = f".iriai-context/{t.id}/handover.md"
-                        task_prompt += (
-                            f"\n\n## Handover — Prior Work\n"
-                            f"Prior work context is in `{rel_handover}`.\n"
-                            f"**Read that file to understand what has been completed.**"
-                        )
-                    else:
-                        task_prompt += handover_context
-
-                    logger.info(
-                        "Task %s: prompt offloaded to files (%d → %d chars)",
-                        t.id, len(inline_prompt), len(task_prompt),
-                    )
-                else:
-                    task_prompt = inline_prompt
+                task_contract = contracts_by_task_id.get(t.id)
+                inline_prompt = (
+                    _build_task_prompt(t, repo_prefix=prefix, contract=task_contract)
+                    + handover_context
+                )
 
                 for attempt in range(TASK_MAX_RETRIES + 1):
+                    sandbox_task_binding: RuntimeSandboxTaskBinding | None = None
                     try:
                         await _log_feature_event(
                             runner,
@@ -4045,27 +16792,29 @@ async def _implement_dag(
                                 "runtime": impl_runtime,
                             },
                         )
-                        result = await runner.run(
-                            Ask(
-                                actor=_make_parallel_actor(
-                                    implementer, f"g{group_idx}-t{task_idx}-a{attempt}",
-                                    runtime=impl_runtime,
-                                    workspace_path=ws_path,
-                                ),
-                                prompt=task_prompt,
-                                output_type=ImplementationResult,
-                            ),
-                            feature,
-                            phase_name="implementation",
+                        result, dispatch_outcome = await _dispatch_task_attempt_via_runtime_dispatcher(
+                            runner=runner,
+                            feature=feature,
+                            workspace_root=Path(workspace_mgr._base) if workspace_mgr else None,
+                            feature_root=feature_root,
+                            dag_sha256=dag_sha256,
+                            group_idx=group_idx,
+                            task_idx=task_idx,
+                            attempt=attempt,
+                            task=t,
+                            task_contract=task_contract,
+                            ws_path=ws_path,
+                            snapshots=authority_guard.snapshots,
+                            runtime_hint=impl_runtime,
+                            runtime_policy=runtime_policy,
+                            repo_prefix=repo_prefix or "",
+                            inline_prompt=inline_prompt,
+                            handover_context=handover_context,
+                            stage="implementation",
+                            actor_suffix=f"g{group_idx}-t{task_idx}-a{attempt}",
+                            log_label=f"Task {t.id}",
                         )
-                        # Force correct task_id
                         if isinstance(result, ImplementationResult):
-                            if result.task_id != t.id:
-                                logger.warning(
-                                    "Task reported task_id=%r, expected %r — correcting",
-                                    result.task_id, t.id,
-                                )
-                                result.task_id = t.id
                             # Enrich fallback results that have empty file metadata
                             if not result.files_created and not result.files_modified:
                                 await _enrich_fallback_result(result, ws_path, t)
@@ -4082,12 +16831,78 @@ async def _implement_dag(
                                     "status": result.status,
                                     "attempt": attempt,
                                     "runtime": impl_runtime,
+                                    "dispatcher_attempt_id": getattr(dispatch_outcome, "attempt_id", None),
+                                    "dispatcher_status": getattr(dispatch_outcome, "status", ""),
                                     "files_created": result.files_created,
                                     "files_modified": result.files_modified,
                                 },
                             )
                         return result
+                    except SandboxWorkflowBlocker as e:
+                        await _log_feature_event(
+                            runner,
+                            feature.id,
+                            "dag_sandbox_workflow_blocked",
+                            "implementation",
+                            content=t.id,
+                            metadata={
+                                "group_idx": group_idx,
+                                "task_id": t.id,
+                                "attempt": attempt,
+                                "runtime": impl_runtime,
+                                "error": str(e)[:1000],
+                            },
+                        )
+                        if (
+                            _is_terminal_sandbox_attempt_blocker(str(e))
+                            and attempt < TASK_MAX_RETRIES
+                        ):
+                            logger.warning(
+                                "Task %s attempt %d hit a terminal durable sandbox lease; "
+                                "advancing to the next attempt",
+                                t.id,
+                                attempt,
+                            )
+                            continue
+                        return ImplementationResult(
+                            task_id=t.id,
+                            summary=str(e),
+                            status="blocked",
+                        )
                     except Exception as e:
+                        if sandbox_task_binding is not None:
+                            try:
+                                await _capture_and_promote_sandbox_patch(
+                                    sandbox_task_binding,
+                                    task_id=t.id,
+                                    promote=False,
+                                )
+                            except SandboxWorkflowBlocker as capture_blocker:
+                                await _log_feature_event(
+                                    runner,
+                                    feature.id,
+                                    "dag_sandbox_workflow_blocked",
+                                    "implementation",
+                                    content=t.id,
+                                    metadata={
+                                        "group_idx": group_idx,
+                                        "task_id": t.id,
+                                        "attempt": attempt,
+                                        "runtime": impl_runtime,
+                                        "error": str(capture_blocker)[:1000],
+                                    },
+                                )
+                                return ImplementationResult(
+                                    task_id=t.id,
+                                    summary=str(capture_blocker),
+                                    status="blocked",
+                                )
+                            except Exception:
+                                logger.warning(
+                                    "Task %s: failed to capture sandbox crash evidence",
+                                    t.id,
+                                    exc_info=True,
+                                )
                         await _log_feature_event(
                             runner,
                             feature.id,
@@ -4117,7 +16932,9 @@ async def _implement_dag(
                             )
                             return ImplementationResult(
                                 task_id=t.id,
-                                summary=f"BLOCKED: prompt too large for model context window: {e}",
+                                summary=_workflow_blocker_text(
+                                    f"Runtime prompt too large for model context window: {e}"
+                                ),
                                 status="blocked",
                             )
                         if attempt + 1 == TASK_WARN_AT:
@@ -4144,7 +16961,10 @@ async def _implement_dag(
                             )
                             return ImplementationResult(
                                 task_id=t.id,
-                                summary=f"FAILED after {TASK_MAX_RETRIES + 1} attempts: {e}",
+                                summary=_workflow_blocker_text(
+                                    "Runtime execution failed after "
+                                    f"{TASK_MAX_RETRIES + 1} attempts: {e}"
+                                ),
                                 status="blocked",
                             )
                 # Unreachable but satisfies type checker
@@ -4152,21 +16972,365 @@ async def _implement_dag(
 
             # Dispatch all tasks in parallel with individual error handling
             gathered = await _asyncio.gather(
-                *[_run_task(i, t) for i, t in enumerate(pending_tasks)],
+                *[
+                    _run_task(stable_task_indices.get(t.id, i), t)
+                    for i, t in enumerate(pending_tasks)
+                ],
             )
             new_results = list(gathered)
 
-            # Save per-task markers
-            for r in new_results:
-                if isinstance(r, ImplementationResult) and r.task_id:
+            results = list(completed_results) + list(new_results)
+            all_results.extend(new_results)  # Don't double-count resumed results
+            sandbox_blocked = [
+                r
+                for r in new_results
+                if isinstance(r, ImplementationResult)
+                and r.status == "blocked"
+                    and _is_workflow_blocker_text(str(r.summary))
+            ]
+            if sandbox_blocked:
+                failure = "\n\n".join(str(r.summary) for r in sandbox_blocked)
+                return DagExecutionOutcome(
+                    implementation_text="\n\n".join(to_str(r) for r in all_results),
+                    failure=failure,
+                    handover=handover,
+                    terminal_state="workflow_blocked",
+                )
+            runtime_blocked = [
+                r
+                for r in new_results
+                if isinstance(r, ImplementationResult)
+                and r.status == "blocked"
+            ]
+            if runtime_blocked:
+                failure = "\n\n".join(str(r.summary) for r in runtime_blocked)
+                return DagExecutionOutcome(
+                    implementation_text="\n\n".join(to_str(r) for r in all_results),
+                    failure=failure,
+                    handover=handover,
+                    terminal_state=(
+                        "workflow_blocked"
+                        if any(_is_workflow_blocker_text(str(r.summary)) for r in runtime_blocked)
+                        else "verify_failed"
+                    ),
+                )
+            pending_merge_queue = [
+                r
+                for r in new_results
+                if isinstance(r, ImplementationResult)
+                and _result_requires_durable_merge_queue(r)
+            ]
+            if pending_merge_queue:
+                # Slice 08e-2: the implementation worker no longer commits to
+                # canonical repos. Sandbox-captured lanes are enqueued onto the
+                # durable merge queue (the only canonical mutation path); the
+                # queue worker owns apply/gates/commit/checkpoint. Fail closed —
+                # never fall back to the legacy canonical commit.
+                try:
+                    enqueued_item_ids = (
+                        await _enqueue_durable_merge_queue_for_results(
+                            runner,
+                            feature,
+                            pending_merge_queue,
+                            dag_sha256=dag_sha256,
+                            group_idx=group_idx,
+                            contracts_by_task_id=contracts_by_task_id,
+                            feature_root=feature_root,
+                            stage="implementation",
+                        )
+                    )
+                except _MergeQueueEnqueueError as exc:
+                    await _log_feature_event(
+                        runner,
+                        feature.id,
+                        "dag_merge_queue_enqueue_failed",
+                        "implementation",
+                        content=f"g{group_idx}:implementation",
+                        metadata={
+                            "group_idx": group_idx,
+                            "stage": "implementation",
+                            "task_ids": [
+                                r.task_id for r in pending_merge_queue
+                            ],
+                            "error": str(exc)[:1000],
+                        },
+                    )
+                    return DagExecutionOutcome(
+                        implementation_text="\n\n".join(
+                            to_str(r) for r in all_results
+                        ),
+                        failure=_workflow_blocker_text(
+                            "Durable merge queue enqueue failed for the "
+                            f"implementation worker path (group {group_idx}); "
+                            "the legacy canonical commit is disabled and is "
+                            f"not a fallback. {exc}"
+                        ),
+                        handover=handover,
+                        terminal_state="workflow_blocked",
+                    )
+                # Slice 08e-3b: the enqueue above leaves `task:{id}` lanes
+                # `queued`. DRAIN them now — the 08e-3a drain worker claims
+                # each lane and drives it through the Slice 08d `MergeQueue`
+                # worker (apply -> post-apply gates -> commit -> prove clean ->
+                # `integrated`). Then CHECKPOINT the group via
+                # `GroupMergeCoordinator.checkpoint_group`, which consumes the
+                # `integrated` lanes and projects the single `dag-group:*`
+                # checkpoint — replacing the legacy `_commit_group` /
+                # `_record_dag_group_commit_proof` / `_project_dag_group_
+                # checkpoint` path for the queue-driven flow. Both drain and
+                # checkpoint fail closed (never the legacy commit) and route
+                # any failure through the Slice 07 failure router.
+
+                def _merge_queue_group_blocked(failure_text: str) -> DagExecutionOutcome:
+                    # Fail closed: persist the per-task pending markers so a
+                    # resume re-drives the (idempotent) enqueue + drain +
+                    # checkpoint, and stop the DAG on a typed workflow blocker.
+                    failure = _workflow_blocker_text(failure_text)
+                    if enqueued_item_ids:
+                        failure = _append_note_once(
+                            failure,
+                            "Enqueued merge_queue_items: "
+                            + ", ".join(str(i) for i in enqueued_item_ids),
+                        )
+                    return DagExecutionOutcome(
+                        implementation_text="\n\n".join(
+                            to_str(r) for r in all_results
+                        ),
+                        failure=failure,
+                        handover=handover,
+                        terminal_state="workflow_blocked",
+                    )
+
+                for result in pending_merge_queue:
                     await runner.artifacts.put(
-                        f"dag-task:{r.task_id}",
-                        r.model_dump_json(),
+                        _pending_merge_queue_marker_key(result.task_id),
+                        str(result.notes),
                         feature=feature,
                     )
 
-            results = list(completed_results) + list(new_results)
-            all_results.extend(new_results)  # Don't double-count resumed results
+                # ── Drain: the 08e-3a worker turns `queued` lanes `integrated`.
+                try:
+                    drain_results = (
+                        await _drain_durable_merge_queue_for_feature(
+                            runner,
+                            feature,
+                            dag_sha256=dag_sha256,
+                            stage="implementation",
+                        )
+                    )
+                except _MergeQueueEnqueueError as exc:
+                    await _log_feature_event(
+                        runner,
+                        feature.id,
+                        "dag_merge_queue_drain_failed",
+                        "implementation",
+                        content=f"g{group_idx}:implementation",
+                        metadata={
+                            "group_idx": group_idx,
+                            "stage": "implementation",
+                            "task_ids": [
+                                r.task_id for r in pending_merge_queue
+                            ],
+                            "error": str(exc)[:1000],
+                        },
+                    )
+                    return _merge_queue_group_blocked(
+                        "Durable merge queue drain failed for the "
+                        f"implementation worker path (group {group_idx}); "
+                        "the legacy canonical commit is disabled and is not "
+                        f"a fallback. {exc}"
+                    )
+                # A per-lane apply/gate/commit failure is recorded `failed` +
+                # routed by the drain itself; here it fails the group closed
+                # (the drain never silently degrades to a legacy commit). A
+                # lane recovered from a crashed `checkpointing` state reaches
+                # `done` (08g P2-A) — `succeeded` counts `integrated` and
+                # `done`, so a recovered-`done` lane is not a failed lane.
+                failed_lanes = [
+                    r for r in drain_results if not r.succeeded
+                ]
+                if failed_lanes:
+                    detail = "; ".join(
+                        f"item {r.item_id} ({r.terminal_status}): "
+                        f"{r.failure_class or 'failed'}"
+                        for r in failed_lanes[:10]
+                    )
+                    return _merge_queue_group_blocked(
+                        "Durable merge queue drain could not integrate every "
+                        f"lane of group {group_idx}: {detail}. The failures "
+                        "were routed through the typed failure router; the "
+                        "legacy canonical commit is not a fallback."
+                    )
+
+                # ── Checkpoint: the coordinator projects `dag-group:*` from
+                #    the `integrated` lanes (08e-3b checkpoint splice).
+                expected_task_ids = [
+                    r.task_id
+                    for r in pending_merge_queue
+                    if isinstance(r, ImplementationResult) and r.task_id
+                ]
+                # 08e-3b P1 remediation: pass the per-task results so the
+                # projected `dag-group:*` body carries the `results` list the
+                # legacy resume freshness gate + post-test guard require.
+                checkpoint_task_results = [
+                    r
+                    for r in pending_merge_queue
+                    if isinstance(r, ImplementationResult)
+                ]
+                try:
+                    checkpoint_result = (
+                        await _checkpoint_durable_merge_queue_group(
+                            runner,
+                            feature,
+                            dag_sha256=dag_sha256,
+                            group_idx=group_idx,
+                            expected_task_ids=expected_task_ids,
+                            task_results=checkpoint_task_results,
+                            # 08e-3b REMEDIATION 2: `group` is
+                            # `dag.execution_order[group_idx]` — the SAME
+                            # wave-ordered task id list the resume gate and the
+                            # post-test guard pass `_dag_group_checkpoint_is_
+                            # fresh` as `group_task_ids`. Threading it makes
+                            # the projected body's `task_ids` carry the DAG
+                            # order so that gate's order-sensitive comparison
+                            # passes for non-lexically-sorted groups.
+                            dag_ordered_task_ids=list(group),
+                            stage="implementation",
+                        )
+                    )
+                except _MergeQueueEnqueueError as exc:
+                    await _log_feature_event(
+                        runner,
+                        feature.id,
+                        "dag_merge_queue_checkpoint_failed",
+                        "implementation",
+                        content=f"g{group_idx}:implementation",
+                        metadata={
+                            "group_idx": group_idx,
+                            "stage": "implementation",
+                            "task_ids": expected_task_ids,
+                            "error": str(exc)[:1000],
+                        },
+                    )
+                    return _merge_queue_group_blocked(
+                        "Durable merge queue group checkpoint failed for "
+                        f"group {group_idx}; the legacy _commit_group / direct "
+                        f"checkpoint is disabled and is not a fallback. {exc}"
+                    )
+                if not checkpoint_result.checkpointed:
+                    await _log_feature_event(
+                        runner,
+                        feature.id,
+                        "dag_merge_queue_checkpoint_failed",
+                        "implementation",
+                        content=f"g{group_idx}:implementation",
+                        metadata={
+                            "group_idx": group_idx,
+                            "stage": "implementation",
+                            "task_ids": expected_task_ids,
+                            "detail": checkpoint_result.detail[:1000],
+                            "route_action": checkpoint_result.routed_failure.get(
+                                "route_action"
+                            ),
+                            "typed_failure_id": (
+                                checkpoint_result.routed_failure.get(
+                                    "typed_failure_id"
+                                )
+                            ),
+                        },
+                    )
+                    return _merge_queue_group_blocked(
+                        "Durable merge queue group checkpoint did not complete "
+                        f"for group {group_idx}: {checkpoint_result.detail}. "
+                        "The failure was routed through the typed failure "
+                        "router; the legacy checkpoint is not a fallback."
+                    )
+
+                # ── Group landed via the durable queue. The single
+                #    `dag-group:*` checkpoint is now projected and every
+                #    covered lane is `done`. Record handover successes (the
+                #    legacy `_verify_and_fix_group` does this for the non-queue
+                #    path; the queue path skips it), clear the now-stale
+                #    pending markers so a resume cannot false-block on them,
+                #    refresh the public exhibit, and advance to the next group.
+                for result in pending_merge_queue:
+                    if isinstance(result, ImplementationResult):
+                        handover.record_success(result)
+                for result in pending_merge_queue:
+                    if isinstance(result, ImplementationResult) and result.task_id:
+                        try:
+                            await runner.artifacts.delete(
+                                _pending_merge_queue_marker_key(result.task_id),
+                                feature=feature,
+                            )
+                        except Exception:  # pragma: no cover - best effort.
+                            pass
+                await _log_feature_event(
+                    runner,
+                    feature.id,
+                    "dag_merge_queue_group_checkpointed",
+                    "implementation",
+                    content=f"g{group_idx}:implementation",
+                    metadata={
+                        "group_idx": group_idx,
+                        "stage": "implementation",
+                        "task_ids": expected_task_ids,
+                        "enqueued_merge_queue_item_ids": enqueued_item_ids,
+                        "done_queue_item_ids": (
+                            checkpoint_result.done_queue_item_ids
+                        ),
+                        "result_commit": checkpoint_result.result_commit,
+                    },
+                )
+                await enqueue_public_exhibit_refresh(
+                    runner,
+                    feature,
+                    reason=f"dag-group-{group_idx}-checkpoint",
+                    group_idx=group_idx,
+                    priority=20,
+                )
+                logger.info(
+                    "Group %d checkpointed via durable merge queue "
+                    "(commit %s, lanes %s)",
+                    group_idx,
+                    checkpoint_result.result_commit or "<none>",
+                    checkpoint_result.done_queue_item_ids,
+                )
+                group_idx += 1
+                continue
+
+            contract_guard = await _record_precommit_contract_verdicts(
+                runner,
+                feature,
+                dag_sha256=dag_sha256,
+                group_idx=group_idx,
+                stage="implementation",
+                feature_root=feature_root,
+                contracts_by_task_id=contracts_by_task_id,
+                results=new_results,
+                workspace_snapshots=authority_guard.snapshots,
+            )
+            if not contract_guard.approved:
+                await _log_feature_event(
+                    runner,
+                    feature.id,
+                    "dag_task_contract_verdict_failed",
+                    "implementation",
+                    content=f"g{group_idx}:implementation",
+                    metadata={
+                        "group_idx": group_idx,
+                        "stage": "implementation",
+                        "violation_codes": contract_guard.violation_codes,
+                        "artifact_keys": contract_guard.artifact_keys,
+                    },
+                )
+                impl_text = "\n\n".join(to_str(r) for r in all_results)
+                return DagExecutionOutcome(
+                    implementation_text=impl_text,
+                    failure=_workflow_blocker_text(contract_guard.failure),
+                    handover=handover,
+                    terminal_state="workflow_blocked",
+                )
 
             # Commit after implementation so work is never left uncommitted
             task_ids = [r.task_id for r in new_results if isinstance(r, ImplementationResult) and r.task_id]
@@ -4176,6 +17340,7 @@ async def _implement_dag(
                     feature,
                     f"feat: group {group_idx} impl — {', '.join(task_ids[:3])}"
                     + (f" (+{len(task_ids) - 3} more)" if len(task_ids) > 3 else ""),
+                    group_idx=group_idx,
                     failure_key=f"dag-commit-failure:g{group_idx}:implementation",
                     failure_metadata={
                         "group_idx": group_idx,
@@ -4204,11 +17369,6 @@ async def _implement_dag(
                     stage="implementation",
                 )
                 initial_verdict_key = f"dag-verify:g{group_idx}:implementation-commit"
-                await runner.artifacts.put(
-                    initial_verdict_key,
-                    to_str(initial_verdict),
-                    feature=feature,
-                )
 
         # ── Verify + fix loop (shared with enhancement group) ─────────
         approved, failure = await _verify_and_fix_group(
@@ -4218,6 +17378,9 @@ async def _implement_dag(
             known_task_ids=set(tasks_by_id),
             initial_verdict=initial_verdict,
             initial_verdict_key=initial_verdict_key,
+            dag_sha256=dag_sha256,
+            contracts_by_task_id=contracts_by_task_id,
+            workspace_snapshots=authority_guard.snapshots,
         )
         if not approved:
             remaining = dag.execution_order[group_idx + 1 :]
@@ -4230,16 +17393,43 @@ async def _implement_dag(
                     + ", ".join(remaining_names)
                 )
             impl_text = "\n\n".join(to_str(r) for r in all_results)
-            return impl_text, failure, handover
+            return DagExecutionOutcome(
+                implementation_text=impl_text,
+                failure=failure,
+                handover=handover,
+                terminal_state=(
+                    "workflow_blocked"
+                    if _is_workflow_blocker_text(failure)
+                    else
+                    "quiesced"
+                    if _OPERATOR_REQUIRED_MARKER in failure
+                    else "verify_failed"
+                ),
+            )
+        group_idx += 1
 
     # ── Enhancement group: fix accumulated non-blocking findings ──────
     enh_failure = await _run_enhancement_group(
         runner, feature, dag, all_results, handover,
     )
     if enh_failure:
-        return "\n\n".join(to_str(r) for r in all_results), enh_failure, handover
+        return DagExecutionOutcome(
+            implementation_text="\n\n".join(to_str(r) for r in all_results),
+            failure=enh_failure,
+            handover=handover,
+            terminal_state=(
+                "workflow_blocked"
+                if _is_workflow_blocker_text(enh_failure)
+                else "verify_failed"
+            ),
+        )
 
-    return "\n\n".join(to_str(r) for r in all_results), "", handover
+    return DagExecutionOutcome(
+        implementation_text="\n\n".join(to_str(r) for r in all_results),
+        failure="",
+        handover=handover,
+        terminal_state="complete",
+    )
 
 
 async def _run_enhancement_group(
@@ -4268,19 +17458,6 @@ async def _run_enhancement_group(
         return ""
 
     enhancement_group_idx = len(dag.execution_order)
-
-    # ── Resume: skip if enhancement group already passed ──────────
-    checkpoint_json = await runner.artifacts.get(
-        f"dag-group:{enhancement_group_idx}", feature=feature,
-    )
-    if checkpoint_json:
-        try:
-            data = _json.loads(checkpoint_json)
-            if data.get("verdict") == "approved":
-                logger.info("Enhancement group already complete — skipping")
-                return ""
-        except (ValueError, TypeError):
-            pass
 
     logger.info(
         "Enhancement group: %d items to fix", len(backlog.items),
@@ -4393,11 +17570,14 @@ async def _run_enhancement_group(
         enhancement_tasks: list[ImplementationTask] = []
         for rt in decomposition.tasks:
             desc_lines = []
+            scope_paths: list[str] = []
             for idx in rt.item_indices:
                 if 0 <= idx < len(backlog.items):
                     item = backlog.items[idx]
                     file_hint = f" (`{item.file}`)" if item.file else ""
                     desc_lines.append(f"- [{item.severity}] {item.description}{file_hint}")
+                    if item.file:
+                        scope_paths.append(item.file)
             if not desc_lines:
                 continue
             enhancement_tasks.append(ImplementationTask(
@@ -4412,6 +17592,10 @@ async def _run_enhancement_group(
                     + "\n".join(desc_lines)
                 ),
                 repo_path=rt.repo_path,
+                file_scope=[
+                    TaskFileScope(path=path, action="modify")
+                    for path in _dedupe_preserving_order(scope_paths)
+                ],
             ))
 
         # Items for verification: only those assigned to tasks
@@ -4422,9 +17606,12 @@ async def _run_enhancement_group(
     else:
         # Fallback: single task with all items
         desc_lines = []
+        scope_paths = []
         for item in backlog.items:
             file_hint = f" (`{item.file}`)" if item.file else ""
             desc_lines.append(f"- [{item.severity}] {item.description}{file_hint}")
+            if item.file:
+                scope_paths.append(item.file)
 
         enhancement_tasks = [
             ImplementationTask(
@@ -4439,14 +17626,142 @@ async def _run_enhancement_group(
                     "note it in your summary.\n\n"
                     + "\n".join(desc_lines)
                 ),
+                file_scope=[
+                    TaskFileScope(path=path, action="modify")
+                    for path in _dedupe_preserving_order(scope_paths)
+                ],
             ),
         ]
         verify_items = list(backlog.items)
 
     enh_tasks_by_id = {t.id: t for t in enhancement_tasks}
 
+    dag_sha256 = hashlib.sha256(
+        dag.model_dump_json().encode("utf-8"),
+    ).hexdigest()
+
+    # ── Resume: skip only when the checkpoint is fresh for current DAG/state ─
+    checkpoint_json = await runner.artifacts.get(
+        f"dag-group:{enhancement_group_idx}", feature=feature,
+    )
+    if checkpoint_json:
+        try:
+            data = _json.loads(checkpoint_json)
+            if data.get("verdict") == "approved" and await _dag_group_checkpoint_is_fresh(
+                runner,
+                feature,
+                group_idx=enhancement_group_idx,
+                group_task_ids=[task.id for task in enhancement_tasks],
+                dag_sha256=dag_sha256,
+                checkpoint=data,
+            ):
+                projected, projection_error = await _ensure_dag_group_checkpoint_projection_for_resume(
+                    runner,
+                    feature,
+                    enhancement_group_idx,
+                    data,
+                    dag_sha256=dag_sha256,
+                    group_task_ids=[task.id for task in enhancement_tasks],
+                )
+                if not projected:
+                    return _workflow_blocker_text(
+                        "Fresh enhancement checkpoint cannot skip without durable "
+                        "group_checkpoint projection evidence: "
+                        f"{projection_error or 'projection unavailable'}"
+                    )
+                logger.info("Enhancement group already complete — skipping")
+                return ""
+            logger.warning(
+                "Enhancement group checkpoint marker is stale or lacks typed "
+                "checkpoint proof — re-running enhancement group"
+            )
+        except (ValueError, TypeError):
+            pass
+
     # ── Ensure worktrees ──────────────────────────────────────────
-    await _ensure_task_worktrees(runner, feature, enhancement_tasks)
+    await _ensure_task_worktrees(
+        runner,
+        feature,
+        enhancement_tasks,
+        group_idx=enhancement_group_idx,
+    )
+
+    authority_guard = WorkspaceAuthorityCompatibilityOutcome()
+    if workspace_mgr and feature_root is not None:
+        authority_guard = await _run_workspace_authority_pre_dispatch_adapter(
+            runner,
+            feature,
+            enhancement_group_idx,
+            enhancement_tasks,
+            workspace_root=Path(workspace_mgr._base),
+            feature_root=feature_root,
+            stage="enhancement-dispatch",
+            dag_sha256=dag_sha256,
+        )
+        if _workspace_authority_blocks_dispatch(authority_guard):
+            evidence = "; ".join(
+                f"{getattr(route, 'failure_class', '')}/"
+                f"{getattr(route, 'failure_type', '')}: "
+                f"{getattr(route, 'route', '')}"
+                for route in authority_guard.routes[:10]
+            )
+            return _workflow_blocker_text(
+                "WorkspaceAuthority pre-dispatch guard blocked enhancement "
+                f"group {enhancement_group_idx} using typed deterministic "
+                "evidence. Run the typed workflow remediation route for "
+                "repairable blockers before dispatch; quiesce only for "
+                "operator-required safety ambiguity before "
+                f"dispatch. Evidence: {evidence or 'see workspace-authority-routes artifact'}"
+            )
+
+    alias_guard_ok, alias_guard_report = await _run_worktree_alias_pre_dispatch_guard(
+        runner,
+        feature,
+        enhancement_group_idx,
+        enhancement_tasks,
+        feature_root=feature_root,
+    )
+    if not alias_guard_ok:
+        details = "; ".join(
+            f"{problem.get('task_id')}: {problem.get('path')} -> "
+            f"{problem.get('canonical_path') or problem.get('canonical_repo')}"
+            for problem in alias_guard_report.get("blockers", [])[:10]
+        )
+        return _workflow_blocker_text(
+            "Canonical worktree alias pre-dispatch guard blocked enhancement "
+            f"group {enhancement_group_idx} before model dispatch. "
+            f"Alias blockers: {details}"
+        )
+    if workspace_mgr and not authority_guard.approved:
+        evidence = "; ".join(
+            f"{getattr(route, 'failure_class', '')}/"
+            f"{getattr(route, 'failure_type', '')}: "
+            f"{getattr(route, 'route', '')}"
+            for route in authority_guard.routes[:10]
+        )
+        return _workflow_blocker_text(
+            "WorkspaceAuthority pre-dispatch guard found deterministic "
+            f"repairable blockers for enhancement group {enhancement_group_idx}. "
+            "Run the typed workflow repair route before implementer dispatch. "
+            f"Evidence: {evidence or 'see workspace-authority-routes artifact'}"
+        )
+
+    contract_outcome = await _compile_task_contracts_for_group(
+        runner,
+        feature,
+        dag,
+        enhancement_group_idx,
+        enhancement_tasks,
+        registry=authority_guard.registry,
+        feature_root=feature_root,
+        dag_sha256=dag_sha256,
+    )
+    if not contract_outcome.approved:
+        return _workflow_blocker_text(
+            contract_outcome.failure
+            or "Task deliverable contract compilation failed before enhancement dispatch."
+        )
+    contracts_by_task_id = contract_outcome.contracts_by_task_id
 
     # ── Runtime routing (continue from last DAG group by default) ─
     runtime_policy = _runner_runtime_policy(runner)
@@ -4465,17 +17780,41 @@ async def _run_enhancement_group(
     # ── Per-task resume ───────────────────────────────────────────
     pending_tasks: list[ImplementationTask] = []
     completed_results: list[ImplementationResult] = []
+    stable_task_indices = {tid: idx for idx, tid in enumerate(enh_tasks_by_id)}
     for tid in enh_tasks_by_id:
         task_marker = await runner.artifacts.get(
             f"dag-task:{tid}", feature=feature,
         )
+        pending_merge_marker = await runner.artifacts.get(
+            _pending_merge_queue_marker_key(tid),
+            feature=feature,
+        )
+        if pending_merge_marker:
+            marker_result = ImplementationResult(
+                task_id=tid,
+                summary="Sandbox patch pending durable merge queue.",
+                status="completed",
+                notes=str(pending_merge_marker),
+            )
+            return _durable_merge_queue_blocker_for_results(
+                [marker_result],
+                enhancement=True,
+            )
         if task_marker:
             try:
                 result = ImplementationResult.model_validate_json(task_marker)
                 if result.status == "completed":
-                    completed_results.append(result)
-                    logger.info("Enhancement task %s already complete — skipping", tid)
-                    continue
+                    if _result_requires_durable_merge_queue(result):
+                        return _durable_merge_queue_blocker_for_results(
+                            [result],
+                            enhancement=True,
+                        )
+                    logger.warning(
+                        "Enhancement task %s completed marker must be revalidated "
+                        "with current contract, patch, and workspace lineage before "
+                        "resume — re-running",
+                        tid,
+                    )
             except Exception:
                 pass
         pending_tasks.append(enh_tasks_by_id[tid])
@@ -4497,62 +17836,78 @@ async def _run_enhancement_group(
 
             # ── Build prompt, offloading to files if too large ──
             prefix = f"{repo_prefix}/" if repo_prefix else ""
-            inline_prompt = _build_task_prompt(t, repo_prefix=prefix) + handover_context
-
-            # Use ws_path for context files, falling back to feature_root
-            # for tasks without a specific repo (e.g. enhancement-general).
-            context_base = ws_path or (str(feature_root) if feature_root else None)
-            if len(inline_prompt) > PROMPT_FILE_THRESHOLD and context_base:
-                context_dir = Path(context_base) / ".iriai-context" / t.id
-                context_dir.mkdir(parents=True, exist_ok=True)
-
-                task_prompt = _build_task_prompt(
-                    t, repo_prefix=prefix, context_dir=context_dir,
-                )
-                if handover_context:
-                    handover_path = context_dir / "handover.md"
-                    handover_path.write_text(
-                        handover_context.lstrip(), encoding="utf-8",
-                    )
-                    rel_handover = f".iriai-context/{t.id}/handover.md"
-                    task_prompt += (
-                        f"\n\n## Handover — Prior Work\n"
-                        f"Prior work context is in `{rel_handover}`.\n"
-                        f"**Read that file to understand what has been completed.**"
-                    )
-                else:
-                    task_prompt += handover_context
-
-                logger.info(
-                    "Enhancement task %s: prompt offloaded to files (%d → %d chars)",
-                    t.id, len(inline_prompt), len(task_prompt),
-                )
-            else:
-                task_prompt = inline_prompt
+            task_contract = contracts_by_task_id.get(t.id)
+            inline_prompt = (
+                _build_task_prompt(t, repo_prefix=prefix, contract=task_contract)
+                + handover_context
+            )
 
             for attempt in range(TASK_MAX_RETRIES + 1):
+                sandbox_task_binding: RuntimeSandboxTaskBinding | None = None
                 try:
-                    result = await runner.run(
-                        Ask(
-                            actor=_make_parallel_actor(
-                                implementer,
-                                f"enh-t{task_idx}-a{attempt}",
-                                runtime=impl_runtime,
-                                workspace_path=ws_path,
-                            ),
-                            prompt=task_prompt,
-                            output_type=ImplementationResult,
-                        ),
-                        feature,
-                        phase_name="implementation",
+                    result, _dispatch_outcome = await _dispatch_task_attempt_via_runtime_dispatcher(
+                        runner=runner,
+                        feature=feature,
+                        workspace_root=Path(workspace_mgr._base) if workspace_mgr else None,
+                        feature_root=feature_root,
+                        dag_sha256=dag_sha256,
+                        group_idx=enhancement_group_idx,
+                        task_idx=task_idx,
+                        attempt=attempt,
+                        task=t,
+                        task_contract=task_contract,
+                        ws_path=ws_path,
+                        snapshots=authority_guard.snapshots,
+                        runtime_hint=impl_runtime,
+                        runtime_policy=runtime_policy,
+                        repo_prefix=repo_prefix or "",
+                        inline_prompt=inline_prompt,
+                        handover_context=handover_context,
+                        stage="enhancement-implementation",
+                        actor_suffix=f"enh-t{task_idx}-a{attempt}",
+                        log_label=f"Enhancement task {t.id}",
                     )
                     if isinstance(result, ImplementationResult):
-                        if result.task_id != t.id:
-                            result.task_id = t.id
                         if not result.files_created and not result.files_modified:
                             await _enrich_fallback_result(result, ws_path, t)
                     return result
+                except SandboxWorkflowBlocker as e:
+                    if (
+                        _is_terminal_sandbox_attempt_blocker(str(e))
+                        and attempt < TASK_MAX_RETRIES
+                    ):
+                        logger.warning(
+                            "Enhancement task %s attempt %d hit a terminal durable "
+                            "sandbox lease; advancing to the next attempt",
+                            t.id,
+                            attempt,
+                        )
+                        continue
+                    return ImplementationResult(
+                        task_id=t.id,
+                        summary=str(e),
+                        status="blocked",
+                    )
                 except Exception as e:
+                    if sandbox_task_binding is not None:
+                        try:
+                            await _capture_and_promote_sandbox_patch(
+                                sandbox_task_binding,
+                                task_id=t.id,
+                                promote=False,
+                            )
+                        except SandboxWorkflowBlocker as capture_blocker:
+                            return ImplementationResult(
+                                task_id=t.id,
+                                summary=str(capture_blocker),
+                                status="blocked",
+                            )
+                        except Exception:
+                            logger.warning(
+                                "Enhancement task %s: failed to capture sandbox crash evidence",
+                                t.id,
+                                exc_info=True,
+                            )
                     logger.warning(
                         "Enhancement task %s crashed (attempt %d/%d): %s",
                         t.id, attempt + 1, TASK_MAX_RETRIES + 1, e,
@@ -4565,7 +17920,9 @@ async def _run_enhancement_group(
                         )
                         return ImplementationResult(
                             task_id=t.id,
-                            summary=f"BLOCKED: prompt too large for model context window: {e}",
+                            summary=_workflow_blocker_text(
+                                f"Runtime prompt too large for model context window: {e}"
+                            ),
                             status="blocked",
                         )
                     if attempt + 1 == TASK_WARN_AT:
@@ -4587,35 +17944,115 @@ async def _run_enhancement_group(
                     if attempt >= TASK_MAX_RETRIES:
                         return ImplementationResult(
                             task_id=t.id,
-                            summary=f"FAILED after {TASK_MAX_RETRIES + 1} attempts: {e}",
+                            summary=_workflow_blocker_text(
+                                "Runtime execution failed after "
+                                f"{TASK_MAX_RETRIES + 1} attempts: {e}"
+                            ),
                             status="blocked",
                         )
             return ImplementationResult(task_id=t.id, summary="FAILED", status="blocked")
 
         gathered = await _asyncio.gather(
-            *[_run_enh_task(i, t) for i, t in enumerate(pending_tasks)],
+            *[
+                _run_enh_task(stable_task_indices.get(t.id, i), t)
+                for i, t in enumerate(pending_tasks)
+            ],
         )
         new_results = list(gathered)
 
-        # Save per-task markers
-        for r in new_results:
-            if isinstance(r, ImplementationResult) and r.task_id:
+        sandbox_blocked = [
+            r
+            for r in new_results
+            if isinstance(r, ImplementationResult)
+            and r.status == "blocked"
+                    and _is_workflow_blocker_text(str(r.summary))
+        ]
+        if sandbox_blocked:
+            return "\n\n".join(str(r.summary) for r in sandbox_blocked)
+
+        pending_merge_queue = [
+            r
+            for r in new_results
+            if isinstance(r, ImplementationResult)
+            and _result_requires_durable_merge_queue(r)
+        ]
+        if pending_merge_queue:
+            for result in pending_merge_queue:
                 await runner.artifacts.put(
-                    f"dag-task:{r.task_id}",
-                    r.model_dump_json(),
+                    _pending_merge_queue_marker_key(result.task_id),
+                    str(result.notes),
                     feature=feature,
                 )
+            return _durable_merge_queue_blocker_for_results(
+                pending_merge_queue,
+                enhancement=True,
+            )
 
-        await _commit_repos(
+        contract_guard = await _record_precommit_contract_verdicts(
             runner,
             feature,
-            f"feat: enhancement group — {len(backlog.items)} items",
-            failure_key=f"dag-commit-failure:g{enhancement_group_idx}:implementation",
-            failure_metadata={
-                "group_idx": enhancement_group_idx,
-                "stage": "enhancement-implementation",
-            },
+            dag_sha256=dag_sha256,
+            group_idx=enhancement_group_idx,
+            stage="enhancement-implementation",
+            feature_root=feature_root,
+            contracts_by_task_id=contracts_by_task_id,
+            results=new_results,
+            workspace_snapshots=authority_guard.snapshots,
         )
+        if not contract_guard.approved:
+            await _log_feature_event(
+                runner,
+                feature.id,
+                "dag_task_contract_verdict_failed",
+                "implementation",
+                content=f"g{enhancement_group_idx}:enhancement-implementation",
+                metadata={
+                    "group_idx": enhancement_group_idx,
+                    "stage": "enhancement-implementation",
+                    "violation_codes": contract_guard.violation_codes,
+                    "artifact_keys": contract_guard.artifact_keys,
+                },
+            )
+            return _workflow_blocker_text(contract_guard.failure)
+
+        initial_verdict: Verdict | None = None
+        initial_verdict_key: str | None = None
+        try:
+            await _commit_repos(
+                runner,
+                feature,
+                f"feat: enhancement group — {len(backlog.items)} items",
+                group_idx=enhancement_group_idx,
+                failure_key=f"dag-commit-failure:g{enhancement_group_idx}:implementation",
+                failure_metadata={
+                    "group_idx": enhancement_group_idx,
+                    "stage": "enhancement-implementation",
+                },
+            )
+        except WorkflowCommitError as exc:
+            await _record_dag_commit_failure(
+                runner,
+                feature,
+                enhancement_group_idx,
+                "enhancement-implementation",
+                exc,
+                message=f"feat: enhancement group — {len(backlog.items)} items",
+                extra_metadata={
+                    "stage": "enhancement-implementation",
+                    "enhancement_item_count": len(backlog.items),
+                },
+            )
+            initial_verdict = _commit_failure_verdict(
+                exc,
+                group_idx=enhancement_group_idx,
+                stage="enhancement-implementation",
+            )
+            initial_verdict_key = (
+                f"dag-verify:g{enhancement_group_idx}:enhancement-commit"
+            )
+    else:
+        initial_verdict = None
+        initial_verdict_key = None
 
     results = list(completed_results) + list(new_results)
     all_results.extend(new_results)
@@ -4657,6 +18094,11 @@ async def _run_enhancement_group(
         diagnostic_runtime,
         verify_fn=_enh_verify,
         fix_context=enh_fix_context,
+        initial_verdict=initial_verdict,
+        initial_verdict_key=initial_verdict_key,
+        dag_sha256=dag_sha256,
+        contracts_by_task_id=contracts_by_task_id,
+        workspace_snapshots=authority_guard.snapshots,
     )
     if approved:
         # Clear the backlog — enhancements are now fixed
@@ -4675,6 +18117,7 @@ async def _commit_repos(
     feature: Feature,
     msg: str,
     *,
+    group_idx: int | None = None,
     failure_key: str | None = None,
     failure_metadata: dict[str, Any] | None = None,
 ) -> str:
@@ -4688,7 +18131,27 @@ async def _commit_repos(
     """
     repos_root = _get_feature_root(runner, feature)
     try:
-        return await _commit_repos_in_root(repos_root, msg)
+        authorized_repos: set[str] | None = None
+        expected_origins: dict[str, str] | None = None
+        optional_noop_repos: set[str] = set()
+        if repos_root is not None:
+            expected_origins, optional_noop_repos, _allowed_origin_root = (
+                await _source_push_expected_origins(
+                    runner,
+                    feature,
+                    repos_root,
+                    group_idx=group_idx,
+                )
+            )
+            if expected_origins is not None:
+                authorized_repos = set(expected_origins)
+        return await _commit_repos_in_root(
+            repos_root,
+            msg,
+            authorized_repos=authorized_repos,
+            authorized_source_roots=expected_origins,
+            optional_noop_repos=optional_noop_repos,
+        )
     except WorkflowCommitError as exc:
         if failure_key:
             await _record_commit_failure_artifact(
@@ -4701,31 +18164,27 @@ async def _commit_repos(
         raise
 
 
-async def _run_git_for_commit(repo_path: Path, *args: str) -> tuple[int, str, str]:
-    proc = await _asyncio.create_subprocess_exec(
-        "git", *args,
-        cwd=str(repo_path),
-        stdout=_asyncio.subprocess.PIPE,
-        stderr=_asyncio.subprocess.PIPE,
-    )
-    stdout, stderr = await proc.communicate()
-    return proc.returncode or 0, stdout.decode(errors="replace"), stderr.decode(errors="replace")
-
-
-async def _git_status_for_commit(repo_path: Path) -> tuple[int, str, str]:
-    return await _run_git_for_commit(repo_path, "status", "--porcelain")
+# `_run_git_for_commit` and `_git_status_for_commit` are shimmed from
+# `..execution.git_service` (Slice 11b).
 
 
 async def _commit_repos_in_root(
     repos_root: Path | None,
     msg: str,
+    *,
+    authorized_repos: set[str] | None = None,
+    authorized_source_roots: dict[str, str] | None = None,
+    optional_noop_repos: set[str] | None = None,
 ) -> str:
     """Commit uncommitted changes in all repo clones rooted under *repos_root*."""
     if not repos_root:
         logger.warning("_commit_repos_in_root: no feature workspace found — skipping")
         return ""
 
-    hygiene_problems = _dag_repo_hygiene_problems(repos_root)
+    hygiene_problems = _dag_repo_hygiene_problems(
+        repos_root,
+        authorized_source_roots=authorized_source_roots,
+    )
     if hygiene_problems:
         details = ", ".join(
             str(problem.get("path", "<unknown>"))
@@ -4756,16 +18215,59 @@ async def _commit_repos_in_root(
     outcomes: list[CommitRepoOutcome] = []
 
     def _is_workflow_repo(repo_dir: Path) -> bool:
-        # Workflow repos live exactly at feature_root/repos/<name>/. Nested
-        # .git dirs (e.g. created by `npm create vite`, `git init` inside an
-        # agent shell) are accidental embedded repos; committing in them
-        # produces orphaned history. Filter them out.
+        # Workflow repos live under feature_root/repos and can be registry-
+        # authorized nested paths such as services/newsvc. Embedded .git dirs
+        # inside another repo are accidental and must not be committed.
         try:
-            return repo_dir.parent == repos_root and repos_root.name == "repos"
+            repo_dir.resolve(strict=False).relative_to(
+                repos_root.resolve(strict=False)
+            )
         except Exception:
             return False
+        if repos_root.name != "repos":
+            return False
+        for other in discovered:
+            if other == repo_dir:
+                continue
+            try:
+                repo_dir.resolve(strict=False).relative_to(
+                    other.resolve(strict=False)
+                )
+            except Exception:
+                continue
+            return False
+        return True
 
-    discovered = _discover_repo_roots_under(repos_root)
+    discovered, discovery_failures = _direct_source_push_repos(
+        repos_root,
+        authorized_repos=authorized_repos,
+        authorized_source_roots=authorized_source_roots,
+    )
+    if discovery_failures:
+        details = "; ".join(discovery_failures[:10])
+        if len(discovery_failures) > 10:
+            details += f"; +{len(discovery_failures) - 10} more"
+        raise WorkflowCommitError(
+            "Refusing to commit workflow repos before registry authority is resolved",
+            [
+                CommitRepoOutcome(
+                    repo_path=str(repos_root),
+                    repo_name=repos_root.name,
+                    message=msg,
+                    dirty=True,
+                    command=["workflow-repo-authority-check"],
+                    exit_code=1,
+                    stderr=details,
+                    status_after=json.dumps(discovery_failures[:25], indent=2),
+                    error=(
+                        "Refusing to commit workflow repos before registry "
+                        f"authority is resolved: {details}"
+                    ),
+                )
+            ],
+        )
+    optional_noop_repos = set(optional_noop_repos or set())
+    dirty_repos: list[tuple[Path, str, str]] = []
     for repo_dir in discovered:
         if not _is_workflow_repo(repo_dir):
             logger.info("Skipping nested .git at %s (not a workflow repo)", repo_dir)
@@ -4789,7 +18291,82 @@ async def _commit_repos_in_root(
         status_before = status_stdout.strip()
         if not status_before:
             continue
+        try:
+            rel_repo = repo_dir.relative_to(repos_root).as_posix()
+        except Exception:
+            rel_repo = str(repo_dir)
+        if rel_repo in optional_noop_repos:
+            outcomes.append(
+                CommitRepoOutcome(
+                    repo_path=str(repo_dir),
+                    repo_name=repo_dir.name,
+                    message=msg,
+                    status_before=status_before,
+                    status_after=status_before,
+                    dirty=True,
+                    command=["workflow-repo-authority-check"],
+                    exit_code=1,
+                    error=(
+                        "read-only or optional-noop repo is dirty before "
+                        "checkpoint commit"
+                    ),
+                )
+            )
+            continue
+        head_rc, head_stdout, head_stderr = await _run_git_for_commit(
+            repo_dir,
+            "rev-parse",
+            "HEAD",
+        )
+        if head_rc != 0:
+            outcomes.append(
+                CommitRepoOutcome(
+                    repo_path=str(repo_dir),
+                    repo_name=repo_dir.name,
+                    message=msg,
+                    status_before=status_before,
+                    dirty=True,
+                    command=["git", "rev-parse", "HEAD"],
+                    exit_code=head_rc,
+                    stdout=head_stdout,
+                    stderr=head_stderr,
+                    error="git HEAD lookup failed before commit",
+                )
+            )
+            continue
+        dirty_repos.append((repo_dir, status_before, head_stdout.strip()))
 
+    failures = [outcome for outcome in outcomes if outcome.error or outcome.exit_code]
+    if failures:
+        raise WorkflowCommitError("Failed to commit dirty workflow repos", outcomes)
+
+    async def _rollback_dirty_repo_mutations(reason: str) -> None:
+        for repo_dir, status_before, head_before in dirty_repos:
+            reset_rc, reset_stdout, reset_stderr = await _run_git_for_commit(
+                repo_dir,
+                "reset",
+                "--mixed",
+                head_before,
+            )
+            if reset_rc != 0:
+                _, status_after, _ = await _git_status_for_commit(repo_dir)
+                outcomes.append(
+                    CommitRepoOutcome(
+                        repo_path=str(repo_dir),
+                        repo_name=repo_dir.name,
+                        message=msg,
+                        status_before=status_before,
+                        status_after=status_after.strip(),
+                        dirty=True,
+                        command=["git", "reset", "--mixed", head_before],
+                        exit_code=reset_rc,
+                        stdout=reset_stdout,
+                        stderr=reset_stderr,
+                        error=f"git rollback failed after {reason}",
+                    )
+                )
+
+    for repo_dir, status_before, _head_before in dirty_repos:
         add_rc, add_stdout, add_stderr = await _run_git_for_commit(
             repo_dir, "add", "--all", ".",
         )
@@ -4810,8 +18387,11 @@ async def _commit_repos_in_root(
                     error="git add failed before commit",
                 )
             )
-            continue
+            await _rollback_dirty_repo_mutations("git add failed")
+            raise WorkflowCommitError("Failed to commit dirty workflow repos", outcomes)
 
+    pending_successes: list[CommitRepoOutcome] = []
+    for repo_dir, status_before, head_before in dirty_repos:
         commit_rc, commit_stdout, commit_stderr = await _run_git_for_commit(
             repo_dir, "commit", "-m", msg,
         )
@@ -4838,7 +18418,8 @@ async def _commit_repos_in_root(
                 commit_rc,
                 commit_stderr.strip() or commit_stdout.strip(),
             )
-            continue
+            await _rollback_dirty_repo_mutations("git commit failed")
+            raise WorkflowCommitError("Failed to commit dirty workflow repos", outcomes)
 
         rev_rc, rev_stdout, rev_stderr = await _run_git_for_commit(
             repo_dir, "rev-parse", "HEAD",
@@ -4860,17 +18441,38 @@ async def _commit_repos_in_root(
                     error="git commit succeeded but HEAD lookup failed",
                 )
             )
-            continue
+            await _rollback_dirty_repo_mutations("post-commit HEAD proof failed")
+            raise WorkflowCommitError("Failed to commit dirty workflow repos", outcomes)
 
         commit_hash = rev_stdout.strip()
-        _, status_after, _ = await _git_status_for_commit(repo_dir)
-        outcomes.append(
+        status_after_rc, status_after_stdout, status_after_stderr = await _git_status_for_commit(repo_dir)
+        status_after = status_after_stdout.strip()
+        if status_after_rc != 0 or status_after:
+            outcomes.append(
+                CommitRepoOutcome(
+                    repo_path=str(repo_dir),
+                    repo_name=repo_dir.name,
+                    message=msg,
+                    status_before=status_before,
+                    status_after=status_after,
+                    dirty=True,
+                    command=["git", "status", "--porcelain"],
+                    exit_code=status_after_rc or 1,
+                    stdout=status_after_stdout,
+                    stderr=status_after_stderr,
+                    commit_hash=commit_hash,
+                    error="git commit succeeded but worktree is dirty after commit",
+                )
+            )
+            await _rollback_dirty_repo_mutations("post-commit no-dirty proof failed")
+            raise WorkflowCommitError("Failed to commit dirty workflow repos", outcomes)
+        pending_successes.append(
             CommitRepoOutcome(
                 repo_path=str(repo_dir),
                 repo_name=repo_dir.name,
                 message=msg,
                 status_before=status_before,
-                status_after=status_after.strip(),
+                status_after=status_after,
                 dirty=True,
                 command=["git", "commit", "-m", msg],
                 stdout=commit_stdout,
@@ -4880,6 +18482,7 @@ async def _commit_repos_in_root(
         )
         logger.info("Committed in %s: %s", repo_dir.name, commit_hash[:8])
 
+    outcomes.extend(pending_successes)
     failures = [outcome for outcome in outcomes if outcome.error or outcome.exit_code]
     if failures:
         raise WorkflowCommitError("Failed to commit dirty workflow repos", outcomes)
@@ -4903,6 +18506,7 @@ async def _commit_group(
         runner,
         feature,
         msg,
+        group_idx=group_idx,
         failure_key=f"dag-commit-failure:g{group_idx}:checkpoint",
         failure_metadata={
             "group_idx": group_idx,
@@ -4910,6 +18514,1080 @@ async def _commit_group(
             "task_ids": [task.id for task in group_tasks],
             "message": msg,
         },
+    )
+
+
+def _current_feature_repo_heads(
+    runner: WorkflowRunner,
+    feature: Feature,
+    *,
+    feature_root: Path | None = None,
+    authorized_repos: set[str] | None = None,
+    authorized_source_roots: dict[str, str] | None = None,
+) -> str:
+    feature_root = feature_root or _get_feature_root(runner, feature)
+    if (
+        feature_root is None
+        or not feature_root.exists()
+        or _workflow_repos_root_guard_problems(
+            feature_root,
+            authorized_source_roots=authorized_source_roots,
+        )
+    ):
+        return ""
+    heads: list[str] = []
+    if authorized_repos is None:
+        repo_dirs = _discover_repo_roots_under(feature_root)
+    else:
+        repo_dirs, discovery_failures = _direct_source_push_repos(
+            feature_root,
+            authorized_repos=authorized_repos,
+            authorized_source_roots=authorized_source_roots,
+        )
+        if discovery_failures:
+            return ""
+    for repo_dir in repo_dirs:
+        try:
+            result = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=repo_dir,
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=5,
+            )
+        except Exception:
+            continue
+        if result.returncode == 0 and result.stdout.strip():
+            try:
+                rel = str(repo_dir.relative_to(feature_root))
+            except ValueError:
+                rel = str(repo_dir)
+            heads.append(f"{rel}:{result.stdout.strip()}")
+    return ",".join(sorted(heads))
+
+
+def _checkpoint_commit_matches_current_heads(commit_hash: str, current_heads: str) -> bool:
+    commit_hash = str(commit_hash or "").strip()
+    current_heads = str(current_heads or "").strip()
+    if not commit_hash or not current_heads:
+        return False
+    if commit_hash == current_heads:
+        return True
+    bare_commits = [part.strip() for part in commit_hash.split(",") if part.strip()]
+    head_values: list[str] = []
+    for item in current_heads.split(","):
+        _repo, separator, head = item.partition(":")
+        if not separator or not head:
+            return False
+        head_values.append(head)
+    if len(head_values) == 1 and head_values[0] == commit_hash:
+        return True
+    return (
+        len(head_values) == len(bare_commits)
+        and sorted(head_values) == sorted(bare_commits)
+    )
+
+
+def _feature_repos_clean_for_checkpoint_resume(
+    runner: WorkflowRunner,
+    feature: Feature,
+    *,
+    feature_root: Path | None = None,
+    authorized_repos: set[str] | None = None,
+    authorized_source_roots: dict[str, str] | None = None,
+) -> bool:
+    feature_root = feature_root or _get_feature_root(runner, feature)
+    if (
+        feature_root is None
+        or not feature_root.exists()
+        or _workflow_repos_root_guard_problems(
+            feature_root,
+            authorized_source_roots=authorized_source_roots,
+        )
+    ):
+        return False
+    if authorized_repos is None:
+        repo_dirs = _discover_repo_roots_under(feature_root)
+    else:
+        repo_dirs, discovery_failures = _direct_source_push_repos(
+            feature_root,
+            authorized_repos=authorized_repos,
+            authorized_source_roots=authorized_source_roots,
+        )
+        if discovery_failures:
+            return False
+    for repo_dir in repo_dirs:
+        try:
+            result = subprocess.run(
+                ["git", "status", "--porcelain"],
+                cwd=repo_dir,
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=5,
+            )
+        except Exception:
+            return False
+        if result.returncode != 0 or result.stdout.strip():
+            return False
+    return True
+
+
+def _checkpoint_no_dirty_proof(
+    runner: WorkflowRunner,
+    feature: Feature,
+    *,
+    feature_root: Path | None = None,
+    authorized_repos: set[str] | None = None,
+    authorized_source_roots: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    feature_root = feature_root or _get_feature_root(runner, feature)
+    proof: dict[str, Any] = {
+        "artifact_schema": "dag-checkpoint-no-dirty-proof-v1",
+        "clean": False,
+        "repo_heads": "",
+        "repos": [],
+    }
+    if feature_root is None or not feature_root.exists():
+        proof["reason"] = "missing_feature_root"
+        return proof
+    guard_problems = _workflow_repos_root_guard_problems(
+        feature_root,
+        authorized_source_roots=authorized_source_roots,
+    )
+    if guard_problems:
+        proof["reason"] = "unsafe_feature_root"
+        proof["problems"] = guard_problems
+        proof["proof_digest"] = _dag_verify_graph_digest({
+            "clean": proof["clean"],
+            "repo_heads": proof["repo_heads"],
+            "problems": guard_problems,
+        })
+        return proof
+    clean = True
+    heads: list[str] = []
+    repos: list[dict[str, Any]] = []
+    repo_dirs, discovery_failures = _direct_source_push_repos(
+        feature_root,
+        authorized_repos=authorized_repos,
+        authorized_source_roots=authorized_source_roots,
+    )
+    if discovery_failures:
+        proof["reason"] = "unauthorized_repo_discovery"
+        proof["problems"] = discovery_failures[:20]
+        proof["proof_digest"] = _dag_verify_graph_digest({
+            "clean": proof["clean"],
+            "repo_heads": proof["repo_heads"],
+            "problems": proof["problems"],
+        })
+        return proof
+    for repo_dir in repo_dirs:
+        repo_record: dict[str, Any] = {"path": str(repo_dir.relative_to(feature_root))}
+        try:
+            status = subprocess.run(
+                ["git", "status", "--porcelain"],
+                cwd=repo_dir,
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=5,
+            )
+            head = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=repo_dir,
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=5,
+            )
+        except Exception as exc:
+            clean = False
+            repo_record["error"] = f"{type(exc).__name__}: {exc}"
+            repos.append(repo_record)
+            continue
+        status_text = (status.stdout or "").strip()
+        head_text = (head.stdout or "").strip() if head.returncode == 0 else ""
+        repo_record.update(
+            {
+                "head": head_text,
+                "status": status_text,
+                "status_returncode": status.returncode,
+                "head_returncode": head.returncode,
+            }
+        )
+        if status.returncode != 0 or head.returncode != 0 or status_text:
+            clean = False
+        if head_text:
+            heads.append(f"{repo_record['path']}:{head_text}")
+        repos.append(repo_record)
+    proof["clean"] = clean
+    proof["repo_heads"] = ",".join(sorted(heads))
+    proof["repos"] = repos
+    proof["proof_digest"] = _dag_verify_graph_digest({
+        "clean": proof["clean"],
+        "repo_heads": proof["repo_heads"],
+        "repos": proof["repos"],
+    })
+    return proof
+
+
+def _checkpoint_results_match_tasks(
+    checkpoint: dict[str, Any],
+    group_task_ids: list[str],
+) -> bool:
+    results = checkpoint.get("results")
+    if not isinstance(results, list):
+        return False
+    if not group_task_ids:
+        return results == []
+    if len(results) != len(group_task_ids):
+        return False
+    result_task_ids: list[str] = []
+    for raw in results:
+        try:
+            result = ImplementationResult.model_validate(raw)
+        except Exception:
+            return False
+        result_task_ids.append(result.task_id)
+    return sorted(result_task_ids) == sorted(group_task_ids) and len(set(result_task_ids)) == len(result_task_ids)
+
+
+async def _record_dag_checkpoint_gate_proof(
+    runner: WorkflowRunner,
+    feature: Feature,
+    group_idx: int,
+    group_tasks: list[ImplementationTask],
+    *,
+    dag_sha256: str,
+    projection_key: str,
+    commit_hash: str,
+    checkpoint_results: list[dict[str, Any]],
+    feature_root: Path | None,
+) -> dict[str, Any]:
+    stage = "checkpoint"
+    graph_key = _dag_verify_graph_artifact_key(
+        group_idx,
+        _dag_verify_stage_from_projection_key(projection_key),
+    )
+    graph_payload = _json_object_from_text(
+        await runner.artifacts.get(graph_key, feature=feature)
+    )
+    proof = _json_object_from_text(graph_payload.get("proof"))
+    durable_projection = _json_object_from_text(graph_payload.get("durable_projection"))
+    authorized_repos = await _checkpoint_authorized_repos(
+        runner,
+        feature,
+        feature_root,
+        group_idx=group_idx,
+    )
+    authorized_sources = await _checkpoint_authorized_repo_sources(
+        runner,
+        feature,
+        feature_root,
+        group_idx=group_idx,
+    )
+    no_dirty = _checkpoint_no_dirty_proof(
+        runner,
+        feature,
+        feature_root=feature_root,
+        authorized_repos=authorized_repos,
+        authorized_source_roots=authorized_sources,
+    )
+    if no_dirty.get("clean") is not True:
+        return {
+            "persisted": False,
+            "failure_class": "checkpoint_gate",
+            "failure_type": "checkpoint_dirty_worktree",
+            "route": "commit_hygiene",
+            "retryable": True,
+            "operator_required": False,
+            "deterministic_workflow_blocker": True,
+            "no_dirty_proof": no_dirty,
+        }
+    no_dirty_proof_digest = _dag_verify_graph_digest(no_dirty)
+    merge_gate = await _record_typed_verification_gate_node(
+        runner,
+        feature,
+        kind="merge_gate",
+        name=f"merge_gate:g{group_idx}",
+        stage=stage,
+        group_idx=group_idx,
+        dag_sha256=dag_sha256,
+        payload={
+            "commit_hash": commit_hash,
+            "dag_sha256": dag_sha256,
+            "durable_projection": durable_projection,
+            "group_idx": group_idx,
+            "projection_key": projection_key,
+            "proof_digest": proof.get("proof_digest"),
+            "task_ids": [task.id for task in group_tasks],
+        },
+        metadata={"gate": "merge_gate", "projection_key": projection_key},
+    )
+    if merge_gate.get("persisted") is not True:
+        return merge_gate
+    checkpoint_results_digest = _dag_verify_graph_digest({
+        "checkpoint_results": checkpoint_results,
+        "group_idx": group_idx,
+        "task_ids": [task.id for task in group_tasks],
+    })
+    checkpoint_gate_payload = {
+        "checkpoint_results_digest": checkpoint_results_digest,
+        "commit_hash": commit_hash,
+        "dag_sha256": dag_sha256,
+        "group_idx": group_idx,
+        "merge_gate": merge_gate,
+        "no_dirty_proof_digest": no_dirty_proof_digest,
+        "projection_key": projection_key,
+        "proof_digest": proof.get("proof_digest"),
+        "task_ids": [task.id for task in group_tasks],
+    }
+    checkpoint_gate = await _record_typed_verification_gate_node(
+        runner,
+        feature,
+        kind="checkpoint_gate",
+        name=f"checkpoint_gate:g{group_idx}",
+        stage=stage,
+        group_idx=group_idx,
+        dag_sha256=dag_sha256,
+        payload=checkpoint_gate_payload,
+        metadata={"gate": "checkpoint_gate", "projection_key": projection_key},
+    )
+    return {
+        "artifact_schema": "dag-checkpoint-gate-proof-v1",
+        "persisted": checkpoint_gate.get("persisted") is True,
+        "checkpoint_gate": checkpoint_gate,
+        "checkpoint_results_digest": checkpoint_results_digest,
+        "checkpoint_results": checkpoint_results,
+        "commit_hash": commit_hash,
+        "dag_sha256": dag_sha256,
+        "group_idx": group_idx,
+        "merge_gate": merge_gate,
+        "no_dirty_proof": no_dirty,
+        "no_dirty_proof_digest": no_dirty_proof_digest,
+        "projection_key": projection_key,
+        "proof_digest": proof.get("proof_digest"),
+        "task_ids": [task.id for task in group_tasks],
+    }
+
+
+async def _project_dag_group_checkpoint(
+    runner: WorkflowRunner,
+    feature: Feature,
+    group_idx: int,
+    checkpoint: dict[str, Any],
+    *,
+    dag_sha256: str,
+    checkpoint_gate_proof: dict[str, Any],
+) -> tuple[bool, str]:
+    store = _execution_control_store_for_runner(runner)
+    projector = getattr(store, "project_group_checkpoint", None)
+    if not callable(projector) or StoredGroupCheckpointProjection is None:
+        return False, "execution-control store does not expose project_group_checkpoint"
+
+    projection_key = f"dag-group:{group_idx}"
+    body = json.dumps(checkpoint, sort_keys=True)
+    body_sha256 = hashlib.sha256(body.encode("utf-8")).hexdigest()
+    checkpoint_gate = _json_object_from_text(
+        checkpoint_gate_proof.get("checkpoint_gate")
+    )
+    source_id = checkpoint_gate.get("evidence_node_id")
+    metadata = {
+        "checkpoint_body_sha256": body_sha256,
+        "checkpoint_gate_content_hash": checkpoint_gate.get("content_hash"),
+        "checkpoint_gate_evidence_node_id": source_id,
+        "commit_hash": checkpoint.get("commit_hash"),
+        "dag_sha256": dag_sha256,
+        "group_idx": group_idx,
+        "projection_key": projection_key,
+        "proof_digest": checkpoint_gate_proof.get("proof_digest"),
+        "result_count": len(list(checkpoint.get("results") or [])),
+        "task_ids": list(checkpoint.get("task_ids") or []),
+    }
+    projection = StoredGroupCheckpointProjection(
+        feature_id=str(feature.id),
+        projection_key=projection_key,
+        artifact_key=projection_key,
+        projection_body=body,
+        artifact_body=body,
+        body=body,
+        value=body,
+        checkpoint=checkpoint,
+        group_idx=group_idx,
+        dag_sha256=dag_sha256,
+        stage="checkpoint",
+        status=str(checkpoint.get("verdict") or "approved"),
+        source_kind="checkpoint_gate",
+        source_table="evidence_nodes",
+        source_id=source_id,
+        idempotency_key=(
+            f"idem:dag-group-checkpoint:{feature.id}:{dag_sha256}:"
+            f"g{group_idx}:{body_sha256}"
+        ),
+        legacy_event_type="dag_group_checkpoint",
+        legacy_event_content=f"group {group_idx}",
+        legacy_event_metadata=metadata,
+    )
+    try:
+        await projector(projection)
+    except Exception as exc:
+        logger.warning(
+            "Failed to project dag-group checkpoint %s", projection_key, exc_info=True,
+        )
+        return False, f"{type(exc).__name__}: {exc}"
+
+    if getattr(store, "test_mirror_group_checkpoint_to_artifacts", False):
+        await runner.artifacts.put(projection_key, body, feature=feature)
+    return True, ""
+
+
+async def _ensure_dag_group_checkpoint_projection_for_resume(
+    runner: WorkflowRunner,
+    feature: Feature,
+    group_idx: int,
+    checkpoint: dict[str, Any],
+    *,
+    dag_sha256: str,
+    group_task_ids: list[str],
+    accepted_dag_sha256s: list[str] | None = None,
+) -> tuple[bool, str]:
+    gate_proof = _json_object_from_text(
+        await runner.artifacts.get(
+            f"dag-checkpoint-gate-proof:{group_idx}",
+            feature=feature,
+        )
+    )
+    if str(gate_proof.get("artifact_schema") or "") != "dag-checkpoint-gate-proof-v1":
+        return True, ""
+    if gate_proof.get("group_idx") != group_idx:
+        return False, "checkpoint gate proof group does not match checkpoint marker"
+    if list(gate_proof.get("task_ids") or []) != list(group_task_ids):
+        return False, "checkpoint gate proof task ids do not match checkpoint marker"
+    allowed_dag_sha256s = {str(dag_sha256 or "")}
+    allowed_dag_sha256s.update(
+        str(value or "") for value in (accepted_dag_sha256s or []) if str(value or "")
+    )
+    projection_dag_sha256 = str(
+        gate_proof.get("dag_sha256")
+        or checkpoint.get("dag_sha256")
+        or dag_sha256
+        or ""
+    )
+    if projection_dag_sha256 not in allowed_dag_sha256s:
+        return False, "checkpoint gate proof DAG digest is stale"
+    if str(gate_proof.get("commit_hash") or "") != str(checkpoint.get("commit_hash") or ""):
+        return False, "checkpoint gate proof commit does not match checkpoint marker"
+    return await _project_dag_group_checkpoint(
+        runner,
+        feature,
+        group_idx,
+        checkpoint,
+        dag_sha256=projection_dag_sha256,
+        checkpoint_gate_proof=gate_proof,
+    )
+
+
+async def _checkpoint_gate_graph_projection_is_fresh(
+    runner: WorkflowRunner,
+    feature: Feature,
+    *,
+    gate_proof: dict[str, Any],
+    group_idx: int,
+    dag_sha256: str,
+    accepted_dag_sha256s: list[str] | None = None,
+) -> bool:
+    projection_key = str(gate_proof.get("projection_key") or "")
+    proof_digest = str(gate_proof.get("proof_digest") or "")
+    if not projection_key.startswith(f"dag-verify:g{group_idx}:") or not proof_digest:
+        return False
+    stage = _dag_verify_stage_from_projection_key(projection_key)
+    allowed_dag_sha256s = [str(dag_sha256 or "")]
+    allowed_dag_sha256s.extend(
+        str(value or "") for value in (accepted_dag_sha256s or []) if str(value or "")
+    )
+    graph_key = _dag_verify_graph_artifact_key(group_idx, stage)
+    artifact_payload = _dag_verify_graph_payload_for_projection(
+        await _get_artifact_text(runner, feature, graph_key),
+        projection_key,
+    )
+    for allowed_dag_sha256 in dict.fromkeys(allowed_dag_sha256s):
+        if artifact_payload is not None:
+            proof = _json_object_from_text(artifact_payload.get("proof"))
+            if str(proof.get("proof_digest") or "") == proof_digest:
+                verified, reload_error = await _load_verified_dag_verification_graph_projection(
+                    runner,
+                    artifact_payload,
+                    projection_key=projection_key,
+                    feature_id=str(feature.id),
+                    group_idx=group_idx,
+                    dag_sha256=allowed_dag_sha256,
+                    stage=stage,
+                )
+                if not reload_error and verified is not None:
+                    payload = dict(artifact_payload)
+                    payload["durable_projection"] = _dag_verify_graph_durable_metadata_from_reload(
+                        None,
+                        verified,
+                    )
+                    if not _validate_dag_verification_graph_payload(
+                        payload,
+                        projection_key=projection_key,
+                        feature_id=str(feature.id),
+                        group_idx=group_idx,
+                        dag_sha256=allowed_dag_sha256,
+                    ):
+                        await runner.artifacts.put(
+                            graph_key,
+                            json.dumps(payload, sort_keys=True),
+                            feature=feature,
+                        )
+                        return True
+        recovered, _recover_error = await _recover_dag_verification_graph_payload_from_store(
+            runner,
+            feature,
+            projection_key=projection_key,
+            group_idx=group_idx,
+            dag_sha256s=[allowed_dag_sha256],
+            stage=stage,
+            proof_digest=proof_digest,
+        )
+        if recovered is not None:
+            return True
+    return False
+
+
+async def _checkpoint_gate_proof_is_fresh(
+    runner: WorkflowRunner,
+    feature: Feature,
+    *,
+    gate_proof: dict[str, Any],
+    group_idx: int,
+    dag_sha256: str,
+    commit_hash: str,
+    accepted_dag_sha256s: list[str] | None = None,
+) -> bool:
+    if gate_proof.get("persisted") is not True:
+        return False
+    if str(gate_proof.get("projection_key") or "") and not str(
+        gate_proof.get("projection_key") or ""
+    ).startswith(f"dag-verify:g{group_idx}:"):
+        return False
+    if not await _checkpoint_gate_graph_projection_is_fresh(
+        runner,
+        feature,
+        gate_proof=gate_proof,
+        group_idx=group_idx,
+        dag_sha256=dag_sha256,
+        accepted_dag_sha256s=accepted_dag_sha256s,
+    ):
+        return False
+    no_dirty = _json_object_from_text(gate_proof.get("no_dirty_proof"))
+    if no_dirty.get("clean") is not True:
+        return False
+    merge_gate = _json_object_from_text(gate_proof.get("merge_gate"))
+    checkpoint_gate = _json_object_from_text(gate_proof.get("checkpoint_gate"))
+    checkpoint_results = gate_proof.get("checkpoint_results")
+    if not isinstance(checkpoint_results, list):
+        return False
+    checkpoint_results_digest = _dag_verify_graph_digest({
+        "checkpoint_results": checkpoint_results,
+        "group_idx": group_idx,
+        "task_ids": list(gate_proof.get("task_ids") or []),
+    })
+    if str(gate_proof.get("checkpoint_results_digest") or "") != checkpoint_results_digest:
+        return False
+    no_dirty_proof_digest = str(gate_proof.get("no_dirty_proof_digest") or "")
+    if not no_dirty_proof_digest:
+        no_dirty_proof_digest = _dag_verify_graph_digest(no_dirty)
+    checkpoint_gate_payload = {
+        "checkpoint_results_digest": checkpoint_results_digest,
+        "commit_hash": commit_hash,
+        "dag_sha256": str(gate_proof.get("dag_sha256") or dag_sha256),
+        "group_idx": group_idx,
+        "merge_gate": merge_gate,
+        "no_dirty_proof_digest": no_dirty_proof_digest,
+        "projection_key": str(gate_proof.get("projection_key") or ""),
+        "proof_digest": str(gate_proof.get("proof_digest") or ""),
+        "task_ids": list(gate_proof.get("task_ids") or []),
+    }
+    checkpoint_gate_content_hashes = {
+        _dag_verify_graph_digest({
+            "dag_sha256": allowed_dag_sha256,
+            "feature_id": str(feature.id),
+            "group_idx": group_idx,
+            "kind": "checkpoint_gate",
+            "name": f"checkpoint_gate:g{group_idx}",
+            "payload": checkpoint_gate_payload,
+            "stage": "checkpoint",
+            "status": "approved",
+        })
+        for allowed_dag_sha256 in dict.fromkeys([
+            str(dag_sha256 or ""),
+            *[
+                str(value or "")
+                for value in (accepted_dag_sha256s or [])
+                if str(value or "")
+            ],
+        ])
+    }
+    if str(checkpoint_gate.get("content_hash") or "") not in checkpoint_gate_content_hashes:
+        return False
+    allowed_dag_sha256s = [str(dag_sha256 or "")]
+    allowed_dag_sha256s.extend(
+        str(value or "") for value in (accepted_dag_sha256s or []) if str(value or "")
+    )
+    merge_gate_fresh = False
+    for allowed_dag_sha256 in dict.fromkeys(allowed_dag_sha256s):
+        if await _typed_verification_gate_node_is_fresh(
+            runner,
+            feature,
+            proof=merge_gate,
+            kind="merge_gate",
+            stage="checkpoint",
+            dag_sha256=allowed_dag_sha256,
+            group_idx=group_idx,
+        ):
+            merge_gate_fresh = True
+            break
+    if not merge_gate_fresh:
+        return False
+    checkpoint_gate_fresh = False
+    for allowed_dag_sha256 in dict.fromkeys(allowed_dag_sha256s):
+        if await _typed_verification_gate_node_is_fresh(
+            runner,
+            feature,
+            proof=checkpoint_gate,
+            kind="checkpoint_gate",
+            stage="checkpoint",
+            dag_sha256=allowed_dag_sha256,
+            group_idx=group_idx,
+        ):
+            checkpoint_gate_fresh = True
+            break
+    if not checkpoint_gate_fresh:
+        return False
+    feature_root = _get_feature_root(runner, feature)
+    authorized_sources = await _checkpoint_authorized_repo_sources(
+        runner,
+        feature,
+        feature_root,
+        group_idx=group_idx,
+    )
+    current_no_dirty = _checkpoint_no_dirty_proof(
+        runner,
+        feature,
+        feature_root=feature_root,
+        authorized_repos=set(authorized_sources) if authorized_sources is not None else None,
+        authorized_source_roots=authorized_sources,
+    )
+    if current_no_dirty.get("clean") is not True:
+        return False
+    if str(current_no_dirty.get("repo_heads") or "") != str(no_dirty.get("repo_heads") or ""):
+        return False
+    return True
+
+
+async def _dag_group_queue_checkpoint_is_fresh(
+    runner: WorkflowRunner,
+    feature: Feature,
+    *,
+    group_idx: int,
+    group_task_ids: list[str],
+    dag_sha256: str,
+    commit_hash: str,
+    current_heads: str,
+    accepted_dag_sha256s: list[str] | None = None,
+) -> bool:
+    """Slice 08e-3b P1 remediation: is a queue-projected `dag-group:*` fresh?
+
+    A queue-driven group is checkpointed by
+    `GroupMergeCoordinator.checkpoint_group`, which writes the `dag-group:*`
+    compatibility projection but NOT the legacy `dag-group-commit-proof:*` /
+    `dag-checkpoint-gate-proof:*` artifacts the legacy resume freshness gate
+    expects. The durable queue's proof is its TYPED `merge_queue_items` rows:
+    a lane reaches terminal `done` only via `complete_checkpoint`, which the
+    schema requires to carry non-null `merge_proof_evidence_id`,
+    `commit_proof_evidence_id`, `checkpoint_gate_evidence_id`,
+    `checkpoint_evidence_id`, and `checkpoint_projection_id` (doc 08
+    § Merge Queue Schema). This predicate confirms the typed rows back the
+    `dag-group:*` body:
+
+    * every expected task id is covered by exactly one `done` lane,
+    * NO lane covering an expected task id is in any non-terminal or `failed`/
+      `poisoned` status (a partially-checkpointed group is NOT fresh),
+    * every covered `done` lane carries a non-null `checkpoint_projection_id`
+      and all covered lanes share ONE projection id (no split-brain),
+    * the covered lanes' `result_commit`s reconstruct the checkpoint body's
+      `commit_hash` and match the current canonical repo heads.
+
+    Fails closed: any missing module, store, connection, or DB error returns
+    `False`, so the caller falls through to the unchanged legacy-marker logic
+    — a queue checkpoint is NEVER judged fresh on incomplete typed evidence.
+    """
+
+    if MergeQueueStore is None:
+        return False
+    store = _execution_control_store_for_runner(runner)
+    if store is None:
+        return False
+    feature_id = str(getattr(feature, "id", "") or "")
+    if not feature_id:
+        return False
+    expected = {str(tid) for tid in group_task_ids if str(tid)}
+    if not expected:
+        return False
+    # The queue lanes were enqueued under one of the accepted DAG digests; a
+    # regroup-overlay resume accepts the pre-overlay base digest too.
+    candidate_dag_sha256s = [s for s in [str(dag_sha256 or "")] if s]
+    for value in accepted_dag_sha256s or []:
+        if str(value or "") and str(value) not in candidate_dag_sha256s:
+            candidate_dag_sha256s.append(str(value))
+    if not candidate_dag_sha256s:
+        return False
+    try:
+        async with _merge_queue_connection(store) as conn:
+            queue_store = MergeQueueStore(conn)
+            items: list[Any] = []
+            for candidate in candidate_dag_sha256s:
+                items = await queue_store.list_group_items(
+                    feature_id, candidate, group_idx
+                )
+                if items:
+                    break
+    except Exception:  # pragma: no cover - fail closed on any store/DB error.
+        logger.debug(
+            "Queue checkpoint freshness probe failed for group %d",
+            group_idx,
+            exc_info=True,
+        )
+        return False
+    if not items:
+        return False
+    # Every lane covering an expected task id must be terminal `done`. A lane in
+    # any other status (`queued`/`leased`/`applying`/.../`integrated`/`failed`/
+    # `poisoned`) covering an expected task means the group is NOT fully
+    # checkpointed — fail closed.
+    done_by_task: dict[str, list[Any]] = {}
+    for item in items:
+        covered = {
+            str(c.task_id)
+            for c in getattr(item, "task_coverage", []) or []
+            if str(getattr(c, "task_id", ""))
+        }
+        if not covered & expected:
+            continue
+        if str(getattr(item, "status", "")) != "done":
+            return False
+        for task_id in covered & expected:
+            done_by_task.setdefault(task_id, []).append(item)
+    # Exactly one `done` lane per expected task id (no missing, no duplicate).
+    if set(done_by_task) != expected:
+        return False
+    if any(len(lanes) != 1 for lanes in done_by_task.values()):
+        return False
+    covered_items = {id(it): it for lanes in done_by_task.values() for it in lanes}
+    projection_ids = {
+        getattr(it, "checkpoint_projection_id", None)
+        for it in covered_items.values()
+    }
+    if None in projection_ids or len(projection_ids) != 1:
+        return False
+    # The reconstructed body's `commit_hash` is the comma-joined sorted set of
+    # the covered lanes' result commits (see `_reconstruct_checkpoint_body` /
+    # `GroupMergeCoverage.result_commits`).
+    result_commits = sorted(
+        {
+            str(getattr(it, "result_commit", "") or "")
+            for it in covered_items.values()
+            if str(getattr(it, "result_commit", "") or "")
+        }
+    )
+    if not result_commits:
+        return False
+    if ",".join(result_commits) != str(commit_hash or ""):
+        return False
+    return _checkpoint_commit_matches_current_heads(commit_hash, current_heads)
+
+
+async def _dag_group_checkpoint_is_fresh(
+    runner: WorkflowRunner,
+    feature: Feature,
+    *,
+    group_idx: int,
+    group_task_ids: list[str],
+    dag_sha256: str,
+    checkpoint: dict[str, Any],
+    accepted_dag_sha256s: list[str] | None = None,
+) -> bool:
+    if not isinstance(checkpoint, dict):
+        return False
+    if checkpoint.get("group_idx") != group_idx:
+        return False
+    if checkpoint.get("verdict") != "approved":
+        return False
+    if list(checkpoint.get("task_ids") or []) != list(group_task_ids):
+        return False
+    if not _checkpoint_results_match_tasks(checkpoint, group_task_ids):
+        return False
+    commit_hash = str(checkpoint.get("commit_hash") or "")
+    if not commit_hash:
+        return False
+    feature_root = _get_feature_root(runner, feature)
+    authorized_repos = await _checkpoint_authorized_repos(
+        runner,
+        feature,
+        feature_root,
+        group_idx=group_idx,
+    )
+    authorized_sources = await _checkpoint_authorized_repo_sources(
+        runner,
+        feature,
+        feature_root,
+        group_idx=group_idx,
+    )
+    if not _feature_repos_clean_for_checkpoint_resume(
+        runner,
+        feature,
+        feature_root=feature_root,
+        authorized_repos=authorized_repos,
+        authorized_source_roots=authorized_sources,
+    ):
+        return False
+    current_heads = _current_feature_repo_heads(
+        runner,
+        feature,
+        feature_root=feature_root,
+        authorized_repos=authorized_repos,
+        authorized_source_roots=authorized_sources,
+    )
+    if not current_heads:
+        return False
+    proof_raw = await runner.artifacts.get(
+        f"dag-group-commit-proof:{group_idx}",
+        feature=feature,
+    )
+    gate_proof_raw = await runner.artifacts.get(
+        f"dag-checkpoint-gate-proof:{group_idx}",
+        feature=feature,
+    )
+    if not proof_raw and not gate_proof_raw:
+        # Slice 08e-3b P1 remediation: a queue-driven group is checkpointed by
+        # `GroupMergeCoordinator.checkpoint_group`, which writes the
+        # `dag-group:*` projection but NOT the legacy `dag-group-commit-proof:*`
+        # / `dag-checkpoint-gate-proof:*` artifacts — its proof is the typed
+        # `merge_queue_items` rows (`done` lanes carry non-null
+        # `commit_proof_evidence_id` / `merge_proof_evidence_id` /
+        # `checkpoint_gate_evidence_id` / `checkpoint_evidence_id` /
+        # `checkpoint_projection_id`, schema-enforced for `done`). When the
+        # durable queue's typed evidence backs this `dag-group:*` body, the
+        # checkpoint is fresh. This is a NEW code path; if the queue evidence
+        # does NOT back it, fall through to the unchanged legacy-marker logic.
+        if await _dag_group_queue_checkpoint_is_fresh(
+            runner,
+            feature,
+            group_idx=group_idx,
+            group_task_ids=group_task_ids,
+            dag_sha256=dag_sha256,
+            commit_hash=commit_hash,
+            current_heads=current_heads,
+            accepted_dag_sha256s=accepted_dag_sha256s,
+        ):
+            return True
+        return (
+            await _feature_has_execution_control_legacy_marker(runner, feature)
+            and _checkpoint_commit_matches_current_heads(commit_hash, current_heads)
+        )
+    proof = _json_object_from_text(proof_raw)
+    if str(proof.get("artifact_schema") or "") != "dag-group-commit-proof-v1":
+        return False
+    if proof.get("group_idx") != group_idx:
+        return False
+    if list(proof.get("task_ids") or []) != list(group_task_ids):
+        return False
+    allowed_dag_sha256s = {str(dag_sha256 or "")}
+    allowed_dag_sha256s.update(
+        str(value or "") for value in (accepted_dag_sha256s or []) if str(value or "")
+    )
+    if str(proof.get("dag_sha256") or "") not in allowed_dag_sha256s:
+        return False
+    if str(proof.get("commit_hash") or "") != commit_hash:
+        return False
+    proof_heads = str(proof.get("repo_heads") or "")
+    if proof_heads != current_heads:
+        return False
+    no_dirty = _json_object_from_text(proof.get("no_dirty_proof"))
+    if no_dirty.get("clean") is not True:
+        return False
+    if str(no_dirty.get("repo_heads") or "") != current_heads:
+        return False
+    gate_proof = _json_object_from_text(gate_proof_raw)
+    if not await _checkpoint_gate_proof_is_fresh(
+        runner,
+        feature,
+        gate_proof=gate_proof,
+        group_idx=group_idx,
+        dag_sha256=dag_sha256,
+        commit_hash=commit_hash,
+        accepted_dag_sha256s=accepted_dag_sha256s,
+    ):
+        return False
+    return True
+
+
+async def _recover_dag_group_checkpoint_from_proofs(
+    runner: WorkflowRunner,
+    feature: Feature,
+    *,
+    group_idx: int,
+    group_task_ids: list[str],
+    dag_sha256: str,
+    accepted_dag_sha256s: list[str] | None = None,
+) -> dict[str, Any] | None:
+    proof = _json_object_from_text(
+        await runner.artifacts.get(
+            f"dag-group-commit-proof:{group_idx}",
+            feature=feature,
+        )
+    )
+    gate_proof = _json_object_from_text(
+        await runner.artifacts.get(
+            f"dag-checkpoint-gate-proof:{group_idx}",
+            feature=feature,
+        )
+    )
+    if str(proof.get("artifact_schema") or "") != "dag-group-commit-proof-v1":
+        return None
+    if str(gate_proof.get("artifact_schema") or "") != "dag-checkpoint-gate-proof-v1":
+        return None
+    if proof.get("group_idx") != group_idx or gate_proof.get("group_idx") != group_idx:
+        return None
+    if list(proof.get("task_ids") or []) != list(group_task_ids):
+        return None
+    if list(gate_proof.get("task_ids") or []) != list(group_task_ids):
+        return None
+    allowed_dag_sha256s = {str(dag_sha256 or "")}
+    allowed_dag_sha256s.update(
+        str(value or "") for value in (accepted_dag_sha256s or []) if str(value or "")
+    )
+    proof_dag_sha256 = str(proof.get("dag_sha256") or "")
+    gate_dag_sha256 = str(gate_proof.get("dag_sha256") or "")
+    if proof_dag_sha256 not in allowed_dag_sha256s or gate_dag_sha256 not in allowed_dag_sha256s:
+        return None
+    commit_hash = str(proof.get("commit_hash") or "")
+    if not commit_hash or str(gate_proof.get("commit_hash") or "") != commit_hash:
+        return None
+    checkpoint_results = gate_proof.get("checkpoint_results")
+    checkpoint = {
+        "group_idx": group_idx,
+        "task_ids": list(group_task_ids),
+        "results": checkpoint_results if isinstance(checkpoint_results, list) else [],
+        "verdict": "approved",
+        "commit_hash": commit_hash,
+        "dag_sha256": proof_dag_sha256,
+    }
+    if not await _dag_group_checkpoint_is_fresh(
+        runner,
+        feature,
+        group_idx=group_idx,
+        group_task_ids=group_task_ids,
+        dag_sha256=dag_sha256,
+        checkpoint=checkpoint,
+        accepted_dag_sha256s=accepted_dag_sha256s,
+    ):
+        return None
+    projected, _projection_error = await _project_dag_group_checkpoint(
+        runner,
+        feature,
+        group_idx,
+        checkpoint,
+        dag_sha256=proof_dag_sha256,
+        checkpoint_gate_proof=gate_proof,
+    )
+    if not projected:
+        return None
+    return checkpoint
+
+
+async def _record_dag_group_commit_intent(
+    runner: WorkflowRunner,
+    feature: Feature,
+    group_idx: int,
+    group_tasks: list[ImplementationTask],
+    *,
+    dag_sha256: str,
+) -> None:
+    await runner.artifacts.put(
+        f"dag-group-commit-intent:{group_idx}",
+        json.dumps(
+            {
+                "artifact_schema": "dag-group-commit-intent-v1",
+                "group_idx": group_idx,
+                "task_ids": [task.id for task in group_tasks],
+                "dag_sha256": dag_sha256,
+                "stage": "checkpoint",
+            },
+            sort_keys=True,
+        ),
+        feature=feature,
+    )
+
+
+async def _record_dag_group_commit_proof(
+    runner: WorkflowRunner,
+    feature: Feature,
+    group_idx: int,
+    group_tasks: list[ImplementationTask],
+    *,
+    dag_sha256: str,
+    commit_hash: str,
+    feature_root: Path | None = None,
+) -> None:
+    authorized_repos = await _checkpoint_authorized_repos(
+        runner,
+        feature,
+        feature_root,
+        group_idx=group_idx,
+    )
+    authorized_sources = await _checkpoint_authorized_repo_sources(
+        runner,
+        feature,
+        feature_root,
+        group_idx=group_idx,
+    )
+    no_dirty = _checkpoint_no_dirty_proof(
+        runner,
+        feature,
+        feature_root=feature_root,
+        authorized_repos=authorized_repos,
+        authorized_source_roots=authorized_sources,
+    )
+    await runner.artifacts.put(
+        f"dag-group-commit-proof:{group_idx}",
+        json.dumps(
+            {
+                "artifact_schema": "dag-group-commit-proof-v1",
+                "group_idx": group_idx,
+                "task_ids": [task.id for task in group_tasks],
+                "dag_sha256": dag_sha256,
+                "stage": "checkpoint",
+                "commit_hash": commit_hash,
+                "repo_heads": _current_feature_repo_heads(
+                    runner,
+                    feature,
+                    feature_root=feature_root,
+                    authorized_repos=authorized_repos,
+                    authorized_source_roots=authorized_sources,
+                ),
+                "no_dirty_proof": no_dirty,
+            },
+            sort_keys=True,
+        ),
+        feature=feature,
     )
 
 
@@ -4966,7 +19644,11 @@ async def _verify(
             pass
 
     contradiction_decisions = await _format_contradiction_decisions_context(
-        runner, feature,
+        runner,
+        feature,
+        group_tasks=tasks,
+        context_text=f"{results_summary}\n\n{ref_context}\n\n{known_issues}",
+        file_stem="verify",
     )
     if contradiction_decisions:
         known_issues += "\n\n" + contradiction_decisions
@@ -5181,6 +19863,29 @@ def _format_prior_attempts(
     return _offload_if_large(text, context_base, "prior-fix-attempts")
 
 
+def _prompt_offload_context_base(
+    runner: WorkflowRunner,
+    feature: Feature,
+) -> Path | None:
+    services = getattr(runner, "services", {}) or {}
+    if not isinstance(services, dict):
+        services = {}
+    mirror = services.get("artifact_mirror")
+    if mirror is not None:
+        try:
+            base = Path(mirror.feature_dir(feature.id))
+            base.mkdir(parents=True, exist_ok=True)
+            return base
+        except Exception:
+            logger.debug("Failed to resolve artifact mirror prompt context base", exc_info=True)
+    context_dir = _context_dir(runner, feature)
+    if context_dir is None:
+        return None
+    base = context_dir.parent if context_dir.name == ".iriai-context" else context_dir
+    base.mkdir(parents=True, exist_ok=True)
+    return base
+
+
 def _get_feature_root(runner: WorkflowRunner, feature: Feature) -> Path | None:
     """Resolve the feature worktree root path."""
     workspace_mgr = runner.services.get("workspace_manager")
@@ -5229,12 +19934,7 @@ def _context_package_prompt(package: ContextPackage | None) -> str:
     )
 
 
-@dataclass(frozen=True)
-class DagVerifyLensSpec:
-    slug: str
-    label: str
-    actor: AgentActor
-    focus: str
+# `DagVerifyLensSpec` is shimmed from `..execution.types` (Slice 11a).
 
 
 def _dag_expanded_verify_enabled() -> bool:
@@ -5434,7 +20134,351 @@ async def _load_contradiction_decision_records(
     return records
 
 
+_CONTRADICTION_D_ID_RE = re.compile(r"\bD-[A-Za-z0-9][A-Za-z0-9._-]*\b")
+_CONTRADICTION_PATH_RE = re.compile(
+    r"\b[A-Za-z0-9_.@-]+(?:/[A-Za-z0-9_.@-]+)+\b"
+)
+
+
+def _contradiction_record_search_text(record: dict[str, Any]) -> str:
+    parts: list[str] = []
+    for key in (
+        "artifact_key",
+        "source",
+        "resolution_kind",
+        "resolution",
+        "implementation_direction",
+        "superseded_expectation",
+        "rationale",
+        "confidence",
+    ):
+        value = record.get(key)
+        if value:
+            parts.append(str(value))
+    for key in ("authoritative_sources", "affected_files", "task_ids"):
+        for item in record.get(key, []) or []:
+            if item:
+                parts.append(str(item))
+    return "\n".join(parts)
+
+
+def _contradiction_decision_summary(text: str, *, max_chars: int = 180) -> str:
+    summary = " ".join((text or "").strip().split())
+    if len(summary) > max_chars:
+        summary = summary[: max_chars - 3].rstrip() + "..."
+    return summary
+
+
+def _format_contradiction_decision_record(
+    record: dict[str, Any],
+    idx: int,
+    *,
+    match_reasons: list[str] | None = None,
+    excerpt_only: bool = False,
+) -> str:
+    artifact_key = str(record.get("artifact_key", "") or f"decision-{idx}")
+    source = str(record.get("source", "") or "unknown")
+    resolution = str(record.get("resolution", "") or "").strip()
+    resolution_kind = str(record.get("resolution_kind", "") or "").strip()
+    implementation_direction = str(
+        record.get("implementation_direction", "") or ""
+    ).strip()
+    superseded = str(record.get("superseded_expectation", "") or "").strip()
+    rationale = str(record.get("rationale", "") or "").strip()
+    authoritative_sources = [
+        str(item).strip()
+        for item in record.get("authoritative_sources", []) or []
+        if str(item).strip()
+    ]
+    lines = [f"### {idx}. `{artifact_key}`", f"- **Source:** {source}"]
+    if match_reasons:
+        lines.append("- **Current-group match:** " + "; ".join(match_reasons))
+    if resolution_kind:
+        lines.append(f"- **Resolution kind:** {resolution_kind}")
+    if excerpt_only:
+        source_text = _contradiction_record_search_text(record)
+        lines.append(
+            "- **Excerpt:** "
+            + _contradiction_decision_summary(source_text, max_chars=1200)
+        )
+        lines.append(
+            "- **Full body:** see `contradiction-decisions-full.md` and search "
+            f"for `{artifact_key}`."
+        )
+        return "\n".join(lines)
+    if resolution:
+        lines.append(f"- **Resolution:** {resolution}")
+    if implementation_direction and implementation_direction != resolution:
+        lines.append(f"- **Implementation direction:** {implementation_direction}")
+    if superseded:
+        lines.append(f"- **Superseded expectation:** {superseded}")
+    if rationale:
+        lines.append(f"- **Rationale:** {rationale}")
+    if authoritative_sources:
+        lines.append(
+            "- **Authoritative sources:** "
+            + "; ".join(authoritative_sources)
+        )
+    return "\n".join(lines)
+
+
+def _contradiction_context_terms(
+    *,
+    group_idx: int | None,
+    retry: int | None,
+    group_tasks: list[ImplementationTask] | None,
+    context_text: str,
+) -> dict[str, set[str]]:
+    group_terms: set[str] = set()
+    if group_idx is not None:
+        group_terms.update({
+            f"g{group_idx}",
+            f"group {group_idx}",
+            f"dag-g{group_idx}",
+            f":g{group_idx}:",
+        })
+    if group_idx is not None and retry is not None:
+        group_terms.update({
+            f"g{group_idx}:retry-{retry}",
+            f"dag-g{group_idx}-r{retry}",
+            f"g{group_idx}-r{retry}",
+        })
+
+    task_terms: set[str] = set()
+    path_terms: set[str] = set()
+    d_ids: set[str] = set(_CONTRADICTION_D_ID_RE.findall(context_text or ""))
+    for task in group_tasks or []:
+        for value in (
+            task.id,
+            task.name,
+            getattr(task, "subfeature_id", ""),
+            getattr(task, "source_artifact_ref", ""),
+        ):
+            clean = str(value or "").strip()
+            if clean and len(clean) >= 4:
+                task_terms.add(clean)
+        for raw_path in [
+            *list(getattr(task, "files", []) or []),
+            *[
+                getattr(scope, "path", "")
+                for scope in getattr(task, "file_scope", []) or []
+                if getattr(scope, "path", "")
+            ],
+        ]:
+            clean = str(raw_path or "").strip()
+            if not clean:
+                continue
+            path_terms.add(clean)
+            path_terms.add(Path(clean).name)
+        task_text = to_str(task)
+        d_ids.update(_CONTRADICTION_D_ID_RE.findall(task_text))
+        path_terms.update(_CONTRADICTION_PATH_RE.findall(task_text))
+
+    path_terms.update(_CONTRADICTION_PATH_RE.findall(context_text or ""))
+    path_terms = {term for term in path_terms if len(term) >= 5}
+    task_terms = {term for term in task_terms if len(term) >= 4}
+    return {
+        "group": group_terms,
+        "task": task_terms,
+        "path": path_terms,
+        "d_id": d_ids,
+    }
+
+
+def _contradiction_decision_match_reasons(
+    record: dict[str, Any],
+    terms: dict[str, set[str]],
+) -> list[str]:
+    text = _contradiction_record_search_text(record)
+    text_lower = text.lower()
+    reasons: list[str] = []
+    for term in sorted(terms.get("group", set()), key=len, reverse=True):
+        if term and term.lower() in text_lower:
+            reasons.append(f"group/retry `{term}`")
+            break
+    for term in sorted(terms.get("task", set()), key=len, reverse=True):
+        if term and term.lower() in text_lower:
+            reasons.append(f"task `{term}`")
+            break
+    matched_d_ids = sorted({
+        term for term in terms.get("d_id", set())
+        if term and term.lower() in text_lower
+    })
+    if matched_d_ids:
+        reasons.append("decision id " + ", ".join(f"`{item}`" for item in matched_d_ids[:5]))
+    for term in sorted(terms.get("path", set()), key=len, reverse=True):
+        if term and term.lower() in text_lower:
+            reasons.append(f"path `{term}`")
+            break
+    return reasons
+
+
+def _format_contradiction_decisions_index(
+    records: list[dict[str, Any]],
+    match_reasons_by_key: dict[str, list[str]],
+) -> str:
+    lines = [
+        "# Resolved Contradiction Decisions Index",
+        "",
+        "Compact index only. Read `contradiction-decisions-current.md` for "
+        "current-group decisions; use `contradiction-decisions-full.md` only "
+        "when this index points to a decision you need to inspect.",
+        "",
+    ]
+    for idx, record in enumerate(records, 1):
+        artifact_key = str(record.get("artifact_key", "") or f"decision-{idx}")
+        source = str(record.get("source", "") or "unknown")
+        kind = str(record.get("resolution_kind", "") or "").strip() or "decision"
+        d_ids = sorted(set(_CONTRADICTION_D_ID_RE.findall(
+            _contradiction_record_search_text(record)
+        )))[:6]
+        summary = _contradiction_decision_summary(
+            str(record.get("resolution") or record.get("implementation_direction") or "")
+            or _contradiction_record_search_text(record)
+        )
+        match = match_reasons_by_key.get(artifact_key, [])
+        match_text = f" | current-match: {', '.join(match)}" if match else ""
+        d_text = f" | D-ids: {', '.join(d_ids)}" if d_ids else ""
+        lines.append(
+            f"- {idx}. `{artifact_key}` | source: {source} | kind: {kind}"
+            f"{d_text}{match_text} | {summary}"
+        )
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _format_contradiction_decisions_full_archive(
+    records: list[dict[str, Any]],
+) -> str:
+    sections = [
+        "# Full Resolved Contradiction Decisions Archive",
+        "",
+        "This is an audit/search archive. Do not read it eagerly; use the "
+        "current pack and compact index first.",
+    ]
+    for idx, record in enumerate(records, 1):
+        sections.append(_format_contradiction_decision_record(record, idx))
+    return "\n\n".join(sections).rstrip() + "\n"
+
+
 async def _format_contradiction_decisions_context(
+    runner: WorkflowRunner,
+    feature: Feature,
+    *,
+    group_idx: int | None = None,
+    retry: int | None = None,
+    group_tasks: list[ImplementationTask] | None = None,
+    context_text: str = "",
+    file_stem: str = "contradiction-decisions",
+) -> str:
+    records = await _load_contradiction_decision_records(runner, feature)
+    if not records:
+        return ""
+    terms = _contradiction_context_terms(
+        group_idx=group_idx,
+        retry=retry,
+        group_tasks=group_tasks,
+        context_text=context_text,
+    )
+    match_reasons_by_key: dict[str, list[str]] = {}
+    relevant: list[tuple[int, dict[str, Any], list[str]]] = []
+    for idx, record in enumerate(records, 1):
+        artifact_key = str(record.get("artifact_key", "") or f"decision-{idx}")
+        reasons = _contradiction_decision_match_reasons(record, terms)
+        if reasons:
+            match_reasons_by_key[artifact_key] = reasons
+            relevant.append((idx, record, reasons))
+
+    context_dir = _context_dir(runner, feature)
+    if context_dir is None:
+        return ""
+    safe_stem = re.sub(r"[^A-Za-z0-9._-]+", "-", file_stem.strip()).strip("-")
+    safe_stem = safe_stem or "contradiction-decisions"
+    current_path = context_dir / f"{safe_stem}-contradiction-decisions-current.md"
+    index_path = context_dir / f"{safe_stem}-contradiction-decisions-index.md"
+    full_path = context_dir / "contradiction-decisions-full.md"
+
+    current_sections = [
+        "# Current-Group Resolved Contradiction Decisions",
+        "",
+        (
+            "These are the only resolved contradiction decisions that the host "
+            "matched to the current repair context. They override conflicting "
+            "task prose, reference material, and stale tests."
+        ),
+        "",
+        f"- Total historical decisions indexed: {len(records)}",
+        f"- Current relevant decisions: {len(relevant)}",
+        f"- Full archive: `{full_path}`",
+        f"- Compact index: `{index_path}`",
+    ]
+    used_chars = sum(len(section) + 2 for section in current_sections)
+    max_chars = max(20_000, CONTRADICTION_DECISION_CURRENT_PACK_MAX_CHARS)
+    full_item_limit = max(4_000, CONTRADICTION_DECISION_FULL_ITEM_MAX_CHARS)
+    indexed_only: list[tuple[int, dict[str, Any], list[str]]] = []
+    for idx, record, reasons in relevant:
+        full_section = _format_contradiction_decision_record(
+            record,
+            idx,
+            match_reasons=reasons,
+        )
+        if len(full_section) > full_item_limit or used_chars + len(full_section) > max_chars:
+            full_section = _format_contradiction_decision_record(
+                record,
+                idx,
+                match_reasons=reasons,
+                excerpt_only=True,
+            )
+        if used_chars + len(full_section) > max_chars:
+            indexed_only.append((idx, record, reasons))
+            continue
+        current_sections.append(full_section)
+        used_chars += len(full_section) + 2
+    if indexed_only:
+        current_sections.append(
+            "\n## Relevant Decisions Represented In Index Only\n\n"
+            "The current pack hit its size budget before these relevant "
+            "decisions could be expanded. They are not dropped: each has a "
+            "`current-match` entry in the compact index and a full body in the "
+            "searchable archive.\n"
+            + "\n".join(
+                (
+                    f"- `{record.get('artifact_key', f'decision-{idx}')}` "
+                    f"| match: {', '.join(reasons)}"
+                )
+                for idx, record, reasons in indexed_only
+            )
+        )
+    if not relevant:
+        recent = list(enumerate(records, 1))[-max(0, CONTRADICTION_DECISION_RECENT_INDEX_COUNT):]
+        if recent:
+            current_sections.append(
+                "\n## Recent Historical Decision Refs (index only)\n"
+                + "\n".join(
+                    f"- `{record.get('artifact_key', f'decision-{idx}')}`"
+                    for idx, record in recent
+                )
+            )
+
+    _write_context_text(current_path, "\n\n".join(current_sections).rstrip() + "\n")
+    _write_context_text(
+        index_path,
+        _format_contradiction_decisions_index(records, match_reasons_by_key),
+    )
+    _write_context_text(full_path, _format_contradiction_decisions_full_archive(records))
+
+    omitted = len(records) - len(relevant)
+    return (
+        "## Resolved Contradiction Decisions (AUTHORITATIVE)\n\n"
+        "Use the current-group decision pack first. Do not eagerly read the "
+        "full archive; it is provided only for targeted lookup from the index.\n\n"
+        f"- Current relevant decision pack: `{current_path}`\n"
+        f"- Compact historical index: `{index_path}`\n"
+        f"- Full searchable archive: `{full_path}`\n"
+        f"- Historical decisions indexed but not inlined here: {omitted}\n"
+    )
+
+
+async def _format_all_contradiction_decisions_context_legacy(
     runner: WorkflowRunner,
     feature: Feature,
 ) -> str:
@@ -5449,34 +20493,7 @@ async def _format_contradiction_decisions_context(
         ),
     ]
     for idx, record in enumerate(records, 1):
-        artifact_key = str(record.get("artifact_key", "") or f"decision-{idx}")
-        source = str(record.get("source", "") or "unknown")
-        resolution = str(record.get("resolution", "") or "").strip()
-        resolution_kind = str(record.get("resolution_kind", "") or "").strip()
-        implementation_direction = str(
-            record.get("implementation_direction", "") or ""
-        ).strip()
-        superseded = str(record.get("superseded_expectation", "") or "").strip()
-        authoritative_sources = [
-            str(item).strip()
-            for item in record.get("authoritative_sources", []) or []
-            if str(item).strip()
-        ]
-        lines = [f"### {idx}. `{artifact_key}`", f"- **Source:** {source}"]
-        if resolution_kind:
-            lines.append(f"- **Resolution kind:** {resolution_kind}")
-        if resolution:
-            lines.append(f"- **Resolution:** {resolution}")
-        if implementation_direction and implementation_direction != resolution:
-            lines.append(f"- **Implementation direction:** {implementation_direction}")
-        if superseded:
-            lines.append(f"- **Superseded expectation:** {superseded}")
-        if authoritative_sources:
-            lines.append(
-                "- **Authoritative sources:** "
-                + "; ".join(authoritative_sources)
-            )
-        sections.append("\n".join(lines))
+        sections.append(_format_contradiction_decision_record(record, idx))
     return "\n\n".join(sections).rstrip() + "\n"
 
 
@@ -5494,109 +20511,21 @@ _DAG_RESULT_REPORTED_FILE_RE = re.compile(
 )
 
 
-def _is_dag_artifact_repair_path(path: str) -> bool:
-    normalized = path.strip().replace("\\", "/")
-    if not normalized:
-        return True
-    if normalized in {"dag.md"}:
-        return True
-    if normalized.startswith("(") and normalized.endswith(")"):
-        return True
-    artifact_markers = (
-        "/.iriai/artifacts/features/",
-        "/.iriai-context/",
-        "/.staging/",
-        "/dag/",
-        "/dag-fragments/",
-        "/outputs/dag-ws-",
-        "/subfeatures/",
-    )
-    if any(marker in normalized for marker in artifact_markers):
-        return True
-    return normalized.startswith((
-        ".iriai/",
-        ".iriai-context/",
-        ".staging/",
-        "compile-",
-        "dag/",
-        "subfeatures/",
-        "dag-fragments/",
-        "dag-ws-",
-        "outputs/dag-ws-",
-    ))
-
-
-def _normalize_dag_artifact_repair_ref(ref: str) -> str:
-    normalized = ref.strip().replace("\\", "/")
-    normalized = normalized.strip("`'\"")
-    normalized = normalized.strip("[](){}<>")
-    normalized = normalized.rstrip(".,;:")
-    line_ref = re.match(r"^(.+\.[A-Za-z0-9]+):\d+(?::\d+)?$", normalized)
-    if line_ref:
-        normalized = line_ref.group(1)
-    return normalized
-
-
-def _is_dag_artifact_repair_key(ref: str) -> bool:
-    normalized = ref.strip()
-    if not normalized or "/" in normalized or "\\" in normalized:
-        return False
-    if _is_dag_task_artifact_key(normalized):
-        return True
-    top_level = {
-        "artifact-audit-summary",
-        "artifact-backfill-status",
-        "context",
-        "contradiction-decisions",
-        "decisions",
-        "decomposition",
-        "decomposition-structured",
-        "design",
-        "dag",
-        "plan",
-        "prd",
-        "scope",
-        "system-design",
-        "test-plan",
-    }
-    if normalized in top_level:
-        return True
-    if ":" not in normalized:
-        return False
-    prefix, slug = normalized.split(":", 1)
-    if not slug:
-        return False
-    return prefix in {
-        "artifact-audit",
-        "dag",
-        "dag-fragment",
-        "dag-fragment-attempt",
-        "dag-slices",
-        "decisions",
-        "decisions-structured",
-        "design",
-        "design-structured",
-        "gate-enhancement-backlog",
-        "gate-review-ledger",
-        "planning-index",
-        "plan",
-        "plan-structured",
-        "prd",
-        "prd-structured",
-        "system-design",
-        "system-design-structured",
-        "test-plan",
-        "test-plan-structured",
-    }
-
-
-def _is_dag_task_artifact_key(ref: str) -> bool:
-    normalized = ref.strip()
-    if "/" in normalized or "\\" in normalized:
-        return False
-    return normalized.startswith("dag-task:") and bool(
-        normalized.removeprefix("dag-task:").strip()
-    )
+# `_is_dag_artifact_repair_path`, `_normalize_dag_artifact_repair_ref`,
+# `_is_dag_artifact_repair_key`, `_is_derived_dag_artifact_key`, and
+# `_is_dag_task_artifact_key` are shimmed from `..execution.repair`
+# (Slice 11h — see the Slice-11h shim block at the head of this module).
+# The impl.py-local `_dedupe_preserving_order`-coupled text-scanner cluster
+# (`_dag_artifact_repair_refs_from_text`, `_dag_task_artifact_refs_from_reported_result_text`,
+# `_planned_non_dag_artifact_refs`, `_planned_needs_source_artifact_repair`,
+# `_dag_artifact_repair_refs_from_planned`, `_dag_artifact_repair_target_refs`,
+# `_dag_artifact_repair_paths_safe`, `_dag_task_artifact_refs_from_planned`,
+# `_safe_dag_task_artifact_refs`, `_planned_needs_dag_task_artifact_repair`,
+# `_dag_metadata_only_repair_candidate`,
+# `_dag_artifact_repair_resolution_from_planned`,
+# `_dag_blocked_result_should_reroute_to_artifact_repair`) STAYS in
+# `implementation.py` per the prompt hard rule against splitting non-pure
+# helpers (they all depend on the impl.py-local `_dedupe_preserving_order`).
 
 
 def _dag_task_artifact_refs_from_reported_result_text(text: str) -> list[str]:
@@ -5670,7 +20599,7 @@ def _dag_artifact_repair_refs_from_text(text: str) -> list[str]:
         normalized = _normalize_dag_artifact_repair_ref(token)
         if not normalized:
             continue
-        if _is_dag_artifact_repair_key(normalized):
+        if _is_dag_artifact_repair_key(normalized) or _is_derived_dag_artifact_key(normalized):
             refs.append(normalized)
         elif _is_dag_artifact_repair_path(normalized):
             refs.append(normalized)
@@ -5694,7 +20623,11 @@ def _dag_artifact_repair_target_refs(
 
     safe_refs = [
         ref for ref in refs
-        if _is_dag_artifact_repair_key(ref) or _is_dag_artifact_repair_path(ref)
+        if (
+            _is_dag_artifact_repair_key(ref)
+            or _is_derived_dag_artifact_key(ref)
+            or _is_dag_artifact_repair_path(ref)
+        )
     ]
     if not safe_refs and planned is not None:
         planned_refs = [
@@ -5708,6 +20641,7 @@ def _dag_artifact_repair_target_refs(
             ref for ref in planned_refs
             if ref and (
                 _is_dag_artifact_repair_key(ref)
+                or _is_derived_dag_artifact_key(ref)
                 or _is_dag_artifact_repair_path(ref)
             )
         ]
@@ -5729,6 +20663,7 @@ def _dag_artifact_repair_paths_safe(planned: PlannedBugGroup) -> bool:
     ]
     return bool(concrete_paths) and all(
         _is_dag_artifact_repair_key(_normalize_dag_artifact_repair_ref(str(path)))
+        or _is_derived_dag_artifact_key(_normalize_dag_artifact_repair_ref(str(path)))
         or _is_dag_artifact_repair_path(str(path))
         for path in concrete_paths
     )
@@ -5755,6 +20690,7 @@ def _dag_artifact_repair_refs_from_planned(
         normalized = _normalize_dag_artifact_repair_ref(str(path))
         if normalized and (
             _is_dag_artifact_repair_key(normalized)
+            or _is_derived_dag_artifact_key(normalized)
             or _is_dag_artifact_repair_path(normalized)
         ):
             refs.append(normalized)
@@ -5976,6 +20912,7 @@ def _validate_dag_contradiction_resolution(
         "decision_only",
         "requires_code_change",
         "artifact_repair",
+        _DAG_CONTRADICTION_MIXED_REPAIR_KIND,
         "stale_not_reproducing",
         "needs_human",
     }
@@ -6003,7 +20940,10 @@ def _validate_dag_contradiction_resolution(
         rejection_reasons.append(f"unknown_confidence:{confidence}")
     if confidence == "low":
         rejection_reasons.append("low_confidence")
-    if kind == "artifact_repair" and planned is not None:
+    if (
+        kind in {"artifact_repair", _DAG_CONTRADICTION_MIXED_REPAIR_KIND}
+        and planned is not None
+    ):
         artifact_refs = _dag_artifact_repair_target_refs(resolution, planned=planned)
         unsafe_structured_refs = [
             _normalize_dag_artifact_repair_ref(ref)
@@ -6011,6 +20951,9 @@ def _validate_dag_contradiction_resolution(
             if ref.strip()
             and not (
                 _is_dag_artifact_repair_key(
+                    _normalize_dag_artifact_repair_ref(ref)
+                )
+                or _is_derived_dag_artifact_key(
                     _normalize_dag_artifact_repair_ref(ref)
                 )
                 or _is_dag_artifact_repair_path(
@@ -6039,7 +20982,10 @@ def _validate_dag_contradiction_resolution(
         "artifact_paths": artifact_refs,
         "confidence": confidence,
         "needs_human": False,
-        "requires_code_change": kind == "requires_code_change",
+        "requires_code_change": kind in {
+            "requires_code_change",
+            _DAG_CONTRADICTION_MIXED_REPAIR_KIND,
+        },
     })
     return DagContradictionResolutionValidation(
         resolution=normalized,
@@ -6095,6 +21041,346 @@ async def _persist_dag_contradiction_rejection(
     return record
 
 
+def _looks_like_closed_contradiction_handoff(text: str) -> bool:
+    lowered = text.lower()
+    closed = any(marker in lowered for marker in (
+        "gate closed",
+        "artifact is final",
+        "artifact finalized",
+        "status:** resolved",
+        "status: resolved",
+        "user decision:** confirmed",
+        "user decision: confirmed",
+    ))
+    if not closed:
+        return False
+    return any(marker in lowered for marker in (
+        "contradiction",
+        "artifact_repair",
+        "artifact repair",
+        "track 1",
+        "track 2",
+    ))
+
+
+def _closed_contradiction_resolution_from_text(
+    text: str,
+    *,
+    source_ref: str,
+    rca: RootCauseAnalysis,
+) -> DagContradictionResolution | None:
+    if not _looks_like_closed_contradiction_handoff(text):
+        return None
+    lowered = text.lower()
+    artifact_track = any(marker in lowered for marker in (
+        "artifact_repair",
+        "artifact repair",
+        "track 1",
+        "task spec",
+        "task specs",
+        "file_scope",
+        "source artifact",
+        "upstream spec",
+    ))
+    code_track = any(marker in lowered for marker in (
+        "requires_code_change",
+        "code fix",
+        "code fixes",
+        "code wiring",
+        "track 2",
+        "real code",
+        "implementation must",
+    ))
+    if artifact_track and code_track:
+        kind = _DAG_CONTRADICTION_MIXED_REPAIR_KIND
+    elif artifact_track:
+        kind = "artifact_repair"
+    elif code_track:
+        kind = "requires_code_change"
+    else:
+        kind = "decision_only"
+    refs = _dedupe_preserving_order([
+        *_dag_artifact_repair_refs_from_text(text),
+        *_dag_artifact_repair_refs_from_text(rca.proposed_approach),
+        *_dag_artifact_repair_refs_from_text(rca.contradiction_detail),
+    ])
+    return DagContradictionResolution(
+        resolution=text.strip(),
+        resolution_kind=kind,
+        authoritative_sources=_dedupe_preserving_order([
+            source_ref,
+            *[item for item in rca.evidence[:8] if item],
+        ]),
+        artifact_paths=refs,
+        superseded_expectation=(
+            "Closed contradiction gate superseded the conflicting task/spec "
+            "expectations identified by RCA."
+        ),
+        implementation_direction=text.strip(),
+        requires_code_change=code_track,
+        needs_human=False,
+        confidence="high",
+        rationale=(
+            "Recovered from a final closed contradiction artifact; the workflow "
+            "must consume this as a handoff, not re-interview the lead gate."
+        ),
+    )
+
+
+def _dag_contradiction_staging_paths(
+    runner: WorkflowRunner,
+    feature: Feature,
+    key: str,
+) -> list[Path]:
+    mirror = (getattr(runner, "services", {}) or {}).get("artifact_mirror")
+    if mirror is None:
+        return []
+    try:
+        from ....services.artifacts import _key_to_path
+
+        feature_dir = Path(mirror.feature_dir(feature.id))
+        rel = Path(_key_to_path(key))
+    except Exception:
+        logger.debug(
+            "Failed to derive contradiction artifact staging path for %s",
+            key,
+            exc_info=True,
+        )
+        return []
+    return [
+        feature_dir / ".staging" / rel,
+        feature_dir / rel,
+    ]
+
+
+async def _recover_closed_dag_contradiction_resolution(
+    runner: WorkflowRunner,
+    feature: Feature,
+    *,
+    source: str,
+    group: BugGroup,
+    rca: RootCauseAnalysis,
+) -> tuple[DagContradictionResolution, dict[str, Any]] | None:
+    key = f"contradiction:{source}:{group.group_id}"
+    candidates: list[tuple[str, str, str]] = []
+    try:
+        raw = await runner.artifacts.get(key, feature=feature)
+    except Exception:
+        raw = None
+    if raw:
+        candidates.append(("artifact_store", key, to_str(raw)))
+
+    for path in _dag_contradiction_staging_paths(runner, feature, key):
+        try:
+            if path.exists() and path.is_file():
+                text = path.read_text(encoding="utf-8")
+                if text.strip():
+                    candidates.append(("artifact_file", str(path), text))
+        except Exception:
+            logger.debug(
+                "Failed to read contradiction staging path %s",
+                path,
+                exc_info=True,
+            )
+
+    for source_kind, source_ref, text in candidates:
+        resolution = _closed_contradiction_resolution_from_text(
+            text,
+            source_ref=source_ref,
+            rca=rca,
+        )
+        if resolution is None:
+            continue
+        return resolution, {
+            "decision_source": source_kind,
+            "decision_ref": source_ref,
+            "decision_key": key,
+            "decision_sha256": hashlib.sha256(
+                text.encode("utf-8")
+            ).hexdigest(),
+            "closed_gate_recovered": True,
+        }
+    return None
+
+
+async def _persist_dag_contradiction_handoff(
+    runner: WorkflowRunner,
+    feature: Feature,
+    group_idx: int,
+    retry: int,
+    planned: PlannedBugGroup,
+    resolution: DagContradictionResolution | None,
+    *,
+    status: str,
+    decision_source: str,
+    resolution_record: dict[str, Any] | None = None,
+    rejection_reasons: list[str] | None = None,
+    dispatches: list[str] | None = None,
+    skipped_lead_review_reason: str = "",
+    decision_metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    safe_group = _safe_context_stem(planned.group.group_id)
+    artifact_key = f"dag-contradiction-handoff:g{group_idx}:retry-{retry}:{safe_group}"
+    kind = resolution.resolution_kind if resolution is not None else ""
+    record = {
+        "artifact_key": artifact_key,
+        "group_idx": group_idx,
+        "retry": retry,
+        "group_id": planned.group.group_id,
+        "rca_key": planned.rca_key,
+        "status": status,
+        "decision_source": decision_source,
+        "resolution_artifact_key": (
+            resolution_record or {}
+        ).get("artifact_key"),
+        "resolution_kind": kind,
+        "artifact_track": (
+            bool(resolution)
+            and _dag_contradiction_needs_artifact_repair(resolution)
+        ),
+        "code_track": (
+            bool(resolution)
+            and _dag_contradiction_needs_product_fix(resolution)
+        ),
+        "dispatches": list(dispatches or []),
+        "skipped_lead_review_reason": skipped_lead_review_reason,
+        "decision_metadata": dict(decision_metadata or {}),
+        "rejection_reasons": list(rejection_reasons or []),
+        "created_at": time.time(),
+    }
+    await runner.artifacts.put(
+        artifact_key,
+        json.dumps(record, indent=2),
+        feature=feature,
+    )
+    return record
+
+
+async def _resolve_or_recover_dag_contradiction(
+    runner: WorkflowRunner,
+    feature: Feature,
+    group_idx: int,
+    retry: int,
+    planned: PlannedBugGroup,
+    *,
+    group_tasks: list[ImplementationTask],
+    feature_root: Path | None,
+    runtime: str | None,
+    feedback: str,
+) -> DagContradictionHandoffOutcome:
+    recovered = await _recover_closed_dag_contradiction_resolution(
+        runner,
+        feature,
+        source="verify",
+        group=planned.group,
+        rca=planned.rca,
+    )
+    decision_source = ""
+    if recovered is not None:
+        resolution, recovery_record = recovered
+        decision_source = recovery_record.get("decision_source", "closed_gate")
+        skipped_reason = "closed_gate_recovered_before_lead_review"
+    else:
+        try:
+            resolution = await _resolve_dag_contradiction(
+                runner,
+                feature,
+                group_idx,
+                retry,
+                planned,
+                group_tasks=group_tasks,
+                feature_root=feature_root,
+                runtime=runtime,
+                feedback=feedback,
+            )
+        except Exception as exc:
+            logger.warning(
+                "DAG contradiction resolver failed group=%d retry=%d "
+                "bug_group=%s: %s",
+                group_idx,
+                retry,
+                planned.group.group_id,
+                exc,
+            )
+            resolution = None
+        recovery_record = {}
+        decision_source = "typed_resolver"
+        skipped_reason = "autonomous_typed_resolver_selected"
+
+    validation = _validate_dag_contradiction_resolution(
+        resolution,
+        planned=planned,
+    )
+    if validation.resolution is None:
+        rejection = await _persist_dag_contradiction_rejection(
+            runner,
+            feature,
+            group_idx,
+            retry,
+            planned,
+            resolution,
+            validation.rejection_reasons,
+        )
+        handoff = await _persist_dag_contradiction_handoff(
+            runner,
+            feature,
+            group_idx,
+            retry,
+            planned,
+            resolution,
+            status="rejected",
+            decision_source=decision_source,
+            rejection_reasons=validation.rejection_reasons,
+            skipped_lead_review_reason=skipped_reason,
+            decision_metadata=recovery_record,
+        )
+        return DagContradictionHandoffOutcome(
+            resolution=None,
+            handoff_record=handoff,
+            rejection_record=rejection,
+            rejection_reasons=validation.rejection_reasons,
+            decision_source=decision_source,
+            decision_metadata=recovery_record,
+        )
+
+    accepted_resolution = validation.resolution
+    record = await _persist_dag_contradiction_resolution(
+        runner,
+        feature,
+        group_idx,
+        retry,
+        planned,
+        accepted_resolution,
+    )
+    handoff = await _persist_dag_contradiction_handoff(
+        runner,
+        feature,
+        group_idx,
+        retry,
+        planned,
+        accepted_resolution,
+        status="accepted",
+        decision_source=decision_source,
+        resolution_record=record,
+        dispatches=[
+            name for name, enabled in (
+                ("artifact_repair", _dag_contradiction_needs_artifact_repair(accepted_resolution)),
+                ("product_code_fix", _dag_contradiction_needs_product_fix(accepted_resolution)),
+            )
+            if enabled
+        ],
+        skipped_lead_review_reason=skipped_reason,
+        decision_metadata=recovery_record,
+    )
+    return DagContradictionHandoffOutcome(
+        resolution=accepted_resolution,
+        resolution_record=record,
+        handoff_record=handoff,
+        decision_source=decision_source,
+        decision_metadata=recovery_record,
+    )
+
+
 def _dag_contradiction_needs_fix(resolution: DagContradictionResolution) -> bool:
     return _dag_contradiction_needs_product_fix(resolution)
 
@@ -6102,13 +21388,14 @@ def _dag_contradiction_needs_fix(resolution: DagContradictionResolution) -> bool
 def _dag_contradiction_needs_product_fix(
     resolution: DagContradictionResolution,
 ) -> bool:
-    return resolution.resolution_kind == "requires_code_change"
+    return resolution.resolution_kind in {
+        "requires_code_change",
+        _DAG_CONTRADICTION_MIXED_REPAIR_KIND,
+    }
 
 
-def _dag_contradiction_needs_artifact_repair(
-    resolution: DagContradictionResolution,
-) -> bool:
-    return resolution.resolution_kind == "artifact_repair"
+# `_dag_contradiction_needs_artifact_repair` is shimmed from
+# `..execution.repair` (Slice 11h).
 
 
 def _dag_contradiction_synthetic_result(
@@ -6132,17 +21419,8 @@ def _dag_contradiction_synthetic_result(
     )
 
 
-def _dag_contradiction_fix_guidance(
-    resolution: DagContradictionResolution,
-) -> str:
-    return (
-        f"{resolution.implementation_direction or resolution.resolution}\n\n"
-        "Authoritative contradiction resolution:\n"
-        f"{resolution.resolution}\n\n"
-        f"Resolution kind: {resolution.resolution_kind}\n\n"
-        "Superseded expectation:\n"
-        f"{resolution.superseded_expectation or 'not specified'}"
-    )
+# `_dag_contradiction_fix_guidance` is shimmed from `..execution.repair`
+# (Slice 11h).
 
 
 def _dag_artifact_repair_workspace(
@@ -6159,7 +21437,7 @@ def _dag_artifact_repair_workspace(
                 "Failed to resolve artifact mirror repair workspace",
                 exc_info=True,
             )
-    return str(feature_root) if feature_root is not None else None
+    return None
 
 
 def _dag_artifact_key_for_repair_file(
@@ -6902,6 +22180,60 @@ def _dag_artifact_delete_allowed(normalized_ref: str) -> bool:
     return normalized.startswith((".iriai-context/", ".staging/"))
 
 
+async def _load_regroup_validation_context(
+    runner: WorkflowRunner,
+    feature: Feature,
+    parsed: DerivedDAGArtifact,
+) -> tuple[
+    ImplementationDAG | None,
+    int | None,
+    str | None,
+    bool,
+    str,
+    list[dict[str, Any]],
+]:
+    if not (
+        callable(getattr(runner.artifacts, "get_record", None))
+        or callable(getattr(runner.artifacts, "get", None))
+    ):
+        return None, None, None, False, "dag_regroup_context_required", []
+    base_record = await _dag_artifact_record_for_key(
+        runner,
+        feature,
+        parsed.source_dag_key,
+    )
+    if base_record is None:
+        return None, None, None, False, "dag_regroup_base_dag_missing", [{
+            "source_dag_key": parsed.source_dag_key,
+        }]
+    base_dag_json = str(base_record.get("value") or "")
+    try:
+        base_dag = ImplementationDAG.model_validate_json(base_dag_json)
+    except Exception as exc:
+        return None, None, None, False, "dag_regroup_base_dag_invalid", [{
+            "source_dag_key": parsed.source_dag_key,
+            "error": str(exc),
+        }]
+    base_dag_artifact_id = base_record.get("id")
+    if not isinstance(base_dag_artifact_id, int):
+        base_dag_artifact_id = None
+    base_dag_sha256 = hashlib.sha256(base_dag_json.encode("utf-8")).hexdigest()
+    boundary_checkpoint_exists = False
+    if parsed.group_idx_offset is not None:
+        boundary_record = await _dag_artifact_record_for_key(
+            runner,
+            feature,
+            f"dag-group:{parsed.group_idx_offset}",
+        )
+        boundary_checkpoint_exists = boundary_record is not None
+    return base_dag, base_dag_artifact_id, base_dag_sha256, boundary_checkpoint_exists, "", [{
+        "source_dag_key": parsed.source_dag_key,
+        "base_dag_artifact_id": base_dag_artifact_id,
+        "base_dag_sha256": base_dag_sha256,
+        "boundary_checkpoint_exists": boundary_checkpoint_exists,
+    }]
+
+
 async def _apply_dag_artifact_repair_updates(
     runner: WorkflowRunner,
     feature: Feature,
@@ -6935,7 +22267,70 @@ async def _apply_dag_artifact_repair_updates(
             })
             continue
         if artifact_key:
-            if _is_dag_task_artifact_key(artifact_key):
+            if _is_derived_dag_artifact_key(artifact_key):
+                derived, reason, validation = _validate_derived_dag_artifact_update(
+                    artifact_key,
+                    update.content,
+                )
+                if derived is not None and artifact_key.startswith("dag-regroup:"):
+                    (
+                        base_dag,
+                        base_dag_artifact_id,
+                        base_dag_sha256,
+                        boundary_checkpoint_exists,
+                        context_reason,
+                        context_validation,
+                    ) = await _load_regroup_validation_context(runner, feature, derived)
+                    if context_reason:
+                        derived = None
+                        reason = context_reason
+                        validation = context_validation
+                    else:
+                        derived, reason, validation = _validate_derived_dag_artifact_update(
+                            artifact_key,
+                            update.content,
+                            base_dag=base_dag,
+                            base_dag_artifact_id=base_dag_artifact_id,
+                            base_dag_sha256=base_dag_sha256,
+                            boundary_checkpoint_exists=boundary_checkpoint_exists,
+                            require_regroup_context=True,
+                        )
+                if derived is None:
+                    skipped_updates.append({
+                        "artifact_key": artifact_key,
+                        "target_ref": target_ref,
+                        "reason": reason,
+                        "validation": validation,
+                    })
+                else:
+                    stored_content = derived.model_dump_json()
+                    await runner.artifacts.put(
+                        artifact_key,
+                        stored_content,
+                        feature=feature,
+                    )
+                    if mirror is not None and hasattr(mirror, "write_artifact"):
+                        try:
+                            mirror.write_artifact(
+                                feature.id,
+                                artifact_key,
+                                stored_content,
+                            )
+                        except Exception:
+                            logger.warning(
+                                "Failed to mirror derived DAG artifact %s",
+                                artifact_key,
+                                exc_info=True,
+                            )
+                    applied_updates.append({
+                        "artifact_key": artifact_key,
+                        "artifact_kind": "derived_dag",
+                        "source_dag_key": derived.source_dag_key,
+                        "summary": update.summary,
+                        "bytes": len(stored_content.encode("utf-8")),
+                        "validation": validation,
+                    })
+            elif _is_dag_task_artifact_key(artifact_key):
                 task_result, reason, validation = _validate_dag_task_artifact_update(
                     artifact_key,
                     update.content,
@@ -7186,6 +22581,52 @@ async def _run_dag_artifact_repair_lane(
         f"dag-artifact-closure:g{group_idx}:retry-{retry}:{safe_group}"
     )
     ws_path = _dag_artifact_repair_workspace(runner, feature, feature_root)
+    if not ws_path:
+        result = ArtifactRepairResult(
+            task_id=f"ARTIFACT-REPAIR-g{group_idx}-r{retry}-{safe_group}",
+            group_id=planned.group.group_id,
+            summary=(
+                "DAG artifact repair lane blocked before runtime dispatch: "
+                "artifact mirror workspace is unavailable."
+            ),
+            status="blocked",
+            notes="artifact_mirror_unavailable",
+        )
+        record = {
+            "artifact_key": artifact_key,
+            "source": "dag-repair",
+            "group_idx": group_idx,
+            "retry": retry,
+            "group_id": planned.group.group_id,
+            "resolution_artifact_key": resolution_record.get("artifact_key"),
+            "target_refs": target_refs,
+            "base_target_refs": base_target_refs,
+            "closure_target_refs": closure_target_refs,
+            "result": result.model_dump(mode="json"),
+            "status": "blocked",
+            "failure_class": "workspace_authority",
+            "failure_type": "artifact_mirror_unavailable",
+            "route": "quiesce_workflow",
+            "reason": "artifact_mirror_unavailable",
+            "artifact_closure": closure_before.to_record(),
+            "created_at": time.time(),
+        }
+        await runner.artifacts.put(
+            artifact_key,
+            json.dumps(record, indent=2),
+            feature=feature,
+        )
+        return (
+            result,
+            _dag_artifact_repair_synthetic_result(
+                group_idx,
+                retry,
+                planned,
+                result,
+                record,
+            ),
+            record,
+        )
     workspace_ctx = (
         f"Your working directory is: `{ws_path}`\n"
         "This lane may edit workflow artifact/context files only. It must not "
@@ -7451,8 +22892,8 @@ def _dag_repair_task_failed_result(
     return ImplementationResult(
         task_id=f"DAG-REPAIR-FAILED-g{group_idx}-r{retry}-{_safe_context_stem(gid)}",
         status="blocked",
-        summary=(
-            f"DAG repair agent for group {gid} failed before returning a usable "
+        summary=_workflow_blocker_text(
+            f"DAG repair runtime for group {gid} failed before returning a usable "
             f"ImplementationResult: {type(exc).__name__}: {exc}"
         ),
         notes=repr(exc),
@@ -7466,63 +22907,90 @@ async def _run_dag_repair_fix_tasks(
     retry: int,
     round_idx: int,
     runnable_ids: list[str],
-    fix_tasks: list[Ask],
+    fix_tasks: list[tuple[Ask, RuntimeSandboxTaskBinding | None]],
 ) -> list[ImplementationResult | None]:
-    if len(fix_tasks) == 1:
+    async def _run_one(
+        idx: int,
+        ask: Ask,
+        binding: RuntimeSandboxTaskBinding | None,
+    ) -> ImplementationResult | None:
+        gid = runnable_ids[idx] if idx < len(runnable_ids) else "unknown"
+        task_id = f"DAG-REPAIR-g{group_idx}-r{retry}-{_safe_context_stem(gid)}"
         try:
             result = await runner.run(
-                fix_tasks[0],
+                ask,
                 feature,
                 phase_name="implementation",
             )
+            if binding is not None:
+                await _capture_and_promote_sandbox_patch(
+                    binding,
+                    task_id=task_id,
+                    promote=True,
+                    result=result if isinstance(result, ImplementationResult) else None,
+                )
+            return result if isinstance(result, ImplementationResult) else None
+        except SandboxWorkflowBlocker as exc:
+            failed = ImplementationResult(
+                task_id=task_id,
+                status="blocked",
+                summary=str(exc),
+                notes=repr(exc),
+            )
         except Exception as exc:
-            gid = runnable_ids[0] if runnable_ids else "unknown"
-            failed = _dag_repair_task_failed_result(group_idx, retry, gid, exc)
-            await runner.artifacts.put(
-                f"dag-repair-fix-error:g{group_idx}:{gid}:retry-{retry}:round-{round_idx}",
-                failed.model_dump_json(),
-                feature=feature,
-            )
-            logger.warning(
-                "DAG repair fix task failed group=%d retry=%d bug_group=%s: %s",
-                group_idx,
-                retry,
-                gid,
-                exc,
-            )
-            return [failed]
-        return [result if isinstance(result, ImplementationResult) else None]
+            if binding is not None:
+                try:
+                    await _capture_and_promote_sandbox_patch(
+                        binding,
+                        task_id=task_id,
+                        promote=False,
+                    )
+                except SandboxWorkflowBlocker as capture_blocker:
+                    failed = ImplementationResult(
+                        task_id=task_id,
+                        status="blocked",
+                        summary=str(capture_blocker),
+                        notes=repr(capture_blocker),
+                    )
+                except Exception:
+                    logger.warning(
+                        "DAG repair fix task failed to capture sandbox crash evidence "
+                        "group=%d retry=%d bug_group=%s",
+                        group_idx,
+                        retry,
+                        gid,
+                        exc_info=True,
+                    )
+                    failed = _dag_repair_task_failed_result(group_idx, retry, gid, exc)
+                else:
+                    failed = _dag_repair_task_failed_result(group_idx, retry, gid, exc)
+            else:
+                failed = _dag_repair_task_failed_result(group_idx, retry, gid, exc)
+        await runner.artifacts.put(
+            f"dag-repair-fix-error:g{group_idx}:{gid}:retry-{retry}:round-{round_idx}",
+            failed.model_dump_json(),
+            feature=feature,
+        )
+        logger.warning(
+            "DAG repair fix task failed group=%d retry=%d bug_group=%s: %s",
+            group_idx,
+            retry,
+            gid,
+            failed.summary,
+        )
+        return failed
+
+    if len(fix_tasks) == 1:
+        ask, binding = fix_tasks[0]
+        return [await _run_one(0, ask, binding)]
 
     gathered = await _asyncio.gather(
         *[
-            runner.run(task, feature, phase_name="implementation")
-            for task in fix_tasks
-        ],
-        return_exceptions=True,
+            _run_one(idx, ask, binding)
+            for idx, (ask, binding) in enumerate(fix_tasks)
+        ]
     )
-    results: list[ImplementationResult | None] = []
-    for gid, result in zip(runnable_ids, gathered):
-        if isinstance(result, ImplementationResult):
-            results.append(result)
-            continue
-        if isinstance(result, BaseException):
-            failed = _dag_repair_task_failed_result(group_idx, retry, gid, result)
-            await runner.artifacts.put(
-                f"dag-repair-fix-error:g{group_idx}:{gid}:retry-{retry}:round-{round_idx}",
-                failed.model_dump_json(),
-                feature=feature,
-            )
-            logger.warning(
-                "DAG repair fix task failed group=%d retry=%d bug_group=%s: %s",
-                group_idx,
-                retry,
-                gid,
-                result,
-            )
-            results.append(failed)
-            continue
-        results.append(None)
-    return results
+    return list(gathered)
 
 
 async def _persist_dag_contradiction_resolution(
@@ -7591,7 +23059,15 @@ async def _resolve_dag_contradiction(
 ) -> DagContradictionResolution | None:
     safe_group = _safe_context_stem(planned.group.group_id)
     file_stem = f"g{group_idx}-contradiction-{safe_group}-r{retry}"
-    existing_decisions = await _format_contradiction_decisions_context(runner, feature)
+    existing_decisions = await _format_contradiction_decisions_context(
+        runner,
+        feature,
+        group_idx=group_idx,
+        retry=retry,
+        group_tasks=group_tasks,
+        context_text=f"{planned.issue_text}\n\n{to_str(planned.rca)}\n\n{feedback}",
+        file_stem=file_stem,
+    )
     workspace_ctx = (
         f"Feature repos are rooted at: `{feature_root}`\n"
         "Use this workspace for read-only source inspection."
@@ -7679,7 +23155,7 @@ async def _resolve_dag_contradiction(
         "Rules:\n"
         "1. Choose the authoritative interpretation only when the cited sources support it.\n"
         "2. Set resolution_kind to exactly one of: decision_only, requires_code_change, "
-        "artifact_repair, stale_not_reproducing, needs_human.\n"
+        "artifact_repair, mixed_repair, stale_not_reproducing, needs_human.\n"
         "3. Set confidence to exactly high, medium, or low. Do not set confidence=contradiction.\n"
         "4. If the right answer is only verifier/spec interpretation, use decision_only "
         "and set requires_code_change=false.\n"
@@ -7691,9 +23167,12 @@ async def _resolve_dag_contradiction(
         "evidence in authoritative_sources or rationale.\n"
         "7. If implementation must change, use requires_code_change, set requires_code_change=true, "
         "and provide exact implementation_direction.\n"
-        "8. If evidence is insufficient or product-risky, use needs_human and set needs_human=true.\n"
-        "9. authoritative_sources must cite concrete files/artifacts/decisions.\n"
-        "10. Do not waive real implementation failures; only resolve conflicting expectations.\n"
+        "8. If both artifact/spec repair and implementation changes are required, use mixed_repair, "
+        "set requires_code_change=true, list artifact repair refs in artifact_paths, "
+        "and provide exact implementation_direction for the product-code fix.\n"
+        "9. If evidence is insufficient or product-risky, use needs_human and set needs_human=true.\n"
+        "10. authoritative_sources must cite concrete files/artifacts/decisions.\n"
+        "11. Do not waive real implementation failures; only resolve conflicting expectations.\n"
     )
     actor = _make_parallel_actor(
         root_cause_analyst,
@@ -7735,12 +23214,28 @@ def _dag_candidate_file_roots(feature_root: Path | None) -> list[Path]:
     return sorted(set(roots))
 
 
+def _dag_path_within_roots(path: Path, roots: list[Path]) -> bool:
+    if not roots:
+        return False
+    try:
+        resolved = path.resolve(strict=False)
+    except Exception:
+        return False
+    for root in roots:
+        try:
+            resolved.relative_to(root.resolve(strict=False))
+            return True
+        except Exception:
+            continue
+    return False
+
+
 def _dag_reported_file_exists(path: str, roots: list[Path]) -> bool:
     if not path or path.startswith("http://") or path.startswith("https://"):
         return True
     candidate = Path(path)
     if candidate.is_absolute():
-        return candidate.exists()
+        return _dag_path_within_roots(candidate, roots) and candidate.exists()
     return any((root / candidate).exists() for root in roots)
 
 
@@ -7750,7 +23245,7 @@ def _dag_existing_path_locations(path: str, roots: list[Path]) -> list[Path]:
     candidate = Path(path)
     locations: list[Path] = []
     if candidate.is_absolute():
-        if candidate.exists():
+        if _dag_path_within_roots(candidate, roots) and candidate.exists():
             locations.append(candidate)
         return locations
     seen: set[str] = set()
@@ -7902,6 +23397,7 @@ def _dag_manifest_path_entries(roots: list[Path]) -> dict[str, list[dict[str, st
                     exc_info=True,
                 )
                 continue
+            repo_prefix = _dag_manifest_repo_prefix_for_config(config_path, root)
             for key in ("expected_files", "forbidden_files"):
                 for item in data.get(key, []):
                     path = ""
@@ -7919,15 +23415,44 @@ def _dag_manifest_path_entries(roots: list[Path]) -> dict[str, list[dict[str, st
                         "path": path.strip().replace("\\", "/").strip("/"),
                         "source": source.strip(),
                         "config_path": str(config_path),
+                        "repo_prefix": repo_prefix,
                     })
     return entries
 
 
+def _dag_manifest_repo_prefix_for_config(config_path: Path, scan_root: Path) -> str:
+    for parent in config_path.parents:
+        if (parent / ".git").exists():
+            return parent.name.strip("/")
+    try:
+        relative = config_path.relative_to(scan_root)
+    except ValueError:
+        return ""
+    parts = relative.parts
+    if len(parts) > 2 and parts[0] not in {"scripts", ".iriai"}:
+        return parts[0].strip("/")
+    return ""
+
+
+def _dag_repo_prefixes_for_manifest_entry(entry: dict[str, str]) -> set[str]:
+    prefixes = set(_DAG_COMPAT_REPO_PREFIXES)
+    repo_prefix = str(entry.get("repo_prefix", "") or "").strip().strip("/")
+    if repo_prefix:
+        prefixes.add(repo_prefix)
+    return prefixes
+
+
 def _dag_forbidden_file_entries(roots: list[Path]) -> set[str]:
-    return {
-        item["path"]
-        for item in _dag_manifest_path_entries(roots).get("forbidden_files", [])
-    }
+    paths: set[str] = set()
+    for item in _dag_manifest_path_entries(roots).get("forbidden_files", []):
+        path = item["path"]
+        paths.add(path)
+        for prefix in _dag_repo_prefixes_for_manifest_entry(item):
+            paths.add(f"{prefix}/{path}")
+    return paths
+
+
+_DAG_COMPAT_REPO_PREFIXES = {"repo"}
 
 
 def _dag_path_matches_forbidden_file(path: str, forbidden: set[str]) -> bool:
@@ -7935,14 +23460,32 @@ def _dag_path_matches_forbidden_file(path: str, forbidden: set[str]) -> bool:
     if not normalized:
         return False
     for forbidden_path in forbidden:
-        if (
-            normalized == forbidden_path
-            or normalized.startswith(f"{forbidden_path}/")
-            or normalized.endswith(f"/{forbidden_path}")
-            or f"/{forbidden_path}/" in normalized
-            or forbidden_path.endswith(f"/{normalized}")
-        ):
+        if _dag_paths_exact_or_manifest_descendant(normalized, forbidden_path):
             return True
+    return False
+
+
+def _dag_paths_exact_or_manifest_descendant(
+    path: str,
+    manifest_path: str,
+    *,
+    allow_repo_prefix: bool = True,
+    allowed_repo_prefixes: set[str] | None = None,
+) -> bool:
+    normalized = path.strip().replace("\\", "/").strip("/")
+    forbidden = manifest_path.strip().replace("\\", "/").strip("/")
+    if not normalized or not forbidden:
+        return False
+    if normalized == forbidden or normalized.startswith(f"{forbidden}/"):
+        return True
+    parts = normalized.split("/")
+    if (
+        allow_repo_prefix
+        and len(parts) > 1
+        and parts[0] in (allowed_repo_prefixes or _DAG_COMPAT_REPO_PREFIXES)
+    ):
+        repo_stripped = "/".join(parts[1:])
+        return repo_stripped == forbidden or repo_stripped.startswith(f"{forbidden}/")
     return False
 
 
@@ -7950,21 +23493,16 @@ def _dag_forbidden_match(
     path: str,
     forbidden_entries: list[dict[str, str]],
 ) -> dict[str, str] | None:
-    forbidden = {entry["path"] for entry in forbidden_entries}
-    if not _dag_path_matches_forbidden_file(path, forbidden):
-        return None
     normalized = path.strip().replace("\\", "/").strip("/")
     for entry in forbidden_entries:
         forbidden_path = entry["path"]
-        if (
-            normalized == forbidden_path
-            or normalized.startswith(f"{forbidden_path}/")
-            or normalized.endswith(f"/{forbidden_path}")
-            or f"/{forbidden_path}/" in normalized
-            or forbidden_path.endswith(f"/{normalized}")
+        if _dag_paths_exact_or_manifest_descendant(
+            normalized,
+            forbidden_path,
+            allowed_repo_prefixes=_dag_repo_prefixes_for_manifest_entry(entry),
         ):
             return entry
-    return {"path": normalized, "source": "", "config_path": ""}
+    return None
 
 
 def _is_external_reported_path(path: str) -> bool:
@@ -8010,7 +23548,7 @@ def _existing_product_path(
         return None
     candidate = Path(reported_path)
     if candidate.is_absolute():
-        if candidate.exists():
+        if _dag_path_within_roots(candidate, roots) and candidate.exists():
             return _feature_relative_path(candidate, feature_root)
         return None
     for root in roots:
@@ -8018,6 +23556,231 @@ def _existing_product_path(
         if absolute.exists():
             return _feature_relative_path(absolute, feature_root)
     return None
+
+
+# `WorktreeAliasPathInfo` is shimmed from `..execution.types` (Slice 11a).
+
+
+def _normalize_relative_alias_candidate(path: str) -> str:
+    normalized = path.strip().replace("\\", "/")
+    while normalized.startswith("./"):
+        normalized = normalized[2:].lstrip("/")
+    return normalized.strip("/")
+
+
+async def _worktree_alias_map_for_group(
+    runner: WorkflowRunner,
+    feature: Feature,
+    group_idx: int,
+    feature_root: Path | None,
+) -> dict[str, str]:
+    """Return non-canonical repo aliases for the current group.
+
+    The map is registry-backed: a sibling ``<repo>-wt`` is treated as an
+    alias only when the worktree registry says ``<repo>`` is a canonical
+    execution repo for this group. This avoids rewriting a legitimate repo
+    whose name happens to end in ``-wt``.
+    """
+    if feature_root is None:
+        return {}
+    get = getattr(getattr(runner, "artifacts", None), "get", None)
+    if not callable(get):
+        return {}
+    raw = None
+    for key in (f"worktree-registry:g{group_idx}", "worktree-registry"):
+        try:
+            raw = await get(key, feature=feature)
+        except Exception:
+            raw = None
+        if raw:
+            break
+    if not raw:
+        return {}
+    try:
+        registry = WorktreeRegistry.model_validate_json(str(raw))
+    except Exception:
+        return {}
+    aliases: dict[str, str] = {}
+    root_resolved = feature_root.resolve()
+    registered_repo_paths: set[str] = set()
+
+    def _safe_registry_repo_path(raw_path: str) -> str:
+        raw_normalized = raw_path.strip().replace("\\", "/")
+        if Path(raw_normalized).is_absolute():
+            return ""
+        normalized = _normalize_relative_alias_candidate(raw_normalized)
+        if not normalized or normalized == ".":
+            return ""
+        candidate = Path(normalized)
+        if candidate.is_absolute() or any(part in {"", ".."} for part in candidate.parts):
+            return ""
+        return normalized
+
+    def _contained_repo_path(rel_path: str) -> Path | None:
+        candidate = feature_root / rel_path
+        try:
+            candidate.resolve().relative_to(root_resolved)
+        except Exception:
+            return None
+        return candidate
+
+    for repo in registry.repos:
+        safe_repo = _safe_registry_repo_path(repo.repo_path)
+        if safe_repo:
+            registered_repo_paths.add(safe_repo)
+    for repo in registry.repos:
+        canonical_repo = _safe_registry_repo_path(repo.repo_path)
+        if not canonical_repo or canonical_repo.endswith("-wt"):
+            continue
+        if repo.role != "execution" and not repo.writable_task_ids:
+            continue
+        canonical_path = _contained_repo_path(canonical_repo)
+        if canonical_path is None:
+            continue
+        if not canonical_path.exists():
+            continue
+        alias_repo = f"{canonical_repo}-wt"
+        if alias_repo in registered_repo_paths:
+            continue
+        alias_path = _contained_repo_path(alias_repo)
+        if alias_path is None:
+            continue
+        canonical_meta = _git_identity_metadata(canonical_path)
+        alias_meta = _git_identity_metadata(alias_path) if alias_path.exists() else {}
+        canonical_remote = str(canonical_meta.get("remote_url") or "").strip()
+        alias_remote = str(alias_meta.get("remote_url") or "").strip()
+        if canonical_remote and alias_remote and canonical_remote != alias_remote:
+            continue
+        aliases[alias_repo] = canonical_repo
+    return aliases
+
+
+def _path_content_differs(left: Path, right: Path) -> bool:
+    if not left.is_file() or not right.is_file():
+        return False
+    try:
+        if left.stat().st_size != right.stat().st_size:
+            return True
+        left_hash = hashlib.sha256()
+        right_hash = hashlib.sha256()
+        with left.open("rb") as left_file, right.open("rb") as right_file:
+            for chunk in iter(lambda: left_file.read(1024 * 1024), b""):
+                left_hash.update(chunk)
+            for chunk in iter(lambda: right_file.read(1024 * 1024), b""):
+                right_hash.update(chunk)
+        return left_hash.digest() != right_hash.digest()
+    except Exception:
+        return True
+
+
+def _worktree_alias_path_info(
+    reported_path: str,
+    roots: list[Path],
+    feature_root: Path | None,
+    alias_map: dict[str, str] | None,
+) -> WorktreeAliasPathInfo | None:
+    if not alias_map:
+        return None
+    raw_path = reported_path.strip().replace("\\", "/")
+    if not raw_path:
+        return None
+    raw_candidate = Path(raw_path)
+    if raw_candidate.is_absolute():
+        if feature_root is None:
+            return None
+        try:
+            normalized = raw_candidate.relative_to(feature_root).as_posix()
+        except Exception:
+            return None
+    else:
+        normalized = _normalize_relative_alias_candidate(raw_path)
+    for alias_repo, canonical_repo in sorted(
+        alias_map.items(),
+        key=lambda item: len(item[0]),
+        reverse=True,
+    ):
+        if normalized == alias_repo:
+            suffix = ""
+        elif normalized.startswith(f"{alias_repo}/"):
+            suffix = normalized[len(alias_repo):]
+        else:
+            continue
+        if any(part in {"", ".."} for part in Path(normalized).parts):
+            return WorktreeAliasPathInfo(
+                original=normalized,
+                canonical="",
+                alias_repo=alias_repo,
+                canonical_repo=canonical_repo,
+                alias_exists=False,
+                canonical_exists=False,
+                divergent=False,
+                category="worktree_alias_unresolved",
+                repair_route="product_cleanup_required",
+            )
+        canonical = f"{canonical_repo}{suffix}"
+        if any(part in {"", ".."} for part in Path(canonical).parts):
+            return WorktreeAliasPathInfo(
+                original=normalized,
+                canonical="",
+                alias_repo=alias_repo,
+                canonical_repo=canonical_repo,
+                alias_exists=False,
+                canonical_exists=False,
+                divergent=False,
+                category="worktree_alias_unresolved",
+                repair_route="product_cleanup_required",
+            )
+        alias_exists = _dag_reported_file_exists(normalized, roots)
+        canonical_exists = _dag_reported_file_exists(canonical, roots)
+        divergent = False
+        if alias_exists and canonical_exists and feature_root is not None:
+            divergent = _path_content_differs(
+                feature_root / normalized,
+                feature_root / canonical,
+            )
+        if canonical_exists and not divergent:
+            category = "worktree_alias_rewritten"
+            repair_route = "artifact_only"
+        elif divergent:
+            category = "worktree_alias_divergent"
+            repair_route = "product_cleanup_required"
+        else:
+            category = "worktree_alias_unresolved"
+            repair_route = "product_cleanup_required" if alias_exists else "artifact_only"
+        return WorktreeAliasPathInfo(
+            original=normalized,
+            canonical=canonical,
+            alias_repo=alias_repo,
+            canonical_repo=canonical_repo,
+            alias_exists=alias_exists,
+            canonical_exists=canonical_exists,
+            divergent=divergent,
+            category=category,
+            repair_route=repair_route,
+        )
+    return None
+
+
+def _raw_path_has_worktree_alias_prefix(
+    reported_path: str,
+    alias_map: dict[str, str] | None,
+    feature_root: Path | None = None,
+) -> bool:
+    if not alias_map:
+        return False
+    raw_path = reported_path.strip().replace("\\", "/")
+    raw_candidate = Path(raw_path)
+    if raw_candidate.is_absolute() and feature_root is not None:
+        try:
+            normalized = raw_candidate.relative_to(feature_root).as_posix()
+        except Exception:
+            normalized = _normalize_relative_alias_candidate(raw_path.lstrip("/"))
+    else:
+        normalized = _normalize_relative_alias_candidate(raw_path)
+    return any(
+        normalized == alias_repo or normalized.startswith(f"{alias_repo}/")
+        for alias_repo in alias_map
+    )
 
 
 def _rewrite_legacy_product_path(
@@ -8046,12 +23809,16 @@ def _classify_dag_repair_path(
     reported_path: str,
     roots: list[Path],
     feature_root: Path | None,
+    alias_map: dict[str, str] | None = None,
 ) -> tuple[str, str | None]:
     path = reported_path.strip()
     if _is_external_reported_path(path):
         return "external_reference", None
     if _is_artifact_context_path(path):
         return "artifact_context", None
+    alias_info = _worktree_alias_path_info(path, roots, feature_root, alias_map)
+    if alias_info is not None:
+        return alias_info.category, alias_info.canonical
     rewritten = _rewrite_legacy_product_path(path, roots, feature_root)
     if rewritten:
         return "rewritten_product", rewritten
@@ -8066,6 +23833,7 @@ def _validate_dag_task_artifact_update(
     content: str,
     roots: list[Path],
     feature_root: Path | None,
+    alias_map: dict[str, str] | None = None,
 ) -> tuple[ImplementationResult | None, str, list[dict[str, Any]]]:
     if not _is_dag_task_artifact_key(artifact_key):
         return None, "not_dag_task_artifact", []
@@ -8130,18 +23898,24 @@ def _validate_dag_task_artifact_update(
             path,
             roots,
             feature_root,
+            alias_map,
         )
         path_records.append({
             "path": path,
             "category": category,
             "normalized": normalized or "",
         })
-        if category == "rewritten_product":
+        if category in {
+            "rewritten_product",
+            "worktree_alias_divergent",
+            "worktree_alias_unresolved",
+        }:
             return None, "dag_task_noncanonical_path", [{
                 "path": path,
                 "canonical": normalized or "",
+                "category": category,
             }]
-        if category != "product":
+        if category not in {"product", "worktree_alias_rewritten"}:
             return None, f"dag_task_{category}", [{
                 "path": path,
                 "normalized": normalized or "",
@@ -8154,6 +23928,7 @@ def _sanitize_dag_repair_result(
     result: ImplementationResult,
     roots: list[Path],
     feature_root: Path | None,
+    alias_map: dict[str, str] | None = None,
 ) -> tuple[ImplementationResult, list[dict[str, Any]]]:
     records: list[dict[str, Any]] = []
     updates: dict[str, list[str]] = {}
@@ -8164,10 +23939,14 @@ def _sanitize_dag_repair_result(
                 original,
                 roots,
                 feature_root,
+                alias_map,
             )
             if normalized and category in {
                 "product",
                 "rewritten_product",
+                "worktree_alias_rewritten",
+                "worktree_alias_divergent",
+                "worktree_alias_unresolved",
                 "invalid_product",
             }:
                 kept.append(normalized)
@@ -8182,6 +23961,9 @@ def _sanitize_dag_repair_result(
                     and category in {
                         "product",
                         "rewritten_product",
+                        "worktree_alias_rewritten",
+                        "worktree_alias_divergent",
+                        "worktree_alias_unresolved",
                         "invalid_product",
                     }
                 ),
@@ -8201,6 +23983,12 @@ async def _sanitize_dag_repair_results(
 ) -> list[ImplementationResult]:
     """Normalize DAG repair result paths before they feed deterministic preflight."""
     roots = _dag_candidate_file_roots(feature_root)
+    alias_map = await _worktree_alias_map_for_group(
+        runner,
+        feature,
+        group_idx,
+        feature_root,
+    )
     sanitized: list[ImplementationResult] = []
     path_records: list[dict[str, Any]] = []
     for result in results:
@@ -8208,6 +23996,7 @@ async def _sanitize_dag_repair_results(
             result,
             roots,
             feature_root,
+            alias_map,
         )
         sanitized.append(clean_result)
         path_records.extend(records)
@@ -8222,10 +24011,19 @@ async def _sanitize_dag_repair_results(
         "ignored_path_count": counts.get("artifact_context", 0)
         + counts.get("external_reference", 0),
         "rewritten_path_count": counts.get("rewritten_product", 0),
+        "worktree_alias_rewritten_count": counts.get("worktree_alias_rewritten", 0),
+        "worktree_alias_unresolved_count": counts.get("worktree_alias_unresolved", 0),
+        "worktree_alias_divergent_count": counts.get("worktree_alias_divergent", 0),
+        "has_worktree_alias_paths": any(
+            str(record.get("category", "")).startswith("worktree_alias_")
+            for record in path_records
+        ),
         "invalid_product_path_count": counts.get("invalid_product", 0),
         "has_invalid_product_paths": counts.get("invalid_product", 0) > 0,
         "paths": path_records,
     }
+    if alias_map:
+        report["alias_map"] = alias_map
     await runner.artifacts.put(
         f"dag-repair-result-sanitize:g{group_idx}:retry-{retry}",
         json.dumps(report),
@@ -8234,11 +24032,48 @@ async def _sanitize_dag_repair_results(
     return sanitized
 
 
+def _dag_result_outside_root_path_problem(
+    result: ImplementationResult,
+    path: str,
+    roots: list[Path],
+    candidate_evidence: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    candidate = Path(path)
+    if not candidate.is_absolute():
+        return None
+    if _dag_path_within_roots(candidate, roots):
+        return None
+    return {
+        "task_id": result.task_id,
+        "artifact_key": f"dag-task:{result.task_id}",
+        "path": path,
+        "canonical_path": "",
+        "reason": "outside_root",
+        "exists": "false",
+        "exists_on_disk": False,
+        "outside_root_exists": candidate.exists(),
+        "absolute_path": True,
+        "noncanonical_path": True,
+        "tracked_or_staged": False,
+        "git_state": "outside_root",
+        "git_states": [],
+        "git_matches": [],
+        "repair_route": "artifact_only",
+        "forbidden_rule": "",
+        "forbidden_path": "",
+        "forbidden_source": "workspace root guard",
+        "candidate_evidence": candidate_evidence,
+    }
+
+
 def _dag_result_path_problems(
     result: ImplementationResult,
     roots: list[Path],
     forbidden_entries: list[dict[str, str]],
     expected_entries: list[dict[str, str]] | None = None,
+    *,
+    feature_root: Path | None = None,
+    alias_map: dict[str, str] | None = None,
 ) -> list[dict[str, Any]]:
     problems: list[dict[str, Any]] = []
     candidate_evidence = _dag_candidate_evidence_for_task_id(
@@ -8249,6 +24084,37 @@ def _dag_result_path_problems(
     for path in _dedupe_preserving_order(
         result.files_created + result.files_modified
     ):
+        outside_root_problem = _dag_result_outside_root_path_problem(
+            result,
+            path,
+            roots,
+            candidate_evidence,
+        )
+        if outside_root_problem is not None:
+            problems.append(outside_root_problem)
+            continue
+        alias_info = _worktree_alias_path_info(path, roots, feature_root, alias_map)
+        if alias_info is not None:
+            problems.append({
+                "task_id": result.task_id,
+                "artifact_key": f"dag-task:{result.task_id}",
+                "path": alias_info.original,
+                "canonical_path": alias_info.canonical,
+                "reason": "worktree_alias_path",
+                "exists": str(bool(alias_info.alias_exists)).lower(),
+                "exists_on_disk": alias_info.alias_exists,
+                "canonical_exists": alias_info.canonical_exists,
+                "worktree_alias_divergent": alias_info.divergent,
+                "tracked_or_staged": _dag_path_tracked_or_staged(
+                    alias_info.original,
+                    roots,
+                ),
+                "repair_route": alias_info.repair_route,
+                "alias_repo": alias_info.alias_repo,
+                "canonical_repo": alias_info.canonical_repo,
+                "candidate_evidence": candidate_evidence,
+            })
+            continue
         forbidden = _dag_forbidden_match(path, forbidden_entries)
         exists = _dag_reported_file_exists(path, roots)
         git_state = _dag_git_path_state(path, roots)
@@ -8312,6 +24178,9 @@ def _dag_task_spec_path_problems(
     roots: list[Path],
     forbidden_entries: list[dict[str, str]],
     expected_entries: list[dict[str, str]] | None = None,
+    *,
+    feature_root: Path | None = None,
+    alias_map: dict[str, str] | None = None,
 ) -> list[dict[str, Any]]:
     problems: list[dict[str, Any]] = []
     candidate_evidence = _dag_candidate_evidence_for_task_id(
@@ -8336,6 +24205,30 @@ def _dag_task_spec_path_problems(
         if key in seen:
             continue
         seen.add(key)
+        alias_info = _worktree_alias_path_info(path, roots, feature_root, alias_map)
+        if alias_info is not None:
+            problems.append({
+                "task_id": task.id,
+                "artifact_key": f"dag-task:{task.id}",
+                "path": alias_info.original,
+                "canonical_path": alias_info.canonical,
+                "field": field,
+                "reason": "worktree_alias_task_spec",
+                "exists": str(bool(alias_info.alias_exists)).lower(),
+                "exists_on_disk": alias_info.alias_exists,
+                "canonical_exists": alias_info.canonical_exists,
+                "worktree_alias_divergent": alias_info.divergent,
+                "tracked_or_staged": _dag_path_tracked_or_staged(
+                    alias_info.original,
+                    roots,
+                ),
+                "repair_route": alias_info.repair_route,
+                "alias_repo": alias_info.alias_repo,
+                "canonical_repo": alias_info.canonical_repo,
+                "candidate_evidence": candidate_evidence,
+                "source_artifact_ref": _dag_fragment_artifact_ref_for_task(task),
+            })
+            continue
         forbidden = _dag_forbidden_match(path, forbidden_entries)
         if forbidden is None:
             continue
@@ -8364,6 +24257,54 @@ def _dag_task_spec_path_problems(
             "source_artifact_ref": _dag_fragment_artifact_ref_for_task(task),
         })
     return problems
+
+
+def _rewrite_worktree_alias_task_specs_in_place(
+    group_tasks: list[ImplementationTask],
+    roots: list[Path],
+    feature_root: Path | None,
+    alias_map: dict[str, str],
+) -> list[dict[str, Any]]:
+    repairs: list[dict[str, Any]] = []
+    for task in group_tasks:
+        file_updates: list[str] = []
+        file_changed = False
+        for path in task.files:
+            alias_info = _worktree_alias_path_info(path, roots, feature_root, alias_map)
+            if alias_info is not None and alias_info.category == "worktree_alias_rewritten":
+                file_updates.append(alias_info.canonical)
+                file_changed = True
+                repairs.append({
+                    "task_id": task.id,
+                    "field": "files",
+                    "original": alias_info.original,
+                    "canonical": alias_info.canonical,
+                    "reason": "worktree_alias_task_spec_rewritten",
+                })
+            else:
+                file_updates.append(path)
+        if file_changed:
+            task.files = _dedupe_preserving_order(file_updates)
+
+        scope_updates = []
+        scope_changed = False
+        for idx, scope in enumerate(task.file_scope):
+            alias_info = _worktree_alias_path_info(scope.path, roots, feature_root, alias_map)
+            if alias_info is not None and alias_info.category == "worktree_alias_rewritten":
+                scope_updates.append(scope.model_copy(update={"path": alias_info.canonical}))
+                scope_changed = True
+                repairs.append({
+                    "task_id": task.id,
+                    "field": f"file_scope[{idx}].path",
+                    "original": alias_info.original,
+                    "canonical": alias_info.canonical,
+                    "reason": "worktree_alias_task_spec_rewritten",
+                })
+            else:
+                scope_updates.append(scope)
+        if scope_changed:
+            task.file_scope = scope_updates
+    return repairs
 
 
 def _dag_task_spec_source_ref(task: ImplementationTask) -> str:
@@ -8581,6 +24522,9 @@ def _dag_task_bearing_source_artifact_path_problems(
     roots: list[Path],
     forbidden_entries: list[dict[str, str]],
     expected_entries: list[dict[str, str]] | None = None,
+    *,
+    feature_root: Path | None = None,
+    alias_map: dict[str, str] | None = None,
 ) -> list[dict[str, Any]]:
     del group_idx
     artifact_root = _dag_artifact_feature_dir(runner, feature)
@@ -8608,34 +24552,54 @@ def _dag_task_bearing_source_artifact_path_problems(
         path: str,
         source_ref: str,
     ) -> None:
+        alias_info = _worktree_alias_path_info(path, roots, feature_root, alias_map)
         forbidden = _dag_forbidden_match(path, forbidden_entries)
-        if forbidden is None:
+        if forbidden is None and alias_info is None:
             return
         key = (str(source_path), task_id, field, path)
         if key in seen:
             return
         seen.add(key)
-        exists = _dag_reported_file_exists(path, roots)
+        exists = (
+            alias_info.alias_exists
+            if alias_info is not None else _dag_reported_file_exists(path, roots)
+        )
         git_state = _dag_git_path_state(path, roots)
         tracked_or_staged = bool(git_state.get("tracked_or_staged"))
+        reason = (
+            "worktree_alias_source_artifact"
+            if alias_info is not None else "forbidden_task_spec_source_artifact"
+        )
         problems.append({
             "task_id": task_id,
             "artifact_key": f"dag-task:{task_id}" if task_id else "",
-            "path": path,
+            "path": alias_info.original if alias_info is not None else path,
+            "canonical_path": alias_info.canonical if alias_info is not None else "",
             "field": field,
-            "reason": "forbidden_task_spec_source_artifact",
+            "reason": reason,
             "exists": str(bool(exists)).lower(),
             "exists_on_disk": bool(exists),
+            "canonical_exists": (
+                alias_info.canonical_exists if alias_info is not None else False
+            ),
+            "worktree_alias_divergent": (
+                alias_info.divergent if alias_info is not None else False
+            ),
             "tracked_or_staged": tracked_or_staged,
             **_dag_git_state_problem_fields(git_state),
             "repair_route": (
-                "product_cleanup_required"
-                if exists or tracked_or_staged
-                else "artifact_only"
+                alias_info.repair_route
+                if alias_info is not None else (
+                    "product_cleanup_required"
+                    if exists or tracked_or_staged
+                    else "artifact_only"
+                )
             ),
-            "forbidden_rule": forbidden.get("path", ""),
-            "forbidden_path": forbidden.get("path", ""),
-            "forbidden_source": forbidden.get("source", ""),
+            "forbidden_rule": forbidden.get("path", "") if forbidden else "",
+            "forbidden_path": forbidden.get("path", "") if forbidden else "",
+            "forbidden_source": forbidden.get("source", "") if forbidden else "",
+            "alias_repo": alias_info.alias_repo if alias_info is not None else "",
+            "canonical_repo": alias_info.canonical_repo if alias_info is not None else "",
             "candidate_evidence": (
                 _dag_candidate_evidence_for_task_id(
                     task_id,
@@ -8737,6 +24701,14 @@ async def _reconcile_dag_task_specs(
     manifest_entries = _dag_manifest_path_entries(roots)
     expected_entries = manifest_entries.get("expected_files", [])
     forbidden_entries = manifest_entries.get("forbidden_files", [])
+    alias_map = await _worktree_alias_map_for_group(
+        runner,
+        feature,
+        group_idx,
+        feature_root,
+    )
+    if alias_map:
+        report["alias_map"] = alias_map
     updated_tasks = list(group_tasks)
     stale_projection_problems: list[dict[str, Any]] = []
 
@@ -8746,6 +24718,8 @@ async def _reconcile_dag_task_specs(
             roots,
             forbidden_entries,
             expected_entries,
+            feature_root=feature_root,
+            alias_map=alias_map,
         )
         if not current_problems:
             continue
@@ -8808,6 +24782,8 @@ async def _reconcile_dag_task_specs(
             roots,
             forbidden_entries,
             expected_entries,
+            feature_root=feature_root,
+            alias_map=alias_map,
         )
         if replacement_problems:
             report["blockers"].append({
@@ -8857,6 +24833,8 @@ async def _reconcile_dag_task_specs(
         roots,
         forbidden_entries,
         expected_entries,
+        feature_root=feature_root,
+        alias_map=alias_map,
     )
     report["source_path_blockers"] = source_path_blockers
     if stale_projection_problems and report["applied"]:
@@ -8990,16 +24968,21 @@ def _dag_workspace_permission_repo_roots(feature_root: Path | None) -> list[Path
 
 
 def _repo_relative_cleanup_target(repo: Path, target: str) -> str | None:
-    normalized = _strip_direct_route_line_suffix(target)
-    if not normalized:
-        return None
+    raw_target = str(target or "").strip().strip("`'\"").replace("\\", "/")
+    if ":" in raw_target:
+        maybe_path, maybe_line = raw_target.rsplit(":", 1)
+        if maybe_line.isdigit():
+            raw_target = maybe_path
     try:
-        candidate = Path(normalized).expanduser()
-        if candidate.is_absolute():
-            return candidate.resolve(strict=False).relative_to(
+        absolute_candidate = Path(raw_target).expanduser()
+        if absolute_candidate.is_absolute():
+            return absolute_candidate.resolve(strict=False).relative_to(
                 repo.resolve(strict=False)
             ).as_posix()
     except Exception:
+        return None
+    normalized = _strip_direct_route_line_suffix(target)
+    if not normalized:
         return None
     repo_name = repo.name.strip("/")
     if repo_name and normalized.startswith(f"{repo_name}/"):
@@ -9025,6 +25008,8 @@ def _cleanup_target_matches_repo_manifest(
 def _cleanup_permission_candidates(
     feature_root: Path | None,
     target_files: list[str],
+    *,
+    allow_missing_targets: bool = False,
 ) -> tuple[list[tuple[Path, Path, str]], list[str]]:
     repos = _dag_workspace_permission_repo_roots(feature_root)
     candidates: list[tuple[Path, Path, str]] = []
@@ -9036,12 +25021,13 @@ def _cleanup_permission_candidates(
             continue
         matched = False
         for repo in repos:
-            repo_relative = _repo_relative_cleanup_target(repo, target)
+            repo_relative = _repo_relative_cleanup_target(repo, raw_target)
             if not repo_relative:
                 continue
             absolute = repo / repo_relative
             relevant = (
-                absolute.exists()
+                allow_missing_targets
+                or absolute.exists()
                 or _git_path_has_state(repo, repo_relative)
                 or _cleanup_target_matches_repo_manifest(repo, repo_relative)
             )
@@ -9060,7 +25046,8 @@ def _cleanup_permission_candidates(
 
 def _path_has_symlink_ancestor(repo: Path, target: Path) -> str:
     try:
-        relative = target.resolve(strict=False).relative_to(repo.resolve(strict=False))
+        repo_resolved = repo.resolve(strict=False)
+        relative = target.relative_to(repo)
     except Exception:
         return "target escapes direct workflow repo"
     current = repo
@@ -9071,6 +25058,10 @@ def _path_has_symlink_ancestor(repo: Path, target: Path) -> str:
                 return f"symlink path component is not permission-normalized: {current}"
         except OSError:
             return f"failed to inspect path component: {current}"
+    try:
+        target.resolve(strict=False).relative_to(repo_resolved)
+    except Exception:
+        return "target escapes direct workflow repo"
     return ""
 
 
@@ -9082,6 +25073,81 @@ def _nearest_existing_dir_for_permission(target: Path) -> Path | None:
         if current == current.parent:
             return None
         current = current.parent
+
+
+def _is_git_metadata_path(path: Path, *, repo: Path) -> bool:
+    try:
+        relative = path.resolve(strict=False).relative_to(repo.resolve(strict=False))
+    except Exception:
+        return False
+    return bool(relative.parts and relative.parts[0] == ".git")
+
+
+def _replace_regular_file_for_agent_group(
+    path: Path,
+    *,
+    repo: Path,
+    report: dict[str, Any],
+    reason: str,
+    desired_mode: int,
+    original_mode: int,
+    chmod_error: OSError,
+    shared_gid: int | None,
+) -> bool:
+    """Make a non-writable regular file agent-writable without owner chmod rights.
+
+    If the bridge user cannot chmod a file owned by one of the agent users, but
+    the containing directory is already shared-writable, we can atomically replace
+    the file with an identical copy. This keeps ACL normalization inside the
+    workflow and avoids asking the operator to fix per-file ownership drift.
+    """
+    if _is_git_metadata_path(path, repo=repo):
+        return False
+    try:
+        st = path.lstat()
+    except OSError:
+        return False
+    if not stat.S_ISREG(st.st_mode):
+        return False
+    parent = path.parent
+    if not _path_agent_writable(parent, repo_path=repo):
+        return False
+
+    tmp_path = parent / f".{path.name}.iriai-acl-{uuid4().hex}.tmp"
+    try:
+        shutil.copyfile(path, tmp_path, follow_symlinks=False)
+        if shared_gid is not None:
+            try:
+                os.chown(tmp_path, -1, shared_gid)
+            except OSError:
+                pass
+        os.chmod(tmp_path, desired_mode)
+        os.replace(tmp_path, path)
+        if not _path_agent_writable(path, repo_path=repo):
+            raise OSError("replacement did not make path agent-writable")
+    except OSError as exc:
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+        report["skipped"].append({
+            "path": str(path),
+            "reason": reason,
+            "error": f"atomic file replacement skipped after chmod failure: {exc}",
+            "chmod_error": f"{chmod_error}",
+            "mode": stat.filemode(original_mode),
+        })
+        return False
+
+    report["changed"].append({
+        "path": str(path),
+        "reason": reason,
+        "old_mode": stat.filemode(original_mode),
+        "new_mode": stat.filemode(path.lstat().st_mode),
+        "method": "atomic_file_replacement_after_chmod_failure",
+        "chmod_error": f"{chmod_error}",
+    })
+    return True
 
 
 def _chmod_for_agent_group(
@@ -9147,6 +25213,26 @@ def _chmod_for_agent_group(
     try:
         os.chmod(path, desired)
     except OSError as exc:
+        if _path_agent_writable(path, repo_path=repo):
+            report["skipped"].append({
+                "path": str(path),
+                "reason": reason,
+                "error": f"chmod skipped after failure because path is already agent-writable: {exc}",
+                "mode": stat.filemode(st.st_mode),
+                "desired_mode": stat.filemode((st.st_mode & ~0o7777) | desired),
+            })
+            return
+        if _replace_regular_file_for_agent_group(
+            path,
+            repo=repo,
+            report=report,
+            reason=reason,
+            desired_mode=desired,
+            original_mode=st.st_mode,
+            chmod_error=exc,
+            shared_gid=shared_gid,
+        ):
+            return
         report["failed"].append({
             "path": str(path),
             "reason": reason,
@@ -9225,6 +25311,7 @@ def _normalize_feature_workspace_cleanup_permissions(
     target_files: list[str],
     *,
     reason: str,
+    allow_missing_targets: bool = False,
 ) -> dict[str, Any]:
     report: dict[str, Any] = {
         "enabled": _dag_workspace_permission_repair_enabled(),
@@ -9248,12 +25335,32 @@ def _normalize_feature_workspace_cleanup_permissions(
         report["operator_reasons"].append("missing feature workspace root")
         return report
 
+    guard_problems = _workflow_repos_root_guard_problems(feature_root)
+    if guard_problems:
+        report["operator_required"] = True
+        report["skipped"].append({
+            "reason": "unsafe_feature_workspace_root",
+            "problems": guard_problems,
+        })
+        report["operator_reasons"].append(
+            "unsafe feature workspace root for permission repair: "
+            + "; ".join(
+                f"{problem.get('path')}: {problem.get('reason')}"
+                for problem in guard_problems[:10]
+            )
+        )
+        return report
+
     candidates, skipped_targets = _cleanup_permission_candidates(
         feature_root,
         target_files,
+        allow_missing_targets=allow_missing_targets,
     )
     for skipped in skipped_targets:
         report["skipped"].append({"reason": skipped})
+    if target_files and skipped_targets:
+        report["operator_required"] = True
+        report["operator_reasons"].extend(skipped_targets)
     if target_files and not candidates:
         report["operator_required"] = True
         report["operator_reasons"].append(
@@ -9310,6 +25417,25 @@ async def _record_workspace_permission_repair(
     )
 
 
+async def _record_workspace_acl_normalization(
+    runner: WorkflowRunner,
+    feature: Feature,
+    group_idx: int,
+    context: str,
+    report: dict[str, Any],
+) -> None:
+    payload = dict(report)
+    payload.update({
+        "group_idx": group_idx,
+        "context": context,
+    })
+    await runner.artifacts.put(
+        f"dag-workspace-acl-normalization:g{group_idx}:{context}",
+        json.dumps(payload, indent=2),
+        feature=feature,
+    )
+
+
 async def _normalize_direct_route_workspace_permissions(
     runner: WorkflowRunner,
     feature: Feature,
@@ -9355,6 +25481,124 @@ def _implementation_result_permission_targets(
     ])
 
 
+def _task_repo_prefixed_path(task: ImplementationTask, raw_path: str) -> str:
+    normalized = _strip_direct_route_line_suffix(raw_path)
+    if not normalized:
+        return ""
+    if Path(normalized).expanduser().is_absolute():
+        return normalized
+    repo_path = str(task.repo_path or "").strip().strip("/")
+    if repo_path and not normalized.startswith(f"{repo_path}/"):
+        return f"{repo_path}/{normalized}"
+    return normalized
+
+
+def _dag_task_permission_targets(tasks: list[ImplementationTask]) -> list[str]:
+    targets: list[str] = []
+    for task in tasks:
+        scoped = [
+            scope.path
+            for scope in task.file_scope
+            if scope.path and scope.action != "read_only"
+        ]
+        raw_paths = scoped or list(task.files)
+        for raw_path in raw_paths:
+            target = _task_repo_prefixed_path(task, raw_path)
+            if target:
+                targets.append(target)
+    return _dedupe_preserving_order(targets)
+
+
+def _dag_verdict_permission_targets(
+    verdict: Verdict,
+    group_tasks: list[ImplementationTask],
+) -> list[str]:
+    repo_paths = sorted({
+        str(task.repo_path or "").strip().strip("/")
+        for task in group_tasks
+        if str(task.repo_path or "").strip().strip("/")
+    })
+    targets: list[str] = []
+    for issue in verdict.concerns:
+        raw_path = str(issue.file or "").strip()
+        if not raw_path:
+            continue
+        normalized = _strip_direct_route_line_suffix(raw_path)
+        if not normalized:
+            continue
+        if Path(normalized).expanduser().is_absolute():
+            targets.append(normalized)
+            continue
+        if any(normalized.startswith(f"{repo_path}/") for repo_path in repo_paths):
+            targets.append(normalized)
+            continue
+        if len(repo_paths) == 1:
+            targets.append(f"{repo_paths[0]}/{normalized}")
+    return _dedupe_preserving_order(targets)
+
+
+def _workspace_acl_operator_required_failure(
+    *,
+    group_idx: int,
+    context: str,
+    report: dict[str, Any],
+    problems: list[dict[str, Any]] | None = None,
+) -> str:
+    reasons = list(report.get("operator_reasons") or [])
+    reasons.extend(str(item.get("error", "")) for item in report.get("failed") or [])
+    for problem in problems or []:
+        reasons.append(
+            f"{problem.get('path')} {problem.get('reason')} at "
+            f"{problem.get('directory') or problem.get('target') or ''}".strip()
+        )
+    reason_text = "; ".join(reason for reason in reasons if reason)
+    return (
+        f"{_OPERATOR_REQUIRED_MARKER}; group {group_idx} workspace ACL "
+        f"normalization blocked during {context}. Fix canonical target "
+        "permissions before dispatching more agents."
+        + (f" Details: {reason_text}" if reason_text else "")
+    )
+
+
+async def _normalize_dag_workspace_acl(
+    runner: WorkflowRunner,
+    feature: Feature,
+    group_idx: int,
+    feature_root: Path | None,
+    target_files: list[str],
+    *,
+    context: str,
+) -> dict[str, Any]:
+    targets = _dedupe_preserving_order([target for target in target_files if target])
+    if feature_root is None:
+        report = {
+            "enabled": _dag_workspace_permission_repair_enabled(),
+            "reason": context,
+            "target_files": targets,
+            "changed": [],
+            "already_ok": [],
+            "skipped": [{"reason": "missing feature workspace root"}],
+            "failed": [],
+            "operator_reasons": [],
+            "operator_required": False,
+        }
+    else:
+        report = _normalize_feature_workspace_cleanup_permissions(
+            feature_root,
+            targets,
+            reason=context,
+            allow_missing_targets=True,
+        )
+    await _record_workspace_acl_normalization(
+        runner,
+        feature,
+        group_idx,
+        context,
+        report,
+    )
+    return report
+
+
 def _manifest_cleanup_scoped_entries(
     feature_root: Path | None,
     target_files: list[str],
@@ -9384,7 +25628,11 @@ def _manifest_cleanup_scoped_entries(
             continue
         if any(
             _dag_path_matches_forbidden_file(target, {forbidden_path})
-            or _dag_path_matches_forbidden_file(forbidden_path, {target})
+            or _dag_paths_exact_or_manifest_descendant(
+                forbidden_path,
+                target,
+                allow_repo_prefix=False,
+            )
             for target in normalized_targets
         ):
             if forbidden_path not in seen:
@@ -9449,8 +25697,18 @@ def _manifest_cleanup_remaining_verdict(
     )
 
 
-def _dag_repo_hygiene_problems(repos_root: Path | None) -> list[dict[str, Any]]:
+def _dag_repo_hygiene_problems(
+    repos_root: Path | None,
+    *,
+    authorized_source_roots: dict[str, str] | None = None,
+) -> list[dict[str, Any]]:
     problems: list[dict[str, Any]] = []
+    problems.extend(
+        _workflow_repos_root_guard_problems(
+            repos_root,
+            authorized_source_roots=authorized_source_roots,
+        )
+    )
     for repo in _dag_direct_workflow_repo_roots(repos_root):
         repo_name = repo.name
 
@@ -9556,6 +25814,170 @@ def _dag_repo_hygiene_problems(repos_root: Path | None) -> list[dict[str, Any]]:
     return problems
 
 
+def _workflow_repos_root_guard_problems(
+    repos_root: Path | None,
+    *,
+    authorized_source_roots: dict[str, str] | None = None,
+) -> list[dict[str, Any]]:
+    if repos_root is None:
+        return []
+    root = Path(repos_root)
+    if not root.exists():
+        return []
+    problems: list[dict[str, Any]] = []
+    current = root
+    while True:
+        if current.exists() and current.is_symlink():
+            problems.append({
+                "task_id": "",
+                "artifact_key": "",
+                "path": str(current),
+                "reason": (
+                    "workflow_repos_root_symlink"
+                    if current == root
+                    else "workflow_repos_root_symlink_ancestor"
+                ),
+                "exists": "true",
+                "exists_on_disk": True,
+                "tracked_or_staged": False,
+                "git_state": "unsafe_root",
+                "repair_route": "workspace_authority_required",
+                "forbidden_rule": "",
+                "forbidden_path": str(current),
+                "forbidden_source": "repo mutation guard",
+                "candidate_evidence": [],
+            })
+            return problems
+        if current == current.parent:
+            break
+        current = current.parent
+    if root.is_symlink():
+        problems.append({
+            "task_id": "",
+            "artifact_key": "",
+            "path": str(root),
+            "reason": "workflow_repos_root_symlink",
+            "exists": "true",
+            "exists_on_disk": True,
+            "tracked_or_staged": False,
+            "git_state": "unsafe_root",
+            "repair_route": "workspace_authority_required",
+            "forbidden_rule": "",
+            "forbidden_path": str(root),
+            "forbidden_source": "repo mutation guard",
+            "candidate_evidence": [],
+        })
+        return problems
+    direct_repos_dir = root if root.name == "repos" else root / "repos"
+    if direct_repos_dir.exists() and direct_repos_dir.is_symlink():
+        problems.append({
+            "task_id": "",
+            "artifact_key": "",
+            "path": str(direct_repos_dir),
+            "reason": "workflow_repos_root_symlink",
+            "exists": "true",
+            "exists_on_disk": True,
+            "tracked_or_staged": False,
+            "git_state": "unsafe_root",
+            "repair_route": "workspace_authority_required",
+            "forbidden_rule": "",
+            "forbidden_path": str(direct_repos_dir),
+            "forbidden_source": "repo mutation guard",
+            "candidate_evidence": [],
+        })
+        return problems
+    if not direct_repos_dir.exists():
+        return problems
+    allowed_metadata_roots = _git_worktree_metadata_roots_for_repos_root(direct_repos_dir)
+    try:
+        for child in sorted(direct_repos_dir.iterdir()):
+            if child.is_symlink():
+                problems.append({
+                    "task_id": "",
+                    "artifact_key": "",
+                    "path": str(child),
+                    "reason": "workflow_repo_symlink",
+                    "exists": "true",
+                    "exists_on_disk": True,
+                    "tracked_or_staged": False,
+                    "git_state": "unsafe_root",
+                    "repair_route": "workspace_authority_required",
+                    "forbidden_rule": "",
+                    "forbidden_path": str(child),
+                    "forbidden_source": "repo mutation guard",
+                    "candidate_evidence": [],
+                })
+        for git_dir in sorted(direct_repos_dir.rglob(".git")):
+            try:
+                rel = git_dir.relative_to(direct_repos_dir).as_posix()
+            except Exception:
+                rel = str(git_dir)
+            try:
+                repo_rel = git_dir.parent.relative_to(direct_repos_dir).as_posix()
+            except Exception:
+                repo_rel = ""
+            if git_dir.is_symlink():
+                problems.append({
+                    "task_id": "",
+                    "artifact_key": "",
+                    "path": str(git_dir),
+                    "reason": "workflow_repo_gitdir_symlink",
+                    "exists": "true",
+                    "exists_on_disk": True,
+                    "tracked_or_staged": False,
+                    "git_state": "unsafe_root",
+                    "repair_route": "workspace_authority_required",
+                    "forbidden_rule": "",
+                    "forbidden_path": rel,
+                    "forbidden_source": "repo mutation guard",
+                    "candidate_evidence": [],
+                })
+            elif (
+                git_dir.exists()
+                and not git_dir.is_dir()
+                and not _is_git_worktree_file(
+                    git_dir,
+                    allowed_metadata_roots=allowed_metadata_roots,
+                    allowed_external_metadata_roots=_git_worktree_external_metadata_roots(
+                        authorized_source_roots,
+                        repo_rel=repo_rel,
+                    ),
+                )
+            ):
+                problems.append({
+                    "task_id": "",
+                    "artifact_key": "",
+                    "path": str(git_dir),
+                    "reason": "workflow_repo_gitdir_not_directory",
+                    "exists": "true",
+                    "exists_on_disk": True,
+                    "tracked_or_staged": False,
+                    "git_state": "unsafe_root",
+                    "repair_route": "workspace_authority_required",
+                    "forbidden_rule": "",
+                    "forbidden_path": rel,
+                    "forbidden_source": "repo mutation guard",
+                    "candidate_evidence": [],
+                })
+    except Exception as exc:
+        problems.append({
+            "task_id": "",
+            "artifact_key": "",
+            "path": str(direct_repos_dir),
+            "reason": "workflow_repos_root_scan_failed",
+            "exists": "unknown",
+            "exists_on_disk": direct_repos_dir.exists(),
+            "tracked_or_staged": False,
+            "git_state": "unsafe_root",
+            "repair_route": "workspace_authority_required",
+            "forbidden_rule": "",
+            "forbidden_path": str(direct_repos_dir),
+            "forbidden_source": f"repo mutation guard: {type(exc).__name__}: {exc}",
+            "candidate_evidence": [],
+        })
+    return problems
+
+
 def _dag_workspace_writeability_problems(
     repos_root: Path | None,
     tasks: list[ImplementationTask],
@@ -9575,6 +25997,13 @@ def _dag_workspace_writeability_problems(
             normalized = normalized[len(task.repo_path.strip("/")) + 1:]
         return repo_root / normalized
 
+    def _path_within_repo(path: Path, repo_root: Path) -> bool:
+        try:
+            path.resolve(strict=False).relative_to(repo_root.resolve(strict=False))
+            return True
+        except Exception:
+            return False
+
     def _nearest_existing_dir(path: Path) -> Path | None:
         current = path if path.is_dir() else path.parent
         while True:
@@ -9583,20 +26012,6 @@ def _dag_workspace_writeability_problems(
             if current == current.parent:
                 return None
             current = current.parent
-
-    def _can_write_dir(directory: Path) -> bool:
-        probe = directory / f".iriai-write-probe-{uuid4().hex}"
-        try:
-            with probe.open("xb") as fh:
-                fh.write(b"")
-            probe.unlink(missing_ok=True)
-            return True
-        except Exception:
-            try:
-                probe.unlink(missing_ok=True)
-            except Exception:
-                pass
-            return False
 
     problems: list[dict[str, Any]] = []
     seen: set[tuple[str, str, str]] = set()
@@ -9615,6 +26030,29 @@ def _dag_workspace_writeability_problems(
             if key in seen:
                 continue
             seen.add(key)
+            repo_root = _task_repo_root(task)
+            if not _path_within_repo(target, repo_root):
+                problems.append({
+                    "task_id": task.id,
+                    "path": raw_path,
+                    "action": action,
+                    "reason": "writeability_target_outside_repo",
+                    "target": str(target),
+                    "directory": str(target.parent),
+                })
+                continue
+            symlink_reason = _path_has_symlink_ancestor(repo_root, target)
+            if symlink_reason:
+                problems.append({
+                    "task_id": task.id,
+                    "path": raw_path,
+                    "action": action,
+                    "reason": "writeability_symlink_ancestor",
+                    "target": str(target),
+                    "directory": str(target.parent),
+                    "detail": symlink_reason,
+                })
+                continue
             if check_dir is None:
                 problems.append({
                     "task_id": task.id,
@@ -9624,13 +26062,38 @@ def _dag_workspace_writeability_problems(
                     "directory": str(target.parent),
                 })
                 continue
-            if not _can_write_dir(check_dir):
+            if not _path_agent_writable(check_dir, repo_path=repo_root):
                 problems.append({
                     "task_id": task.id,
                     "path": raw_path,
                     "action": action,
                     "reason": "writeability_denied",
                     "directory": str(check_dir),
+                })
+                continue
+            if target.exists() and not target.is_dir() and not _path_agent_writable(
+                target,
+                repo_path=repo_root,
+            ):
+                problems.append({
+                    "task_id": task.id,
+                    "path": raw_path,
+                    "action": action,
+                    "reason": "writeability_file_denied",
+                    "target": str(target),
+                    "directory": str(target.parent),
+                })
+            elif target.exists() and target.is_dir() and not _path_agent_writable(
+                target,
+                repo_path=repo_root,
+            ):
+                problems.append({
+                    "task_id": task.id,
+                    "path": raw_path,
+                    "action": action,
+                    "reason": "writeability_directory_denied",
+                    "target": str(target),
+                    "directory": str(target),
                 })
     return problems
 
@@ -9989,35 +26452,12 @@ async def _append_dag_task_rows_from_product_repair(
     return report
 
 
-def _dag_product_cleanup_ready_for_artifact_repair(
-    report: dict[str, Any],
-) -> bool:
-    """Return true when product cleanup is done enough to repair metadata."""
-    blocking_reasons = {
-        "missing_feature_roots",
-        "fix_result_status_not_completed_or_partial",
-        "product_cleanup_still_required",
-    }
-    for item in report.get("skipped", []) or []:
-        if not isinstance(item, dict):
-            continue
-        if str(item.get("reason", "")) in blocking_reasons:
-            return False
-    return True
+# `_dag_product_cleanup_ready_for_artifact_repair` is shimmed from
+# `..execution.repair` (Slice 11h).
 
 
-@dataclass(slots=True)
-class DagTaskReconcileOutcome:
-    results: list[object]
-    verify_results_context: list[object]
-    all_results: list[object]
-    report: dict[str, Any]
-
-
-@dataclass(slots=True)
-class DagTaskSpecReconcileOutcome:
-    tasks: list[ImplementationTask]
-    report: dict[str, Any]
+# `DagTaskReconcileOutcome` and `DagTaskSpecReconcileOutcome` are shimmed
+# from `..execution.types` (Slice 11a).
 
 
 def _dag_task_id_aliases(task_id: str) -> set[str]:
@@ -10165,6 +26605,7 @@ def _validate_dag_task_reconcile_candidate(
     expected_entries: list[dict[str, str]],
     forbidden_entries: list[dict[str, str]],
     source: str,
+    alias_map: dict[str, str] | None = None,
 ) -> tuple[ImplementationResult | None, str, list[dict[str, Any]]]:
     if not _dag_task_id_matches_or_alias(task.id, candidate.task_id):
         return None, "task_id_mismatch", [{
@@ -10197,6 +26638,7 @@ def _validate_dag_task_reconcile_candidate(
             path,
             roots,
             feature_root,
+            alias_map,
         )
         records.append({
             "path": path,
@@ -10204,12 +26646,17 @@ def _validate_dag_task_reconcile_candidate(
             "normalized": normalized or "",
             "source": source,
         })
-        if category == "rewritten_product":
+        if category in {
+            "rewritten_product",
+            "worktree_alias_divergent",
+            "worktree_alias_unresolved",
+        }:
             return None, "noncanonical_path", [{
                 "path": path,
                 "canonical": normalized or "",
+                "category": category,
             }]
-        if category != "product":
+        if category not in {"product", "worktree_alias_rewritten"}:
             return None, f"{category}_path", [{
                 "path": path,
                 "normalized": normalized or "",
@@ -10224,12 +26671,20 @@ def _validate_dag_task_reconcile_candidate(
             for variant in path_variants
             if variant
         )
-        if scope_paths and not allowed_by_scope and not allowed_by_expected:
+        allowed_by_authority_resolution = source == "existing_product_match"
+        if (
+            scope_paths
+            and not allowed_by_scope
+            and not allowed_by_expected
+            and not allowed_by_authority_resolution
+        ):
             return None, "outside_task_scope", [{
                 "path": path,
                 "normalized": normalized or "",
                 "task_id": task.id,
             }]
+        if allowed_by_authority_resolution and not allowed_by_scope and not allowed_by_expected:
+            records[-1]["scope_override"] = "existing_product_match"
 
     return candidate.model_copy(update={"task_id": task.id}), "", records
 
@@ -10268,6 +26723,7 @@ def _dag_existing_valid_paths_by_field(
     roots: list[Path],
     feature_root: Path | None,
     forbidden_entries: list[dict[str, str]],
+    alias_map: dict[str, str] | None = None,
 ) -> dict[str, list[str]]:
     kept: dict[str, list[str]] = {"files_created": [], "files_modified": []}
     for field_name in ("files_created", "files_modified"):
@@ -10278,9 +26734,12 @@ def _dag_existing_valid_paths_by_field(
                 path,
                 roots,
                 feature_root,
+                alias_map,
             )
             if category == "product":
                 kept[field_name].append(path)
+            elif category == "worktree_alias_rewritten" and _normalized:
+                kept[field_name].append(_normalized)
     return {
         key: _dedupe_preserving_order(value)
         for key, value in kept.items()
@@ -10298,6 +26757,7 @@ def _dag_merge_reconcile_candidate(
     feature_root: Path | None,
     forbidden_entries: list[dict[str, str]],
     expected_entries: list[dict[str, str]],
+    alias_map: dict[str, str] | None = None,
 ) -> ImplementationResult:
     if not stale_results:
         return candidate
@@ -10309,6 +26769,8 @@ def _dag_merge_reconcile_candidate(
             roots,
             forbidden_entries,
             expected_entries,
+            feature_root=feature_root,
+            alias_map=alias_map,
         )
     }
     existing: dict[str, list[str]] = {
@@ -10321,6 +26783,7 @@ def _dag_merge_reconcile_candidate(
             roots,
             feature_root,
             forbidden_entries,
+            alias_map,
         )
         for field_name in ("files_created", "files_modified"):
             existing[field_name].extend(valid_paths[field_name])
@@ -10345,6 +26808,7 @@ def _dag_expected_manifest_candidate(
     feature_root: Path | None,
     expected_entries: list[dict[str, str]],
     forbidden_entries: list[dict[str, str]],
+    alias_map: dict[str, str] | None = None,
 ) -> ImplementationResult | None:
     task_entries = _dag_expected_entries_for_task(task, expected_entries)
     if not task_entries:
@@ -10354,6 +26818,7 @@ def _dag_expected_manifest_candidate(
         roots,
         feature_root,
         forbidden_entries,
+        alias_map,
     )
     expected_paths = _dedupe_preserving_order([
         entry["path"] for entry in task_entries
@@ -10388,6 +26853,289 @@ def _dag_expected_manifest_candidate(
     })
 
 
+_DAG_CANDIDATE_SEARCH_EXCLUDED_DIRS = frozenset({
+    ".git",
+    ".hg",
+    ".svn",
+    ".iriai-context",
+    ".staging",
+    "__pycache__",
+    "coverage",
+    "dist",
+    "node_modules",
+    "out",
+})
+
+
+def _dag_existing_product_files_by_basename(
+    roots: list[Path],
+    feature_root: Path | None,
+    basenames: set[str],
+    forbidden_entries: list[dict[str, str]],
+    alias_map: dict[str, str] | None = None,
+) -> dict[str, list[dict[str, Any]]]:
+    wanted = {name for name in basenames if name}
+    if not wanted:
+        return {}
+    by_name: dict[str, list[dict[str, Any]]] = {name: [] for name in wanted}
+    seen: set[Path] = set()
+    for root in roots:
+        if not root.exists() or not root.is_dir():
+            continue
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [
+                name for name in dirnames
+                if name not in _DAG_CANDIDATE_SEARCH_EXCLUDED_DIRS
+            ]
+            matching_names = wanted & set(filenames)
+            if not matching_names:
+                continue
+            for filename in sorted(matching_names):
+                absolute = Path(dirpath) / filename
+                try:
+                    resolved = absolute.resolve()
+                except Exception:
+                    resolved = absolute
+                if resolved in seen:
+                    continue
+                seen.add(resolved)
+                feature_relative = _feature_relative_path(absolute, feature_root)
+                if _dag_forbidden_match(feature_relative, forbidden_entries) is not None:
+                    continue
+                category, normalized = _classify_dag_repair_path(
+                    feature_relative,
+                    roots,
+                    feature_root,
+                    alias_map,
+                )
+                if category != "product" or not normalized:
+                    continue
+                by_name[filename].append({
+                    "path": normalized,
+                    "feature_relative": feature_relative,
+                    "basename": filename,
+                    "source": "product_file_index",
+                    "exists": True,
+                })
+    for records in by_name.values():
+        records.sort(key=lambda item: item["path"])
+    return by_name
+
+
+def _dag_path_is_test_like(path: str) -> bool:
+    normalized = path.strip().replace("\\", "/")
+    basename = Path(normalized).name
+    return (
+        "/test/" in normalized
+        or "/tests/" in normalized
+        or "/__tests__/" in normalized
+        or ".test." in basename
+        or ".spec." in basename
+    )
+
+
+def _dag_score_existing_product_candidate(
+    stale_path: str,
+    candidate_path: str,
+    task: ImplementationTask,
+) -> tuple[int, list[str]]:
+    stale = stale_path.strip().replace("\\", "/").strip("/")
+    candidate = candidate_path.strip().replace("\\", "/").strip("/")
+    score = 0
+    reasons: list[str] = []
+    if Path(stale).name == Path(candidate).name:
+        score += 100
+        reasons.append("same_basename")
+    stale_test = _dag_path_is_test_like(stale)
+    candidate_test = _dag_path_is_test_like(candidate)
+    if stale_test == candidate_test:
+        score += 25
+        reasons.append("same_test_kind")
+    elif stale_test:
+        score -= 50
+        reasons.append("stale_test_candidate_not_test")
+    if "/studioWorkflow/browser/workflowTab/chat/" in f"/{stale}":
+        if "/src/webviews/projectSurface/src/chat/" in f"/{candidate}":
+            score += 60
+            reasons.append("retired_chat_to_project_surface_chat")
+        elif "/studioWorkflow/browser/workflowTab/chat/" in f"/{candidate}":
+            score -= 100
+            reasons.append("candidate_still_retired_chat_tree")
+    if "/__tests__/" in f"/{candidate}" and stale_test:
+        score += 15
+        reasons.append("canonical_tests_directory")
+    if task.subfeature_id and task.subfeature_id in candidate:
+        score += 5
+        reasons.append("subfeature_token")
+    return score, reasons
+
+
+def _dag_stale_result_path_field_map(
+    stale_results: list[ImplementationResult],
+) -> dict[str, str]:
+    fields: dict[str, str] = {}
+    for result in stale_results:
+        for field_name in ("files_created", "files_modified"):
+            for path in getattr(result, field_name):
+                key = _normalize_dag_reported_path_key(path)
+                fields.setdefault(key, field_name)
+    return fields
+
+
+def _dag_existing_product_match_candidate(
+    task: ImplementationTask,
+    stale_result: ImplementationResult,
+    stale_results: list[ImplementationResult],
+    roots: list[Path],
+    feature_root: Path | None,
+    expected_entries: list[dict[str, str]],
+    forbidden_entries: list[dict[str, str]],
+    alias_map: dict[str, str] | None = None,
+) -> tuple[ImplementationResult | None, list[dict[str, Any]]]:
+    stale_problems = [
+        problem
+        for result in stale_results
+        for problem in _dag_result_path_problems(
+            result,
+            roots,
+            forbidden_entries,
+            expected_entries,
+            feature_root=feature_root,
+            alias_map=alias_map,
+        )
+    ]
+    if not stale_problems:
+        return None, []
+    alias_problems = [
+        problem for problem in stale_problems
+        if str(problem.get("reason", "")).startswith("worktree_alias")
+        or _raw_path_has_worktree_alias_prefix(
+            str(problem.get("path", "")),
+            alias_map,
+            feature_root,
+        )
+    ]
+    if alias_problems:
+        return None, [
+            {
+                "task_id": task.id,
+                "artifact_key": f"dag-task:{task.id}",
+                "stale_path": str(problem.get("path", "")),
+                "canonical_path": str(problem.get("canonical_path", "")),
+                "status": "skipped_registry_alias_requires_exact_canonical_path",
+                "candidate_source": "existing_product_match",
+                "candidates": [],
+            }
+            for problem in alias_problems
+        ]
+
+    basenames = {
+        Path(str(problem.get("path", ""))).name
+        for problem in stale_problems
+    }
+    index = _dag_existing_product_files_by_basename(
+        roots,
+        feature_root,
+        basenames,
+        forbidden_entries,
+        alias_map,
+    )
+    path_fields = _dag_stale_result_path_field_map(stale_results)
+    existing = _dag_existing_valid_paths_by_field(
+        stale_result,
+        roots,
+        feature_root,
+        forbidden_entries,
+        alias_map,
+    )
+    updates: dict[str, list[str]] = {
+        "files_created": list(existing["files_created"]),
+        "files_modified": list(existing["files_modified"]),
+    }
+    resolution_records: list[dict[str, Any]] = []
+    unresolved = False
+
+    for problem in stale_problems:
+        stale_path = str(problem.get("path", ""))
+        basename = Path(stale_path).name
+        raw_candidates = index.get(basename, [])
+        scored: list[dict[str, Any]] = []
+        for candidate in raw_candidates:
+            score, reasons = _dag_score_existing_product_candidate(
+                stale_path,
+                str(candidate.get("path", "")),
+                task,
+            )
+            scored.append({
+                **candidate,
+                "score": score,
+                "reasons": reasons,
+            })
+        scored.sort(key=lambda item: (-int(item["score"]), str(item["path"])))
+        accepted: dict[str, Any] | None = None
+        status = "no_candidate"
+        if scored:
+            best_score = int(scored[0]["score"])
+            best = [
+                candidate for candidate in scored
+                if int(candidate["score"]) == best_score
+            ]
+            if best_score > 0 and len(best) == 1:
+                accepted = best[0]
+                status = "accepted"
+                field_name = path_fields.get(
+                    _normalize_dag_reported_path_key(stale_path),
+                    "files_modified",
+                )
+                updates[field_name].append(str(accepted["path"]))
+            elif len(best) > 1:
+                status = "ambiguous"
+            else:
+                status = "no_positive_candidate"
+        if accepted is None:
+            unresolved = True
+        resolution_records.append({
+            "task_id": task.id,
+            "artifact_key": f"dag-task:{task.id}",
+            "stale_path": stale_path,
+            "status": status,
+            "accepted_path": str(accepted.get("path", "")) if accepted else "",
+            "candidate_source": "existing_product_match",
+            "candidates": scored[:10],
+        })
+
+    if unresolved:
+        return None, resolution_records
+
+    files_created = _dedupe_preserving_order(updates["files_created"])
+    files_modified = [
+        path for path in _dedupe_preserving_order(updates["files_modified"])
+        if path not in files_created
+    ]
+    if not files_created and not files_modified:
+        return None, resolution_records
+    notes = (
+        f"{stale_result.notes}\n\n" if stale_result.notes else ""
+    ) + (
+        "DAG task result metadata reconciled by the authority gate from "
+        "unique existing product files matching stale path basenames and "
+        "task context. The host validated these paths before appending the "
+        "replacement dag-task row."
+    )
+    candidate = stale_result.model_copy(update={
+        "task_id": task.id,
+        "summary": (
+            "Reconciled stale DAG task metadata to canonical existing "
+            "product paths from authority-gate candidate resolution."
+        ),
+        "status": "completed" if stale_result.status == "completed" else "partial",
+        "files_created": files_created,
+        "files_modified": files_modified,
+        "notes": notes,
+    })
+    return candidate, resolution_records
+
+
 async def _reconcile_dag_task_results(
     runner: WorkflowRunner,
     feature: Feature,
@@ -10408,6 +27156,7 @@ async def _reconcile_dag_task_results(
         "applied": [],
         "skipped": [],
         "blockers": [],
+        "candidate_resolution": [],
     }
     if not roots or not group_tasks:
         report["skipped"].append({"reason": "missing_roots_or_tasks"})
@@ -10417,6 +27166,14 @@ async def _reconcile_dag_task_results(
             all_results,
             report,
         )
+    alias_map = await _worktree_alias_map_for_group(
+        runner,
+        feature,
+        group_idx,
+        feature_root,
+    )
+    if alias_map:
+        report["alias_map"] = alias_map
 
     manifest_entries = _dag_manifest_path_entries(roots)
     expected_entries = manifest_entries.get("expected_files", [])
@@ -10447,6 +27204,8 @@ async def _reconcile_dag_task_results(
                 roots,
                 forbidden_entries,
                 expected_entries,
+                feature_root=feature_root,
+                alias_map=alias_map,
             )
         ]
         parent_record = await _dag_artifact_record_for_key(
@@ -10469,7 +27228,11 @@ async def _reconcile_dag_task_results(
                     roots,
                     forbidden_entries,
                     expected_entries,
+                    feature_root=feature_root,
+                    alias_map=alias_map,
                 ))
+                if latest_problem and latest not in stale_results:
+                    stale_results.append(latest)
                 if not latest_problem:
                     valid, reason, validation = _validate_dag_task_reconcile_candidate(
                         task,
@@ -10479,6 +27242,7 @@ async def _reconcile_dag_task_results(
                         expected_entries=expected_entries,
                         forbidden_entries=forbidden_entries,
                         source="latest_db",
+                        alias_map=alias_map,
                     )
                     if valid is not None:
                         updated_results = _replace_task_result_in_list(
@@ -10523,6 +27287,7 @@ async def _reconcile_dag_task_results(
                     feature_root,
                     forbidden_entries,
                     expected_entries,
+                    alias_map,
                 )
                 valid, reason, validation = _validate_dag_task_reconcile_candidate(
                     task,
@@ -10532,6 +27297,7 @@ async def _reconcile_dag_task_results(
                     expected_entries=expected_entries,
                     forbidden_entries=forbidden_entries,
                     source="latest_db",
+                    alias_map=alias_map,
                 )
                 if valid is not None:
                     candidates.append((
@@ -10555,24 +27321,28 @@ async def _reconcile_dag_task_results(
                 roots,
                 forbidden_entries,
                 expected_entries,
+                feature_root=feature_root,
+                alias_map=alias_map,
             ))
             candidate = _dag_merge_reconcile_candidate(
                 candidate,
                 stale_results,
                 roots,
                 feature_root,
-                forbidden_entries,
-                expected_entries,
-            )
+	                forbidden_entries,
+	                expected_entries,
+	                alias_map,
+	            )
             valid, reason, validation = _validate_dag_task_reconcile_candidate(
                 task,
                 candidate,
                 roots,
                 feature_root,
                 expected_entries=expected_entries,
-                forbidden_entries=forbidden_entries,
-                source="same_task_result",
-            )
+	                forbidden_entries=forbidden_entries,
+	                source="same_task_result",
+	                alias_map=alias_map,
+	            )
             if valid is not None:
                 candidates.append((
                     "same_task_stale_drop"
@@ -10598,26 +27368,29 @@ async def _reconcile_dag_task_results(
                 roots,
                 feature_root,
                 expected_entries,
-                forbidden_entries,
-            )
+	                forbidden_entries,
+	                alias_map,
+	            )
             if manifest_candidate is not None:
                 manifest_candidate = _dag_merge_reconcile_candidate(
                     manifest_candidate,
                     stale_results,
                     roots,
                     feature_root,
-                    forbidden_entries,
-                    expected_entries,
-                )
+	                    forbidden_entries,
+	                    expected_entries,
+	                    alias_map,
+	                )
                 valid, reason, validation = _validate_dag_task_reconcile_candidate(
                     task,
                     manifest_candidate,
                     roots,
                     feature_root,
                     expected_entries=expected_entries,
-                    forbidden_entries=forbidden_entries,
-                    source="expected_files",
-                )
+	                    forbidden_entries=forbidden_entries,
+	                    source="expected_files",
+	                    alias_map=alias_map,
+	                )
                 if valid is not None:
                     candidates.append(("expected_files", valid, validation))
                 else:
@@ -10627,6 +27400,40 @@ async def _reconcile_dag_task_results(
                         "source": "expected_files",
                         "reason": reason,
                         "validation": validation,
+                    })
+
+            resolver_candidate, resolution_records = _dag_existing_product_match_candidate(
+                task,
+                stale_results[0],
+                stale_results,
+                roots,
+                feature_root,
+                expected_entries,
+	                forbidden_entries,
+	                alias_map,
+	            )
+            report["candidate_resolution"].extend(resolution_records)
+            if resolver_candidate is not None:
+                valid, reason, validation = _validate_dag_task_reconcile_candidate(
+                    task,
+                    resolver_candidate,
+                    roots,
+                    feature_root,
+                    expected_entries=expected_entries,
+	                    forbidden_entries=forbidden_entries,
+	                    source="existing_product_match",
+	                    alias_map=alias_map,
+	                )
+                if valid is not None:
+                    candidates.append(("existing_product_match", valid, validation))
+                else:
+                    report["skipped"].append({
+                        "task_id": task.id,
+                        "artifact_key": artifact_key,
+                        "source": "existing_product_match",
+                        "reason": reason,
+                        "validation": validation,
+                        "candidate_resolution": resolution_records,
                     })
 
         if stale_results:
@@ -10658,9 +27465,15 @@ async def _reconcile_dag_task_results(
                     for problem in _dag_result_path_problems(
                         result,
                         roots,
-                        forbidden_entries,
-                        expected_entries,
-                    )
+	                        forbidden_entries,
+	                        expected_entries,
+	                        feature_root=feature_root,
+	                        alias_map=alias_map,
+	                    )
+                ],
+                "candidate_resolution": [
+                    record for record in report["candidate_resolution"]
+                    if record.get("task_id") == task.id
                 ],
             })
             continue
@@ -10670,6 +27483,10 @@ async def _reconcile_dag_task_results(
                 "artifact_key": artifact_key,
                 "reason": "ambiguous_candidates",
                 "candidate_count": len(unique),
+                "candidate_resolution": [
+                    record for record in report["candidate_resolution"]
+                    if record.get("task_id") == task.id
+                ],
             })
             continue
 
@@ -10745,9 +27562,11 @@ async def _reconcile_dag_task_results(
                 for problem in _dag_result_path_problems(
                     result,
                     roots,
-                    forbidden_entries,
-                    expected_entries,
-                )
+	                    forbidden_entries,
+	                    expected_entries,
+	                    feature_root=feature_root,
+	                    alias_map=alias_map,
+	                )
             ],
         })
 
@@ -10762,6 +27581,224 @@ async def _reconcile_dag_task_results(
         updated_all_results,
         report,
     )
+
+
+async def _run_worktree_alias_pre_dispatch_guard(
+    runner: WorkflowRunner,
+    feature: Feature,
+    group_idx: int,
+    group_tasks: list[ImplementationTask],
+    *,
+    feature_root: Path | None,
+) -> tuple[bool, dict[str, Any]]:
+    """Resolve repo-alias DAG metadata before normal group dispatch.
+
+    This guard is deliberately registry-backed. It only treats a sibling
+    ``<repo>-wt`` path as an alias when the worktree registry identifies
+    ``<repo>`` as the canonical execution repo for this group.
+    """
+    roots = _dag_candidate_file_roots(feature_root)
+    alias_map = await _worktree_alias_map_for_group(
+        runner,
+        feature,
+        group_idx,
+        feature_root,
+    )
+    report: dict[str, Any] = {
+        "group_idx": group_idx,
+        "approved": True,
+        "operator_required": False,
+        "alias_map": alias_map,
+        "task_spec_problems": [],
+        "source_artifact_problems": [],
+        "dag_task_problems_before": [],
+        "dag_task_problems_after": [],
+        "task_spec_repairs": [],
+        "reconcile_report": {},
+        "deleted_generated_snapshots": [],
+    }
+    artifact_key = f"dag-worktree-alias-preflight:g{group_idx}:initial-dispatch"
+    if not roots or not alias_map:
+        await runner.artifacts.put(artifact_key, json.dumps(report, indent=2), feature=feature)
+        return True, report
+
+    manifest_entries = _dag_manifest_path_entries(roots)
+    expected_entries = manifest_entries.get("expected_files", [])
+    forbidden_entries = manifest_entries.get("forbidden_files", [])
+    task_spec_problems: list[dict[str, Any]] = []
+    dag_task_results: list[ImplementationResult] = []
+    dag_task_problems: list[dict[str, Any]] = []
+
+    for task in group_tasks:
+        task_spec_problems.extend([
+            problem for problem in _dag_task_spec_path_problems(
+                task,
+                roots,
+                forbidden_entries,
+                expected_entries,
+                feature_root=feature_root,
+                alias_map=alias_map,
+            )
+            if str(problem.get("reason", "")).startswith("worktree_alias")
+        ])
+    source_artifact_problems = [
+        problem for problem in _dag_task_bearing_source_artifact_path_problems(
+            runner,
+            feature,
+            group_idx,
+            group_tasks,
+            roots,
+            forbidden_entries,
+            expected_entries,
+            feature_root=feature_root,
+            alias_map=alias_map,
+        )
+        if str(problem.get("reason", "")).startswith("worktree_alias")
+    ]
+    report["source_artifact_problems"] = source_artifact_problems
+    for task in group_tasks:
+        parent_record = await _dag_artifact_record_for_key(
+            runner,
+            feature,
+            f"dag-task:{task.id}",
+        )
+        if parent_record is None or not parent_record.get("value"):
+            continue
+        try:
+            result = ImplementationResult.model_validate_json(
+                str(parent_record.get("value", "")),
+            )
+        except Exception:
+            continue
+        dag_task_results.append(result)
+        dag_task_problems.extend([
+            problem for problem in _dag_result_path_problems(
+                result,
+                roots,
+                forbidden_entries,
+                expected_entries,
+                feature_root=feature_root,
+                alias_map=alias_map,
+            )
+            if str(problem.get("reason", "")).startswith("worktree_alias")
+        ])
+
+    report["task_spec_problems"] = task_spec_problems
+    report["dag_task_problems_before"] = dag_task_problems
+    if task_spec_problems or source_artifact_problems or dag_task_problems:
+        report["deleted_generated_snapshots"] = _dag_delete_stale_generated_snapshots(
+            runner,
+            feature,
+            group_idx,
+            [*task_spec_problems, *source_artifact_problems, *dag_task_problems],
+        )
+    if task_spec_problems:
+        task_spec_repairs = _rewrite_worktree_alias_task_specs_in_place(
+            group_tasks,
+            roots,
+            feature_root,
+            alias_map,
+        )
+        report["task_spec_repairs"] = task_spec_repairs
+        if task_spec_repairs:
+            task_spec_problems = []
+            for task in group_tasks:
+                task_spec_problems.extend([
+                    problem for problem in _dag_task_spec_path_problems(
+                        task,
+                        roots,
+                        forbidden_entries,
+                        expected_entries,
+                        feature_root=feature_root,
+                        alias_map=alias_map,
+                    )
+                    if str(problem.get("reason", "")).startswith("worktree_alias")
+                ])
+            report["task_spec_problems_after"] = task_spec_problems
+
+    non_reconcilable_dag_task_problems = [
+        problem for problem in dag_task_problems
+        if problem.get("repair_route") != "artifact_only"
+        or bool(problem.get("worktree_alias_divergent"))
+    ]
+    reconcilable_dag_task_problems = [
+        problem for problem in dag_task_problems
+        if problem not in non_reconcilable_dag_task_problems
+    ]
+    report["non_reconcilable_dag_task_problems"] = non_reconcilable_dag_task_problems
+    if reconcilable_dag_task_problems and not non_reconcilable_dag_task_problems:
+        reconcile = await _reconcile_dag_task_results(
+            runner,
+            feature,
+            group_idx,
+            "worktree-alias-pre-dispatch",
+            group_tasks,
+            results=[],
+            verify_results_context=dag_task_results,
+            all_results=[],
+            repair_results=[],
+            feature_root=feature_root,
+        )
+        report["reconcile_report"] = reconcile.report
+
+    if task_spec_problems or source_artifact_problems or dag_task_problems:
+        remaining: list[dict[str, Any]] = [
+            *task_spec_problems,
+            *source_artifact_problems,
+            *non_reconcilable_dag_task_problems,
+        ]
+        for task in group_tasks:
+            parent_record = await _dag_artifact_record_for_key(
+                runner,
+                feature,
+                f"dag-task:{task.id}",
+            )
+            if parent_record is None or not parent_record.get("value"):
+                continue
+            try:
+                latest = ImplementationResult.model_validate_json(
+                    str(parent_record.get("value", "")),
+                )
+            except Exception:
+                continue
+            remaining.extend([
+                problem for problem in _dag_result_path_problems(
+                    latest,
+                    roots,
+                    forbidden_entries,
+                    expected_entries,
+                    feature_root=feature_root,
+                    alias_map=alias_map,
+                )
+                if str(problem.get("reason", "")).startswith("worktree_alias")
+            ])
+        report["dag_task_problems_after"] = [
+            problem for problem in remaining
+            if str(problem.get("reason", "")) == "worktree_alias_path"
+        ]
+        if remaining:
+            report["approved"] = False
+            report["recommended_action"] = (
+                "workflow deterministic alias reconcile / focused canonical repair"
+            )
+            report["blocker_count"] = len(remaining)
+            report["blockers"] = remaining[:20]
+
+    await runner.artifacts.put(artifact_key, json.dumps(report, indent=2), feature=feature)
+    if not report["approved"]:
+        await _log_feature_event(
+            runner,
+            feature.id,
+            "dag_worktree_alias_preflight_failed",
+            "implementation",
+            content=f"group {group_idx}",
+            metadata={
+                "group_idx": group_idx,
+                "blocker_count": report.get("blocker_count", 0),
+                "operator_required": False,
+            },
+        )
+    return bool(report["approved"]), report
 
 
 def _dedupe_task_field(
@@ -10899,6 +27936,12 @@ async def _run_dag_group_preflight(
 
     roots = _dag_candidate_file_roots(feature_root)
     if roots:
+        alias_map = await _worktree_alias_map_for_group(
+            runner,
+            feature,
+            group_idx,
+            feature_root,
+        )
         hygiene_problems = _dag_repo_hygiene_problems(feature_root)
         path_problems.extend(hygiene_problems)
         for problem in hygiene_problems:
@@ -10965,6 +28008,8 @@ async def _run_dag_group_preflight(
                 roots,
                 forbidden_entries,
                 expected_entries,
+                feature_root=feature_root,
+                alias_map=alias_map,
             )
             path_problems.extend(task_spec_problems)
             for problem in task_spec_problems:
@@ -10982,6 +28027,20 @@ async def _run_dag_group_preflight(
                         if problem.get("source_artifact_ref") else []
                     ),
                 ]
+                if str(problem.get("reason", "")).startswith("worktree_alias"):
+                    concerns.append(Issue(
+                        severity="major",
+                        description=(
+                            f"{task.id} task spec {field} references a "
+                            "non-canonical worktree alias path; source artifacts: "
+                            f"{', '.join(source_refs)}; canonical path: "
+                            f"{problem.get('canonical_path', '')}; repair the "
+                            "DAG/source artifact or port product work before "
+                            f"normal implementation dispatch: {path}"
+                        ),
+                        file=str(problem.get("canonical_path") or path),
+                    ))
+                    continue
                 concerns.append(Issue(
                     severity="major",
                     description=(
@@ -11001,6 +28060,8 @@ async def _run_dag_group_preflight(
             roots,
             forbidden_entries,
             expected_entries,
+            feature_root=feature_root,
+            alias_map=alias_map,
         )
         path_problems.extend(source_artifact_problems)
         for problem in source_artifact_problems:
@@ -11013,6 +28074,19 @@ async def _run_dag_group_preflight(
                 if problem.get("repair_route") == "product_cleanup_required"
                 else ""
             )
+            if str(problem.get("reason", "")).startswith("worktree_alias"):
+                concerns.append(Issue(
+                    severity="major",
+                    description=(
+                        "DAG source artifact task spec metadata references a "
+                        "non-canonical worktree alias path; source artifact: "
+                        f"{source_ref or source_path}; field {field}; canonical "
+                        f"path: {problem.get('canonical_path', '')}; repair the "
+                        f"DAG/source artifact before normal dispatch: {path}"
+                    ),
+                    file=str(problem.get("canonical_path") or path),
+                ))
+                continue
             concerns.append(Issue(
                 severity="major",
                 description=(
@@ -11039,6 +28113,8 @@ async def _run_dag_group_preflight(
                 roots,
                 forbidden_entries,
                 expected_entries,
+                feature_root=feature_root,
+                alias_map=alias_map,
             )
             path_problems.extend(result_problems)
             for problem in result_problems:
@@ -11057,6 +28133,32 @@ async def _run_dag_group_preflight(
                             f"source artifact: dag-task:{result.task_id}; "
                             "repair stale task metadata instead of creating "
                             f"this path: {path}"
+                        ),
+                        file=path,
+                    ))
+                elif problem["reason"] == "worktree_alias_path":
+                    concerns.append(Issue(
+                        severity="major",
+                        description=(
+                            f"{result.task_id} reports a non-canonical worktree "
+                            f"alias path; source artifact: dag-task:{result.task_id}; "
+                            f"alias path: {path}; canonical path: "
+                            f"{problem.get('canonical_path', '')}. Workflow must "
+                            "reconcile metadata or port product work to the canonical "
+                            "repo before verifier/RCA context is generated."
+                        ),
+                        file=str(problem.get("canonical_path") or path),
+                    ))
+                elif problem["reason"] == "outside_root":
+                    concerns.append(Issue(
+                        severity="major",
+                        description=(
+                            f"{result.task_id} reports an absolute outside-root "
+                            f"or otherwise non-canonical result path; source "
+                            f"artifact: dag-task:{result.task_id}; path: {path}. "
+                            "Repair DAG task metadata to a feature-workspace "
+                            "relative product path before verifier/RCA context "
+                            "is generated."
                         ),
                         file=path,
                     ))
@@ -11084,12 +28186,13 @@ async def _run_dag_group_preflight(
     artifact_key = f"dag-repair-preflight:g{group_idx}:retry-{retry_label}"
     await runner.artifacts.put(
         artifact_key,
-        json.dumps({
-            "group_idx": group_idx,
-            "retry": retry_label,
-            "repair_enabled": repair_enabled,
-            "approved": not concerns,
-            "concerns": [issue.model_dump(mode="json") for issue in concerns],
+            json.dumps({
+                "group_idx": group_idx,
+                "retry": retry_label,
+                "repair_enabled": repair_enabled,
+                "approved": not concerns,
+                "alias_map": alias_map if roots else {},
+                "concerns": [issue.model_dump(mode="json") for issue in concerns],
             "warnings": warnings,
             "repairs": repairs,
             "path_problems": path_problems,
@@ -11209,6 +28312,7 @@ def _dag_deterministic_artifact_only_path_problems(
         "forbidden_task_result",
         "forbidden_task_spec",
         "forbidden_task_spec_source_artifact",
+        "outside_root",
     }
     artifact_only: list[dict[str, Any]] = []
     for problem in problems:
@@ -11338,11 +28442,9 @@ def _deterministic_dag_artifact_repair_group(
     )
 
 
-def _dag_authority_preflight_key(
-    group_idx: int,
-    retry_label: str,
-) -> str:
-    return f"dag-repair-preflight:g{group_idx}:retry-{retry_label}"
+# `_dag_authority_preflight_key` is shimmed from `..execution.gates`
+# (Slice 11f -- see the Slice-11f shim re-export block at the head of this
+# module).
 
 
 async def _dag_authority_load_preflight_report(
@@ -11367,49 +28469,9 @@ async def _dag_authority_load_preflight_report(
     return key, payload if isinstance(payload, dict) else {}
 
 
-def _dag_authority_path_problem_route(
-    problems: list[dict[str, Any]],
-    artifact_only: list[dict[str, Any]],
-) -> tuple[str, str]:
-    if not problems:
-        return _DAG_AUTHORITY_SEMANTIC_ROUTE, "no_path_problems"
-    if any(
-        str(problem.get("reason", "")) in {"embedded_git", "gitlink", "parked_fallback"}
-        for problem in problems
-    ):
-        return _DAG_AUTHORITY_REPO_BLOCKER_ROUTE, "repo_hygiene_path_problem"
-    if any(
-        str(problem.get("repair_route", "")) == "product_cleanup_required"
-        or bool(problem.get("exists_on_disk"))
-        or bool(problem.get("tracked_or_staged"))
-        or str(problem.get("git_state", "")) in {
-            "clean_tracked",
-            "unstaged_delete",
-            "staged_add",
-            "untracked",
-        }
-        for problem in problems
-    ):
-        return _DAG_AUTHORITY_PRODUCT_WORKSPACE_ROUTE, (
-            "path_problem_requires_product_workspace_cleanup"
-        )
-    if not artifact_only:
-        return _DAG_AUTHORITY_SEMANTIC_ROUTE, "no_deterministic_artifact_only_problem"
-    if any(
-        str(problem.get("reason", "")) in {
-            "forbidden_task_spec",
-            "forbidden_task_spec_source_artifact",
-        }
-        for problem in artifact_only
-    ):
-        return _DAG_AUTHORITY_TASK_SPEC_PROJECTION_ROUTE, "task_spec_projection_drift"
-    if any(
-        str(problem.get("source_artifact_ref", "")).strip()
-        and not str(problem.get("artifact_key", "")).startswith("dag-task:")
-        for problem in artifact_only
-    ):
-        return _DAG_AUTHORITY_SOURCE_ARTIFACT_ROUTE, "source_artifact_drift"
-    return _DAG_AUTHORITY_DB_TASK_RESULT_ROUTE, "db_task_result_drift"
+# `_dag_authority_path_problem_route` is shimmed from
+# `..execution.gates` (Slice 11f -- see the Slice-11f shim re-export
+# block at the head of this module).
 
 
 def _dag_authority_task_refs_from_path_problems(
@@ -11439,36 +28501,9 @@ async def _dag_authority_latest_records(
     }
 
 
-def _dag_authority_blocked_verdict(
-    group_idx: int,
-    retry: int,
-    *,
-    route: str,
-    reason: str,
-    target_refs: list[str],
-    detail: str,
-) -> Verdict:
-    refs = ", ".join(target_refs) if target_refs else "(none)"
-    return Verdict(
-        approved=False,
-        summary=(
-            f"Group {group_idx} authority gate blocked retry {retry}: "
-            f"{route} did not produce a valid authoritative repair."
-        ),
-        concerns=[
-            Issue(
-                severity="blocker",
-                description=(
-                    "DAG authority gate blocked broad repair. "
-                    f"Route: {route}; reason: {reason}; target refs: {refs}. "
-                    f"{detail}"
-                ),
-            )
-        ],
-        suggestions=[
-            "Repair the authoritative DAG/task artifact state, then retry verification.",
-        ],
-    )
+# `_dag_authority_blocked_verdict` is shimmed from `..execution.gates`
+# (Slice 11f -- see the Slice-11f shim re-export block at the head of this
+# module).
 
 
 async def _record_dag_authority_gate(
@@ -11485,22 +28520,9 @@ async def _record_dag_authority_gate(
     )
 
 
-def _dag_authority_synthetic_result(
-    group_idx: int,
-    retry: int,
-    report: dict[str, Any],
-) -> ImplementationResult:
-    return ImplementationResult(
-        task_id=f"DAG-AUTHORITY-REPAIR-g{group_idx}-r{retry}",
-        summary=(
-            "DAG authority gate repaired deterministic workflow metadata "
-            f"via {report.get('status', 'unknown')}."
-        ),
-        status="completed",
-        files_created=[],
-        files_modified=[],
-        notes=json.dumps(report, indent=2),
-    )
+# `_dag_authority_synthetic_result` is shimmed from `..execution.gates`
+# (Slice 11f -- see the Slice-11f shim re-export block at the head of this
+# module).
 
 
 def _dag_authority_applied_dag_task_updates(
@@ -11522,6 +28544,11 @@ def _dag_authority_applied_dag_task_updates(
         and item.get("artifact_kind") == "dag_task"
         and _is_dag_task_artifact_key(str(item.get("artifact_key", "")))
     ]
+
+
+# `_dag_authority_reconcile_target_coverage` is shimmed from
+# `..execution.gates` (Slice 11f -- see the Slice-11f shim re-export
+# block at the head of this module).
 
 
 async def _attempt_dag_authority_gate_repair(
@@ -11574,6 +28601,7 @@ async def _attempt_dag_authority_gate_repair(
         "latest_records_before": {},
         "latest_records_after": {},
         "reconcile_reports": [],
+        "candidate_resolution": [],
         "artifact_repair": None,
         "post_repair_preflight_key": "",
     }
@@ -11691,6 +28719,9 @@ async def _attempt_dag_authority_gate_repair(
         feature_root=feature_root,
     )
     report["reconcile_reports"].append(reconcile.report)
+    report["candidate_resolution"].extend(
+        reconcile.report.get("candidate_resolution", [])
+    )
     reconcile_label = f"{retry}-authority-reconcile"
     post_reconcile = await _run_dag_group_preflight(
         runner,
@@ -11824,7 +28855,46 @@ async def _attempt_dag_authority_gate_repair(
         feature_root=feature_root,
     )
     report["reconcile_reports"].append(after_reconcile.report)
+    report["candidate_resolution"].extend(
+        after_reconcile.report.get("candidate_resolution", [])
+    )
     after_label = f"{retry}-authority-artifact"
+    target_coverage = _dag_authority_reconcile_target_coverage(
+        after_reconcile.report,
+        target_refs,
+    )
+    report["post_artifact_target_coverage"] = target_coverage
+    report["latest_records_after"] = await _dag_authority_latest_records(
+        runner,
+        feature,
+        target_refs,
+    )
+    if not target_coverage["complete"]:
+        blocked = _dag_authority_blocked_verdict(
+            group_idx,
+            retry,
+            route=route,
+            reason="partial_authority_repair",
+            target_refs=target_refs,
+            detail=(
+                "Authority repair did not produce valid latest dag-task rows "
+                "for every target ref. Missing refs: "
+                f"{', '.join(target_coverage['missing_refs']) or '(none)'}. "
+                "See post_artifact_target_coverage and candidate_resolution "
+                "for rejected candidates and nearest valid alternatives."
+            ),
+        )
+        report["status"] = "blocked_partial_authority_repair"
+        report["blocked_verdict"] = blocked.model_dump(mode="json")
+        await _record_dag_authority_gate(runner, feature, group_idx, retry, report)
+        return DagAuthorityGateOutcome(
+            route=route,
+            status=report["status"],
+            reason="partial_authority_repair",
+            blocked_verdict=blocked,
+            report=report,
+        )
+
     post_artifact = await _run_dag_group_preflight(
         runner,
         feature,
@@ -11838,11 +28908,6 @@ async def _attempt_dag_authority_gate_repair(
     report["post_repair_preflight_key"] = _dag_authority_preflight_key(
         group_idx,
         after_label,
-    )
-    report["latest_records_after"] = await _dag_authority_latest_records(
-        runner,
-        feature,
-        target_refs,
     )
     if post_artifact is None:
         report["status"] = "repaired_by_artifact_repair"
@@ -11878,16 +28943,8 @@ async def _attempt_dag_authority_gate_repair(
     )
 
 
-def _prefix_lens_issue(spec: DagVerifyLensSpec, issue: Issue) -> Issue:
-    return issue.model_copy(update={
-        "description": f"[{spec.label} Lens] {issue.description}",
-    })
-
-
-def _prefix_lens_gap(spec: DagVerifyLensSpec, gap: Gap) -> Gap:
-    return gap.model_copy(update={
-        "description": f"[{spec.label} Lens] {gap.description}",
-    })
+# `_prefix_lens_issue`, `_prefix_lens_gap` are shimmed from
+# `..execution.verification` (Slice 11g).
 
 
 def _merge_dag_expanded_verify_verdicts(
@@ -11975,7 +29032,7 @@ async def _run_expanded_dag_verify_lenses(
     runner: WorkflowRunner,
     feature: Feature,
     group_idx: int,
-    retry: int,
+    retry: int | str,
     base_verdict: Verdict,
     results: list[object],
     files: list[str],
@@ -11983,13 +29040,19 @@ async def _run_expanded_dag_verify_lenses(
     *,
     runtime: str | None = None,
     feature_root: Path | None = None,
+    projection_key: str | None = None,
+    dag_sha256: str = "",
+    record_graph: bool = True,
+    lens_collector: list[tuple[object, Verdict]] | None = None,
+    lens_failure_collector: list[dict[str, Any]] | None = None,
 ) -> Verdict:
+    retry_label = str(retry)
     if not _dag_expanded_verify_enabled():
         logger.info(
-            "DAG expanded verify disabled by %s=0 for group=%d retry=%d",
+            "DAG expanded verify disabled by %s=0 for group=%d retry=%s",
             DAG_EXPANDED_VERIFY_ENV,
             group_idx,
-            retry,
+            retry_label,
         )
         return base_verdict
 
@@ -11999,10 +29062,10 @@ async def _run_expanded_dag_verify_lenses(
         feature.id,
         "dag_expanded_verify_start",
         "implementation",
-        content=f"g{group_idx}:retry-{retry}",
+        content=f"g{group_idx}:retry-{retry_label}",
         metadata={
             "group_idx": group_idx,
-            "retry": retry,
+            "retry": retry_label,
             "lens_slugs": [spec.slug for spec in specs],
             "runtime": runtime,
         },
@@ -12019,8 +29082,8 @@ async def _run_expanded_dag_verify_lenses(
     context = await _build_prompt_context_package(
         runner,
         feature,
-        title=f"Expanded DAG Verify — Group {group_idx} Retry {retry}",
-        file_stem=f"g{group_idx}-expanded-verify-r{retry}",
+        title=f"Expanded DAG Verify — Group {group_idx} Retry {retry_label}",
+        file_stem=f"g{group_idx}-expanded-verify-r{retry_label}",
         intro_lines=[
             "Run read-only DAG verification lenses after the normal group verifier failed.",
             "The normal verifier remains authoritative; lenses broaden discovery before RCA/fix.",
@@ -12036,11 +29099,11 @@ async def _run_expanded_dag_verify_lenses(
     context_prompt = _context_package_prompt(context)
 
     async def _run_lens(spec: DagVerifyLensSpec) -> tuple[DagVerifyLensSpec, Verdict | None, str | None]:
-        artifact_key = f"dag-repair-lens:g{group_idx}:{spec.slug}:retry-{retry}"
+        artifact_key = f"dag-repair-lens:g{group_idx}:{spec.slug}:retry-{retry_label}"
         lens_runtime = _dag_repair_runtime_for(f"lens:{spec.slug}", runtime)
         actor = _make_parallel_actor(
             spec.actor,
-            f"dag-lens-g{group_idx}-r{retry}-{spec.slug}",
+            f"dag-lens-g{group_idx}-r{retry_label}-{spec.slug}",
             runtime=lens_runtime,
             workspace_path=str(feature_root) if feature_root else None,
         )
@@ -12082,9 +29145,9 @@ async def _run_expanded_dag_verify_lenses(
             return spec, verdict, None
         except Exception as exc:
             logger.warning(
-                "DAG expanded verify lens failed group=%d retry=%d lens=%s: %s",
+                "DAG expanded verify lens failed group=%d retry=%s lens=%s: %s",
                 group_idx,
-                retry,
+                retry_label,
                 spec.slug,
                 exc,
             )
@@ -12103,6 +29166,8 @@ async def _run_expanded_dag_verify_lenses(
 
     gathered = await _asyncio.gather(*[_run_lens(spec) for spec in specs])
     successful = [(spec, verdict) for spec, verdict, _err in gathered if verdict is not None]
+    if lens_collector is not None:
+        lens_collector.extend(successful)
     failures = [
         {
             "lens": spec.slug,
@@ -12113,12 +29178,26 @@ async def _run_expanded_dag_verify_lenses(
         for spec, verdict, err in gathered
         if verdict is None and err
     ]
+    if lens_failure_collector is not None:
+        lens_failure_collector.extend(failures)
     merged = _merge_dag_expanded_verify_verdicts(base_verdict, successful)
+    if record_graph:
+        await _record_dag_verification_graph_artifact(
+            runner,
+            feature,
+            group_idx,
+            projection_key or f"dag-verify:g{group_idx}:retry-{retry_label}",
+            merged,
+            dag_sha256=dag_sha256,
+            lens_verdicts=successful,
+            required_lens_slugs=[spec.slug for spec in specs],
+            lens_failures=failures,
+        )
     await runner.artifacts.put(
-        f"dag-repair-expanded-verify:g{group_idx}:retry-{retry}",
+        f"dag-repair-expanded-verify:g{group_idx}:retry-{retry_label}",
         json.dumps({
             "group_idx": group_idx,
-            "retry": retry,
+            "retry": retry_label,
             "enabled": True,
             "normal_approved": _is_approved(base_verdict),
             "merged_approved": _is_approved(merged),
@@ -12138,10 +29217,10 @@ async def _run_expanded_dag_verify_lenses(
         feature=feature,
     )
     logger.info(
-        "DAG expanded verify completed group=%d retry=%d successful_lenses=%d "
+        "DAG expanded verify completed group=%d retry=%s successful_lenses=%d "
         "failed_lenses=%d merged_concerns=%d merged_gaps=%d",
         group_idx,
-        retry,
+        retry_label,
         len(successful),
         len(failures),
         len(merged.concerns),
@@ -12152,10 +29231,10 @@ async def _run_expanded_dag_verify_lenses(
         feature.id,
         "dag_expanded_verify_finish",
         "implementation",
-        content=f"g{group_idx}:retry-{retry}",
+        content=f"g{group_idx}:retry-{retry_label}",
         metadata={
             "group_idx": group_idx,
-            "retry": retry,
+            "retry": retry_label,
             "successful_lenses": [spec.slug for spec, _verdict in successful],
             "failed_lenses": [item["lens"] for item in failures],
             "concern_count": len(merged.concerns),
@@ -12166,12 +29245,25 @@ async def _run_expanded_dag_verify_lenses(
 
 
 def _discover_repo_roots_under(repos_root: Path) -> list[Path]:
+    if _workflow_repos_root_guard_problems(repos_root):
+        return []
+    allowed_metadata_roots = _git_worktree_metadata_roots_for_repos_root(repos_root)
     repos: list[Path] = []
     for git_dir in repos_root.rglob(".git"):
         repo_dir = git_dir.parent
         if repo_dir == repos_root:
             continue
-        if not git_dir.exists():
+        if (
+            not git_dir.exists()
+            or git_dir.is_symlink()
+            or (
+                not git_dir.is_dir()
+                and not _is_git_worktree_file(
+                    git_dir,
+                    allowed_metadata_roots=allowed_metadata_roots,
+                )
+            )
+        ):
             continue
         repos.append(repo_dir)
     return sorted(set(repos))
@@ -12231,7 +29323,10 @@ async def _plan_bug_groups(
     """Plan multi-issue bug work without mutating the codebase."""
     attempt_number = sum(1 for a in prior_attempts if a.source_verdict == source) + 1
     feature_root = repos_root or _get_feature_root(runner, feature)
-    prior_context = _format_prior_attempts(prior_attempts, context_base=feature_root)
+    prior_context = _format_prior_attempts(
+        prior_attempts,
+        context_base=_prompt_offload_context_base(runner, feature),
+    )
     workspace_hint = (
         f"\n\n### Workspace\nFeature repos at: `{feature_root}`\n"
         if feature_root else ""
@@ -12428,6 +29523,9 @@ async def _attempt_parallel_dag_repair(
     rca_runtime: str | None,
     feedback: str,
     fix_context: str = "",
+    dag_sha256: str = "",
+    contracts_by_task_id: dict[str, Any] | None = None,
+    workspace_snapshots: list[Any] | None = None,
 ) -> list[ImplementationResult] | None:
     """Try the faster DAG repair path: triage, parallel RCA, scheduled fixes.
 
@@ -12443,6 +29541,12 @@ async def _attempt_parallel_dag_repair(
     dag_rca_runtime = _dag_repair_runtime_for("dag-rca", rca_runtime)
     dag_fix_runtime = _dag_repair_runtime_for("dag-fix", impl_runtime)
     dag_reverify_runtime = _dag_repair_runtime_for("dag-focused-reverify", rca_runtime)
+    workspace_root = (
+        feature_root.parents[3]
+        if feature_root is not None and len(feature_root.parents) >= 4
+        else None
+    )
+    workspace_snapshots = list(workspace_snapshots or [])
 
     def _dag_actor_factory(base: AgentActor, suffix: str) -> AgentActor:
         role = "dag-triage" if suffix == "triage" else "dag-rca"
@@ -12472,7 +29576,40 @@ async def _attempt_parallel_dag_repair(
             retry,
             exc,
         )
-        return None
+        failure = _workflow_blocker_text(
+            "Parallel DAG repair triage/RCA runtime failed before product "
+            f"repair dispatch; runtime={dag_rca_runtime or '<default>'} "
+            f"group={group_idx} retry={retry}: {exc}"
+        )
+        await runner.artifacts.put(
+            f"dag-runtime-failure:g{group_idx}:parallel-rca-retry-{retry}",
+            json.dumps(
+                {
+                    **_typed_runtime_provider_route_payload(
+                        group_idx=group_idx,
+                        retry=retry,
+                        runtime=dag_rca_runtime,
+                        error=exc,
+                        context="dag-parallel-rca",
+                        source=source,
+                    ),
+                    "blocked_before_product_repair": True,
+                },
+                sort_keys=True,
+            ),
+            feature=feature,
+        )
+        return [
+            ImplementationResult(
+                task_id=f"g{group_idx}-parallel-rca-runtime",
+                summary=failure,
+                status="blocked",
+                notes=(
+                    "Typed runtime provider blocker recorded before normal "
+                    "parallel repair dispatch."
+                ),
+            )
+        ]
 
     await runner.artifacts.put(
         f"dag-repair-triage:g{group_idx}:retry-{retry}",
@@ -12717,55 +29854,25 @@ async def _attempt_parallel_dag_repair(
                 dag_rca_runtime,
             )
             for planned in dispatch.contradiction_groups:
-                try:
-                    resolution = await _resolve_dag_contradiction(
-                        runner,
-                        feature,
-                        group_idx,
-                        retry,
-                        planned,
-                        group_tasks=group_tasks,
-                        feature_root=feature_root,
-                        runtime=resolver_runtime,
-                        feedback=feedback,
-                    )
-                except Exception as exc:
-                    logger.warning(
-                        "DAG contradiction resolver failed group=%d retry=%d "
-                        "bug_group=%s: %s",
-                        group_idx,
-                        retry,
-                        planned.group.group_id,
-                        exc,
-                    )
-                    resolution = None
-                validation = _validate_dag_contradiction_resolution(
-                    resolution,
-                    planned=planned,
-                )
-                if validation.resolution is None:
-                    rejection = await _persist_dag_contradiction_rejection(
-                        runner,
-                        feature,
-                        group_idx,
-                        retry,
-                        planned,
-                        resolution,
-                        validation.rejection_reasons,
-                    )
-                    rejected_contradictions.append(rejection)
-                    human_needed_contradictions.append(planned.group.group_id)
-                    quarantined_contradiction_groups.append(planned)
-                    continue
-                resolution = validation.resolution
-                record = await _persist_dag_contradiction_resolution(
+                handoff = await _resolve_or_recover_dag_contradiction(
                     runner,
                     feature,
                     group_idx,
                     retry,
                     planned,
-                    resolution,
+                    group_tasks=group_tasks,
+                    feature_root=feature_root,
+                    runtime=resolver_runtime,
+                    feedback=feedback,
                 )
+                if handoff.resolution is None:
+                    if handoff.rejection_record is not None:
+                        rejected_contradictions.append(handoff.rejection_record)
+                    human_needed_contradictions.append(planned.group.group_id)
+                    quarantined_contradiction_groups.append(planned)
+                    continue
+                resolution = handoff.resolution
+                record = handoff.resolution_record or {}
                 resolved_contradictions.append(record)
                 if _dag_contradiction_needs_artifact_repair(resolution):
                     _artifact_result, synthetic_result, artifact_record = (
@@ -12791,7 +29898,7 @@ async def _attempt_parallel_dag_repair(
                     )
                     artifact_repair_records.append(artifact_record)
                     decision_results.append(synthetic_result)
-                elif _dag_contradiction_needs_fix(resolution):
+                if _dag_contradiction_needs_fix(resolution):
                     guidance = _dag_contradiction_fix_guidance(resolution)
                     resolved_rca = planned.rca.model_copy(
                         update={
@@ -12810,7 +29917,7 @@ async def _attempt_parallel_dag_repair(
                         issue_text=planned.issue_text,
                         rca_key=planned.rca_key,
                     ))
-                else:
+                elif not _dag_contradiction_needs_artifact_repair(resolution):
                     decision_results.append(_dag_contradiction_synthetic_result(
                         group_idx,
                         retry,
@@ -12953,24 +30060,61 @@ async def _attempt_parallel_dag_repair(
     group_by_id = {item.group.group_id: item for item in fixable_groups}
     fix_results: dict[str, ImplementationResult] = {}
     task_specs = _format_dag_group_task_specs(group_tasks)
-    contradiction_context = await _format_contradiction_decisions_context(
-        runner, feature,
-    )
     for round_idx, round_ids in enumerate(schedule):
-        fix_tasks: list[Ask] = []
+        fix_tasks: list[tuple[Ask, RuntimeSandboxTaskBinding | None]] = []
         runnable_ids: list[str] = []
         for gid in round_ids:
             planned = group_by_id.get(gid)
             if planned is None:
                 continue
             ws_path = _resolve_fix_workspace(feature_root, planned.rca.affected_files)
+            try:
+                repair_binding = await _bind_repair_sandbox(
+                    runner,
+                    feature,
+                    workspace_root=workspace_root,
+                    feature_root=feature_root,
+                    dag_sha256=dag_sha256,
+                    group_idx=group_idx,
+                    retry=retry,
+                    repair_idx=len(fix_tasks),
+                    repair_id=f"DAG-REPAIR-g{group_idx}-r{retry}-{gid}",
+                    group_tasks=group_tasks,
+                    contracts_by_task_id=contracts_by_task_id,
+                    ws_path=ws_path,
+                    snapshots=workspace_snapshots,
+                    runtime=dag_fix_runtime,
+                )
+            except SandboxWorkflowBlocker as exc:
+                return [
+                    ImplementationResult(
+                        task_id=f"DAG-REPAIR-g{group_idx}-r{retry}-{_safe_context_stem(gid)}",
+                        status="blocked",
+                        summary=str(exc),
+                        notes=repr(exc),
+                    )
+                ]
+            repair_workspace = (
+                str(repair_binding.binding.cwd)
+                if repair_binding is not None
+                else ws_path
+            )
             workspace_ctx = (
                 f"\n\n## Workspace\n"
-                f"Your working directory is: `{ws_path}`\n"
+                f"Your working directory is: `{repair_workspace}`\n"
                 f"All file reads and writes MUST use paths within this directory.\n"
                 f"Do NOT use absolute paths from search results that point to "
                 f"other copies of the same repo.\n"
-            ) if ws_path else ""
+            ) if repair_workspace else ""
+            contradiction_context = await _format_contradiction_decisions_context(
+                runner,
+                feature,
+                group_idx=group_idx,
+                retry=retry,
+                group_tasks=group_tasks,
+                context_text=f"{planned.issue_text}\n\n{to_str(planned.rca)}\n\n{feedback}",
+                file_stem=f"g{group_idx}-parallel-fix-r{retry}-{gid}",
+            )
             context_package = await _build_prompt_context_package(
                 runner,
                 feature,
@@ -13004,22 +30148,29 @@ async def _attempt_parallel_dag_repair(
                     ),
                 ],
             )
-            fix_tasks.append(Ask(
-                actor=_make_parallel_actor(
-                    implementer,
-                    f"dag-g{group_idx}-r{retry}-fix-{gid}",
-                    runtime=dag_fix_runtime,
-                    workspace_path=ws_path,
+            fix_tasks.append((
+                Ask(
+                    actor=_make_parallel_actor(
+                        implementer,
+                        f"dag-g{group_idx}-r{retry}-fix-{gid}",
+                        runtime=dag_fix_runtime,
+                        workspace_path=repair_workspace,
+                        runtime_workspace_binding=(
+                            repair_binding.binding if repair_binding is not None else None
+                        ),
+                        sandbox_required=repair_binding is not None,
+                    ),
+                    prompt=(
+                        f"## DAG Repair Fix: group {gid}\n\n"
+                        f"{_context_package_prompt(context_package)}"
+                        "Apply the RCA's proposed fix precisely. You are not alone in "
+                        "the codebase: do not revert changes made by other agents, and "
+                        "keep the patch scoped to this root-cause group. Report every "
+                        "file you create or modify."
+                    ),
+                    output_type=ImplementationResult,
                 ),
-                prompt=(
-                    f"## DAG Repair Fix: group {gid}\n\n"
-                    f"{_context_package_prompt(context_package)}"
-                    "Apply the RCA's proposed fix precisely. You are not alone in "
-                    "the codebase: do not revert changes made by other agents, and "
-                    "keep the patch scoped to this root-cause group. Report every "
-                    "file you create or modify."
-                ),
-                output_type=ImplementationResult,
+                repair_binding,
             ))
             runnable_ids.append(gid)
 
@@ -13116,10 +30267,37 @@ async def _attempt_parallel_dag_repair(
                     )
                 fix_results[gid] = sanitized_result
         if any(gid in fix_results for gid in runnable_ids):
+            round_guard_results = _contract_guard_results_for_repair(
+                [
+                    fix_results[gid]
+                    for gid in runnable_ids
+                    if gid in fix_results
+                ],
+                contracts_by_task_id,
+            )
+            contract_guard = await _record_precommit_contract_verdicts(
+                runner,
+                feature,
+                dag_sha256=dag_sha256,
+                group_idx=group_idx,
+                stage=f"parallel-retry-{retry}-round-{round_idx}",
+                feature_root=feature_root,
+                contracts_by_task_id=contracts_by_task_id or {},
+                results=round_guard_results,
+            )
+            if not contract_guard.approved:
+                return [
+                    ImplementationResult(
+                        task_id=f"g{group_idx}-parallel-contract-guard-{retry}-{round_idx}",
+                        summary=_workflow_blocker_text(contract_guard.failure),
+                        status="blocked",
+                    )
+                ]
             await _commit_repos(
                 runner,
                 feature,
                 f"fix: DAG group {group_idx} repair round {round_idx}",
+                group_idx=group_idx,
                 failure_key=f"dag-commit-failure:g{group_idx}:retry-{retry}",
                 failure_metadata={
                     "group_idx": group_idx,
@@ -13240,6 +30418,61 @@ async def _attempt_parallel_dag_repair(
     return decision_results + list(fix_results.values())
 
 
+async def _record_bug_rca_runtime_blocker_attempt(
+    runner: WorkflowRunner,
+    feature: Feature,
+    *,
+    source: str,
+    bug_id: str,
+    attempt_number: int,
+    phase_name: str,
+    rca_runtime: str | None,
+    exc: Exception,
+    context: str,
+    verdict_text: str,
+) -> BugFixAttempt:
+    failure = _workflow_blocker_text(
+        "RCA runtime failed before product repair dispatch; "
+        f"runtime={rca_runtime or '<default>'} source={source} "
+        f"bug_id={bug_id} context={context}: {exc}"
+    )
+    blocker_payload = {
+        **_typed_runtime_provider_route_payload(
+            group_idx=-1,
+            retry=attempt_number,
+            runtime=rca_runtime,
+            error=exc,
+            context=context,
+            source=source,
+        ),
+        "bug_id": bug_id,
+        "attempt_number": attempt_number,
+        "phase": phase_name,
+        "context": context,
+        "blocked_before_product_repair": True,
+    }
+    await runner.artifacts.put(
+        f"bug-rca-runtime-failure:{source}:{bug_id}",
+        json.dumps(blocker_payload, sort_keys=True),
+        feature=feature,
+    )
+    await runner.artifacts.put(
+        f"workflow-blocker:bug-rca:{source}:{bug_id}",
+        json.dumps(blocker_payload, sort_keys=True),
+        feature=feature,
+    )
+    return BugFixAttempt(
+        bug_id=bug_id,
+        source_verdict=source,
+        description=verdict_text,
+        root_cause="RCA runtime failed before root cause analysis completed.",
+        fix_applied=failure,
+        files_modified=[],
+        re_verify_result="FAIL",
+        attempt_number=attempt_number,
+    )
+
+
 async def _diagnose_and_fix(
     runner: WorkflowRunner,
     feature: Feature,
@@ -13267,7 +30500,8 @@ async def _diagnose_and_fix(
 
     # Resolve workspace path for RCA git access
     feature_root = _get_feature_root(runner, feature)
-    prior_context = _format_prior_attempts(prior_attempts, context_base=feature_root)
+    prior_context_base = _prompt_offload_context_base(runner, feature)
+    prior_context = _format_prior_attempts(prior_attempts, context_base=prior_context_base)
     workspace_hint = (
         f"\n\n### Workspace\nFeature repos at: `{feature_root}`\n"
         if feature_root else ""
@@ -13303,22 +30537,38 @@ async def _diagnose_and_fix(
         triage_actor = _make_parallel_actor(
             triage_actor, "triage", runtime=rca_runtime,
         )
-    triage: BugTriage = await runner.run(
-        Ask(
-            actor=triage_actor,
-            prompt=(
-                f"## Verdict from: {source}\n\n"
-                f"### Summary\n{verdict.summary}\n\n"
-                f"### Issues (reference by index)\n{indexed_issues}\n\n"
-                "Group ALL issues by likely root cause. Every index must appear "
-                "in exactly one group. Use issue_indices for [C*] entries and "
-                "gap_indices for [G*] entries."
+    try:
+        triage: BugTriage = await runner.run(
+            Ask(
+                actor=triage_actor,
+                prompt=(
+                    f"## Verdict from: {source}\n\n"
+                    f"### Summary\n{verdict.summary}\n\n"
+                    f"### Issues (reference by index)\n{indexed_issues}\n\n"
+                    "Group ALL issues by likely root cause. Every index must appear "
+                    "in exactly one group. Use issue_indices for [C*] entries and "
+                    "gap_indices for [G*] entries."
+                ),
+                output_type=BugTriage,
             ),
-            output_type=BugTriage,
-        ),
-        feature,
-        phase_name=phase_name,
-    )
+            feature,
+            phase_name=phase_name,
+        )
+    except Exception as exc:
+        return [
+            await _record_bug_rca_runtime_blocker_attempt(
+                runner,
+                feature,
+                source=source,
+                bug_id=f"{source.upper().replace(' ', '-')}-TRIAGE-RUNTIME-{attempt_number}",
+                attempt_number=attempt_number,
+                phase_name=phase_name,
+                rca_runtime=rca_runtime,
+                exc=exc,
+                context="bug-triage",
+                verdict_text=verdict_text,
+            )
+        ]
 
     await runner.artifacts.put(
         f"bug-triage:{source}:attempt-{attempt_number}",
@@ -13369,10 +30619,26 @@ async def _diagnose_and_fix(
         for group in triage.groups
     ]
 
-    if len(rca_tasks) == 1:
-        rca_results = [await runner.run(rca_tasks[0], feature, phase_name=phase_name)]
-    else:
-        rca_results = await runner.parallel(rca_tasks, feature)
+    try:
+        if len(rca_tasks) == 1:
+            rca_results = [await runner.run(rca_tasks[0], feature, phase_name=phase_name)]
+        else:
+            rca_results = await runner.parallel(rca_tasks, feature)
+    except Exception as exc:
+        return [
+            await _record_bug_rca_runtime_blocker_attempt(
+                runner,
+                feature,
+                source=source,
+                bug_id=f"{source.upper().replace(' ', '-')}-RCA-RUNTIME-{attempt_number}",
+                attempt_number=attempt_number,
+                phase_name=phase_name,
+                rca_runtime=rca_runtime,
+                exc=exc,
+                context="bug-rca-parallel",
+                verdict_text=verdict_text,
+            )
+        ]
 
     # Build group_id → RCA mapping
     group_rcas: list[tuple[str, RootCauseAnalysis]] = []
@@ -13520,7 +30786,7 @@ async def _diagnose_and_fix(
     dag_product_cleanup_routes_by_gid: dict[str, dict[str, DagTaskDriftRoute]] = {}
 
     for round_idx, round_ids in enumerate(schedule):
-        fix_tasks = []
+        fix_tasks: list[tuple[Ask, RuntimeSandboxTaskBinding | None]] = []
         fix_task_ids: list[str] = []
         for gid in round_ids:
             rca = rca_by_group[gid]
@@ -13564,46 +30830,83 @@ async def _diagnose_and_fix(
                     artifact_only_fix_ids.add(gid)
                     continue
             ws_path = _resolve_fix_workspace(feature_root, rca.affected_files)
+            try:
+                repair_binding = await _bind_post_dag_product_repair_sandbox(
+                    runner,
+                    feature,
+                    source=source,
+                    attempt_number=attempt_number,
+                    repair_idx=len(fix_tasks),
+                    repair_id=f"{source.upper().replace(' ', '-')}-REPAIR-{gid}",
+                    feature_root=feature_root,
+                    ws_path=ws_path,
+                    affected_files=rca.affected_files,
+                    runtime=rca_runtime,
+                )
+            except SandboxWorkflowBlocker as exc:
+                fix_results[gid] = ImplementationResult(
+                    task_id=f"{source.upper().replace(' ', '-')}-REPAIR-{gid}",
+                    summary=str(exc),
+                    status="blocked",
+                )
+                continue
+            actor_ws_path = (
+                str(repair_binding.binding.cwd)
+                if repair_binding is not None
+                else ws_path
+            )
             ws_ctx = (
                 f"\n\n## Workspace\n"
-                f"Your working directory is: `{ws_path}`\n"
+                f"Your working directory is: `{actor_ws_path}`\n"
                 f"All file reads and writes MUST use paths within this directory.\n"
                 f"Do NOT use absolute paths from search results that point to "
                 f"other copies of the same repo.\n"
-            ) if ws_path else ""
-            fix_tasks.append(Ask(
-                actor=_make_parallel_actor(
-                    fixer, f"fix-{gid}",
-                    workspace_path=ws_path,
+            ) if actor_ws_path else ""
+            fix_tasks.append((
+                Ask(
+                    actor=_make_parallel_actor(
+                        fixer, f"fix-{gid}",
+                        workspace_path=actor_ws_path,
+                        runtime_workspace_binding=(
+                            repair_binding.binding if repair_binding is not None else None
+                        ),
+                        sandbox_required=repair_binding is not None,
+                    ),
+                    prompt=(
+                        f"## Bug Fix: group {gid}\n\n"
+                        f"### Root Cause Analysis\n\n"
+                        f"**Hypothesis:** {rca.hypothesis}\n\n"
+                        f"**Evidence:**\n"
+                        + "\n".join(f"- {e}" for e in rca.evidence)
+                        + f"\n\n**Affected Files:**\n"
+                        + "\n".join(f"- `{f}`" for f in rca.affected_files)
+                        + f"\n\n**Proposed Approach:** {rca.proposed_approach}\n\n"
+                        f"### Issues\n{_extract_group_issues(verdict, group_by_id[gid])}\n\n"
+                        f"{ws_ctx}\n"
+                        f"{_dag_product_cleanup_guidance(dag_product_cleanup_routes_by_gid.get(gid, {}))}\n"
+                        "## Instructions\n"
+                        "1. Read each affected file listed above\n"
+                        "2. Apply the fix described in the RCA — be precise\n"
+                        "3. Fix only what the root cause analysis identified\n"
+                        "4. Report all files modified"
+                        f"{prior_context}"
+                    ),
+                    output_type=ImplementationResult,
                 ),
-                prompt=(
-                    f"## Bug Fix: group {gid}\n\n"
-                    f"### Root Cause Analysis\n\n"
-                    f"**Hypothesis:** {rca.hypothesis}\n\n"
-                    f"**Evidence:**\n"
-                    + "\n".join(f"- {e}" for e in rca.evidence)
-                    + f"\n\n**Affected Files:**\n"
-                    + "\n".join(f"- `{f}`" for f in rca.affected_files)
-                    + f"\n\n**Proposed Approach:** {rca.proposed_approach}\n\n"
-                    f"### Issues\n{_extract_group_issues(verdict, group_by_id[gid])}\n\n"
-                    f"{ws_ctx}\n"
-                    f"{_dag_product_cleanup_guidance(dag_product_cleanup_routes_by_gid.get(gid, {}))}\n"
-                    "## Instructions\n"
-                    "1. Read each affected file listed above\n"
-                    "2. Apply the fix described in the RCA — be precise\n"
-                    "3. Fix only what the root cause analysis identified\n"
-                    "4. Report all files modified"
-                    f"{prior_context}"
-                ),
-                output_type=ImplementationResult,
+                repair_binding,
             ))
             fix_task_ids.append(gid)
 
         if fix_tasks:
-            if len(fix_tasks) == 1:
-                results = [await runner.run(fix_tasks[0], feature, phase_name=phase_name)]
-            else:
-                results = await runner.parallel(fix_tasks, feature)
+            results = await _run_dag_repair_fix_tasks(
+                runner,
+                feature,
+                _post_dag_repair_group_idx(source, attempt_number),
+                attempt_number,
+                round_idx,
+                fix_task_ids,
+                fix_tasks,
+            )
 
             for gid, result in zip(fix_task_ids, results):
                 if isinstance(result, ImplementationResult):
@@ -13624,6 +30927,7 @@ async def _diagnose_and_fix(
         fixed_ids = [
             gid for gid in round_ids
             if gid in fix_results and gid not in artifact_only_fix_ids
+            and fix_results[gid].status != "blocked"
         ]
         if fixed_ids:
             commit_message = f"fix: round {round_idx} — {', '.join(fixed_ids)}"
@@ -13689,10 +30993,34 @@ async def _diagnose_and_fix(
         ))
         del fix_results[gid]
 
+    blocked_workflow_attempts: list[BugFixAttempt] = []
+    for gid in list(fix_results):
+        fix = fix_results[gid]
+        if (
+            gid in artifact_only_fix_ids
+            or fix.status != "blocked"
+            or not _is_workflow_blocker_text(str(fix.summary))
+        ):
+            continue
+        group = group_by_id[gid]
+        blocked_workflow_attempts.append(BugFixAttempt(
+            bug_id=f"{source.upper().replace(' ', '-')}-FAIL-{next(bug_counter)}",
+            group_id=gid,
+            source_verdict=source,
+            description=group.likely_root_cause,
+            root_cause=rca_by_group[gid].hypothesis,
+            fix_applied=fix.summary,
+            files_modified=[],
+            re_verify_result="FAIL",
+            attempt_number=attempt_number,
+        ))
+        del fix_results[gid]
+
     if not fix_results:
         return (
             contradiction_results
             + blocked_artifact_attempts
+            + blocked_workflow_attempts
             + commit_failed_attempts
         )
 
@@ -13779,7 +31107,7 @@ async def _diagnose_and_fix(
                         _format_feedback("Regression", regression_verdict),
                         f"regression:{source}",
                         original_reviewer, fixer,
-                        _format_prior_attempts(prior_attempts, context_base=feature_root),
+                        _format_prior_attempts(prior_attempts, context_base=prior_context_base),
                         bug_id=f"{source.upper()}-REGRESSION-{attempt_number}",
                         attempt_number=attempt_number,
                         handover_context=handover_context,
@@ -13825,8 +31153,48 @@ async def _diagnose_and_fix(
     return (
         contradiction_results
         + blocked_artifact_attempts
+        + blocked_workflow_attempts
         + commit_failed_attempts
         + attempts
+    )
+
+
+async def _bind_post_dag_product_repair_sandbox(
+    runner: WorkflowRunner,
+    feature: Feature,
+    *,
+    source: str,
+    attempt_number: int,
+    repair_idx: int,
+    repair_id: str,
+    feature_root: Path | None,
+    ws_path: str | None,
+    affected_files: list[str],
+    runtime: str | None,
+) -> RuntimeSandboxTaskBinding | None:
+    workspace_root = _workspace_root_for_feature_root(runner, feature_root)
+    repo_id = _repair_repo_id_for_sandbox(
+        [],
+        None,
+        feature_root=feature_root,
+        ws_path=ws_path,
+    )
+    repair_task = _repair_task_for_rca(repair_id, repo_id, affected_files)
+    return await _bind_repair_sandbox(
+        runner,
+        feature,
+        workspace_root=workspace_root,
+        feature_root=feature_root,
+        dag_sha256=await _current_dag_sha256(runner, feature),
+        group_idx=_post_dag_repair_group_idx(source, attempt_number),
+        retry=attempt_number,
+        repair_idx=repair_idx,
+        repair_id=repair_id,
+        group_tasks=[repair_task],
+        contracts_by_task_id=None,
+        ws_path=ws_path,
+        snapshots=[],
+        runtime=runtime,
     )
 
 
@@ -14046,28 +31414,42 @@ async def _single_rca_fix_verify(
     actor_builder = actor_factory or _make_parallel_actor
 
     # 1. Root Cause Analysis
-    rca: RootCauseAnalysis = await runner.run(
-        Ask(
-            actor=actor_builder(
-                root_cause_analyst,
-                f"rca-{bug_id}",
-                runtime=rca_runtime,
-                workspace_path=str(feature_root) if feature_root else None,
+    try:
+        rca: RootCauseAnalysis = await runner.run(
+            Ask(
+                actor=actor_builder(
+                    root_cause_analyst,
+                    f"rca-{bug_id}",
+                    runtime=rca_runtime,
+                    workspace_path=str(feature_root) if feature_root else None,
+                ),
+                prompt=(
+                    f"## Bug Report: {bug_id}\n\n"
+                    f"### Failure Source: {source}\n\n"
+                    f"### Verdict\n\n{verdict_text}\n\n"
+                    "Investigate the root cause of this failure. Read the relevant "
+                    "code, trace the data flow, and identify the exact point of failure. "
+                    "Propose a conceptual fix approach — do NOT implement anything."
+                    f"{prior_context}"
+                ),
+                output_type=RootCauseAnalysis,
             ),
-            prompt=(
-                f"## Bug Report: {bug_id}\n\n"
-                f"### Failure Source: {source}\n\n"
-                f"### Verdict\n\n{verdict_text}\n\n"
-                "Investigate the root cause of this failure. Read the relevant "
-                "code, trace the data flow, and identify the exact point of failure. "
-                "Propose a conceptual fix approach — do NOT implement anything."
-                f"{prior_context}"
-            ),
-            output_type=RootCauseAnalysis,
-        ),
-        feature,
-        phase_name=phase_name,
-    )
+            feature,
+            phase_name=phase_name,
+        )
+    except Exception as exc:
+        return await _record_bug_rca_runtime_blocker_attempt(
+            runner,
+            feature,
+            source=source,
+            bug_id=bug_id,
+            attempt_number=attempt_number,
+            phase_name=phase_name,
+            rca_runtime=rca_runtime,
+            exc=exc,
+            context="bug-rca",
+            verdict_text=verdict_text,
+        )
     await runner.artifacts.put(
         f"bug-rca:{source}:{bug_id}",
         to_str(rca),
@@ -14127,37 +31509,135 @@ async def _single_rca_fix_verify(
             f"other copies of the same repo.\n"
         ) if ws_path else ""
 
+        repair_binding: RuntimeSandboxTaskBinding | None = None
+        try:
+            repair_binding = await _bind_post_dag_product_repair_sandbox(
+                runner,
+                feature,
+                source=source,
+                attempt_number=attempt_number,
+                repair_idx=0,
+                repair_id=bug_id,
+                feature_root=feature_root,
+                ws_path=ws_path,
+                affected_files=rca.affected_files,
+                runtime=rca_runtime,
+            )
+        except SandboxWorkflowBlocker as exc:
+            return BugFixAttempt(
+                bug_id=bug_id,
+                source_verdict=source,
+                description=verdict_text,
+                root_cause=rca.hypothesis,
+                fix_applied=str(exc),
+                files_modified=[],
+                re_verify_result="FAIL",
+                attempt_number=attempt_number,
+            )
+
+        if repair_binding is not None:
+            ws_ctx = (
+                f"\n\n## Workspace\n"
+                f"Your working directory is: `{repair_binding.binding.cwd}`\n"
+                f"All file reads and writes MUST use paths within this directory.\n"
+                f"Do NOT use absolute paths from search results that point to "
+                f"other copies of the same repo.\n"
+            )
         fix_actor = actor_builder(
             fixer, f"fix-{bug_id}",
-            workspace_path=ws_path,
-        )
-        fix_result = await runner.run(
-            Ask(
-                actor=fix_actor,
-                prompt=(
-                    f"## Bug Fix: {bug_id}\n\n"
-                    f"### Root Cause Analysis\n\n"
-                    f"**Hypothesis:** {rca.hypothesis}\n\n"
-                    f"**Evidence:**\n"
-                    + "\n".join(f"- {e}" for e in rca.evidence)
-                    + f"\n\n**Affected Files:**\n"
-                    + "\n".join(f"- `{f}`" for f in rca.affected_files)
-                    + f"\n\n**Proposed Approach:** {rca.proposed_approach}\n\n"
-                    f"### Original Verdict\n\n{verdict_text}\n\n"
-                    f"{ws_ctx}\n"
-                    f"{dag_product_cleanup_guidance}\n"
-                    "## Instructions\n"
-                    "1. Read each affected file listed above\n"
-                    "2. Apply the fix described in the RCA — be precise\n"
-                    "3. Fix only what the root cause analysis identified\n"
-                    "4. Report all files modified"
-                    f"{prior_context}"
-                ),
-                output_type=ImplementationResult,
+            workspace_path=(
+                str(repair_binding.binding.cwd)
+                if repair_binding is not None
+                else ws_path
             ),
-            feature,
-            phase_name=phase_name,
+            runtime_workspace_binding=(
+                repair_binding.binding if repair_binding is not None else None
+            ),
+            sandbox_required=repair_binding is not None,
         )
+        try:
+            fix_result = await runner.run(
+                Ask(
+                    actor=fix_actor,
+                    prompt=(
+                        f"## Bug Fix: {bug_id}\n\n"
+                        f"### Root Cause Analysis\n\n"
+                        f"**Hypothesis:** {rca.hypothesis}\n\n"
+                        f"**Evidence:**\n"
+                        + "\n".join(f"- {e}" for e in rca.evidence)
+                        + f"\n\n**Affected Files:**\n"
+                        + "\n".join(f"- `{f}`" for f in rca.affected_files)
+                        + f"\n\n**Proposed Approach:** {rca.proposed_approach}\n\n"
+                        f"### Original Verdict\n\n{verdict_text}\n\n"
+                        f"{ws_ctx}\n"
+                        f"{dag_product_cleanup_guidance}\n"
+                        "## Instructions\n"
+                        "1. Read each affected file listed above\n"
+                        "2. Apply the fix described in the RCA — be precise\n"
+                        "3. Fix only what the root cause analysis identified\n"
+                        "4. Report all files modified"
+                        f"{prior_context}"
+                    ),
+                    output_type=ImplementationResult,
+                ),
+                feature,
+                phase_name=phase_name,
+            )
+            if repair_binding is not None:
+                await _capture_and_promote_sandbox_patch(
+                    repair_binding,
+                    task_id=bug_id,
+                    promote=True,
+                    result=fix_result if isinstance(fix_result, ImplementationResult) else None,
+                )
+        except SandboxWorkflowBlocker as exc:
+            return BugFixAttempt(
+                bug_id=bug_id,
+                source_verdict=source,
+                description=verdict_text,
+                root_cause=rca.hypothesis,
+                fix_applied=str(exc),
+                files_modified=[],
+                re_verify_result="FAIL",
+                attempt_number=attempt_number,
+            )
+        except Exception as exc:
+            if repair_binding is not None:
+                try:
+                    await _capture_and_promote_sandbox_patch(
+                        repair_binding,
+                        task_id=bug_id,
+                        promote=False,
+                    )
+                except SandboxWorkflowBlocker as capture_blocker:
+                    failure = str(capture_blocker)
+                except Exception:
+                    logger.warning(
+                        "Post-DAG repair %s failed to capture sandbox crash evidence",
+                        bug_id,
+                        exc_info=True,
+                    )
+                    failure = _workflow_blocker_text(
+                        f"Post-DAG repair runtime failed: {type(exc).__name__}: {exc}"
+                    )
+                else:
+                    failure = _workflow_blocker_text(
+                        f"Post-DAG repair runtime failed: {type(exc).__name__}: {exc}"
+                    )
+            else:
+                failure = _workflow_blocker_text(
+                    f"Post-DAG repair runtime failed: {type(exc).__name__}: {exc}"
+                )
+            return BugFixAttempt(
+                bug_id=bug_id,
+                source_verdict=source,
+                description=verdict_text,
+                root_cause=rca.hypothesis,
+                fix_applied=failure,
+                files_modified=[],
+                re_verify_result="FAIL",
+                attempt_number=attempt_number,
+            )
         if dag_product_cleanup_routes:
             await _append_dag_task_rows_from_product_repair(
                 runner,
@@ -14170,6 +31650,21 @@ async def _single_rca_fix_verify(
             )
 
     if used_artifact_repair and fix_result.status == "blocked":
+        return BugFixAttempt(
+            bug_id=bug_id,
+            source_verdict=source,
+            description=verdict_text,
+            root_cause=rca.hypothesis,
+            fix_applied=fix_result.summary,
+            files_modified=[],
+            re_verify_result="FAIL",
+            attempt_number=attempt_number,
+        )
+    if (
+        not used_artifact_repair
+        and fix_result.status == "blocked"
+        and _is_workflow_blocker_text(str(fix_result.summary))
+    ):
         return BugFixAttempt(
             bug_id=bug_id,
             source_verdict=source,
@@ -14358,6 +31853,23 @@ async def _escalate_contradiction(
     rca: RootCauseAnalysis,
 ) -> str:
     """Interview the user about a spec contradiction. Blocks until resolved."""
+    recovered = await _recover_closed_dag_contradiction_resolution(
+        runner,
+        feature,
+        source=source,
+        group=group,
+        rca=rca,
+    )
+    if recovered is not None:
+        resolution, recovery_record = recovered
+        logger.warning(
+            "Skipping lead-architect contradiction interview for closed gate "
+            "source=%s group=%s recovered_from=%s",
+            source,
+            group.group_id,
+            recovery_record.get("decision_ref", "<unknown>"),
+        )
+        return resolution.implementation_direction or resolution.resolution
     result = await runner.run(
         HostedInterview(
             questioner=lead_architect_gate_reviewer,

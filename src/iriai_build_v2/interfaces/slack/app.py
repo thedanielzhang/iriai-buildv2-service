@@ -39,6 +39,11 @@ async def run_slack_bridge(
     selected per-feature via a scoping card in the workflow channel.
     Runs until SIGINT or SIGTERM.
     """
+    from ...execution_control.startup import (
+        EnvFlagState,
+        assert_control_plane_ready_for_workflow_launch,
+        read_control_plane_env_flag,
+    )
     from .adapter import SlackAdapter
     from .interaction import SlackInteractionRuntime
     from .orchestrator import SlackWorkflowOrchestrator
@@ -57,6 +62,24 @@ async def run_slack_bridge(
             "SLACK_BOT_TOKEN environment variable is required. "
             "Get it from your Slack app's OAuth settings (xoxb-...)."
         )
+
+    # Slice 12c — IRIAI_EXEC_CONTROL_PLANE_ENABLED env-flag + startup guard.
+    # The Slack bridge is a long-lived process that admits new workflow
+    # starts; the env flag must be evaluated ONCE at process startup. When
+    # the flag is unset/disabled, the bridge runs on the legacy executor
+    # (backward-compat during rollout). When enabled, the Slice-10f
+    # assert_control_plane_ready fires BEFORE the bridge connects — a
+    # malformed flag, missing component, or forbidden partial control
+    # refuses startup (NOT silent fallback). Per-feature control-plane
+    # state (deploy_artifact_commit / candidate_commit / required
+    # migrations) is supplied by the Slice-12d adoption record + Slice-12e
+    # final-landing wiring; Slice 12c lands the env-flag + outermost guard.
+    flag_state = read_control_plane_env_flag()
+    if flag_state is EnvFlagState.ENABLED:
+        await assert_control_plane_ready_for_workflow_launch(
+            require_enabled=True,
+        )
+
     ignored_mentions = await _load_ignored_mention_user_ids(ignored_mention_user_ids)
 
     # 2. Create adapter

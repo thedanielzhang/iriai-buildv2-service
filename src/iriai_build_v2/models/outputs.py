@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Generic, Literal, TypeVar
+from typing import Any, Generic, Literal, TypeVar
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -988,6 +988,34 @@ class ImplementationDAG(BaseModel):
     num_teams: int = 0
     execution_order: list[list[str]] = Field(default_factory=list)
     requirement_coverage: dict[str, list[str]] = Field(default_factory=dict)
+    complete: bool = False
+
+
+class DerivedDAGArtifact(BaseModel):
+    """A staged DAG candidate that is not yet the active implementation DAG."""
+
+    artifact_key: str = Field(
+        description="Staging artifact key, e.g. derived-dag:accounts:worker-b or dag-regroup:g45-g73.",
+    )
+    source_dag_key: str = Field(
+        description="Active DAG artifact this candidate was derived from.",
+    )
+    dag: ImplementationDAG
+    base_dag_artifact_id: int | None = None
+    base_dag_sha256: str = ""
+    checkpointed_group: int | None = None
+    group_idx_offset: int | None = None
+    original_execution_order: list[list[str]] = Field(default_factory=list)
+    original_to_new_group_mapping: dict[str, list[int]] = Field(default_factory=dict)
+    barriers: list[dict[str, Any]] = Field(default_factory=list)
+    write_sets: dict[str, list[str]] = Field(default_factory=dict)
+    verification_matrix: dict[str, Any] = Field(default_factory=dict)
+    speed_index: dict[str, Any] = Field(default_factory=dict)
+    activation_contract: list[str] = Field(default_factory=list)
+    rollback_plan: list[str] = Field(default_factory=list)
+    derivation_reason: str = ""
+    activation_plan: list[str] = Field(default_factory=list)
+    validation_notes: list[str] = Field(default_factory=list)
     complete: bool = False
 
 

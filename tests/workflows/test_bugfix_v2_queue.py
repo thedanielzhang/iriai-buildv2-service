@@ -1383,6 +1383,11 @@ async def test_execute_bug_lane_passes_thread_actor_factory_to_retry_helper(
             "probe",
             runtime="secondary",
             workspace_path=str(lane_root),
+            runtime_workspace_binding={
+                "sandbox_id": "lane-retry-sandbox",
+                "cwd": str(lane_root),
+            },
+            sandbox_required=True,
         )
         return BugFixAttempt(
             bug_id="L-2301B-retry-1",
@@ -1409,6 +1414,8 @@ async def test_execute_bug_lane_passes_thread_actor_factory_to_retry_helper(
     assert success is False
     assert captured_actor is not None
     assert captured_actor.role.metadata["runtime_instance"].name == "codex"
+    assert captured_actor.role.metadata["sandbox_required"] is True
+    assert captured_actor.role.metadata["runtime_workspace_binding"]["sandbox_id"] == "lane-retry-sandbox"
 
 
 @pytest.mark.asyncio
@@ -1503,6 +1510,11 @@ async def test_execute_bug_lane_passes_thread_actor_factory_to_regression_helper
             "probe",
             runtime="secondary",
             workspace_path=str(lane_root),
+            runtime_workspace_binding={
+                "sandbox_id": "lane-regression-sandbox",
+                "cwd": str(lane_root),
+            },
+            sandbox_required=True,
         )
         return None
 
@@ -1519,6 +1531,8 @@ async def test_execute_bug_lane_passes_thread_actor_factory_to_regression_helper
     assert success is True
     assert captured_actor is not None
     assert captured_actor.role.metadata["runtime_instance"].name == "codex"
+    assert captured_actor.role.metadata["sandbox_required"] is True
+    assert captured_actor.role.metadata["runtime_workspace_binding"]["sandbox_id"] == "lane-regression-sandbox"
 
 
 @pytest.mark.asyncio
@@ -3243,7 +3257,8 @@ async def test_recover_stale_promoting_lane_finalizes_if_commits_already_on_main
 
     pushed = False
 
-    async def _fake_push(_root):
+    async def _fake_push(_root, **kwargs):
+        assert "allowed_origin_root" in kwargs
         nonlocal pushed
         pushed = True
 
@@ -3321,7 +3336,8 @@ async def test_recover_stale_promoting_lane_finalizes_if_marked_applied_main(
 
     pushed = False
 
-    async def _fake_push(_root):
+    async def _fake_push(_root, **kwargs):
+        assert "allowed_origin_root" in kwargs
         nonlocal pushed
         pushed = True
 
@@ -3339,6 +3355,348 @@ async def test_recover_stale_promoting_lane_finalizes_if_marked_applied_main(
     assert isinstance(saved_lane, queue_module.BugflowLaneSnapshot)
     assert pushed is True
     assert saved_lane.status == "promoted"
+
+
+@pytest.mark.asyncio
+async def test_recover_stale_applied_main_lane_resumes_after_source_push_crash(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    feature = _feature()
+    artifacts = _Artifacts()
+    adapter = _Adapter()
+    main_root = tmp_path / "main" / "repos"
+    main_root.mkdir(parents=True, exist_ok=True)
+
+    report = _report("BR-pushed", status="active_fix", category="bug", summary="Checkout button does nothing")
+    report.lane_id = "L-pushed"
+    report.cluster_id = "C-pushed"
+    lane_root = tmp_path / "pushed-lane"
+    lane_root.mkdir(parents=True, exist_ok=True)
+    cluster = queue_module.BugflowClusterSnapshot(
+        cluster_id="C-pushed",
+        report_ids=[report.report_id],
+        lane_id="L-pushed",
+        status="active_fix",
+        current_phase="promoting",
+    )
+    lane = BugflowLaneSnapshot(
+        lane_id="L-pushed",
+        report_ids=[report.report_id],
+        category="bug",
+        source_cluster_id=cluster.cluster_id,
+        status="promoting",
+        promotion_status="applied-main",
+        workspace_root=str(lane_root),
+        base_main_commits_by_repo={"frontend": "abc123"},
+    )
+
+    await artifacts.put(report_key(report.report_id), report.model_dump_json(), feature=feature)
+    await artifacts.put(lane_key(lane.lane_id), lane.model_dump_json(), feature=feature)
+    await artifacts.put(queue_module.cluster_key(cluster.cluster_id), cluster.model_dump_json(), feature=feature)
+
+    runner = SimpleNamespace(
+        artifacts=artifacts,
+        services={"slack_adapter": adapter},
+        feature_store=_FeatureStore(),
+    )
+
+    push_attempts = 0
+
+    async def _fake_push(_root, **kwargs):
+        assert "allowed_origin_root" in kwargs
+        nonlocal push_attempts
+        push_attempts += 1
+        raise RuntimeError(
+            "failed to push cloned repos to source: "
+            "frontend: remote already at local HEAD; source push produced no mutation proof"
+        )
+
+    monkeypatch.setattr(queue_module, "_get_feature_root", lambda *_args, **_kwargs: main_root)
+    monkeypatch.setattr(queue_module, "_lane_commits_already_on_main", lambda *_args, **_kwargs: asyncio.sleep(0, result=False))
+    monkeypatch.setattr(queue_module, "_push_clones_to_source_root", _fake_push)
+
+    phase = queue_module.BugflowQueuePhase()
+    await phase._recover_stale_execution_state(runner, feature, [lane])
+
+    saved_lane = queue_module.parse_model(
+        artifacts.values[(feature.id, lane_key(lane.lane_id))],
+        queue_module.BugflowLaneSnapshot,
+    )
+    saved_report = queue_module.parse_model(
+        artifacts.values[(feature.id, report_key(report.report_id))],
+        queue_module.BugflowReportSnapshot,
+    )
+    saved_cluster = queue_module.parse_model(
+        artifacts.values[(feature.id, queue_module.cluster_key(cluster.cluster_id))],
+        queue_module.BugflowClusterSnapshot,
+    )
+    assert isinstance(saved_lane, queue_module.BugflowLaneSnapshot)
+    assert isinstance(saved_report, queue_module.BugflowReportSnapshot)
+    assert isinstance(saved_cluster, queue_module.BugflowClusterSnapshot)
+    assert push_attempts == 1
+    assert saved_lane.status == "promoted"
+    assert saved_lane.promotion_status == "pushed"
+    assert saved_report.status == "resolved"
+    assert saved_cluster.status == "resolved"
+
+
+@pytest.mark.asyncio
+async def test_applied_main_source_push_initial_attempt_does_not_mark_changed_repos_optional_noop(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    main_root = tmp_path / "main" / "repos"
+    for repo_name in ("frontend", "api"):
+        (main_root / repo_name / ".git").mkdir(parents=True)
+    lane = BugflowLaneSnapshot(
+        lane_id="L-initial-push",
+        report_ids=["BR-initial"],
+        category="bug",
+        source_cluster_id="C-initial",
+        status="promoting",
+        promotion_status="applied-main",
+        workspace_root=str(tmp_path / "lane"),
+        base_main_commits_by_repo={"frontend": "abc123", "api": "def456"},
+    )
+    captured: dict[str, object] = {}
+
+    async def _fake_push(root: Path, **kwargs: object) -> None:
+        captured["root"] = root
+        captured.update(kwargs)
+
+    monkeypatch.setattr(queue_module, "_push_clones_to_source_root", _fake_push)
+
+    await queue_module._push_applied_main_lane_to_source_root(main_root, lane)
+
+    assert captured["root"] == main_root
+    assert "optional_noop_repos" not in captured
+    assert captured["allowed_origin_root"] == main_root.parent
+
+
+@pytest.mark.asyncio
+async def test_applied_main_source_push_replay_marks_only_remote_synced_repos_optional_noop(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    main_root = tmp_path / "main" / "repos"
+    repo_dirs = {
+        repo_name: main_root / repo_name
+        for repo_name in ("frontend", "api", "docs")
+    }
+    for repo_dir in repo_dirs.values():
+        (repo_dir / ".git").mkdir(parents=True)
+    lane = BugflowLaneSnapshot(
+        lane_id="L-mixed-push",
+        report_ids=["BR-mixed"],
+        category="bug",
+        source_cluster_id="C-mixed",
+        status="promoting",
+        promotion_status="applied-main",
+        workspace_root=str(tmp_path / "lane"),
+        base_main_commits_by_repo={"frontend": "abc123", "api": "def456"},
+    )
+    captured: dict[str, object] = {}
+
+    async def _fake_push(root: Path, **kwargs: object) -> None:
+        captured["root"] = root
+        captured.update(kwargs)
+
+    def _fake_discover(root: Path) -> list[Path]:
+        assert root == main_root
+        return [repo_dirs["frontend"], repo_dirs["api"], repo_dirs["docs"]]
+
+    async def _fake_run_git(repo_dir: Path, *args: str) -> str:
+        if args == ("branch", "--show-current"):
+            return "main\n"
+        if args == ("rev-parse", "HEAD"):
+            if repo_dir == repo_dirs["frontend"]:
+                return "front-head\n"
+            if repo_dir == repo_dirs["api"]:
+                return "api-head\n"
+            return "docs-head\n"
+        if args == ("ls-remote", "origin", "refs/heads/main"):
+            if repo_dir == repo_dirs["frontend"]:
+                return "front-head\trefs/heads/main\n"
+            if repo_dir == repo_dirs["api"]:
+                return "old-api-head\trefs/heads/main\n"
+            raise RuntimeError("temporary remote lookup failure")
+        raise AssertionError(args)
+
+    monkeypatch.setattr(queue_module, "_discover_repo_roots_under", _fake_discover)
+    monkeypatch.setattr(queue_module, "_run_git", _fake_run_git)
+    monkeypatch.setattr(queue_module, "_push_clones_to_source_root", _fake_push)
+
+    await queue_module._push_applied_main_lane_to_source_root(
+        main_root,
+        lane,
+        resume_replay=True,
+    )
+
+    assert captured["root"] == main_root
+    assert captured["optional_noop_repos"] == {"frontend"}
+    assert captured["allowed_origin_root"] == main_root.parent
+
+
+@pytest.mark.asyncio
+async def test_promote_lane_initial_push_uses_applied_main_helper(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    feature = _feature()
+    artifacts = _Artifacts()
+    adapter = _Adapter()
+    main_root = tmp_path / "main" / "repos"
+    main_root.mkdir(parents=True, exist_ok=True)
+    lane_root = tmp_path / "lane"
+    lane_root.mkdir(parents=True, exist_ok=True)
+    promotion_root = tmp_path / "promotion"
+    promotion_root.mkdir(parents=True, exist_ok=True)
+
+    report = _report("BR-initial-push", status="active_fix", category="bug", summary="Checkout button does nothing")
+    report.lane_id = "L-initial-push"
+    report.cluster_id = "C-initial-push"
+    cluster = queue_module.BugflowClusterSnapshot(
+        cluster_id="C-initial-push",
+        report_ids=[report.report_id],
+        lane_id="L-initial-push",
+        status="verified_pending_promotion",
+        current_phase="promotion_pending",
+    )
+    lane = BugflowLaneSnapshot(
+        lane_id="L-initial-push",
+        report_ids=[report.report_id],
+        category="bug",
+        source_cluster_id=cluster.cluster_id,
+        status="verified_pending_promotion",
+        promotion_status="queued",
+        workspace_root=str(lane_root),
+        base_main_commits_by_repo={"frontend": "abc123"},
+    )
+    await artifacts.put(report_key(report.report_id), report.model_dump_json(), feature=feature)
+    await artifacts.put(lane_key(lane.lane_id), lane.model_dump_json(), feature=feature)
+    await artifacts.put(queue_module.cluster_key(cluster.cluster_id), cluster.model_dump_json(), feature=feature)
+
+    runner = SimpleNamespace(
+        artifacts=artifacts,
+        services={"slack_adapter": adapter},
+        feature_store=_FeatureStore(),
+    )
+    pushed: list[tuple[Path, str]] = []
+
+    async def _fake_push_applied_main(root: Path, lane_snapshot: BugflowLaneSnapshot) -> None:
+        pushed.append((root, lane_snapshot.lane_id))
+
+    monkeypatch.setattr(queue_module, "_get_feature_root", lambda *_args, **_kwargs: main_root)
+    monkeypatch.setattr(
+        queue_module,
+        "_create_promotion_worktree_root",
+        lambda *_args, **_kwargs: asyncio.sleep(0, result=(promotion_root, {}, {})),
+    )
+    monkeypatch.setattr(
+        queue_module,
+        "_lane_commit_sequences",
+        lambda *_args, **_kwargs: asyncio.sleep(0, result={"frontend": ["abc"]}),
+    )
+    monkeypatch.setattr(queue_module, "_cherry_pick_lane_commits", lambda *_args, **_kwargs: asyncio.sleep(0))
+    monkeypatch.setattr(
+        queue_module,
+        "_promotion_verify_lane",
+        lambda *_args, **_kwargs: asyncio.sleep(0, result=Verdict(approved=True, summary="promotion clean")),
+    )
+    monkeypatch.setattr(
+        queue_module,
+        "_missing_terminal_approval_requirements",
+        lambda *_args, **_kwargs: [],
+    )
+    monkeypatch.setattr(queue_module, "_run_regression", lambda *_args, **_kwargs: asyncio.sleep(0, result=None))
+    monkeypatch.setattr(queue_module, "_push_applied_main_lane_to_source_root", _fake_push_applied_main)
+    monkeypatch.setattr(queue_module, "_finalize_promoted_lane", lambda *_args, **_kwargs: asyncio.sleep(0))
+
+    phase = queue_module.BugflowQueuePhase()
+    await phase._promote_lane(runner, feature, lane.lane_id)
+
+    assert pushed == [(main_root, lane.lane_id)]
+
+
+def test_applied_main_source_push_allowed_origin_root_uses_workspace_authority(
+    tmp_path: Path,
+):
+    workspace = tmp_path / "workspace"
+    main_root = workspace / ".iriai" / "features" / "feat" / "repos"
+
+    assert (
+        queue_module._applied_main_source_push_allowed_origin_root(main_root)
+        == workspace
+    )
+
+
+@pytest.mark.asyncio
+async def test_recover_stale_promoting_lane_does_not_ignore_source_push_without_applied_main_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    feature = _feature()
+    artifacts = _Artifacts()
+    adapter = _Adapter()
+    main_root = tmp_path / "main" / "repos"
+    main_root.mkdir(parents=True, exist_ok=True)
+
+    report = _report("BR-ambiguous", status="active_fix", category="bug", summary="Checkout button does nothing")
+    report.lane_id = "L-ambiguous"
+    report.cluster_id = "C-ambiguous"
+    lane_root = tmp_path / "ambiguous-lane"
+    lane_root.mkdir(parents=True, exist_ok=True)
+    cluster = queue_module.BugflowClusterSnapshot(
+        cluster_id="C-ambiguous",
+        report_ids=[report.report_id],
+        lane_id="L-ambiguous",
+        status="active_fix",
+        current_phase="promoting",
+    )
+    lane = BugflowLaneSnapshot(
+        lane_id="L-ambiguous",
+        report_ids=[report.report_id],
+        category="bug",
+        source_cluster_id=cluster.cluster_id,
+        status="promoting",
+        promotion_status="promoting",
+        workspace_root=str(lane_root),
+        base_main_commits_by_repo={"frontend": "abc123"},
+    )
+
+    await artifacts.put(report_key(report.report_id), report.model_dump_json(), feature=feature)
+    await artifacts.put(lane_key(lane.lane_id), lane.model_dump_json(), feature=feature)
+    await artifacts.put(queue_module.cluster_key(cluster.cluster_id), cluster.model_dump_json(), feature=feature)
+
+    runner = SimpleNamespace(
+        artifacts=artifacts,
+        services={"slack_adapter": adapter},
+        feature_store=_FeatureStore(),
+    )
+
+    async def _fake_push(_root, **kwargs):
+        assert "allowed_origin_root" in kwargs
+        raise RuntimeError(
+            "failed to push cloned repos to source: "
+            "frontend: remote already at local HEAD; source push produced no mutation proof"
+        )
+
+    monkeypatch.setattr(queue_module, "_get_feature_root", lambda *_args, **_kwargs: main_root)
+    monkeypatch.setattr(queue_module, "_lane_commits_already_on_main", lambda *_args, **_kwargs: asyncio.sleep(0, result=True))
+    monkeypatch.setattr(queue_module, "_push_clones_to_source_root", _fake_push)
+
+    phase = queue_module.BugflowQueuePhase()
+    with pytest.raises(RuntimeError, match="remote already at local HEAD"):
+        await phase._recover_stale_execution_state(runner, feature, [lane])
+
+    saved_lane = queue_module.parse_model(
+        artifacts.values[(feature.id, lane_key(lane.lane_id))],
+        queue_module.BugflowLaneSnapshot,
+    )
+    assert isinstance(saved_lane, queue_module.BugflowLaneSnapshot)
+    assert saved_lane.status == "promoting"
+    assert saved_lane.promotion_status == "promoting"
 
 
 def test_strategy_scope_override_adds_repo_lock_for_bare_repo_name():

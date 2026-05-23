@@ -24,9 +24,11 @@ from ...runtime_policy import (
     normalize_runtime_policy,
 )
 from ...workflows.bugfix_v2.models import BugflowReportSnapshot, new_short_id, report_key, utc_now
+from ...workflows._runner import WorkflowQuiesceResult
 from .._bootstrap import (
     bootstrap,
     create_feature,
+    maybe_assert_adopted_or_legacy_for_resume,
     rebuild_state,
     select_workflow,
     build_state,
@@ -626,6 +628,10 @@ class SlackWorkflowOrchestrator:
             binder = getattr(runner, "bind_invocation_observer", None)
             with binder(observer) if observer is not None and callable(binder) else nullcontext():
                 await runner.execute_workflow(workflow, feature, state)
+            quiesce = self._runner_quiesce_result(runner)
+            if quiesce is not None:
+                await self._mark_workflow_quiesced(feature, channel_id, quiesce)
+                return
             if self._slack_verbosity != "quiet":
                 await self._adapter.post_message(channel_id, "Workflow complete!")
             await self._adapter.add_reaction(
@@ -641,6 +647,10 @@ class SlackWorkflowOrchestrator:
                     "mode": str(current_meta.get("mode", "singleplayer") or "singleplayer"),
                     "phase": str(current_meta.get("_db_phase", "bugflow-setup") or "bugflow-setup"),
                     "agent_runtime": str(current_meta.get("agent_runtime", self._agent_runtime_name) or self._agent_runtime_name),
+                    "runtime_policy": str(
+                        current_meta.get("runtime_policy", self._runtime_policy)
+                        or self._runtime_policy
+                    ),
                 }
                 self._feature_workflows[feature.id] = current_feature.workflow_name
                 self._interaction.register_channel(feature.id, channel_id)
@@ -944,9 +954,31 @@ class SlackWorkflowOrchestrator:
                     f"Cannot resume: feature `{feature_id}` not found in database.",
                 )
                 return
+
+            # Slice 12e -- PR 11.13 final atomic landing: consult the
+            # Slice-12d resume guard BEFORE entering the typed control-plane
+            # resume path. Per doc 12 § "In-Flight Cutover Policy" lines
+            # 73-78: when `IRIAI_EXEC_CONTROL_PLANE_ENABLED=ENABLED` and we
+            # are resuming an in-flight feature, the guard requires an
+            # explicit adoption marker; absent the marker the guard raises
+            # ControlPlaneAdoptionError and we MUST NOT silently migrate
+            # the feature -- the operator runs the adoption command at a
+            # safe boundary, or the feature quiesces on the legacy executor.
+            # Under UNSET/DISABLED the guard is a strict pass-through and
+            # the legacy Slack resume path is bit-exact identical to
+            # pre-12e behavior.
+            await maybe_assert_adopted_or_legacy_for_resume(
+                feature=feature,
+                artifacts=self._env.artifacts,
+                is_resume=True,
+            )
+
             await self._env.feature_store.update_metadata(
                 feature.id,
-                {"concurrency_max": self._concurrency_max},
+                {
+                    "concurrency_max": self._concurrency_max,
+                    "runtime_policy": str(runtime_policy or self._runtime_policy),
+                },
             )
             feature = await self._env.feature_store.get_feature(feature_id) or feature
 
@@ -971,6 +1003,18 @@ class SlackWorkflowOrchestrator:
             if isinstance(streamer, SlackStreamer):
                 self._feature_streamers[feature_id] = streamer
 
+            recovered_sandbox_leases = await self._recover_sandbox_leases_for_resume(
+                runner,
+                feature,
+                workspace_path,
+            )
+            if recovered_sandbox_leases:
+                logger.info(
+                    "Recovered %d sandbox leases before resuming feature %s",
+                    recovered_sandbox_leases,
+                    feature.id,
+                )
+
             await self._adapter.post_message(
                 channel_id,
                 f"Resuming *{feature.workflow_name}* workflow from phase: *{resume_phase}*\n"
@@ -979,7 +1023,13 @@ class SlackWorkflowOrchestrator:
 
             task = asyncio.create_task(
                 self._run_workflow_resumed(
-                    runner, workflow, feature, state, channel_id, resume_phase
+                    runner,
+                    workflow,
+                    feature,
+                    state,
+                    channel_id,
+                    resume_phase,
+                    runtime_policy=runtime_policy,
                 )
             )
             self._active_workflows[feature_id] = task
@@ -993,6 +1043,43 @@ class SlackWorkflowOrchestrator:
             )
             return
 
+    async def _recover_sandbox_leases_for_resume(
+        self,
+        runner: Any,
+        feature: Any,
+        workspace_path: Path,
+    ) -> int:
+        try:
+            from ...execution_control import ExecutionControlStore
+            from ...workflows.develop.execution.sandbox import SandboxRunner
+        except Exception:
+            return 0
+        services = getattr(runner, "services", {}) or {}
+        store = services.get("execution_control_store") or services.get("execution_control")
+        if store is None:
+            pool = (
+                services.get("pool")
+                or services.get("db_pool")
+                or getattr(self._env, "pool", None)
+                or getattr(self._env, "db_pool", None)
+            )
+            if pool is not None:
+                store = ExecutionControlStore(pool)
+        if store is None:
+            return 0
+        owner_prefix = f"workflow:{feature.id}:"
+        recovery_runner = SandboxRunner(
+            workspace_root=workspace_path,
+            repo_sources={},
+            store=store,
+            owner=f"workflow:{feature.id}",
+            recovery_owner_prefix=owner_prefix,
+            recovery_feature_id=str(feature.id),
+            allowed_source_roots=[workspace_path],
+        )
+        recovered = await recovery_runner.recover()
+        return len(recovered)
+
     async def _run_workflow_resumed(
         self,
         runner: Any,
@@ -1001,6 +1088,7 @@ class SlackWorkflowOrchestrator:
         state: Any,
         channel_id: str,
         resume_phase: str,
+        runtime_policy: str | None = None,
     ) -> None:
         try:
             observer = self._make_invocation_observer(feature.id, feature.workflow_name, channel_id)
@@ -1009,6 +1097,15 @@ class SlackWorkflowOrchestrator:
                 await runner.resume_workflow(
                     workflow, feature, state, resume_from_phase=resume_phase
                 )
+            quiesce = self._runner_quiesce_result(runner)
+            if quiesce is not None:
+                await self._mark_workflow_quiesced(
+                    feature,
+                    channel_id,
+                    quiesce,
+                    runtime_policy=runtime_policy,
+                )
+                return
             if self._slack_verbosity != "quiet":
                 await self._adapter.post_message(channel_id, "Workflow complete!")
         except Exception as e:
@@ -1020,6 +1117,11 @@ class SlackWorkflowOrchestrator:
                 "mode": str(current_meta.get("mode", "singleplayer") or "singleplayer"),
                 "phase": str(current_meta.get("_db_phase", resume_phase) or resume_phase),
                 "agent_runtime": str(current_meta.get("agent_runtime", self._agent_runtime_name) or self._agent_runtime_name),
+                "runtime_policy": str(
+                    runtime_policy
+                    or current_meta.get("runtime_policy")
+                    or self._runtime_policy
+                ),
             }
             self._feature_workflows[feature.id] = current_feature.workflow_name
             self._interaction.register_channel(feature.id, channel_id)
@@ -1033,7 +1135,54 @@ class SlackWorkflowOrchestrator:
             if feature.id not in self._recoverable_features:
                 self._feature_workflows.pop(feature.id, None)
                 self._interaction.unregister_channel(feature.id)
-            self._user_notes.pop(feature.id, None)
+
+    def _runner_quiesce_result(self, runner: Any) -> WorkflowQuiesceResult | None:
+        quiesce = getattr(runner, "last_workflow_quiesce", None)
+        if isinstance(quiesce, WorkflowQuiesceResult):
+            return quiesce
+        return None
+
+    async def _mark_workflow_quiesced(
+        self,
+        feature: Any,
+        channel_id: str,
+        quiesce: WorkflowQuiesceResult,
+        runtime_policy: str | None = None,
+    ) -> None:
+        current_feature = await self._env.feature_store.get_feature(feature.id) or feature
+        current_meta = dict(getattr(current_feature, "metadata", {}) or {})
+        phase = str(
+            current_meta.get("_db_phase")
+            or current_meta.get("phase")
+            or quiesce.phase_name
+        )
+        self._recoverable_features[feature.id] = {
+            "workspace_path": str(current_meta.get("workspace_path", "") or ""),
+            "mode": str(current_meta.get("mode", "singleplayer") or "singleplayer"),
+            "phase": phase,
+            "agent_runtime": str(
+                current_meta.get("agent_runtime", self._agent_runtime_name)
+                or self._agent_runtime_name
+            ),
+            "runtime_policy": str(
+                runtime_policy
+                or current_meta.get("runtime_policy")
+                or self._runtime_policy
+            ),
+        }
+        self._feature_workflows[feature.id] = current_feature.workflow_name
+        self._interaction.register_channel(feature.id, channel_id)
+        if self._slack_verbosity != "quiet":
+            reason = " ".join(str(quiesce.reason or "workflow quiesced").split())
+            if len(reason) > 700:
+                reason = reason[:697].rstrip() + "..."
+            await self._adapter.post_message(
+                channel_id,
+                f"Workflow paused in phase `{phase}`.\n"
+                f"Reason: {reason}\n"
+                "Send any message to resume when the pause condition is cleared.",
+            )
+        self._user_notes.pop(feature.id, None)
 
     # ── Helpers ───────────────────────────────────────────────────────────
 
@@ -1264,6 +1413,7 @@ class SlackWorkflowOrchestrator:
                 "slack_adapter": self._adapter,
                 "autonomous_remainder": self._autonomous_remainder,
                 "runtime_policy": resolved_runtime_policy,
+                "pool": getattr(self._env, "pool", None),
             },
         )
         runner._slack_streamer = streamer  # type: ignore[attr-defined]

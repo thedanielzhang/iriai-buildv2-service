@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import tempfile
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -17,9 +19,13 @@ from iriai_build_v2.runtimes.claude_pool import (
     ClaudePoolRunner,
     ClaudePoolRuntime,
     _apply_runner_umask,
+    _bound_write_authorization,
+    _classify_claude_pool_error,
     _coerce_profile,
     _job_state_path,
+    _pool_write_auth_secret,
     _payload_dir,
+    _write_sandbox_exec_profile,
     _write_json_atomic,
     load_profiles,
 )
@@ -91,6 +97,33 @@ def _weighted_profiles() -> list[ClaudePoolProfile]:
             weight=9,
         ),
     ]
+
+
+def _write_sandbox_manifest(
+    sandbox_root: Path,
+    cwd: Path,
+    *,
+    sandbox_id: str = "sandbox-04",
+    writable_roots: list[Path] | None = None,
+    blocked_roots: list[Path] | None = None,
+) -> Path:
+    manifest_path = sandbox_root / "sandbox-manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "manifest_version": "sandbox-runner-v1",
+                "sandbox_id": sandbox_id,
+                "root": str(sandbox_root),
+                "repo_roots": {"app": str(cwd)},
+                "writable_roots": [
+                    str(path) for path in (writable_roots if writable_roots is not None else [cwd])
+                ],
+                "blocked_roots": [str(path) for path in (blocked_roots or [])],
+            }
+        ),
+        encoding="utf-8",
+    )
+    return manifest_path
 
 
 @pytest.mark.asyncio
@@ -280,6 +313,58 @@ async def test_invoke_fails_over_when_profile_hits_usage_limit(
     assert state["profiles"]["iriai-claude-1"]["reason"] == "usage_limited"
 
 
+def test_internal_server_api_error_is_retryable_transient_failure():
+    error = (
+        "Claude CLI failed with exit code 1: "
+        '{"type":"result","is_error":true,"result":"API Error: '
+        '{\\"type\\":\\"error\\",\\"error\\":{\\"type\\":\\"api_error\\",'
+        '\\"message\\":\\"Internal server error\\"}}"}'
+    )
+
+    assert _classify_claude_pool_error(error) == "transient_api_error"
+
+
+@pytest.mark.asyncio
+async def test_invoke_fails_over_when_profile_hits_transient_api_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    runtime = ClaudePoolRuntime(root=tmp_path, profiles=_profiles(), poll_interval=0.01)
+    role = Role(name="root-cause-analyst", prompt="Return RCA.", metadata={})
+    calls: list[str] = []
+
+    async def _fake_submit_and_wait(*args, **kwargs):
+        profile = kwargs["profile"]
+        calls.append(profile.name)
+        if len(calls) == 1:
+            raise RuntimeError(
+                'Claude CLI failed with exit code 1: {"type":"result",'
+                '"is_error":true,"result":"API Error: {'
+                '\\"type\\":\\"error\\",\\"error\\":{'
+                '\\"type\\":\\"api_error\\",'
+                '\\"message\\":\\"Internal server error\\"}}"}'
+            )
+        return ("ok", None, {})
+
+    monkeypatch.setattr(runtime, "_submit_and_wait", _fake_submit_and_wait)
+
+    result = await runtime.invoke(
+        role,
+        "Return RCA.",
+        workspace=SimpleNamespace(path=tmp_path),
+        session_key="root-cause-analyst:feat-1",
+    )
+
+    assert result == "ok"
+    assert calls == ["iriai-claude-1", "iriai-claude-2"]
+    state = json.loads((tmp_path / "profile_state.json").read_text())
+    record = state["profiles"]["iriai-claude-1"]
+    assert record["reason"] == "transient_api_error"
+    probe_after = datetime.fromisoformat(record["probe_after"])
+    delay = (probe_after - datetime.now(UTC)).total_seconds()
+    assert 0 < delay <= 60
+
+
 @pytest.mark.asyncio
 async def test_select_profile_prefers_lower_recent_usage(tmp_path: Path):
     runtime = ClaudePoolRuntime(root=tmp_path, profiles=_profiles())
@@ -344,6 +429,256 @@ async def test_invoke_validates_structured_output_from_runner(tmp_path: Path):
 
     assert result == _SimpleOutput(message="ok")
     assert store.sessions["implementer:feat-1"].metadata["turns"][-1]["text"] == '{"message": "ok"}'
+
+
+@pytest.mark.asyncio
+async def test_bound_pool_manifest_includes_runtime_binding_fields(tmp_path: Path):
+    runtime = ClaudePoolRuntime(root=tmp_path, profiles=_profiles(), poll_interval=0.01)
+    profile = _profiles()[0]
+    cwd = tmp_path / "sandbox"
+    cwd.mkdir()
+    manifest_path = _write_sandbox_manifest(cwd, cwd)
+    binding = {
+        "sandbox_id": "sandbox-04",
+        "cwd": str(cwd),
+        "workspace_override": str(cwd),
+        "repo_roots": [str(cwd / "repo")],
+        "contract_ids": ["contract-1"],
+        "writable_roots": [str(cwd)],
+        "readonly_roots": [],
+        "blocked_roots": [str(tmp_path / "blocked")],
+        "manifest_path": str(manifest_path),
+        "expires_at": (datetime.now(UTC) + timedelta(hours=1)).isoformat(),
+        "runtime": "claude_pool",
+    }
+    role = Role(
+        name="observer",
+        prompt="Return ok.",
+        tools=["Read"],
+        metadata={"runtime_workspace_binding": binding},
+    )
+
+    task = asyncio.create_task(
+        runtime._submit_and_wait(
+            role,
+            "Do work.",
+            output_type=None,
+            workspace=SimpleNamespace(path=cwd),
+            session_key="implementer:feat-1",
+            profile=profile,
+        )
+    )
+
+    for _ in range(100):
+        queued = list((tmp_path / "jobs" / "queued" / profile.name).glob("*.json"))
+        if queued:
+            break
+        await asyncio.sleep(0.01)
+    else:
+        raise AssertionError("bound job was not queued")
+
+    manifest = json.loads(queued[0].read_text(encoding="utf-8"))
+    assert manifest["runtime_workspace_binding"]["sandbox_id"] == "sandbox-04"
+    assert manifest["sandbox_id"] == "sandbox-04"
+    assert manifest["repo_roots"] == [str(cwd / "repo")]
+    assert manifest["contract_ids"] == ["contract-1"]
+    assert manifest["writable_roots"] == [str(cwd)]
+    assert manifest["blocked_roots"] == [str(tmp_path / "blocked")]
+    assert manifest["manifest_path"] == str(manifest_path)
+    assert manifest["expires_at"] == binding["expires_at"]
+
+    result_path = Path(manifest["paths"]["result"])
+    _write_json_atomic(result_path, {"ok": True, "result_text": "ok"})
+    _write_json_atomic(
+        _job_state_path(tmp_path, "done", profile.name, manifest["id"]),
+        {**manifest, "status": "done"},
+    )
+
+    result_text, structured_output, raw = await task
+    assert result_text == "ok"
+    assert structured_output is None
+    assert raw is None
+
+
+def test_bound_pool_sandbox_profile_excludes_global_temp_roots(tmp_path: Path):
+    cwd = tmp_path / "sandbox"
+    cwd.mkdir()
+    result_path = tmp_path / "payload" / "result.json"
+    result_path.parent.mkdir()
+    profile_path = tmp_path / "payload" / "sandbox.sb"
+    manifest = {
+        "cwd": str(cwd),
+        "paths": {
+            "prompt": str(tmp_path / "payload" / "prompt.txt"),
+            "system_prompt": str(tmp_path / "payload" / "system.txt"),
+            "schema": str(tmp_path / "payload" / "schema.json"),
+            "result": str(result_path),
+            "stdout": str(tmp_path / "payload" / "stdout.log"),
+            "stderr": str(tmp_path / "payload" / "stderr.log"),
+            "sandbox_profile": str(profile_path),
+        },
+        "runtime_workspace_binding": {
+            "writable_roots": [str(cwd / "src")],
+        },
+    }
+
+    written = _write_sandbox_exec_profile(manifest)
+
+    profile = written.read_text(encoding="utf-8")
+    assert f'(subpath "{tempfile.gettempdir()}"' not in profile
+    if os.environ.get("TMPDIR"):
+        assert f'(subpath "{os.environ["TMPDIR"].rstrip("/")}"' not in profile
+    assert str(cwd) in profile
+    assert str(result_path.parent) in profile
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tools", "metadata"),
+    [
+        (["Read", "Write"], {}),
+        (["Read", "Bash"], {}),
+        (["Read"], {"write_producing": True}),
+    ],
+)
+async def test_bound_pool_write_producing_role_submits_authorized_sandbox_job(
+    tmp_path: Path,
+    tools: list[str],
+    metadata: dict[str, object],
+):
+    runtime = ClaudePoolRuntime(root=tmp_path, profiles=_profiles(), poll_interval=0.01)
+    profile = _profiles()[0]
+    cwd = tmp_path / "sandbox"
+    cwd.mkdir()
+    manifest_path = _write_sandbox_manifest(cwd, cwd)
+    role = Role(
+        name="implementer",
+        prompt="Return ok.",
+        tools=tools,
+        metadata={
+            **metadata,
+            "runtime_workspace_binding": {
+                "sandbox_id": "sandbox-04",
+                "cwd": str(cwd),
+                "workspace_override": str(cwd),
+                "repo_roots": {"app": str(cwd)},
+                "writable_roots": [str(cwd)],
+                "blocked_roots": [],
+                "manifest_path": str(manifest_path),
+                "expires_at": (datetime.now(UTC) + timedelta(hours=1)).isoformat(),
+                "runtime": "claude_pool",
+            }
+        },
+    )
+
+    task = asyncio.create_task(runtime._submit_and_wait(
+        role,
+        "Do work.",
+        output_type=None,
+        workspace=SimpleNamespace(path=cwd),
+        session_key="implementer:feat-1",
+        profile=profile,
+    ))
+    await asyncio.sleep(0.05)
+    queued = list((tmp_path / "jobs" / "queued" / profile.name).glob("*.json"))
+    assert len(queued) == 1
+    manifest = json.loads(queued[0].read_text(encoding="utf-8"))
+    assert manifest["runtime_workspace_write_authorized"] is True
+    assert manifest["runtime_workspace_write_guard"] == "sandbox_exec"
+    assert manifest["runtime_workspace_write_authorization"] == _bound_write_authorization(
+        manifest,
+        _pool_write_auth_secret(tmp_path),
+    )
+    assert manifest["runtime_workspace_binding"]["cwd"] == str(cwd)
+    result_path = Path(manifest["paths"]["result"])
+    _write_json_atomic(result_path, {"ok": True, "result_text": "ok"})
+    _write_json_atomic(
+        _job_state_path(tmp_path, "done", profile.name, manifest["id"]),
+        {**manifest, "status": "done"},
+    )
+
+    result_text, structured_output, raw = await task
+    assert result_text == "ok"
+    assert structured_output is None
+    assert raw is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    [
+        (
+            lambda binding, root, cwd, outside: binding.update(
+                {"manifest_path": str(root / "missing.json")}
+            ),
+            "sandbox manifest does not exist",
+        ),
+        (
+            lambda binding, root, cwd, outside: (
+                (root / "bad-manifest.json").write_text("{", encoding="utf-8"),
+                binding.update({"manifest_path": str(root / "bad-manifest.json")}),
+            ),
+            "unreadable sandbox manifest",
+        ),
+        (
+            lambda binding, root, cwd, outside: binding.update({"sandbox_id": "stale-sandbox"}),
+            "sandbox_id does not match manifest",
+        ),
+        (
+            lambda binding, root, cwd, outside: binding.update(
+                {
+                    "cwd": str(outside),
+                    "workspace_override": str(outside),
+                    "writable_roots": [str(outside)],
+                }
+            ),
+            "cwd is outside sandbox root",
+        ),
+    ],
+)
+async def test_bound_pool_write_binding_rejects_unproved_binding_before_queue(
+    tmp_path: Path,
+    mutate,
+    message: str,
+) -> None:
+    runtime = ClaudePoolRuntime(root=tmp_path, profiles=_profiles(), poll_interval=0.01)
+    profile = _profiles()[0]
+    sandbox_root = tmp_path / "sandbox"
+    cwd = sandbox_root / "repos" / "app"
+    cwd.mkdir(parents=True)
+    outside = tmp_path / "canonical" / "app"
+    outside.mkdir(parents=True)
+    manifest_path = _write_sandbox_manifest(sandbox_root, cwd)
+    binding = {
+        "sandbox_id": "sandbox-04",
+        "cwd": str(cwd),
+        "workspace_override": str(cwd),
+        "repo_roots": {"app": str(cwd)},
+        "writable_roots": [str(cwd)],
+        "blocked_roots": [],
+        "manifest_path": str(manifest_path),
+        "expires_at": (datetime.now(UTC) + timedelta(hours=1)).isoformat(),
+        "runtime": "claude_pool",
+    }
+    mutate(binding, tmp_path, cwd, outside)
+    role = Role(
+        name="implementer",
+        prompt="Return ok.",
+        tools=["Read", "Write"],
+        metadata={"runtime_workspace_binding": binding},
+    )
+
+    workspace_path = outside if "outside sandbox root" in message else cwd
+    with pytest.raises(RuntimeError, match=message):
+        await runtime._submit_and_wait(
+            role,
+            "Do work.",
+            output_type=None,
+            workspace=SimpleNamespace(path=workspace_path),
+            session_key="implementer:feat-1",
+            profile=profile,
+        )
+    assert not list((tmp_path / "jobs" / "queued" / profile.name).glob("*.json"))
 
 
 def test_atomic_claim_prevents_duplicate_execution(tmp_path: Path):
@@ -420,6 +755,238 @@ def test_runner_builds_claude_cli_command_shape(tmp_path: Path):
     assert "--allowedTools" in command
     assert "--add-dir" in command
     assert "--no-session-persistence" in command
+
+
+def test_runner_wraps_bound_write_jobs_in_sandbox_exec(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    runner = _FakeClaudeRunner(profile="iriai-claude-1", root=tmp_path)
+    cwd = tmp_path / "sandbox"
+    cwd.mkdir()
+    profile_path = tmp_path / "payload" / "sandbox-exec.sb"
+    manifest_path = _write_sandbox_manifest(cwd, cwd)
+    manifest = {
+        "cwd": str(cwd),
+        "role": {"name": "implementer", "tools": ["Read", "Write"]},
+        "runtime_workspace_binding": {
+            "sandbox_id": "sandbox-04",
+            "cwd": str(cwd),
+            "writable_roots": [str(cwd)],
+            "blocked_roots": [str(tmp_path / "canonical")],
+            "manifest_path": str(manifest_path),
+            "expires_at": (datetime.now(UTC) + timedelta(hours=1)).isoformat(),
+            "runtime": "claude_pool",
+        },
+        "runtime_workspace_write_guard": "sandbox_exec",
+        "paths": {"sandbox_profile": str(profile_path)},
+        "claude": {"command": "/bin/echo"},
+    }
+    monkeypatch.setattr("iriai_build_v2.runtimes.claude_pool.shutil.which", lambda name: f"/usr/bin/{name}")
+
+    command = runner._build_claude_command(
+        manifest,
+        system_prompt="",
+        schema=None,
+    )
+
+    assert command[:3] == ["/usr/bin/sandbox-exec", "-f", str(profile_path)]
+    profile = profile_path.read_text(encoding="utf-8")
+    assert "(deny file-write*)" in profile
+    assert str(cwd) in profile
+    assert str(tmp_path / "canonical") not in profile
+
+
+@pytest.mark.asyncio
+async def test_bound_pool_worker_rejects_absent_symlinked_expired_and_missing_cwd(tmp_path: Path):
+    runner = ClaudePoolRunner(profile="iriai-claude-1", root=tmp_path)
+    valid_cwd = tmp_path / "sandbox"
+    valid_cwd.mkdir()
+    manifest_path = _write_sandbox_manifest(valid_cwd, valid_cwd)
+    real_cwd = tmp_path / "real"
+    real_cwd.mkdir()
+    symlink_cwd = tmp_path / "linked"
+    symlink_cwd.symlink_to(real_cwd, target_is_directory=True)
+
+    base_binding = {
+        "sandbox_id": "sandbox-04",
+        "cwd": str(valid_cwd),
+        "writable_roots": [str(valid_cwd)],
+        "blocked_roots": [],
+        "manifest_path": str(manifest_path),
+        "expires_at": (datetime.now(UTC) + timedelta(hours=1)).isoformat(),
+        "runtime": "claude_pool",
+    }
+
+    cases = [
+        ({**base_binding}, None, "missing cwd"),
+        ({**base_binding, "cwd": str(tmp_path / "missing")}, str(tmp_path / "missing"), "does not exist"),
+        ({**base_binding, "cwd": str(symlink_cwd)}, str(symlink_cwd), "symlinked"),
+        (
+            {
+                **base_binding,
+                "expires_at": (datetime.now(UTC) - timedelta(seconds=1)).isoformat(),
+            },
+            str(valid_cwd),
+            "expired",
+        ),
+    ]
+
+    for binding, cwd, message in cases:
+        manifest = {
+            "id": "job",
+            "kind": "claude",
+            "cwd": cwd,
+            "runtime_workspace_binding": binding,
+            "paths": {},
+        }
+        with pytest.raises(RuntimeError, match=message):
+            await runner._execute_claude(manifest)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "role",
+    [
+        {"name": "fake", "tools": ["Read", "Bash"]},
+        {"name": "fake", "tools": ["Read", "Edit"]},
+        {"name": "fake", "tools": ["Read"], "metadata": {"write_producing": True}},
+        {"name": "fake", "tools": ["Read"], "write_producing": True},
+    ],
+)
+async def test_bound_pool_worker_rejects_handwritten_write_role_manifest(
+    tmp_path: Path,
+    role: dict[str, object],
+) -> None:
+    runner = ClaudePoolRunner(profile="iriai-claude-1", root=tmp_path)
+    cwd = tmp_path / "sandbox"
+    cwd.mkdir()
+    manifest_path = _write_sandbox_manifest(cwd, cwd)
+    manifest = {
+        "id": "job",
+        "kind": "claude",
+        "cwd": str(cwd),
+        "role": role,
+        "runtime_workspace_binding": {
+            "sandbox_id": "sandbox-04",
+            "cwd": str(cwd),
+            "writable_roots": [str(cwd)],
+            "blocked_roots": [],
+            "manifest_path": str(manifest_path),
+            "expires_at": (datetime.now(UTC) + timedelta(hours=1)).isoformat(),
+            "runtime": "claude_pool",
+        },
+        "paths": {},
+    }
+
+    with pytest.raises(RuntimeError, match="write-producing"):
+        await runner._execute_claude(manifest)
+
+
+@pytest.mark.asyncio
+async def test_bound_pool_worker_rejects_unbound_write_role_manifest(
+    tmp_path: Path,
+) -> None:
+    runner = ClaudePoolRunner(profile="iriai-claude-1", root=tmp_path)
+    cwd = tmp_path / "canonical"
+    cwd.mkdir()
+    manifest = {
+        "id": "job",
+        "kind": "claude",
+        "cwd": str(cwd),
+        "role": {"name": "fake", "tools": ["Read", "Write"]},
+        "paths": {},
+    }
+
+    with pytest.raises(RuntimeError, match="requires runtime workspace binding"):
+        await runner._execute_claude(manifest)
+
+
+@pytest.mark.asyncio
+async def test_bound_pool_worker_rejects_spoofed_write_authorization_flag(
+    tmp_path: Path,
+) -> None:
+    runner = ClaudePoolRunner(profile="iriai-claude-1", root=tmp_path)
+    cwd = tmp_path / "sandbox"
+    cwd.mkdir()
+    manifest_path = _write_sandbox_manifest(cwd, cwd)
+    manifest = {
+        "id": "job",
+        "kind": "claude",
+        "created_at": datetime.now(UTC).isoformat(),
+        "cwd": str(cwd),
+        "role": {"name": "fake", "tools": ["Read", "Write"]},
+        "runtime_workspace_binding": {
+            "sandbox_id": "sandbox-04",
+            "cwd": str(cwd),
+            "workspace_override": str(cwd),
+            "repo_roots": {"app": str(cwd)},
+            "writable_roots": [str(cwd)],
+            "blocked_roots": [],
+            "contract_ids": [44],
+            "manifest_path": str(manifest_path),
+            "expires_at": (datetime.now(UTC) + timedelta(hours=1)).isoformat(),
+            "runtime": "claude_pool",
+        },
+        "runtime_workspace_write_authorized": True,
+        "runtime_workspace_write_guard": "sandbox_exec",
+        "paths": {"prompt": str(tmp_path / "prompt.md")},
+    }
+    manifest["paths"]["sandbox_profile"] = str(tmp_path / "sandbox-exec.sb")
+    manifest["runtime_workspace_write_authorization"] = _bound_write_authorization(
+        manifest,
+        "attacker-secret",
+    )
+
+    with pytest.raises(RuntimeError, match="invalid write authorization"):
+        await runner._execute_claude(manifest)
+
+
+@pytest.mark.asyncio
+async def test_bound_pool_worker_rejects_edited_binding_expiry_after_authorization(
+    tmp_path: Path,
+) -> None:
+    runner = ClaudePoolRunner(profile="iriai-claude-1", root=tmp_path)
+    cwd = tmp_path / "sandbox"
+    cwd.mkdir()
+    manifest_path = _write_sandbox_manifest(cwd, cwd)
+    manifest = {
+        "id": "job",
+        "kind": "claude",
+        "created_at": datetime.now(UTC).isoformat(),
+        "cwd": str(cwd),
+        "role": {"name": "fake", "tools": ["Read", "Write"]},
+        "runtime_workspace_binding": {
+            "sandbox_id": "sandbox-04",
+            "cwd": str(cwd),
+            "workspace_override": str(cwd),
+            "repo_roots": {"app": str(cwd)},
+            "writable_roots": [str(cwd)],
+            "blocked_roots": [],
+            "contract_ids": [44],
+            "manifest_path": str(manifest_path),
+            "expires_at": (datetime.now(UTC) + timedelta(minutes=5)).isoformat(),
+            "runtime": "claude_pool",
+        },
+        "runtime_workspace_write_authorized": True,
+        "runtime_workspace_write_guard": "sandbox_exec",
+        "paths": {
+            "prompt": str(tmp_path / "prompt.md"),
+            "sandbox_profile": str(tmp_path / "sandbox-exec.sb"),
+        },
+    }
+    manifest["expires_at"] = manifest["runtime_workspace_binding"]["expires_at"]
+    manifest["runtime_workspace_write_authorization"] = _bound_write_authorization(
+        manifest,
+        _pool_write_auth_secret(tmp_path),
+    )
+    manifest["runtime_workspace_binding"]["expires_at"] = (
+        datetime.now(UTC) + timedelta(hours=2)
+    ).isoformat()
+    manifest["expires_at"] = manifest["runtime_workspace_binding"]["expires_at"]
+
+    with pytest.raises(RuntimeError, match="invalid write authorization"):
+        await runner._execute_claude(manifest)
 
 
 def test_runner_umask_is_group_writable(monkeypatch: pytest.MonkeyPatch):

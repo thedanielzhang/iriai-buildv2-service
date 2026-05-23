@@ -1,0 +1,104 @@
+{
+  "feature_id": "8ac124d6",
+  "findings": [
+    {
+      "evidence_refs": [
+        "artifact:art_8ac124d6_000007",
+        "event:evt_8ac124d6_000008",
+        "slice:acl_writeability_evidence_slice"
+      ],
+      "failure_class": "acl_writeability",
+      "observed": true
+    },
+    {
+      "evidence_refs": [
+        "artifact:art_8ac124d6_000019",
+        "event:evt_8ac124d6_000014",
+        "slice:broad_read_legacy_consumer_evidence_slice"
+      ],
+      "failure_class": "broad_read_legacy_consumer",
+      "observed": true
+    },
+    {
+      "evidence_refs": [
+        "artifact:art_8ac124d6_000017",
+        "event:evt_8ac124d6_000013",
+        "slice:checkpoint_contradiction_evidence_slice"
+      ],
+      "failure_class": "checkpoint_contradiction",
+      "observed": true
+    },
+    {
+      "evidence_refs": [
+        "artifact:art_8ac124d6_000008",
+        "event:evt_8ac124d6_000009",
+        "slice:commit_hygiene_evidence_slice"
+      ],
+      "failure_class": "commit_hygiene",
+      "observed": true
+    },
+    {
+      "evidence_refs": [
+        "artifact:art_8ac124d6_000020",
+        "event:evt_8ac124d6_000015",
+        "slice:commit_only_routing_evidence_slice"
+      ],
+      "failure_class": "commit_only_routing",
+      "observed": true
+    },
+    {
+      "evidence_refs": [
+        "artifact:art_8ac124d6_000005",
+        "event:evt_8ac124d6_000005",
+        "slice:product_contract_drift_evidence_slice"
+      ],
+      "failure_class": "product_contract_drift",
+      "observed": true
+    },
+    {
+      "evidence_refs": [
+        "artifact:art_8ac124d6_000021",
+        "event:evt_8ac124d6_000016",
+        "slice:queue_recovery_evidence_slice"
+      ],
+      "failure_class": "queue_recovery",
+      "observed": true
+    },
+    {
+      "evidence_refs": [
+        "artifact:art_8ac124d6_000012",
+        "event:evt_8ac124d6_000011",
+        "slice:regroup_overlay_readiness_evidence_slice"
+      ],
+      "failure_class": "regroup_overlay_readiness",
+      "observed": true
+    },
+    {
+      "evidence_refs": [
+        "artifact:art_8ac124d6_000018",
+        "event:evt_8ac124d6_000004",
+        "slice:runtime_provider_evidence_slice"
+      ],
+      "failure_class": "runtime_provider",
+      "observed": true
+    },
+    {
+      "evidence_refs": [
+        "artifact:art_8ac124d6_000015",
+        "slice:stale_projection_evidence_slice"
+      ],
+      "failure_class": "stale_projection",
+      "observed": true
+    },
+    {
+      "evidence_refs": [
+        "artifact:art_8ac124d6_000006",
+        "event:evt_8ac124d6_000007",
+        "slice:worktree_alias_evidence_slice"
+      ],
+      "failure_class": "worktree_alias",
+      "observed": true
+    }
+  ],
+  "schema_version": 1
+}

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 from pathlib import Path
 from typing import Any, Callable
@@ -11,6 +13,7 @@ from iriai_compose import Ask, Feature, Phase, WorkflowRunner, to_str
 from ....models.outputs import (
     Envelope,
     HandoverDoc,
+    ImplementationDAG,
     ImplementationResult,
     Observation,
     ObservationReport,
@@ -28,15 +31,39 @@ from ....roles import (
     user,
     verifier,
 )
-from ..._common import Interview
+from ..._common import Interview, Notify
 from ..._common._helpers import _offload_if_large
+from ..._runner import WorkflowQuiesced
 from .implementation import (
+    DAG_REGROUP_ACTIVE_KEY,
+    DAG_REGROUP_FROM_GROUP,
     WorkflowCommitError,
+    _checkpoint_authorized_repo_sources,
     _commit_repos,
     _commit_repos_in_root,
+    _dag_group_checkpoint_is_fresh,
+    _feature_has_execution_control_legacy_marker,
+    _feature_requires_execution_control_proofs,
+    _generate_and_publish_implementation_report,
     _get_feature_root,
+    _json_object_from_text,
     _make_parallel_actor,
+    _notify_delivery_id,
+    _notify_gate_proof_extra_from_delivery,
+    _post_dag_gate_is_fresh,
+    _post_dag_gate_tree_digest,
+    _put_notify_delivery_record,
+    _push_clones_to_source,
     _record_commit_failure_artifact,
+    _record_implementation_report_workflow_blocker,
+    _record_notify_workflow_blocker,
+    _record_post_dag_gate_proof,
+    _record_source_push_workflow_blocker,
+    _resolve_active_regroup_before_group_dispatch,
+    _source_push_proof_key,
+    _source_push_proof_payload,
+    _source_push_durable_proof_is_fresh,
+    _source_push_proof_records_are_self_consistent,
 )
 
 logger = logging.getLogger(__name__)
@@ -44,6 +71,373 @@ logger = logging.getLogger(__name__)
 # No iteration cap — broad observations like "all E2E tests green" need
 # many RCA→impl→verify cycles.  Managed manually via Slack.
 MAX_FIX_ITERATIONS = 50
+
+_POST_DAG_REQUIRED_GATE_KEYS = (
+    "dag-gate:code-review",
+    "dag-gate:security",
+    "dag-gate:test-authoring",
+    "dag-gate:qa",
+    "dag-gate:integration",
+    "dag-gate:verifier",
+    "dag-gate:source-push",
+    "dag-gate:implementation-report",
+    "dag-gate:notify",
+)
+_POST_TEST_REPUBLISH_PENDING_KEY = "post-test-republish-pending"
+
+_LEGACY_POST_DAG_DERIVED_GATES = frozenset({
+    "source-push",
+    "implementation-report",
+    "notify",
+})
+
+
+async def _current_post_test_tree_digest(
+    runner: WorkflowRunner,
+    feature: Feature,
+) -> str:
+    feature_root = _get_feature_root(runner, feature)
+    authorized_sources = await _checkpoint_authorized_repo_sources(
+        runner,
+        feature,
+        feature_root,
+    )
+    if authorized_sources is None:
+        return _post_dag_gate_tree_digest(runner, feature)
+    return _post_dag_gate_tree_digest(
+        runner,
+        feature,
+        authorized_repos=set(authorized_sources),
+        authorized_source_roots=authorized_sources,
+    )
+
+
+async def _legacy_source_push_gate_status(
+    runner: WorkflowRunner,
+    feature: Feature,
+    current_tree_digest: str,
+) -> str:
+    proof = _source_push_proof_payload(
+        await runner.artifacts.get(_source_push_proof_key(), feature=feature)
+    )
+    if not proof:
+        return "missing"
+    if _get_feature_root(runner, feature) is not None:
+        if await _source_push_durable_proof_is_fresh(
+            runner,
+            feature,
+            current_tree_digest,
+        ):
+            return "satisfied"
+        return "stale"
+    if _source_push_proof_records_are_self_consistent(proof, current_tree_digest):
+        return "satisfied"
+    return "stale"
+
+
+async def _legacy_post_dag_gate_is_satisfied(
+    runner: WorkflowRunner,
+    feature: Feature,
+    gate_name: str,
+    current_tree_digest: str | None = None,
+) -> bool:
+    if gate_name == "source-push":
+        if not current_tree_digest:
+            current_tree_digest = await _current_post_test_tree_digest(runner, feature)
+        return (
+            await _legacy_source_push_gate_status(
+                runner,
+                feature,
+                current_tree_digest,
+            )
+            == "satisfied"
+        )
+    if gate_name == "implementation-report":
+        return bool(
+            await runner.artifacts.get("implementation-report", feature=feature)
+            and await runner.artifacts.get(
+                "implementation-report-metadata",
+                feature=feature,
+            )
+        )
+    if gate_name == "notify":
+        return bool(await runner.artifacts.get("dag-notify-delivery", feature=feature))
+    return False
+
+
+async def _quiesce_post_test_workflow_blocker(
+    runner: WorkflowRunner,
+    feature: Feature,
+    *,
+    reason: str,
+    failure_class: str,
+    failure_type: str,
+    metadata: dict[str, Any],
+) -> None:
+    blocker_payload = {
+        "source": "post-test-observation",
+        "reason": reason,
+        "failure_class": failure_class,
+        "failure_type": failure_type,
+        "route": "workflow_control",
+        "deterministic_workflow_blocker": True,
+        "operator_required": False,
+        **metadata,
+    }
+    await runner.artifacts.put(
+        f"workflow-blocker:post-test:{failure_type}",
+        json.dumps(blocker_payload, indent=2, sort_keys=True),
+        feature=feature,
+    )
+    raise WorkflowQuiesced(
+        phase_name=PostTestObservationPhase.name,
+        reason=reason,
+        metadata={
+            **metadata,
+            "terminal_state": "workflow_blocked",
+            "deterministic_workflow_blocker": True,
+            "operator_required": False,
+            "source": "post-test-observation",
+            "failure_class": failure_class,
+            "failure_type": failure_type,
+            "route": "workflow_control",
+        },
+    )
+
+
+async def _raise_if_dag_incomplete_before_post_test(
+    runner: WorkflowRunner,
+    feature: Feature,
+) -> None:
+    dag_json = await runner.artifacts.get("dag", feature=feature)
+    if not dag_json:
+        return
+    try:
+        dag = ImplementationDAG.model_validate_json(dag_json)
+    except Exception as exc:
+        await _quiesce_post_test_workflow_blocker(
+            runner,
+            feature,
+            reason="post_test_blocked_invalid_dag",
+            failure_class="stale_projection",
+            failure_type="invalid_dag",
+            metadata={"error": str(exc)[:1000]},
+        )
+
+    base_dag_sha256 = hashlib.sha256(
+        dag.model_dump_json().encode("utf-8"),
+    ).hexdigest()
+    regroup_overlay_applied = False
+    active_marker = await runner.artifacts.get(DAG_REGROUP_ACTIVE_KEY, feature=feature)
+    boundary_checkpoint = await runner.artifacts.get(
+        f"dag-group:{DAG_REGROUP_FROM_GROUP}",
+        feature=feature,
+    )
+    if active_marker:
+        probe_group_idx = (
+            DAG_REGROUP_FROM_GROUP + 1
+            if boundary_checkpoint
+            else DAG_REGROUP_FROM_GROUP
+        )
+        effective_dag, failure, observation = await _resolve_active_regroup_before_group_dispatch(
+            runner,
+            feature,
+            dag,
+            group_idx=probe_group_idx,
+        )
+        if failure:
+            await _quiesce_post_test_workflow_blocker(
+                runner,
+                feature,
+                reason="post_test_blocked_dag_regroup_invalid",
+                failure_class="stale_projection",
+                failure_type="dag_regroup_invalid",
+                metadata={
+                    "failure": failure[:2000],
+                    "observation": observation,
+                    "active_marker_key": DAG_REGROUP_ACTIVE_KEY,
+                },
+            )
+        if effective_dag is not None:
+            dag = effective_dag
+            regroup_overlay_applied = True
+
+    missing_groups: list[int] = []
+    for group_idx in range(len(dag.execution_order)):
+        checkpoint = await runner.artifacts.get(
+            f"dag-group:{group_idx}",
+            feature=feature,
+        )
+        if not checkpoint:
+            missing_groups.append(group_idx)
+            if len(missing_groups) >= 20:
+                break
+    if missing_groups:
+        await _quiesce_post_test_workflow_blocker(
+            runner,
+            feature,
+            reason="post_test_blocked_dag_incomplete",
+            failure_class="stale_projection",
+            failure_type="dag_incomplete",
+            metadata={
+                "first_missing_group": missing_groups[0],
+                "missing_group_count_observed": len(missing_groups),
+                "total_group_count": len(dag.execution_order),
+            },
+        )
+
+    current_tree_digest = await _current_post_test_tree_digest(runner, feature)
+    observed_control_plane_proofs = 0
+    control_plane_required = await _post_test_requires_control_plane_proofs(
+        runner,
+        feature,
+    )
+    legacy_marker_present = await _feature_has_execution_control_legacy_marker(
+        runner,
+        feature,
+    )
+    for gate_key in _POST_DAG_REQUIRED_GATE_KEYS:
+        gate_name = gate_key.removeprefix("dag-gate:")
+        proof_key = f"dag-gate-proof:{gate_name}"
+        if await runner.artifacts.get(proof_key, feature=feature):
+            observed_control_plane_proofs += 1
+    legacy_artifact_only_gates = (
+        observed_control_plane_proofs == 0
+        and not control_plane_required
+        and legacy_marker_present
+    )
+    if observed_control_plane_proofs == 0 and not legacy_artifact_only_gates:
+        await _quiesce_post_test_workflow_blocker(
+            runner,
+            feature,
+            reason="post_test_blocked_post_dag_gates_incomplete",
+            failure_class="stale_projection",
+            failure_type="post_dag_gates_incomplete",
+            metadata={
+                "first_missing_gate": _POST_DAG_REQUIRED_GATE_KEYS[0],
+                "missing_gate_count_observed": len(_POST_DAG_REQUIRED_GATE_KEYS),
+                "missing_gates": list(_POST_DAG_REQUIRED_GATE_KEYS),
+                "observed_control_plane_proofs": 0,
+            },
+        )
+
+    missing_gates: list[str] = []
+    stale_gates: list[str] = []
+    for gate_key in _POST_DAG_REQUIRED_GATE_KEYS:
+        gate_name = gate_key.removeprefix("dag-gate:")
+        gate_value = await runner.artifacts.get(gate_key, feature=feature)
+        if legacy_artifact_only_gates and gate_name == "source-push":
+            source_push_status = await _legacy_source_push_gate_status(
+                runner,
+                feature,
+                current_tree_digest,
+            )
+            if source_push_status == "missing":
+                missing_gates.append(gate_key)
+                continue
+            if source_push_status == "stale":
+                stale_gates.append(gate_key)
+                continue
+            if not gate_value:
+                continue
+        if not gate_value:
+            if (
+                legacy_artifact_only_gates
+                and gate_name in _LEGACY_POST_DAG_DERIVED_GATES
+                and await _legacy_post_dag_gate_is_satisfied(
+                    runner,
+                    feature,
+                    gate_name,
+                )
+            ):
+                continue
+            missing_gates.append(gate_key)
+            continue
+        if not legacy_artifact_only_gates and not await _post_dag_gate_is_fresh(
+            runner,
+            feature,
+            gate_name,
+            current_tree_digest,
+        ):
+            stale_gates.append(gate_key)
+    if missing_gates:
+        await _quiesce_post_test_workflow_blocker(
+            runner,
+            feature,
+            reason="post_test_blocked_post_dag_gates_incomplete",
+            failure_class="stale_projection",
+            failure_type="post_dag_gates_incomplete",
+            metadata={
+                "first_missing_gate": missing_gates[0],
+                "missing_gate_count_observed": len(missing_gates),
+                "missing_gates": missing_gates[:20],
+            },
+        )
+    if stale_gates:
+        await _quiesce_post_test_workflow_blocker(
+            runner,
+            feature,
+            reason="post_test_blocked_post_dag_gates_stale",
+            failure_class="stale_projection",
+            failure_type="post_dag_gates_stale",
+            metadata={
+                "first_stale_gate": stale_gates[0],
+                "stale_gate_count_observed": len(stale_gates),
+                "stale_gates": stale_gates[:20],
+                "tree_digest": current_tree_digest,
+            },
+        )
+
+    dag_sha256 = hashlib.sha256(
+        dag.model_dump_json().encode("utf-8"),
+    ).hexdigest()
+    stale_groups: list[int] = []
+    for group_idx, group_task_ids in enumerate(dag.execution_order):
+        checkpoint_raw = await runner.artifacts.get(
+            f"dag-group:{group_idx}",
+            feature=feature,
+        )
+        try:
+            checkpoint = json.loads(checkpoint_raw)
+        except Exception:
+            checkpoint = {}
+        accepted_dag_sha256s = []
+        if regroup_overlay_applied and group_idx < DAG_REGROUP_FROM_GROUP:
+            accepted_dag_sha256s.append(base_dag_sha256)
+        if not await _dag_group_checkpoint_is_fresh(
+            runner,
+            feature,
+            group_idx=group_idx,
+            group_task_ids=list(group_task_ids),
+            dag_sha256=dag_sha256,
+            checkpoint=checkpoint,
+            accepted_dag_sha256s=accepted_dag_sha256s,
+        ):
+            stale_groups.append(group_idx)
+            if len(stale_groups) >= 20:
+                break
+    if stale_groups:
+        await _quiesce_post_test_workflow_blocker(
+            runner,
+            feature,
+            reason="post_test_blocked_dag_checkpoint_stale",
+            failure_class="stale_projection",
+            failure_type="dag_checkpoint_stale",
+            metadata={
+                "first_stale_group": stale_groups[0],
+                "stale_group_count_observed": len(stale_groups),
+                "stale_groups": stale_groups[:20],
+                "total_group_count": len(dag.execution_order),
+                "dag_sha256": dag_sha256,
+            },
+        )
+
+
+async def _post_test_requires_control_plane_proofs(
+    runner: WorkflowRunner,
+    feature: Feature,
+) -> bool:
+    return await _feature_requires_execution_control_proofs(runner, feature)
 
 
 async def _commit_observation_repos(
@@ -79,6 +473,410 @@ async def _commit_observation_repos(
             "Observation fix cannot continue because pre-commit/husky failed; "
             f"see `{artifact_key}` for hook output."
         ) from exc
+
+
+def _post_test_observation_id(result: dict[str, Any]) -> str:
+    obs = result.get("observation")
+    return str(getattr(obs, "id", "") or result.get("id") or "observation").strip()
+
+
+def _json_safe_post_test_result(result: dict[str, Any]) -> dict[str, Any]:
+    entry: dict[str, Any] = {}
+    obs = result.get("observation")
+    obs_id = _post_test_observation_id(result)
+    if obs_id:
+        entry["id"] = obs_id
+    if isinstance(obs, Observation):
+        entry["observation"] = obs.model_dump(mode="json")
+    elif isinstance(obs, dict):
+        entry["observation"] = obs
+    for key, value in result.items():
+        if key == "observation":
+            continue
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            entry[key] = value
+            continue
+        if hasattr(value, "model_dump"):
+            entry[key] = value.model_dump(mode="json")
+            continue
+        if isinstance(value, (list, dict)):
+            try:
+                json.dumps(value)
+            except TypeError:
+                entry[key] = str(value)
+            else:
+                entry[key] = value
+            continue
+        entry[key] = str(value)
+    return entry
+
+
+def _restore_post_test_result(result: Any) -> dict[str, Any]:
+    if not isinstance(result, dict):
+        return {"id": "observation", "status": "ERROR", "summary": str(result)}
+    restored = dict(result)
+    obs = restored.get("observation")
+    if isinstance(obs, dict):
+        try:
+            restored["observation"] = Observation.model_validate(obs)
+        except Exception:
+            restored.setdefault("id", obs.get("id") or "observation")
+    return restored
+
+
+def _post_test_republish_pending_payload(
+    *,
+    cycle: int,
+    checkpoint_key: str,
+    flat_results: list[dict[str, Any]],
+    prior_fix_summary: str,
+    all_decisions: list[str],
+    cycle_history: str,
+) -> dict[str, Any]:
+    return {
+        "artifact_schema": "post-test-republish-pending-v1",
+        "cycle": cycle,
+        "checkpoint_key": checkpoint_key,
+        "flat_results": [
+            _json_safe_post_test_result(result)
+            for result in flat_results
+        ],
+        "prior_fix_summary": prior_fix_summary,
+        "observation_decisions": list(all_decisions),
+        "cycle_history": cycle_history,
+    }
+
+
+async def _persist_post_test_cycle_completion(
+    runner: WorkflowRunner,
+    feature: Feature,
+    payload: dict[str, Any],
+) -> None:
+    cycle = int(payload.get("cycle") or 0)
+    checkpoint_key = str(payload.get("checkpoint_key") or f"observations-checkpoint:{cycle}")
+    prior_fix_summary = str(payload.get("prior_fix_summary") or "")
+    decisions = payload.get("observation_decisions")
+    if not isinstance(decisions, list):
+        decisions = []
+
+    await runner.artifacts.put("observations", prior_fix_summary, feature=feature)
+    await runner.artifacts.put(checkpoint_key, "", feature=feature)
+    await runner.artifacts.put(
+        "observation-cycle-counter", str(cycle), feature=feature,
+    )
+    await runner.artifacts.put(
+        "observation-decisions", json.dumps(decisions), feature=feature,
+    )
+    cycle_history = str(payload.get("cycle_history") or "")
+    if cycle_history:
+        existing_history = (
+            await runner.artifacts.get("observation-history", feature=feature) or ""
+        )
+        if cycle_history not in existing_history:
+            await runner.artifacts.put(
+                "observation-history",
+                existing_history + cycle_history,
+                feature=feature,
+            )
+
+
+async def _store_post_test_republish_pending(
+    runner: WorkflowRunner,
+    feature: Feature,
+    payload: dict[str, Any],
+) -> None:
+    await runner.artifacts.put(
+        _POST_TEST_REPUBLISH_PENDING_KEY,
+        json.dumps(payload, indent=2, sort_keys=True),
+        feature=feature,
+    )
+    await _persist_post_test_cycle_completion(runner, feature, payload)
+
+
+async def _resume_pending_post_test_republish(
+    runner: WorkflowRunner,
+    feature: Feature,
+) -> bool:
+    raw = await runner.artifacts.get(_POST_TEST_REPUBLISH_PENDING_KEY, feature=feature)
+    if not raw or not str(raw).strip():
+        return False
+    try:
+        payload = json.loads(raw)
+    except Exception:
+        await _quiesce_post_test_workflow_blocker(
+            runner,
+            feature,
+            reason="post_test_blocked_republish_pending_unreadable",
+            failure_class="stale_projection",
+            failure_type="post_test_republish_pending_unreadable",
+            metadata={},
+        )
+        return True
+    if not isinstance(payload, dict):
+        await _quiesce_post_test_workflow_blocker(
+            runner,
+            feature,
+            reason="post_test_blocked_republish_pending_unreadable",
+            failure_class="stale_projection",
+            failure_type="post_test_republish_pending_unreadable",
+            metadata={},
+        )
+        return True
+    await _persist_post_test_cycle_completion(runner, feature, payload)
+    flat_results = [
+        _restore_post_test_result(result)
+        for result in payload.get("flat_results") or []
+    ]
+    await _republish_post_test_fixes(
+        runner,
+        feature,
+        cycle=int(payload.get("cycle") or 0),
+        flat_results=flat_results,
+        prior_fix_summary=str(payload.get("prior_fix_summary") or ""),
+    )
+    await runner.artifacts.put(_POST_TEST_REPUBLISH_PENDING_KEY, "", feature=feature)
+    return True
+
+
+def _handover_from_post_test_results(
+    *,
+    cycle: int,
+    flat_results: list[dict[str, Any]],
+    prior_fix_summary: str,
+) -> HandoverDoc:
+    handover = HandoverDoc(
+        summary_of_prior_work=(
+            f"Post-test observation cycle {cycle} refreshed the implementation "
+            "after downstream source-push/report/notify gates had already run."
+        ),
+        notes=prior_fix_summary,
+    )
+    for result in flat_results:
+        obs_id = _post_test_observation_id(result)
+        summary = str(result.get("summary") or result.get("status") or "").strip()
+        if result.get("status") == "FIXED":
+            handover.record_success(
+                ImplementationResult(
+                    task_id=f"post-test:{obs_id}",
+                    summary=summary or f"Resolved post-test observation {obs_id}.",
+                )
+            )
+        elif result.get("status") in {"UNRESOLVED", "ERROR", "BLOCKED"}:
+            handover.record_failure(
+                task_id=f"post-test:{obs_id}",
+                summary=summary or f"Post-test observation {obs_id} did not resolve.",
+                failure_reason=str(result.get("status") or "unresolved"),
+            )
+    return handover
+
+
+async def _republish_post_test_fixes(
+    runner: WorkflowRunner,
+    feature: Feature,
+    *,
+    cycle: int,
+    flat_results: list[dict[str, Any]],
+    prior_fix_summary: str,
+) -> None:
+    fixed_results = [result for result in flat_results if result.get("status") == "FIXED"]
+    if not fixed_results:
+        return
+
+    tree_digest = await _current_post_test_tree_digest(runner, feature)
+    if not await _post_dag_gate_is_fresh(runner, feature, "source-push", tree_digest):
+        try:
+            await _push_clones_to_source(runner, feature, tree_digest=tree_digest)
+        except Exception as exc:
+            blocker = await _record_source_push_workflow_blocker(
+                runner,
+                feature,
+                reason=f"{type(exc).__name__}: {exc}",
+                tree_digest_before=tree_digest,
+                failure_type="post_test_source_push_failed",
+            )
+            raise WorkflowQuiesced(
+                phase_name=PostTestObservationPhase.name,
+                reason=blocker,
+                metadata={
+                    "terminal_state": "workflow_blocked",
+                    "deterministic_workflow_blocker": True,
+                    "operator_required": False,
+                    "source": "post-test-source-push",
+                    "failure_class": "runtime_context",
+                    "failure_type": "post_test_source_push_failed",
+                    "route": "quiesce_workflow",
+                },
+            ) from exc
+        post_push_tree_digest = await _current_post_test_tree_digest(runner, feature)
+        if post_push_tree_digest != tree_digest:
+            blocker = await _record_source_push_workflow_blocker(
+                runner,
+                feature,
+                reason="post-test source push changed the post-DAG tree digest",
+                tree_digest_before=tree_digest,
+                tree_digest_after=post_push_tree_digest,
+                failure_type="post_test_source_push_stale_gate_digest",
+            )
+            raise WorkflowQuiesced(
+                phase_name=PostTestObservationPhase.name,
+                reason=blocker,
+                metadata={
+                    "terminal_state": "workflow_blocked",
+                    "deterministic_workflow_blocker": True,
+                    "operator_required": False,
+                    "source": "post-test-source-push",
+                    "failure_class": "runtime_context",
+                    "failure_type": "post_test_source_push_stale_gate_digest",
+                    "route": "quiesce_workflow",
+                },
+            )
+        await runner.artifacts.put("dag-gate:source-push", "approved", feature=feature)
+        await _record_post_dag_gate_proof(runner, feature, "source-push", tree_digest)
+
+    handover = _handover_from_post_test_results(
+        cycle=cycle,
+        flat_results=flat_results,
+        prior_fix_summary=prior_fix_summary,
+    )
+    verdict = Verdict(
+        approved=True,
+        summary=f"Post-test observation cycle {cycle} fixes were verified.",
+    )
+    test_result = ImplementationResult(
+        task_id=f"post-test-cycle-{cycle}",
+        summary=prior_fix_summary or "Post-test observation fixes were verified.",
+    )
+    try:
+        report_url, backlog_url, backlog = await _generate_and_publish_implementation_report(
+            runner,
+            feature,
+            tree_digest=tree_digest,
+            handover=handover,
+            verdicts={"post_test_observation": verdict},
+            prior_attempts=[],
+            test_result=test_result,
+        )
+    except Exception as exc:
+        blocker = await _record_implementation_report_workflow_blocker(
+            runner,
+            feature,
+            reason=f"{type(exc).__name__}: {exc}",
+            tree_digest=tree_digest,
+            failure_type="post_test_implementation_report_failed",
+        )
+        raise WorkflowQuiesced(
+            phase_name=PostTestObservationPhase.name,
+            reason=blocker,
+            metadata={
+                "terminal_state": "workflow_blocked",
+                "deterministic_workflow_blocker": True,
+                "operator_required": False,
+                "source": "post-test-implementation-report",
+                "failure_class": "runtime_context",
+                "failure_type": "post_test_implementation_report_failed",
+                "route": "quiesce_workflow",
+            },
+        ) from exc
+
+    notification = "Post-test observations resolved. Implementation report refreshed."
+    if report_url:
+        notification += f"\n\n**[View Implementation Report]({report_url})**"
+    if backlog_url:
+        notification += (
+            f"\n\n**[View Enhancement Backlog]({backlog_url})** "
+            f"({len(backlog.items)} items deferred)"
+        )
+    delivery_id = _notify_delivery_id(feature, tree_digest, notification)
+    existing_delivery = _json_object_from_text(
+        await runner.artifacts.get("dag-notify-delivery", feature=feature)
+    )
+    delivery_matches = (
+        existing_delivery.get("delivery_id") == delivery_id
+        and existing_delivery.get("tree_digest") == tree_digest
+    )
+    if delivery_matches and existing_delivery.get("status") == "sent":
+        notify_gate_extra = _notify_gate_proof_extra_from_delivery(existing_delivery)
+    elif delivery_matches and existing_delivery.get("status") == "pending":
+        blocker = await _record_notify_workflow_blocker(
+            runner,
+            feature,
+            reason=(
+                "previous post-test notify delivery is pending; external Slack "
+                "send outcome cannot be proven after restart"
+            ),
+            tree_digest=tree_digest,
+            delivery_id=delivery_id,
+        )
+        raise WorkflowQuiesced(
+            phase_name=PostTestObservationPhase.name,
+            reason=blocker,
+            metadata={
+                "terminal_state": "workflow_blocked",
+                "deterministic_workflow_blocker": True,
+                "operator_required": False,
+                "source": "post-test-notify",
+                "failure_class": "runtime_context",
+                "failure_type": "post_test_notify_delivery_ambiguous",
+                "route": "quiesce_workflow",
+            },
+        )
+    else:
+        await _put_notify_delivery_record(
+            runner,
+            feature,
+            delivery_id=delivery_id,
+            tree_digest=tree_digest,
+            notification=notification,
+            status="pending",
+        )
+        try:
+            await runner.run(
+                Notify(message=notification, delivery_id=delivery_id),
+                feature,
+                phase_name=PostTestObservationPhase.name,
+            )
+        except Exception as exc:
+            blocker = await _record_notify_workflow_blocker(
+                runner,
+                feature,
+                reason=f"{type(exc).__name__}: {exc}",
+                tree_digest=tree_digest,
+                delivery_id=delivery_id,
+                failure_type="post_test_notify_delivery_failed",
+            )
+            raise WorkflowQuiesced(
+                phase_name=PostTestObservationPhase.name,
+                reason=blocker,
+                metadata={
+                    "terminal_state": "workflow_blocked",
+                    "deterministic_workflow_blocker": True,
+                    "operator_required": False,
+                    "source": "post-test-notify",
+                    "failure_class": "runtime_context",
+                    "failure_type": "post_test_notify_delivery_failed",
+                    "route": "quiesce_workflow",
+                },
+            ) from exc
+        await _put_notify_delivery_record(
+            runner,
+            feature,
+            delivery_id=delivery_id,
+            tree_digest=tree_digest,
+            notification=notification,
+            status="sent",
+        )
+        notify_gate_extra = {
+            "delivery_id": delivery_id,
+            "notification_sha256": hashlib.sha256(notification.encode("utf-8")).hexdigest(),
+        }
+    await runner.artifacts.put("dag-gate:notify", "approved", feature=feature)
+    await _record_post_dag_gate_proof(
+        runner,
+        feature,
+        "notify",
+        tree_digest,
+        extra=notify_gate_extra,
+    )
 
 
 # Live testing instructions for verify prompts — extracted from
@@ -469,6 +1267,28 @@ async def _dispatch_observation(
     handover = HandoverDoc()
     feature_root = workspace_root or _get_feature_root(runner, feature)
     actor_builder = actor_factory or _make_parallel_actor
+    write_agents_require_sandbox = (
+        await _post_test_requires_control_plane_proofs(runner, feature)
+    )
+    write_workspace_path = (
+        None
+        if write_agents_require_sandbox
+        else str(feature_root) if feature_root else None
+    )
+
+    def _actor_kwargs(
+        *,
+        runtime: str | None,
+        workspace_path: str | None,
+        sandbox_required: bool = False,
+    ) -> dict[str, Any]:
+        kwargs: dict[str, Any] = {"runtime": runtime}
+        if workspace_path:
+            kwargs["workspace_path"] = workspace_path
+        if sandbox_required:
+            kwargs["sandbox_required"] = True
+        return kwargs
+
     ws_hint = (
         f"\n\n### Workspace\nFeature repos at: `{feature_root}`\n"
         if feature_root else ""
@@ -516,8 +1336,10 @@ async def _dispatch_observation(
                 actor=actor_builder(
                     root_cause_analyst,
                     f"obs-rca-symptoms-{obs.id}",
-                    runtime=rca_runtime,
-                    workspace_path=str(feature_root) if feature_root else None,
+                    **_actor_kwargs(
+                        runtime=rca_runtime,
+                        workspace_path=str(feature_root) if feature_root else None,
+                    ),
                 ),
                 prompt=_build_rca_prompt(obs, observation_context, ws_hint, prior_context,
                                          lens="symptoms"),
@@ -527,8 +1349,10 @@ async def _dispatch_observation(
                 actor=actor_builder(
                     root_cause_analyst,
                     f"obs-rca-architecture-{obs.id}",
-                    runtime=rca_runtime,
-                    workspace_path=str(feature_root) if feature_root else None,
+                    **_actor_kwargs(
+                        runtime=rca_runtime,
+                        workspace_path=str(feature_root) if feature_root else None,
+                    ),
                 ),
                 prompt=_build_rca_prompt(obs, observation_context, ws_hint, prior_context,
                                          lens="architecture"),
@@ -537,22 +1361,41 @@ async def _dispatch_observation(
         ], feature)
         rca = _merge_rca(rca_symptoms, rca_architecture)
 
-        # 2. Fix/Implement (no workspace_path — inherits worktree_root
-        # = full feature root for cross-repo access)
-        impl_result: ImplementationResult = await runner.run(
-            Ask(
-                actor=actor_builder(
-                    implementer,
-                    f"obs-impl-{obs.id}",
-                    runtime=implement_runtime,
-                    workspace_path=str(feature_root) if feature_root else None,
+        # 2. Fix/Implement. Legacy features use the feature worktree; adopted
+        # control-plane features fail closed unless a sandbox binding is present.
+        try:
+            impl_result: ImplementationResult = await runner.run(
+                Ask(
+                    actor=actor_builder(
+                        implementer,
+                        f"obs-impl-{obs.id}",
+                        **_actor_kwargs(
+                            runtime=implement_runtime,
+                            workspace_path=write_workspace_path,
+                            sandbox_required=write_agents_require_sandbox,
+                        ),
+                    ),
+                    prompt=_build_fix_prompt(obs, rca, observation_context, prior_context),
+                    output_type=ImplementationResult,
                 ),
-                prompt=_build_fix_prompt(obs, rca, observation_context, prior_context),
-                output_type=ImplementationResult,
-            ),
-            feature,
-            phase_name=phase_name,
-        )
+                feature,
+                phase_name=phase_name,
+            )
+        except RuntimeError as exc:
+            if write_agents_require_sandbox and "Runtime workspace binding required" in str(exc):
+                await _quiesce_post_test_workflow_blocker(
+                    runner,
+                    feature,
+                    reason="post_test_blocked_runtime_workspace_binding_missing",
+                    failure_class="sandbox_binding",
+                    failure_type="runtime_workspace_binding_missing",
+                    metadata={
+                        "observation_id": obs.id,
+                        "actor_role": "implementer",
+                        "error": str(exc)[:1000],
+                    },
+                )
+            raise
         await _commit_observation_repos(
             runner,
             feature,
@@ -565,20 +1408,39 @@ async def _dispatch_observation(
         # 3. Write tests (requirement + missing_test categories only)
         test_result: ImplementationResult | None = None
         if obs.category in ("requirement", "missing_test"):
-            test_result = await runner.run(
-                Ask(
-                    actor=actor_builder(
-                        test_author,
-                        f"obs-test-{obs.id}",
-                        runtime=test_runtime,
-                        workspace_path=str(feature_root) if feature_root else None,
+            try:
+                test_result = await runner.run(
+                    Ask(
+                        actor=actor_builder(
+                            test_author,
+                            f"obs-test-{obs.id}",
+                            **_actor_kwargs(
+                                runtime=test_runtime,
+                                workspace_path=write_workspace_path,
+                                sandbox_required=write_agents_require_sandbox,
+                            ),
+                        ),
+                        prompt=_build_test_prompt(obs, impl_result, observation_context, prior_context),
+                        output_type=ImplementationResult,
                     ),
-                    prompt=_build_test_prompt(obs, impl_result, observation_context, prior_context),
-                    output_type=ImplementationResult,
-                ),
-                feature,
-                phase_name=phase_name,
-            )
+                    feature,
+                    phase_name=phase_name,
+                )
+            except RuntimeError as exc:
+                if write_agents_require_sandbox and "Runtime workspace binding required" in str(exc):
+                    await _quiesce_post_test_workflow_blocker(
+                        runner,
+                        feature,
+                        reason="post_test_blocked_runtime_workspace_binding_missing",
+                        failure_class="sandbox_binding",
+                        failure_type="runtime_workspace_binding_missing",
+                        metadata={
+                            "observation_id": obs.id,
+                            "actor_role": "test_author",
+                            "error": str(exc)[:1000],
+                        },
+                    )
+                raise
             await _commit_observation_repos(
                 runner,
                 feature,
@@ -594,8 +1456,10 @@ async def _dispatch_observation(
                 actor=actor_builder(
                     verifier,
                     f"obs-verify-{obs.id}",
-                    runtime=verify_runtime,
-                    workspace_path=str(feature_root) if feature_root else None,
+                    **_actor_kwargs(
+                        runtime=verify_runtime,
+                        workspace_path=str(feature_root) if feature_root else None,
+                    ),
                 ),
                 prompt=_build_verify_prompt(obs, impl_result, test_result, observation_context),
                 output_type=Verdict,
@@ -659,6 +1523,9 @@ class PostTestObservationPhase(Phase):
         feature_root = _get_feature_root(runner, feature)
         if feature_root:
             runner.services["worktree_root"] = feature_root
+
+        await _resume_pending_post_test_republish(runner, feature)
+        await _raise_if_dag_incomplete_before_post_test(runner, feature)
 
         # ── Restore state from prior cycles on resume ────────────
         # Pattern: implementation.py:408-418 restores prior_attempts
@@ -782,6 +1649,8 @@ class PostTestObservationPhase(Phase):
                         result = await _dispatch_observation(
                             runner, feature, obs, observation_context, self.name,
                         )
+                    except WorkflowQuiesced:
+                        raise
                     except Exception as exc:
                         err_msg = str(exc).lower()
                         if "prompt too long" in err_msg or "input too long" in err_msg:
@@ -822,20 +1691,6 @@ class PostTestObservationPhase(Phase):
             # rebuild_state can recover if the phase crashes mid-cycle.
             prior_fix_summary = _build_fix_summary(flat_results)
             state.observations = prior_fix_summary
-            await runner.artifacts.put("observations", state.observations, feature=feature)
-
-            # Clear the interview checkpoint now that dispatch is complete.
-            await runner.artifacts.put(checkpoint_key, "", feature=feature)
-
-            # Persist cycle counter + decisions so resume skips completed
-            # cycles and restores clarification decisions.
-            import json as _json
-            await runner.artifacts.put(
-                "observation-cycle-counter", str(cycle), feature=feature,
-            )
-            await runner.artifacts.put(
-                "observation-decisions", _json.dumps(all_decisions), feature=feature,
-            )
 
             # Append to cumulative history so the next cycle's interviewer
             # knows what was observed and fixed in ALL prior cycles.
@@ -844,14 +1699,38 @@ class PostTestObservationPhase(Phase):
                 f"### Observations Reported\n{report_text}\n\n"
                 f"### Fix Results\n{prior_fix_summary}\n\n"
             )
-            existing_history = (
-                await runner.artifacts.get("observation-history", feature=feature) or ""
+            completion_payload = _post_test_republish_pending_payload(
+                cycle=cycle,
+                checkpoint_key=checkpoint_key,
+                flat_results=flat_results,
+                prior_fix_summary=prior_fix_summary,
+                all_decisions=all_decisions,
+                cycle_history=cycle_history,
             )
-            await runner.artifacts.put(
-                "observation-history",
-                existing_history + cycle_history,
-                feature=feature,
-            )
+            if any(result.get("status") == "FIXED" for result in flat_results):
+                await _store_post_test_republish_pending(
+                    runner,
+                    feature,
+                    completion_payload,
+                )
+                await _republish_post_test_fixes(
+                    runner,
+                    feature,
+                    cycle=cycle,
+                    flat_results=flat_results,
+                    prior_fix_summary=prior_fix_summary,
+                )
+                await runner.artifacts.put(
+                    _POST_TEST_REPUBLISH_PENDING_KEY,
+                    "",
+                    feature=feature,
+                )
+            else:
+                await _persist_post_test_cycle_completion(
+                    runner,
+                    feature,
+                    completion_payload,
+                )
 
             logger.info("Cycle %d complete: %s", cycle, prior_fix_summary[:200])
 

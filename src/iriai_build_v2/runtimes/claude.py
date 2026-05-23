@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import contextvars
+import json
 import logging
 import os
 from contextlib import asynccontextmanager
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel
@@ -25,6 +28,7 @@ _current_invocation_var: contextvars.ContextVar[str | None] = contextvars.Contex
 # ── Write-isolation callback ───────────────────────────────────────────
 # Tools that can create or modify files on disk.
 _WRITE_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
+_WRITE_PRODUCING_TOOLS = _WRITE_TOOLS | {"Bash"}
 # File-path parameter name per tool.
 _PATH_PARAMS: dict[str, str] = {
     "Edit": "file_path",
@@ -32,9 +36,294 @@ _PATH_PARAMS: dict[str, str] = {
     "MultiEdit": "file_path",
     "NotebookEdit": "file_path",
 }
+_RUNTIME_WORKSPACE_BINDING_KEY = "runtime_workspace_binding"
 
 
-def _make_write_guard(allowed_dir: str) -> Any:
+def _as_string_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        text = value.strip()
+        return [text] if text else []
+    if isinstance(value, (list, tuple, set)):
+        return [str(item) for item in value if str(item).strip()]
+    return []
+
+
+def _runtime_workspace_binding(role: Any) -> dict[str, Any] | None:
+    raw = (getattr(role, "metadata", None) or {}).get(_RUNTIME_WORKSPACE_BINDING_KEY)
+    if hasattr(raw, "model_dump"):
+        raw = raw.model_dump(mode="json")
+    if not isinstance(raw, Mapping):
+        return None
+    return dict(raw)
+
+
+def _role_is_write_producing(role: Any) -> bool:
+    tools = {str(tool) for tool in (getattr(role, "tools", None) or [])}
+    return bool(
+        tools & _WRITE_PRODUCING_TOOLS
+        or (getattr(role, "metadata", None) or {}).get("write_producing")
+    )
+
+
+def _path_is_under(path: str, root: str) -> bool:
+    return path == root or path.startswith(root + os.sep)
+
+
+def _path_is_relative_to(path: Path, root: Path) -> bool:
+    try:
+        path.resolve(strict=False).relative_to(root.resolve(strict=False))
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def _path_has_symlink_component(path: Path) -> bool:
+    current = Path(path.anchor) if path.is_absolute() else Path()
+    parts = path.parts[1:] if path.is_absolute() else path.parts
+    for part in parts:
+        current = current / part
+        try:
+            if current.is_symlink():
+                return True
+        except OSError:
+            return True
+    return False
+
+
+def _as_path_list(value: Any) -> list[Path]:
+    if value is None:
+        return []
+    if isinstance(value, (str, Path)):
+        text = str(value).strip()
+        return [Path(text).expanduser()] if text else []
+    if isinstance(value, (list, tuple, set)):
+        return [Path(str(item)).expanduser() for item in value if str(item).strip()]
+    return []
+
+
+@dataclass(frozen=True)
+class _RuntimeWorkspaceAuthority:
+    cwd: Path
+    sandbox_root: Path
+    writable_roots: tuple[Path, ...]
+    blocked_roots: tuple[Path, ...]
+
+
+def _existing_absolute_path(
+    value: Any,
+    *,
+    role_name: str,
+    label: str,
+    directory: bool,
+    reject_symlinks: bool,
+) -> Path:
+    text = str(value or "").strip()
+    if not text:
+        raise RuntimeError(f"Bound Claude write role {role_name} is missing {label}")
+    path = Path(text).expanduser()
+    if not path.is_absolute():
+        raise RuntimeError(f"Bound Claude write role {role_name} {label} must be absolute")
+    if not path.exists():
+        raise RuntimeError(f"Bound Claude write role {role_name} {label} does not exist")
+    if directory and not path.is_dir():
+        raise RuntimeError(f"Bound Claude write role {role_name} {label} is not a directory")
+    if not directory and not path.is_file():
+        raise RuntimeError(f"Bound Claude write role {role_name} {label} is not a file")
+    if reject_symlinks and _path_has_symlink_component(path):
+        raise RuntimeError(f"Bound Claude write role {role_name} {label} is symlinked")
+    return path
+
+
+def _resolve_root_path(
+    value: Any,
+    *,
+    role_name: str,
+    label: str,
+    sandbox_root: Path | None,
+    require_existing: bool,
+    allow_external: bool = False,
+) -> Path:
+    path = Path(str(value)).expanduser()
+    if not path.is_absolute():
+        raise RuntimeError(f"Bound Claude write role {role_name} {label} must be absolute")
+    if require_existing and not path.exists():
+        raise RuntimeError(f"Bound Claude write role {role_name} {label} does not exist")
+    if path.exists() and _path_has_symlink_component(path):
+        raise RuntimeError(f"Bound Claude write role {role_name} {label} is symlinked")
+    resolved = path.resolve(strict=False)
+    if sandbox_root is not None and not allow_external and not _path_is_relative_to(resolved, sandbox_root):
+        raise RuntimeError(f"Bound Claude write role {role_name} {label} is outside sandbox root")
+    return resolved
+
+
+def _resolve_root_list(
+    value: Any,
+    *,
+    role_name: str,
+    label: str,
+    sandbox_root: Path | None,
+    require_existing: bool,
+    allow_external: bool = False,
+) -> list[Path]:
+    return [
+        _resolve_root_path(
+            item,
+            role_name=role_name,
+            label=label,
+            sandbox_root=sandbox_root,
+            require_existing=require_existing,
+            allow_external=allow_external,
+        )
+        for item in _as_path_list(value)
+    ]
+
+
+def _validate_runtime_workspace_binding(
+    binding: Mapping[str, Any],
+    *,
+    role_name: str,
+    expected_runtime: str,
+    workspace_path: Any | None = None,
+) -> _RuntimeWorkspaceAuthority:
+    if str(binding.get("runtime") or "") != expected_runtime:
+        raise RuntimeError(
+            f"Bound Claude write role {role_name} binding runtime must be {expected_runtime}"
+        )
+
+    cwd = _existing_absolute_path(
+        binding.get("cwd"),
+        role_name=role_name,
+        label="binding cwd",
+        directory=True,
+        reject_symlinks=True,
+    )
+    if workspace_path is not None:
+        workspace = _existing_absolute_path(
+            workspace_path,
+            role_name=role_name,
+            label="workspace cwd",
+            directory=True,
+            reject_symlinks=True,
+        )
+        if workspace.resolve(strict=True) != cwd.resolve(strict=True):
+            raise RuntimeError(
+                f"Bound Claude write role {role_name} workspace does not match binding cwd"
+            )
+
+    workspace_override = str(binding.get("workspace_override") or "").strip()
+    if workspace_override:
+        override = _existing_absolute_path(
+            workspace_override,
+            role_name=role_name,
+            label="workspace_override",
+            directory=True,
+            reject_symlinks=True,
+        )
+        if override.resolve(strict=True) != cwd.resolve(strict=True):
+            raise RuntimeError(
+                f"Bound Claude write role {role_name} workspace override does not match binding cwd"
+            )
+
+    manifest_path = _existing_absolute_path(
+        binding.get("manifest_path"),
+        role_name=role_name,
+        label="sandbox manifest",
+        directory=False,
+        reject_symlinks=True,
+    )
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            f"Bound Claude write role {role_name} has unreadable sandbox manifest"
+        ) from exc
+    if not isinstance(manifest, Mapping):
+        raise RuntimeError(f"Bound Claude write role {role_name} has invalid sandbox manifest")
+
+    binding_sandbox_id = str(binding.get("sandbox_id") or "")
+    manifest_sandbox_id = str(manifest.get("sandbox_id") or "")
+    if binding_sandbox_id and manifest_sandbox_id and binding_sandbox_id != manifest_sandbox_id:
+        raise RuntimeError(
+            f"Bound Claude write role {role_name} binding sandbox_id does not match manifest"
+        )
+
+    sandbox_root = _existing_absolute_path(
+        manifest.get("root"),
+        role_name=role_name,
+        label="sandbox root",
+        directory=True,
+        reject_symlinks=True,
+    )
+    if not _path_is_relative_to(manifest_path, sandbox_root):
+        raise RuntimeError(f"Bound Claude write role {role_name} manifest is outside sandbox root")
+    if not _path_is_relative_to(cwd, sandbox_root):
+        raise RuntimeError(f"Bound Claude write role {role_name} cwd is outside sandbox root")
+
+    manifest_writable_roots = _resolve_root_list(
+        manifest.get("writable_roots"),
+        role_name=role_name,
+        label="writable root",
+        sandbox_root=sandbox_root,
+        require_existing=False,
+    )
+    binding_writable_roots = _resolve_root_list(
+        binding.get("writable_roots"),
+        role_name=role_name,
+        label="binding writable root",
+        sandbox_root=sandbox_root,
+        require_existing=False,
+    )
+    writable_roots = manifest_writable_roots or binding_writable_roots
+    if not writable_roots:
+        raise RuntimeError(f"Bound Claude write role {role_name} requires writable roots")
+    if binding_writable_roots and set(binding_writable_roots) != set(writable_roots):
+        raise RuntimeError(
+            f"Bound Claude write role {role_name} binding writable roots do not match manifest"
+        )
+    if not any(_path_is_relative_to(cwd, root) for root in writable_roots):
+        raise RuntimeError(f"Bound Claude write role {role_name} cwd is outside writable roots")
+
+    blocked_roots = tuple(
+        dict.fromkeys(
+            [
+                *_resolve_root_list(
+                    manifest.get("blocked_roots"),
+                    role_name=role_name,
+                    label="blocked root",
+                    sandbox_root=None,
+                    require_existing=False,
+                    allow_external=True,
+                ),
+                *_resolve_root_list(
+                    binding.get("blocked_roots"),
+                    role_name=role_name,
+                    label="binding blocked root",
+                    sandbox_root=None,
+                    require_existing=False,
+                    allow_external=True,
+                ),
+            ]
+        )
+    )
+    if any(_path_is_relative_to(cwd, blocked) for blocked in blocked_roots):
+        raise RuntimeError(f"Bound Claude write role {role_name} cwd is under a blocked binding root")
+
+    return _RuntimeWorkspaceAuthority(
+        cwd=cwd.resolve(strict=True),
+        sandbox_root=sandbox_root.resolve(strict=True),
+        writable_roots=tuple(writable_roots),
+        blocked_roots=blocked_roots,
+    )
+
+
+def _make_write_guard(
+    allowed_dir: str,
+    *,
+    allowed_roots: list[str] | None = None,
+    blocked_roots: list[str] | None = None,
+) -> Any:
     """Return an async ``can_use_tool`` callback that denies writes outside *allowed_dir*.
 
     Reads (Glob, Grep, Read, Bash without mutations) are unrestricted.
@@ -43,7 +332,26 @@ def _make_write_guard(allowed_dir: str) -> Any:
     """
     from claude_agent_sdk.types import PermissionResultAllow, PermissionResultDeny
 
-    resolved_root = os.path.realpath(allowed_dir)
+    resolved_root = os.path.realpath(os.path.expanduser(allowed_dir))
+    raw_allowed_roots = [root for root in (allowed_roots or []) if str(root).strip()]
+    resolved_allowed_roots = {
+        os.path.realpath(os.path.expanduser(root))
+        for root in (raw_allowed_roots or [allowed_dir])
+        if str(root).strip()
+    }
+    resolved_blocked_roots = {
+        os.path.realpath(os.path.expanduser(root))
+        for root in (blocked_roots or [])
+        if str(root).strip()
+    }
+
+    def _resolve_target(target: str) -> str:
+        expanded = os.path.expanduser(str(target))
+        if os.path.isabs(expanded):
+            candidate = expanded
+        else:
+            candidate = os.path.join(resolved_root, expanded)
+        return os.path.realpath(candidate)
 
     async def _guard(
         tool_name: str,
@@ -63,8 +371,20 @@ def _make_write_guard(allowed_dir: str) -> Any:
                 message=f"Write denied: no {path_key} provided",
             )
 
-        resolved = os.path.realpath(target)
-        if resolved == resolved_root or resolved.startswith(resolved_root + os.sep):
+        resolved = _resolve_target(str(target))
+        if any(_path_is_under(resolved, root) for root in resolved_blocked_roots):
+            logger.warning(
+                "Write guard: blocked %s to %s (blocked root)",
+                tool_name, resolved,
+            )
+            return PermissionResultDeny(
+                message=(
+                    f"Write denied: {target} resolves to a blocked workspace path. "
+                    "All file writes must stay within writable roots."
+                ),
+            )
+
+        if any(_path_is_under(resolved, root) for root in resolved_allowed_roots):
             return PermissionResultAllow()
 
         logger.warning(
@@ -533,15 +853,44 @@ class ClaudeAgentRuntime(AgentRuntime):
         """Construct ClaudeAgentOptions from a role."""
         from claude_agent_sdk import ClaudeAgentOptions
 
-        cwd = str(workspace.path) if workspace else None
+        binding = _runtime_workspace_binding(role)
+        bound_write_role = bool(binding and _role_is_write_producing(role))
+        authority = (
+            _validate_runtime_workspace_binding(
+                binding or {},
+                role_name=role.name,
+                expected_runtime="claude",
+            )
+            if bound_write_role
+            else None
+        )
+        binding_cwd = str(authority.cwd if authority else (binding or {}).get("cwd") or "").strip()
+        cwd = binding_cwd or (str(workspace.path) if workspace else None)
+        if bound_write_role and not cwd:
+            raise RuntimeError(f"Bound Claude write role {role.name} is missing binding cwd")
 
         # Write isolation: use can_use_tool callback to deny Edit/Write
         # outside the workspace.  The sandbox setting only restricts Bash
         # commands (Seatbelt/bubblewrap); Edit/Write bypass it entirely.
         write_guard = None
         sandbox = None
-        if cwd and role.metadata.get("sandbox", True):
-            write_guard = _make_write_guard(cwd)
+        sandbox_requested = bool(role.metadata.get("sandbox", True))
+        if cwd and (sandbox_requested or bound_write_role):
+            writable_roots = (
+                [str(root) for root in authority.writable_roots]
+                if authority is not None
+                else _as_string_list((binding or {}).get("writable_roots"))
+            )
+            blocked_roots = (
+                [str(root) for root in authority.blocked_roots]
+                if authority is not None
+                else _as_string_list((binding or {}).get("blocked_roots"))
+            )
+            write_guard = _make_write_guard(
+                cwd,
+                allowed_roots=writable_roots,
+                blocked_roots=blocked_roots,
+            )
             sandbox = {
                 "enabled": True,
             }
@@ -558,7 +907,7 @@ class ClaudeAgentRuntime(AgentRuntime):
             can_use_tool=write_guard,
         )
 
-        if cwd:
+        if cwd and not bound_write_role:
             options.add_dirs = [os.path.expanduser("~/.npm")]
 
         if "setting_sources" in role.metadata:

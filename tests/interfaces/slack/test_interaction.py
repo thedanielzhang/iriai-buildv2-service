@@ -31,9 +31,14 @@ class MockAdapter:
 
     posted_blocks: list[tuple[str, list[dict], str]] = field(default_factory=list)
     posted_block_kwargs: list[dict[str, Any]] = field(default_factory=list)
+    posted_messages: list[tuple[str, str]] = field(default_factory=list)
     posted_decisions: list[dict] = field(default_factory=list)
     updated_messages: list[dict] = field(default_factory=list)
     opened_modals: list[dict] = field(default_factory=list)
+
+    async def post_message(self, channel, text):
+        self.posted_messages.append((channel, text))
+        return "1234.5678"
 
     async def post_blocks(self, channel, blocks, text, **kwargs):
         self.posted_blocks.append((channel, blocks, text))
@@ -131,6 +136,135 @@ class TestChannelRegistration:
 
 
 class TestInstrumentation:
+    @pytest.mark.asyncio
+    async def test_notify_without_delivery_id_still_drops_missing_channel(self):
+        adapter = MockAdapter()
+        runtime = SlackInteractionRuntime(adapter)
+
+        await runtime.notify(
+            feature_id="missing-feature",
+            phase_name="pm",
+            message="Ready for review",
+        )
+
+        assert adapter.posted_messages == []
+        assert runtime._notification_delivery_ids == set()
+
+    @pytest.mark.asyncio
+    async def test_notify_delivery_id_raises_without_registered_channel(self):
+        adapter = MockAdapter()
+        runtime = SlackInteractionRuntime(adapter)
+
+        with pytest.raises(
+            RuntimeError,
+            match="no Slack channel registered.*delivery-1",
+        ):
+            await runtime.notify(
+                feature_id="missing-feature",
+                phase_name="pm",
+                message="Ready for review",
+                delivery_id="delivery-1",
+            )
+
+        assert adapter.posted_messages == []
+        assert runtime._notification_delivery_ids == set()
+
+    @pytest.mark.asyncio
+    async def test_notify_delivery_id_requires_slack_post_ack(self):
+        class NoAckAdapter(MockAdapter):
+            async def post_message(self, channel, text):
+                self.posted_messages.append((channel, text))
+                return None
+
+        adapter = NoAckAdapter()
+        runtime = SlackInteractionRuntime(adapter)
+        runtime.register_channel("feat-1", "C001")
+
+        with pytest.raises(
+            RuntimeError,
+            match="no Slack message timestamp.*delivery-1",
+        ):
+            await runtime.notify(
+                feature_id="feat-1",
+                phase_name="pm",
+                message="Ready for review",
+                delivery_id="delivery-1",
+            )
+
+        assert adapter.posted_messages == [("C001", "Ready for review")]
+        assert runtime._notification_delivery_ids == set()
+
+    @pytest.mark.asyncio
+    async def test_notify_dedupes_same_delivery_id(self):
+        adapter = MockAdapter()
+        runtime = SlackInteractionRuntime(adapter)
+        runtime.register_channel("feat-1", "C001")
+        feature_store = MockFeatureStore()
+        runtime._feature_store = feature_store
+
+        await runtime.notify(
+            feature_id="feat-1",
+            phase_name="pm",
+            message="Ready for review",
+            delivery_id="delivery-1",
+        )
+        await runtime.notify(
+            feature_id="feat-1",
+            phase_name="pm",
+            message="Ready for review",
+            delivery_id="delivery-1",
+        )
+        await asyncio.sleep(0)
+
+        assert adapter.posted_messages == [("C001", "Ready for review")]
+        assert [event["event_type"] for event in feature_store.events] == [
+            "slack_notification_posted",
+            "slack_notification_deduped",
+        ]
+        deduped = feature_store.events[-1]
+        assert deduped["metadata"] == {
+            "message": "Ready for review",
+            "channel": "C001",
+            "delivery_id": "delivery-1",
+            "feature_id": "feat-1",
+            "phase_name": "pm",
+        }
+
+    @pytest.mark.asyncio
+    async def test_notify_posts_again_for_different_delivery_id(self):
+        adapter = MockAdapter()
+        runtime = SlackInteractionRuntime(adapter)
+        runtime.register_channel("feat-1", "C001")
+        feature_store = MockFeatureStore()
+        runtime._feature_store = feature_store
+
+        await runtime.notify(
+            feature_id="feat-1",
+            phase_name="pm",
+            message="Ready for review",
+            delivery_id="delivery-1",
+        )
+        await runtime.notify(
+            feature_id="feat-1",
+            phase_name="pm",
+            message="Ready for review",
+            delivery_id="delivery-2",
+        )
+        await asyncio.sleep(0)
+
+        assert adapter.posted_messages == [
+            ("C001", "Ready for review"),
+            ("C001", "Ready for review"),
+        ]
+        assert [event["event_type"] for event in feature_store.events] == [
+            "slack_notification_posted",
+            "slack_notification_posted",
+        ]
+        assert [event["metadata"]["delivery_id"] for event in feature_store.events] == [
+            "delivery-1",
+            "delivery-2",
+        ]
+
     @pytest.mark.asyncio
     async def test_gate_action_logs_missing_pending(self):
         runtime = SlackInteractionRuntime(MockAdapter())

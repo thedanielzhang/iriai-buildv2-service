@@ -52,6 +52,7 @@ from ...develop.phases.implementation import (
     _get_feature_root,
     _load_prior_attempts,
     _make_parallel_actor,
+    _parse_ls_remote_head,
     _plan_bug_groups,
     _push_clones_to_source_root,
     _record_commit_failure_artifact,
@@ -133,6 +134,11 @@ _EXECUTION_STATES = frozenset({"running", "recovering", "stalled", "strategy_pen
 _STRATEGY_STATUSES = frozenset({"pending", "decided", "applied"})
 _RECOVERABLE_FAILURE_KINDS = frozenset({"infrastructure", "report-task", "planning-task", "promotion-task", "strategy-task"})
 _EXECUTION_RECOVERY_GRACE_SECONDS = 60
+_SOURCE_PUSH_ALREADY_AT_LOCAL_HEAD_FAILURE_RE = re.compile(
+    r"^failed to push cloned repos to source: "
+    r"[^;]+: remote already at local HEAD; source push produced no mutation proof"
+    r"(?:; [^;]+: remote already at local HEAD; source push produced no mutation proof)*$"
+)
 
 
 @dataclass
@@ -2197,15 +2203,26 @@ class BugflowQueuePhase(Phase):
         )
         prior_context = _format_prior_attempts(prior_attempts, context_base=lane_root)
         ws_path = _resolve_fix_workspace_from_root(lane_root, rca.affected_files) or str(lane_root)
-        lane_actor_factory = lambda base, suffix, *, runtime=None, workspace_path=None: _make_lane_actor(
-            runner,
-            feature,
-            reports,
+        def lane_actor_factory(
             base,
             suffix,
-            runtime=runtime,
-            workspace_path=workspace_path,
-        )
+            *,
+            runtime=None,
+            workspace_path=None,
+            runtime_workspace_binding=None,
+            sandbox_required=False,
+        ):
+            return _make_lane_actor(
+                runner,
+                feature,
+                reports,
+                base,
+                suffix,
+                runtime=runtime,
+                workspace_path=workspace_path,
+                runtime_workspace_binding=runtime_workspace_binding,
+                sandbox_required=sandbox_required,
+            )
 
         lane.current_phase = "fixing"
         lane.updated_at = utc_now()
@@ -2537,7 +2554,8 @@ class BugflowQueuePhase(Phase):
             implement_runtime="primary",
             test_runtime="primary",
             verify_runtime="secondary",
-            actor_factory=lambda base, suffix, *, runtime=None, workspace_path=None: _make_lane_actor(
+            actor_factory=lambda base, suffix, *, runtime=None, workspace_path=None,
+            runtime_workspace_binding=None, sandbox_required=False: _make_lane_actor(
                 runner,
                 feature,
                 list(report_map.values()),
@@ -2545,6 +2563,8 @@ class BugflowQueuePhase(Phase):
                 suffix,
                 runtime=runtime,
                 workspace_path=workspace_path,
+                runtime_workspace_binding=runtime_workspace_binding,
+                sandbox_required=sandbox_required,
             ),
         )
         lane.modified_files = await _lane_modified_files(
@@ -2787,7 +2807,7 @@ class BugflowQueuePhase(Phase):
                 lane.promotion_status = "applied-main"
                 lane.updated_at = utc_now()
                 await _save_lane(runner, feature, lane)
-                await _push_clones_to_source_root(main_root)
+                await _push_applied_main_lane_to_source_root(main_root, lane)
 
                 lane = await _load_lane(runner, feature, lane_id) or lane
                 await _finalize_promoted_lane(
@@ -5240,12 +5260,16 @@ def _make_thread_actor(
     *,
     runtime: str | None = None,
     workspace_path: str | None = None,
+    runtime_workspace_binding: Any | None = None,
+    sandbox_required: bool = False,
 ) -> Any:
     actor = _make_parallel_actor(
         base,
         suffix,
         runtime=runtime,
         workspace_path=workspace_path,
+        runtime_workspace_binding=runtime_workspace_binding,
+        sandbox_required=sandbox_required,
     )
     runtimes = _thread_agent_runtimes(runner, feature, report)
     if not runtimes:
@@ -5266,6 +5290,8 @@ def _make_lane_actor(
     *,
     runtime: str | None = None,
     workspace_path: str | None = None,
+    runtime_workspace_binding: Any | None = None,
+    sandbox_required: bool = False,
 ) -> Any:
     if not reports:
         return _make_parallel_actor(
@@ -5273,6 +5299,8 @@ def _make_lane_actor(
             suffix,
             runtime=runtime,
             workspace_path=workspace_path,
+            runtime_workspace_binding=runtime_workspace_binding,
+            sandbox_required=sandbox_required,
         )
     primary_report = reports[0]
     return _make_thread_actor(
@@ -5283,6 +5311,8 @@ def _make_lane_actor(
         suffix,
         runtime=runtime,
         workspace_path=workspace_path,
+        runtime_workspace_binding=runtime_workspace_binding,
+        sandbox_required=sandbox_required,
     )
 
 
@@ -6094,7 +6124,11 @@ async def _finalize_promoted_lane(
     if not main_root:
         raise RuntimeError("Missing main bugflow root for promotion finalization")
     if ensure_push:
-        await _push_clones_to_source_root(main_root)
+        await _push_applied_main_lane_to_source_root(
+            main_root,
+            lane,
+            resume_replay=True,
+        )
 
     lane = await _load_lane(runner, feature, lane.lane_id) or lane
     lane.status = "promoted"
@@ -6124,6 +6158,95 @@ async def _finalize_promoted_lane(
         has_unpushed_verified_work=bool(queued_lanes),
         unpromoted_lane_ids=[entry.lane_id for entry in queued_lanes],
     )
+
+
+async def _push_applied_main_lane_to_source_root(
+    main_root: Path,
+    lane: BugflowLaneSnapshot,
+    *,
+    resume_replay: bool = False,
+) -> None:
+    try:
+        allowed_origin_root = _applied_main_source_push_allowed_origin_root(main_root)
+        optional_noop_repos = (
+            await _applied_main_source_push_replay_optional_noop_repos(main_root)
+            if resume_replay
+            else set()
+        )
+        if optional_noop_repos:
+            await _push_clones_to_source_root(
+                main_root,
+                optional_noop_repos=optional_noop_repos,
+                allowed_origin_root=allowed_origin_root,
+            )
+        else:
+            await _push_clones_to_source_root(
+                main_root,
+                allowed_origin_root=allowed_origin_root,
+            )
+    except RuntimeError as exc:
+        if _is_applied_main_source_push_resume_complete(lane, exc):
+            logger.info(
+                "Treating source push as complete for applied-main bugflow lane %s; source remotes are already at local HEAD.",
+                lane.lane_id,
+            )
+            return
+        raise
+
+
+def _applied_main_source_push_allowed_origin_root(main_root: Path) -> Path:
+    resolved = main_root.expanduser().resolve(strict=False)
+    parents = resolved.parents
+    if (
+        resolved.name == "repos"
+        and len(parents) >= 4
+        and parents[1].name == "features"
+        and parents[2].name == ".iriai"
+    ):
+        return parents[3]
+    return resolved.parent
+
+
+async def _applied_main_source_push_replay_optional_noop_repos(main_root: Path) -> set[str]:
+    if not main_root.exists() or main_root.is_symlink():
+        return set()
+    repos: set[str] = set()
+    for repo_dir in _discover_repo_roots_under(main_root):
+        try:
+            rel_path = repo_dir.relative_to(main_root).as_posix()
+        except Exception:
+            continue
+        try:
+            branch = (await _run_git(repo_dir, "branch", "--show-current")).strip()
+            if not branch:
+                continue
+            local_head = (await _run_git(repo_dir, "rev-parse", "HEAD")).strip()
+            remote_head = _parse_ls_remote_head(
+                await _run_git(repo_dir, "ls-remote", "origin", f"refs/heads/{branch}")
+            )
+        except Exception:
+            logger.debug(
+                "Could not prove applied-main replay optional-noop state for %s",
+                repo_dir,
+                exc_info=True,
+            )
+            continue
+        if local_head and remote_head == local_head:
+            repos.add(rel_path)
+    return repos
+
+
+def _is_applied_main_source_push_resume_complete(
+    lane: BugflowLaneSnapshot,
+    exc: RuntimeError,
+) -> bool:
+    # Bugflow writes applied-main only after the main worktree cherry-pick
+    # succeeds. If the process crashes after the subsequent source push but
+    # before finalization, Slice 06's generic source-push helper has no
+    # durable proof record and rejects the replay as "already at HEAD".
+    if lane.status != "promoting" or lane.promotion_status != "applied-main":
+        return False
+    return bool(_SOURCE_PUSH_ALREADY_AT_LOCAL_HEAD_FAILURE_RE.fullmatch(str(exc).strip()))
 
 
 async def _retry_or_block_bug_lane(

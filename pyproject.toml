@@ -7,6 +7,7 @@ dependencies = [
     "iriai-compose[terminal]>=0.3.0,<0.4.0",
     "iriai-preview",
     "asyncpg>=0.29",
+    "mcp>=1.0",
     "pydantic>=2.0",
     "click>=8.0",
     "playwright>=1.40",
@@ -19,6 +20,7 @@ slack = ["slack-sdk>=3.26", "aiohttp>=3.9"]
 
 [project.scripts]
 iriai-build-v2 = "iriai_build_v2.interfaces.cli.app:main"
+iriai-dag-regroup = "iriai_build_v2.workflows.develop.dag_regroup:main"
 claude-pool-runner = "iriai_build_v2.runtimes.claude_pool_runner:main"
 
 [build-system]

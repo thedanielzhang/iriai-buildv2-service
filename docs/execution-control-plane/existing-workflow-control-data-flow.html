@@ -1,0 +1,287 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Existing Workflow Control/Data Flow</title>
+  <style>
+    :root {
+      --bg: #f7f8fb;
+      --ink: #1c2430;
+      --muted: #5e6b7a;
+      --line: #cbd4df;
+      --control: #0f766e;
+      --data: #2563eb;
+      --risk: #b45309;
+      --store: #4f46e5;
+      --card: #ffffff;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--ink);
+      font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    header {
+      padding: 28px 36px 18px;
+      background: #172033;
+      color: #fff;
+    }
+    header h1 { margin: 0 0 8px; font-size: 28px; letter-spacing: 0; }
+    header p { margin: 0; color: #d7deea; max-width: 980px; }
+    main { padding: 28px 36px 44px; }
+    .legend {
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
+      margin-bottom: 22px;
+    }
+    .pill {
+      display: inline-flex;
+      gap: 8px;
+      align-items: center;
+      border: 1px solid var(--line);
+      background: var(--card);
+      border-radius: 999px;
+      padding: 7px 12px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+    .dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+    .dot.control { background: var(--control); }
+    .dot.data { background: var(--data); }
+    .dot.risk { background: var(--risk); }
+    .dot.store { background: var(--store); }
+    .diagram {
+      display: grid;
+      grid-template-columns: 1.1fr 0.9fr;
+      gap: 22px;
+      align-items: start;
+    }
+    .lane {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 18px;
+      box-shadow: 0 8px 24px rgba(23, 32, 51, 0.06);
+    }
+    .lane h2 {
+      margin: 0 0 14px;
+      font-size: 18px;
+    }
+    .flow {
+      display: grid;
+      gap: 10px;
+    }
+    .node {
+      border: 1px solid var(--line);
+      border-left: 5px solid var(--control);
+      border-radius: 10px;
+      padding: 12px 12px 11px;
+      background: #fff;
+    }
+    .node.data { border-left-color: var(--data); }
+    .node.store { border-left-color: var(--store); }
+    .node.risk { border-left-color: var(--risk); background: #fff8ed; }
+    .node h3 {
+      margin: 0 0 5px;
+      font-size: 14px;
+    }
+    .node p { margin: 0; color: var(--muted); }
+    .arrow {
+      text-align: center;
+      color: #718096;
+      font-weight: 700;
+      line-height: 1;
+    }
+    .grid-2 {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 14px;
+      margin-top: 22px;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      background: #fff;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      overflow: hidden;
+    }
+    th, td {
+      text-align: left;
+      vertical-align: top;
+      border-bottom: 1px solid var(--line);
+      padding: 10px 12px;
+    }
+    th { background: #eef2f7; font-size: 13px; }
+    tr:last-child td { border-bottom: 0; }
+    .badge {
+      display: inline-block;
+      margin-right: 6px;
+      padding: 2px 7px;
+      border-radius: 999px;
+      background: #eef2f7;
+      color: #465468;
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.02em;
+    }
+    .badge.risk { background: #fef3c7; color: #92400e; }
+    @media (max-width: 980px) {
+      .diagram, .grid-2 { grid-template-columns: 1fr; }
+      main, header { padding-left: 20px; padding-right: 20px; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Existing Workflow Control/Data Flow</h1>
+    <p>
+      Current legacy execution path for develop workflows. The diagram separates
+      control decisions, data artifacts, durable stores, and known fragility
+      points observed during feature 8ac124d6.
+    </p>
+  </header>
+  <main>
+    <section class="legend" aria-label="Legend">
+      <span class="pill"><span class="dot control"></span>Control flow</span>
+      <span class="pill"><span class="dot data"></span>Data/evidence flow</span>
+      <span class="pill"><span class="dot store"></span>Durable store</span>
+      <span class="pill"><span class="dot risk"></span>Known risk or ambiguity</span>
+    </section>
+
+    <section class="diagram">
+      <div class="lane">
+        <h2>Main Control Path</h2>
+        <div class="flow">
+          <div class="node">
+            <h3>Slack/Dashboard/Runner Resume</h3>
+            <p>Workflow runner resolves the current feature phase and calls the phase adapter.</p>
+          </div>
+          <div class="arrow">down</div>
+          <div class="node">
+            <h3>Planning Phases</h3>
+            <p>Planning, DAG compilation, and task artifacts create the root <code>dag</code>.</p>
+          </div>
+          <div class="arrow">down</div>
+          <div class="node">
+            <h3>ImplementationPhase.execute</h3>
+            <p>Loads root DAG, calls <code>_implement_dag</code>, persists implementation/handover, then runs post-DAG gates.</p>
+          </div>
+          <div class="arrow">down</div>
+          <div class="node risk">
+            <h3>_implement_dag Monolith</h3>
+            <p>Schedules groups, resolves regroup marker, dispatches agents, verifies, repairs, commits, and checkpoints in one large control path.</p>
+          </div>
+          <div class="arrow">down</div>
+          <div class="node">
+            <h3>Per-Group Loop</h3>
+            <p>Resume from <code>dag-group:*</code>; choose next group; run worktree setup, alias guard, ACL preflight, task dispatch, verification, repair, commit, checkpoint.</p>
+          </div>
+          <div class="arrow">down</div>
+          <div class="node">
+            <h3>Post-DAG Business Gates</h3>
+            <p>Code review, security, test authoring, QA, integration, final verifier, source push, reports, and notification run after the last group checkpoint.</p>
+          </div>
+          <div class="arrow">down</div>
+          <div class="node risk">
+            <h3>PostTestObservationPhase</h3>
+            <p>Defensive guard currently reads root DAG checkpoint completion; active regroup/effective-DAG semantics are a compatibility hazard.</p>
+          </div>
+        </div>
+      </div>
+
+      <div class="lane">
+        <h2>Durable Data And Side Effects</h2>
+        <div class="flow">
+          <div class="node store">
+            <h3>Postgres Artifacts</h3>
+            <p><code>dag</code>, <code>dag-task:*</code>, <code>dag-verify:*</code>, <code>dag-commit-failure:*</code>, <code>dag-group:*</code>, <code>dag-gate:*</code>, regroup markers.</p>
+          </div>
+          <div class="node store">
+            <h3>Postgres Events</h3>
+            <p>Phase events, agent starts/dones, verify failures, RCA/repair starts, commit failures, quiesce markers, Slack bridge status.</p>
+          </div>
+          <div class="node data">
+            <h3>Feature Repositories</h3>
+            <p>Canonical repos under the feature root are mutated directly by implementers, repair agents, commit helpers, and post-DAG gates.</p>
+          </div>
+          <div class="node data">
+            <h3>Runtime Context</h3>
+            <p>Model prompts draw from task specs, latest artifacts, selected file contents, verifier concerns, and generated context packages.</p>
+          </div>
+          <div class="node risk">
+            <h3>Authority Ambiguity</h3>
+            <p>Task evidence can claim files that are stale, aliased, unmerged, uncommitted, or unverifiable in the canonical repo.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="grid-2">
+      <table>
+        <thead>
+          <tr><th>Current Stage</th><th>Primary Inputs</th><th>Primary Outputs</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Dispatch</td>
+            <td>Root DAG, group tasks, worktree registry, runtime policy</td>
+            <td><code>dag-task:*</code>, agent events, modified repo files</td>
+          </tr>
+          <tr>
+            <td>Verify</td>
+            <td>Latest task artifacts, file contents, verifier context</td>
+            <td><code>dag-verify:*</code>, expanded lens artifacts, concerns/gaps</td>
+          </tr>
+          <tr>
+            <td>Repair</td>
+            <td>Verifier/RCA concerns and current repo state</td>
+            <td>More task/repair artifacts and repo mutations</td>
+          </tr>
+          <tr>
+            <td>Commit/checkpoint</td>
+            <td>Repo status, verifier approval, commit hooks</td>
+            <td>Commit hash or <code>dag-commit-failure:*</code>, then <code>dag-group:*</code></td>
+          </tr>
+          <tr>
+            <td>Post-DAG gates</td>
+            <td>Completed groups and canonical repos</td>
+            <td><code>dag-gate:*</code>, reports, source push, notification</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <table>
+        <thead>
+          <tr><th>Observed Fragility</th><th>Why It Matters</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><span class="badge risk">Risk</span>Alias drift</td>
+            <td><code>*-wt</code> evidence can diverge from canonical verifier paths.</td>
+          </tr>
+          <tr>
+            <td><span class="badge risk">Risk</span>ACL/writeability mismatch</td>
+            <td>Bridge-user checks can pass while runtime users cannot write target files.</td>
+          </tr>
+          <tr>
+            <td><span class="badge risk">Risk</span>Stale projections</td>
+            <td>Latest artifacts can outlive corrected filesystem state or regroup overlays.</td>
+          </tr>
+          <tr>
+            <td><span class="badge risk">Risk</span>Commit-only loops</td>
+            <td>Verify success can re-enter broad repair after hook/status failure.</td>
+          </tr>
+          <tr>
+            <td><span class="badge risk">Risk</span>Post-test boundary</td>
+            <td>Root DAG completion checks are not enough when an effective regroup overlay exists.</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+  </main>
+</body>
+</html>
