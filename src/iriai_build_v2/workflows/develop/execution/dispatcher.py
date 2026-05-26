@@ -781,12 +781,34 @@ class RuntimeDispatcher:
         output_schema_digest: str | None = None,
         output_type_name: str = "ImplementationResult",
         timeout_seconds: int = 1_800,
+        # Slice 13A fourth sub-slice -- doc-13a:269-272 +
+        # auto-memory feedback_no_refactor. The new optional opt-in
+        # constructor port is a duck-typed
+        # AuthoritativePromptBuilderPort (defined in
+        # iriai_build_v2.execution_control.dispatcher_prompt_context).
+        # The parameter type is Any | None so the dispatcher module
+        # does NOT import the new execution_control module (avoids a
+        # circular import: dispatcher_prompt_context.py imports from
+        # dispatcher.py). When None (default), _build_prompt falls
+        # through to the legacy path BYTE-IDENTICAL (preserves the
+        # Slice 05 22-passed baseline + the Slice 00-12 frozen V4
+        # spot-check baseline per the chunk shape point 4 invariant).
+        authoritative_prompt_builder: Any | None = None,
     ) -> None:
         """Create a dispatcher from narrow, fake-friendly execution ports.
 
         Required ports are the dispatch journal facade, a sandbox bind/capture
         port, a runtime client port, and a prompt builder port.  All are
         structural protocols; no workflow implementation module is imported.
+
+        Optional ``authoritative_prompt_builder`` (Slice 13A fourth
+        sub-slice; doc-13a:269-272): when set, the dispatcher routes
+        the prompt/context build through the 13A authoritative
+        adapter and projects the typed routing decision onto
+        ``runtime_context/context_incomplete`` when the adapter signals
+        ``state="unavailable"``. When ``None`` (default), the dispatcher
+        falls through to the legacy prompt-builder path BYTE-IDENTICAL
+        per the auto-memory ``feedback_no_refactor`` rule.
         """
 
         self._store = store
@@ -801,6 +823,10 @@ class RuntimeDispatcher:
         self._output_schema_digest = output_schema_digest or stable_digest(output_schema)
         self._output_type_name = output_type_name
         self._timeout_seconds = timeout_seconds
+        # Slice 13A fourth sub-slice -- doc-13a:269-272. Defaults to
+        # None so the legacy Slice 05 _build_prompt path is BYTE-
+        # IDENTICAL (per auto-memory feedback_no_refactor).
+        self._authoritative_prompt_builder = authoritative_prompt_builder
 
     async def dispatch(self, request: DispatchRequest | Mapping[str, Any] | Any) -> DispatchOutcome:
         request = DispatchRequest.model_validate(request)
@@ -872,6 +898,109 @@ class RuntimeDispatcher:
             validate_dispatch_transition(state, "context_prepared")
             state = "context_prepared"
         except Exception as exc:
+            # Slice 13A fourth sub-slice -- doc-13a:269-272 +
+            # auto-memory feedback_no_silent_degradation. The new opt-in
+            # AuthoritativePromptContextIncompleteSignal is the typed
+            # control-flow marker the 13A wired path raises when the
+            # adapter reports state="unavailable"; route it to the
+            # typed failure id runtime_context/context_incomplete
+            # WITHOUT invoking the runtime. The legacy code path is
+            # BYTE-IDENTICAL when the new opt-in port is None (this
+            # branch is never entered; the signal class is never
+            # imported in that case). The legacy
+            # runtime_context/context_materialization_failed route is
+            # preserved verbatim for ALL other exceptions.
+            #
+            # Slice 13A fourth sub-slice finalizer (P3-13A-4-1) --
+            # use a true isinstance check via the same local-import
+            # pattern that the helper at _build_prompt_authoritatively
+            # already uses (see dispatcher.py:1210-1212). The local
+            # import scope avoids the module-level circular dependency
+            # (the new module imports from this module). The prior
+            # `exc.__class__.__name__ == "..."` string comparison was
+            # brittle to typos / subclasses / refactor renames and is
+            # replaced here with the typed-isinstance form.
+            from iriai_build_v2.execution_control.dispatcher_prompt_context import (
+                AuthoritativePromptContextIncompleteSignal,
+            )
+            if isinstance(exc, AuthoritativePromptContextIncompleteSignal):
+                routing = getattr(exc, "routing", None)
+                legacy_result = getattr(exc, "legacy_result", None)
+                # Persist the legacy prompt context BEFORE recording the
+                # typed failure; the Slice 05 persistence invariant
+                # (record_prompt_context is called before _finish_failure)
+                # is preserved per the doc-13a:269-272 wording "dispatch
+                # records runtime_context/context_incomplete" -- the
+                # legacy bundle is the record. If persistence itself
+                # fails the existing legacy except-handler at this same
+                # block routes the secondary failure via
+                # context_materialization_failed below.
+                if legacy_result is not None:
+                    try:
+                        await self._store.record_prompt_context(
+                            attempt_id,
+                            request,
+                            legacy_result.prompt,
+                            legacy_result.bundle,
+                        )
+                    except Exception as record_exc:
+                        return await self._finish_failure(
+                            attempt_id=attempt_id,
+                            request=request,
+                            state=state,
+                            failure_class="runtime_context",
+                            failure_type="context_materialization_failed",
+                            terminal_reason="context_materialization_failed",
+                            retryable=True,
+                            deterministic=True,
+                            operator_required=False,
+                            provider_request_id=None,
+                            evidence_ids=[],
+                            details={
+                                "exception": record_exc.__class__.__name__,
+                                "message": str(record_exc),
+                            },
+                        )
+                missing_field_names = (
+                    list(getattr(routing, "missing_field_names", ()) or ())
+                    if routing is not None
+                    else []
+                )
+                unavailable_reason = (
+                    getattr(routing, "unavailable_reason", None)
+                    if routing is not None
+                    else None
+                )
+                return await self._finish_failure(
+                    attempt_id=attempt_id,
+                    request=request,
+                    state=state,
+                    failure_class="runtime_context",
+                    failure_type="context_incomplete",
+                    # The legacy RuntimeTerminalReason Literal (defined at
+                    # dispatcher.py:44-56) does NOT carry a dedicated
+                    # context_incomplete value; reuse the closest
+                    # semantic match (context_materialization_failed)
+                    # so the Slice 05 typed enum remains BYTE-IDENTICAL
+                    # per doc-13a:42-46 + 124-126. The typed failure id
+                    # (failure_class/failure_type) is the authoritative
+                    # routing signal for the Slice 07 typed-failure
+                    # router; the terminal_reason is the legacy
+                    # observability tag.
+                    terminal_reason="context_materialization_failed",
+                    retryable=False,
+                    deterministic=True,
+                    operator_required=False,
+                    provider_request_id=None,
+                    evidence_ids=[],
+                    details={
+                        "exception": exc.__class__.__name__,
+                        "message": str(exc),
+                        "missing_field_names": missing_field_names,
+                        "unavailable_reason": unavailable_reason,
+                        "slice_13a_typed_failure": True,
+                    },
+                )
             return await self._finish_failure(
                 attempt_id=attempt_id,
                 request=request,
@@ -1055,11 +1184,62 @@ class RuntimeDispatcher:
         request: DispatchRequest,
         binding: RuntimeWorkspaceBinding,
     ) -> PromptBuildResult:
+        # Slice 13A fourth sub-slice -- doc-13a:269-272 +
+        # auto-memory feedback_no_refactor + feedback_no_silent_degradation.
+        # When the opt-in authoritative prompt builder port is set,
+        # route through it; when None (default), fall through to the
+        # legacy Slice 05 path BYTE-IDENTICAL (preserves the 22-passed
+        # Slice 05 dispatcher baseline + the Slice 00-12 frozen V4
+        # spot-check baseline per the chunk shape point 4 invariant).
+        if self._authoritative_prompt_builder is not None:
+            return await self._build_prompt_authoritatively(request)
         try:
             result = await self._prompt_builder.build_prompt_context(request, binding)
         except TypeError:
             result = await self._prompt_builder.build_prompt_context(request)
         return _coerce_prompt_result(result)
+
+    async def _build_prompt_authoritatively(
+        self,
+        request: DispatchRequest,
+    ) -> PromptBuildResult:
+        # Slice 13A fourth sub-slice -- doc-13a:269-272 +
+        # auto-memory feedback_no_silent_degradation. This helper is
+        # ONLY called when the opt-in authoritative prompt builder
+        # port is set (verified in _build_prompt above). Per
+        # doc-13a:269-272: when routing.should_invoke_runtime=True,
+        # the runtime PROCEEDS with the authoritative companion record
+        # attached; when False, the dispatcher raises a typed sentinel
+        # exception (AuthoritativePromptContextIncompleteSignal) that
+        # the dispatch() except-block catches and routes onto the typed
+        # failure id runtime_context/context_incomplete WITHOUT
+        # invoking the runtime.
+        #
+        # The local import avoids a circular import (the new module
+        # iriai_build_v2.execution_control.dispatcher_prompt_context
+        # imports from this module). The module-level Any | None
+        # parameter typing on the constructor avoids needing the type
+        # at module load.
+        from iriai_build_v2.execution_control.dispatcher_prompt_context import (
+            AuthoritativePromptContextIncompleteSignal,
+        )
+
+        authoritative_result = await self._authoritative_prompt_builder.build_prompt_context(
+            request
+        )
+        if not authoritative_result.routing.should_invoke_runtime:
+            raise AuthoritativePromptContextIncompleteSignal(
+                routing=authoritative_result.routing,
+                legacy_result=authoritative_result.legacy_result,
+            )
+        # Runtime proceeds with the authoritative companion record
+        # attached (the legacy result is still consumed by the Slice 05
+        # persistence path at record_prompt_context(...) immediately
+        # after _build_prompt returns; the authoritative bundle is
+        # available via getattr(result, '_authoritative_result', None)
+        # for future Slice 13A sub-slices that wire downstream
+        # consumers per doc-13a § Refactoring Steps steps 5-7).
+        return authoritative_result.legacy_result
 
     async def _capture_patch(
         self,

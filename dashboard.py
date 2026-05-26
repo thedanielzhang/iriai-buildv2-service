@@ -34,6 +34,19 @@ from iriai_build_v2.public_dashboard import (
     PublicDashboardOutbox,
     project_control_plane_snapshot_if_changed,
 )
+# Slice 13A 8th sub-slice 13An-2 (P3-13A-6-3 binding closure wiring) -- the
+# production-callsite swap at line 1541 wraps the legacy `PublicDashboardOutbox`
+# with `CompletenessAwareDashboardOutbox` so the composite
+# `LegacyGateConsumerSnapshotAdapter` chain has a real production caller.
+# Per the env flag `IRIAI_EXEC_CONTROL_DASHBOARD_COMPANION_WIRING_ENABLED`
+# (default OFF) the wrapper delegates byte-identical to the legacy outbox
+# until the wiring is opt-in enabled, preserving Slice 10 baseline behaviour.
+# Closes the binding statement at `13a-acceptance.md:222-227` by making the
+# composite chain reachable from a real production caller (the dashboard's
+# `_project_control_plane_snapshot_event` ETag-path projection).
+from iriai_build_v2.execution_control.dashboard_wrapper import (
+    CompletenessAwareDashboardOutbox,
+)
 from iriai_build_v2.storage.artifacts import (
     _SPILL_SQL_PREFIX,
     _content_ref_from_stored_value,
@@ -1538,7 +1551,21 @@ async def _project_control_plane_snapshot_event(
     if not typed_control_plane_version:
         return
     try:
-        outbox = PublicDashboardOutbox(pool)
+        # Slice 13A 8th sub-slice 13An-2 (P3-13A-6-3 binding closure wiring) --
+        # wrap the legacy outbox with `CompletenessAwareDashboardOutbox` so the
+        # composite `LegacyGateConsumerSnapshotAdapter` chain has a real
+        # production caller. Env flag default OFF -> byte-identical Slice 10
+        # legacy behaviour at this callsite; env flag ON -> the wrapper invokes
+        # the composite chain BEFORE delegating to the legacy outbox per the
+        # fail-closed contract at doc-13a:18-23 + 111-115 + 280-282.
+        # `outbox.outbox_enabled` below + the
+        # `project_control_plane_snapshot_if_changed` driver's
+        # `getattr(outbox, "outbox_enabled", False)` early-return guard at
+        # `public_dashboard.py:705` both consume the wrapper's delegating
+        # `outbox_enabled` property which forwards to the wrapped legacy
+        # outbox's flag, preserving Slice 10 behaviour byte-identical when
+        # the wiring is OFF.
+        outbox = CompletenessAwareDashboardOutbox(PublicDashboardOutbox(pool))
         if not outbox.outbox_enabled:
             return
         store = ExecutionControlStore(conn)

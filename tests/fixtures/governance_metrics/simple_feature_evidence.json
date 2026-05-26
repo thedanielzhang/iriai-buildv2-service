@@ -1,0 +1,131 @@
+{
+  "corpus_id": "simple-feature-v1",
+  "definitions": [
+    {
+      "name": "tasks_per_hour",
+      "version": "v1.0",
+      "scope_kind": "feature",
+      "numerator": "completed tasks",
+      "denominator": "elapsed hours",
+      "required_evidence_kinds": [
+        "typed_journal"
+      ],
+      "active_work_policy": "exclude",
+      "confidence_rule": "evidence_completeness * sample_count_factor * freshness_factor * data_quality_factor * impl_log_factor"
+    },
+    {
+      "name": "complexity_adjusted_tasks_per_hour",
+      "version": "v1.0",
+      "scope_kind": "feature",
+      "numerator": "completed tasks",
+      "denominator": "elapsed hours",
+      "required_evidence_kinds": [
+        "typed_journal"
+      ],
+      "active_work_policy": "exclude",
+      "confidence_rule": "evidence_completeness * sample_count_factor * freshness_factor * data_quality_factor * impl_log_factor"
+    }
+  ],
+  "evidence_set_refs": [
+    {
+      "authority": "typed_journal",
+      "ref_id": "typed_journal:simple-feature-v1:dispatch",
+      "feature_id": "simple-feature-v1",
+      "slice_id": null,
+      "artifact_id": null,
+      "event_id": 101,
+      "commit_hash": null,
+      "journal_anchor": null,
+      "created_at": "2026-05-24T12:00:00Z",
+      "digest": "sha256:aaaa00000000000000000000000000000000000000000000000000000000aaaa",
+      "quality": "canonical",
+      "completeness": "complete",
+      "page_refs": [],
+      "preview_only": false
+    },
+    {
+      "authority": "typed_journal",
+      "ref_id": "typed_journal:simple-feature-v1:verify",
+      "feature_id": "simple-feature-v1",
+      "slice_id": null,
+      "artifact_id": null,
+      "event_id": 102,
+      "commit_hash": null,
+      "journal_anchor": null,
+      "created_at": "2026-05-24T12:00:00Z",
+      "digest": "sha256:bbbb00000000000000000000000000000000000000000000000000000000bbbb",
+      "quality": "canonical",
+      "completeness": "complete",
+      "page_refs": [],
+      "preview_only": false
+    },
+    {
+      "authority": "typed_journal",
+      "ref_id": "typed_journal:simple-feature-v1:commit",
+      "feature_id": "simple-feature-v1",
+      "slice_id": null,
+      "artifact_id": null,
+      "event_id": 103,
+      "commit_hash": null,
+      "journal_anchor": null,
+      "created_at": "2026-05-24T12:00:00Z",
+      "digest": "sha256:cccc00000000000000000000000000000000000000000000000000000000cccc",
+      "quality": "canonical",
+      "completeness": "complete",
+      "page_refs": [],
+      "preview_only": false
+    },
+    {
+      "authority": "implementation_journal",
+      "ref_id": "impl_journal:simple-feature-v1:root",
+      "feature_id": "simple-feature-v1",
+      "slice_id": null,
+      "artifact_id": 201,
+      "event_id": null,
+      "commit_hash": null,
+      "journal_anchor": null,
+      "created_at": "2026-05-24T12:00:00Z",
+      "digest": "sha256:dddd00000000000000000000000000000000000000000000000000000000dddd",
+      "quality": "canonical",
+      "completeness": "complete",
+      "page_refs": [],
+      "preview_only": false
+    }
+  ],
+  "completeness_state": {
+    "state": "complete",
+    "authority": "execution_authority",
+    "complete_for": [
+      "governance-metric-extraction:simple-feature-v1"
+    ],
+    "missing_required_refs": [],
+    "page_refs": [],
+    "preview_ref": null,
+    "unavailable_reason": null,
+    "completeness_digest": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+  },
+  "active_work_filter": "exclude",
+  "freshness_window_hours": 87600.0,
+  "prompt_context_routing": null,
+  "task_shape_inputs": {
+    "task_count": 3,
+    "contract_path_breadth": 1,
+    "repo_count": 1,
+    "barrier_type": "none",
+    "dependency_depth": 0,
+    "planned_verifier_gate_count": 1,
+    "declared_write_set_uncertainty": 0.0
+  },
+  "implementation_log_completeness": {
+    "state": "complete",
+    "authority": "execution_authority",
+    "complete_for": [
+      "implementation-journal-completeness:simple-feature-v1"
+    ],
+    "missing_required_refs": [],
+    "page_refs": [],
+    "preview_ref": null,
+    "unavailable_reason": null,
+    "completeness_digest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+  }
+}

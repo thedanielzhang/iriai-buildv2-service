@@ -181,3 +181,69 @@ rather than rewriting past results.
 - Slice 17 consumes replay results for recommendations.
 - Slice 00 supplies the initial `8ac124d6` corpus.
 - Slice 12 supplies acceptance metrics and implementation artifacts.
+
+## Slice 13A Shared Completeness Model Dependency
+
+Per **doc-13a:285-287 § Refactoring Steps step 9** — *"Update governance
+Slices 13-20 and context Slice 21 to depend on this shared completeness
+model instead of redefining authority semantics locally."* — this
+slice's counterfactual replay and simulation evidence depends on the
+Slice 13A shared completeness model. Replay-result rows and scenario
+fixtures cite typed governance evidence refs whose `CompletenessState`
+governs whether the replay can produce a high-confidence result or
+must mark itself invalidated.
+
+Source-of-truth modules:
+
+- `src/iriai_build_v2/execution_control/completeness.py` (Slice 13A
+  2nd sub-slice) — `CompletenessState`, `EvidenceCompleteness`,
+  `AuthoritativeContextRef`, `EvidencePageRef`, `ExactEvidenceManifest`,
+  `compute_completeness_digest`. Replay fixtures cite typed evidence
+  refs (via `AuthoritativeContextRef`); refs whose completeness-state
+  is `preview_only` or `unavailable` cannot supply replay-input
+  evidence.
+- The shared `ExactEvidenceManifest` is the source-of-truth shape for
+  the "Replay corpus loader rejects malformed or unbounded fixture
+  inputs" acceptance test (§ Tests). Fixture inputs whose typed
+  manifest is missing or incomplete fail closed at load time per the
+  doc-13a:18-23 invariant.
+
+Per-purpose adapter modules consumed (READ-ONLY references):
+
+- `src/iriai_build_v2/execution_control/dispatcher_prompt_context.py`
+  (Slice 13A 4th sub-slice) — replay scenarios that simulate
+  dispatcher behavior must consume the typed
+  `AuthoritativePromptContextRouting` shape; scenarios that simulate
+  `runtime_context/context_incomplete` outcomes must use the typed
+  failure id rather than a string label.
+- `src/iriai_build_v2/execution_control/gate_companion.py` (Slice 13A
+  5th sub-slice) — replay scenarios that simulate gate behavior must
+  consume the typed `AuthoritativeGateCompanionRecord` +
+  `AuthoritativeGateProofRow` shapes; scenarios that simulate the
+  `verifier_context/companion_record_unavailable` or
+  `verifier_context/proof_row_required` typed failure ids must use
+  the typed failure ids rather than free-text labels.
+- `src/iriai_build_v2/execution_control/snapshot_companion.py`
+  (Slice 13A 6th sub-slice) — replay scenarios that simulate
+  classifier behavior must consume the typed
+  `AuthoritativeSnapshotClassifierRouting` shape; scenarios that
+  simulate the `evidence_corruption/list_field_incomplete` or
+  `evidence_corruption/classifier_rule_blocked` typed failure ids
+  must use the typed failure ids rather than free-text labels.
+
+Per the existing § "Edge Cases And Failure Handling" rule
+*"Policy requires evidence not in corpus: mark invalidated and collect
+more evidence."* — the "evidence not in corpus" check is precisely the
+shared `CompletenessState="unavailable"` state. This dependency
+reference makes that mapping explicit.
+
+Per **P3-13A-6-3 dead-until-wired binding statement** (see
+`13a-acceptance.md:193-227`), the composite adapter chain must be
+wired into a real consumer site before replay results citing 13A typed
+completeness can feed Slice 17 policy recommendations as runtime
+authority. The wiring is the **Slice 13A 8th sub-slice 13An-2**
+deliverable.
+
+This dependency-reconciliation reference was added by
+**Slice 13A 8th sub-slice 13An-1** (this iteration) per
+doc-13a:285-287 step 9.

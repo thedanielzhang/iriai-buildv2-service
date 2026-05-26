@@ -245,6 +245,16 @@ debugging, and rollback-safe internal validation.
     records the post-00-12 change-control remediation for exact-or-paged
     evidence, display previews, and completeness semantics before
     governance/context surfaces can use that evidence as execution authority.
+    - **13A acceptance artifact**:
+      [13a-acceptance.md](13a-acceptance.md) — pins doc-13a § Refactoring
+      Steps 2 + 3 + 4 + 5 + 6 + 7 + 8 SATISFIED (step 1 is the
+      foundational doc itself; step 9 deferred to the LAST sub-slice
+      13An), the per-sub-slice module `__all__` projections, the typed
+      failure ids registered by Slice 13A, the carried-P3 ledger, and
+      the dead-until-wired binding statement (P3-13A-6-3) for the
+      composite `LegacyGateConsumerSnapshotAdapter` chain. Authority
+      remains doc 13A (the line above); STATUS, journal, and
+      decision-log live alongside.
 15. [Governance evidence model](13-governance-evidence-model.md): defines the
     evidence model for governance analysis over typed journal rows, compatibility
     projections, commit proof, supervisor signals, resource metrics, and

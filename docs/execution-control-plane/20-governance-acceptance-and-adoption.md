@@ -192,3 +192,55 @@ review artifacts intact for diagnosis.
 - Slice 18 supplies replay.
 - Slice 19 supplies reporting and agent context.
 - Slice 21 is required before task-execute agent context can be adopted.
+
+## Slice 13A Shared Completeness Model Dependency
+
+Per **doc-13a:285-287 § Refactoring Steps step 9** — *"Update governance
+Slices 13-20 and context Slice 21 to depend on this shared completeness
+model instead of redefining authority semantics locally."* — this
+slice's all-at-once governance acceptance gate depends on the Slice
+13A shared completeness model. The existing § "Refactoring Steps"
+step 2 already pins this dependency: *"Validate that required 13A
+remediation is complete before governance/context surfaces consume
+exact/paged evidence as execution authority."*
+
+Source-of-truth modules:
+
+- `src/iriai_build_v2/execution_control/completeness.py` (Slice 13A
+  2nd sub-slice) — `CompletenessState`, `EvidenceCompleteness`,
+  `AuthoritativeContextRef`, `EvidencePageRef`, `ExactEvidenceManifest`,
+  `compute_completeness_digest`.
+- `src/iriai_build_v2/execution_control/prompt_context_adapter.py` +
+  `dispatcher_prompt_context.py` + `gate_companion.py` +
+  `snapshot_companion.py` (Slice 13A 3rd-6th sub-slices) — the four
+  adapter modules + their typed companion records.
+- `docs/execution-control-plane/13a-acceptance.md` — the Slice 13A
+  acceptance artifact pins the doc-13a § Refactoring Steps per-step
+  status table; the governance-acceptance gate consumes that
+  per-step status table as one of its required-13A-remediation
+  signals.
+
+The governance-acceptance collector (§ Refactoring Step 1: *"Add
+governance acceptance collector after Slices 13-19 exist."*) must
+include a fail-closed precondition that:
+
+- The Slice 13A acceptance artifact at
+  `docs/execution-control-plane/13a-acceptance.md` lists all 9
+  doc-13a § Refactoring Steps as SATISFIED.
+- The composite-adapter wiring referenced by **P3-13A-6-3** (see
+  `13a-acceptance.md:193-227`) has been LANDED at the production
+  consumer site (delivered by the **Slice 13A 8th sub-slice 13An-2**).
+- The Slice 13A test surface (the 7 modules tabulated at
+  `13a-acceptance.md:255-263` + this iteration's NEW step-9
+  reconciliation test surface) is all green at byte-identical baselines.
+
+Per **P3-13A-6-3 dead-until-wired binding statement** (see
+`13a-acceptance.md:193-227`), the composite adapter chain must be
+wired into a real consumer site before any governance slice can claim
+gate execution authority and before this slice's all-at-once
+acceptance can pass. The wiring is the **Slice 13A 8th sub-slice
+13An-2** deliverable.
+
+This dependency-reconciliation reference was added by
+**Slice 13A 8th sub-slice 13An-1** (this iteration) per
+doc-13a:285-287 step 9.
