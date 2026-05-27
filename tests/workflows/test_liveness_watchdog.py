@@ -431,14 +431,6 @@ def _bound_role_with_metadata(metadata: dict) -> object:
             "outside runtime workspace roots",
         ),
         (
-            "cwd_parent_of_writable_root",
-            lambda tmp_path, binding: (
-                (tmp_path / "cwd" / "src").mkdir(exist_ok=True),
-                binding.update({"writable_roots": [str(tmp_path / "cwd" / "src")]}),
-            ),
-            "outside runtime workspace roots",
-        ),
-        (
             "missing_expires_at",
             lambda _tmp_path, binding: binding.pop("expires_at"),
             "missing expires_at",
@@ -492,6 +484,41 @@ async def test_invalid_runtime_workspace_binding_metadata_fails_before_runtime(
         await runner.resolve(actor, "write with invalid binding", feature=_feature())
 
     assert runtime.task is None
+
+
+@pytest.mark.asyncio
+async def test_runtime_workspace_binding_allows_file_level_writable_root(
+    tmp_path: Path,
+):
+    runtime = _CaptureRuntime()
+    runner = _runner(runtime)
+    cwd = tmp_path / "cwd"
+    writable_file = cwd / "src" / "allowed.py"
+    writable_file.parent.mkdir(parents=True)
+    manifest_path = _write_sandbox_manifest(
+        tmp_path,
+        sandbox_id="sandbox-04",
+        writable_roots=[str(writable_file)],
+    )
+    actor = _bound_role_with_metadata(
+        {
+            "sandbox_id": "sandbox-04",
+            "cwd": str(cwd),
+            "workspace_override": str(cwd),
+            "writable_roots": [str(writable_file)],
+            "readonly_roots": [],
+            "blocked_roots": [str(tmp_path / "blocked")],
+            "repo_roots": {"app": str(cwd)},
+            "manifest_path": str(manifest_path),
+            "expires_at": "2999-01-01T00:00:00+00:00",
+            "runtime": "claude",
+        }
+    )
+
+    result = await runner.resolve(actor, "write with file-level root", feature=_feature())
+
+    assert result == "ok"
+    assert runtime.kwargs["workspace"].path == cwd
 
 
 class TestLivenessTracker:

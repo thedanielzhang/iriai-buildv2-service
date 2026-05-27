@@ -112,7 +112,12 @@ def _scope(path: str, action: str, **extra):
     return SimpleNamespace(path=path, action=action, **extra)
 
 
-def _snapshot(repo: RepoIdentity, *, present_paths: list[str] | None = None) -> WorkspaceSnapshot:
+def _snapshot(
+    repo: RepoIdentity,
+    *,
+    present_paths: list[str] | None = None,
+    case_sensitivity: str = "case_sensitive",
+) -> WorkspaceSnapshot:
     return WorkspaceSnapshot(
         feature_id=FEATURE_ID,
         dag_sha256=DAG_SHA,
@@ -120,7 +125,7 @@ def _snapshot(repo: RepoIdentity, *, present_paths: list[str] | None = None) -> 
         repo_id=repo.repo_id,
         canonical_path=repo.canonical_path,
         workspace_relative_path=repo.workspace_relative_path,
-        case_sensitivity="case_sensitive",
+        case_sensitivity=case_sensitivity,
         present_paths=present_paths or [],
     )
 
@@ -234,6 +239,111 @@ def test_acceptance_without_id_gets_deterministic_source_ordinal_id(tmp_path: Pa
     assert first.contract_digest == second.contract_digest
 
 
+def test_task_verification_gates_resolve_external_test_plan_criteria(tmp_path: Path) -> None:
+    registry, _feature_root = _registry(tmp_path)
+    task = _task(
+        task_id="checkpoint-resume-slice-8-T-sf10-slice8-004",
+        file_scope=[_scope("src/resume.py", "modify")],
+        acceptance_criteria=[SimpleNamespace(description="Wire the resume bridge commands.")],
+        verification_gates=["AC-checkpoint-resume-15"],
+    )
+
+    contract = ContractCompiler().compile_task(
+        _request(
+            registry,
+            task,
+            external_acceptance_criteria=[
+                {
+                    "id": "AC-checkpoint-resume-15",
+                    "description": "Resume command routes to ResumeCoordinator.",
+                    "verification_method": "integration",
+                    "pass_condition": "Bridge command dispatch invokes the coordinator.",
+                    "source": "test-plan:checkpoint-resume",
+                }
+            ],
+        )
+    )
+
+    external = next(
+        criterion
+        for criterion in contract.acceptance_criteria
+        if criterion.id == "ac-checkpoint-resume-15"
+    )
+    assert external.source_model == "TestAcceptanceCriterion"
+    assert external.source_field == "test-plan:checkpoint-resume"
+    assert "Resume command routes" in external.text
+    assert any(
+        gate.gate_kind == "model_verifier"
+        and gate.source == "task_verification"
+        and gate.criterion_ids == ["ac-checkpoint-resume-15"]
+        for gate in contract.verification_gates
+    )
+
+
+def test_task_local_gate_criteria_are_reused_without_external_duplicates(tmp_path: Path) -> None:
+    registry, _feature_root = _registry(tmp_path)
+    task = _task(
+        file_scope=[_scope("src/resume.py", "modify")],
+        acceptance_criteria=[
+            SimpleNamespace(
+                id="AC-checkpoint-resume-15",
+                description="Use the task-local criterion.",
+            )
+        ],
+        verification_gates=["AC-checkpoint-resume-15"],
+    )
+
+    contract = ContractCompiler().compile_task(
+        _request(
+            registry,
+            task,
+            external_acceptance_criteria=[
+                {
+                    "id": "AC-checkpoint-resume-15",
+                    "description": "External test-plan text should not duplicate the local criterion.",
+                    "source": "test-plan:checkpoint-resume",
+                }
+            ],
+        )
+    )
+
+    matching = [
+        criterion
+        for criterion in contract.acceptance_criteria
+        if criterion.id == "ac-checkpoint-resume-15"
+    ]
+    assert len(matching) == 1
+    assert matching[0].source_model == "TaskAcceptanceCriterion"
+    assert "task-local criterion" in matching[0].text
+
+
+def test_task_verification_gates_missing_from_external_catalog_fail_closed(tmp_path: Path) -> None:
+    registry, _feature_root = _registry(tmp_path)
+    task = _task(
+        file_scope=[_scope("src/resume.py", "modify")],
+        acceptance_criteria=[SimpleNamespace(description="Wire the resume bridge commands.")],
+        verification_gates=["AC-checkpoint-resume-404"],
+    )
+
+    with pytest.raises(ContractCompileError) as exc_info:
+        ContractCompiler().compile_task(
+            _request(
+                registry,
+                task,
+                external_acceptance_criteria=[
+                    {
+                        "id": "AC-checkpoint-resume-15",
+                        "description": "A different real test-plan AC.",
+                        "source": "test-plan:checkpoint-resume",
+                    }
+                ],
+            )
+        )
+
+    assert exc_info.value.failure_type == "contract_unknown_criterion"
+    assert "AC-checkpoint-resume-404" in str(exc_info.value)
+
+
 @pytest.mark.parametrize(
     ("path", "failure_type"),
     [
@@ -336,6 +446,12 @@ def test_gate_specs_reject_unknown_criteria_shell_strings_and_bad_command_repos(
                         "name": "Unknown",
                         "source": "task_verification",
                         "criterion_ids": ["missing"],
+                    }
+                ],
+                external_acceptance_criteria=[
+                    {
+                        "id": "missing",
+                        "description": "External criteria do not authorize explicit gate specs.",
                     }
                 ],
             )
@@ -455,6 +571,97 @@ def test_manifest_forbidden_overrides_scope_and_directory_rules_match_descendant
     )
     assert "forbidden_path_touched" in forbidden_verdict.violation_codes
     assert "modify_outside_allowed_paths" not in forbidden_verdict.violation_codes
+
+
+def test_manifest_forbidden_case_variants_compile_when_case_mode_unknown(tmp_path: Path) -> None:
+    registry, _feature_root = _registry(tmp_path)
+    repo = registry.repos[0]
+    upper_path = "src/webviews/projectSurface/src/chat/utils/EventDeduplicator.ts"
+    lower_path = "src/webviews/projectSurface/src/chat/utils/eventDeduplicator.ts"
+
+    contract = ContractCompiler().compile_task(
+        _request(
+            registry,
+            _task(task_id="TASK-forbidden-sentinels"),
+            manifest_forbidden_files=[
+                {"path": upper_path, "source": "uppercase sentinel"},
+                {"path": lower_path, "source": "lowercase sentinel"},
+            ],
+        )
+    )
+
+    assert [rule.path for rule in contract.forbidden_paths] == [upper_path, lower_path]
+    for path in (upper_path, lower_path):
+        verdict = ContractCompiler().validate_patch(
+            contract,
+            PatchSummary(
+                sandbox_id=f"sandbox-{Path(path).stem}",
+                repo_id=repo.repo_id,
+                modified_paths=[path],
+                diff_sha256="digest",
+            ),
+            _snapshot(repo, case_sensitivity="unknown"),
+        )
+        assert verdict.violation_codes == ["forbidden_path_touched"]
+
+    variant_contract = ContractCompiler().compile_task(
+        _request(
+            registry,
+            _task(task_id="TASK-single-sentinel"),
+            manifest_forbidden_files=[{"path": upper_path}],
+        )
+    )
+    variant_verdict = ContractCompiler().validate_patch(
+        variant_contract,
+        PatchSummary(
+            sandbox_id="sandbox-case-variant",
+            repo_id=repo.repo_id,
+            modified_paths=[lower_path],
+            diff_sha256="digest",
+        ),
+        _snapshot(repo, case_sensitivity="unknown"),
+    )
+    assert variant_verdict.violation_codes == ["case_collision_variant"]
+
+
+def test_writable_case_variants_still_fail_when_case_mode_unknown(tmp_path: Path) -> None:
+    registry, _feature_root = _registry(tmp_path)
+    task = _task(
+        file_scope=[
+            _scope("src/webviews/projectSurface/src/chat/utils/EventDeduplicator.ts", "modify"),
+            _scope("src/webviews/projectSurface/src/chat/utils/eventDeduplicator.ts", "modify"),
+        ],
+        acceptance_criteria=[SimpleNamespace(description="Modify the utility.")],
+    )
+
+    with pytest.raises(ContractCompileError) as exc_info:
+        ContractCompiler().compile_task(_request(registry, task))
+
+    assert exc_info.value.failure_type == "contract_invalid_path"
+    assert "case-collision variant" in str(exc_info.value)
+
+
+def test_forbidden_case_variant_still_overrides_writable_scope(tmp_path: Path) -> None:
+    registry, _feature_root = _registry(tmp_path)
+    task = _task(
+        file_scope=[
+            _scope("src/webviews/projectSurface/src/chat/utils/eventDeduplicator.ts", "modify"),
+        ],
+        acceptance_criteria=[SimpleNamespace(description="Modify the utility.")],
+    )
+
+    with pytest.raises(ContractCompileError) as exc_info:
+        ContractCompiler().compile_task(
+            _request(
+                registry,
+                task,
+                manifest_forbidden_files=[
+                    {"path": "src/webviews/projectSurface/src/chat/utils/EventDeduplicator.ts"},
+                ],
+            )
+        )
+
+    assert exc_info.value.failure_type == "contract_scope_conflict"
 
 
 def test_unknown_write_set_is_isolated_and_group_read_write_conflicts_fail(tmp_path: Path) -> None:

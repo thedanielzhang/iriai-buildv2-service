@@ -131,6 +131,10 @@ def _path_is_under(path: Path, root: Path) -> bool:
         return False
 
 
+def _paths_overlap(left: Path, right: Path) -> bool:
+    return _path_is_under(left, right) or _path_is_under(right, left)
+
+
 def _path_has_symlink_component(path: Path) -> bool:
     current = Path(path.anchor) if path.is_absolute() else Path()
     parts = path.parts[1:] if path.is_absolute() else path.parts
@@ -288,11 +292,14 @@ def _runtime_workspace_binding_error(
         for path in _as_string_list(binding.get("writable_roots"))
         if str(path).strip()
     ]
-    allowed_roots = writable_roots or repo_roots
-    if allowed_roots and not any(
-        _path_is_under(cwd_resolved, root)
-        for root in allowed_roots
+    if repo_roots and not any(_path_is_under(cwd_resolved, root) for root in repo_roots):
+        return "cwd is outside runtime workspace roots"
+    if repo_roots and writable_roots and any(
+        not any(_path_is_under(root, repo_root) for repo_root in repo_roots)
+        for root in writable_roots
     ):
+        return "writable root is outside runtime workspace roots"
+    if writable_roots and not any(_paths_overlap(cwd_resolved, root) for root in writable_roots):
         return "cwd is outside runtime workspace roots"
 
     if validate_manifest:
@@ -337,6 +344,40 @@ def _runtime_workspace_binding_error(
         if not _path_is_under(cwd_resolved, sandbox_root_resolved):
             return "cwd is outside sandbox root"
 
+        manifest_repo_roots_value = manifest.get("repo_roots")
+        manifest_repo_root_paths = (
+            list(manifest_repo_roots_value.values())
+            if isinstance(manifest_repo_roots_value, Mapping)
+            else _as_string_list(manifest_repo_roots_value)
+        )
+        manifest_repo_roots = [
+            Path(path).expanduser().resolve(strict=False)
+            for path in manifest_repo_root_paths
+            if str(path).strip()
+        ]
+        for root in manifest_repo_roots:
+            if root.exists() and _path_has_symlink_component(root):
+                return "repo root is symlinked"
+            if not _path_is_under(root, sandbox_root_resolved):
+                return "repo root is outside sandbox root"
+        binding_repo_roots = [
+            Path(path).expanduser().resolve(strict=False)
+            for path in repo_root_paths
+            if str(path).strip()
+        ]
+        for root in binding_repo_roots:
+            if root.exists() and _path_has_symlink_component(root):
+                return "binding repo root is symlinked"
+            if not _path_is_under(root, sandbox_root_resolved):
+                return "binding repo root is outside sandbox root"
+        manifest_bound_repo_roots = manifest_repo_roots or binding_repo_roots
+        if binding_repo_roots and manifest_repo_roots and set(binding_repo_roots) != set(manifest_repo_roots):
+            return "binding repo roots do not match manifest"
+        if manifest_bound_repo_roots and not any(
+            _path_is_under(cwd_resolved, root) for root in manifest_bound_repo_roots
+        ):
+            return "cwd is outside bound repo roots"
+
         manifest_writable_roots = [
             Path(path).expanduser().resolve(strict=False)
             for path in _as_string_list(manifest.get("writable_roots"))
@@ -362,7 +403,12 @@ def _runtime_workspace_binding_error(
             return "missing writable roots"
         if binding_writable_roots and set(binding_writable_roots) != set(manifest_allowed_roots):
             return "binding writable roots do not match manifest"
-        if not any(_path_is_under(cwd_resolved, root) for root in manifest_allowed_roots):
+        if manifest_bound_repo_roots and any(
+            not any(_path_is_under(root, repo_root) for repo_root in manifest_bound_repo_roots)
+            for root in manifest_allowed_roots
+        ):
+            return "writable root is outside bound repo roots"
+        if not any(_paths_overlap(cwd_resolved, root) for root in manifest_allowed_roots):
             return "cwd is outside writable roots"
 
     expires_raw = binding.get("expires_at")

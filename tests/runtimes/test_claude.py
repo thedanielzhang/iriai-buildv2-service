@@ -135,6 +135,103 @@ async def test_bound_write_role_forces_sandbox_and_blocks_escapes(monkeypatch, t
     assert isinstance(symlink_escape, _FakePermissionResultDeny)
 
 
+@pytest.mark.asyncio
+async def test_bound_write_role_accepts_file_level_writable_roots(monkeypatch, tmp_path):
+    monkeypatch.setitem(
+        sys.modules,
+        "claude_agent_sdk",
+        SimpleNamespace(ClaudeAgentOptions=_FakeClaudeAgentOptions),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "claude_agent_sdk.types",
+        SimpleNamespace(
+            PermissionResultAllow=_FakePermissionResultAllow,
+            PermissionResultDeny=_FakePermissionResultDeny,
+        ),
+    )
+
+    sandbox_root = tmp_path / "sandbox"
+    repo = sandbox_root / "repos" / "app"
+    allowed_file = repo / "src" / "allowed.py"
+    allowed_file.parent.mkdir(parents=True)
+    manifest_path = _write_sandbox_manifest(
+        sandbox_root,
+        repo,
+        writable_roots=[allowed_file],
+    )
+    runtime = object.__new__(ClaudeAgentRuntime)
+    role = Role(
+        name="implementer",
+        prompt="Implement safely.",
+        tools=["Read", "Write"],
+        metadata={
+            "runtime_workspace_binding": {
+                "sandbox_id": "sandbox-04",
+                "cwd": str(repo),
+                "workspace_override": str(repo),
+                "repo_roots": {"app": str(repo)},
+                "writable_roots": [str(allowed_file)],
+                "readonly_roots": [],
+                "blocked_roots": [],
+                "manifest_path": str(manifest_path),
+                "expires_at": "2999-01-01T00:00:00+00:00",
+                "runtime": "claude",
+            },
+        },
+    )
+
+    options = runtime._build_options(role, workspace=SimpleNamespace(path=str(repo)))
+
+    assert options.cwd == str(repo)
+    allowed = await options.can_use_tool("Write", {"file_path": "src/allowed.py"}, None)
+    sibling = await options.can_use_tool("Write", {"file_path": "src/other.py"}, None)
+    assert isinstance(allowed, _FakePermissionResultAllow)
+    assert isinstance(sibling, _FakePermissionResultDeny)
+
+
+def test_bound_write_role_rejects_writable_root_outside_bound_repo(monkeypatch, tmp_path):
+    monkeypatch.setitem(
+        sys.modules,
+        "claude_agent_sdk",
+        SimpleNamespace(ClaudeAgentOptions=_FakeClaudeAgentOptions),
+    )
+
+    sandbox_root = tmp_path / "sandbox"
+    repo = sandbox_root / "repos" / "app"
+    outside_repo_file = sandbox_root / "other" / "allowed.py"
+    repo.mkdir(parents=True)
+    outside_repo_file.parent.mkdir(parents=True)
+    manifest_path = _write_sandbox_manifest(
+        sandbox_root,
+        repo,
+        writable_roots=[outside_repo_file],
+    )
+    role = Role(
+        name="implementer",
+        prompt="Implement safely.",
+        tools=["Read", "Write"],
+        metadata={
+            "runtime_workspace_binding": {
+                "sandbox_id": "sandbox-04",
+                "cwd": str(repo),
+                "workspace_override": str(repo),
+                "repo_roots": {"app": str(repo)},
+                "writable_roots": [str(outside_repo_file)],
+                "readonly_roots": [],
+                "blocked_roots": [],
+                "manifest_path": str(manifest_path),
+                "expires_at": "2999-01-01T00:00:00+00:00",
+                "runtime": "claude",
+            },
+        },
+    )
+
+    runtime = object.__new__(ClaudeAgentRuntime)
+    with pytest.raises(RuntimeError, match="writable root is outside bound repo roots"):
+        runtime._build_options(role, workspace=SimpleNamespace(path=str(repo)))
+
+
 @pytest.mark.parametrize(
     ("mutate", "message"),
     [

@@ -79,6 +79,10 @@ def _path_is_relative_to(path: Path, root: Path) -> bool:
         return False
 
 
+def _paths_overlap(left: Path, right: Path) -> bool:
+    return _path_is_relative_to(left, right) or _path_is_relative_to(right, left)
+
+
 def _path_has_symlink_component(path: Path) -> bool:
     current = Path(path.anchor) if path.is_absolute() else Path()
     parts = path.parts[1:] if path.is_absolute() else path.parts
@@ -180,6 +184,29 @@ def _resolve_root_list(
     ]
 
 
+def _resolve_root_mapping(
+    value: Any,
+    *,
+    role_name: str,
+    label: str,
+    sandbox_root: Path,
+    require_existing: bool,
+) -> dict[str, Path]:
+    if not isinstance(value, Mapping):
+        return {}
+    return {
+        str(key): _resolve_root_path(
+            raw_path,
+            role_name=role_name,
+            label=label,
+            sandbox_root=sandbox_root,
+            require_existing=require_existing,
+        )
+        for key, raw_path in value.items()
+        if str(key).strip() and str(raw_path).strip()
+    }
+
+
 def _validate_runtime_workspace_binding(
     binding: Mapping[str, Any],
     *,
@@ -261,6 +288,28 @@ def _validate_runtime_workspace_binding(
     if not _path_is_relative_to(cwd, sandbox_root):
         raise RuntimeError(f"Bound Claude write role {role_name} cwd is outside sandbox root")
 
+    manifest_repo_roots = _resolve_root_mapping(
+        manifest.get("repo_roots"),
+        role_name=role_name,
+        label="manifest repo root",
+        sandbox_root=sandbox_root,
+        require_existing=True,
+    )
+    binding_repo_roots = _resolve_root_mapping(
+        binding.get("repo_roots"),
+        role_name=role_name,
+        label="binding repo root",
+        sandbox_root=sandbox_root,
+        require_existing=True,
+    )
+    if binding_repo_roots and manifest_repo_roots and binding_repo_roots != manifest_repo_roots:
+        raise RuntimeError(
+            f"Bound Claude write role {role_name} binding repo roots do not match manifest"
+        )
+    repo_roots = tuple((manifest_repo_roots or binding_repo_roots).values())
+    if repo_roots and not any(_path_is_relative_to(cwd, root) for root in repo_roots):
+        raise RuntimeError(f"Bound Claude write role {role_name} cwd is outside bound repo roots")
+
     manifest_writable_roots = _resolve_root_list(
         manifest.get("writable_roots"),
         role_name=role_name,
@@ -282,7 +331,12 @@ def _validate_runtime_workspace_binding(
         raise RuntimeError(
             f"Bound Claude write role {role_name} binding writable roots do not match manifest"
         )
-    if not any(_path_is_relative_to(cwd, root) for root in writable_roots):
+    if repo_roots and any(
+        not any(_path_is_relative_to(root, repo_root) for repo_root in repo_roots)
+        for root in writable_roots
+    ):
+        raise RuntimeError(f"Bound Claude write role {role_name} writable root is outside bound repo roots")
+    if not any(_paths_overlap(cwd, root) for root in writable_roots):
         raise RuntimeError(f"Bound Claude write role {role_name} cwd is outside writable roots")
 
     blocked_roots = tuple(

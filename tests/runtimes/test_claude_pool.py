@@ -599,6 +599,66 @@ async def test_bound_pool_write_producing_role_submits_authorized_sandbox_job(
 
 
 @pytest.mark.asyncio
+async def test_bound_pool_write_role_accepts_file_level_writable_roots(
+    tmp_path: Path,
+) -> None:
+    runtime = ClaudePoolRuntime(root=tmp_path, profiles=_profiles(), poll_interval=0.01)
+    profile = _profiles()[0]
+    sandbox_root = tmp_path / "sandbox"
+    cwd = sandbox_root / "repos" / "app"
+    writable_file = cwd / "src" / "allowed.py"
+    writable_file.parent.mkdir(parents=True)
+    manifest_path = _write_sandbox_manifest(
+        sandbox_root,
+        cwd,
+        writable_roots=[writable_file],
+    )
+    role = Role(
+        name="implementer",
+        prompt="Return ok.",
+        tools=["Read", "Write"],
+        metadata={
+            "runtime_workspace_binding": {
+                "sandbox_id": "sandbox-04",
+                "cwd": str(cwd),
+                "workspace_override": str(cwd),
+                "repo_roots": {"app": str(cwd)},
+                "writable_roots": [str(writable_file)],
+                "blocked_roots": [],
+                "manifest_path": str(manifest_path),
+                "expires_at": (datetime.now(UTC) + timedelta(hours=1)).isoformat(),
+                "runtime": "claude_pool",
+            }
+        },
+    )
+
+    task = asyncio.create_task(runtime._submit_and_wait(
+        role,
+        "Do work.",
+        output_type=None,
+        workspace=SimpleNamespace(path=cwd),
+        session_key="implementer:feat-1",
+        profile=profile,
+    ))
+    await asyncio.sleep(0.05)
+    queued = list((tmp_path / "jobs" / "queued" / profile.name).glob("*.json"))
+    assert len(queued) == 1
+    manifest = json.loads(queued[0].read_text(encoding="utf-8"))
+    assert manifest["runtime_workspace_binding"]["writable_roots"] == [str(writable_file)]
+    result_path = Path(manifest["paths"]["result"])
+    _write_json_atomic(result_path, {"ok": True, "result_text": "ok"})
+    _write_json_atomic(
+        _job_state_path(tmp_path, "done", profile.name, manifest["id"]),
+        {**manifest, "status": "done"},
+    )
+
+    result_text, structured_output, raw = await task
+    assert result_text == "ok"
+    assert structured_output is None
+    assert raw is None
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("mutate", "message"),
     [

@@ -985,7 +985,7 @@ class TestCodexAgentRuntime:
         assert run_called is False
 
     @pytest.mark.asyncio
-    async def test_bound_run_codex_rejects_cwd_ancestor_of_writable_root(
+    async def test_bound_run_codex_allows_repo_cwd_with_file_level_writable_root(
         self,
         monkeypatch: pytest.MonkeyPatch,
         tmp_path: Path,
@@ -993,19 +993,19 @@ class TestCodexAgentRuntime:
         runtime = self._runtime(monkeypatch)
         sandbox_root = tmp_path / "sandbox"
         cwd = sandbox_root / "repos" / "app"
-        writable_file_parent = cwd / "src"
-        writable_file_parent.mkdir(parents=True)
+        writable_file = cwd / "src" / "commands.py"
+        writable_file.parent.mkdir(parents=True)
         manifest_path = _write_sandbox_manifest(
             sandbox_root,
             cwd,
-            writable_roots=[writable_file_parent],
+            writable_roots=[writable_file],
         )
         run_called = False
 
         async def _fake_run_process(*_args, **_kwargs):
             nonlocal run_called
             run_called = True
-            return "", None, ""
+            return "ok", None, ""
 
         monkeypatch.setattr(runtime, "_run_process", _fake_run_process)
         role = Role(
@@ -1016,7 +1016,7 @@ class TestCodexAgentRuntime:
                 "runtime_workspace_binding": {
                     "sandbox_id": "sandbox-04",
                     "cwd": str(cwd),
-                    "writable_roots": [str(writable_file_parent)],
+                    "writable_roots": [str(writable_file)],
                     "readonly_roots": [],
                     "blocked_roots": [],
                     "manifest_path": str(manifest_path),
@@ -1026,19 +1026,19 @@ class TestCodexAgentRuntime:
             },
         )
 
-        with pytest.raises(RuntimeError, match="cwd is outside writable roots"):
-            await runtime._run_codex(
-                role,
-                "Return a value.",
-                workspace=SimpleNamespace(path=str(cwd)),
-                output_type=None,
-                resume_thread_id=None,
-                ephemeral=True,
-                feature_id="feat-1",
-                session_key="implementer:feat-1",
-            )
+        final_text, _thread_id = await runtime._run_codex(
+            role,
+            "Return a value.",
+            workspace=SimpleNamespace(path=str(cwd)),
+            output_type=None,
+            resume_thread_id=None,
+            ephemeral=True,
+            feature_id="feat-1",
+            session_key="implementer:feat-1",
+        )
 
-        assert run_called is False
+        assert final_text == "ok"
+        assert run_called is True
 
     def test_bound_codex_write_authority_accepts_manifest_matched_binding(
         self,
@@ -1073,6 +1073,44 @@ class TestCodexAgentRuntime:
 
         assert authority.cwd == cwd.resolve()
         assert cwd.resolve() in authority.writable_roots
+
+    def test_bound_codex_write_authority_rejects_writable_root_outside_repo(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ):
+        runtime = self._runtime(monkeypatch)
+        sandbox_root = tmp_path / "sandbox"
+        cwd = sandbox_root / "repos" / "app"
+        outside_repo_file = sandbox_root / "other" / "commands.py"
+        cwd.mkdir(parents=True)
+        outside_repo_file.parent.mkdir(parents=True)
+        manifest_path = _write_sandbox_manifest(
+            sandbox_root,
+            cwd,
+            writable_roots=[outside_repo_file],
+        )
+        role = Role(
+            name="implementer",
+            prompt="Fix it.",
+            tools=["Read", "Write"],
+            metadata={
+                "runtime_workspace_binding": {
+                    "sandbox_id": "sandbox-04",
+                    "runtime": "codex",
+                    "cwd": str(cwd),
+                    "workspace_override": str(cwd),
+                    "repo_roots": {"app": str(cwd)},
+                    "writable_roots": [str(outside_repo_file)],
+                    "blocked_roots": [],
+                    "manifest_path": str(manifest_path),
+                    "expires_at": "2999-01-01T00:00:00+00:00",
+                }
+            },
+        )
+
+        with pytest.raises(RuntimeError, match="writable root is outside bound repo roots"):
+            runtime._bound_runtime_authority(role, SimpleNamespace(path=str(cwd)))
 
     @pytest.mark.parametrize(
         ("mutate", "message"),

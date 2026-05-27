@@ -22,14 +22,25 @@ from iriai_build_v2.workflows.develop.execution.workspace_authority import (
 class _Artifacts:
     def __init__(self) -> None:
         self.store: dict[str, str] = {}
+        self.ids: dict[str, int] = {}
+        self._next_id = 0
 
     async def put(self, key: str, value: str, *, feature) -> None:
         del feature
+        self._next_id += 1
         self.store[key] = value
+        self.ids[key] = self._next_id
+        self.last_artifact_id = self._next_id
 
     async def get(self, key: str, *, feature) -> str | None:
         del feature
         return self.store.get(key)
+
+    async def get_record(self, key: str, *, feature) -> dict[str, object] | None:
+        del feature
+        if key not in self.store:
+            return None
+        return {"id": self.ids.get(key, 0), "value": self.store[key]}
 
 
 class _BridgeExecutionControlStore:
@@ -207,6 +218,60 @@ def _workspace(tmp_path: Path) -> tuple[Path, Path]:
     return workspace_root, feature_root
 
 
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "provider_error",
+        "process_failed",
+        "timeout",
+        "watchdog_stall",
+        "context_materialization_failed",
+        "structured_output_invalid",
+    ],
+)
+def test_retryable_dispatch_terminal_reasons_advance_attempt(reason: str) -> None:
+    outcome = SimpleNamespace(status="failed", runtime_terminal_reason=reason)
+
+    assert implementation_module._should_retry_implementation_dispatch_outcome(
+        outcome,
+        attempt=0,
+        max_retries=5,
+    )
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "sandbox_binding_failed",
+        "prompt_too_large",
+        "cancelled",
+        "patch_capture_failed",
+        "completed",
+    ],
+)
+def test_non_retryable_dispatch_terminal_reasons_block(reason: str) -> None:
+    outcome = SimpleNamespace(status="failed", runtime_terminal_reason=reason)
+
+    assert not implementation_module._should_retry_implementation_dispatch_outcome(
+        outcome,
+        attempt=0,
+        max_retries=5,
+    )
+
+
+def test_retryable_dispatch_terminal_reason_stops_at_budget() -> None:
+    outcome = SimpleNamespace(
+        status="failed",
+        runtime_terminal_reason="provider_error",
+    )
+
+    assert not implementation_module._should_retry_implementation_dispatch_outcome(
+        outcome,
+        attempt=5,
+        max_retries=5,
+    )
+
+
 def _authority_repo(
     feature_root: Path,
     name: str,
@@ -306,6 +371,175 @@ def _patch_git_evidence(
         )
 
     monkeypatch.setattr(implementation_module, "_git_patch_evidence", _git_evidence)
+
+
+def test_dispatch_repo_binding_uses_contract_when_task_repo_path_empty(tmp_path: Path) -> None:
+    workspace_root, feature_root = _workspace(tmp_path)
+    repo = _repo(feature_root, "app")
+    registry = _authority_registry(
+        feature_root,
+        [
+            _authority_repo(
+                feature_root,
+                "app",
+                "repo-app",
+                writable_task_ids=["TASK-contract"],
+            )
+        ],
+    )
+    task = ImplementationTask(
+        id="TASK-contract",
+        name="contract",
+        description="contract",
+        repo_path="",
+        file_scope=[TaskFileScope(path="app/src/example.py", action="modify")],
+    )
+    contract = SimpleNamespace(repo_id="repo-app", repo_path="app")
+
+    binding = implementation_module._resolve_task_dispatch_repo_binding(
+        task=task,
+        task_contract=contract,
+        registry=registry,
+        feature_root=feature_root,
+    )
+
+    assert workspace_root  # keeps the workspace fixture shape explicit
+    assert binding.repo_id == "repo-app"
+    assert binding.repo_path == "app"
+    assert binding.ws_path == str(repo)
+    assert binding.source == "contract"
+
+
+def test_dispatch_repo_binding_uses_unique_registry_owner(tmp_path: Path) -> None:
+    _workspace_root, feature_root = _workspace(tmp_path)
+    repo = _repo(feature_root, "app")
+    registry = _authority_registry(
+        feature_root,
+        [
+            _authority_repo(
+                feature_root,
+                "app",
+                "repo-app",
+                writable_task_ids=["TASK-registry"],
+            )
+        ],
+    )
+    task = ImplementationTask(
+        id="TASK-registry",
+        name="registry",
+        description="registry",
+        repo_path="",
+        file_scope=[TaskFileScope(path="app/src/example.py", action="modify")],
+    )
+
+    binding = implementation_module._resolve_task_dispatch_repo_binding(
+        task=task,
+        task_contract=None,
+        registry=registry,
+        feature_root=feature_root,
+    )
+
+    assert binding.repo_id == "repo-app"
+    assert binding.repo_path == "app"
+    assert binding.ws_path == str(repo)
+    assert binding.source == "registry"
+
+
+def test_dispatch_repo_binding_fails_on_contract_registry_mismatch(tmp_path: Path) -> None:
+    _workspace_root, feature_root = _workspace(tmp_path)
+    _repo(feature_root, "app")
+    registry = _authority_registry(
+        feature_root,
+        [
+            _authority_repo(
+                feature_root,
+                "app",
+                "repo-app",
+                writable_task_ids=["TASK-mismatch"],
+            )
+        ],
+    )
+    task = ImplementationTask(
+        id="TASK-mismatch",
+        name="mismatch",
+        description="mismatch",
+        repo_path="",
+        file_scope=[TaskFileScope(path="app/src/example.py", action="modify")],
+    )
+    contract = SimpleNamespace(repo_id="repo-app", repo_path="other")
+
+    with pytest.raises(implementation_module.SandboxWorkflowBlocker, match="repo_path mismatch"):
+        implementation_module._resolve_task_dispatch_repo_binding(
+            task=task,
+            task_contract=contract,
+            registry=registry,
+            feature_root=feature_root,
+        )
+
+
+def test_dispatch_repo_binding_fails_on_missing_git_worktree(tmp_path: Path) -> None:
+    _workspace_root, feature_root = _workspace(tmp_path)
+    registry = _authority_registry(
+        feature_root,
+        [
+            _authority_repo(
+                feature_root,
+                "app",
+                "repo-app",
+                writable_task_ids=["TASK-nongit"],
+            )
+        ],
+    )
+    task = ImplementationTask(
+        id="TASK-nongit",
+        name="nongit",
+        description="nongit",
+        repo_path="",
+        file_scope=[TaskFileScope(path="app/src/example.py", action="modify")],
+    )
+    contract = SimpleNamespace(repo_id="repo-app", repo_path="app")
+
+    with pytest.raises(implementation_module.SandboxWorkflowBlocker, match="not a Git worktree"):
+        implementation_module._resolve_task_dispatch_repo_binding(
+            task=task,
+            task_contract=contract,
+            registry=registry,
+            feature_root=feature_root,
+        )
+
+
+@pytest.mark.asyncio
+async def test_implementation_prompt_context_materializes_positive_prompt_ref(
+    tmp_path: Path,
+) -> None:
+    workspace_root, _feature_root = _workspace(tmp_path)
+    artifacts = _Artifacts()
+    feature = _feature()
+    runner = _runner(workspace_root, artifacts)
+    task = ImplementationTask(
+        id="TASK-prompt",
+        name="prompt",
+        description="prompt",
+        repo_path="app",
+        file_scope=[TaskFileScope(path="app/src/example.py", action="modify")],
+    )
+    builder = implementation_module._ImplementationPromptBuilder(
+        runner=runner,
+        feature=feature,
+        task=task,
+        repo_prefix="app/",
+        task_contract=None,
+        handover_context="",
+        inline_prompt="Do it.",
+        log_label="Prompt",
+    )
+
+    result = await builder.build_prompt_context(
+        SimpleNamespace(group_idx=7, request_digest="d" * 64),
+    )
+
+    assert result.bundle.prompt_ref > 0
+    assert _artifact_key_with_prefix(artifacts, "dag-dispatch-prompt:g7:TASK-prompt:")
 
 
 @pytest.mark.asyncio
@@ -409,6 +643,341 @@ async def test_context_layer_uses_review_source_id_when_typed_store_lacks_source
     assert len(keys) == 1
     payload = json.loads(artifacts.store[keys[0]])
     assert payload["source_dag_artifact_id"] == source_id
+
+
+def _legacy_completed_group_checkpoint(
+    *,
+    group_idx: int,
+    task_id: str,
+    status: str = "completed",
+) -> str:
+    result = implementation_module.ImplementationResult(
+        task_id=task_id,
+        summary=f"legacy completed {task_id}",
+        status=status,
+    )
+    return json.dumps(
+        {
+            "group_idx": group_idx,
+            "task_ids": [task_id],
+            "results": [result.model_dump()],
+            "verdict": "approved",
+            "commit_hash": "",
+        },
+        sort_keys=True,
+    )
+
+
+async def _noop_worktrees(*_args, **_kwargs) -> None:
+    return None
+
+
+async def _alias_guard_ok(*_args, **_kwargs):
+    return True, {"blockers": []}
+
+
+@pytest.mark.asyncio
+async def test_legacy_completed_checkpoint_skips_before_contract_compile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artifacts = _Artifacts()
+    artifacts.store["dag-group:0"] = _legacy_completed_group_checkpoint(
+        group_idx=0,
+        task_id="TASK-old",
+    )
+    feature = _feature()
+    compiled_groups: list[int] = []
+    dag = implementation_module.ImplementationDAG(
+        tasks=[
+            ImplementationTask(id="TASK-old", name="old", description="old"),
+            ImplementationTask(id="TASK-next", name="next", description="next"),
+        ],
+        execution_order=[["TASK-old"], ["TASK-next"]],
+        complete=True,
+    )
+
+    async def _compile_contracts(*args, **_kwargs):
+        compiled_groups.append(args[3])
+        return implementation_module.TaskContractCompileOutcome(
+            approved=False,
+            failure=f"stop at g{args[3]}",
+            failure_class="contract_compile",
+            failure_type="contract_invalid_path",
+        )
+
+    monkeypatch.setattr(implementation_module, "_ensure_task_worktrees", _noop_worktrees)
+    monkeypatch.setattr(
+        implementation_module,
+        "_run_worktree_alias_pre_dispatch_guard",
+        _alias_guard_ok,
+    )
+    monkeypatch.setattr(
+        implementation_module,
+        "_compile_task_contracts_for_group",
+        _compile_contracts,
+    )
+    runner = SimpleNamespace(artifacts=artifacts, services={})
+
+    outcome = await _implement_dag(runner, feature, dag)
+
+    assert compiled_groups == [1]
+    assert "stop at g1" in outcome.failure
+    assert "legacy completed TASK-old" in outcome.implementation_text
+
+
+@pytest.mark.asyncio
+async def test_legacy_approved_checkpoint_skips_partial_result_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artifacts = _Artifacts()
+    artifacts.store["dag-group:0"] = _legacy_completed_group_checkpoint(
+        group_idx=0,
+        task_id="TASK-partial-old",
+        status="partial",
+    )
+    compiled_groups: list[int] = []
+    dag = implementation_module.ImplementationDAG(
+        tasks=[
+            ImplementationTask(
+                id="TASK-partial-old",
+                name="partial old",
+                description="partial old",
+            ),
+            ImplementationTask(id="TASK-next", name="next", description="next"),
+        ],
+        execution_order=[["TASK-partial-old"], ["TASK-next"]],
+        complete=True,
+    )
+
+    async def _compile_contracts(*args, **_kwargs):
+        compiled_groups.append(args[3])
+        return implementation_module.TaskContractCompileOutcome(
+            approved=False,
+            failure=f"stop at g{args[3]}",
+            failure_class="contract_compile",
+            failure_type="contract_invalid_path",
+        )
+
+    monkeypatch.setattr(implementation_module, "_ensure_task_worktrees", _noop_worktrees)
+    monkeypatch.setattr(
+        implementation_module,
+        "_run_worktree_alias_pre_dispatch_guard",
+        _alias_guard_ok,
+    )
+    monkeypatch.setattr(
+        implementation_module,
+        "_compile_task_contracts_for_group",
+        _compile_contracts,
+    )
+    runner = SimpleNamespace(artifacts=artifacts, services={})
+
+    outcome = await _implement_dag(runner, _feature(), dag)
+
+    assert compiled_groups == [1]
+    assert "stop at g1" in outcome.failure
+    assert "legacy completed TASK-partial-old" in outcome.implementation_text
+
+
+@pytest.mark.asyncio
+async def test_legacy_completed_checkpoint_reruns_after_execution_control_adoption(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artifacts = _Artifacts()
+    feature = _feature()
+    artifacts.store["dag-group:0"] = _legacy_completed_group_checkpoint(
+        group_idx=0,
+        task_id="TASK-old",
+    )
+    artifacts.store[f"execution-control-adoption:{feature.id}"] = json.dumps(
+        {"status": "adopted", "feature_id": feature.id},
+        sort_keys=True,
+    )
+    compiled_groups: list[int] = []
+    dag = implementation_module.ImplementationDAG(
+        tasks=[ImplementationTask(id="TASK-old", name="old", description="old")],
+        execution_order=[["TASK-old"]],
+        complete=True,
+    )
+
+    async def _compile_contracts(*args, **_kwargs):
+        compiled_groups.append(args[3])
+        return implementation_module.TaskContractCompileOutcome(
+            approved=False,
+            failure="adopted group must revalidate",
+            failure_class="contract_compile",
+            failure_type="contract_invalid_path",
+        )
+
+    monkeypatch.setattr(implementation_module, "_ensure_task_worktrees", _noop_worktrees)
+    monkeypatch.setattr(
+        implementation_module,
+        "_run_worktree_alias_pre_dispatch_guard",
+        _alias_guard_ok,
+    )
+    monkeypatch.setattr(
+        implementation_module,
+        "_compile_task_contracts_for_group",
+        _compile_contracts,
+    )
+    runner = SimpleNamespace(artifacts=artifacts, services={})
+
+    outcome = await _implement_dag(runner, feature, dag)
+
+    assert compiled_groups == [0]
+    assert "adopted group must revalidate" in outcome.failure
+    assert "legacy completed TASK-old" not in outcome.implementation_text
+
+
+@pytest.mark.asyncio
+async def test_incomplete_legacy_checkpoint_does_not_skip_contract_compile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artifacts = _Artifacts()
+    artifacts.store["dag-group:0"] = _legacy_completed_group_checkpoint(
+        group_idx=0,
+        task_id="TASK-missing",
+    )
+    checkpoint = json.loads(artifacts.store["dag-group:0"])
+    checkpoint["results"] = []
+    artifacts.store["dag-group:0"] = json.dumps(checkpoint, sort_keys=True)
+    compiled_groups: list[int] = []
+    dag = implementation_module.ImplementationDAG(
+        tasks=[ImplementationTask(id="TASK-missing", name="missing", description="missing")],
+        execution_order=[["TASK-missing"]],
+        complete=True,
+    )
+
+    async def _compile_contracts(*args, **_kwargs):
+        compiled_groups.append(args[3])
+        return implementation_module.TaskContractCompileOutcome(
+            approved=False,
+            failure="incomplete group must rerun",
+            failure_class="contract_compile",
+            failure_type="contract_invalid_path",
+        )
+
+    monkeypatch.setattr(implementation_module, "_ensure_task_worktrees", _noop_worktrees)
+    monkeypatch.setattr(
+        implementation_module,
+        "_run_worktree_alias_pre_dispatch_guard",
+        _alias_guard_ok,
+    )
+    monkeypatch.setattr(
+        implementation_module,
+        "_compile_task_contracts_for_group",
+        _compile_contracts,
+    )
+    runner = SimpleNamespace(artifacts=artifacts, services={})
+
+    outcome = await _implement_dag(runner, _feature(), dag)
+
+    assert compiled_groups == [0]
+    assert "incomplete group must rerun" in outcome.failure
+    assert "legacy completed TASK-missing" not in outcome.implementation_text
+
+
+@pytest.mark.asyncio
+async def test_mismatched_legacy_checkpoint_does_not_skip_contract_compile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artifacts = _Artifacts()
+    artifacts.store["dag-group:0"] = _legacy_completed_group_checkpoint(
+        group_idx=0,
+        task_id="OTHER",
+    )
+    checkpoint = json.loads(artifacts.store["dag-group:0"])
+    checkpoint["task_ids"] = ["TASK-mismatch"]
+    artifacts.store["dag-group:0"] = json.dumps(checkpoint, sort_keys=True)
+    compiled_groups: list[int] = []
+    dag = implementation_module.ImplementationDAG(
+        tasks=[
+            ImplementationTask(
+                id="TASK-mismatch",
+                name="mismatch",
+                description="mismatch",
+            )
+        ],
+        execution_order=[["TASK-mismatch"]],
+        complete=True,
+    )
+
+    async def _compile_contracts(*args, **_kwargs):
+        compiled_groups.append(args[3])
+        return implementation_module.TaskContractCompileOutcome(
+            approved=False,
+            failure="mismatched group must rerun",
+            failure_class="contract_compile",
+            failure_type="contract_invalid_path",
+        )
+
+    monkeypatch.setattr(implementation_module, "_ensure_task_worktrees", _noop_worktrees)
+    monkeypatch.setattr(
+        implementation_module,
+        "_run_worktree_alias_pre_dispatch_guard",
+        _alias_guard_ok,
+    )
+    monkeypatch.setattr(
+        implementation_module,
+        "_compile_task_contracts_for_group",
+        _compile_contracts,
+    )
+    runner = SimpleNamespace(artifacts=artifacts, services={})
+
+    outcome = await _implement_dag(runner, _feature(), dag)
+
+    assert compiled_groups == [0]
+    assert "mismatched group must rerun" in outcome.failure
+    assert "legacy completed OTHER" not in outcome.implementation_text
+
+
+@pytest.mark.asyncio
+async def test_legacy_completed_checkpoints_resume_at_group_77(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artifacts = _Artifacts()
+    task_ids = [f"TASK-{idx}" for idx in range(78)]
+    for group_idx, task_id in enumerate(task_ids[:77]):
+        artifacts.store[f"dag-group:{group_idx}"] = _legacy_completed_group_checkpoint(
+            group_idx=group_idx,
+            task_id=task_id,
+        )
+    compiled_groups: list[int] = []
+    dag = implementation_module.ImplementationDAG(
+        tasks=[
+            ImplementationTask(id=task_id, name=task_id, description=task_id)
+            for task_id in task_ids
+        ],
+        execution_order=[[task_id] for task_id in task_ids],
+        complete=True,
+    )
+
+    async def _compile_contracts(*args, **_kwargs):
+        compiled_groups.append(args[3])
+        return implementation_module.TaskContractCompileOutcome(
+            approved=False,
+            failure=f"reached g{args[3]}",
+            failure_class="contract_compile",
+            failure_type="contract_invalid_path",
+        )
+
+    monkeypatch.setattr(implementation_module, "_ensure_task_worktrees", _noop_worktrees)
+    monkeypatch.setattr(
+        implementation_module,
+        "_run_worktree_alias_pre_dispatch_guard",
+        _alias_guard_ok,
+    )
+    monkeypatch.setattr(
+        implementation_module,
+        "_compile_task_contracts_for_group",
+        _compile_contracts,
+    )
+    runner = SimpleNamespace(artifacts=artifacts, services={})
+
+    outcome = await _implement_dag(runner, _feature(), dag)
+
+    assert compiled_groups == [77]
+    assert "reached g77" in outcome.failure
+    assert "legacy completed TASK-76" in outcome.implementation_text
 
 
 @pytest.mark.asyncio
@@ -1433,6 +2002,325 @@ async def test_live_dag_dispatch_uses_dispatcher_not_direct_runner_run(
 
     _assert_pending_merge_queue_blocker(outcome)
     assert dispatcher_calls
+
+
+@pytest.mark.asyncio
+async def test_live_dag_dispatch_retries_retryable_terminal_outcome(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    workspace_root, feature_root = _workspace(tmp_path)
+    _repo(feature_root, "app")
+    artifacts = _Artifacts()
+    feature = _feature()
+    dispatch_requests: list[object] = []
+
+    async def _noop_worktrees(*_args, **_kwargs) -> None:
+        return None
+
+    async def _alias_guard_ok(*_args, **_kwargs):
+        return True, {"blockers": []}
+
+    class _RetryRuntimeDispatcher:
+        def __init__(self, **kwargs):
+            self._normalizer = kwargs["output_normalizer"]
+
+        async def dispatch(self, request):
+            dispatch_requests.append(request)
+            if request.retry == 0:
+                return implementation_module.DispatcherOutcome(
+                    attempt_id=100,
+                    state="failed",
+                    status="failed",
+                    runtime_terminal_reason="provider_error",
+                    structured_result_evidence_id=None,
+                    raw_text_ref=501,
+                    patch_summary_ids=[],
+                    compatibility_artifact_ids=[],
+                    runtime_failure_id=200,
+                    typed_failure_id=200,
+                    idempotency_key=request.idempotency_key,
+                )
+            self._normalizer.result = implementation_module.ImplementationResult(
+                task_id=request.task_id,
+                summary="done after retry",
+                status="completed",
+                files_created=["app/src/generated.py"],
+            )
+            return implementation_module.DispatcherOutcome(
+                attempt_id=101,
+                state="succeeded",
+                status="succeeded",
+                runtime_terminal_reason="completed",
+                structured_result_evidence_id=301,
+                raw_text_ref=None,
+                patch_summary_ids=[701],
+                compatibility_artifact_ids=[],
+                runtime_failure_id=None,
+                typed_failure_id=None,
+                idempotency_key=request.idempotency_key,
+            )
+
+    monkeypatch.setattr(implementation_module, "_ensure_task_worktrees", _noop_worktrees)
+    monkeypatch.setattr(
+        implementation_module,
+        "_run_worktree_alias_pre_dispatch_guard",
+        _alias_guard_ok,
+    )
+    monkeypatch.setattr(implementation_module, "RuntimeDispatcher", _RetryRuntimeDispatcher)
+    runner = _runner(workspace_root, artifacts)
+    dag = implementation_module.ImplementationDAG(
+        tasks=[
+            ImplementationTask(
+                id="TASK-retry",
+                name="retry",
+                description="retry",
+                repo_path="app",
+                file_scope=[TaskFileScope(path="app/src/generated.py", action="create")],
+            )
+        ],
+        execution_order=[["TASK-retry"]],
+        complete=True,
+    )
+
+    outcome = await _implement_dag(runner, feature, dag)
+
+    _assert_pending_merge_queue_blocker(outcome)
+    assert [request.retry for request in dispatch_requests] == [0, 1]
+    assert dispatch_requests[0].idempotency_key != dispatch_requests[1].idempotency_key
+    assert dispatch_requests[0].sandbox_id != dispatch_requests[1].sandbox_id
+
+
+@pytest.mark.asyncio
+async def test_live_dag_dispatch_retries_stale_context_failure_with_positive_prompt_ref(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    workspace_root, feature_root = _workspace(tmp_path)
+    _repo(feature_root, "app")
+    artifacts = _Artifacts()
+    feature = _feature()
+
+    class _ReplayContextFailureStore(_BridgeExecutionControlStore):
+        async def start_dispatch_attempt(self, request):
+            self.start_requests.append(request)
+            if request.retry == 0:
+                outcome = implementation_module.DispatcherOutcome(
+                    attempt_id=900,
+                    state="failed",
+                    status="failed",
+                    runtime_terminal_reason="context_materialization_failed",
+                    structured_result_evidence_id=None,
+                    raw_text_ref=None,
+                    patch_summary_ids=[],
+                    compatibility_artifact_ids=[],
+                    runtime_failure_id=901,
+                    typed_failure_id=901,
+                    idempotency_key=request.idempotency_key,
+                )
+                return SimpleNamespace(
+                    attempt_id=900,
+                    created=False,
+                    attempt=SimpleNamespace(
+                        status="failed",
+                        dispatcher_state="failed",
+                        request_digest=request.request_digest,
+                        payload={"dispatch_outcome": outcome.model_dump(mode="json")},
+                    ),
+                )
+            return SimpleNamespace(
+                attempt_id=900 + request.retry,
+                created=True,
+                attempt=SimpleNamespace(
+                    status="started",
+                    dispatcher_state="attempt_started",
+                    payload={},
+                    request_digest=request.request_digest,
+                ),
+            )
+
+    async def _noop_worktrees(*_args, **_kwargs) -> None:
+        return None
+
+    async def _alias_guard_ok(*_args, **_kwargs):
+        return True, {"blockers": []}
+
+    async def _run(ask, *_args, **_kwargs):
+        _write_sandbox_file(ask, "src/generated.py", "value = 'retry'\n")
+        return implementation_module.ImplementationResult(
+            task_id="TASK-context-retry",
+            summary="completed after context retry",
+            status="completed",
+            files_created=["app/src/generated.py"],
+        )
+
+    monkeypatch.setattr(implementation_module, "_ensure_task_worktrees", _noop_worktrees)
+    monkeypatch.setattr(
+        implementation_module,
+        "_run_worktree_alias_pre_dispatch_guard",
+        _alias_guard_ok,
+    )
+    runner = _runner(workspace_root, artifacts)
+    runner.services["execution_control_store"] = _ReplayContextFailureStore()
+    runner.run = _run
+    dag = implementation_module.ImplementationDAG(
+        tasks=[
+            ImplementationTask(
+                id="TASK-context-retry",
+                name="context retry",
+                description="context retry",
+                repo_path="app",
+                file_scope=[TaskFileScope(path="app/src/generated.py", action="create")],
+            )
+        ],
+        execution_order=[["TASK-context-retry"]],
+        complete=True,
+    )
+
+    outcome = await _implement_dag(runner, feature, dag)
+
+    _assert_pending_merge_queue_blocker(outcome)
+    store = runner.services["execution_control_store"]
+    assert [request.retry for request in store.start_requests] == [0, 1]
+    assert store.prompt_contexts
+    assert store.prompt_contexts[-1].prompt_ref > 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminal_reason", ["sandbox_binding_failed", "prompt_too_large"])
+async def test_live_dag_dispatch_does_not_retry_non_retryable_terminal_outcome(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    terminal_reason: str,
+) -> None:
+    workspace_root, feature_root = _workspace(tmp_path)
+    _repo(feature_root, "app")
+    artifacts = _Artifacts()
+    feature = _feature()
+    dispatch_requests: list[object] = []
+
+    async def _noop_worktrees(*_args, **_kwargs) -> None:
+        return None
+
+    async def _alias_guard_ok(*_args, **_kwargs):
+        return True, {"blockers": []}
+
+    class _NonRetryRuntimeDispatcher:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def dispatch(self, request):
+            dispatch_requests.append(request)
+            return implementation_module.DispatcherOutcome(
+                attempt_id=100,
+                state="failed",
+                status="failed",
+                runtime_terminal_reason=terminal_reason,
+                structured_result_evidence_id=None,
+                raw_text_ref=None,
+                patch_summary_ids=[],
+                compatibility_artifact_ids=[],
+                runtime_failure_id=200,
+                typed_failure_id=200,
+                idempotency_key=request.idempotency_key,
+            )
+
+    monkeypatch.setattr(implementation_module, "_ensure_task_worktrees", _noop_worktrees)
+    monkeypatch.setattr(
+        implementation_module,
+        "_run_worktree_alias_pre_dispatch_guard",
+        _alias_guard_ok,
+    )
+    monkeypatch.setattr(implementation_module, "RuntimeDispatcher", _NonRetryRuntimeDispatcher)
+    runner = _runner(workspace_root, artifacts)
+    dag = implementation_module.ImplementationDAG(
+        tasks=[
+            ImplementationTask(
+                id="TASK-no-retry",
+                name="no retry",
+                description="no retry",
+                repo_path="app",
+                file_scope=[TaskFileScope(path="app/src/generated.py", action="create")],
+            )
+        ],
+        execution_order=[["TASK-no-retry"]],
+        complete=True,
+    )
+
+    outcome = await _implement_dag(runner, feature, dag)
+
+    assert outcome.terminal_state == "workflow_blocked"
+    assert terminal_reason in outcome.failure
+    assert [request.retry for request in dispatch_requests] == [0]
+
+
+@pytest.mark.asyncio
+async def test_live_dag_dispatch_retryable_terminal_outcome_exhausts_budget(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    workspace_root, feature_root = _workspace(tmp_path)
+    _repo(feature_root, "app")
+    artifacts = _Artifacts()
+    feature = _feature()
+    dispatch_requests: list[object] = []
+
+    async def _noop_worktrees(*_args, **_kwargs) -> None:
+        return None
+
+    async def _alias_guard_ok(*_args, **_kwargs):
+        return True, {"blockers": []}
+
+    class _AlwaysFailRuntimeDispatcher:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def dispatch(self, request):
+            dispatch_requests.append(request)
+            failure_id = 200 + int(request.retry)
+            return implementation_module.DispatcherOutcome(
+                attempt_id=100 + int(request.retry),
+                state="failed",
+                status="failed",
+                runtime_terminal_reason="provider_error",
+                structured_result_evidence_id=None,
+                raw_text_ref=500 + int(request.retry),
+                patch_summary_ids=[],
+                compatibility_artifact_ids=[],
+                runtime_failure_id=failure_id,
+                typed_failure_id=failure_id,
+                idempotency_key=request.idempotency_key,
+            )
+
+    monkeypatch.setattr(implementation_module, "_ensure_task_worktrees", _noop_worktrees)
+    monkeypatch.setattr(
+        implementation_module,
+        "_run_worktree_alias_pre_dispatch_guard",
+        _alias_guard_ok,
+    )
+    monkeypatch.setattr(implementation_module, "RuntimeDispatcher", _AlwaysFailRuntimeDispatcher)
+    runner = _runner(workspace_root, artifacts)
+    dag = implementation_module.ImplementationDAG(
+        tasks=[
+            ImplementationTask(
+                id="TASK-exhaust",
+                name="exhaust",
+                description="exhaust",
+                repo_path="app",
+                file_scope=[TaskFileScope(path="app/src/generated.py", action="create")],
+            )
+        ],
+        execution_order=[["TASK-exhaust"]],
+        complete=True,
+    )
+
+    outcome = await _implement_dag(runner, feature, dag)
+
+    assert outcome.terminal_state == "workflow_blocked"
+    assert [request.retry for request in dispatch_requests] == [0, 1, 2, 3, 4, 5]
+    assert "typed_failure_id=205" in outcome.failure
+    assert "runtime_failure_id=205" in outcome.failure
+    assert "dispatcher_attempt_id=105" in outcome.failure
 
 
 @pytest.mark.asyncio

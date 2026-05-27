@@ -101,7 +101,12 @@ class ContractPathRule(_ContractModel):
 
 class AcceptanceCriterionSpec(_ContractModel):
     id: str
-    source_model: Literal["TaskAcceptanceCriterion", "ImplementationTask", "derived"]
+    source_model: Literal[
+        "TaskAcceptanceCriterion",
+        "ImplementationTask",
+        "TestAcceptanceCriterion",
+        "derived",
+    ]
     source_field: str
     source_ordinal: int
     text: str
@@ -262,6 +267,7 @@ class ContractCompileRequest(_ContractModel):
     manifest_forbidden_files: list[Any] = Field(default_factory=list)
     generated_outputs: list[Any] = Field(default_factory=list)
     verification_gates: list[Any] = Field(default_factory=list)
+    external_acceptance_criteria: list[Any] | dict[str, Any] = Field(default_factory=list)
     task_lineage_sources: list[str] = Field(default_factory=list)
     case_sensitivity_by_repo: dict[str, CaseSensitivity] = Field(default_factory=dict)
     task_wave: int = 0
@@ -280,6 +286,7 @@ class ContractGroupCompileRequest(_ContractModel):
     manifest_forbidden_files: list[Any] = Field(default_factory=list)
     generated_outputs: list[Any] | dict[str, list[Any]] = Field(default_factory=list)
     verification_gates: list[Any] | dict[str, list[Any]] = Field(default_factory=list)
+    external_acceptance_criteria: list[Any] | dict[str, Any] = Field(default_factory=list)
     task_lineage_sources: dict[str, list[str]] = Field(default_factory=dict)
     repo_ids_by_task: dict[str, str] = Field(default_factory=dict)
     case_sensitivity_by_repo: dict[str, CaseSensitivity] = Field(default_factory=dict)
@@ -311,7 +318,13 @@ class ContractCompiler:
         )
         all_task_ids = list(dict.fromkeys([*request.all_task_ids, task_id]))
 
-        acceptance = _compile_acceptance_criteria(request.task)
+        task_acceptance = _compile_acceptance_criteria(request.task)
+        acceptance = _acceptance_with_external_task_gates(
+            request.task,
+            task_acceptance,
+            request.external_acceptance_criteria,
+        )
+        task_criterion_ids = {criterion.id for criterion in task_acceptance}
         criterion_ids = {criterion.id for criterion in acceptance}
         evidence_specs: list[RequiredEvidenceSpec] = []
         required_paths: list[ContractPathRule] = []
@@ -473,7 +486,7 @@ class ContractCompiler:
             )
             absent = _truthy(entry.get("absent") or entry.get("path_absent") or entry.get("intentional_absence"))
             entry_criterion_ids = _normalized_criterion_ids(entry.get("criterion_ids") or entry.get("criteria") or [])
-            unknown_criteria = sorted(set(entry_criterion_ids) - criterion_ids)
+            unknown_criteria = sorted(set(entry_criterion_ids) - task_criterion_ids)
             if unknown_criteria:
                 _raise_compile(
                     "contract_unknown_criterion",
@@ -537,7 +550,7 @@ class ContractCompiler:
         generated_outputs = _sort_rules(_merge_rules(generated_outputs))
 
         _fail_on_case_collisions(
-            [*required_paths, *allowed_paths, *read_only_paths, *forbidden_paths, *generated_outputs],
+            [*required_paths, *allowed_paths, *read_only_paths, *generated_outputs],
             case_sensitivity=context.case_sensitivity,
         )
         _fail_on_same_contract_conflicts(
@@ -557,6 +570,7 @@ class ContractCompiler:
             acceptance,
             evidence_specs,
             repo_ids={repo.repo_id for repo in request.workspace_registry.repos},
+            explicit_acceptance=task_acceptance,
         )
         dependencies = _normalize_dependencies(
             _task_attr(request.task, "dependencies", []) or [],
@@ -649,6 +663,7 @@ class ContractCompiler:
                 manifest=_extra_attr(request, "manifest", {}),
                 generated_outputs=_task_scoped_items(request.generated_outputs, task_id),
                 verification_gates=_task_scoped_items(request.verification_gates, task_id),
+                external_acceptance_criteria=request.external_acceptance_criteria,
                 task_lineage_sources=request.task_lineage_sources.get(task_id, []),
                 case_sensitivity_by_repo=request.case_sensitivity_by_repo,
                 task_wave=request.task_waves.get(task_id, 0),
@@ -764,18 +779,6 @@ class ContractCompiler:
         case_sensitivity: CaseSensitivity,
         violations: list[dict[str, str]],
     ) -> None:
-        forbidden_variant = _case_variant_rule(contract.forbidden_paths, path)
-        if case_sensitivity == "unknown" and forbidden_variant is not None:
-            _add_violation(
-                violations,
-                code="case_collision_variant",
-                failure_class="contract_violation",
-                failure_type="outside_allowed_paths",
-                route="run_product_repair",
-                path=path,
-                rule=forbidden_variant.path,
-            )
-            return
         forbidden = _first_matching_rule(contract.forbidden_paths, path, case_sensitivity=case_sensitivity)
         if forbidden is not None:
             _add_violation(
@@ -787,6 +790,19 @@ class ContractCompiler:
                 path=path,
                 operation=operation,
                 rule=forbidden.path,
+            )
+            return
+
+        forbidden_variant = _case_variant_rule(contract.forbidden_paths, path)
+        if case_sensitivity == "unknown" and forbidden_variant is not None:
+            _add_violation(
+                violations,
+                code="case_collision_variant",
+                failure_class="contract_violation",
+                failure_type="outside_allowed_paths",
+                route="run_product_repair",
+                path=path,
+                rule=forbidden_variant.path,
             )
             return
 
@@ -958,6 +974,154 @@ def _compile_acceptance_criteria(task: Any) -> list[AcceptanceCriterionSpec]:
     return sorted(rows, key=lambda row: (row.source_ordinal, row.id))
 
 
+def _acceptance_with_external_task_gates(
+    task: Any,
+    acceptance: Sequence[AcceptanceCriterionSpec],
+    external_acceptance_criteria: list[Any] | dict[str, Any],
+) -> list[AcceptanceCriterionSpec]:
+    existing_ids = {criterion.id for criterion in acceptance}
+    gate_ids = {
+        _slug_id(str(raw_id))
+        for raw_id in list(_task_attr(task, "verification_gates", []) or [])
+    }
+    needed_ids = gate_ids - existing_ids
+    if not needed_ids:
+        return list(acceptance)
+    external_by_id = _external_acceptance_criteria_by_id(
+        external_acceptance_criteria,
+        needed_ids=needed_ids,
+    )
+    additions: list[AcceptanceCriterionSpec] = []
+    added_ids: set[str] = set()
+    for raw_id in list(_task_attr(task, "verification_gates", []) or []):
+        criterion_id = _slug_id(str(raw_id))
+        if criterion_id in existing_ids or criterion_id in added_ids:
+            continue
+        external = external_by_id.get(criterion_id)
+        if external is None:
+            continue
+        additions.append(external)
+        added_ids.add(criterion_id)
+    return sorted(
+        [*acceptance, *additions],
+        key=lambda row: (row.source_ordinal, row.id),
+    )
+
+
+def _external_acceptance_criteria_by_id(
+    external_acceptance_criteria: list[Any] | dict[str, Any],
+    *,
+    needed_ids: set[str] | None = None,
+) -> dict[str, AcceptanceCriterionSpec]:
+    criteria: dict[str, AcceptanceCriterionSpec] = {}
+    for ordinal, item in enumerate(_external_acceptance_items(external_acceptance_criteria)):
+        entry = _entry_dict(item)
+        raw_id = str(
+            entry.get("id")
+            or entry.get("criterion_id")
+            or entry.get("ac_id")
+            or entry.get("acceptance_criterion_id")
+            or ""
+        ).strip()
+        if not raw_id:
+            continue
+        criterion_id = _slug_id(raw_id)
+        if needed_ids is not None and criterion_id not in needed_ids:
+            continue
+        text = _external_acceptance_text(raw_id, entry)
+        if not text:
+            continue
+        source = str(
+            entry.get("source")
+            or entry.get("source_ref")
+            or entry.get("artifact_key")
+            or "external_acceptance_criteria"
+        )
+        source_ordinal = _coerce_int(entry.get("source_ordinal"), 100_000 + ordinal)
+        digest = stable_digest(
+            {
+                "id": criterion_id,
+                "source_model": "TestAcceptanceCriterion",
+                "source_field": source,
+                "source_ordinal": source_ordinal,
+                "text": text,
+                "must_pass": True,
+            }
+        )
+        criterion = AcceptanceCriterionSpec(
+            id=criterion_id,
+            source_model="TestAcceptanceCriterion",
+            source_field=source,
+            source_ordinal=source_ordinal,
+            text=text,
+            must_pass=True,
+            digest=digest,
+        )
+        existing = criteria.get(criterion_id)
+        if existing is not None and existing.digest != criterion.digest:
+            _raise_compile(
+                "contract_duplicate_criterion",
+                f"external acceptance criterion {raw_id!r} has conflicting definitions",
+            )
+        criteria[criterion_id] = criterion
+    return criteria
+
+
+def _external_acceptance_items(value: Any) -> list[Any]:
+    if value is None:
+        return []
+    if isinstance(value, BaseModel):
+        value = value.model_dump(mode="json")
+    if isinstance(value, dict):
+        if isinstance(value.get("content"), dict):
+            return _external_acceptance_items(value["content"])
+        if "acceptance_criteria" in value:
+            return list(value.get("acceptance_criteria") or [])
+        if any(key in value for key in ("id", "criterion_id", "ac_id", "acceptance_criterion_id")):
+            return [value]
+        items: list[Any] = []
+        for key, item in value.items():
+            if isinstance(item, dict):
+                entry = dict(item)
+                entry.setdefault("id", key)
+                items.append(entry)
+            else:
+                items.append({"id": key, "description": str(item)})
+        return items
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    return []
+
+
+def _external_acceptance_text(raw_id: str, entry: dict[str, Any]) -> str:
+    parts: list[str] = []
+    description = str(
+        entry.get("description")
+        or entry.get("text")
+        or entry.get("title")
+        or entry.get("name")
+        or ""
+    ).strip()
+    if description:
+        parts.append(description)
+    method = str(entry.get("verification_method") or "").strip()
+    if method:
+        parts.append(f"Method: {method}")
+    pass_condition = str(entry.get("pass_condition") or "").strip()
+    if pass_condition:
+        parts.append(f"Pass Condition: {pass_condition}")
+    if not parts:
+        return ""
+    return " ".join(f"{raw_id} — {' '.join(parts)}".split())
+
+
+def _coerce_int(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def _compile_legacy_files(
     task_id: str,
     legacy_files: Sequence[str],
@@ -1003,12 +1167,24 @@ def _compile_verification_gates(
     evidence_specs: Sequence[RequiredEvidenceSpec],
     *,
     repo_ids: set[str],
+    explicit_acceptance: Sequence[AcceptanceCriterionSpec] | None = None,
 ) -> list[VerificationGateSpec]:
     criteria_by_id = {criterion.id: criterion for criterion in acceptance}
+    explicit_criteria_by_id = {
+        criterion.id: criterion
+        for criterion in (explicit_acceptance if explicit_acceptance is not None else acceptance)
+    }
     gates: list[VerificationGateSpec] = []
 
     for raw_gate in _task_scoped_items(request.verification_gates, str(_task_attr(request.task, "id", ""))):
-        gates.append(_coerce_gate(raw_gate, criteria_by_id, repo_ids=repo_ids, default_source="task_verification"))
+        gates.append(
+            _coerce_gate(
+                raw_gate,
+                explicit_criteria_by_id,
+                repo_ids=repo_ids,
+                default_source="task_verification",
+            )
+        )
 
     task_id = str(_task_attr(request.task, "id", ""))
     for raw_id in list(_task_attr(request.task, "verification_gates", []) or []):

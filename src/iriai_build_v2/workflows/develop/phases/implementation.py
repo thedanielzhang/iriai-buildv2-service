@@ -301,6 +301,7 @@ from ....models.outputs import (
     RootCauseAnalysis,
     SubfeatureDecomposition,
     TaskFileScope,
+    TestPlan,
     Verdict,
     envelope_done,
 )
@@ -2983,6 +2984,10 @@ async def _compile_task_contracts_for_group(
             source_dag_artifact_id = 0
     source_dag_sha256 = str(source_record.get("sha256") if source_record else "") or dag_sha256
     manifest_entries = _dag_manifest_path_entries(_dag_candidate_file_roots(feature_root))
+    external_acceptance_criteria = await _load_external_acceptance_criteria_catalog(
+        runner,
+        feature,
+    )
     try:
         contracts = ContractCompiler().compile_group(
             ContractGroupCompileRequest(
@@ -2997,6 +3002,7 @@ async def _compile_task_contracts_for_group(
                 repo_ids_by_task=repo_ids_by_task,
                 manifest_expected_files=manifest_entries.get("expected_files", []),
                 manifest_forbidden_files=manifest_entries.get("forbidden_files", []),
+                external_acceptance_criteria=external_acceptance_criteria,
             )
         )
         persisted = await _persist_task_contracts(runner, feature, contracts)
@@ -3050,6 +3056,290 @@ def _contract_repo_path(contract: Any) -> str:
         getattr(contract, "repo_path", "")
         or _model_json_dict(contract).get("repo_path", "")
     ).strip("/")
+
+
+@dataclass(frozen=True)
+class _TaskDispatchRepoBinding:
+    repo_id: str
+    repo_path: str
+    ws_path: str
+    source: str
+
+
+def _normalize_dispatch_repo_path(value: Any) -> str:
+    text = str(value or "").strip().replace("\\", "/").strip("/")
+    if not text or text == "." or Path(text).is_absolute():
+        return ""
+    parts = Path(text).parts
+    if any(part in {"", ".", ".."} for part in parts):
+        return ""
+    return "/".join(parts)
+
+
+def _registry_repos(registry: Any | None) -> list[Any]:
+    if registry is None:
+        return []
+    repos = _value_attr(registry, "repos", []) or []
+    try:
+        return list(repos)
+    except TypeError:
+        return []
+
+
+def _registry_repo_id(repo: Any) -> str:
+    return str(_value_attr(repo, "repo_id", "") or "").strip()
+
+
+def _registry_repo_task_ids(repo: Any) -> set[str]:
+    task_ids: set[str] = set()
+    for attr in ("writable_task_ids", "read_only_task_ids", "task_ids"):
+        raw = _value_attr(repo, attr, []) or []
+        if isinstance(raw, str):
+            raw_iterable = [raw]
+        else:
+            try:
+                raw_iterable = list(raw)
+            except TypeError:
+                raw_iterable = []
+        task_ids.update(str(item) for item in raw_iterable if str(item))
+    return task_ids
+
+
+def _registry_has_task_claims(registry: Any | None) -> bool:
+    return any(_registry_repo_task_ids(repo) for repo in _registry_repos(registry))
+
+
+def _registry_repo_mentions_task(repo: Any, task_id: str) -> bool:
+    return task_id in _registry_repo_task_ids(repo)
+
+
+def _registry_repo_relative_path(repo: Any, feature_root: Path | None) -> str:
+    for attr in ("workspace_relative_path", "repo_path"):
+        normalized = _normalize_dispatch_repo_path(_value_attr(repo, attr, ""))
+        if normalized:
+            return normalized
+    if feature_root is not None:
+        canonical = str(
+            _value_attr(repo, "canonical_path", "")
+            or _value_attr(repo, "destination_path", "")
+            or ""
+        ).strip()
+        if canonical:
+            try:
+                return Path(canonical).expanduser().resolve(strict=False).relative_to(
+                    feature_root.resolve(strict=False)
+                ).as_posix()
+            except Exception:
+                return ""
+    return ""
+
+
+def _registry_repo_canonical_path(
+    repo: Any | None,
+    *,
+    feature_root: Path,
+    repo_path: str,
+) -> Path:
+    if repo is not None:
+        raw = str(
+            _value_attr(repo, "canonical_path", "")
+            or _value_attr(repo, "destination_path", "")
+            or ""
+        ).strip()
+        if raw:
+            candidate = Path(raw).expanduser()
+            if candidate.is_absolute():
+                return candidate
+            return feature_root / candidate
+    return feature_root / repo_path
+
+
+def _unique_registry_repo_for_task(
+    registry: Any | None,
+    *,
+    task_id: str,
+) -> tuple[Any | None, list[Any]]:
+    matches = [
+        repo
+        for repo in _registry_repos(registry)
+        if _registry_repo_mentions_task(repo, task_id)
+    ]
+    if len(matches) == 1:
+        return matches[0], matches
+    return None, matches
+
+
+def _registry_repo_for_selection(
+    registry: Any | None,
+    *,
+    task_id: str,
+    repo_id: str,
+    repo_path: str,
+    feature_root: Path | None,
+) -> Any | None:
+    repos = _registry_repos(registry)
+    if not repos:
+        return None
+    matches: list[Any] = []
+    for repo in repos:
+        if repo_id and _registry_repo_id(repo) == repo_id:
+            matches.append(repo)
+            continue
+        if repo_path and _registry_repo_relative_path(repo, feature_root) == repo_path:
+            matches.append(repo)
+    unique_matches: list[Any] = []
+    for repo in matches:
+        if not any(repo is existing for existing in unique_matches):
+            unique_matches.append(repo)
+    if not unique_matches:
+        raise _sandbox_blocker(
+            "Sandbox binding repo resolution could not match task "
+            f"{task_id} to workspace-authority registry "
+            f"(repo_id={repo_id or '-'}, repo_path={repo_path or '-'}).",
+            task_id=task_id,
+        )
+    if len(unique_matches) > 1:
+        labels = [
+            f"{_registry_repo_id(repo) or '-'}:"
+            f"{_registry_repo_relative_path(repo, feature_root) or '-'}"
+            for repo in unique_matches
+        ]
+        raise _sandbox_blocker(
+            "Sandbox binding repo resolution is ambiguous for task "
+            f"{task_id}: {labels}.",
+            task_id=task_id,
+        )
+    selected = unique_matches[0]
+    selected_id = _registry_repo_id(selected)
+    selected_path = _registry_repo_relative_path(selected, feature_root)
+    if repo_id and selected_id and repo_id != selected_id:
+        raise _sandbox_blocker(
+            "Sandbox binding repo_id mismatch for task "
+            f"{task_id}: contract/task selected {repo_id}, registry has {selected_id}.",
+            task_id=task_id,
+        )
+    if repo_path and selected_path and repo_path != selected_path:
+        raise _sandbox_blocker(
+            "Sandbox binding repo_path mismatch for task "
+            f"{task_id}: selected {repo_path}, registry has {selected_path}.",
+            task_id=task_id,
+        )
+    if _registry_has_task_claims(registry) and not _registry_repo_mentions_task(
+        selected,
+        task_id,
+    ):
+        raise _sandbox_blocker(
+            "Sandbox binding registry repo does not claim task "
+            f"{task_id}: {selected_id or selected_path or '<unknown>'}.",
+            task_id=task_id,
+        )
+    return selected
+
+
+def _resolve_task_dispatch_repo_binding(
+    *,
+    task: ImplementationTask,
+    task_contract: Any | None,
+    registry: Any | None,
+    feature_root: Path | None,
+) -> _TaskDispatchRepoBinding:
+    task_id = str(getattr(task, "id", "") or "")
+    repo_id = _contract_repo_id(task_contract) if task_contract is not None else ""
+    repo_path = (
+        _normalize_dispatch_repo_path(_contract_repo_path(task_contract))
+        if task_contract is not None
+        else ""
+    )
+    source = "contract" if repo_id or repo_path else ""
+
+    if not repo_id and not repo_path:
+        repo, matches = _unique_registry_repo_for_task(registry, task_id=task_id)
+        if len(matches) > 1:
+            labels = [
+                f"{_registry_repo_id(item) or '-'}:"
+                f"{_registry_repo_relative_path(item, feature_root) or '-'}"
+                for item in matches
+            ]
+            raise _sandbox_blocker(
+                f"Sandbox binding registry has multiple repo owners for task {task_id}: {labels}.",
+                task_id=task_id,
+            )
+        if repo is not None:
+            repo_id = _registry_repo_id(repo)
+            repo_path = _registry_repo_relative_path(repo, feature_root)
+            source = "registry"
+
+    if not repo_id and not repo_path:
+        repo_path = _normalize_dispatch_repo_path(getattr(task, "repo_path", ""))
+        source = "task" if repo_path else ""
+
+    if not repo_id and not repo_path:
+        raise _sandbox_blocker(
+            f"Sandbox binding could not resolve a repo for task {task_id}.",
+            task_id=task_id,
+        )
+
+    selected_repo = _registry_repo_for_selection(
+        registry,
+        task_id=task_id,
+        repo_id=repo_id,
+        repo_path=repo_path,
+        feature_root=feature_root,
+    )
+    if selected_repo is not None:
+        repo_id = repo_id or _registry_repo_id(selected_repo)
+        repo_path = repo_path or _registry_repo_relative_path(selected_repo, feature_root)
+
+    if feature_root is None:
+        raise _sandbox_blocker(
+            f"Sandbox binding is missing feature_root for task {task_id}.",
+            task_id=task_id,
+        )
+    if not repo_path:
+        raise _sandbox_blocker(
+            f"Sandbox binding resolved no workspace-relative repo path for task {task_id}.",
+            task_id=task_id,
+        )
+
+    canonical_path = _registry_repo_canonical_path(
+        selected_repo,
+        feature_root=feature_root,
+        repo_path=repo_path,
+    )
+    feature_root_resolved = feature_root.resolve(strict=False)
+    try:
+        canonical_rel = canonical_path.resolve(strict=False).relative_to(
+            feature_root_resolved
+        ).as_posix()
+    except Exception as exc:
+        raise _sandbox_blocker(
+            f"Sandbox binding repo path escapes feature_root for task {task_id}: {canonical_path}",
+            task_id=task_id,
+        ) from exc
+    if canonical_rel != repo_path:
+        raise _sandbox_blocker(
+            "Sandbox binding canonical path mismatch for task "
+            f"{task_id}: repo_path={repo_path}, canonical_relative={canonical_rel}.",
+            task_id=task_id,
+        )
+    if not canonical_path.exists():
+        raise _sandbox_blocker(
+            f"Sandbox binding source path is missing for task {task_id}: {canonical_path}",
+            task_id=task_id,
+        )
+    if not (canonical_path / ".git").exists():
+        raise _sandbox_blocker(
+            f"Sandbox binding source path is not a Git worktree for task {task_id}: "
+            f"{canonical_path}",
+            task_id=task_id,
+        )
+
+    return _TaskDispatchRepoBinding(
+        repo_id=repo_id or repo_path,
+        repo_path=repo_path,
+        ws_path=str(canonical_path),
+        source=source or "resolved",
+    )
 
 
 def _contract_verdict_projection_key(
@@ -7527,6 +7817,7 @@ async def _bind_task_sandbox(
     ws_path: str | None,
     snapshots: list[Any],
     runtime: str | None,
+    repo_id_hint: str | None = None,
     sandbox_mode: str = "task",
 ) -> RuntimeSandboxTaskBinding | None:
     if SandboxRunner is None or SandboxSpec is None:
@@ -7534,12 +7825,22 @@ async def _bind_task_sandbox(
             "SandboxRunner is unavailable for write-producing implementation dispatch.",
             task_id=task.id,
         )
-    if workspace_root is None or feature_root is None or not ws_path:
+    missing_roots = [
+        name
+        for name, value in (
+            ("workspace_root", workspace_root),
+            ("feature_root", feature_root),
+            ("ws_path", ws_path),
+        )
+        if not value
+    ]
+    if missing_roots:
         raise _sandbox_blocker(
-            f"Sandbox binding is missing workspace roots for task {task.id}.",
+            f"Sandbox binding is missing workspace roots for task {task.id}: "
+            f"{', '.join(missing_roots)}.",
             task_id=task.id,
         )
-    repo_id = str(getattr(task_contract, "repo_id", "") or task.repo_path or "repo")
+    repo_id = repo_id_hint or _contract_repo_id(task_contract) or task.repo_path or "repo"
     source = Path(ws_path)
     if not source.exists():
         raise _sandbox_blocker(
@@ -7705,6 +8006,8 @@ def _dispatcher_request_for_task(
     stage: str,
     inline_prompt: str = "",
     handover_context: str = "",
+    repo_id: str | None = None,
+    repo_path_hint: str = "",
 ) -> Any:
     if (
         DispatcherDispatchRequest is None
@@ -7717,7 +8020,13 @@ def _dispatcher_request_for_task(
             "RuntimeDispatcher is unavailable for implementation dispatch.",
             task_id=task.id,
         )
-    repo_id = _contract_repo_id(task_contract) or task.repo_path or "repo"
+    dispatch_repo_id = (
+        repo_id
+        or _contract_repo_id(task_contract)
+        or repo_path_hint
+        or task.repo_path
+        or "repo"
+    )
     retry_identity = DispatcherRetryIdentity(
         retry=attempt,
         dispatch_retry_id=(
@@ -7744,8 +8053,8 @@ def _dispatcher_request_for_task(
             f"dispatch-sandbox:{feature.id}:g{group_idx}:"
             f"t{task_idx}:a{attempt}:{stage}"
         ),
-        "workspace_snapshot_ids": _workspace_snapshot_ids_for_dispatch(snapshots, repo_id),
-        "base_commit_by_repo": _base_commit_for_dispatch(ws_path, repo_id),
+        "workspace_snapshot_ids": _workspace_snapshot_ids_for_dispatch(snapshots, dispatch_repo_id),
+        "base_commit_by_repo": _base_commit_for_dispatch(ws_path, dispatch_repo_id),
         "runtime_policy": str(runtime_policy),
         "runtime_policy_digest": _runtime_policy_digest_for_dispatch(runtime_policy),
         "actor_role": "implementer",
@@ -7777,10 +8086,40 @@ def _dispatcher_request_for_task(
     return DispatcherDispatchRequest.model_validate(data)
 
 
+_RETRYABLE_IMPLEMENTATION_DISPATCH_TERMINAL_REASONS = frozenset(
+    {
+        "provider_error",
+        "process_failed",
+        "timeout",
+        "watchdog_stall",
+        "context_materialization_failed",
+        "structured_output_invalid",
+    }
+)
+
+
+def _should_retry_implementation_dispatch_outcome(
+    outcome: Any,
+    *,
+    attempt: int,
+    max_retries: int,
+) -> bool:
+    if attempt >= max_retries:
+        return False
+    if str(getattr(outcome, "status", "") or "") != "failed":
+        return False
+    terminal_reason = str(
+        getattr(outcome, "runtime_terminal_reason", "") or ""
+    )
+    return terminal_reason in _RETRYABLE_IMPLEMENTATION_DISPATCH_TERMINAL_REASONS
+
+
 class _ImplementationPromptBuilder:
     def __init__(
         self,
         *,
+        runner: WorkflowRunner,
+        feature: Feature,
         task: ImplementationTask,
         repo_prefix: str,
         task_contract: Any | None,
@@ -7788,6 +8127,8 @@ class _ImplementationPromptBuilder:
         inline_prompt: str,
         log_label: str,
     ) -> None:
+        self._runner = runner
+        self._feature = feature
         self._task = task
         self._repo_prefix = repo_prefix
         self._task_contract = task_contract
@@ -7847,8 +8188,16 @@ class _ImplementationPromptBuilder:
                             context_sha_material.append(f"{rel}:unreadable")
         prompt_sha = _sha256_text(prompt)
         context_sha = _sha256_text("\n".join(context_sha_material))
+        prompt_ref = await _materialize_implementation_prompt_artifact(
+            self._runner,
+            self._feature,
+            request=_request,
+            task=self._task,
+            prompt=prompt,
+            prompt_sha=prompt_sha,
+        )
         bundle = DispatcherPromptContextBundle(
-            prompt_ref=0,
+            prompt_ref=prompt_ref,
             prompt_sha256=prompt_sha,
             prompt_summary=f"task prompt for {self._task.id}",
             context_file_refs=[],
@@ -7860,6 +8209,85 @@ class _ImplementationPromptBuilder:
             truncation_notes=[],
         )
         return DispatcherPromptBuildResult(prompt=prompt, bundle=bundle)
+
+
+async def _materialize_implementation_prompt_artifact(
+    runner: WorkflowRunner,
+    feature: Feature,
+    *,
+    request: Any,
+    task: ImplementationTask,
+    prompt: str,
+    prompt_sha: str,
+) -> int:
+    artifacts = getattr(runner, "artifacts", None)
+    if artifacts is None:
+        raise _sandbox_blocker(
+            f"Implementation prompt artifact store is unavailable for task {task.id}.",
+            task_id=task.id,
+        )
+    group_idx = str(getattr(request, "group_idx", "") or "g")
+    request_digest = str(getattr(request, "request_digest", "") or prompt_sha)
+    key = (
+        f"dag-dispatch-prompt:g{group_idx}:{_safe_contract_key_fragment(task.id)}:"
+        f"{request_digest[:16]}:{prompt_sha[:16]}"
+    )
+
+    write_bytes = getattr(artifacts, "write_artifact_bytes", None)
+    if callable(write_bytes):
+        try:
+            artifact_id = await write_bytes(
+                key,
+                prompt.encode("utf-8"),
+                {"content_type": "text/markdown"},
+                feature=feature,
+            )
+            prompt_ref = _positive_context_layer_id(artifact_id)
+            if prompt_ref is not None:
+                return prompt_ref
+        except TypeError:
+            artifact_id = await write_bytes(
+                key,
+                prompt.encode("utf-8"),
+                feature=feature,
+            )
+            prompt_ref = _positive_context_layer_id(artifact_id)
+            if prompt_ref is not None:
+                return prompt_ref
+
+    put = getattr(artifacts, "put", None)
+    if callable(put):
+        put_result = await put(key, prompt, feature=feature)
+        prompt_ref = _positive_context_layer_id(put_result) or _positive_context_layer_id(
+            getattr(artifacts, "last_artifact_id", None)
+        )
+        if prompt_ref is not None:
+            return prompt_ref
+
+    get_record = getattr(artifacts, "get_record", None)
+    if callable(get_record):
+        try:
+            record = await get_record(key, feature=feature)
+        except TypeError:
+            record = await get_record(key)
+        prompt_ref = _positive_context_layer_id(
+            record.get("id") if isinstance(record, dict) else getattr(record, "id", None)
+        )
+        if prompt_ref is not None:
+            return prompt_ref
+
+    store = getattr(artifacts, "store", None)
+    if isinstance(store, dict) and key in store:
+        # Unit-test artifact stores are often in-memory dicts without row ids.
+        # They have still materialized the prompt under an artifact key, so use
+        # a stable positive compatibility id rather than the forbidden 0.
+        return int(prompt_sha[:12], 16) or 1
+
+    raise _sandbox_blocker(
+        f"Implementation prompt artifact materialization did not return an artifact id "
+        f"for task {task.id}.",
+        task_id=task.id,
+    )
 
 
 class _ImplementationContextLayerBuilder:
@@ -7877,6 +8305,7 @@ class _ImplementationContextLayerBuilder:
         task: ImplementationTask,
         task_contract: Any | None,
         ws_path: str | None,
+        repo_id: str | None,
         snapshots: list[Any],
         repo_prefix: str,
     ) -> None:
@@ -7891,6 +8320,7 @@ class _ImplementationContextLayerBuilder:
         self._task = task
         self._task_contract = task_contract
         self._ws_path = ws_path
+        self._repo_id = repo_id
         self._snapshots = list(snapshots)
         self._repo_prefix = repo_prefix
 
@@ -7929,6 +8359,7 @@ class _ImplementationContextLayerBuilder:
             task=self._task,
             task_contract=self._task_contract,
             ws_path=self._ws_path,
+            repo_id=self._repo_id,
             snapshots=self._snapshots,
             repo_prefix=self._repo_prefix,
         )
@@ -7994,6 +8425,7 @@ async def _context_layer_request_for_dispatch(
     task: ImplementationTask,
     task_contract: Any | None,
     ws_path: str | None,
+    repo_id: str | None,
     snapshots: list[Any],
     repo_prefix: str,
 ) -> tuple[Any, list[Any]]:
@@ -8003,7 +8435,7 @@ async def _context_layer_request_for_dispatch(
         feature,
         task_contract,
     )
-    repo_id = _contract_repo_id(task_contract) or task.repo_path or repo_prefix or "repo"
+    resolved_repo_id = repo_id or _contract_repo_id(task_contract) or repo_prefix or task.repo_path or "repo"
     repo_root = _context_layer_repo_root(
         workspace_root=workspace_root,
         feature_root=feature_root,
@@ -8012,13 +8444,13 @@ async def _context_layer_request_for_dispatch(
         task=task,
     )
     repo = WorkspaceAuthorityRepoIdentity(
-        repo_id=repo_id,
-        repo_name=repo_id,
+        repo_id=resolved_repo_id,
+        repo_name=resolved_repo_id,
         workspace_relative_path=repo_prefix or task.repo_path or ".",
         canonical_path=str(repo_root),
         safety_status="ok",
     )
-    snapshot_ids = _workspace_snapshot_ids_for_dispatch(snapshots, repo_id)
+    snapshot_ids = _workspace_snapshot_ids_for_dispatch(snapshots, resolved_repo_id)
     contract_ids = _task_contract_ids_for_dispatch(task_contract)
     typed_evidence_digest = _context_layer_typed_evidence_digest(
         dispatch_request=dispatch_request,
@@ -8038,7 +8470,7 @@ async def _context_layer_request_for_dispatch(
     )
     spans = _context_layer_spans_for_task(
         task,
-        repo_id=repo_id,
+        repo_id=resolved_repo_id,
         repo_prefix=repo_prefix,
     )
     changed_paths = [span.path for span in spans]
@@ -8049,7 +8481,7 @@ async def _context_layer_request_for_dispatch(
         evidence_snapshot=evidence_snapshot,
         task_id=task.id,
         group_idx=group_idx,
-        repo_ids=[repo_id],
+        repo_ids=[resolved_repo_id],
         spans=spans,
         changed_paths=changed_paths,
         include_governance=True,
@@ -8318,6 +8750,7 @@ class _ImplementationSandboxPort:
         attempt: int,
         task: ImplementationTask,
         task_contract: Any | None,
+        repo_id: str | None,
         ws_path: str | None,
         snapshots: list[Any],
         runtime: str | None,
@@ -8333,6 +8766,7 @@ class _ImplementationSandboxPort:
         self._attempt = attempt
         self._task = task
         self._task_contract = task_contract
+        self._repo_id = repo_id
         self._ws_path = ws_path
         self._snapshots = snapshots
         self._runtime = runtime
@@ -8356,6 +8790,7 @@ class _ImplementationSandboxPort:
                 ws_path=self._ws_path,
                 snapshots=self._snapshots,
                 runtime=self._runtime,
+                repo_id_hint=self._repo_id,
             )
         except Exception as exc:
             self.last_failure_message = str(exc)
@@ -8998,6 +9433,7 @@ async def _dispatch_task_attempt_via_runtime_dispatcher(
     stage: str,
     actor_suffix: str,
     log_label: str,
+    repo_id: str | None = None,
 ) -> tuple[ImplementationResult, Any]:
     if RuntimeDispatcher is None or RunnerRuntimeClient is None:
         raise _sandbox_blocker(
@@ -9015,12 +9451,14 @@ async def _dispatch_task_attempt_via_runtime_dispatcher(
         task_contract=task_contract,
         snapshots=snapshots,
         ws_path=ws_path,
+        repo_id=repo_id,
         runtime_hint=runtime_hint,
         runtime_policy=runtime_policy,
         actor_suffix=actor_suffix,
         stage=stage,
         inline_prompt=inline_prompt,
         handover_context=handover_context,
+        repo_path_hint=repo_prefix,
     )
     sandbox_port = _ImplementationSandboxPort(
         runner=runner,
@@ -9033,6 +9471,7 @@ async def _dispatch_task_attempt_via_runtime_dispatcher(
         attempt=attempt,
         task=task,
         task_contract=task_contract,
+        repo_id=repo_id,
         ws_path=ws_path,
         snapshots=snapshots,
         runtime=runtime_hint,
@@ -9050,6 +9489,8 @@ async def _dispatch_task_attempt_via_runtime_dispatcher(
         sandbox=sandbox_port,
         runtime=runtime_client,
         prompt_builder=_ImplementationPromptBuilder(
+            runner=runner,
+            feature=feature,
             task=task,
             repo_prefix=f"{repo_prefix}/" if repo_prefix else "",
             task_contract=task_contract,
@@ -9070,6 +9511,7 @@ async def _dispatch_task_attempt_via_runtime_dispatcher(
             task=task,
             task_contract=task_contract,
             ws_path=ws_path,
+            repo_id=repo_id,
             snapshots=snapshots,
             repo_prefix=repo_prefix,
         ),
@@ -9175,6 +9617,139 @@ async def _load_test_plan_section(
         return ""
     body = "\n\n---\n\n".join(parts)
     return f"\n\n## Test Plan\n\n{body}"
+
+
+async def _load_external_acceptance_criteria_catalog(
+    runner: WorkflowRunner,
+    feature: Feature,
+) -> list[dict[str, Any]]:
+    """Load test-plan ACs for contract-time verification gate resolution."""
+    decomp_raw = await runner.artifacts.get("decomposition", feature=feature)
+    if not decomp_raw:
+        return []
+    try:
+        decomposition = SubfeatureDecomposition.model_validate_json(str(decomp_raw))
+    except Exception:
+        try:
+            decomposition = SubfeatureDecomposition.model_validate(json.loads(str(decomp_raw)))
+        except Exception:
+            logger.warning("Could not parse decomposition for contract test-plan catalog")
+            return []
+
+    catalog: list[dict[str, Any]] = []
+    for sf in decomposition.subfeatures:
+        slug = (sf.slug or "").strip()
+        if not slug:
+            continue
+        raw_plan = await runner.artifacts.get(f"test-plan:{slug}", feature=feature)
+        if not raw_plan:
+            continue
+        catalog.extend(_test_plan_acceptance_criteria_entries(raw_plan, slug))
+    return catalog
+
+
+def _test_plan_acceptance_criteria_entries(raw_plan: Any, slug: str) -> list[dict[str, Any]]:
+    test_plan = _coerce_test_plan(raw_plan)
+    if test_plan is not None:
+        entries: list[dict[str, Any]] = []
+        for ordinal, criterion in enumerate(test_plan.acceptance_criteria):
+            if not criterion.id:
+                continue
+            entries.append(
+                {
+                    "id": criterion.id,
+                    "description": criterion.description,
+                    "verification_method": criterion.verification_method,
+                    "pass_condition": criterion.pass_condition,
+                    "source": f"test-plan:{slug}",
+                    "source_ordinal": 100_000 + ordinal,
+                }
+            )
+        return entries
+    return _markdown_test_plan_acceptance_criteria_entries(str(raw_plan), slug)
+
+
+def _coerce_test_plan(raw_plan: Any) -> TestPlan | None:
+    payload: Any
+    if isinstance(raw_plan, BaseModel):
+        payload = raw_plan.model_dump(mode="json")
+    elif isinstance(raw_plan, dict):
+        payload = raw_plan
+    else:
+        try:
+            payload = json.loads(str(raw_plan))
+        except Exception:
+            return None
+    if isinstance(payload, dict) and isinstance(payload.get("content"), dict):
+        payload = payload["content"]
+    try:
+        return TestPlan.model_validate(payload)
+    except Exception:
+        logger.debug("Could not parse structured test-plan artifact", exc_info=True)
+        return None
+
+
+def _markdown_test_plan_acceptance_criteria_entries(raw_plan: str, slug: str) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
+    section_match = re.search(r"^##\s+Acceptance Criteria\b.*$", raw_plan, re.MULTILINE | re.IGNORECASE)
+    if section_match is not None:
+        section_start = section_match.end()
+        next_section = re.search(r"^##\s+", raw_plan[section_start:], re.MULTILINE)
+        section_end = section_start + next_section.start() if next_section else len(raw_plan)
+        section = raw_plan[section_start:section_end]
+    else:
+        section = raw_plan
+    lines = section.splitlines()
+    bullet_pattern = re.compile(r"^\s*[-*]\s*(?:\*\*)?(AC-[A-Za-z0-9_-]+)(?:\*\*)?\s*[—:-]\s*(.+)$")
+    heading_pattern = re.compile(
+        r"^\s*(?:#{3,6}\s*)?(?:\*\*)?(AC-[A-Za-z0-9_-]+)(?:\*\*)?"
+        r"\s*(?:\([^)]*\))?\s*(?:[—:-]\s*(.*))?$"
+    )
+    for ordinal, line in enumerate(lines):
+        match = bullet_pattern.match(line)
+        if match:
+            entries.append(
+                {
+                    "id": match.group(1),
+                    "description": match.group(2).strip(),
+                    "source": f"test-plan:{slug}",
+                    "source_ordinal": 100_000 + ordinal,
+                }
+            )
+            continue
+        cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+        if len(cells) < 2 or not re.fullmatch(r"AC-[A-Za-z0-9_-]+", cells[0]):
+            heading_match = heading_pattern.match(line)
+            if not heading_match:
+                continue
+            description = (heading_match.group(2) or "").strip()
+            if not description:
+                for next_line in lines[ordinal + 1 : ordinal + 8]:
+                    desc_match = re.match(r"^\s*Description:\s*(.+)$", next_line)
+                    if desc_match:
+                        description = desc_match.group(1).strip()
+                        break
+            entries.append(
+                {
+                    "id": heading_match.group(1),
+                    "description": description,
+                    "source": f"test-plan:{slug}",
+                    "source_ordinal": 100_000 + ordinal,
+                }
+            )
+            continue
+        entry: dict[str, Any] = {
+            "id": cells[0],
+            "description": cells[1],
+            "source": f"test-plan:{slug}",
+            "source_ordinal": 100_000 + ordinal,
+        }
+        if len(cells) >= 4:
+            entry["verification_method"] = cells[3]
+        if len(cells) >= 5:
+            entry["pass_condition"] = cells[4]
+        entries.append(entry)
+    return entries
 
 
 def _workflow_blocker_from_attempts(attempts: list[BugFixAttempt]) -> str:
@@ -16773,7 +17348,7 @@ async def _implement_dag(
                 data = _json.loads(checkpoint_json)
             except (ValueError, TypeError):
                 break
-        if not await _dag_group_checkpoint_is_fresh(
+        checkpoint_fresh = await _dag_group_checkpoint_is_fresh(
             runner,
             feature,
             group_idx=g_idx,
@@ -16781,32 +17356,49 @@ async def _implement_dag(
             dag_sha256=dag_sha256,
             checkpoint=data,
             accepted_dag_sha256s=accepted_dag_sha256s,
-        ):
+        )
+        legacy_completed_skip = False
+        if not checkpoint_fresh:
+            legacy_completed_skip = await _legacy_completed_checkpoint_can_skip_without_proofs(
+                runner,
+                feature,
+                group_idx=g_idx,
+                group_task_ids=group_task_ids,
+                checkpoint=data,
+            )
+        if not checkpoint_fresh and not legacy_completed_skip:
             logger.warning(
                 "Group %d checkpoint marker is stale or lacks durable proof — re-running",
                 g_idx,
             )
             break
-        projected, projection_error = await _ensure_dag_group_checkpoint_projection_for_resume(
-            runner,
-            feature,
-            g_idx,
-            data,
-            dag_sha256=dag_sha256,
-            group_task_ids=group_task_ids,
-            accepted_dag_sha256s=accepted_dag_sha256s,
-        )
-        if not projected:
-            impl_text = "\n\n".join(to_str(r) for r in all_results)
-            return DagExecutionOutcome(
-                implementation_text=impl_text,
-                failure=_workflow_blocker_text(
-                    f"Fresh checkpoint dag-group:{g_idx} cannot skip without "
-                    "durable group_checkpoint projection evidence: "
-                    f"{projection_error or 'projection unavailable'}"
-                ),
-                handover=handover,
-                terminal_state="workflow_blocked",
+        if checkpoint_fresh:
+            projected, projection_error = await _ensure_dag_group_checkpoint_projection_for_resume(
+                runner,
+                feature,
+                g_idx,
+                data,
+                dag_sha256=dag_sha256,
+                group_task_ids=group_task_ids,
+                accepted_dag_sha256s=accepted_dag_sha256s,
+            )
+            if not projected:
+                impl_text = "\n\n".join(to_str(r) for r in all_results)
+                return DagExecutionOutcome(
+                    implementation_text=impl_text,
+                    failure=_workflow_blocker_text(
+                        f"Fresh checkpoint dag-group:{g_idx} cannot skip without "
+                        "durable group_checkpoint projection evidence: "
+                        f"{projection_error or 'projection unavailable'}"
+                    ),
+                    handover=handover,
+                    terminal_state="workflow_blocked",
+                )
+        else:
+            logger.info(
+                "Group %d legacy completed checkpoint lacks durable proof but "
+                "is pre-adoption — skipping contract recompile",
+                g_idx,
             )
         for r_data in data.get("results", []):
             try:
@@ -17303,16 +17895,25 @@ async def _implement_dag(
 
             async def _run_task(task_idx: int, t: ImplementationTask) -> ImplementationResult:
                 """Run a single implementation task with retry on crash."""
-                repo_prefix = t.repo_path
-                ws_path = None
-                if feature_root and repo_prefix:
-                    worktree = feature_root / repo_prefix
-                    if worktree.exists():
-                        ws_path = str(worktree)
+                task_contract = contracts_by_task_id.get(t.id)
+                try:
+                    repo_binding = _resolve_task_dispatch_repo_binding(
+                        task=t,
+                        task_contract=task_contract,
+                        registry=authority_guard.registry,
+                        feature_root=feature_root,
+                    )
+                except SandboxWorkflowBlocker as exc:
+                    return ImplementationResult(
+                        task_id=t.id,
+                        summary=str(exc),
+                        status="blocked",
+                    )
+                repo_prefix = repo_binding.repo_path
+                ws_path = repo_binding.ws_path
 
                 # ── Build prompt, offloading to files if too large ──
                 prefix = f"{repo_prefix}/" if repo_prefix else ""
-                task_contract = contracts_by_task_id.get(t.id)
                 inline_prompt = (
                     _build_task_prompt(t, repo_prefix=prefix, contract=task_contract)
                     + handover_context
@@ -17331,7 +17932,8 @@ async def _implement_dag(
                                 "group_idx": group_idx,
                                 "task_id": t.id,
                                 "task_name": t.name,
-                                "repo_path": t.repo_path,
+                                "repo_path": repo_prefix,
+                                "repo_binding_source": repo_binding.source,
                                 "attempt": attempt,
                                 "runtime": impl_runtime,
                             },
@@ -17351,6 +17953,7 @@ async def _implement_dag(
                             snapshots=authority_guard.snapshots,
                             runtime_hint=impl_runtime,
                             runtime_policy=runtime_policy,
+                            repo_id=repo_binding.repo_id,
                             repo_prefix=repo_prefix or "",
                             inline_prompt=inline_prompt,
                             handover_context=handover_context,
@@ -17358,6 +17961,63 @@ async def _implement_dag(
                             actor_suffix=f"g{group_idx}-t{task_idx}-a{attempt}",
                             log_label=f"Task {t.id}",
                         )
+                        if (
+                            isinstance(result, ImplementationResult)
+                            and result.status == "blocked"
+                            and _should_retry_implementation_dispatch_outcome(
+                                dispatch_outcome,
+                                attempt=attempt,
+                                max_retries=TASK_MAX_RETRIES,
+                            )
+                        ):
+                            await _log_feature_event(
+                                runner,
+                                feature.id,
+                                "dag_task_dispatch_retry",
+                                "implementation",
+                                content=t.id,
+                                metadata={
+                                    "group_idx": group_idx,
+                                    "task_id": t.id,
+                                    "task_name": t.name,
+                                    "attempt": attempt,
+                                    "next_attempt": attempt + 1,
+                                    "runtime": impl_runtime,
+                                    "dispatcher_attempt_id": getattr(
+                                        dispatch_outcome,
+                                        "attempt_id",
+                                        None,
+                                    ),
+                                    "runtime_terminal_reason": getattr(
+                                        dispatch_outcome,
+                                        "runtime_terminal_reason",
+                                        None,
+                                    ),
+                                    "typed_failure_id": getattr(
+                                        dispatch_outcome,
+                                        "typed_failure_id",
+                                        None,
+                                    ),
+                                    "runtime_failure_id": getattr(
+                                        dispatch_outcome,
+                                        "runtime_failure_id",
+                                        None,
+                                    ),
+                                },
+                            )
+                            logger.warning(
+                                "Task %s dispatcher attempt %d failed with %s; "
+                                "advancing to attempt %d",
+                                t.id,
+                                attempt,
+                                getattr(
+                                    dispatch_outcome,
+                                    "runtime_terminal_reason",
+                                    "unknown",
+                                ),
+                                attempt + 1,
+                            )
+                            continue
                         if isinstance(result, ImplementationResult):
                             # Enrich fallback results that have empty file metadata
                             if not result.files_created and not result.files_modified:
@@ -18371,16 +19031,25 @@ async def _run_enhancement_group(
     if pending_tasks:
 
         async def _run_enh_task(task_idx: int, t: ImplementationTask) -> ImplementationResult:
-            repo_prefix = t.repo_path
-            ws_path = None
-            if feature_root and repo_prefix:
-                worktree = feature_root / repo_prefix
-                if worktree.exists():
-                    ws_path = str(worktree)
+            task_contract = contracts_by_task_id.get(t.id)
+            try:
+                repo_binding = _resolve_task_dispatch_repo_binding(
+                    task=t,
+                    task_contract=task_contract,
+                    registry=authority_guard.registry,
+                    feature_root=feature_root,
+                )
+            except SandboxWorkflowBlocker as exc:
+                return ImplementationResult(
+                    task_id=t.id,
+                    summary=str(exc),
+                    status="blocked",
+                )
+            repo_prefix = repo_binding.repo_path
+            ws_path = repo_binding.ws_path
 
             # ── Build prompt, offloading to files if too large ──
             prefix = f"{repo_prefix}/" if repo_prefix else ""
-            task_contract = contracts_by_task_id.get(t.id)
             inline_prompt = (
                 _build_task_prompt(t, repo_prefix=prefix, contract=task_contract)
                 + handover_context
@@ -18404,6 +19073,7 @@ async def _run_enhancement_group(
                         snapshots=authority_guard.snapshots,
                         runtime_hint=impl_runtime,
                         runtime_policy=runtime_policy,
+                        repo_id=repo_binding.repo_id,
                         repo_prefix=repo_prefix or "",
                         inline_prompt=inline_prompt,
                         handover_context=handover_context,
@@ -19299,6 +19969,37 @@ def _checkpoint_results_match_tasks(
             return False
         result_task_ids.append(result.task_id)
     return sorted(result_task_ids) == sorted(group_task_ids) and len(set(result_task_ids)) == len(result_task_ids)
+
+
+async def _legacy_completed_checkpoint_can_skip_without_proofs(
+    runner: WorkflowRunner,
+    feature: Feature,
+    *,
+    group_idx: int,
+    group_task_ids: list[str],
+    checkpoint: dict[str, Any],
+) -> bool:
+    if await _feature_requires_execution_control_proofs(runner, feature):
+        return False
+    if not isinstance(checkpoint, dict):
+        return False
+    if checkpoint.get("group_idx") != group_idx:
+        return False
+    if checkpoint.get("verdict") != "approved":
+        return False
+    if list(checkpoint.get("task_ids") or []) != list(group_task_ids):
+        return False
+    if await _artifact_exists(runner, feature, f"dag-group-commit-proof:{group_idx}"):
+        return False
+    if await _artifact_exists(runner, feature, f"dag-checkpoint-gate-proof:{group_idx}"):
+        return False
+    # Pre-control-plane legacy checkpoints sometimes preserved per-task
+    # statuses such as "partial" even after the aggregate group verdict was
+    # approved. For this pre-adoption skip path, exact result coverage plus the
+    # approved checkpoint verdict is the compatibility contract.
+    if not _checkpoint_results_match_tasks(checkpoint, group_task_ids):
+        return False
+    return True
 
 
 async def _record_dag_checkpoint_gate_proof(

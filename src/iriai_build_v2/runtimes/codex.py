@@ -180,6 +180,10 @@ def _path_is_relative_to(path: Path, root: Path) -> bool:
         return False
 
 
+def _paths_overlap(left: Path, right: Path) -> bool:
+    return _path_is_relative_to(left, right) or _path_is_relative_to(right, left)
+
+
 def _path_has_symlink_component(path: Path) -> bool:
     current = Path(path.anchor) if path.is_absolute() else Path()
     parts = path.parts[1:] if path.is_absolute() else path.parts
@@ -938,10 +942,13 @@ class CodexAgentRuntime(AgentRuntime):
             raise RuntimeError(f"Bound Codex write role {role.name} requires writable roots")
         if binding_writable_roots and set(binding_writable_roots) != set(writable_roots):
             raise RuntimeError(f"Bound Codex write role {role.name} binding writable roots do not match manifest")
-        if writable_roots and not any(
-            _path_is_relative_to(cwd, root)
+        repo_roots = tuple(manifest_repo_roots.values())
+        if repo_roots and any(
+            not any(_path_is_relative_to(root, repo_root) for repo_root in repo_roots)
             for root in writable_roots
         ):
+            raise RuntimeError(f"Bound Codex write role {role.name} writable root is outside bound repo roots")
+        if writable_roots and not any(_paths_overlap(cwd, root) for root in writable_roots):
             raise RuntimeError(f"Bound Codex write role {role.name} cwd is outside writable roots")
 
         blocked_roots = tuple(

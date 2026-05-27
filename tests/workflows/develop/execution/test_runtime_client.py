@@ -9,6 +9,10 @@ from types import SimpleNamespace
 import pytest
 from pydantic import BaseModel
 
+from iriai_compose.actors import AgentActor, Role
+from iriai_compose.exceptions import TaskExecutionError
+from iriai_compose.tasks import Ask
+
 from iriai_build_v2.workflows.develop.execution.runtime_client import (
     RunnerRuntimeClient,
     RuntimeClient,
@@ -259,6 +263,42 @@ async def test_bound_workspace_guard_errors_map_to_sandbox_binding_failed(messag
     assert response.status == "failed"
     assert response.terminal_reason == "sandbox_binding_failed"
     assert response.raw_text == message
+
+
+@pytest.mark.asyncio
+async def test_wrapped_task_execution_error_uses_inner_binding_failure() -> None:
+    inner_message = "Bound Codex write role implementer cwd is outside writable roots"
+
+    class Runner:
+        async def run(self, ask):
+            task = Ask(
+                actor=AgentActor(
+                    name="implementer",
+                    role=Role(name="implementer", prompt="", tools=["Write"]),
+                ),
+                prompt=ask.prompt,
+            )
+            feature = SimpleNamespace(id="8ac124d6")
+            try:
+                raise RuntimeError(inner_message)
+            except RuntimeError as exc:
+                raise TaskExecutionError(
+                    task=task,
+                    feature=feature,
+                    phase_name="implementation",
+                ) from exc
+
+    client = RuntimeClient(
+        runner=Runner(),
+        actor_factory=lambda request: SimpleNamespace(name=request.actor_name),
+        ask_factory=_ask_factory,
+    )
+
+    response = await client.invoke(_request())
+
+    assert response.status == "failed"
+    assert response.terminal_reason == "sandbox_binding_failed"
+    assert response.raw_text == inner_message
 
 
 @pytest.mark.asyncio

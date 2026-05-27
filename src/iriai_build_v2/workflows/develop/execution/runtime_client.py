@@ -116,12 +116,13 @@ class RuntimeClient:
                 process_started=_process_started_from(exc, observer.process_started),
             )
         except Exception as exc:
+            diagnostic_exc = _diagnostic_exception(exc)
             return self._failure_response(
                 request,
                 started_at,
                 _classify_exception(exc),
                 exc=exc,
-                process_started=_process_started_from(exc, observer.process_started),
+                process_started=_process_started_from(diagnostic_exc, observer.process_started),
             )
 
     async def _resolve_runner(self, request: Any) -> Any:
@@ -250,14 +251,15 @@ class RuntimeClient:
         exc: BaseException | None = None,
         process_started: bool = False,
     ) -> RuntimeInvocationResponse:
-        extracted = _extract_result_payload(exc)
+        diagnostic_exc = _diagnostic_exception(exc)
+        extracted = _extract_result_payload(diagnostic_exc)
         return RuntimeInvocationResponse(
             invocation_id=_text(_field(request, "invocation_id", "")),
             status=status,
             terminal_reason=terminal_reason,
             process_started=process_started,
             structured_output=None,
-            raw_text=extracted["raw_text"] or (_exception_text(exc) if exc else None),
+            raw_text=extracted["raw_text"] or (_exception_text(diagnostic_exc) if diagnostic_exc else None),
             raw_artifact_id=extracted["raw_artifact_id"],
             provider_request_id=extracted["provider_request_id"],
             provider_error_code=extracted["provider_error_code"],
@@ -447,6 +449,7 @@ def _raw_text(value: Any) -> str | None:
 
 
 def _classify_exception(exc: BaseException) -> RuntimeTerminalReason:
+    exc = _diagnostic_exception(exc) or exc
     if isinstance(exc, asyncio.CancelledError):
         return "cancelled"
     if _looks_like_watchdog_stall(exc):
@@ -488,6 +491,15 @@ def _classify_exception(exc: BaseException) -> RuntimeTerminalReason:
     if _looks_like_process_failure(exc):
         return "process_failed"
     return "provider_error"
+
+
+def _diagnostic_exception(exc: BaseException | None) -> BaseException | None:
+    if exc is None:
+        return None
+    if type(exc).__name__ != "TaskExecutionError":
+        return exc
+    cause = exc.__cause__
+    return cause if cause is not None else exc
 
 
 def _looks_like_watchdog_stall(exc: BaseException) -> bool:
