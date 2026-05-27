@@ -82,17 +82,11 @@ def _weighted_profiles() -> list[ClaudePoolProfile]:
             name="iriai-claude-1",
             user="iriai-claude-1",
             claude_command="/bin/echo",
-            weight=5,
+            weight=1,
         ),
         ClaudePoolProfile(
             name="iriai-claude-2",
             user="iriai-claude-2",
-            claude_command="/bin/echo",
-            weight=1,
-        ),
-        ClaudePoolProfile(
-            name="iriai-claude-3",
-            user="iriai-claude-3",
             claude_command="/bin/echo",
             weight=9,
         ),
@@ -146,26 +140,25 @@ async def test_round_robin_assigns_ephemeral_jobs_evenly(tmp_path: Path):
 
 
 @pytest.mark.asyncio
-async def test_weighted_selection_sends_most_work_to_profile_three(tmp_path: Path):
+async def test_weighted_selection_sends_most_work_to_profile_two(tmp_path: Path):
     runtime = ClaudePoolRuntime(root=tmp_path, profiles=_weighted_profiles())
 
     picked = [
         (await runtime._select_profile(session_key=f"actor-{idx}:feat", persistent=False)).name
-        for idx in range(15)
+        for idx in range(10)
     ]
 
-    assert picked.count("iriai-claude-1") == 5
-    assert picked.count("iriai-claude-2") == 1
-    assert picked.count("iriai-claude-3") == 9
+    assert picked.count("iriai-claude-1") == 1
+    assert picked.count("iriai-claude-2") == 9
 
 
 def test_known_profiles_load_default_capacity_weights():
-    assert _coerce_profile({"name": "iriai-claude-1"}).weight == 5
-    assert _coerce_profile({"name": "iriai-claude-2"}).weight == 1
-    assert _coerce_profile({"name": "iriai-claude-3"}).weight == 9
+    assert _coerce_profile({"name": "iriai-claude-1"}).weight == 1
+    assert _coerce_profile({"name": "iriai-claude-2"}).weight == 9
+    assert _coerce_profile({"name": "iriai-claude-3"}).weight == 1
 
 
-def test_load_profiles_migrates_legacy_default_capacity_weights(tmp_path: Path):
+def test_load_profiles_migrates_legacy_default_capacity_profile_set(tmp_path: Path):
     _write_json_atomic(
         tmp_path / "profiles.json",
         {
@@ -181,16 +174,18 @@ def test_load_profiles_migrates_legacy_default_capacity_weights(tmp_path: Path):
     weights = {profile.name: profile.weight for profile in profiles}
 
     assert weights == {
-        "iriai-claude-1": 5,
-        "iriai-claude-2": 1,
-        "iriai-claude-3": 9,
+        "iriai-claude-1": 1,
+        "iriai-claude-2": 9,
     }
     stored = json.loads((tmp_path / "profiles.json").read_text(encoding="utf-8"))
     stored_weights = {
         profile["name"]: profile["weight"]
         for profile in stored["profiles"]
     }
-    assert stored_weights["iriai-claude-3"] == 9
+    assert stored_weights == {
+        "iriai-claude-1": 1,
+        "iriai-claude-2": 9,
+    }
 
 
 @pytest.mark.asyncio

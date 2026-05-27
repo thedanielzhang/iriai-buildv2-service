@@ -13,6 +13,10 @@ from iriai_build_v2.workflows.develop.phases.implementation import (
     _implement_dag,
     _run_workspace_authority_pre_dispatch_adapter,
 )
+from iriai_build_v2.workflows.develop.execution.workspace_authority import (
+    CanonicalRepoRegistry,
+    RepoIdentity,
+)
 
 
 class _Artifacts:
@@ -203,6 +207,70 @@ def _workspace(tmp_path: Path) -> tuple[Path, Path]:
     return workspace_root, feature_root
 
 
+def _authority_repo(
+    feature_root: Path,
+    name: str,
+    repo_id: str,
+    *,
+    writable_task_ids: list[str] | None = None,
+    read_only_task_ids: list[str] | None = None,
+    task_ids: list[str] | None = None,
+) -> RepoIdentity:
+    repo = feature_root / name
+    repo.mkdir(parents=True, exist_ok=True)
+    return RepoIdentity(
+        repo_id=repo_id,
+        repo_name=name,
+        role="execution",
+        workspace_relative_path=name,
+        canonical_path=str(repo),
+        identity_kind="source_path",
+        identity_value=str(repo),
+        writable_task_ids=writable_task_ids or [],
+        read_only_task_ids=read_only_task_ids or [],
+        task_ids=task_ids or [],
+        safety_status="ok",
+        identity_evidence_digest=f"identity:{repo_id}",
+    )
+
+
+def _authority_registry(
+    feature_root: Path,
+    repos: list[RepoIdentity],
+) -> CanonicalRepoRegistry:
+    return CanonicalRepoRegistry(
+        feature_id="feature-slice-02",
+        feature_slug="slice-02",
+        feature_root=str(feature_root),
+        repos=repos,
+        registry_digest="registry:digest",
+    )
+
+
+async def _compile_single_contract_with_registry(
+    workspace_root: Path,
+    feature_root: Path,
+    artifacts: _Artifacts,
+    registry: CanonicalRepoRegistry,
+    task: ImplementationTask,
+) -> implementation_module.TaskContractCompileOutcome:
+    dag = implementation_module.ImplementationDAG(
+        tasks=[task],
+        execution_order=[[task.id]],
+        complete=True,
+    )
+    return await implementation_module._compile_task_contracts_for_group(
+        _runner(workspace_root, artifacts),
+        _feature(),
+        dag,
+        0,
+        [task],
+        registry=registry,
+        feature_root=feature_root,
+        dag_sha256="dag-sha",
+    )
+
+
 def _patch_git_evidence(
     monkeypatch: pytest.MonkeyPatch,
     *,
@@ -341,6 +409,168 @@ async def test_context_layer_uses_review_source_id_when_typed_store_lacks_source
     assert len(keys) == 1
     payload = json.loads(artifacts.store[keys[0]])
     assert payload["source_dag_artifact_id"] == source_id
+
+
+@pytest.mark.asyncio
+async def test_contract_compile_resolves_missing_task_repo_from_writable_registry(
+    tmp_path: Path,
+) -> None:
+    workspace_root, feature_root = _workspace(tmp_path)
+    artifacts = _Artifacts()
+    registry = _authority_registry(
+        feature_root,
+        [
+            _authority_repo(
+                feature_root,
+                "app",
+                "repo-app",
+                writable_task_ids=["TASK-registry"],
+            ),
+            _authority_repo(feature_root, "lib", "repo-lib"),
+        ],
+    )
+    task = ImplementationTask(
+        id="TASK-registry",
+        name="registry",
+        description="registry-backed contract",
+        file_scope=[TaskFileScope(path="src/main.py", action="create")],
+    )
+
+    outcome = await _compile_single_contract_with_registry(
+        workspace_root,
+        feature_root,
+        artifacts,
+        registry,
+        task,
+    )
+
+    assert outcome.approved is True
+    projection = json.loads(artifacts.store["dag-task-contract:TASK-registry"])
+    assert projection["repo_id"] == "repo-app"
+    assert projection["path_counts"]["allowed_paths"] == 1
+
+
+@pytest.mark.asyncio
+async def test_contract_compile_resolves_missing_task_repo_from_read_only_registry(
+    tmp_path: Path,
+) -> None:
+    workspace_root, feature_root = _workspace(tmp_path)
+    artifacts = _Artifacts()
+    registry = _authority_registry(
+        feature_root,
+        [
+            _authority_repo(feature_root, "app", "repo-app"),
+            _authority_repo(
+                feature_root,
+                "docs",
+                "repo-docs",
+                read_only_task_ids=["TASK-read"],
+            ),
+        ],
+    )
+    task = ImplementationTask(
+        id="TASK-read",
+        name="read",
+        description="read-only contract",
+        file_scope=[TaskFileScope(path="reference.md", action="read_only")],
+    )
+
+    outcome = await _compile_single_contract_with_registry(
+        workspace_root,
+        feature_root,
+        artifacts,
+        registry,
+        task,
+    )
+
+    assert outcome.approved is True
+    projection = json.loads(artifacts.store["dag-task-contract:TASK-read"])
+    assert projection["repo_id"] == "repo-docs"
+    assert projection["path_counts"]["read_only_paths"] == 1
+
+
+@pytest.mark.asyncio
+async def test_contract_compile_missing_registry_mapping_keeps_invalid_path_blocker(
+    tmp_path: Path,
+) -> None:
+    workspace_root, feature_root = _workspace(tmp_path)
+    artifacts = _Artifacts()
+    registry = _authority_registry(
+        feature_root,
+        [
+            _authority_repo(feature_root, "app", "repo-app"),
+            _authority_repo(feature_root, "lib", "repo-lib"),
+        ],
+    )
+    task = ImplementationTask(
+        id="TASK-unmapped",
+        name="unmapped",
+        description="unmapped contract",
+        file_scope=[TaskFileScope(path="src/main.py", action="create")],
+    )
+
+    outcome = await _compile_single_contract_with_registry(
+        workspace_root,
+        feature_root,
+        artifacts,
+        registry,
+        task,
+    )
+
+    assert outcome.approved is False
+    assert outcome.failure_class == "contract_compile"
+    assert outcome.failure_type == "contract_invalid_path"
+    failure = json.loads(artifacts.store["dag-task-contract:compile-failure:g0"])
+    assert failure["failure_type"] == "contract_invalid_path"
+    assert "repo_id or repo_path is required" in failure["error"]
+
+
+@pytest.mark.asyncio
+async def test_contract_compile_ambiguous_registry_mapping_blocks_without_guessing(
+    tmp_path: Path,
+) -> None:
+    workspace_root, feature_root = _workspace(tmp_path)
+    artifacts = _Artifacts()
+    registry = _authority_registry(
+        feature_root,
+        [
+            _authority_repo(
+                feature_root,
+                "app",
+                "repo-app",
+                writable_task_ids=["TASK-ambiguous"],
+            ),
+            _authority_repo(
+                feature_root,
+                "lib",
+                "repo-lib",
+                read_only_task_ids=["TASK-ambiguous"],
+            ),
+        ],
+    )
+    task = ImplementationTask(
+        id="TASK-ambiguous",
+        name="ambiguous",
+        description="ambiguous contract",
+        file_scope=[TaskFileScope(path="src/main.py", action="create")],
+    )
+
+    outcome = await _compile_single_contract_with_registry(
+        workspace_root,
+        feature_root,
+        artifacts,
+        registry,
+        task,
+    )
+
+    assert outcome.approved is False
+    assert outcome.failure_class == "contract_compile"
+    assert outcome.failure_type == "contract_invalid_path"
+    failure = json.loads(artifacts.store["dag-task-contract:compile-failure:g0"])
+    assert failure["ambiguous_repo_ids_by_task"] == {
+        "TASK-ambiguous": ["repo-app", "repo-lib"]
+    }
+    assert "ambiguous" in failure["error"]
 
 
 @pytest.mark.asyncio

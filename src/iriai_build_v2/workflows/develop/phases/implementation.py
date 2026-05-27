@@ -2833,6 +2833,66 @@ def _task_contract_prompt_block(contract: Any | None) -> str:
     return "\n".join(sections)
 
 
+def _value_attr(value: Any, key: str, default: Any = "") -> Any:
+    if isinstance(value, dict):
+        return value.get(key, default)
+    return getattr(value, key, default)
+
+
+def _repo_ids_by_task_from_registry(
+    registry: Any,
+    group_tasks: list[ImplementationTask],
+) -> tuple[dict[str, str], dict[str, list[str]]]:
+    task_ids_needing_registry: set[str] = set()
+    for task in group_tasks:
+        task_id = str(_value_attr(task, "id", "") or "")
+        if not task_id:
+            continue
+        explicit_repo_id = str(_value_attr(task, "repo_id", "") or "").strip()
+        explicit_repo_path = str(_value_attr(task, "repo_path", "") or "").strip()
+        if explicit_repo_id or explicit_repo_path:
+            continue
+        task_ids_needing_registry.add(task_id)
+    if not task_ids_needing_registry:
+        return {}, {}
+
+    candidate_repo_ids: dict[str, set[str]] = {
+        task_id: set() for task_id in task_ids_needing_registry
+    }
+    for repo in list(_value_attr(registry, "repos", []) or []):
+        repo_id = str(_value_attr(repo, "repo_id", "") or "").strip()
+        if not repo_id:
+            continue
+        repo_task_ids: list[str] = []
+        for attr in ("writable_task_ids", "read_only_task_ids", "task_ids"):
+            raw_ids = _value_attr(repo, attr, []) or []
+            if isinstance(raw_ids, str):
+                raw_iterable = [raw_ids]
+            else:
+                try:
+                    raw_iterable = list(raw_ids)
+                except TypeError:
+                    raw_iterable = []
+            repo_task_ids.extend(
+                str(raw_task_id) for raw_task_id in raw_iterable if str(raw_task_id)
+            )
+        for task_id in set(repo_task_ids):
+            if task_id in candidate_repo_ids:
+                candidate_repo_ids[task_id].add(repo_id)
+
+    repo_ids_by_task = {
+        task_id: next(iter(repo_ids))
+        for task_id, repo_ids in candidate_repo_ids.items()
+        if len(repo_ids) == 1
+    }
+    ambiguous = {
+        task_id: sorted(repo_ids)
+        for task_id, repo_ids in candidate_repo_ids.items()
+        if len(repo_ids) > 1
+    }
+    return repo_ids_by_task, ambiguous
+
+
 async def _compile_task_contracts_for_group(
     runner: WorkflowRunner,
     feature: Feature,
@@ -2859,6 +2919,45 @@ async def _compile_task_contracts_for_group(
             failure_class="contract_compile",
             failure_type="contract_missing_workspace_registry",
             route="quiesce",
+        )
+    repo_ids_by_task, ambiguous_repo_ids_by_task = _repo_ids_by_task_from_registry(
+        registry,
+        group_tasks,
+    )
+    if ambiguous_repo_ids_by_task:
+        artifact_key = f"dag-task-contract:compile-failure:g{group_idx}"
+        error = (
+            "task repo identity is ambiguous in the canonical registry: "
+            + ", ".join(
+                f"{task_id} -> {repo_ids}"
+                for task_id, repo_ids in sorted(ambiguous_repo_ids_by_task.items())
+            )
+        )
+        await runner.artifacts.put(
+            artifact_key,
+            _workspace_authority_json({
+                "artifact_schema": "dag-task-contract-compile-failure-v1",
+                "group_idx": group_idx,
+                "approved": False,
+                "failure_class": "contract_compile",
+                "failure_type": "contract_invalid_path",
+                "route": "run_contract_repair",
+                "error": error,
+                "task_ids": [task.id for task in group_tasks],
+                "ambiguous_repo_ids_by_task": ambiguous_repo_ids_by_task,
+            }),
+            feature=feature,
+        )
+        return TaskContractCompileOutcome(
+            approved=False,
+            failure=(
+                "Task deliverable contract compilation failed before dispatch. "
+                f"contract_compile/contract_invalid_path: {error}"
+            ),
+            failure_class="contract_compile",
+            failure_type="contract_invalid_path",
+            route="run_contract_repair",
+            artifact_key=artifact_key,
         )
     preexisting_digests: dict[str, str] = {}
     for task in group_tasks:
@@ -2895,6 +2994,7 @@ async def _compile_task_contracts_for_group(
                 tasks=group_tasks,
                 all_task_ids=[task.id for task in dag.tasks],
                 workspace_registry=registry,
+                repo_ids_by_task=repo_ids_by_task,
                 manifest_expected_files=manifest_entries.get("expected_files", []),
                 manifest_forbidden_files=manifest_entries.get("forbidden_files", []),
             )

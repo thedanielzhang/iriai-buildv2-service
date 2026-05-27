@@ -48,17 +48,16 @@ _WRITE_PRODUCING_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit", "Bash"}
 DEFAULT_POOL_ROOT = Path(
     os.environ.get("IRIAI_CLAUDE_POOL_ROOT", "/Users/Shared/iriai/claude-pool")
 )
-DEFAULT_PROFILE_NAMES = ("iriai-claude-1", "iriai-claude-2", "iriai-claude-3")
+DEFAULT_PROFILE_NAMES = ("iriai-claude-1", "iriai-claude-2")
 DEFAULT_PROFILE_WEIGHTS = {
-    "iriai-claude-1": 5.0,
-    "iriai-claude-2": 1.0,
-    "iriai-claude-3": 9.0,
+    "iriai-claude-1": 1.0,
+    "iriai-claude-2": 9.0,
 }
-LEGACY_DEFAULT_PROFILE_WEIGHTS = {
-    "iriai-claude-1": 5.0,
-    "iriai-claude-2": 1.0,
-    "iriai-claude-3": 12.0,
-}
+LEGACY_DEFAULT_PROFILE_NAMES = ("iriai-claude-1", "iriai-claude-2", "iriai-claude-3")
+LEGACY_DEFAULT_PROFILE_WEIGHT_SETS = (
+    {"iriai-claude-1": 5.0, "iriai-claude-2": 1.0, "iriai-claude-3": 12.0},
+    {"iriai-claude-1": 5.0, "iriai-claude-2": 1.0, "iriai-claude-3": 9.0},
+)
 DEFAULT_CLAUDE_COMMAND = os.environ.get("IRIAI_CLAUDE_COMMAND", "/opt/homebrew/bin/claude")
 DEFAULT_POLL_INTERVAL_SECONDS = float(
     os.environ.get("IRIAI_CLAUDE_POOL_POLL_INTERVAL_SECONDS", "1") or "1"
@@ -446,40 +445,57 @@ def _profile_entry_weight(entry: Any) -> float | None:
 
 
 def _migrate_legacy_default_profile_weights(entries: Any) -> tuple[Any, bool]:
-    """Move generated 5/1/12 profile configs to the current 5/1/9 default.
+    """Move generated three-profile configs to the current two-profile default.
 
-    A pool generated before the 60% rebalance has explicit weights in
-    profiles.json, so changing only DEFAULT_PROFILE_WEIGHTS would not affect
-    existing installs. Only the exact known legacy default set is rewritten;
-    custom profile weights continue to win.
+    Existing pool installs have explicit entries in profiles.json, so changing
+    only DEFAULT_PROFILE_NAMES / DEFAULT_PROFILE_WEIGHTS would not affect them.
+    Only known generated defaults are rewritten; custom profiles continue to
+    win.
     """
     if not isinstance(entries, list):
         return entries, False
 
-    by_name = {_profile_entry_name(entry): entry for entry in entries}
-    for name, legacy_weight in LEGACY_DEFAULT_PROFILE_WEIGHTS.items():
+    names = [_profile_entry_name(entry) for entry in entries]
+    if names != list(LEGACY_DEFAULT_PROFILE_NAMES):
+        return entries, False
+
+    by_name = dict(zip(names, entries, strict=False))
+    for name in LEGACY_DEFAULT_PROFILE_NAMES:
         entry = by_name.get(name)
-        if entry is None:
+        if isinstance(entry, str):
+            continue
+        if not isinstance(entry, dict):
+            return entries, False
+        user = str(entry.get("user") or name)
+        command = str(entry.get("claude_command") or DEFAULT_CLAUDE_COMMAND)
+        if user != name or command != DEFAULT_CLAUDE_COMMAND:
             return entries, False
         weight = _profile_entry_weight(entry)
-        if weight is None or not math.isclose(weight, legacy_weight):
+        if weight is None:
+            continue
+        if not any(
+            math.isclose(weight, legacy_weights[name])
+            for legacy_weights in LEGACY_DEFAULT_PROFILE_WEIGHT_SETS
+        ):
             return entries, False
 
     migrated: list[Any] = []
-    changed = False
-    for entry in entries:
-        name = _profile_entry_name(entry)
-        if name in DEFAULT_PROFILE_WEIGHTS and isinstance(entry, dict):
-            replacement = dict(entry)
-            replacement["weight"] = DEFAULT_PROFILE_WEIGHTS[name]
-            migrated.append(replacement)
-            changed = changed or not math.isclose(
-                float(entry.get("weight")),
-                DEFAULT_PROFILE_WEIGHTS[name],
-            )
-        else:
-            migrated.append(entry)
-    return migrated, changed
+    for name in DEFAULT_PROFILE_NAMES:
+        entry = by_name.get(name)
+        command = (
+            str(entry.get("claude_command"))
+            if isinstance(entry, dict) and entry.get("claude_command")
+            else DEFAULT_CLAUDE_COMMAND
+        )
+        migrated.append(
+            {
+                "name": name,
+                "user": name,
+                "claude_command": command,
+                "weight": DEFAULT_PROFILE_WEIGHTS[name],
+            }
+        )
+    return migrated, True
 
 
 def load_profiles(root: Path = DEFAULT_POOL_ROOT) -> list[ClaudePoolProfile]:
