@@ -87,6 +87,7 @@ import dataclasses
 import json
 import sys
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Callable, Sequence
 
 from pydantic import BaseModel
@@ -110,6 +111,9 @@ from iriai_build_v2.execution_control.counterfactual_metrics_comparator import (
 )
 from iriai_build_v2.execution_control.counterfactual_replay import (
     CounterfactualResult,
+)
+from iriai_build_v2.execution_control.finding_engine import (
+    GovernanceFinding,
 )
 
 # Slice 19 1st sub-slice -- typed snapshot + agent context shapes
@@ -139,6 +143,10 @@ from iriai_build_v2.execution_control.governance_snapshot_api import (
 # Slice 15 -- metric value shape (typed input for the comparator).
 from iriai_build_v2.execution_control.governance_metrics import (
     GovernanceMetricValue,
+)
+from iriai_build_v2.workflows.develop.governance.models import (
+    GovernanceEvidencePageRef,
+    GovernanceEvidenceRef,
 )
 
 
@@ -256,6 +264,21 @@ discipline.
 """
 
 
+_DEFAULT_FIXTURE_ROOT: Path = (
+    Path(__file__).resolve().parents[5]
+    / "tests"
+    / "fixtures"
+    / "execution_control_plane"
+)
+"""Checked-in bounded summary fixture root used by the default report path."""
+
+_DEFAULT_FIXTURE_MAX_FILE_BYTES: int = 64 * 1024
+"""Per-file byte cap for the default fixture-backed corpus loader."""
+
+_DEFAULT_FIXTURE_MAX_JSONL_ROWS: int = 256
+"""Per-JSONL row cap for the default fixture-backed corpus loader."""
+
+
 # --- Typed CLI provider-factories shape (DI seam for tests) ----------------
 
 
@@ -263,7 +286,7 @@ discipline.
 class CLIProviderFactories:
     """Typed dependency-injection seam for the CLI runner.
 
-    Holds the 4 per-subcommand provider factories (callables that
+    Holds the 6 provider hooks (callables that
     return typed upstream API instances + the per-subcommand corpus
     loaders) the runner consumes. Tests OVERRIDE individual factories
     to inject fakes without mocking the CLI itself.
@@ -274,7 +297,7 @@ class CLIProviderFactories:
     factory's return value via its public methods only.
 
     Per auto-memory ``feedback_flat_structured_output`` the typed
-    shape is FLAT (just 4 callable fields); no nested DI metadata.
+    shape is FLAT (just 6 callable fields); no nested DI metadata.
 
     Per ``feedback_no_silent_degradation`` the dataclass is ``frozen=True``
     so a mis-construction raises a typed :class:`dataclasses.FrozenInstanceError`
@@ -294,15 +317,13 @@ class CLIProviderFactories:
     """Loads the typed Slice 19 2nd sub-slice
     :class:`SnapshotAPICorpus` for a given ``feature_id``.
 
-    The default loader RAISES a :class:`NotImplementedError` because
-    the production corpus loader requires a Postgres connection
-    + bounded-read primitives that this READ-ONLY CLI does NOT own
-    (per the doc-19:151 step 2 contract *"the caller owns the
-    bounded-read transaction"*). Real callers MUST inject a custom
-    loader that returns a typed :class:`SnapshotAPICorpus`.
+    The default loader is a bounded, checked-in fixture loader for
+    summary-only governance corpora such as ``8ac124d6``. Real callers
+    MAY still inject a custom loader that returns a typed
+    :class:`SnapshotAPICorpus` for live or non-fixture feature ids.
 
     Per the fail-closed discipline the runner CATCHES the
-    :class:`NotImplementedError` + emits a typed gap projection with
+    fixture-loader exceptions + emits a typed gap projection with
     :data:`EXIT_UPSTREAM_EXCEPTION` rather than letting the exception
     propagate to stderr.
     """
@@ -362,25 +383,341 @@ class CLIProviderFactories:
 
 
 def _default_snapshot_corpus_loader(feature_id: str) -> SnapshotAPICorpus:
-    """Default snapshot corpus loader -- RAISES NotImplementedError.
+    """Default snapshot corpus loader backed by bounded summary fixtures.
 
-    Per the CLI's READ-ONLY contract the production corpus loader
-    requires bounded-read primitives the CLI does NOT own. Real
-    callers MUST inject a custom loader via
-    :class:`CLIProviderFactories`.
+    Slice 19A remediation 19A-2 closes the historical fail-loud
+    placeholder on the accepted default report path. The loader reads
+    only checked-in bounded fixture summaries from
+    ``tests/fixtures/execution_control_plane/feature_<feature_id>``.
+    It enforces a small byte cap before parsing each file and a row
+    cap before accepting each JSONL file, then projects those rows into
+    typed refs/summaries consumed by :class:`GovernanceSnapshotAPI`.
 
-    Per ``feedback_no_silent_degradation`` the loader FAILS LOUD
-    rather than silently returning an empty corpus.
+    Unknown feature ids still fail loud so callers do not receive an
+    empty, falsely-successful corpus.
     """
 
-    raise NotImplementedError(
-        "No SnapshotAPICorpus loader is wired for "
-        f"feature_id={feature_id!r}. Inject a typed loader via "
-        "CLIProviderFactories.snapshot_corpus_loader (the CLI is a "
-        "READ-ONLY projection consumer; the production loader "
-        "requires bounded-read primitives the CLI does not own per "
-        "doc-19:151 step 2)."
+    return _load_fixture_snapshot_corpus(feature_id)
+
+
+def _load_fixture_snapshot_corpus(feature_id: str) -> SnapshotAPICorpus:
+    safe_feature_id = _validate_fixture_feature_id(feature_id)
+    fixture_dir = _DEFAULT_FIXTURE_ROOT / f"feature_{safe_feature_id}"
+    if not fixture_dir.is_dir():
+        raise FileNotFoundError(
+            "No bounded governance fixture corpus is available for "
+            f"feature_id={feature_id!r}. Inject a typed loader via "
+            "CLIProviderFactories.snapshot_corpus_loader for non-fixture "
+            "features."
+        )
+
+    manifest = _read_fixture_json(fixture_dir / "manifest.json")
+    if manifest.get("feature_id") != safe_feature_id:
+        raise ValueError(
+            "Fixture manifest feature_id mismatch for "
+            f"feature_id={feature_id!r}"
+        )
+    collection_policy = manifest.get("collection_policy")
+    if not isinstance(collection_policy, dict) or not (
+        collection_policy.get("bounded_reads") is True
+        and collection_policy.get("summary_only") is True
+        and collection_policy.get("live_mutation") is False
+    ):
+        raise ValueError(
+            "Fixture manifest does not prove bounded summary-only reads "
+            f"for feature_id={feature_id!r}"
+        )
+
+    artifact_rows = _read_fixture_jsonl(
+        fixture_dir / "artifact_summaries.jsonl"
     )
+    event_rows = _read_fixture_jsonl(fixture_dir / "event_summaries.jsonl")
+    slice_rows = _read_fixture_jsonl(
+        fixture_dir / "selected_artifact_slices.jsonl"
+    )
+    audit_rows = _read_fixture_jsonl(fixture_dir / "collector_audit.jsonl")
+    drag_findings = _read_fixture_json(fixture_dir / "drag_findings.json")
+
+    _validate_collector_audit(audit_rows, safe_feature_id)
+
+    artifact_digests = _digest_by_id(artifact_rows, id_key="id")
+    event_digests = _digest_by_id(event_rows, id_key="id")
+    slice_digests = {
+        f"slice:{row.get('purpose')}": str(row.get("sha256", ""))
+        for row in slice_rows
+        if isinstance(row, dict) and row.get("purpose")
+    }
+
+    page_refs = [
+        _page_ref_from_fixture_slice(safe_feature_id, row)
+        for row in slice_rows
+        if isinstance(row, dict)
+    ]
+    findings = _findings_from_fixture(
+        safe_feature_id,
+        drag_findings,
+        artifact_digests=artifact_digests,
+        event_digests=event_digests,
+        slice_digests=slice_digests,
+    )
+
+    return SnapshotAPICorpus(
+        findings=findings,
+        recommendations=[],
+        replay_results=[],
+        page_refs=page_refs,
+        corpus_evidence_quality="canonical",
+        blocked_by=[],
+    )
+
+
+def _validate_fixture_feature_id(feature_id: str) -> str:
+    if not feature_id or not feature_id.strip():
+        raise ValueError("feature_id must be non-empty")
+    stripped = feature_id.strip()
+    if not all(ch.isalnum() or ch in {"_", "-"} for ch in stripped):
+        raise ValueError(
+            "feature_id contains characters that are not valid for the "
+            "bounded fixture loader"
+        )
+    return stripped
+
+
+def _read_fixture_text(path: Path) -> str:
+    resolved = path.resolve()
+    fixture_root = _DEFAULT_FIXTURE_ROOT.resolve()
+    if fixture_root not in resolved.parents:
+        raise ValueError(f"Refusing to read outside fixture root: {path}")
+    size = resolved.stat().st_size
+    if size > _DEFAULT_FIXTURE_MAX_FILE_BYTES:
+        raise ValueError(
+            f"Fixture file {resolved.name} exceeds bounded read cap "
+            f"({_DEFAULT_FIXTURE_MAX_FILE_BYTES} bytes)"
+        )
+    return resolved.read_text(encoding="utf-8")
+
+
+def _read_fixture_json(path: Path) -> dict[str, Any]:
+    payload = json.loads(_read_fixture_text(path))
+    if not isinstance(payload, dict):
+        raise ValueError(f"Fixture JSON {path.name} must be an object")
+    return payload
+
+
+def _read_fixture_jsonl(path: Path) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for lineno, raw in enumerate(_read_fixture_text(path).splitlines(), start=1):
+        if lineno > _DEFAULT_FIXTURE_MAX_JSONL_ROWS:
+            raise ValueError(
+                f"Fixture JSONL {path.name} exceeds row cap "
+                f"({_DEFAULT_FIXTURE_MAX_JSONL_ROWS})"
+            )
+        if not raw.strip():
+            continue
+        row = json.loads(raw)
+        if not isinstance(row, dict):
+            raise ValueError(
+                f"Fixture JSONL {path.name}:{lineno} must be an object"
+            )
+        rows.append(row)
+    return rows
+
+
+def _validate_collector_audit(
+    rows: list[dict[str, Any]], feature_id: str
+) -> None:
+    if not rows:
+        raise ValueError("collector_audit.jsonl must contain audit rows")
+    for row in rows:
+        if row.get("feature_id") != feature_id:
+            raise ValueError("collector audit feature_id mismatch")
+        if row.get("bounded") is not True:
+            raise ValueError("collector audit row is not bounded")
+        if row.get("forbidden_broad_hydration_count") != 0:
+            raise ValueError("collector audit records broad hydration")
+        if row.get("forbidden_live_mutation_count") != 0:
+            raise ValueError("collector audit records live mutation")
+
+
+def _digest_by_id(
+    rows: list[dict[str, Any]], *, id_key: str
+) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for row in rows:
+        row_id = row.get(id_key)
+        if not isinstance(row_id, str) or not row_id:
+            continue
+        digest = row.get("sha256") or row.get("value_preview_sha256")
+        if isinstance(digest, str) and digest:
+            result[row_id] = digest
+    return result
+
+
+def _page_ref_from_fixture_slice(
+    feature_id: str, row: dict[str, Any]
+) -> GovernanceEvidencePageRef:
+    artifact_id = _required_str(row, "artifact_id")
+    purpose = _required_str(row, "purpose")
+    digest = _required_str(row, "sha256")
+    byte_start = _required_int(row, "start")
+    byte_end = _required_int(row, "end")
+    return GovernanceEvidencePageRef(
+        page_ref_id=f"fixture:{feature_id}:slice:{artifact_id}:{byte_start}:{byte_end}",
+        authority="legacy_artifact_summary",
+        source_ref_id=artifact_id,
+        byte_start=byte_start,
+        byte_end=byte_end,
+        digest=digest,
+        completeness="paged",
+        exact=True,
+        stale_check={
+            "ref_digest": digest,
+            "source_row_count": 1,
+            "authority": "legacy_artifact_summary",
+            "freshness": f"fixture:{purpose}",
+        },
+    )
+
+
+def _findings_from_fixture(
+    feature_id: str,
+    payload: dict[str, Any],
+    *,
+    artifact_digests: dict[str, str],
+    event_digests: dict[str, str],
+    slice_digests: dict[str, str],
+) -> list[GovernanceFinding]:
+    if payload.get("feature_id") != feature_id:
+        raise ValueError("drag_findings feature_id mismatch")
+    raw_findings = payload.get("findings")
+    if not isinstance(raw_findings, list):
+        raise ValueError("drag_findings.findings must be a list")
+
+    findings: list[GovernanceFinding] = []
+    for index, raw in enumerate(raw_findings, start=1):
+        if not isinstance(raw, dict):
+            raise ValueError("drag_findings row must be an object")
+        failure_class = _required_str(raw, "failure_class")
+        observed = raw.get("observed") is True
+        evidence_tokens = raw.get("evidence_refs")
+        if not isinstance(evidence_tokens, list):
+            raise ValueError("drag_findings evidence_refs must be a list")
+        refs = [
+            _evidence_ref_from_fixture_token(
+                feature_id,
+                str(token),
+                artifact_digests=artifact_digests,
+                event_digests=event_digests,
+                slice_digests=slice_digests,
+            )
+            for token in evidence_tokens
+        ]
+        finding_key = (
+            f"fixture:{feature_id}:finding:{index:02d}:{failure_class}"
+        )
+        findings.append(
+            GovernanceFinding(
+                idempotency_key=finding_key,
+                kind=_finding_kind_for_failure_class(failure_class),
+                class_name=failure_class,
+                severity="medium" if observed else "low",
+                confidence=0.9 if observed else 0.55,
+                feature_id=feature_id,
+                affected_scope={
+                    "feature_id": feature_id,
+                    "failure_class": failure_class,
+                },
+                primary_evidence_refs=refs,
+                supporting_evidence_refs=[],
+                implementation_log_anchors=[
+                    "fixture:feature_8ac124d6:README.md"
+                ],
+                metric_refs=[f"fixture_failure_class:{failure_class}"],
+                estimated_lost_hours=None,
+                estimated_retry_impact=None,
+                recommended_action_display=(
+                    "Review bounded fixture evidence for "
+                    f"{failure_class}; governance output is advisory."
+                ),
+                recommendation_draft_ref=None,
+                safe_runtime_action=False,
+                requires_policy_artifact=True,
+                product_defect_related=(
+                    failure_class == "product_contract_drift"
+                ),
+                workflow_related=True,
+                causal_role="primary",
+                primary_cause_finding_id=None,
+                linked_finding_ids=[],
+            )
+        )
+    return findings
+
+
+def _evidence_ref_from_fixture_token(
+    feature_id: str,
+    token: str,
+    *,
+    artifact_digests: dict[str, str],
+    event_digests: dict[str, str],
+    slice_digests: dict[str, str],
+) -> GovernanceEvidenceRef:
+    if token.startswith("artifact:"):
+        ref_id = token.removeprefix("artifact:")
+        authority = "legacy_artifact_summary"
+        digest = artifact_digests.get(ref_id)
+    elif token.startswith("event:"):
+        ref_id = token.removeprefix("event:")
+        authority = "legacy_event"
+        digest = event_digests.get(ref_id)
+    elif token.startswith("slice:"):
+        ref_id = token
+        authority = "legacy_artifact_summary"
+        digest = slice_digests.get(ref_id)
+    else:
+        ref_id = token
+        authority = "legacy_artifact_summary"
+        digest = None
+    if not digest:
+        raise ValueError(
+            "Fixture evidence token has no digest in bounded indexes: "
+            f"{token!r}"
+        )
+    return GovernanceEvidenceRef(
+        authority=authority,
+        ref_id=ref_id,
+        feature_id=feature_id,
+        digest=digest,
+        quality="canonical",
+        completeness="complete",
+    )
+
+
+def _finding_kind_for_failure_class(failure_class: str) -> str:
+    mapping = {
+        "broad_read_legacy_consumer": "provenance_gap",
+        "checkpoint_contradiction": "governance_evidence_conflict",
+        "commit_only_routing": "unsafe_route",
+        "product_contract_drift": "product_defect_cluster",
+        "queue_recovery": "merge_queue_drag",
+        "runtime_provider": "runtime_instability",
+        "stale_projection": "stale_projection",
+    }
+    return mapping.get(failure_class, "workflow_inefficiency")
+
+
+def _required_str(row: dict[str, Any], key: str) -> str:
+    value = row.get(key)
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"Fixture row missing non-empty string {key!r}")
+    return value
+
+
+def _required_int(row: dict[str, Any], key: str) -> int:
+    value = row.get(key)
+    if not isinstance(value, int):
+        raise ValueError(f"Fixture row missing integer {key!r}")
+    return value
 
 
 def _default_line_provenance_reader_factory(repo_id: str) -> LineProvenanceReader:
@@ -431,13 +768,14 @@ def _default_compare_corpus_loader(
 
 def default_provider_factories() -> CLIProviderFactories:
     """Construct the typed :class:`CLIProviderFactories` with the
-    stateless default factories + the fail-loud corpus loaders.
+    stateless default factories, the bounded fixture snapshot loader,
+    and the fail-loud loaders for non-report surfaces that still lack
+    owned default data sources.
 
     The CLI runner consumes this factory bundle when no override is
-    passed; the 3 ``_default_*_loader`` callables FAIL LOUD on
-    invocation so production callers MUST inject typed loaders +
-    so test callers can structurally verify the fail-closed
-    fallback path.
+    passed. Unsupported feature ids and unsupported compare/provenance
+    defaults still FAIL LOUD so callers never receive silent empty
+    projections.
     """
 
     return CLIProviderFactories(

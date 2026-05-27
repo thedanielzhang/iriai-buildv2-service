@@ -1,10 +1,10 @@
 """Slice 19 5th sub-slice -- READ-ONLY typed agent-context builder that
 projects governance snapshots + line-provenance + recommendations onto a
-bounded typed :class:`GovernanceAgentContext` for workflow agent task-
-execute prompts.
+bounded typed :class:`GovernanceAgentContext` for reusable display/advisory
+agent-context projections.
 
-This module implements doc-19 § Refactoring Steps step 5 (lines
-157-160): *"Add agent-context builder that selects findings and
+This module implements doc-19 § Refactoring Steps step 5: *"Add
+agent-context builder that selects findings and
 provenance relevant to a task contract, repo, path, or line range.
 After Slice 21, this builder must call the Context Layer package API
 and return ``ContextLayerPackageSummary`` rather than assembling
@@ -24,7 +24,7 @@ It owns the typed agent-context-builder surface:
   action).
 
 * :class:`AgentContextScope` -- the typed scope record bundling the 4
-  scoping axes from doc-19:144-146 / doc-19:157-160 (``task_id`` /
+  scoping axes from doc-19:144-146 / doc-19 step 5 (``task_id`` /
   ``repo_id`` / ``path`` / ``line_start`` / ``line_end``).
 
 * :class:`AgentContextBuilderInputs` -- the typed bundle of all inputs
@@ -45,22 +45,16 @@ It owns the typed agent-context-builder surface:
 * :class:`GovernanceAgentContextBuilder` -- the typed agent-context-
   builder class with the public projection method :meth:`build`.
 
-**Slice 21-conditional `ContextLayerPackageSummary` field DEFERRED.**
-Per doc-19:89-101 + doc-19:125-127 + doc-19:179-182 + doc-19:205-210
-the typed :class:`ContextLayerPackageSummary` shape is a post-Slice-21
-typed-package-id-and-digest projection the builder MUST return so
-agents and gates can cite + stale-check the exact context package
-they consumed. **This 5th sub-slice DEFERS the field.** The typed
-Slice 19 1st sub-slice :class:`GovernanceAgentContext` does NOT
-expose a ``context_package`` attribute (per the Slice 19 1st sub-
-slice typed-shape foundation); the typed builder this slice
-construct does NOT mint a context-package summary; future Slice 21
-wiring will tighten the typed :class:`GovernanceAgentContext` shape
-to include the typed :class:`ContextLayerPackageSummary` field and
-update this builder to populate it from the Slice 21 Context Layer
-package API. Until then the builder is a pure-local refs-only
-projection over the typed governance snapshot + line-provenance
-inputs.
+**Slice 21 ``ContextLayerPackageSummary`` field WIRED.** Per
+doc-19:89-101 + doc-19:125-127 + doc-19:179-182 + doc-19:205-210 and
+doc-21:369-370 the builder now accepts an optional typed
+:class:`ContextLayerPackage` or :class:`ContextLayerPackageSummary` and
+carries the compact summary through to
+:attr:`GovernanceAgentContext.context_package`. The builder does not
+mint package ids, hydrate provider output, stale-check for gates, or
+promote the package into runtime authority; it only projects the
+advisory/read-only package summary supplied by or derived from the
+caller input.
 
 **Bounded-prompt + refs-only discipline (per governance prompt §
 "Non-Negotiables" + doc-19:124-127 + doc-19:128-131).** The agent-
@@ -84,7 +78,7 @@ truncating the typed lists (findings -> recommendations -> line
 provenance) in priority order and recording the omitted counts +
 exact page refs per doc-19:128-131.
 
-**Scope-filtering discipline (per doc-19:157-160 + doc-19:144-146).**
+**Scope-filtering discipline (per doc-19 step 5 + doc-19:144-146).**
 The agent-context builder selects governance content relevant to the
 caller's typed :class:`AgentContextScope`. The 4 scoping axes are:
 
@@ -156,10 +150,12 @@ doc-19:348-349 *"Supervisor/dashboard read-only contract preserved
   builder propagates the completeness verbatim so callers cannot
   silently consume preview-only context as execution authority.
 
-* **AC3** (doc-19:227) *"Workflow agents can receive compact governance
-  context at task execute time."* -- enforced by the typed
-  :class:`GovernanceAgentContext` shape (the compact context surface
-  the builder emits).
+* **AC3** (19A-5 remediation of doc-19:227) -- Slice 19 provides a
+  reusable display/advisory builder for compact governance context.
+  The builder emits the typed :class:`GovernanceAgentContext` shape,
+  but production task-execute consumption is deferred to a later
+  accepted source-of-truth slice and guarded by the 19A-5 consumer
+  sentinel.
 
 * **AC5** (doc-19:230-231) *"Workflow agents receive governance policy
   guidance only as advisory context; contracts, gates, router, and
@@ -232,8 +228,7 @@ in the unit-test surface enforce the contract):
 
 It is the **agent-context projection layer** that subsequent Slice 19
 sub-slices (report artifacts / read-only enforcement) cite as the
-typed bounded-prompt contract for the workflow agent task-execute
-surface.
+typed bounded-prompt contract for reusable display/advisory context.
 
 **Slice 13A invariant compliance.** The agent-context builder consumes
 the typed Slice 19 2nd sub-slice :class:`SnapshotAPIResult` which is
@@ -243,13 +238,14 @@ surface; the builder does NOT hydrate artifact bodies (omitted_detail_refs
 preserves the upstream completeness verbatim. Per the Slice 13A
 invariant doc-13a:18-23 the typed
 :attr:`GovernanceAgentContext.completeness` field carries the typed
-:data:`CompletenessState` Literal so downstream task-execute
-consumers can detect ``preview_only`` / ``unavailable`` context at
-construction and reject it as authoritative input per doc-19:128-131.
+:data:`CompletenessState` Literal so future production task-execute
+consumers can detect ``preview_only`` / ``unavailable`` context after
+they are wired by a later accepted source-of-truth slice and reject it
+as authoritative input per doc-19:128-131.
 
 References:
 
-* Doc-19 § Refactoring Steps step 5 (lines 157-160) -- *"Add agent-
+* Doc-19 § Refactoring Steps step 5 -- *"Add agent-
   context builder that selects findings and provenance relevant to a
   task contract, repo, path, or line range. After Slice 21, this
   builder must call the Context Layer package API and return
@@ -281,7 +277,13 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    model_validator,
+)
 
 from iriai_build_v2.execution_control.commit_provenance import (
     LineProvenanceResult,
@@ -291,6 +293,7 @@ from iriai_build_v2.execution_control.finding_engine import (
 )
 from iriai_build_v2.execution_control.governance_agent import (
     GOVERNANCE_AGENT_CONTEXT_MAX_PROMPT_CHARS_CAP,
+    ContextLayerPackageSummary,
     GovernanceAgentContext,
 )
 from iriai_build_v2.execution_control.governance_snapshot_api import (
@@ -300,6 +303,9 @@ from iriai_build_v2.execution_control.governance_snapshot_api import (
 from iriai_build_v2.execution_control.policy_recommendation import (
     GovernancePolicyRecommendation,
 )
+from iriai_build_v2.workflows.develop.context_layer.models import (
+    ContextLayerPackage,
+)
 from iriai_build_v2.workflows.develop.governance.models import (
     CompletenessState,
 )
@@ -308,13 +314,13 @@ from iriai_build_v2.workflows.develop.governance.models import (
 __all__ = [
     # Typed failure id (doc-19:184-194 + doc-14:242-243 NON-BLOCKING).
     "AGENT_CONTEXT_BUILDER_FAILURE_ID",
-    # Typed scope record (doc-19:144-146 + doc-19:157-160 -- 4 axes).
+    # Typed scope record (doc-19:144-146 + doc-19 step 5 -- 4 axes).
     "AgentContextScope",
     # Typed agent-context-builder inputs / gap / result.
     "AgentContextBuilderInputs",
     "AgentContextBuilderGap",
     "AgentContextBuilderResult",
-    # The agent-context-builder class (doc-19:157-160 step 5).
+    # The agent-context-builder class (doc-19 step 5).
     "GovernanceAgentContextBuilder",
 ]
 
@@ -390,14 +396,14 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
-# --- AgentContextScope (typed scope record; doc-19:144-146 + doc-19:157-160)
+# --- AgentContextScope (typed scope record; doc-19:144-146 + doc-19 step 5)
 
 
 class AgentContextScope(BaseModel):
     """Typed scope record bundling the 4 scoping axes from doc-19:144-146
-    + doc-19:157-160.
+    + doc-19 step 5.
 
-    Per doc-19:157-160 *"Add agent-context builder that selects findings
+    Per doc-19 step 5 *"Add agent-context builder that selects findings
     and provenance relevant to a task contract, repo, path, or line
     range."* + doc-19:144-146 *"Agent context endpoint that returns
     compact governance context for a task, repo, file, or line range."*
@@ -434,7 +440,7 @@ class AgentContextScope(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     task_id: str | None = None
-    """The task contract scope (doc-19:144-146 + doc-19:157-160). When
+    """The task contract scope (doc-19:144-146 + doc-19 step 5). When
     set the builder restricts findings to those whose
     :attr:`GovernanceFinding.affected_scope` dict carries the matching
     ``task_id`` value OR whose related-finding-id graph reaches a
@@ -446,7 +452,7 @@ class AgentContextScope(BaseModel):
     other scoping axes)."""
 
     repo_id: str | None = None
-    """The repo scope (doc-19:144-146 + doc-19:157-160). When set the
+    """The repo scope (doc-19:144-146 + doc-19 step 5). When set the
     builder restricts findings to those whose
     :attr:`GovernanceFinding.affected_scope` dict carries the matching
     ``repo_id`` value + recommendations whose
@@ -457,7 +463,7 @@ class AgentContextScope(BaseModel):
     ``None`` -> cross-repo scope."""
 
     path: str | None = None
-    """The repo-relative file path scope (doc-19:144-146 + doc-19:157-160).
+    """The repo-relative file path scope (doc-19:144-146 + doc-19 step 5).
     When set the builder restricts line-provenance results to those
     whose originating :attr:`LineProvenanceQuery.path` matches the
     value. The typed :class:`LineProvenanceResult` does NOT directly
@@ -470,7 +476,7 @@ class AgentContextScope(BaseModel):
 
     line_start: int | None = None
     """The 1-indexed inclusive start line of the range scope inside
-    :attr:`path` (doc-19:144-146 + doc-19:157-160). When ``path`` is
+    :attr:`path` (doc-19:144-146 + doc-19 step 5). When ``path`` is
     set AND both line bounds are set the builder restricts line-
     provenance results to those whose originating
     :class:`LineProvenanceQuery` range intersects the caller's range
@@ -481,20 +487,36 @@ class AgentContextScope(BaseModel):
 
     line_end: int | None = None
     """The 1-indexed inclusive end line of the range scope inside
-    :attr:`path` (doc-19:144-146 + doc-19:157-160). See
+    :attr:`path` (doc-19:144-146 + doc-19 step 5). See
     :attr:`line_start` for the intersection semantics.
 
     ``None`` -> no per-line filtering inside the path-restricted slice."""
 
+    @model_validator(mode="after")
+    def _validate_line_range(self) -> "AgentContextScope":
+        """Fail closed on impossible 1-indexed line ranges."""
 
-# --- AgentContextBuilderInputs (typed inputs; doc-19:157-160 step 5) -------
+        if self.line_start is not None and self.line_start < 1:
+            raise ValueError("line_start must be 1-indexed when provided")
+        if self.line_end is not None and self.line_end < 1:
+            raise ValueError("line_end must be 1-indexed when provided")
+        if (
+            self.line_start is not None
+            and self.line_end is not None
+            and self.line_end < self.line_start
+        ):
+            raise ValueError("line_end must be >= line_start")
+        return self
+
+
+# --- AgentContextBuilderInputs (typed inputs; doc-19 step 5) ---------------
 
 
 class AgentContextBuilderInputs(BaseModel):
     """Typed bundle of all inputs the
     :meth:`GovernanceAgentContextBuilder.build` method consumes.
 
-    Per doc-19:157-160 step 5 + doc-19:124-127 + doc-19:128-131 the
+    Per doc-19 step 5 + doc-19:124-127 + doc-19:128-131 the
     inputs carry:
 
     * The typed Slice 19 2nd sub-slice :class:`SnapshotAPIResult`
@@ -516,6 +538,9 @@ class AgentContextBuilderInputs(BaseModel):
       :attr:`AgentContextScope.line_end`.
     * The typed :class:`AgentContextScope` carrying the 4 scoping
       axes.
+    * The optional Slice 21 :class:`ContextLayerPackage` or
+      :class:`ContextLayerPackageSummary` that the caller resolved from
+      the Context Layer package API.
     * The optional caller-side prompt-char budget override (defaults
       to the doc-19:124-127 20 000 char hard cap from
       :data:`GOVERNANCE_AGENT_CONTEXT_MAX_PROMPT_CHARS_CAP`; the
@@ -636,6 +661,16 @@ class AgentContextBuilderInputs(BaseModel):
     :attr:`GovernanceAgentContext.max_prompt_chars` is
     ``min(max_prompt_chars, GOVERNANCE_AGENT_CONTEXT_MAX_PROMPT_CHARS_CAP)``)."""
 
+    context_package: ContextLayerPackageSummary | ContextLayerPackage | None = None
+    """Optional Slice 21 package or package summary to project onto the
+    advisory :class:`GovernanceAgentContext` surface.
+
+    If a full :class:`ContextLayerPackage` is supplied, the builder
+    projects only its citeable summary. It does not mint package ids,
+    hydrate provider output, stale-check for gates, or treat package
+    completeness as product-authoritative execution state.
+    """
+
 
 # --- AgentContextBuilderGap (typed gap; doc-19:184-194 + doc-14:242-243) ----
 
@@ -702,6 +737,8 @@ class AgentContextBuilderGap(BaseModel):
       :attr:`AgentContextBuilderInputs.line_provenance_line_ranges`
       lists are non-empty and do not match
       :attr:`AgentContextBuilderInputs.line_provenance_results` length.
+    * ``missing_context_package_summary`` -- Slice 21 package identity is
+      required before line-aware governance context can be emitted.
     * ``prompt_budget_exceeded`` -- the effective
       :attr:`max_prompt_chars` cap cannot accommodate even the empty
       typed :class:`GovernanceAgentContext` (structurally impossible
@@ -741,7 +778,7 @@ class AgentContextBuilderGap(BaseModel):
     governance-finding precedent."""
 
 
-# --- AgentContextBuilderResult (typed result; doc-19:157-160 step 5) --------
+# --- AgentContextBuilderResult (typed result; doc-19 step 5) ---------------
 
 
 class AgentContextBuilderResult(BaseModel):
@@ -773,7 +810,7 @@ class AgentContextBuilderResult(BaseModel):
     """The typed :class:`GovernanceAgentContext` the builder emitted,
     OR ``None`` if the projection failed structurally.
 
-    Per the doc-19:157-160 step 5 contract the builder emits the
+    Per the doc-19 step 5 contract the builder emits the
     typed agent context when inputs are valid; on structural failure
     the context is ``None`` + the gap finding is recorded in
     :attr:`gap_findings`. On informational-only gaps the context is
@@ -793,7 +830,7 @@ class AgentContextBuilderResult(BaseModel):
     the truncated agent context."""
 
 
-# --- GovernanceAgentContextBuilder (the builder class; doc-19:157-160 step 5)
+# --- GovernanceAgentContextBuilder (the builder class; doc-19 step 5)
 
 
 # Internal scoring tuple for finding ranking inside the budget loop.
@@ -842,7 +879,7 @@ def _finding_rank_key(finding: GovernanceFinding) -> tuple[float, float, float]:
 
 
 class GovernanceAgentContextBuilder:
-    """The typed agent-context builder class (doc-19:157-160 step 5).
+    """The typed agent-context builder class (doc-19 step 5).
 
     Per *"Add agent-context builder that selects findings and
     provenance relevant to a task contract, repo, path, or line range.
@@ -852,17 +889,16 @@ class GovernanceAgentContextBuilder:
     consumes the typed :class:`AgentContextBuilderInputs` and emits a
     typed :class:`GovernanceAgentContext` record.
 
-    **Slice 21-conditional ``ContextLayerPackageSummary`` field
-    DEFERRED.** Per doc-19:89-101 + doc-19:125-127 + doc-19:179-182 +
-    doc-19:205-210 the typed :class:`ContextLayerPackageSummary` shape
-    is a post-Slice-21 typed-package-id-and-digest projection. This
-    5th sub-slice builder does NOT populate the field (the typed
-    Slice 19 1st sub-slice :class:`GovernanceAgentContext` shape
-    does NOT include a ``context_package`` attribute per the typed-
-    shape foundation; future Slice 21 wiring will tighten the typed
-    surface).
+    **Slice 21 ``ContextLayerPackageSummary`` field WIRED.** Per
+    doc-19:89-101 + doc-19:125-127 + doc-19:179-182 + doc-19:205-210
+    and doc-21:369-370 the builder carries an optional typed package or
+    package summary from :class:`AgentContextBuilderInputs` to
+    :attr:`GovernanceAgentContext.context_package` as a compact
+    :class:`ContextLayerPackageSummary`. It remains a display/advisory
+    projection and is not a gate, router, merge, or runtime-activation
+    authority.
 
-    **Scope-filtering discipline (per doc-19:144-146 + doc-19:157-160).**
+    **Scope-filtering discipline (per doc-19:144-146 + doc-19 step 5).**
     The builder filters the typed Slice 16
     :class:`GovernanceFinding` list + Slice 17
     :class:`GovernancePolicyRecommendation` list + Slice 14
@@ -931,7 +967,7 @@ class GovernanceAgentContextBuilder:
         """Build the typed :class:`GovernanceAgentContext` from the
         typed inputs.
 
-        Per doc-19:157-160 the method:
+        Per doc-19 step 5 the method:
 
         1. Validates the parallel-list-length contract for the typed
            :attr:`AgentContextBuilderInputs.line_provenance_paths` /
@@ -1030,6 +1066,7 @@ class GovernanceAgentContextBuilder:
             )
 
         corpus_id = snapshot.corpus_id
+        context_package = self._context_package_summary(inputs.context_package)
 
         # Step 3: scope-filter the typed Slice 16 / Slice 17 / Slice 14
         # lists.
@@ -1045,6 +1082,39 @@ class GovernanceAgentContextBuilder:
                 line_results, line_paths, line_ranges, scope
             )
         )
+        if (
+            self._line_aware_context_requested(
+                scope=scope,
+                line_results=line_results,
+                line_paths=line_paths,
+                line_ranges=line_ranges,
+            )
+            and context_package is None
+        ):
+            return AgentContextBuilderResult(
+                context=None,
+                gap_findings=[
+                    AgentContextBuilderGap(
+                        failure_id=AGENT_CONTEXT_BUILDER_FAILURE_ID,
+                        corpus_id=corpus_id,
+                        reason="missing_context_package_summary",
+                        observed_at=_utcnow(),
+                        evidence_payload={
+                            "line_provenance_results_count": len(line_results),
+                            "scoped_line_provenance_count": len(
+                                scoped_line_provenance
+                            ),
+                            "line_provenance_paths_count": len(line_paths),
+                            "line_provenance_line_ranges_count": len(line_ranges),
+                            "scope_task_id": scope.task_id,
+                            "scope_repo_id": scope.repo_id,
+                            "scope_path": scope.path,
+                            "scope_line_start": scope.line_start,
+                            "scope_line_end": scope.line_end,
+                        },
+                    )
+                ],
+            )
 
         # Step 4: compute the effective budget cap (hard-clamped to the
         # doc-19:124-127 20 000 char cap).
@@ -1072,6 +1142,7 @@ class GovernanceAgentContextBuilder:
                 pre_filter_recommendation_count=len(snapshot.recommendations),
                 pre_filter_line_provenance_count=len(line_results),
                 effective_max_prompt_chars=effective_max_prompt_chars,
+                context_package=context_package,
             )
         except ValidationError as exc:  # pragma: no cover -- defensive
             return AgentContextBuilderResult(
@@ -1118,6 +1189,39 @@ class GovernanceAgentContextBuilder:
         )
 
     # --- Private helpers --------------------------------------------------
+
+    @staticmethod
+    def _line_aware_context_requested(
+        *,
+        scope: AgentContextScope,
+        line_results: list[LineProvenanceResult],
+        line_paths: list[str],
+        line_ranges: list[tuple[int, int]],
+    ) -> bool:
+        """Return whether this request is file/line/provenance aware."""
+
+        return bool(
+            line_results
+            or line_paths
+            or line_ranges
+            or scope.path is not None
+            or scope.line_start is not None
+            or scope.line_end is not None
+        )
+
+    @staticmethod
+    def _context_package_summary(
+        context_package: ContextLayerPackageSummary | ContextLayerPackage | None,
+    ) -> ContextLayerPackageSummary | None:
+        """Normalize the optional Slice 21 package input to its
+        governance-agent reporting summary.
+        """
+
+        if context_package is None:
+            return None
+        if isinstance(context_package, ContextLayerPackageSummary):
+            return context_package
+        return ContextLayerPackageSummary.from_context_layer_package(context_package)
 
     @staticmethod
     def _extract_corpus_id(source: SnapshotAPIResult) -> str:
@@ -1171,7 +1275,7 @@ class GovernanceAgentContextBuilder:
         """Filter the typed Slice 16 finding list by the typed
         :class:`AgentContextScope` axes.
 
-        Per doc-19:157-160 + doc-19:144-146 the typed scope axes
+        Per doc-19 step 5 + doc-19:144-146 the typed scope axes
         filter findings as follows:
 
         * ``task_id``: keep findings whose
@@ -1216,7 +1320,7 @@ class GovernanceAgentContextBuilder:
         """Filter the typed Slice 17 recommendation list by the typed
         :class:`AgentContextScope` axes.
 
-        Per doc-19:157-160 + doc-19:144-146 the typed scope axes
+        Per doc-19 step 5 + doc-19:144-146 the typed scope axes
         filter recommendations as follows:
 
         * ``task_id``: NO filtering (recommendations are repo / scheduler
@@ -1260,7 +1364,7 @@ class GovernanceAgentContextBuilder:
         """Filter the typed Slice 14 line-provenance list by the typed
         :class:`AgentContextScope` axes.
 
-        Per doc-19:157-160 + doc-19:144-146 the typed scope axes
+        Per doc-19 step 5 + doc-19:144-146 the typed scope axes
         filter line-provenance as follows:
 
         * ``task_id``: keep line-provenance results whose
@@ -1334,6 +1438,7 @@ class GovernanceAgentContextBuilder:
         pre_filter_recommendation_count: int,
         pre_filter_line_provenance_count: int,
         effective_max_prompt_chars: int,
+        context_package: ContextLayerPackageSummary | None,
     ) -> GovernanceAgentContext | None:
         """Iteratively construct the typed
         :class:`GovernanceAgentContext` honouring the effective char
@@ -1381,6 +1486,7 @@ class GovernanceAgentContextBuilder:
         envelope = GovernanceAgentContext(
             task_id=scope.task_id,
             repo_id=scope.repo_id,
+            context_package=context_package,
             relevant_findings=[],
             relevant_line_provenance=[],
             policy_guidance=[],
@@ -1409,6 +1515,7 @@ class GovernanceAgentContextBuilder:
             candidate_envelope = GovernanceAgentContext(
                 task_id=scope.task_id,
                 repo_id=scope.repo_id,
+                context_package=context_package,
                 relevant_findings=[*included_findings, finding],
                 relevant_line_provenance=included_line_provenance,
                 policy_guidance=included_recommendations,
@@ -1430,6 +1537,7 @@ class GovernanceAgentContextBuilder:
             candidate_envelope = GovernanceAgentContext(
                 task_id=scope.task_id,
                 repo_id=scope.repo_id,
+                context_package=context_package,
                 relevant_findings=included_findings,
                 relevant_line_provenance=included_line_provenance,
                 policy_guidance=[*included_recommendations, recommendation],
@@ -1460,6 +1568,7 @@ class GovernanceAgentContextBuilder:
             candidate_envelope = GovernanceAgentContext(
                 task_id=scope.task_id,
                 repo_id=scope.repo_id,
+                context_package=context_package,
                 relevant_findings=included_findings,
                 relevant_line_provenance=[
                     *included_line_provenance,
@@ -1555,6 +1664,7 @@ class GovernanceAgentContextBuilder:
         return GovernanceAgentContext(
             task_id=scope.task_id,
             repo_id=scope.repo_id,
+            context_package=context_package,
             relevant_findings=included_findings,
             relevant_line_provenance=included_line_provenance,
             policy_guidance=included_recommendations,

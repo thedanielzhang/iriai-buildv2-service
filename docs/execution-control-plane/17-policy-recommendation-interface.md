@@ -252,13 +252,13 @@ shared completeness model in two specific places:
    `preview_only` or `unavailable`; that fail-closed disposition is
    the doc-13a:18-23 invariant.
 2. Per **doc-13a:285-287 explicitly names Slice 17** as one of the
-   slices that MUST consume the shared completeness model. The Slice
-   17 binding statement at `13a-acceptance.md:209-215`
-   (P3-13A-6-3) names this slice as one of the candidates that MAY
-   provide the composite-adapter wiring (the other candidate is the
-   LAST sub-slice 13An itself). In either case, the Slice 13A typed
-   surfaces are this slice's hard dependency for any recommendation
-   that would activate a runtime policy.
+   slices that MUST consume the shared completeness model. Slice 19A
+   later reopened the P3-13A-6-3 dashboard-wrapper authority claim as
+   `19A-P2-001`;
+   until a future source-of-truth slice wires an actual authoritative
+   consumer with durable failure observation, the Slice 13A typed
+   surfaces are advisory inputs for recommendations and not runtime
+   activation authority.
 
 Source-of-truth modules:
 
@@ -287,12 +287,12 @@ Source-of-truth modules:
   recommendation's expected impact on
   `runtime_context/context_incomplete` failure routing is auditable.
 
-Per **P3-13A-6-3 dead-until-wired binding statement** (see
-`13a-acceptance.md:193-227`), the composite adapter chain must be
-wired into a real consumer site before any Slice 17 policy
-recommendation can claim runtime activation authority. The wiring is
-either the **Slice 13A 8th sub-slice 13An-2** deliverable (most
-likely) or a Slice 17 sub-task per doc-13a:286-287.
+Per P3-13A-6-3 and Slice 19A source-of-truth
+`19a-governance-implementation-reassessment.md` (`19A-P2-001`), the current
+dashboard wrapper is display/advisory-only and does not let any Slice 17 policy
+recommendation claim runtime activation authority. Authority use must wait for
+a future source-of-truth slice that wires an actual authoritative consumer with
+durable failure observation.
 
 This dependency-reconciliation reference was added by
 **Slice 13A 8th sub-slice 13An-1** (this iteration) per

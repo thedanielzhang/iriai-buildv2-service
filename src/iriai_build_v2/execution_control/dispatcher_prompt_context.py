@@ -52,14 +52,15 @@ auto-memory ``feedback_no_refactor``):
   ``should_invoke_runtime=False`` +
   ``typed_failure_class="runtime_context"`` +
   ``typed_failure_type="context_incomplete"`` + the missing field names.
-* When the adapter returns ``state="paged"`` /
-  ``state="preview_only"`` /  ``state="complete"`` the routing carries
-  ``should_invoke_runtime=True`` (per doc-13a:269-272 "a large prompt
-  emits a compact preview plus exact page refs"; the runtime PROCEEDS
-  with the authoritative companion record attached). The
-  preview_only state's ``authority="display_only"`` is preserved
-  verbatim per the Slice 13A invariant doc-13a:18-23 +
-  doc-13a:111-115 (override-resistant).
+* When the adapter returns ``state="complete"`` the routing carries
+  ``should_invoke_runtime=True``.
+* Slice 19A remediation: ``state="preview_only"``, ``state="unavailable"``,
+  and ``state="paged"`` without nonempty exact
+  :class:`EvidenceCompleteness.page_refs` route
+  ``should_invoke_runtime=False`` +
+  ``runtime_context/context_incomplete``. A paged context may invoke
+  the runtime only when the authoritative completeness record carries
+  exact page refs.
 
 **Implementation discipline** (stdlib + Pydantic + the in-package
 sanctioned surfaces only):
@@ -92,7 +93,7 @@ from __future__ import annotations
 
 from typing import Any, Literal, Mapping, Protocol
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 # Slice 13A second sub-slice foundational typed shapes (READ-ONLY consumer).
 from iriai_build_v2.execution_control.completeness import (
@@ -207,10 +208,12 @@ class AuthoritativePromptContextRouting(BaseModel):
     authoritative prompt build result.
 
     Carries the typed signal the dispatcher needs to either invoke the
-    runtime (state="complete" / "paged" / "preview_only") or record the
-    typed failure id ``runtime_context/context_incomplete`` and NOT
-    invoke the runtime (state="unavailable" / adapter raised
-    :class:`MissingPromptContextFieldError`).
+    runtime (state="complete", or state="paged" with exact page refs)
+    or record the typed failure id
+    ``runtime_context/context_incomplete`` and NOT invoke the runtime
+    (state="preview_only", state="unavailable", adapter raised
+    :class:`MissingPromptContextFieldError`, or paged context lacks
+    exact page refs).
 
     Per the auto-memory ``feedback_no_silent_degradation`` rule the
     routing is **fail-closed**: when ``should_invoke_runtime=False`` the
@@ -296,10 +299,11 @@ class AuthoritativePromptBuildResult(BaseModel):
     :data:`routing.typed_failure_type`) and does NOT invoke the
     runtime.
 
-    The :data:`authoritative_bundle` field is ``None`` when
-    ``routing.should_invoke_runtime=False`` (the adapter raised
-    :class:`MissingPromptContextFieldError`; no authoritative bundle
-    was produced).
+    The :data:`authoritative_bundle` field is ``None`` when the adapter
+    raised :class:`MissingPromptContextFieldError`; it can remain
+    populated for fail-closed ``preview_only`` or non-exact ``paged``
+    states so downstream observability can inspect the incomplete
+    authoritative record.
     """
 
     # ``extra="forbid"`` aligns with the sibling Slice 13A typed shapes.
@@ -333,6 +337,18 @@ class AuthoritativePromptBuildResult(BaseModel):
     the runtime; when False, it records the typed failure id
     (:data:`routing.typed_failure_class` /
     :data:`routing.typed_failure_type`) and does NOT invoke."""
+
+    @model_validator(mode="after")
+    def _enforce_slice_19a_runtime_context_exactness(
+        self,
+    ) -> "AuthoritativePromptBuildResult":
+        """Fail closed when the requested route is not execution-safe."""
+
+        self.routing = _runtime_routing_for_authoritative_bundle(
+            authoritative_bundle=self.authoritative_bundle,
+            requested_routing=self.routing,
+        )
+        return self
 
 
 # --- Port Protocol --------------------------------------------------------
@@ -443,18 +459,22 @@ class LegacyPromptBuilderAuthoritativeAdapter:
        Slice 05 persistence invariant holds even when the typed failure
        is raised).
     4. Otherwise emits an :class:`AuthoritativePromptBuildResult` whose
-       :data:`routing.should_invoke_runtime=True` and the
-       :data:`authoritative_bundle` field is populated.
+       :data:`routing` is derived from the authoritative completeness
+       record. ``state="complete"`` proceeds; ``state="paged"``
+       proceeds only with nonempty exact page refs; ``preview_only`` /
+       ``unavailable`` fail closed to
+       ``runtime_context/context_incomplete``.
 
     Per the auto-memory ``feedback_no_silent_degradation`` rule the
-    adapter is **fail-closed**: the
-    :class:`MissingPromptContextFieldError` is the ONLY exception path
-    that produces ``should_invoke_runtime=False``; any other exception
-    (e.g. legacy ``build_prompt_context`` itself raises) propagates
-    unchanged so the existing Slice 05 dispatcher error handling at
-    ``dispatcher.py:874-887`` catches and routes it (preserves the
-    Slice 05 ``runtime_context/context_materialization_failed`` route
-    for legitimate legacy failures).
+    adapter is **fail-closed**: :class:`MissingPromptContextFieldError`,
+    ``preview_only`` context, ``unavailable`` context, and non-exact
+    ``paged`` context all produce ``should_invoke_runtime=False``. Any
+    other exception (e.g. legacy ``build_prompt_context`` itself raises)
+    propagates unchanged so the existing Slice 05 dispatcher error
+    handling at ``dispatcher.py:874-887`` catches and routes it
+    (preserves the Slice 05
+    ``runtime_context/context_materialization_failed`` route for
+    legitimate legacy failures).
 
     Per the auto-memory ``feedback_no_refactor`` rule this adapter is a
     NEW opt-in code path; the existing Slice 05
@@ -531,22 +551,23 @@ class LegacyPromptBuilderAuthoritativeAdapter:
                 ),
             )
 
-        # Step 4: runtime PROCEEDS (state="complete" / "paged" /
-        # "preview_only"); per doc-13a:269-272 the runtime proceeds
-        # with the authoritative companion record attached. Per
-        # doc-13a:115-118 + doc-13a:18-23 (override-resistant Slice 13A
-        # invariant) the preview_only state's authority="display_only"
-        # was already forced inside the third-sub-slice adapter
-        # function; we surface it verbatim here.
+        # Step 4: derive the runtime routing from the authoritative
+        # completeness record. Slice 19A-P1-002 tightens the original
+        # Slice 13A behavior: preview-only and paged-without-exact-page-
+        # refs context are display/incomplete states and must not invoke
+        # the runtime.
         return AuthoritativePromptBuildResult(
             legacy_result=legacy_result,
             authoritative_bundle=authoritative_bundle,
-            routing=AuthoritativePromptContextRouting(
-                should_invoke_runtime=True,
-                typed_failure_class=None,
-                typed_failure_type=None,
-                unavailable_reason=None,
-                missing_field_names=(),
+            routing=_runtime_routing_for_authoritative_bundle(
+                authoritative_bundle=authoritative_bundle,
+                requested_routing=AuthoritativePromptContextRouting(
+                    should_invoke_runtime=True,
+                    typed_failure_class=None,
+                    typed_failure_type=None,
+                    unavailable_reason=None,
+                    missing_field_names=(),
+                ),
             ),
         )
 
@@ -628,3 +649,105 @@ def _coerce_legacy_prompt_result(
     # ``from_attributes`` path (the _DispatcherModel base carries
     # ``from_attributes=True`` per ``dispatcher.py:99-104``).
     return PromptBuildResult.model_validate(value)
+
+
+def _runtime_routing_for_authoritative_bundle(
+    *,
+    authoritative_bundle: AuthoritativePromptContextBundle | None,
+    requested_routing: AuthoritativePromptContextRouting,
+) -> AuthoritativePromptContextRouting:
+    """Return fail-closed dispatcher routing for an authoritative bundle."""
+
+    if not requested_routing.should_invoke_runtime:
+        return requested_routing
+    if authoritative_bundle is None:
+        return _context_incomplete_routing(
+            unavailable_reason="authoritative prompt context bundle is missing",
+            missing_field_names=("authoritative_bundle",),
+        )
+
+    completeness = authoritative_bundle.completeness
+    required_scopes = tuple(
+        authoritative_bundle.context_manifest_ref.required_complete_for
+    )
+    covered_scopes = set(completeness.complete_for)
+    scope_mismatch = not set(required_scopes).issubset(covered_scopes)
+    if completeness.state == "preview_only":
+        return _context_incomplete_routing(
+            unavailable_reason=(
+                "preview_only prompt context cannot invoke the runtime; "
+                "exact page refs are required"
+            ),
+            missing_field_names=("page_refs",),
+        )
+    if completeness.state == "unavailable":
+        return _context_incomplete_routing(
+            unavailable_reason=(
+                completeness.unavailable_reason
+                or "required prompt context is unavailable"
+            ),
+            missing_field_names=("page_refs",),
+        )
+    if completeness.state == "complete" and scope_mismatch:
+        return _context_incomplete_routing(
+            unavailable_reason=(
+                "prompt context does not cover required manifest scopes"
+            ),
+            missing_field_names=("required_complete_for",),
+        )
+    if completeness.state == "paged":
+        missing_field_names: list[str] = []
+        unavailable_reasons: list[str] = []
+        if not _has_all_exact_page_refs(completeness.page_refs):
+            missing_field_names.append("page_refs")
+            unavailable_reasons.append(
+                "paged prompt context lacks complete exact page-ref coverage"
+            )
+        if completeness.missing_required_refs:
+            missing_field_names.append("missing_required_refs")
+            unavailable_reasons.append(
+                "paged prompt context still has missing required refs"
+            )
+        if scope_mismatch:
+            missing_field_names.append("required_complete_for")
+            unavailable_reasons.append(
+                "prompt context does not cover required manifest scopes"
+            )
+        if missing_field_names:
+            return _context_incomplete_routing(
+                unavailable_reason="; ".join(unavailable_reasons),
+                missing_field_names=tuple(missing_field_names),
+            )
+    return requested_routing
+
+
+def _context_incomplete_routing(
+    *,
+    unavailable_reason: str,
+    missing_field_names: tuple[str, ...],
+) -> AuthoritativePromptContextRouting:
+    """Build the registered Slice 13A runtime-context failure routing."""
+
+    return AuthoritativePromptContextRouting(
+        should_invoke_runtime=False,
+        typed_failure_class="runtime_context",
+        typed_failure_type="context_incomplete",
+        unavailable_reason=unavailable_reason,
+        missing_field_names=missing_field_names,
+    )
+
+
+def _has_all_exact_page_refs(page_refs: list[Any]) -> bool:
+    """True when every paged ref carries exact identity and digest."""
+
+    return bool(page_refs) and all(
+        _is_exact_page_ref(page_ref) for page_ref in page_refs
+    )
+
+
+def _is_exact_page_ref(page_ref: Any) -> bool:
+    """Execution-control page refs are exact when id and digest are present."""
+
+    return bool(str(getattr(page_ref, "ref_id", "")).strip()) and bool(
+        str(getattr(page_ref, "sha256", "")).strip()
+    )

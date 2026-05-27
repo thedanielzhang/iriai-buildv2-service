@@ -47,7 +47,7 @@ slice plans or destabilize an active slice review cycle**.
 | 6 | doc-13a:276-279 — "Replace any deterministic-summary escape hatch in post-13A gates with explicit typed proof rows. A summary can satisfy a required gate only if the proof row states the exact source digest, page refs, proof algorithm, and verification time" | **SATISFIED** | Slice 13A 5th sub-slice (CO-BUNDLED with step 5 via the `AuthoritativeGateProofRow` shape + `derive_proof_row` helper in `gate_companion.py`) |
 | 7 | doc-13a:280-282 — "Add a 13A snapshot companion so every list field carries field-level completeness. Partial snapshots are allowed for display but classifier rules fail closed unless their required fields are complete" | **SATISFIED** | Slice 13A 6th sub-slice (`src/iriai_build_v2/execution_control/snapshot_companion.py`; 1176 lines; 9 `__all__` surfaces) |
 | 8 | doc-13a:283-285 — "Add a 13A acceptance artifact and README index entry instead of rewriting accepted Slice 00-12 plan docs" | **SATISFIED** (this artifact + the appended README index entry) | Slice 13A 7th sub-slice |
-| 9 | doc-13a:285-287 — "Update governance Slices 13-20 and context Slice 21 to depend on this shared completeness model instead of redefining authority semantics locally" | **SATISFIED** (13An-1 appended uniform `## Slice 13A Shared Completeness Model Dependency` sub-section to 9 plan docs; 13An-2 finalizer landed the P3-13A-6-3 binding closure via production-callsite swap at `dashboard.py:1568`) | Slice 13A 8th sub-slice 13An-1 (step 9 reconciliation) + 13An-2 (P3-13A-6-3 binding closure wiring) + 13An-3 (slice-end SIX-VECTOR review) |
+| 9 | doc-13a:285-287 — "Update governance Slices 13-20 and context Slice 21 to depend on this shared completeness model instead of redefining authority semantics locally" | **SATISFIED** (13An-1 appended uniform `## Slice 13A Shared Completeness Model Dependency` sub-section to 9 plan docs; 13An-2 recorded the opt-in dashboard wrapper at `dashboard.py:1563`; Slice 19A later reopened that wrapper's authority sufficiency as `19A-P2-001`) | Slice 13A 8th sub-slice 13An-1 (step 9 reconciliation) + 13An-2 (P3-13A-6-3 display/advisory wrapper) + 13An-3 (slice-end SIX-VECTOR review) |
 
 ## Invariants pinned by Slice 13A
 
@@ -100,11 +100,11 @@ Per doc-13a:111-115:
   per-list-field completeness and force classifier rules to fail closed
   when their required snapshot fields are incomplete.
 
-**Binding statement (carry)**: the full deviation closure depends on
-**P3-13A-6-3** — the composite `LegacyGateConsumerSnapshotAdapter`
-chain must be wired into a real gate / verifier / classifier production
-consumer site before any Slice 14-19 governance slice can claim gate
-execution authority. See § "Carried-P3 ledger" below.
+**Binding statement (carry)**: the full deviation closure still depends on
+**P3-13A-6-3**. Per Slice 19A `19A-P2-001`, the current dashboard wrapper is
+display/advisory-only and does not let any Slice 14-19 governance slice claim
+gate execution authority. See the Slice 19A source doc for the active
+reassessment item.
 
 ### Doc-13a:280-282 — snapshot classifier fail-closed
 
@@ -121,11 +121,10 @@ EXISTING `evidence_corruption` failure_class in
 `src/iriai_build_v2/workflows/develop/execution/failure_router.py`.
 Both route to `quiesce` per doc-13a:280-282.
 
-**Binding statement (carry)**: the runtime fail-closed behavior
-depends on **P3-13A-6-3** — the composite adapter chain must be wired
-into a real consumer (likely supervisor `classifier.py` or
-`public_dashboard.py`) via an external opt-in wrapper. See § "Carried-P3
-ledger" below.
+**Binding statement (carry)**: the runtime fail-closed authority closure still
+depends on **P3-13A-6-3**. The existing dashboard wrapper is an external opt-in
+display/advisory wrapper only; active authority sufficiency is tracked by Slice
+19A `19A-P2-001`.
 
 ## Per-sub-slice module `__all__` projections
 
@@ -177,18 +176,20 @@ See P3-13A-6-1 in the carry ledger.
 
 This ledger tracks the carried-P3 items introduced by Slice 13A
 sub-slices. Items downgraded or closed in subsequent sub-slices are
-noted inline. The full ledger across the implementation lives in
-`STATUS.md` § "Carried-P3 ledger".
+noted inline. The current cross-slice 19A acceptance ledger lives in
+`19a-governance-implementation-reassessment.md` §
+"19A-6 carried-P3 acceptance ledger"; `STATUS.md` is the active restart
+pointer, not the durable P3 ledger.
 
 | ID | Introduced by | Status | Summary |
 |----|---------------|--------|---------|
-| **P3-13A-1** | Slice 13A 1st sub-slice finalizer | **CARRIED** | Structural false positives in the governance completeness scanner. 7 descriptive-text mentions of canonical `P[12]-<slice>-<digit>` IDs in narrative prose without same-line status markers. **Binding statement**: future Slice 13A sub-slices MUST design downstream consumers to EITHER (a) ignore `is_complete` and consume `unresolved_findings` / `evidence_gaps` lists directly, OR (b) add journal-section-aware filtering. |
+| **P3-13A-1** | Slice 13A 1st sub-slice finalizer; closed by Slice 19A-3 | **CLOSED** | The historical structural false positives in the governance completeness scanner are no longer present in the live corpus. Slice 19A-3 exact-gate remediation updated the live-corpus regression to derive completeness from active STATUS blockers: active 19A P1/P2 ids keep `is_complete=False`, and a clean STATUS with no active blockers must produce `unresolved_findings == []` and `is_complete=True`. Synthetic fail-closed coverage for genuine unresolved P1/P2 finding ids remains. |
 | **P3-13A-5-1** | Slice 13A 5th sub-slice | **CARRIED** | `LegacyGateCompanionAdapter` is a stateless wrapper that simply delegates to `derive_gate_companion`. Kept for symmetry with the 4th sub-slice's `LegacyPromptBuilderAuthoritativeAdapter` pattern (stable opt-in port shape for future wiring). |
 | **P3-13A-5-2** | Slice 13A 5th sub-slice | **CARRIED** | `AuthoritativeGateProofRow.proof_metadata: dict[str, Any]` is free-form. Intentionally permissive; future Slice 13A sub-slices (or Slice 17 policy interface) may tighten the shape once algorithm-specific metadata is known. |
 | **P3-13A-5-4** | Slice 13A 5th sub-slice; **DOWNGRADED** by Slice 13A 6th sub-slice finalizer | **DOWNGRADED → restated as P3-13A-6-3** | Dead-until-wired binding closure for the fifth-sub-slice `LegacyGateCompanionAdapter` + `derive_gate_companion`. The 6th-sub-slice implementer's CLOSURE claim was OVERSTATED — the composed `LegacyGateConsumerSnapshotAdapter` chain remains dead-until-wired because NEITHER underlying adapter has external production callers. The previous CLOSED claim is hereby DOWNGRADED; P3-13A-5-4 remains OPEN and is superseded / restated as P3-13A-6-3 NEW binding statement (see below). |
 | **P3-13A-6-1** | Slice 13A 6th sub-slice | **CARRIED** | The snapshot companion record's 2 NEW typed failure ids (`list_field_incomplete` + `classifier_rule_blocked`) register under the EXISTING `evidence_corruption` failure_class rather than a dedicated `snapshot` failure_class. Pragmatic compromise to honor the MUST-NOT-EDIT-SUPERVISOR-MODULES rule — a new `snapshot` failure_class would have required a coverage row in `supervisor/classifier_mapping.py` (READ-ONLY). A future Slice 13A sub-slice or maintenance pass MAY introduce a dedicated `snapshot` failure_class once the supervisor classifier mapping change-control window opens. |
 | **P3-13A-6-2** | Slice 13A 6th sub-slice | **CARRIED** | `LegacySnapshotCompanionAdapter` is a stateless wrapper that simply delegates to `derive_snapshot_companion`. Mirrors P3-13A-5-1 (the 5th-sub-slice `LegacyGateCompanionAdapter` stateless-wrapper carry). Kept for symmetry with the 4th + 5th sub-slices' opt-in port pattern. |
-| **P3-13A-6-3** | Slice 13A 6th sub-slice finalizer (reframed from reviewer P2-V-1) | **CARRIED — dead-until-wired binding statement** | See § "Dead-until-wired binding statement" below. |
+| **P3-13A-6-3** | Slice 13A 6th sub-slice finalizer (reframed from reviewer P2-V-1); authority sufficiency reopened by Slice 19A | **CARRIED — dashboard wrapper is display/advisory-only** | See § "Dead-until-wired binding statement" below and the Slice 19A source doc item `19A-P2-001`. |
 
 ## Dead-until-wired binding statement (P3-13A-6-3)
 
@@ -196,9 +197,11 @@ noted inline. The full ledger across the implementation lives in
 `src/iriai_build_v2/execution_control/snapshot_companion.py` (Slice
 13A 6th sub-slice) composes the 5th-sub-slice
 `LegacyGateCompanionAdapter` with the 6th-sub-slice
-`LegacySnapshotCompanionAdapter`. As of this acceptance artifact,
-NEITHER underlying adapter has external production callers; the
-composite chain is dead-until-wired.**
+`LegacySnapshotCompanionAdapter`. Slice 13An-2 later made that chain reachable
+from the dashboard display mirror, but Slice 19A reopened the old authority
+claim: the current dashboard wrapper remains display/advisory-only and is not
+an authoritative gate / verifier / classifier consumer with durable failure
+observation.**
 
 Composition of two dead adapters does NOT constitute production
 wiring (the 6th-sub-slice implementer's prior P3-13A-5-4 CLOSURE
@@ -206,27 +209,26 @@ claim was OVERSTATED; the reviewer's P2-V-1 correctly identified
 this; the 6th-sub-slice finalizer DOWNGRADED the claim and restated
 it as this binding statement).
 
-**Binding statement**: a future Slice 13A sub-slice (likely the LAST
-— 13An — which also covers doc-13a step 9 + the slice-end six-vector
-review) **OR** the Slice 17 policy interface per doc-13a:286-287
-**MUST** wire the `LegacyGateConsumerSnapshotAdapter` (or equivalent
-composite) into a real gate / verifier / classifier production
-consumer site **BEFORE** any Slice 14-19 governance slice can claim
-gate execution authority. The wiring closes:
+**Binding statement after Slice 19A**: a future source-of-truth slice must wire
+the `LegacyGateConsumerSnapshotAdapter` (or equivalent composite) into an
+actual authoritative consumer with durable failure observation before any Slice
+14-19 governance slice can claim gate execution authority. See the Slice 19A
+source doc for the active reassessment item. The future wiring is the authority
+precondition for:
 
 - The **doc-13a:18-23 + 111-115** invariant that gates may NOT
   approve from `preview_only` evidence.
 - The **doc-13a:280-282** invariant that classifier rules MUST fail
   closed when their required snapshot fields are incomplete.
 
-The wiring target is likely either the supervisor classifier consumer
-site (`src/iriai_build_v2/supervisor/classifier.py`) OR the dashboard
-snapshot consumer site (`src/iriai_build_v2/public_dashboard.py`).
+The future wiring target is likely either the supervisor classifier consumer
+site (`src/iriai_build_v2/supervisor/classifier.py`) OR an explicitly
+authoritative dashboard/snapshot consumer with durable observation.
 Per doc-13a:42-46 + 124-126 + `feedback_no_refactor`, the wiring
 **must land as a NEW external opt-in code path** (not an in-place
 edit of either accepted Slice 10 module).
 
-## Decision: CO-BUNDLE-VS-SPLIT for P3-13A-6-3 binding closure (this sub-slice)
+## Decision: Historical CO-BUNDLE-VS-SPLIT for P3-13A-6-3 (this sub-slice)
 
 **Outcome**: **DEFER to the LAST sub-slice (13An).**
 
@@ -254,13 +256,13 @@ sub-slice unchanged.
 
 | Test module | Test count | Sub-slice |
 |-------------|------------|-----------|
-| `tests/test_governance_completeness_scanner.py` | 18 | 1st |
+| `tests/test_governance_completeness_scanner.py` | 19 | 1st + 19A-3 |
 | `tests/test_execution_control_completeness.py` | 35 | 2nd |
 | `tests/test_execution_control_prompt_context_adapter.py` | 23 | 3rd |
-| `tests/test_execution_control_dispatcher_prompt_context.py` | 21 | 4th |
-| `tests/test_execution_control_gate_companion.py` | 44 | 5th |
+| `tests/test_execution_control_dispatcher_prompt_context.py` | 29 | 4th + 19A-1 |
+| `tests/test_execution_control_gate_companion.py` | 51 | 5th + 19A-1 |
 | `tests/test_execution_control_snapshot_companion.py` | 54 | 6th |
-| `tests/test_governance_13a_acceptance_artifact.py` | (this sub-slice) | 7th |
+| `tests/test_governance_13a_acceptance_artifact.py` | 52 | 7th + 19A-3 |
 
 All sub-slice tests run in well under one second; all are
 byte-identical to the post-implementer baselines per the gates in
@@ -278,32 +280,23 @@ Per doc-13a:42-46 + 124-126 + `feedback_no_refactor`:
   pure-data additions to the existing `failure_router.py`.
 - **NO** silent migration of in-flight features. The Slice 12d
   adoption marker remains the only path.
-- **NO** new authority introduced. The 13A surfaces are read-only
-  wrappers + opt-in ports + typed companion records; the 6th-sub-slice
-  composite chain remains dead-until-wired per P3-13A-6-3.
+- **NO** new authority introduced. The 13A surfaces are read-only wrappers +
+  opt-in ports + typed companion records; the current dashboard wrapper remains
+  display/advisory-only per Slice 19A `19A-P2-001`.
 
-## Pending after this sub-slice (LAST sub-slice 13An)
+## Historical pending plan after this sub-slice
 
-- **Doc-13a step 9** (doc-13a:285-287): "Update governance Slices
-  13-20 and context Slice 21 to depend on this shared completeness
-  model instead of redefining authority semantics locally."
-- **P3-13A-6-3 binding closure**: wire the composite adapter into a
-  real gate / verifier / classifier production consumer site
-  (external opt-in wrapper around `supervisor/classifier.py` OR
-  `public_dashboard.py`).
-- **Slice-end SIX-VECTOR review** (V1 doc-acceptance / V2 contract
-  integrity / V3 test honesty / V4 Slice 00-12 preservation / V5
-  fail-closed + deps / V6 Slice 13A invariant compliance) — fires at
-  the LAST sub-slice 13An.
+At the time this acceptance artifact was first written, the following work was
+pending for the LAST Slice 13A sub-slice (`13An`). The work did split as
+planned:
 
-**13An overloading risk acknowledged.** The LAST sub-slice as
-currently scoped bundles 3 workstreams (step 9 reconciliation across
-8-9 docs + P3-13A-6-3 wiring + slice-end SIX-VECTOR review). 13An
-MAY SPLIT into **13An-1** (step 9 reconciliation), **13An-2**
-(P3-13A-6-3 wiring + binding closure tests), and **13An-3** (slice-end
-six-vector review + finalizer) if scope inflates beyond a single
-coherent chunk. Mirrors the 12a-1 / 12a-2 / 12a-3 SPLIT precedent
-per `IMPLEMENTATION_PROMPT_GOVERNANCE.md:188-189`.
+- **13An-1** closed doc-13a step 9 by reconciling the governance and context
+  slice docs against the shared completeness model.
+- **13An-2** recorded the P3-13A-6-3 binding-closure implementation and tests.
+  Slice 19A later reopened the authority sufficiency of that closure as
+  `19A-P2-001`; that reassessment item is tracked in the Slice 19A source doc
+  and remains outside this historical Slice 13A artifact.
+- **13An-3** ran the Slice 13A slice-end six-vector review and finalizer.
 
-After 13An (or the 13An-1 / 13An-2 / 13An-3 SPLIT) closes, the
-governance loop advances to **Slice 14 — Commit And Line Provenance**.
+This section is retained as historical sequencing evidence rather than an
+active restart pointer. The active restart state is always `STATUS.md`.

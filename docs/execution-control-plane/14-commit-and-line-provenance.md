@@ -299,12 +299,12 @@ The doc's existing `completeness="paged"` + `GovernanceEvidencePageRef`
 wording at lines 200-203 already maps onto the shared model's
 `CompletenessState = Literal["complete", "paged", "preview_only",
 "unavailable"]` enum; this dependency reference makes that mapping
-explicit. Per **P3-13A-6-3 dead-until-wired binding statement** (see
-`13a-acceptance.md:193-227`), the composite adapter chain must be wired
-into a real gate / verifier / classifier production consumer site
-before line-provenance evidence is consumed as execution authority by
-this slice. The wiring is the **Slice 13A 8th sub-slice 13An-2**
-deliverable.
+explicit. Per P3-13A-6-3 and Slice 19A source-of-truth
+`19a-governance-implementation-reassessment.md` (`19A-P2-001`), the current
+dashboard wrapper is display/advisory-only and does not let line-provenance
+evidence become execution authority. Authority use must wait for a future
+source-of-truth slice that wires an actual authoritative consumer with durable
+failure observation.
 
 This dependency-reconciliation reference was added by
 **Slice 13A 8th sub-slice 13An-1** (this iteration) per

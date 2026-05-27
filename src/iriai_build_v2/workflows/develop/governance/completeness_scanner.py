@@ -8,9 +8,10 @@ deliverable per STATUS.md § "Next safe action" point 4:
 > (NEW module). The scanner detects:
 > (a) missing Slice 00-12 acceptance markers (cross-references
 > ``STATUS.md`` + the JSONL ``slice_end_finalizer_after`` rows);
-> (b) unresolved P1/P2 findings across the journal tail (greps
-> ``implementation-journal.md`` for the P1/P2 forms emitted by
-> reviewer subagents);
+> (b) unresolved P1/P2 findings across the journal tail and active
+> restart pointer (greps ``implementation-journal.md`` for the P1/P2
+> forms emitted by reviewer subagents and ``STATUS.md`` for active
+> reassessment finding ids);
 > (c) any ``governance_evidence_gap`` blocker present in a
 > :class:`~iriai_build_v2.workflows.develop.governance.models.GovernanceEvidenceSet`
 > consumed by a downstream slice (the 13A invariant guard).
@@ -164,6 +165,21 @@ only at the match-result level (criterion (e) per doc-13:253-254 only
 treats P1/P2 as blocking; P3 is maintainability/clarity per
 ``IMPLEMENTATION_PROMPT_GOVERNANCE.md:206-216`` and explicitly NOT
 blocking)."""
+
+
+_REASSESSMENT_FINDING_ID_RE: re.Pattern[str] = re.compile(
+    r"\b(?P<finding_id>(?P<slice_id>\d{1,3}[A-Z])-(?P<severity>P[123])-\d{3})\b"
+)
+"""Scanner-local regex for active reassessment ids such as
+``19A-P1-003``.
+
+The shared ``FINDING_ID_REGEX`` remains the single source of truth for
+canonical journal/decision-log ids shaped like ``P1-13a-1``. Slice 19A
+reopened governance acceptance with a source-doc-local id shape whose
+severity appears in the middle. The scanner consumes that shape only
+from ``STATUS.md`` so active reassessment blockers fail closed without
+re-admitting historical journal-tail false positives.
+"""
 
 
 # The 2 severity codes the scanner treats as blocking per
@@ -504,7 +520,11 @@ def _detect_missing_acceptance(
 # --- Unresolved-finding detection -----------------------------------------
 
 
-def _detect_unresolved_findings(*, journal_tail_text: str) -> list[str]:
+def _detect_unresolved_findings(
+    *,
+    journal_tail_text: str,
+    include_reassessment_ids: bool = False,
+) -> list[str]:
     """Detect P1 / P2 finding IDs lacking a status marker.
 
     Per doc-13:253-254 + the implementer prompt point 4 (b) the
@@ -520,6 +540,10 @@ def _detect_unresolved_findings(*, journal_tail_text: str) -> list[str]:
     doc-13:253-254 fail-closed posture (better to over-report
     unresolved findings than to silently drop a real blocker).
 
+    :param include_reassessment_ids: when true, also detect active
+        reassessment ids shaped like ``19A-P1-003``. This is used for
+        ``STATUS.md`` only; historical journal tails keep the original
+        canonical-id scan to avoid stale narrative false positives.
     :returns: sorted deduplicated list of P1/P2 finding IDs lacking a
         status marker. Empty when every P1/P2 finding has a status
         marker.
@@ -554,6 +578,13 @@ def _detect_unresolved_findings(*, journal_tail_text: str) -> list[str]:
                 # level.
                 continue
             unresolved.add(finding_id)
+
+        if include_reassessment_ids:
+            for match in _REASSESSMENT_FINDING_ID_RE.finditer(line):
+                severity = match.group("severity")
+                if severity not in _BLOCKING_SEVERITIES:
+                    continue
+                unresolved.add(match.group("finding_id"))
 
     return sorted(unresolved)
 
@@ -643,8 +674,9 @@ async def scan_governance_completeness(
 
     2. **Unresolved P1/P2 findings** -- greps the journal tail for
        the canonical ``P[12]-<scope>-<seq>`` finding-ID shape and
-       reports any finding ID lacking a CLOSED / RESOLVED / FIXED /
-       APPLIED status marker on the same line. Reported in
+       greps STATUS.md for active reassessment ids such as
+       ``19A-P1-003``. Any finding ID lacking a CLOSED / RESOLVED /
+       FIXED / APPLIED status marker on the same line is reported in
        :attr:`CompletenessScanReport.unresolved_findings`.
 
     3. **`governance_evidence_gap` blockers** -- inspects the
@@ -743,8 +775,14 @@ async def scan_governance_completeness(
         status_md_text=status_md_text,
         journal_tail_text=journal_tail_text,
     )
-    unresolved_findings = _detect_unresolved_findings(
-        journal_tail_text=journal_tail_text,
+    unresolved_findings = sorted(
+        set(_detect_unresolved_findings(journal_tail_text=journal_tail_text))
+        | set(
+            _detect_unresolved_findings(
+                journal_tail_text=status_md_text,
+                include_reassessment_ids=True,
+            )
+        )
     )
 
     # Evidence-set gap detection. The store.get(...) coroutine is

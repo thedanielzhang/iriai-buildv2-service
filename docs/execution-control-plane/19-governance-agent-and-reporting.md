@@ -3,8 +3,9 @@
 ## Objective
 
 Define the governance CLI/API, dashboard integration, Slack/report output, and
-agent-readable summaries. The main consumer is the workflow itself, so structured
-governance records are primary and prose reports are secondary.
+agent-readable summaries. Structured governance records are primary and prose
+reports are secondary; production workflow consumption remains gated by later
+accepted source-of-truth wiring.
 
 Governance reporting must be bounded, reproducible, evidence-cited, and
 compatible with the supervisor/dashboard read-only contract.
@@ -78,7 +79,7 @@ class GovernanceSnapshot(BaseModel):
     truncated: bool
     omitted_counts: dict[str, int]
     completeness: CompletenessState
-    page_refs: list[GovernanceEvidencePageRef]
+    page_refs: list[str]
     next_cursor: str | None = None
     top_findings: list[GovernanceFinding]
     recommendations: list[GovernancePolicyRecommendation]
@@ -87,6 +88,7 @@ class GovernanceSnapshot(BaseModel):
     blocked_by: list[str]
 
 class ContextLayerPackageSummary(BaseModel):
+    # Post-Slice-21 context package summary shape.
     package_id: str
     package_digest: str
     package_ref: GovernanceEvidenceRef
@@ -103,15 +105,14 @@ class ContextLayerPackageSummary(BaseModel):
 class GovernanceAgentContext(BaseModel):
     task_id: str | None
     repo_id: str | None
-    context_package: ContextLayerPackageSummary | None = None
     relevant_findings: list[GovernanceFinding]
     relevant_line_provenance: list[LineProvenanceResult]
     policy_guidance: list[GovernancePolicyRecommendation]
     policy_guidance_authority: Literal["advisory_only"] = "advisory_only"
-    omitted_detail_refs: list[GovernanceEvidencePageRef]
+    omitted_detail_refs: list[str]
     omitted_counts: dict[str, int]
     completeness: CompletenessState
-    page_refs: list[GovernanceEvidencePageRef]
+    page_refs: list[str]
     truncated: bool
     max_prompt_chars: int
 ```
@@ -126,9 +127,10 @@ Default response budgets:
   response must include `ContextLayerPackageSummary` so agents and gates can
   cite and stale-check the exact context package they consumed.
 - Reporting budgets are preview/display budgets. Any truncated snapshot or
-  agent context must include exact `GovernanceEvidencePageRef` rows plus
-  `completeness`; without those refs the response is display-only and cannot
-  feed acceptance, recommendations, policy guidance, or task-execute context.
+  agent context must include completeness plus exact page-ref metadata or
+  page-ref ids traceable to exact `GovernanceEvidencePageRef` rows; without
+  those refs the response is display-only and cannot feed acceptance,
+  recommendations, policy guidance, or future production task-execute context.
 - Dashboard detail panes fetch bounded slices by evidence ref and never expand
   full artifact bodies by default.
 
@@ -140,8 +142,10 @@ Reporting surfaces:
 - Slack digest with dedupe key from `snapshot_digest`, not only corpus id or top
   ids, so material changes in evidence quality, replay confidence, omitted
   detail counts, or implementation-deviation summaries are not suppressed.
-- Agent context endpoint that returns compact governance context for a task,
-  repo, file, or line range. After Slice 21, this endpoint is backed by the
+- Agent context builder/API surface that returns compact display/advisory
+  governance context for a task, repo, file, or line range. Production
+  task-execute consumption is deferred until a later accepted source-of-truth
+  slice wires an actual consumer. After Slice 21, this surface is backed by the
   IriAI Context Layer package API rather than independently assembling
   provider-specific context.
 
@@ -158,6 +162,8 @@ Reporting surfaces:
    task contract, repo, path, or line range. After Slice 21, this builder must
    call the Context Layer package API and return `ContextLayerPackageSummary`
    rather than assembling uncited provider context locally.
+   The Slice 19 builder is reusable display/advisory projection only; it is not
+   production task-execute wiring.
 6. Add report artifacts such as `review:governance-report:{corpus_id}` with
    bounded summary only.
 7. Keep governance agent/tooling read-only. If future self-healing is added, it
@@ -224,7 +230,9 @@ Reporting surfaces:
 - Reports are bounded, reproducible, evidence-cited, and structured first.
 - Truncated or preview reports are never authoritative unless exact page refs
   and completeness metadata cover the consumer's required scope.
-- Workflow agents can receive compact governance context at task execute time.
+- Slice 19 provides a reusable display/advisory builder for compact governance
+  context; production task-execute consumption is deferred to a later accepted
+  source-of-truth slice.
 - After Slice 21, every context response that uses line/context-layer provenance
   carries a citeable context package id and digest.
 - Workflow agents receive governance policy guidance only as advisory context;
@@ -290,9 +298,10 @@ public method call:
   `EvidencePageRef` shape + `EvidenceCompleteness` record) into every
   reporting surface. The exact-vs-preview distinction per doc-13a:128-131
   is preserved structurally: every truncated snapshot or agent context
-  carries exact `GovernanceEvidencePageRef` rows and `completeness`;
-  without those refs the response is display-only and cannot feed
-  acceptance / recommendations / policy guidance / task-execute context.
+  carries completeness plus exact page-ref metadata or page-ref ids traceable
+  to exact `GovernanceEvidencePageRef` rows; without those refs the response
+  is display-only and cannot feed acceptance / recommendations / policy
+  guidance / future production task-execute context.
 - The governance agent + reporting layer's typed CLI (8th sub-slice per
   doc-19:59-66 + step 1 line 150 + doc-19:198 test contract) emits stable
   JSON first and prose second, returns nonzero exit codes for blocked
@@ -382,9 +391,10 @@ model instead of redefining authority semantics locally."* — this
 slice's reporting surfaces (`GovernanceSnapshot`,
 `ContextLayerPackageSummary`, `GovernanceAgentContext` — all defined
 at lines 71-117) depend on the Slice 13A shared completeness model.
-Each shape carries a `completeness: CompletenessState` field and a
-`page_refs: list[GovernanceEvidencePageRef]` field that map onto the
-shared `CompletenessState` enum + `EvidencePageRef` shape.
+Current Slice 19 snapshot and agent-context shapes carry a
+`completeness: CompletenessState` field and `page_refs: list[str]` page-ref ids
+that map onto exact `GovernanceEvidencePageRef` rows. The post-Slice-21
+`ContextLayerPackageSummary` shape carries typed page-ref metadata directly.
 
 Source-of-truth modules:
 
@@ -397,12 +407,12 @@ Source-of-truth modules:
   carries the per-list-field completeness that dashboard truncation
   metadata reports. The doc's existing rule (lines 128-131:
   *"Reporting budgets are preview/display budgets. Any truncated
-  snapshot or agent context must include exact `GovernanceEvidencePageRef`
-  rows plus `completeness`; without those refs the response is
-  display-only and cannot feed acceptance, recommendations, policy
-  guidance, or task-execute context."*) is exactly the shared
-  preview-vs-exact distinction enforced by the Slice 13A 6th
-  sub-slice's snapshot companion record.
+  snapshot or agent context must include completeness plus exact page-ref
+  metadata or page-ref ids traceable to exact `GovernanceEvidencePageRef`
+  rows; without those refs the response is display-only and cannot feed
+  acceptance, recommendations, policy guidance, or future production
+  task-execute context."*) is exactly the shared preview-vs-exact distinction
+  enforced by the Slice 13A 6th sub-slice's snapshot companion record.
 - `src/iriai_build_v2/execution_control/dispatcher_prompt_context.py`
   (Slice 13A 4th sub-slice) — `AuthoritativePromptContextRouting` is
   the source-of-truth shape for the `GovernanceAgentContext`
@@ -423,12 +433,13 @@ dependency reference makes the source-of-truth pointer explicit and
 aligns the reporting-surface shapes with the typed contract enforced
 by the Slice 13A 4th-6th sub-slices.
 
-Per **P3-13A-6-3 dead-until-wired binding statement** (see
-`13a-acceptance.md:193-227`), the composite adapter chain must be
-wired into a real consumer site before reporting surfaces consume 13A
-typed completeness as execution authority for the
-`task-execute-agent-context` channel. The wiring is the **Slice 13A
-8th sub-slice 13An-2** deliverable.
+Per P3-13A-6-3 and Slice 19A source-of-truth
+`19a-governance-implementation-reassessment.md` (`19A-P2-001`), the current
+dashboard wrapper is display/advisory-only and does not let reporting surfaces
+consume 13A typed completeness as execution authority for the
+`task-execute-agent-context` channel. Authority use must wait for a future
+source-of-truth slice that wires an actual authoritative consumer with durable
+failure observation.
 
 This dependency-reconciliation reference was added by
 **Slice 13A 8th sub-slice 13An-1** (this iteration) per

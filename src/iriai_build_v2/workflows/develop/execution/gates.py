@@ -354,6 +354,18 @@ class ContextPackage(_GateModel):
     selected_refs: list[EvidenceRef] = Field(default_factory=list)
     failure: GateFailure | None = None
     payloads: list[dict[str, JsonValue]] = Field(default_factory=list)
+    package_id: str | None = None
+    package_digest: str | None = None
+    package_ref: str | None = None
+    package_kind: str | None = None
+    completeness: str | None = None
+    feature_id: str | None = None
+    task_id: str | None = None
+    source_dag_artifact_id: int | str | None = None
+    dag_sha256: str | None = None
+    evidence_snapshot_digest: str | None = None
+    provider_state_digest: str | None = None
+    advisory_only: bool | None = None
 
 
 class ContextBudget(_GateModel):
@@ -798,12 +810,26 @@ class GateRunner:
                         context_package.failure.message if context_package.failure else "bounded context package failed",
                         details=context_package.failure.details if context_package.failure else {},
                     )
+                self._validate_context_package_identity(
+                    request,
+                    contracts,
+                    task_attempts,
+                    context_package,
+                )
+                context_identity = _context_package_identity_payload(context_package)
                 self._write_approved_node(
                     request,
                     "bounded_context_package",
-                    {"package_hash": context_package.package_hash, "read_budget": _dump(context_package.read_budget)},
+                    {
+                        "package_hash": context_package.package_hash,
+                        "read_budget": _dump(context_package.read_budget),
+                        **context_identity,
+                    },
                     input_refs=context_package.selected_refs,
-                    metadata={"package_hash": context_package.package_hash},
+                    metadata={
+                        "package_hash": context_package.package_hash,
+                        **context_identity,
+                    },
                 )
             return GateRunResult(
                 approved=True,
@@ -852,6 +878,117 @@ class GateRunner:
             input_refs=input_refs,
             metadata=metadata,
         )
+
+    def _validate_context_package_identity(
+        self,
+        request: GateRequest,
+        contracts: Sequence[GateContractSnapshot],
+        task_attempts: Sequence[GateTaskAttempt],
+        context_package: ContextPackage,
+    ) -> None:
+        identity = _context_package_identity_payload(context_package)
+        if not identity:
+            return
+
+        missing = [
+            field
+            for field in (
+                "package_id",
+                "package_digest",
+                "completeness",
+                "feature_id",
+                "task_id",
+                "source_dag_artifact_id",
+                "dag_sha256",
+                "evidence_snapshot_digest",
+                "provider_state_digest",
+            )
+            if field not in identity
+        ]
+        mismatches: list[dict[str, JsonValue]] = []
+
+        def _check(field: str, expected: Any) -> None:
+            if expected is None or expected == "":
+                return
+            actual = identity.get(field)
+            if actual is None or str(actual) != str(expected):
+                mismatches.append(
+                    {
+                        "field": field,
+                        "expected": str(expected),
+                        "actual": "" if actual is None else str(actual),
+                    }
+                )
+
+        _check("feature_id", request.feature_id)
+        _check("dag_sha256", request.dag_sha256)
+        completeness = str(identity.get("completeness") or "")
+        if completeness not in {"complete", "paged"}:
+            mismatches.append(
+                {
+                    "field": "completeness",
+                    "expected": "complete,paged",
+                    "actual": completeness,
+                }
+            )
+        task_ids = {attempt.task_id for attempt in task_attempts if attempt.task_id}
+        if task_ids and str(identity.get("task_id") or "") not in task_ids:
+            mismatches.append(
+                {
+                    "field": "task_id",
+                    "expected": ",".join(sorted(task_ids)),
+                    "actual": str(identity.get("task_id") or ""),
+                }
+            )
+
+        _check(
+            "source_dag_artifact_id",
+            _expected_context_package_field(
+                request,
+                contracts,
+                "source_dag_artifact_id",
+            ),
+        )
+        _check(
+            "evidence_snapshot_digest",
+            _expected_context_package_field(
+                request,
+                contracts,
+                "evidence_snapshot_digest",
+                "typed_evidence_snapshot_digest",
+            ),
+        )
+        _check(
+            "provider_state_digest",
+            _expected_context_package_field(
+                request,
+                contracts,
+                "provider_state_digest",
+            ),
+        )
+        advisory_only = identity.get("advisory_only")
+        if advisory_only is not True:
+            mismatches.append(
+                {
+                    "field": "advisory_only",
+                    "expected": "true",
+                    "actual": str(advisory_only).lower(),
+                }
+            )
+
+        if missing or mismatches:
+            raise GateValidationError(
+                "context_package.stale",
+                "stale_projection",
+                "verifier_context_stale",
+                "context package identity is stale for the gate request lineage",
+                details={
+                    "missing_fields": missing,
+                    "mismatches": mismatches,
+                    "package_id": str(identity.get("package_id") or ""),
+                    "package_digest": str(identity.get("package_digest") or ""),
+                },
+            )
 
     def _validate_workspace_snapshots(
         self,
@@ -1229,6 +1366,63 @@ def _line_count(record: Any) -> int:
     return max(1, len(_record_text(record).splitlines()))
 
 
+_CONTEXT_PACKAGE_IDENTITY_FIELDS = (
+    "package_id",
+    "package_digest",
+    "package_ref",
+    "package_kind",
+    "completeness",
+    "feature_id",
+    "task_id",
+    "source_dag_artifact_id",
+    "dag_sha256",
+    "evidence_snapshot_digest",
+    "provider_state_digest",
+    "advisory_only",
+)
+
+
+def _context_package_identity_payload(package: ContextPackage) -> dict[str, JsonValue]:
+    payload: dict[str, JsonValue] = {}
+    for field in _CONTEXT_PACKAGE_IDENTITY_FIELDS:
+        value = _attr(package, field, None)
+        if value is None or value == "":
+            continue
+        if field == "advisory_only":
+            payload[field] = _context_package_advisory_only_value(value)
+        elif field == "source_dag_artifact_id":
+            payload[field] = int(value) if str(value).isdigit() else str(value)
+        else:
+            payload[field] = str(value)
+    return payload
+
+
+def _context_package_advisory_only_value(value: Any) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes"}
+    return bool(value)
+
+
+def _expected_context_package_field(
+    request: GateRequest,
+    contracts: Sequence[GateContractSnapshot],
+    *field_names: str,
+) -> Any:
+    for field_name in field_names:
+        value = _attr(request, field_name, None)
+        if value is not None and value != "":
+            return value
+    for field_name in field_names:
+        values = {
+            _attr(contract, field_name, None)
+            for contract in contracts
+            if _attr(contract, field_name, None) not in (None, "")
+        }
+        if len(values) == 1:
+            return next(iter(values))
+    return None
+
+
 def _node_name_for_local_code(local_code: str) -> str:
     return {
         "workspace_snapshot.stale": "workspace_snapshot_freshness",
@@ -1237,6 +1431,7 @@ def _node_name_for_local_code(local_code: str) -> str:
         "path_scope.invalid": "path_scope_and_projection",
         "patch_integrity.invalid": "patch_integrity",
         "context_package.insufficient": "bounded_context_package",
+        "context_package.stale": "bounded_context_package",
         "gate_request.invalid": "gate_request",
     }.get(local_code, local_code.replace(".", "_"))
 

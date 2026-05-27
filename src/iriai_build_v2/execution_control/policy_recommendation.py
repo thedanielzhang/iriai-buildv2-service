@@ -119,13 +119,15 @@ local ``CompletenessState`` / ``EvidenceCompleteness`` /
 ``AuthoritativeSnapshotListFieldCompleteness`` /
 ``AuthoritativeSnapshotClassifierRouting`` redefinition.
 
-Per doc-17:283-289 the **P3-13A-6-3 dead-until-wired binding
-statement** is CLOSED (per the Slice 13A 8th sub-slice 13An-2
-finalizer landing at ``dashboard.py:1568``); policy recommendations
-that would activate runtime behavior may now treat the Slice 13A
-typed completeness shapes as execution authority; this first
-sub-slice exposes the typed surface but the wiring + validation rules
-land in subsequent sub-slices per doc-17:165-179.
+Per Slice 19A source-of-truth
+``docs/execution-control-plane/19a-governance-implementation-reassessment.md``
+(``19A-P2-001``), the dashboard wrapper at ``dashboard.py:1563`` is
+display/advisory-only and does not close P3-13A-6-3 for authority purposes.
+Policy recommendations that would activate runtime behavior must not treat the
+Slice 13A typed completeness shapes as execution authority until a future
+source-of-truth slice wires an actual authoritative consumer with durable
+failure observation. This first sub-slice exposes the typed surface but the
+wiring + validation rules land in subsequent sub-slices per doc-17:165-179.
 
 **By-name reference contracts.** Per doc-17:80-81 the
 :attr:`GovernancePolicyRecommendation.source_finding_ids` +

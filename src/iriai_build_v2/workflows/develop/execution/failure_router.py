@@ -903,7 +903,7 @@ FailureType: TypeAlias = Literal[
     # Slice 17 + Slice 18 + Slice 19 2nd + 3rd non-blocking
     # observer.
     "governance_slack_renderer_failed",
-    # Slice 19 fifth sub-slice -- doc-19:157-160 + doc-19:124-127 +
+    # Slice 19 fifth sub-slice -- doc-19 step 5 + doc-19:124-127 +
     # doc-19:144-146 + doc-19:184-194 + doc-14:242-243.
     # `governance_agent_context_builder_failed` is the typed governance
     # failure id under the EXISTING `evidence_corruption`
@@ -1301,7 +1301,7 @@ FAILURE_TYPES: tuple[str, ...] = (
     # Slice 18 2nd + 3rd + 4th + 5th + 6th + 7th + Slice 19 2nd + 3rd
     # sub-slice failure-id patterns).
     "governance_slack_renderer_failed",
-    # Slice 19 fifth sub-slice -- doc-19:157-160 + doc-19:124-127 +
+    # Slice 19 fifth sub-slice -- doc-19 step 5 + doc-19:124-127 +
     # doc-19:144-146 + doc-19:184-194 + doc-14:242-243. See FailureType
     # Literal above for the per-id citation + the REUSED NON-BLOCKING
     # `retry_governance_projection` routing rationale (REUSES the
@@ -1982,7 +1982,7 @@ _RETRYABLE_FAILURE_TYPES = frozenset(
         # without raising. NOT in `_DETERMINISTIC_FAILURE_TYPES`
         # because the symptom is observer-transient.
         "governance_slack_renderer_failed",
-        # Slice 19 fifth sub-slice -- doc-19:157-160 + doc-19:124-127 +
+        # Slice 19 fifth sub-slice -- doc-19 step 5 + doc-19:124-127 +
         # doc-19:144-146 + doc-19:184-194 + doc-14:242-243. Retryable
         # per the Slice 14 + Slice 15 + Slice 16 + Slice 17 + Slice 18
         # + Slice 19 2nd + 3rd + 4th sub-slice precedent (REUSES the
@@ -3722,8 +3722,8 @@ _ROUTE_ROWS = (
         "retry_governance_projection",
         "governance Slack renderer failed (Slice 19 4th: post-checkpoint observer; non-blocking per doc-19:155 + doc-19:140-142 + doc-19:122-123 + doc-19:184-194 + doc-19:191-192 + doc-14:242-243)",
     ),
-    # Slice 19 fifth sub-slice -- doc-19:157-160 + doc-19:124-127 +
-    # doc-19:144-146 + doc-19:184-194 + doc-14:242-243. Per doc-19:157-160
+    # Slice 19 fifth sub-slice -- doc-19 step 5 + doc-19:124-127 +
+    # doc-19:144-146 + doc-19:184-194 + doc-14:242-243. Per doc-19 step 5
     # § Refactoring Steps step 5 the GovernanceAgentContextBuilder
     # consumes the typed Slice 19 2nd sub-slice SnapshotAPIResult +
     # emits a typed GovernanceAgentContext (the Slice 19 1st sub-slice
@@ -3759,7 +3759,7 @@ _ROUTE_ROWS = (
         "evidence_corruption",
         "governance_agent_context_builder_failed",
         "retry_governance_projection",
-        "governance agent-context builder failed (Slice 19 5th: post-checkpoint observer; non-blocking per doc-19:157-160 + doc-19:124-127 + doc-19:144-146 + doc-19:184-194 + doc-14:242-243)",
+        "governance agent-context builder failed (Slice 19 5th: post-checkpoint observer; non-blocking per doc-19 step 5 + doc-19:124-127 + doc-19:144-146 + doc-19:184-194 + doc-14:242-243)",
     ),
     # Slice 19 sixth sub-slice -- doc-19:161-162 + doc-19:166-167 +
     # doc-19:184-194 + doc-14:242-243. Per doc-19:161-162 § Refactoring
@@ -4022,19 +4022,9 @@ class FailureRouter:
             action not in ("quiesce", "operator_required", "retry_governance_projection")
             and budget_remaining <= 0
         ):
-            # Slice 14 second sub-slice -- doc-14:242-243 NON-BLOCKING
-            # exception: `retry_governance_projection` MUST NOT fall back
-            # to `quiesce` when budget is exhausted -- per doc-14:242-243
-            # "Governance provenance projection failures never block
-            # `dag-group:*` checkpointing, merge queue integration, or
-            # resume". Budget-exhausted governance projection routes
-            # stay on the `retry_governance_projection` action with
-            # `budget_exhausted=True`; the caller (a post-checkpoint
-            # governance job) inspects the budget flag and either
-            # gracefully gives up the projection retry attempt (logging
-            # the typed `CommitProvenanceGapFinding`) or schedules a
-            # later retry. The executor / checkpoint / merge-queue /
-            # resume code paths NEVER see a `quiesce` from this route.
+            # Ordinary exhausted retry/repair routes quiesce. Governance
+            # projection retries are excluded here and handled below because
+            # they are post-checkpoint observers.
             action = "quiesce"
             budget_exhausted = True
             reason = f"retry budget exhausted for {route.failure_class}/{route.failure_type}"
@@ -4222,6 +4212,102 @@ class FailureRouter:
                 payload,
                 "source_queue_item_status",
                 "queue_item_status",
+            ),
+            "source_feature_id": _payload_value(
+                payload,
+                "source_feature_id",
+                "failed_source_feature_id",
+                "source_queue_item_feature_id",
+            ),
+            "replacement_feature_id": _payload_value(
+                payload,
+                "replacement_feature_id",
+                "replacement_queue_item_feature_id",
+            ),
+            "source_dag_sha256": _payload_value(
+                payload,
+                "source_dag_sha256",
+                "failed_source_dag_sha256",
+                "source_queue_item_dag_sha256",
+            ),
+            "replacement_dag_sha256": _payload_value(
+                payload,
+                "replacement_dag_sha256",
+                "replacement_queue_item_dag_sha256",
+            ),
+            "source_group_idx": _payload_value(
+                payload,
+                "source_group_idx",
+                "failed_source_group_idx",
+                "source_queue_item_group_idx",
+            ),
+            "replacement_group_idx": _payload_value(
+                payload,
+                "replacement_group_idx",
+                "replacement_queue_item_group_idx",
+            ),
+            "source_task_ids": _str_list(
+                _payload_value(
+                    payload,
+                    "source_task_ids",
+                    "failed_source_task_ids",
+                    "source_task_id",
+                )
+            ),
+            "replacement_task_ids": _str_list(
+                _payload_value(
+                    payload,
+                    "replacement_task_ids",
+                    "replacement_queue_item_task_ids",
+                    "replacement_task_id",
+                )
+            ),
+            "source_contract_ids": _int_list(
+                _payload_value(
+                    payload,
+                    "source_contract_ids",
+                    "failed_source_contract_ids",
+                    "source_queue_item_contract_ids",
+                )
+            ),
+            "replacement_contract_ids": _int_list(
+                _payload_value(
+                    payload,
+                    "replacement_contract_ids",
+                    "replacement_queue_item_contract_ids",
+                )
+            ),
+            "source_gate_ids": _str_list(
+                _payload_value(
+                    payload,
+                    "source_gate_ids",
+                    "failed_source_gate_ids",
+                    "source_queue_item_gate_ids",
+                )
+            ),
+            "replacement_gate_ids": _str_list(
+                _payload_value(
+                    payload,
+                    "replacement_gate_ids",
+                    "replacement_queue_item_gate_ids",
+                )
+            ),
+            "source_queue_lane": _payload_value(
+                payload,
+                "source_queue_lane",
+                "failed_source_queue_lane",
+                "queue_lane",
+            ),
+            "replacement_queue_lane": _payload_value(payload, "replacement_queue_lane"),
+            "source_route_decision_evidence_ids": _int_list(
+                _payload_value(
+                    payload,
+                    "source_route_decision_evidence_ids",
+                    "failed_source_route_decision_evidence_ids",
+                )
+            ),
+            "replacement_route_decision_evidence_ids": _int_list(
+                _payload_value(payload, "replacement_route_decision_evidence_ids")
             ),
             "sandbox_lease_id": _payload_value(
                 payload,

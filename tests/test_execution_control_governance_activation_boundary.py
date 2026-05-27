@@ -52,6 +52,15 @@ verbatim):
     sub-slice retry_governance_projection NON-blocking RouteAction.
     (doc-14:242-243)
 
+Doc-20 governance acceptance/adoption boundary PIN cite:
+
+    Verify every recommendation is advisory unless a later policy
+    activation feature explicitly owns mutation. Enable governance for
+    new-feature analysis, dashboard, supervisor digest, and CLI
+    reporting together only after the acceptance record passes. Task-
+    execute agent context remains disabled until Slice 21 lands.
+    (doc-20 Refactoring Steps 6-9 + Acceptance Criteria)
+
 The 6 prior Slice 17 sub-slice modules (1st-6th) ALL honor the
 activation-out-of-governance-v1 invariant individually via per-
 module boundary tests inside their own test files (e.g.
@@ -64,9 +73,10 @@ module boundary tests inside their own test files (e.g.
 This 7th sub-slice's ADDED VALUE is the **cross-cutting + forward-
 applying** boundary test surface:
 
-1. The boundary is enforced for ALL 22 governance modules (the 6
+1. The boundary is enforced for ALL 23 governance modules (the 6
    Slice 17 sub-slice modules + the 16 prior Slice 13/13A/14/15/16
-   governance modules) in a single parametrized fixture surface.
+   governance modules + the Slice 20 acceptance/adoption module) in a
+   single parametrized fixture surface.
 2. The boundary is **forward-applicable** (forward-applying):
    future governance modules MUST be added to the
    GOVERNANCE_MODULES list so the boundary is structurally
@@ -149,6 +159,8 @@ GOVERNANCE_MODULES: tuple[str, ...] = (
     "iriai_build_v2.execution_control.decision_record_writer",
     "iriai_build_v2.execution_control.replay_requirement_hook",
     "iriai_build_v2.execution_control.consumer_read_api",
+    # Slice 20 -- governance acceptance/adoption boundary.
+    "iriai_build_v2.execution_control.governance_acceptance",
     # Slice 16 sub-slices -- finding engine + taxonomy.
     "iriai_build_v2.execution_control.finding_engine",
     "iriai_build_v2.execution_control.finding_rule_engine",
@@ -175,7 +187,7 @@ GOVERNANCE_MODULES: tuple[str, ...] = (
     "iriai_build_v2.execution_control.gate_companion",
     "iriai_build_v2.execution_control.snapshot_companion",
 )
-"""The cross-cutting governance module list (22 modules; forward-
+"""The cross-cutting governance module list (23 modules; forward-
 applicable). Future governance modules MUST be appended to this list
 (future governance modules MUST be appended) so the activation-out-
 of-governance-v1 discipline is structurally enforced at test time.
@@ -185,9 +197,11 @@ Per doc-17:178-179 step 7 VERBATIM:
     Keep activation out of governance v1 unless a later self-healing
     feature explicitly owns activation with tests.
 
-The 22 modules cover:
+The 23 modules cover:
 - Slice 17 1st-6th sub-slices (6 modules; policy recommendation
   interface).
+- Slice 20 acceptance/adoption (1 module; all-at-once governance
+  acceptance gate + read-only adoption record).
 - Slice 16 5 sub-slices (5 modules; finding engine + taxonomy).
 - Slice 15 3 sub-slices (3 modules; governance metrics + scoring).
 - Slice 14 4 sub-slices (4 modules; commit / line provenance).
@@ -198,7 +212,7 @@ Forward-applicability sentinel: the test
 `test_governance_modules_list_is_non_empty_and_stable` enforces
 the list's non-empty + stable-shape contract; the test
 `test_governance_modules_list_covers_all_known_governance_modules`
-enforces the list's coverage of all 22 known governance modules.
+enforces the list's coverage of all 23 known governance modules.
 """
 
 
@@ -393,7 +407,7 @@ def _public_class_methods(module_name: str) -> dict[str, list[str]]:
 
 def test_governance_modules_list_is_non_empty_and_stable() -> None:
     """Sentinel: the GOVERNANCE_MODULES list MUST be non-empty +
-    have stable composition (≥22 modules; never shrinks).
+    have stable composition (≥23 modules; never shrinks).
 
     Per doc-17:178-179 step 7 + forward-applicability, future
     governance modules MUST be appended to this list; the list
@@ -403,10 +417,11 @@ def test_governance_modules_list_is_non_empty_and_stable() -> None:
     """
 
     assert isinstance(GOVERNANCE_MODULES, tuple)
-    assert len(GOVERNANCE_MODULES) >= 22, (
+    assert len(GOVERNANCE_MODULES) >= 23, (
         f"GOVERNANCE_MODULES is suspiciously small: "
-        f"{len(GOVERNANCE_MODULES)} (expected >=22 covering Slice "
-        f"17 1st-6th + Slice 13/13A/14/15/16 governance modules)"
+        f"{len(GOVERNANCE_MODULES)} (expected >=23 covering Slice "
+        f"17 1st-6th + Slice 13/13A/14/15/16 governance modules "
+        f"+ Slice 20 governance acceptance)"
     )
     # Stable composition: no duplicates.
     assert len(set(GOVERNANCE_MODULES)) == len(GOVERNANCE_MODULES), (
@@ -505,6 +520,27 @@ def test_governance_modules_list_covers_all_slice_13a_sub_slices() -> None:
     missing = slice_13a_modules - governance_set
     assert missing == set(), (
         f"Slice 13A sub-slice modules missing from GOVERNANCE_MODULES: "
+        f"{sorted(missing)}"
+    )
+
+
+def test_governance_modules_list_covers_slice_20_acceptance_module() -> None:
+    """The Slice 20 governance acceptance/adoption module MUST be covered.
+
+    Per doc-20 Refactoring Steps 6-9 and Acceptance Criteria, governance
+    acceptance/adoption remains advisory/read-only, enables analytical surfaces
+    only after acceptance, and keeps task-execute context disabled until Slice
+    21. The structural activation boundary must therefore cover the new Slice 20
+    module.
+    """
+
+    slice_20_modules = {
+        "iriai_build_v2.execution_control.governance_acceptance",
+    }
+    governance_set = set(GOVERNANCE_MODULES)
+    missing = slice_20_modules - governance_set
+    assert missing == set(), (
+        f"Slice 20 governance acceptance module missing from GOVERNANCE_MODULES: "
         f"{sorted(missing)}"
     )
 
@@ -792,6 +828,7 @@ def test_module_docstring_carries_doc_17_178_179_pin_cite() -> None:
         "(doc-17:170-171)",
         "(doc-13a:42-46 + 124-126)",
         "(doc-14:242-243)",
+        "(doc-20 Refactoring Steps 6-9 + Acceptance Criteria)",
     )
     for cite in expected_cites:
         assert cite in docstring, (

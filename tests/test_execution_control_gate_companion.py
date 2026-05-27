@@ -70,6 +70,7 @@ from pydantic import ValidationError
 
 from iriai_build_v2.execution_control.completeness import (
     AuthoritativeContextRef,
+    CompletenessState,
     EvidenceCompleteness,
     EvidencePageRef,
     compute_completeness_digest,
@@ -183,6 +184,56 @@ def _bundle(
     return derive_authoritative_prompt_context_bundle(legacy, **base)
 
 
+def _bundle_for_gate(
+    gate_scope_ids: str | list[str],
+    legacy_bundle: PromptContextBundle | None = None,
+    **derive_kwargs: Any,
+) -> AuthoritativePromptContextBundle:
+    """Return a complete bundle whose upstream evidence covers gate scopes."""
+
+    bundle = _bundle(legacy_bundle, **derive_kwargs)
+    scopes = (
+        [gate_scope_ids]
+        if isinstance(gate_scope_ids, str)
+        else list(gate_scope_ids)
+    )
+    complete_for = list(
+        dict.fromkeys([*bundle.completeness.complete_for, *scopes])
+    )
+    completeness_digest = compute_completeness_digest(
+        state=bundle.completeness.state,
+        authority=bundle.completeness.authority,
+        complete_for=complete_for,
+        missing_required_refs=list(bundle.completeness.missing_required_refs),
+        page_refs=list(bundle.completeness.page_refs),
+        preview_ref=bundle.completeness.preview_ref,
+        unavailable_reason=bundle.completeness.unavailable_reason,
+    )
+    completeness = bundle.completeness.model_copy(
+        update={
+            "complete_for": complete_for,
+            "completeness_digest": completeness_digest,
+        }
+    )
+    required_complete_for = list(
+        dict.fromkeys(
+            [*bundle.context_manifest_ref.required_complete_for, *scopes]
+        )
+    )
+    context_manifest_ref = bundle.context_manifest_ref.model_copy(
+        update={
+            "required_complete_for": required_complete_for,
+            "completeness_digest": completeness_digest,
+        }
+    )
+    return bundle.model_copy(
+        update={
+            "completeness": completeness,
+            "context_manifest_ref": context_manifest_ref,
+        }
+    )
+
+
 def _page_ref(**overrides: Any) -> EvidencePageRef:
     """Construct a fully-populated :class:`EvidencePageRef`."""
 
@@ -199,6 +250,58 @@ def _page_ref(**overrides: Any) -> EvidencePageRef:
     )
     base.update(overrides)
     return EvidencePageRef(**base)
+
+
+def _bundle_with_completeness(
+    *,
+    state: CompletenessState,
+    complete_for: list[str],
+    page_refs: list[EvidencePageRef] | None = None,
+    missing_required_refs: list[EvidencePageRef] | None = None,
+    required_complete_for: list[str] | None = None,
+    unavailable_reason: str | None = None,
+) -> AuthoritativePromptContextBundle:
+    """Return a bundle with an explicit completeness/context-ref pair."""
+
+    base_bundle = _bundle(
+        _legacy_bundle(
+            truncation_notes=(["paged gate evidence"] if state == "paged" else [])
+        )
+    )
+    resolved_page_refs = list(page_refs or [])
+    resolved_missing_refs = list(missing_required_refs or [])
+    completeness_digest = compute_completeness_digest(
+        state=state,
+        authority="execution_authority",
+        complete_for=list(complete_for),
+        missing_required_refs=resolved_missing_refs,
+        page_refs=resolved_page_refs,
+        preview_ref=None,
+        unavailable_reason=unavailable_reason,
+    )
+    completeness = EvidenceCompleteness(
+        state=state,
+        authority="execution_authority",
+        complete_for=list(complete_for),
+        missing_required_refs=resolved_missing_refs,
+        page_refs=resolved_page_refs,
+        preview_ref=None,
+        unavailable_reason=unavailable_reason,
+        completeness_digest=completeness_digest,
+    )
+    context_ref = AuthoritativeContextRef(
+        manifest_id=base_bundle.context_manifest_ref.manifest_id,
+        manifest_digest=base_bundle.context_manifest_ref.manifest_digest,
+        completeness_digest=completeness_digest,
+        required_complete_for=list(required_complete_for or complete_for),
+        authority="execution_authority",
+    )
+    return base_bundle.model_copy(
+        update={
+            "completeness": completeness,
+            "context_manifest_ref": context_ref,
+        }
+    )
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -219,7 +322,7 @@ def test_derive_gate_companion_from_complete_bundle() -> None:
     the companion record carries complete or paged evidence.
     """
 
-    bundle = _bundle()
+    bundle = _bundle_for_gate("gate:atomic_landing")
     record = derive_gate_companion(
         bundle,
         gate_scope_id="gate:atomic_landing",
@@ -247,7 +350,7 @@ def test_derive_gate_companion_completeness_scoped_to_gate() -> None:
     the completeness covers the gate scope id only.
     """
 
-    bundle = _bundle()
+    bundle = _bundle_for_gate("gate:code_review:g3")
     record = derive_gate_companion(
         bundle,
         gate_scope_id="gate:code_review:g3",
@@ -265,7 +368,7 @@ def test_derive_gate_companion_authority_is_gate_authority() -> None:
     control authority taxonomy carries the gate-specific value).
     """
 
-    bundle = _bundle()
+    bundle = _bundle_for_gate("gate:scope")
     record = derive_gate_companion(
         bundle,
         gate_scope_id="gate:scope",
@@ -281,7 +384,7 @@ def test_derive_gate_companion_preserves_upstream_page_refs() -> None:
     bundle's page_refs is empty; we test the propagation path.
     """
 
-    bundle = _bundle()
+    bundle = _bundle_for_gate("gate:scope")
     record = derive_gate_companion(
         bundle,
         gate_scope_id="gate:scope",
@@ -387,29 +490,210 @@ def test_derive_gate_companion_fails_closed_on_unavailable_state() -> None:
 def test_derive_gate_companion_state_paged_proceeds() -> None:
     """Per doc-13a:273-275 "model verifier input is either complete
     for the gate scope or exactly paged" -- the helper allows the
-    state="paged" path to proceed (gate may approve).
+    state="paged" path to proceed only when exact page refs and proof
+    rows cover the gate scope.
     """
+
+    page_ref = _page_ref(ref_id="gate-page-1")
+    bundle = _bundle_with_completeness(
+        state="paged",
+        complete_for=["gate:scope"],
+        page_refs=[page_ref],
+    )
+    assert bundle.completeness.state == "paged"
+    proof_row = derive_proof_row(
+        source_digest="source-sha",
+        page_refs=[page_ref],
+        proof_algorithm="sha256",
+        verification_time="2026-05-26T09:30:00Z",
+    )
+
+    record = derive_gate_companion(
+        bundle,
+        gate_scope_id="gate:scope",
+        gate_input_digest="digest",
+        proof_rows=[proof_row],
+    )
+    assert record.completeness.state == "paged"
+    assert record.completeness.page_refs == [page_ref]
+    assert record.approval_routing.should_approve_gate is True
+
+
+def test_derive_gate_companion_paged_requires_exact_page_refs() -> None:
+    """Paged gate evidence without exact page refs fails closed."""
 
     legacy = _legacy_bundle(
         truncation_notes=["budget exhausted; 2 of 5 pages dropped"]
     )
     bundle = _bundle(legacy)
     assert bundle.completeness.state == "paged"
+    assert bundle.completeness.page_refs == []
 
-    record = derive_gate_companion(
-        bundle,
-        gate_scope_id="gate:scope",
-        gate_input_digest="digest",
+    with pytest.raises(MissingGateCompanionFieldError) as exc_info:
+        derive_gate_companion(
+            bundle,
+            gate_scope_id="gate:scope",
+            gate_input_digest="digest",
+        )
+
+    assert "completeness.page_refs" in exc_info.value.missing_field_names
+    assert "proof_rows" in exc_info.value.missing_field_names
+    assert exc_info.value.gate_scope_id == "gate:scope"
+    assert "exact page refs" in (exc_info.value.unavailable_reason or "")
+
+
+def test_derive_gate_companion_paged_rejects_non_exact_page_refs() -> None:
+    """Paged gate evidence rejects page refs without stable digests."""
+
+    page_ref = _page_ref(ref_id="gate-page-1", sha256="")
+    proof_row = derive_proof_row(
+        source_digest="source-sha",
+        page_refs=[page_ref],
+        proof_algorithm="sha256",
+        verification_time="2026-05-26T09:30:00Z",
     )
-    assert record.completeness.state == "paged"
-    assert record.approval_routing.should_approve_gate is True
+    bundle = _bundle_with_completeness(
+        state="paged",
+        complete_for=["gate:scope"],
+        page_refs=[page_ref],
+    )
+
+    with pytest.raises(MissingGateCompanionFieldError) as exc_info:
+        derive_gate_companion(
+            bundle,
+            gate_scope_id="gate:scope",
+            gate_input_digest="digest",
+            proof_rows=[proof_row],
+        )
+
+    assert exc_info.value.missing_field_names == (
+        "completeness.page_refs",
+        "proof_rows.page_refs",
+    )
+    assert "non-exact page refs" in (
+        exc_info.value.unavailable_reason or ""
+    )
+
+
+def test_derive_gate_companion_paged_requires_proof_rows() -> None:
+    """Paged gate evidence with page refs still needs typed proof rows."""
+
+    page_ref = _page_ref(ref_id="gate-page-1")
+    bundle = _bundle_with_completeness(
+        state="paged",
+        complete_for=["gate:scope"],
+        page_refs=[page_ref],
+    )
+
+    with pytest.raises(MissingGateCompanionFieldError) as exc_info:
+        derive_gate_companion(
+            bundle,
+            gate_scope_id="gate:scope",
+            gate_input_digest="digest",
+        )
+
+    assert exc_info.value.missing_field_names == ("proof_rows",)
+
+
+def test_derive_gate_companion_paged_rejects_scope_mismatch() -> None:
+    """Paged gate evidence must already cover the requested gate scope."""
+
+    page_ref = _page_ref(ref_id="gate-page-1")
+    proof_row = derive_proof_row(
+        source_digest="source-sha",
+        page_refs=[page_ref],
+        proof_algorithm="sha256",
+        verification_time="2026-05-26T09:30:00Z",
+    )
+    bundle = _bundle_with_completeness(
+        state="paged",
+        complete_for=["gate:other"],
+        page_refs=[page_ref],
+        required_complete_for=["gate:other"],
+    )
+
+    with pytest.raises(MissingGateCompanionFieldError) as exc_info:
+        derive_gate_companion(
+            bundle,
+            gate_scope_id="gate:scope",
+            gate_input_digest="digest",
+            proof_rows=[proof_row],
+        )
+
+    assert set(exc_info.value.missing_field_names) == {
+        "completeness.complete_for",
+        "context_manifest_ref.required_complete_for",
+    }
+    assert "gate scope" in (exc_info.value.unavailable_reason or "")
+
+
+def test_derive_gate_companion_paged_rejects_proof_row_page_ref_mismatch() -> None:
+    """Paged proof rows must cover all exact page refs on completeness."""
+
+    required_page_ref = _page_ref(ref_id="gate-page-1")
+    other_page_ref = _page_ref(ref_id="gate-page-2", sha256="other-sha")
+    bundle = _bundle_with_completeness(
+        state="paged",
+        complete_for=["gate:scope"],
+        page_refs=[required_page_ref],
+    )
+    proof_row = derive_proof_row(
+        source_digest="source-sha",
+        page_refs=[other_page_ref],
+        proof_algorithm="sha256",
+        verification_time="2026-05-26T09:30:00Z",
+    )
+
+    with pytest.raises(MissingGateCompanionFieldError) as exc_info:
+        derive_gate_companion(
+            bundle,
+            gate_scope_id="gate:scope",
+            gate_input_digest="digest",
+            proof_rows=[proof_row],
+        )
+
+    assert exc_info.value.missing_field_names == ("proof_rows.page_refs",)
+    assert "cover all exact page refs" in (
+        exc_info.value.unavailable_reason or ""
+    )
+
+
+def test_derive_gate_companion_paged_rejects_same_ref_id_digest_mismatch() -> None:
+    """Proof rows must cover exact ref id plus digest, not id alone."""
+
+    required_page_ref = _page_ref(ref_id="gate-page-1", sha256="required-sha")
+    stale_page_ref = _page_ref(ref_id="gate-page-1", sha256="stale-sha")
+    bundle = _bundle_with_completeness(
+        state="paged",
+        complete_for=["gate:scope"],
+        page_refs=[required_page_ref],
+    )
+    proof_row = derive_proof_row(
+        source_digest="source-sha",
+        page_refs=[stale_page_ref],
+        proof_algorithm="sha256",
+        verification_time="2026-05-26T09:30:00Z",
+    )
+
+    with pytest.raises(MissingGateCompanionFieldError) as exc_info:
+        derive_gate_companion(
+            bundle,
+            gate_scope_id="gate:scope",
+            gate_input_digest="digest",
+            proof_rows=[proof_row],
+        )
+
+    assert exc_info.value.missing_field_names == ("proof_rows.page_refs",)
+    assert "cover all exact page refs" in (
+        exc_info.value.unavailable_reason or ""
+    )
 
 
 def test_derive_gate_companion_state_complete_proceeds() -> None:
     """Per doc-13a:273-275 the state="complete" path proceeds (gate
     may approve)."""
 
-    bundle = _bundle()
+    bundle = _bundle_for_gate("gate:scope")
     assert bundle.completeness.state == "complete"
 
     record = derive_gate_companion(
@@ -421,6 +705,29 @@ def test_derive_gate_companion_state_complete_proceeds() -> None:
     assert record.approval_routing.should_approve_gate is True
 
 
+def test_derive_gate_companion_state_complete_rejects_scope_mismatch() -> None:
+    """Complete gate evidence must already cover the requested scope."""
+
+    bundle = _bundle_with_completeness(
+        state="complete",
+        complete_for=["gate:other"],
+        required_complete_for=["gate:other"],
+    )
+
+    with pytest.raises(MissingGateCompanionFieldError) as exc_info:
+        derive_gate_companion(
+            bundle,
+            gate_scope_id="gate:scope",
+            gate_input_digest="digest",
+        )
+
+    assert set(exc_info.value.missing_field_names) == {
+        "completeness.complete_for",
+        "context_manifest_ref.required_complete_for",
+    }
+    assert "gate scope" in (exc_info.value.unavailable_reason or "")
+
+
 # ── (d) missing required fields -> typed exception ─────────────────────────
 
 
@@ -428,7 +735,7 @@ def test_derive_gate_companion_raises_on_empty_gate_scope_id() -> None:
     """An empty gate_scope_id is missing required identity; the helper
     raises :class:`MissingGateCompanionFieldError`."""
 
-    bundle = _bundle()
+    bundle = _bundle_for_gate("gate:scope")
     with pytest.raises(MissingGateCompanionFieldError) as exc_info:
         derive_gate_companion(
             bundle,
@@ -441,7 +748,7 @@ def test_derive_gate_companion_raises_on_empty_gate_scope_id() -> None:
 def test_derive_gate_companion_raises_on_whitespace_gate_scope_id() -> None:
     """A whitespace-only gate_scope_id is missing required identity."""
 
-    bundle = _bundle()
+    bundle = _bundle_for_gate("gate:scope")
     with pytest.raises(MissingGateCompanionFieldError):
         derive_gate_companion(
             bundle,
@@ -453,7 +760,7 @@ def test_derive_gate_companion_raises_on_whitespace_gate_scope_id() -> None:
 def test_derive_gate_companion_raises_on_empty_gate_input_digest() -> None:
     """An empty gate_input_digest is missing required content digest."""
 
-    bundle = _bundle()
+    bundle = _bundle_for_gate("gate:scope")
     with pytest.raises(MissingGateCompanionFieldError) as exc_info:
         derive_gate_companion(
             bundle,
@@ -471,7 +778,7 @@ def test_missing_gate_companion_field_error_inherits_value_error() -> None:
     precedent).
     """
 
-    bundle = _bundle()
+    bundle = _bundle_for_gate("gate:scope")
     with pytest.raises(ValueError):
         derive_gate_companion(
             bundle,
@@ -492,7 +799,7 @@ def test_authoritative_gate_companion_record_round_trips_via_json() -> None:
     the doc-13a:298-301 freshness contract.
     """
 
-    bundle = _bundle()
+    bundle = _bundle_for_gate("gate:scope")
     record = derive_gate_companion(
         bundle,
         gate_scope_id="gate:scope",
@@ -553,7 +860,7 @@ def test_authoritative_gate_companion_record_forbids_unknown_fields() -> None:
     """The Pydantic model rejects unknown fields per
     ``ConfigDict(extra='forbid')``."""
 
-    bundle = _bundle()
+    bundle = _bundle_for_gate("gate:scope")
     record = derive_gate_companion(
         bundle,
         gate_scope_id="gate:scope",
@@ -815,7 +1122,7 @@ def test_derive_gate_companion_carries_proof_rows() -> None:
     per doc-13a:276-278.
     """
 
-    bundle = _bundle()
+    bundle = _bundle_for_gate("gate:scope")
     proof_row = derive_proof_row(
         source_digest="src-sha",
         page_refs=[_page_ref()],
@@ -833,14 +1140,14 @@ def test_derive_gate_companion_carries_proof_rows() -> None:
 
 def test_derive_gate_companion_default_proof_rows_is_empty() -> None:
     """When no proof_rows argument is supplied, the companion record's
-    proof_rows is an empty list (default).
+    proof_rows is an empty list for complete gate evidence.
 
-    Per doc-13a:276-278 the proof rows are OPTIONAL on a gate companion
-    record; a gate scope may have NO deterministic-summary proof rows
-    attached (the typed companion record alone satisfies the gate).
+    Per doc-13a:276-278 proof rows are optional for complete gate
+    evidence; paged gate evidence is covered separately by the
+    exact-page-ref proof-row tests above.
     """
 
-    bundle = _bundle()
+    bundle = _bundle_for_gate("gate:scope")
     record = derive_gate_companion(
         bundle,
         gate_scope_id="gate:scope",
@@ -877,7 +1184,7 @@ def test_legacy_gate_companion_adapter_derives_companion_record() -> None:
     :func:`derive_gate_companion`.
     """
 
-    bundle = _bundle()
+    bundle = _bundle_for_gate("gate:scope")
     adapter = LegacyGateCompanionAdapter()
     record = adapter.derive_companion(
         bundle,
@@ -962,7 +1269,7 @@ def test_companion_record_routing_should_approve_gate_on_complete() -> None:
     """On state="complete", the approval_routing carries
     should_approve_gate=True with no typed failure id."""
 
-    bundle = _bundle()
+    bundle = _bundle_for_gate("gate:scope")
     record = derive_gate_companion(
         bundle,
         gate_scope_id="gate:scope",
@@ -978,14 +1285,26 @@ def test_companion_record_routing_should_approve_gate_on_complete() -> None:
 
 def test_companion_record_routing_should_approve_gate_on_paged() -> None:
     """On state="paged", the approval_routing carries
-    should_approve_gate=True per doc-13a:273-275."""
+    should_approve_gate=True when exact page refs and proof rows cover
+    the gate scope per doc-13a:273-275."""
 
-    legacy = _legacy_bundle(truncation_notes=["page 1 of 2"])
-    bundle = _bundle(legacy)
+    page_ref = _page_ref(ref_id="gate-page-1")
+    bundle = _bundle_with_completeness(
+        state="paged",
+        complete_for=["gate:scope"],
+        page_refs=[page_ref],
+    )
+    proof_row = derive_proof_row(
+        source_digest="source-sha",
+        page_refs=[page_ref],
+        proof_algorithm="sha256",
+        verification_time="2026-05-26T09:30:00Z",
+    )
     record = derive_gate_companion(
         bundle,
         gate_scope_id="gate:scope",
         gate_input_digest="digest",
+        proof_rows=[proof_row],
     )
     assert record.approval_routing.should_approve_gate is True
 
@@ -998,8 +1317,8 @@ def test_derive_gate_companion_completeness_digest_is_deterministic() -> None:
     byte-identical completeness_digest values per the doc-13a:298-301
     freshness contract."""
 
-    bundle1 = _bundle()
-    bundle2 = _bundle()
+    bundle1 = _bundle_for_gate("gate:scope")
+    bundle2 = _bundle_for_gate("gate:scope")
     record1 = derive_gate_companion(
         bundle1,
         gate_scope_id="gate:scope",
@@ -1025,7 +1344,7 @@ def test_derive_gate_companion_different_scopes_yield_different_digests() -> Non
     different completeness_digest values (the scope is part of the
     digest material via complete_for)."""
 
-    bundle = _bundle()
+    bundle = _bundle_for_gate(["gate:atomic_landing", "gate:code_review"])
     record_atomic = derive_gate_companion(
         bundle,
         gate_scope_id="gate:atomic_landing",
@@ -1051,7 +1370,9 @@ def test_derive_gate_companion_preserves_upstream_manifest_identity() -> None:
     the completeness_digest + required_complete_for + authority
     change per the gate-scope re-projection)."""
 
-    bundle = _bundle(manifest_id="m-abc", manifest_digest="m-digest-xyz")
+    bundle = _bundle_for_gate(
+        "gate:scope", manifest_id="m-abc", manifest_digest="m-digest-xyz"
+    )
     record = derive_gate_companion(
         bundle,
         gate_scope_id="gate:scope",

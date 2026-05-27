@@ -1,5 +1,5 @@
 """Slice 13A sixth sub-slice -- snapshot companion record + per-list-field
-completeness + dead-until-wired binding closure for the fifth sub-slice's
+completeness + composable adapter for the fifth sub-slice's
 :class:`~iriai_build_v2.execution_control.gate_companion.LegacyGateCompanionAdapter`.
 
 This module implements **doc-13a Refactoring Steps step 7** verbatim
@@ -29,21 +29,19 @@ READ-ONLY). When the consumer wires the new port, it routes through
 :class:`AuthoritativeSnapshotCompanionRecord` (per doc-13a:280-282)
 instead of treating the raw snapshot as authoritative.
 
-**P3-13A-5-4 BINDING CLOSURE** (dead-until-wired statement from the
-Slice 13A fifth sub-slice finalizer). The fifth sub-slice landed
+**P3-13A-5-4 / P3-13A-6-3 ADVISORY COMPOSITE** (dead-until-wired statement
+from the Slice 13A fifth and sixth sub-slice finalizers). The fifth sub-slice landed
 :class:`~iriai_build_v2.execution_control.gate_companion.LegacyGateCompanionAdapter`
-as a stable opt-in port; this sub-slice closes the binding by wiring
-the gate adapter into a real verifier / gate consumer site via the
-NEW :class:`LegacyGateConsumerSnapshotAdapter` external opt-in
-wrapper. The wrapper composes the snapshot companion record + the
-gate companion record so the consumer routes through BOTH layers of
-typed completeness before approving a gate. Per the doc-13a:18-23
-invariant + the doc-13a:111-115 Blocking deviations rule the consumer
-MUST NOT approve a gate from snapshot evidence that is incomplete for
-the gate's required scope.
+as a stable opt-in port; this sub-slice supplies the
+NEW :class:`LegacyGateConsumerSnapshotAdapter` external opt-in wrapper that
+composes the snapshot companion record + the gate companion record. Slice 19A
+source-of-truth ``docs/execution-control-plane/19a-governance-implementation-reassessment.md``
+reopened the later dashboard-wrapper authority claim as ``19A-P2-001``:
+this composition is still not an actual authoritative gate / verifier /
+classifier consumer with durable failure observation.
 
 **Co-bundle decision** (recorded in the BEFORE journal entry +
-JSONL row). Step 7 + the P3-13A-5-4 binding closure land as ONE
+JSONL row). Step 7 + the P3-13A-5-4 advisory composition land as ONE
 sub-slice because:
 
 1. Both adopt the same EXTERNAL-adapter wiring pattern from the
@@ -104,8 +102,8 @@ sanctioned surfaces only):
   third sub-slice's compatibility adapter; READ-ONLY consumer; used
   by the gate-binding-closure wrapper) +
   :mod:`iriai_build_v2.execution_control.gate_companion` (the fifth
-  sub-slice's gate companion; READ-ONLY consumer; closes the
-  P3-13A-5-4 binding statement).
+  sub-slice's gate companion; READ-ONLY consumer; composed here without
+  granting production authority).
 * NO imports from ``governance/`` (the governance layer consumes
   execution-control surfaces, not the reverse).
 * NO imports from ``workflows/develop/execution/`` (the legacy
@@ -145,16 +143,15 @@ from iriai_build_v2.execution_control.completeness import (
 )
 
 # Slice 13A third sub-slice compatibility adapter (READ-ONLY consumer).
-# Used by the P3-13A-5-4 binding-closure wrapper that composes the
+# Used by the opt-in wrapper that composes the
 # snapshot companion with the gate companion record.
 from iriai_build_v2.execution_control.prompt_context_adapter import (
     AuthoritativePromptContextBundle,
 )
 
 # Slice 13A fifth sub-slice gate companion (READ-ONLY consumer).
-# Closes the P3-13A-5-4 dead-until-wired binding statement: the gate
-# adapter lands as a composable wrapper alongside the snapshot
-# companion adapter.
+# The gate adapter stays a composable advisory wrapper alongside the snapshot
+# companion adapter; this module does not make it an authoritative consumer.
 from iriai_build_v2.execution_control.gate_companion import (
     AuthoritativeGateCompanionPort,
     AuthoritativeGateCompanionRecord,
@@ -172,7 +169,7 @@ __all__ = [
     "AuthoritativeSnapshotCompanionPort",
     "LegacySnapshotCompanionAdapter",
     "derive_snapshot_companion",
-    # P3-13A-5-4 binding closure -- gate-consumer external opt-in wrapper
+    # P3-13A-5-4 / P3-13A-6-3 advisory composition -- external opt-in wrapper
     # that composes the snapshot companion with the gate companion record.
     "LegacyGateConsumerSnapshotAdapter",
     "derive_gate_companion_with_snapshot",
@@ -654,10 +651,28 @@ def _classify_routing(
             missing.append(scope)
             continue
         per_field = list_field_completeness[scope]
-        state = per_field.completeness.state
+        completeness = per_field.completeness
+        state = completeness.state
         if state not in ("complete", "paged"):
             missing.append(scope)
             continue
+        if completeness.authority != "routing_authority":
+            missing.append(scope)
+            continue
+        if f"snapshot:{scope}" not in completeness.complete_for:
+            missing.append(scope)
+            continue
+        if completeness.missing_required_refs:
+            missing.append(scope)
+            continue
+        if state == "paged":
+            if (
+                not _page_refs_are_exact(completeness.page_refs)
+                or per_field.next_page_ref is None
+                or not _page_refs_are_exact((per_field.next_page_ref,))
+            ):
+                missing.append(scope)
+                continue
 
     if missing:
         return AuthoritativeSnapshotClassifierRouting(
@@ -677,6 +692,16 @@ def _classify_routing(
         typed_failure_type=None,
         unavailable_reason=None,
         missing_field_names=(),
+    )
+
+
+def _page_refs_are_exact(page_refs: Sequence[EvidencePageRef]) -> bool:
+    """Return true only for stable, digest-backed page refs."""
+
+    return bool(page_refs) and all(
+        bool(page_ref.ref_id.strip())
+        and bool(page_ref.sha256.strip())
+        for page_ref in page_refs
     )
 
 
@@ -997,7 +1022,7 @@ class LegacySnapshotCompanionAdapter:
         )
 
 
-# --- P3-13A-5-4 binding closure: gate-consumer external opt-in wrapper -----
+# --- P3-13A-5-4 / P3-13A-6-3 advisory external opt-in wrapper -------------
 
 
 class LegacyGateConsumerSnapshotAdapter:
@@ -1005,15 +1030,16 @@ class LegacyGateConsumerSnapshotAdapter:
     companion record (Slice 13A sixth sub-slice) with the gate
     companion record (Slice 13A fifth sub-slice).
 
-    **Closes P3-13A-5-4 dead-until-wired binding statement.** The
-    fifth sub-slice landed
+    **Authority boundary.** The fifth sub-slice landed
     :class:`~iriai_build_v2.execution_control.gate_companion.LegacyGateCompanionAdapter`
-    as a stable opt-in port; this sub-slice wires it into a real
-    consumer site via the EXTERNAL opt-in wrapper pattern (per
-    doc-13a:42-46 + 124-126 + ``feedback_no_refactor`` -- the
-    wrapper composes the gate adapter OUTSIDE the legacy Slice 06
+    as a stable opt-in port; this sub-slice composes it with snapshot
+    completeness via the EXTERNAL opt-in wrapper pattern (per doc-13a:42-46 +
+    124-126 + ``feedback_no_refactor`` -- the wrapper composes the gate adapter
+    OUTSIDE the legacy Slice 06
     :class:`~iriai_build_v2.workflows.develop.execution.gates.GateRunner`
-    boundary; the legacy gate boundary remains BYTE-IDENTICAL).
+    boundary; the legacy gate boundary remains BYTE-IDENTICAL). Slice 19A
+    ``19A-P2-001`` makes explicit that this composition does not by itself
+    wire an actual authoritative consumer with durable failure observation.
 
     The wrapper composes the two companion records in two phases:
 
@@ -1067,11 +1093,9 @@ class LegacyGateConsumerSnapshotAdapter:
         isolation.
 
         The default behavior (``gate_adapter=None`` -> fresh
-        :class:`LegacyGateCompanionAdapter`) closes the
-        P3-13A-5-4 binding statement: the fifth sub-slice's adapter
-        now has a real production caller (this wrapper), satisfying
-        the binding before any Slice 14-19 governance slice can
-        claim gate execution authority.
+        :class:`LegacyGateCompanionAdapter`) keeps the composition
+        lightweight and advisory. It is not evidence that a Slice 14-19
+        governance surface may claim gate execution authority.
         """
 
         # Per P3-13A-5-1 the LegacyGateCompanionAdapter is a stateless
@@ -1097,10 +1121,9 @@ class LegacyGateConsumerSnapshotAdapter:
         gate's required scope.
 
         See class docstring for the full two-phase flow (snapshot gate
-        + gate approval). Closes the P3-13A-5-4 dead-until-wired
-        binding statement by wiring the fifth-sub-slice
+        + gate approval). This composes the fifth-sub-slice
         :class:`~iriai_build_v2.execution_control.gate_companion.LegacyGateCompanionAdapter`
-        into a real consumer site.
+        without granting production authority.
         """
 
         # --- Phase 1: snapshot gate ---------------------------------------
@@ -1159,10 +1182,11 @@ def derive_gate_companion_with_snapshot(
     delegates to a fresh :class:`LegacyGateConsumerSnapshotAdapter`
     so the two-phase fail-closed contract is preserved verbatim.
 
-    Closes the P3-13A-5-4 binding statement: the fifth-sub-slice's
+    This helper preserves the same advisory composition as the wrapper. It does
+    not make the fifth-sub-slice
     :class:`~iriai_build_v2.execution_control.gate_companion.LegacyGateCompanionAdapter`
-    + :func:`~iriai_build_v2.execution_control.gate_companion.derive_gate_companion`
-    now have real production callers through this composition.
+    or :func:`~iriai_build_v2.execution_control.gate_companion.derive_gate_companion`
+    an authoritative production consumer.
     """
 
     wrapper = LegacyGateConsumerSnapshotAdapter(gate_adapter=gate_adapter)

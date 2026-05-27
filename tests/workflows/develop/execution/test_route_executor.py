@@ -3,6 +3,7 @@ import pytest
 from iriai_build_v2.workflows.develop.execution.failure_router import (
     FailureObservation,
     FailureRouter,
+    ROUTE_TABLE,
 )
 from iriai_build_v2.workflows.develop.execution.repair import (
     RepairRequest,
@@ -205,6 +206,15 @@ def test_every_repairable_action_builds_deterministic_repair_request(
                 "failed_merge_queue_item_id": 404,
                 "failed_source_queue_item_evidence_id": 405,
                 "source_queue_item_status": "failed",
+                "queue_lane": "dag-group:3",
+                "replacement_feature_id": "feat-07",
+                "replacement_dag_sha256": "dag-sha",
+                "replacement_group_idx": 3,
+                "replacement_task_ids": ["TASK-1"],
+                "replacement_contract_ids": [203],
+                "replacement_gate_ids": ["gate:merge"],
+                "replacement_route_decision_evidence_ids": [9001],
+                "replacement_queue_lane": "dag-group:3",
             },
             {
                 "retry_kind": "merge",
@@ -244,6 +254,24 @@ def test_every_repairable_action_builds_deterministic_repair_request(
                 "attempt_kind": "repair",
                 "allocate_new_sandbox": False,
                 "preserve_sandbox_lease_id": 606,
+                "preserve_merge_queue_item_id": None,
+            },
+        ),
+        (
+            "retry_governance_projection",
+            {
+                "failure_class": "evidence_corruption",
+                "failure_type": "governance_snapshot_api_failed",
+                "contract_ids": [206],
+                "gate_ids": ["gate:governance"],
+                "sandbox_lease_id": 707,
+                "failed_merge_queue_item_id": 808,
+            },
+            {
+                "retry_kind": "governance_projection",
+                "attempt_kind": "verify",
+                "allocate_new_sandbox": False,
+                "preserve_sandbox_lease_id": None,
                 "preserve_merge_queue_item_id": None,
             },
         ),
@@ -295,14 +323,32 @@ def test_product_repair_rejects_workflow_failure_classes():
                 failure_type="dirty_after_commit",
             )
         )
-    # A workflow class with an unrouted type passes the route-table guard but
-    # is still rejected by the _product_repair failure-class allowlist.
-    with pytest.raises(RouteExecutorError, match="product repair is only allowed"):
+    # An unrouted workflow type now fails closed at the route-table boundary.
+    with pytest.raises(RouteExecutorError, match="unknown route policy"):
         RouteExecutor().build_repair_request(
             _decision(
                 "run_product_repair",
                 failure_class="commit_hygiene",
                 failure_type="unrouted_workflow_type",
+            )
+        )
+
+
+def test_unknown_route_policy_cannot_build_product_repair_on_resume():
+    with pytest.raises(RouteExecutorError, match="unknown route policy"):
+        RouteExecutor().build_repair_request(
+            _decision(
+                "run_product_repair",
+                failure_class="product_defect",
+                failure_type="unknown_product_defect",
+            )
+        )
+    with pytest.raises(RouteExecutorError, match="failure_class and failure_type"):
+        RouteExecutor().build_repair_request(
+            _decision(
+                "run_product_repair",
+                failure_class="product_defect",
+                failure_type="",
             )
         )
 
@@ -538,6 +584,16 @@ def test_retry_merge_preserves_failed_source_queue_item_id_when_evidence_present
             failed_source_queue_item_evidence_id=809,
             contract_ids=[901],
             gate_ids=["gate:merge"],
+            route_decision_evidence_ids=[811],
+            queue_lane="dag-group:3",
+            replacement_feature_id="feat-07",
+            replacement_dag_sha256="dag-sha",
+            replacement_group_idx=3,
+            replacement_task_ids=["TASK-1"],
+            replacement_contract_ids=[901],
+            replacement_gate_ids=["gate:merge"],
+            replacement_route_decision_evidence_ids=[811],
+            replacement_queue_lane="dag-group:3",
         )
     )
 
@@ -545,6 +601,144 @@ def test_retry_merge_preserves_failed_source_queue_item_id_when_evidence_present
     assert 809 in request.required_evidence_ids
     assert request.preserve_contract_ids == [901]
     assert request.preserve_gate_ids == ["gate:merge"]
+
+
+def test_retry_merge_accepts_replacement_with_matching_lineage_authorities():
+    request = RouteExecutor().build_retry_request(
+        _decision(
+            "retry_merge",
+            failure_class="merge_conflict",
+            failure_type="patch_apply_conflict",
+            failed_merge_queue_item_id=808,
+            failed_source_queue_item_evidence_id=809,
+            contract_ids=[901],
+            gate_ids=["gate:merge"],
+            route_decision_evidence_ids=[811],
+            queue_lane="dag-group:6",
+            replacement_feature_id="feat-07",
+            replacement_dag_sha256="dag-sha",
+            replacement_group_idx=3,
+            replacement_task_ids=["TASK-1"],
+            replacement_contract_ids=[901],
+            replacement_gate_ids=["gate:merge"],
+            replacement_route_decision_evidence_ids=[811],
+            replacement_queue_lane="dag-group:6",
+        )
+    )
+
+    assert request.preserve_merge_queue_item_id == 808
+    assert request.preserve_contract_ids == [901]
+    assert request.preserve_gate_ids == ["gate:merge"]
+    assert request.required_evidence_ids == [501, 502, 811, 809]
+
+
+@pytest.mark.parametrize(
+    ("drift", "match"),
+    [
+        ({"replacement_feature_id": "feat-other"}, "feature id"),
+        ({"replacement_dag_sha256": "dag-other"}, "DAG sha"),
+        ({"replacement_group_idx": 4}, "group id"),
+        ({"replacement_task_ids": ["TASK-2"]}, "task coverage"),
+        ({"replacement_contract_ids": [902]}, "contract coverage"),
+        ({"replacement_contract_ids": ["bogus"]}, "contract coverage"),
+        ({"replacement_gate_ids": ["gate:other"]}, "gate requirements"),
+        ({"replacement_queue_lane": "dag-group:other"}, "queue lane"),
+        ({"replacement_group_idx": "bogus"}, "group id"),
+        ({"replacement_route_decision_evidence_ids": [812]}, "route-decision evidence"),
+        ({"replacement_route_decision_evidence_ids": ["bogus"]}, "route-decision evidence"),
+    ],
+)
+def test_retry_merge_rejects_replacement_lineage_authority_drift(drift, match):
+    lineage = {
+        "replacement_feature_id": "feat-07",
+        "replacement_dag_sha256": "dag-sha",
+        "replacement_group_idx": 3,
+        "replacement_task_ids": ["TASK-1"],
+        "replacement_contract_ids": [901],
+        "replacement_gate_ids": ["gate:merge"],
+        "replacement_route_decision_evidence_ids": [811],
+        "replacement_queue_lane": "dag-group:6",
+    }
+    lineage.update(drift)
+    with pytest.raises(RouteExecutorError, match=match):
+        RouteExecutor().build_retry_request(
+            _decision(
+                "retry_merge",
+                failure_class="merge_conflict",
+                failure_type="patch_apply_conflict",
+                failed_merge_queue_item_id=808,
+                failed_source_queue_item_evidence_id=809,
+                contract_ids=[901],
+                gate_ids=["gate:merge"],
+                route_decision_evidence_ids=[811],
+                queue_lane="dag-group:6",
+                **lineage,
+            )
+        )
+
+
+def test_retry_merge_rejects_missing_replacement_lineage_authorities():
+    with pytest.raises(RouteExecutorError, match="feature id"):
+        RouteExecutor().build_retry_request(
+            _decision(
+                "retry_merge",
+                failure_class="merge_conflict",
+                failure_type="patch_apply_conflict",
+                failed_merge_queue_item_id=808,
+                failed_source_queue_item_evidence_id=809,
+                contract_ids=[901],
+                gate_ids=["gate:merge"],
+                route_decision_evidence_ids=[811],
+                queue_lane="dag-group:6",
+            )
+        )
+
+
+def test_retry_merge_rejects_absent_required_lineage_authorities():
+    with pytest.raises(RouteExecutorError, match="contract coverage"):
+        RouteExecutor().build_retry_request(
+            _decision(
+                "retry_merge",
+                failure_class="merge_conflict",
+                failure_type="patch_apply_conflict",
+                failed_merge_queue_item_id=808,
+                failed_source_queue_item_evidence_id=809,
+                contract_ids=[],
+                gate_ids=[],
+                route_decision_evidence_ids=[],
+                replacement_feature_id="feat-07",
+                replacement_dag_sha256="dag-sha",
+                replacement_group_idx=3,
+                replacement_task_ids=["TASK-1"],
+            )
+        )
+
+
+def test_retry_merge_rejects_conflicting_scalar_lineage_aliases():
+    with pytest.raises(RouteExecutorError, match="feature id"):
+        RouteExecutor().build_retry_request(
+            _decision(
+                "retry_merge",
+                failure_class="merge_conflict",
+                failure_type="patch_apply_conflict",
+                failed_merge_queue_item_id=808,
+                failed_source_queue_item_evidence_id=809,
+                source_feature_id="feat-other",
+                contract_ids=[901],
+                gate_ids=["gate:merge"],
+                route_decision_evidence_ids=[811],
+                queue_lane="dag-group:6",
+                replacement_feature_id="feat-07",
+                replacement_queue_item_feature_id="feat-other",
+                replacement_dag_sha256="dag-sha",
+                replacement_group_idx=3,
+                replacement_task_ids=["TASK-1"],
+                replacement_contract_ids=[901],
+                replacement_gate_ids=["gate:merge"],
+                replacement_route_decision_evidence_ids=[811],
+                replacement_queue_lane="dag-group:6",
+            )
+        )
 
 
 def test_request_digest_is_stable_from_route_decision_and_repair_scope():
@@ -641,6 +835,7 @@ def test_router_merge_retry_decision_preserves_failed_queue_lineage():
             feature_id="feat-merge-route",
             dag_sha256="dag-merge",
             group_idx=6,
+            task_id="TASK-1",
             source="merge_queue",
             failure_class="merge_conflict",
             failure_type="patch_apply_conflict",
@@ -653,6 +848,15 @@ def test_router_merge_retry_decision_preserves_failed_queue_lineage():
                 "source_queue_item_status": "failed",
                 "contract_ids": [901],
                 "gate_ids": ["gate:merge"],
+                "queue_lane": "dag-group:6",
+                "replacement_feature_id": "feat-merge-route",
+                "replacement_dag_sha256": "dag-merge",
+                "replacement_group_idx": 6,
+                "replacement_task_id": "TASK-1",
+                "replacement_contract_ids": [901],
+                "replacement_gate_ids": ["gate:merge"],
+                "replacement_route_decision_evidence_ids": [809],
+                "replacement_queue_lane": "dag-group:6",
             },
         )
     )
@@ -666,3 +870,153 @@ def test_router_merge_retry_decision_preserves_failed_queue_lineage():
     assert request.required_evidence_ids == [809]
     assert request.preserve_contract_ids == [901]
     assert request.preserve_gate_ids == ["gate:merge"]
+
+
+def test_router_merge_retry_rejects_replacement_lineage_drift_from_payload():
+    router = FailureRouter()
+    failure_id = router.record(
+        FailureObservation(
+            feature_id="feat-merge-route",
+            dag_sha256="dag-merge",
+            group_idx=6,
+            task_id="TASK-1",
+            source="merge_queue",
+            failure_class="merge_conflict",
+            failure_type="patch_apply_conflict",
+            deterministic=False,
+            retryable=True,
+            evidence_ids=[809],
+            payload={
+                "queue_item_id": 808,
+                "failed_source_queue_item_evidence_id": 809,
+                "source_queue_item_status": "failed",
+                "contract_ids": [901],
+                "gate_ids": ["gate:merge"],
+                "queue_lane": "dag-group:6",
+                "replacement_feature_id": "feat-merge-route",
+                "replacement_dag_sha256": "dag-merge",
+                "replacement_group_idx": 6,
+                "replacement_task_id": "TASK-1",
+                "replacement_contract_ids": [902],
+                "replacement_gate_ids": ["gate:merge"],
+                "replacement_route_decision_evidence_ids": [809],
+                "replacement_queue_lane": "dag-group:6",
+            },
+        )
+    )
+    decision = router.mark_route_started(router.decide(failure_id))
+
+    with pytest.raises(RouteExecutorError, match="contract coverage"):
+        RouteExecutor().build_route_request(decision)
+
+
+def test_router_governance_projection_decisions_build_non_mutating_retry_requests():
+    governance_routes = sorted(
+        key
+        for key, policy in ROUTE_TABLE.items()
+        if policy.action == "retry_governance_projection"
+    )
+    assert len(governance_routes) == 24
+
+    for index, (failure_class, failure_type) in enumerate(governance_routes, start=1):
+        router = FailureRouter()
+        evidence_id = 9000 + index
+        failure_id = router.record(
+            FailureObservation(
+                feature_id="feat-governance-route",
+                dag_sha256="dag-governance",
+                group_idx=index,
+                source="journal",
+                failure_class=failure_class,
+                failure_type=failure_type,
+                deterministic=False,
+                retryable=True,
+                evidence_ids=[evidence_id],
+                payload={
+                    "contract_ids": [700 + index],
+                    "gate_ids": [f"gate:governance:{index}"],
+                    "sandbox_lease_id": 800 + index,
+                    "queue_item_id": 850 + index,
+                },
+            )
+        )
+        decision = router.mark_route_started(router.decide(failure_id))
+        assert decision.reservation_ordinal > 0
+
+        request = RouteExecutor().build_route_request(decision)
+
+        assert isinstance(request, RetryRequest)
+        assert request.action == "retry_governance_projection"
+        assert request.retry_kind == "governance_projection"
+        assert request.attempt_kind == "verify"
+        assert request.allocate_new_sandbox is False
+        assert request.reset_context is False
+        assert request.preserve_sandbox_lease_id is None
+        assert request.preserve_merge_queue_item_id is None
+        assert request.required_evidence_ids == [evidence_id]
+        assert request.preserve_contract_ids == [700 + index]
+        assert request.preserve_gate_ids == [f"gate:governance:{index}"]
+
+
+def test_exhausted_governance_projection_decision_does_not_build_retry_request():
+    decision = _decision(
+        "retry_governance_projection",
+        failure_class="evidence_corruption",
+        failure_type="governance_snapshot_api_failed",
+        contract_ids=[206],
+        gate_ids=["gate:governance"],
+    ).model_copy(
+        update={
+            "budget_remaining": 0,
+            "budget_exhausted": True,
+            "reason": "retry budget exhausted for evidence_corruption/governance_snapshot_api_failed",
+        }
+    )
+
+    with pytest.raises(RouteExecutorError, match="budget exhausted"):
+        RouteExecutor().build_route_request(decision)
+
+
+def test_zero_budget_governance_projection_decision_does_not_build_retry_request():
+    decision = _decision(
+        "retry_governance_projection",
+        failure_class="evidence_corruption",
+        failure_type="governance_snapshot_api_failed",
+        contract_ids=[206],
+        gate_ids=["gate:governance"],
+    ).model_copy(update={"budget_remaining": 0})
+
+    with pytest.raises(RouteExecutorError, match="budget exhausted"):
+        RouteExecutor().build_retry_request(decision)
+
+
+def test_reserved_last_governance_projection_attempt_can_build_retry_request():
+    router = FailureRouter()
+    failure_id = router.record(
+        FailureObservation(
+            feature_id="feat-governance-route",
+            dag_sha256="dag-governance",
+            group_idx=1,
+            source="journal",
+            failure_class="evidence_corruption",
+            failure_type="governance_snapshot_api_failed",
+            deterministic=False,
+            retryable=True,
+            evidence_ids=[9001],
+            payload={
+                "contract_ids": [701],
+                "gate_ids": ["gate:governance"],
+                "sandbox_lease_id": 801,
+                "queue_item_id": 851,
+            },
+        )
+    )
+    decision = router.mark_route_started(router.decide(failure_id))
+    assert decision.budget_remaining == 0
+    assert decision.budget_exhausted is False
+    assert decision.reservation_ordinal == 1
+
+    request = RouteExecutor().build_retry_request(decision)
+
+    assert request.action == "retry_governance_projection"
+    assert request.retry_kind == "governance_projection"

@@ -310,12 +310,12 @@ execution-control namespace `EvidenceAuthority` (5 values per the
 Slice 13A 2nd sub-slice). The two aliases are intentionally distinct
 and the distinction is pinned by
 `tests/test_execution_control_completeness.py::test_evidence_authority_is_distinct_from_governance_namespace`.
-Per **P3-13A-6-3 dead-until-wired binding statement** (see
-`13a-acceptance.md:193-227`), the composite
-`LegacyGateConsumerSnapshotAdapter` chain must be wired into a real
-gate / verifier / classifier production consumer site before any
-governance slice consumes 13A-derived evidence as execution authority.
-The wiring is the **Slice 13A 8th sub-slice 13An-2** deliverable.
+Per P3-13A-6-3 and Slice 19A source-of-truth
+`19a-governance-implementation-reassessment.md` (`19A-P2-001`), the current
+dashboard wrapper is display/advisory-only and does not let any governance
+slice consume 13A-derived evidence as execution authority. Authority use must
+wait for a future source-of-truth slice that wires an actual authoritative
+consumer with durable failure observation.
 
 This dependency-reconciliation reference was added by
 **Slice 13A 8th sub-slice 13An-1** (this iteration) per

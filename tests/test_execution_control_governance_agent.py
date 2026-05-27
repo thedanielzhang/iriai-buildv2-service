@@ -17,11 +17,12 @@ canonical-JSON helper functions + the 5 default-budget constants:
   assertion). Slice 18 ``CounterfactualResult`` consumption on
   :attr:`replay_results` (NOT redefined; DIRECT annotation-identity
   assertion).
-- :class:`GovernanceAgentContext` -- 12 fields per doc-19:103-117 with
-  the Slice 21-conditional ``context_package`` field intentionally
-  deferred to a future sub-slice (per doc-19:89-101 +
-  doc-19:125-127 *"After Slice 21, this response must include
-  `ContextLayerPackageSummary`..."*). Slice 16 ``GovernanceFinding``
+- :class:`ContextLayerPackageSummary` -- Slice 21 citeable package id,
+  digest, source DAG, provider-state, completeness, omitted-count, and
+  page-ref summary per doc-19:89-101 + doc-21:197-232.
+- :class:`GovernanceAgentContext` -- 13 fields per doc-19:103-117 with
+  the Slice 21 ``context_package`` field wired as optional advisory
+  reporting context. Slice 16 ``GovernanceFinding``
   consumption on :attr:`relevant_findings` (NOT redefined; DIRECT
   annotation-identity assertion). Slice 17
   ``GovernancePolicyRecommendation`` consumption on
@@ -121,6 +122,7 @@ from iriai_build_v2.execution_control.governance_agent import (
     GOVERNANCE_SNAPSHOT_DEFAULT_MAX_FINDINGS,
     GOVERNANCE_SNAPSHOT_DEFAULT_MAX_RECOMMENDATIONS,
     GOVERNANCE_SNAPSHOT_DEFAULT_MAX_REPLAY_RESULTS,
+    ContextLayerPackageSummary,
     GovernanceAgentContext,
     GovernanceSnapshot,
     canonical_governance_snapshot_dict,
@@ -133,6 +135,7 @@ from iriai_build_v2.execution_control.policy_recommendation import (
 from iriai_build_v2.workflows.develop.governance.models import (
     CompletenessState,
     EvidenceQuality,
+    GovernanceEvidencePageRef,
     GovernanceEvidenceRef,
 )
 
@@ -141,24 +144,26 @@ from iriai_build_v2.workflows.develop.governance.models import (
 
 
 def test_module_all_lists_documented_surface_exactly() -> None:
-    """The module ``__all__`` carries the 2 typed BaseModels + 2
+    """The module ``__all__`` carries the 3 typed BaseModels + 2
     canonical-JSON helpers + 5 default-budget constants.
 
     Per doc-19:70-127 the surface is:
-    * 2 typed BaseModels (``GovernanceSnapshot`` 16-field +
-      ``GovernanceAgentContext`` 12-field per doc-19:103-117 with the
-      Slice 21-conditional ``context_package`` deferred).
+    * 3 typed BaseModels (``GovernanceSnapshot`` 16-field +
+      ``ContextLayerPackageSummary`` Slice 21 summary +
+      ``GovernanceAgentContext`` 13-field per doc-19:103-117 with the
+      Slice 21 ``context_package`` field wired).
     * 2 canonical-JSON helpers (``compute_governance_snapshot_digest``
       + ``canonical_governance_snapshot_dict``).
     * 5 default-budget constants (per doc-19:121-127).
 
-    Total: 9 exported names.
+    Total: 10 exported names.
     """
 
     from iriai_build_v2.execution_control import governance_agent as mod
 
     expected = {
         "GovernanceSnapshot",
+        "ContextLayerPackageSummary",
         "GovernanceAgentContext",
         "compute_governance_snapshot_digest",
         "canonical_governance_snapshot_dict",
@@ -169,7 +174,7 @@ def test_module_all_lists_documented_surface_exactly() -> None:
         "GOVERNANCE_AGENT_CONTEXT_MAX_PROMPT_CHARS_CAP",
     }
     assert set(mod.__all__) == expected
-    assert len(expected) == 9
+    assert len(expected) == 10
     for name in expected:
         assert hasattr(mod, name)
 
@@ -305,18 +310,14 @@ def test_module_does_not_redefine_exact_evidence_manifest() -> None:
     assert getattr(mod, "ExactEvidenceManifest", None) is None
 
 
-def test_module_does_not_redefine_context_layer_package_summary() -> None:
-    """Per doc-19:89-101 + doc-19:125-127 the
-    :class:`ContextLayerPackageSummary` shape is a Slice 21-conditional
-    contract (*"After Slice 21, this response must include
-    `ContextLayerPackageSummary`..."*); the Slice 19 1st sub-slice does
-    NOT yet expose the typed shape (it lands at the future Slice 21
-    integration sub-slice).
+def test_module_exposes_context_layer_package_summary() -> None:
+    """Slice 21 wires the typed package summary into governance-agent
+    reporting without importing product-authoritative runtime authority.
     """
 
     from iriai_build_v2.execution_control import governance_agent as mod
 
-    assert getattr(mod, "ContextLayerPackageSummary", None) is None
+    assert mod.ContextLayerPackageSummary is ContextLayerPackageSummary
 
 
 def test_module_import_discipline_no_implementation_py() -> None:
@@ -456,6 +457,7 @@ def test_package_init_does_not_re_export_governance_agent() -> None:
 
     forbidden_re_exports = (
         "GovernanceSnapshot",
+        "ContextLayerPackageSummary",
         "GovernanceAgentContext",
         "compute_governance_snapshot_digest",
         "canonical_governance_snapshot_dict",
@@ -495,6 +497,40 @@ def _evidence_ref(**overrides: object) -> GovernanceEvidenceRef:
     )
     base.update(overrides)
     return GovernanceEvidenceRef(**base)
+
+
+def _page_ref(**overrides: object) -> GovernanceEvidencePageRef:
+    base: dict[str, object] = dict(
+        page_ref_id="page-ref-21-1",
+        authority="typed_journal",
+        source_ref_id="ref-19-1",
+        digest="b" * 64,
+        completeness="complete",
+        exact=True,
+    )
+    base.update(overrides)
+    return GovernanceEvidencePageRef(**base)
+
+
+def _context_package_summary(
+    **overrides: object,
+) -> ContextLayerPackageSummary:
+    base: dict[str, object] = dict(
+        package_id="ctxpkg-21-1",
+        package_digest="c" * 64,
+        package_ref=_evidence_ref(ref_id="ctxpkg-ref-21-1"),
+        source_dag_artifact_id=21,
+        dag_sha256="d" * 64,
+        typed_evidence_digest="e" * 64,
+        provider_state_digest="f" * 64,
+        advisory_only=True,
+        omitted_counts={"provider_records": 0, "page_refs": 0},
+        page_refs=[_page_ref()],
+        completeness="complete",
+        truncated=False,
+    )
+    base.update(overrides)
+    return ContextLayerPackageSummary(**base)
 
 
 def _finding(**overrides: object) -> GovernanceFinding:
@@ -623,6 +659,7 @@ def _agent_context(**overrides: object) -> GovernanceAgentContext:
     base: dict[str, object] = dict(
         task_id="task-19-1",
         repo_id="repo-19-1",
+        context_package=_context_package_summary(),
         relevant_findings=[_finding()],
         relevant_line_provenance=[
             {
@@ -960,26 +997,74 @@ def test_snapshot_truncated_is_bool() -> None:
     assert annotation is bool
 
 
-# ── GovernanceAgentContext (doc-19:103-117) ────────────────────────────────
+# -- ContextLayerPackageSummary (doc-19:89-101 + Slice 21) -------------------
 
 
-def test_agent_context_accepts_all_12_fields() -> None:
-    """The 12 doc-19:103-117 fields (excluding Slice 21-conditional
-    ``context_package``) all populate cleanly on a fully-specified
+def test_context_layer_package_summary_accepts_slice_21_fields() -> None:
+    summary = _context_package_summary()
+
+    assert summary.package_id == "ctxpkg-21-1"
+    assert summary.package_digest == "c" * 64
+    assert isinstance(summary.package_ref, GovernanceEvidenceRef)
+    assert summary.source_dag_artifact_id == 21
+    assert summary.dag_sha256 == "d" * 64
+    assert summary.typed_evidence_digest == "e" * 64
+    assert summary.provider_state_digest == "f" * 64
+    assert summary.advisory_only is True
+    assert summary.omitted_counts == {"provider_records": 0, "page_refs": 0}
+    assert len(summary.page_refs) == 1
+    assert isinstance(summary.page_refs[0], GovernanceEvidencePageRef)
+    assert summary.completeness == "complete"
+    assert summary.truncated is False
+
+
+def test_context_layer_package_summary_extra_forbid() -> None:
+    with pytest.raises(ValidationError):
+        _context_package_summary(unknown_field="oops")  # type: ignore[arg-type]
+
+
+def test_context_layer_package_summary_advisory_only_rejects_false() -> None:
+    with pytest.raises(ValidationError):
+        _context_package_summary(advisory_only=False)
+
+
+def test_context_layer_package_summary_rejects_unknown_completeness() -> None:
+    with pytest.raises(ValidationError):
+        _context_package_summary(completeness="random_made_up_state")
+
+
+def test_context_layer_package_summary_page_refs_are_typed_page_refs() -> None:
+    annotation = ContextLayerPackageSummary.model_fields["page_refs"].annotation
+    assert get_origin(annotation) is list
+    assert get_args(annotation)[0] is GovernanceEvidencePageRef
+
+
+def test_context_layer_package_summary_completeness_annotation_is_direct_literal() -> None:
+    annotation = ContextLayerPackageSummary.model_fields["completeness"].annotation
+    assert annotation is CompletenessState
+
+
+# -- GovernanceAgentContext (doc-19:103-117) ---------------------------------
+
+
+def test_agent_context_accepts_all_13_fields() -> None:
+    """The 13 doc-19:103-117 fields including Slice 21
+    ``context_package`` all populate cleanly on a fully-specified
     :class:`GovernanceAgentContext`.
 
     Per doc-19:103-117 the surface is:
-    task_id, repo_id, [context_package -- Slice 21 conditional, NOT
-    in this 1st sub-slice], relevant_findings,
+    task_id, repo_id, context_package, relevant_findings,
     relevant_line_provenance, policy_guidance,
     policy_guidance_authority, omitted_detail_refs, omitted_counts,
-    completeness, page_refs, truncated, max_prompt_chars = 12 fields
-    (13 with ``context_package`` after Slice 21).
+    completeness, page_refs, truncated, max_prompt_chars = 13 fields.
     """
 
     c = _agent_context()
     assert c.task_id == "task-19-1"
     assert c.repo_id == "repo-19-1"
+    assert c.context_package is not None
+    assert c.context_package.package_id == "ctxpkg-21-1"
+    assert c.context_package.advisory_only is True
     assert len(c.relevant_findings) == 1
     assert isinstance(c.relevant_findings[0], GovernanceFinding)
     assert len(c.relevant_line_provenance) == 1
@@ -999,14 +1084,13 @@ def test_agent_context_accepts_all_12_fields() -> None:
     assert c.max_prompt_chars == 10_000
 
 
-def test_agent_context_field_count_is_12() -> None:
-    """Per doc-19:103-117 :class:`GovernanceAgentContext` has 12
-    declared fields in this 1st sub-slice (the Slice 21-conditional
-    ``context_package`` field per doc-19:106 + doc-19:125-127 lands
-    at the future Slice 21 integration sub-slice).
+def test_agent_context_field_count_is_13() -> None:
+    """Per doc-19:103-117 + Slice 21
+    :class:`GovernanceAgentContext` has 13 declared fields including
+    optional ``context_package``.
     """
 
-    assert len(GovernanceAgentContext.model_fields) == 12
+    assert len(GovernanceAgentContext.model_fields) == 13
 
 
 def test_agent_context_extra_forbid_rejects_unknown_field() -> None:
@@ -1055,6 +1139,11 @@ def test_agent_context_repo_id_accepts_none() -> None:
 
     c = _agent_context(repo_id=None)
     assert c.repo_id is None
+
+
+def test_agent_context_context_package_accepts_none() -> None:
+    c = _agent_context(context_package=None)
+    assert c.context_package is None
 
 
 def test_agent_context_policy_guidance_authority_defaults_to_advisory_only() -> None:
@@ -1168,6 +1257,13 @@ def test_agent_context_policy_guidance_annotation_is_list_of_direct_governance_p
     ].annotation
     assert get_origin(annotation) is list
     assert get_args(annotation)[0] is GovernancePolicyRecommendation
+
+
+def test_agent_context_context_package_annotation_is_optional_summary() -> None:
+    annotation = GovernanceAgentContext.model_fields["context_package"].annotation
+    args = get_args(annotation)
+    assert ContextLayerPackageSummary in args
+    assert type(None) in args
 
 
 def test_agent_context_completeness_annotation_is_direct_completeness_state_literal() -> None:
@@ -1870,12 +1966,12 @@ def test_doc_19_225_226_ac2_truncated_preview_authority_blocker_surface_present(
     assert "completeness" in GovernanceAgentContext.model_fields
 
 
-def test_doc_19_227_ac3_compact_governance_context_at_task_execute_time_surface_present() -> None:
-    """**Doc-19:227 AC3 binding statement awareness.** Per doc-19:227
-    *"Workflow agents can receive compact governance context at task
-    execute time."* the typed surface MUST expose the
-    :class:`GovernanceAgentContext` shape (the compact context
-    surface).
+def test_doc_19_227_ac3_reusable_display_advisory_context_surface_present() -> None:
+    """19A-5 AC3 binding statement awareness.
+
+    Slice 19 now exposes :class:`GovernanceAgentContext` as a reusable
+    display/advisory compact context surface. Production task-execute
+    consumption is deferred to a later accepted source-of-truth slice.
     """
 
     # GovernanceAgentContext exists + has the required scoping fields.
@@ -2010,10 +2106,6 @@ def test_doc_19_256_303_no_local_completeness_state_redefinition() -> None:
         "class CounterfactualResult",
         "class CounterfactualScenario",
         "class ReplayCorpus",
-        # The Slice 21-conditional ContextLayerPackageSummary is also
-        # NOT redefined locally (it lands at the future Slice 21
-        # integration sub-slice).
-        "class ContextLayerPackageSummary",
         # CompletenessState + EvidenceQuality are typed as Literals
         # in the Slice 13a models module; the Slice 19 module MUST NOT
         # redefine the Literals locally.

@@ -13,12 +13,17 @@ This module owns the doc-19 "Proposed Interfaces And Types" typed shapes
   ``GovernancePolicyRecommendation`` REUSE) + ``replay_results``
   (Slice 18 ``CounterfactualResult`` REUSE) + ``evidence_quality``
   (Slice 13a ``EvidenceQuality`` REUSE) + ``blocked_by``.
+* :class:`ContextLayerPackageSummary` -- the Slice 21 advisory package
+  summary carrying package id/digest, source DAG, typed evidence
+  digest, provider-state digest, completeness, omitted counts, and
+  exact page refs.
 * :class:`GovernanceAgentContext` -- the 13-field governance agent
   context record shape (doc-19:103-117): ``task_id`` + ``repo_id`` +
+  ``context_package`` (Slice 21 advisory package summary) +
   ``relevant_findings`` (Slice 16 REUSE) + ``relevant_line_provenance``
   (free-form list[dict[str, Any]] reference shape; Slice 14 line-
-  provenance shape lands at the future Slice 19 5th sub-slice agent-
-  context builder per doc-19:157-160) + ``policy_guidance`` (Slice 17
+  provenance rows are serialized by the Slice 19 5th sub-slice agent-
+  context builder per doc-19 step 5) + ``policy_guidance`` (Slice 17
   REUSE) + ``policy_guidance_authority: Literal["advisory_only"]``
   (hard-coded literal default per doc-19:110 + doc-19:230-231
   advisory-only AC) + ``omitted_detail_refs`` + ``omitted_counts`` +
@@ -52,13 +57,10 @@ Plus the 5 default-budget constants per doc-19:121-127:
   (the hard cap per doc-19:124 *"`max_prompt_chars` from caller,
   hard-capped at 20,000 chars"*).
 
-It is the **cross-cutting typed foundation** that subsequent Slice 19
-sub-slices (the typed snapshot API + dashboard view + Slack rendering +
-agent-context builder + report-artifact writer + read-only governance
-agent tooling per doc-19 § Refactoring Steps steps 1-7 at
-doc-19:150-164) build on; this first sub-slice does NOT yet wire these
-typed shapes into any CLI / dashboard / Slack / report-artifact / agent-
-context-builder consumer -- that wiring lands in subsequent sub-slices.
+It is the **cross-cutting typed foundation** that Slice 19 and Slice 21
+reporting surfaces build on. The models remain read-only descriptors and
+do not wire CLI / dashboard / Slack / report-artifact / agent-context
+surfaces into product-authoritative runtime consumers.
 
 Per the governance prompt § "Non-Negotiables" the typed shapes here are
 analytical / advisory / read-only -- they do NOT mutate executor /
@@ -99,17 +101,16 @@ acceptance criteria at:
   surface lets future Slice 19 sub-slices' consumers detect display-
   only state at construction.
 
-* **AC3** -- *"Workflow agents can receive compact governance context
-  at task execute time."* (doc-19:227) -- enforced by the typed
-  :class:`GovernanceAgentContext` shape (the compact context surface).
+* **AC3** -- remediated by 19A-5 as a reusable display/advisory
+  compact context surface; production task-execute consumption is
+  deferred to a later accepted source-of-truth slice.
 
 * **AC4** -- *"After Slice 21, every context response that uses
   line/context-layer provenance carries a citeable context package
-  id and digest."* (doc-19:228) -- this AC lives in Slice 21+ wiring
-  (the :class:`ContextLayerPackageSummary` shape per doc-19:89-101 is
-  NOT included in this 1st sub-slice surface; doc-19:89-101 is a
-  Slice 21-conditional contract per doc-19:125-127 *"After Slice 21,
-  this response must include `ContextLayerPackageSummary`..."*).
+  id and digest."* (doc-19:228) -- Slice 21 wires the advisory
+  :class:`ContextLayerPackageSummary` onto
+  :attr:`GovernanceAgentContext.context_package`; the summary remains a
+  reporting descriptor and never grants runtime authority.
 
 * **AC5** -- *"Workflow agents receive governance policy guidance only
   as advisory context; contracts, gates, router, and merge queue
@@ -221,7 +222,7 @@ Per doc-19:108 the
 :attr:`GovernanceAgentContext.relevant_line_provenance` field is
 ``list[dict[str, Any]]`` (free-form per-line-provenance-result dict
 shape; the typed Slice 14 line-provenance shape lands at the future
-Slice 19 5th sub-slice agent-context builder per doc-19:157-160 *"Add
+Slice 19 5th sub-slice agent-context builder per doc-19 step 5 *"Add
 agent-context builder that selects findings and provenance relevant to
 a task contract, repo, path, or line range."*).
 
@@ -303,9 +304,14 @@ from iriai_build_v2.execution_control.finding_engine import (
 from iriai_build_v2.execution_control.policy_recommendation import (
     GovernancePolicyRecommendation,
 )
+from iriai_build_v2.workflows.develop.context_layer.models import (
+    ContextLayerPackage,
+)
 from iriai_build_v2.workflows.develop.governance.models import (
     CompletenessState,
     EvidenceQuality,
+    GovernanceEvidencePageRef,
+    GovernanceEvidenceRef,
 )
 
 
@@ -313,6 +319,7 @@ __all__ = [
     # Doc-19:71-87 -- the 16-field GovernanceSnapshot BaseModel.
     "GovernanceSnapshot",
     # Doc-19:103-117 -- the 13-field GovernanceAgentContext BaseModel.
+    "ContextLayerPackageSummary",
     "GovernanceAgentContext",
     # Helpers mirroring Slice 13A's compute_completeness_digest +
     # Slice 14's compute_payload_sha256 + Slice 15's
@@ -351,11 +358,12 @@ so consumers can cross-check the typed
 :attr:`GovernanceSnapshot.max_response_bytes` field against the
 documented default.
 
-Per doc-19:128-131 *"Reporting budgets are preview/display budgets. Any
-truncated snapshot or agent context must include exact
-`GovernanceEvidencePageRef` rows plus `completeness`; without those
-refs the response is display-only and cannot feed acceptance,
-recommendations, policy guidance, or task-execute context."* the
+Per doc-19:128-131 *"Reporting budgets are preview/display budgets."*
+truncated snapshot or agent-context records must include completeness plus
+exact page-ref metadata or page-ref ids traceable to exact
+`GovernanceEvidencePageRef` rows; without those refs the response is
+display-only and cannot feed acceptance, recommendations, policy guidance, or
+future production task-execute context. The
 default budget is a preview / display budget; the typed surface does
 NOT pre-emptively enforce the budget at construction (the typed
 :class:`GovernanceSnapshot` accepts any positive integer); the budget
@@ -403,12 +411,10 @@ GOVERNANCE_AGENT_CONTEXT_MAX_PROMPT_CHARS_CAP: int = 20_000
 
 Per doc-19:124 *"Agent context: `max_prompt_chars` from caller,
 hard-capped at 20,000 chars, with omitted refs instead of full evidence
-bodies."* this is the typed hard cap the (future) Slice 19 5th sub-
-slice agent-context builder enforces; the typed surface does NOT
+bodies."* this is the typed hard cap the Slice 19 5th sub-slice
+agent-context builder enforces; the typed surface does NOT
 pre-emptively enforce the cap at construction (the typed
-:class:`GovernanceAgentContext` accepts any positive integer); the cap
-enforcement lives in the future Slice 19 5th sub-slice agent-context
-builder that constructs contexts from real corpus data.
+:class:`GovernanceAgentContext` accepts any positive integer).
 
 This is INTENTIONALLY distinct from the per-snapshot
 :data:`GOVERNANCE_SNAPSHOT_DEFAULT_MAX_BYTES` cap above; the snapshot
@@ -416,6 +422,99 @@ cap is BYTE-based (256 KB serialized JSON) while the agent-context cap
 is CHAR-based (20,000 chars of prompt text) per doc-19:121 vs
 doc-19:124.
 """
+
+
+# --- ContextLayerPackageSummary (doc-19:89-101 + Slice 21) ------------------
+
+
+class ContextLayerPackageSummary(BaseModel):
+    """Doc-19:89-101 + doc-21:197-232 -- citeable Slice 21 context
+    package summary carried by governance reporting surfaces.
+
+    The summary is a read-only/advisory descriptor for an already
+    generated Context Layer package. It exposes ids, digests, exact page
+    refs, completeness, and omission metadata so governance-agent context
+    consumers can cite and stale-check what they consumed without
+    treating the package as runtime authority.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    package_id: str
+    """Opaque Context Layer package id."""
+
+    package_digest: str
+    """Canonical digest for the generated Context Layer package."""
+
+    package_ref: GovernanceEvidenceRef
+    """Typed evidence ref for the package artifact itself."""
+
+    source_dag_artifact_id: int
+    """Source DAG artifact id used to generate the package."""
+
+    dag_sha256: str
+    """Digest for the source DAG snapshot consumed by the package."""
+
+    typed_evidence_digest: str
+    """Digest for the typed evidence snapshot used by the package."""
+
+    provider_state_digest: str
+    """Digest for provider-state references consumed by the package."""
+
+    advisory_only: Literal[True] = True
+    """Hard advisory-only marker; cannot be set to runtime authority."""
+
+    omitted_counts: dict[str, int]
+    """Omitted-row counts from the package projection."""
+
+    page_refs: list[GovernanceEvidencePageRef]
+    """Exact page refs for omitted or paged package evidence."""
+
+    completeness: CompletenessState
+    """Completeness state for the package summary."""
+
+    truncated: bool
+    """Whether package evidence was trimmed to the reporting budget."""
+
+    @classmethod
+    def from_context_layer_package(
+        cls,
+        package: ContextLayerPackage,
+    ) -> "ContextLayerPackageSummary":
+        """Project the Slice 21 package manifest to the governance
+        reporting summary shape without hydrating provider payloads.
+        """
+
+        return cls(
+            package_id=package.package_id,
+            package_digest=package.package_digest,
+            package_ref=GovernanceEvidenceRef(
+                authority="typed_journal",
+                ref_id=package.review_ref,
+                digest=package.package_digest,
+                quality="derived",
+                completeness=package.completeness,
+            ),
+            source_dag_artifact_id=package.source_dag_artifact_id,
+            dag_sha256=package.dag_sha256,
+            typed_evidence_digest=package.evidence_snapshot.typed_evidence_digest,
+            provider_state_digest=package.provider_state_digest,
+            advisory_only=package.advisory_only,
+            omitted_counts=dict(package.omitted_counts),
+            page_refs=[
+                GovernanceEvidencePageRef(
+                    page_ref_id=ref.ref_id,
+                    authority=ref.authority,
+                    source_ref_id=package.package_id,
+                    digest=ref.digest,
+                    completeness=ref.completeness,
+                    exact=ref.completeness in ("complete", "paged"),
+                )
+                for ref in package.page_refs
+            ],
+            completeness=package.completeness,
+            truncated=bool(package.omitted_counts),
+        )
 
 
 # --- GovernanceSnapshot (doc-19:71-87) --------------------------------------
@@ -556,9 +655,10 @@ class GovernanceSnapshot(BaseModel):
     lives in the future Slice 19 2nd sub-slice snapshot API).
 
     Per doc-19:128-131 the cap is a preview / display budget; truncated
-    snapshots MUST carry exact :attr:`page_refs` + :attr:`completeness`
-    rows or the snapshot is display-only (cannot feed acceptance /
-    recommendations / policy guidance / task-execute context)."""
+    snapshots MUST carry completeness plus page-ref ids traceable to exact
+    page-ref rows or the snapshot is display-only (cannot feed acceptance /
+    recommendations / policy guidance / future production task-execute
+    context)."""
 
     truncated: bool
     """Doc-19:78 -- ``True`` if the snapshot's typed lists
@@ -567,10 +667,11 @@ class GovernanceSnapshot(BaseModel):
     ``False`` if all rows fit within the cap.
 
     Per doc-19:128-131 *"Reporting budgets are preview/display
-    budgets. Any truncated snapshot or agent context must include exact
-    `GovernanceEvidencePageRef` rows plus `completeness`; without those
-    refs the response is display-only and cannot feed acceptance,
-    recommendations, policy guidance, or task-execute context."* the
+    budgets."* truncated snapshot or agent-context records must include
+    completeness plus exact page-ref metadata or page-ref ids traceable to
+    exact `GovernanceEvidencePageRef` rows; without those refs the response is
+    display-only and cannot feed acceptance, recommendations, policy guidance,
+    or future production task-execute context. The
     truncated flag combines with the typed :attr:`page_refs` +
     :attr:`completeness` triple to enforce AC2 at the typed-shape
     layer."""
@@ -606,7 +707,7 @@ class GovernanceSnapshot(BaseModel):
     the typed completeness state is the AC2 enforcer: ``preview_only``
     / ``unavailable`` snapshots are display-only; ``complete`` /
     ``paged`` snapshots may feed downstream acceptance + recommendation
-    + policy-guidance + task-execute consumers."""
+    + policy-guidance + future production task-execute consumers."""
 
     page_refs: list[str]
     """Doc-19:81 -- the list of typed page-ref string identifiers (e.g.
@@ -734,13 +835,13 @@ class GovernanceAgentContext(BaseModel):
     """Doc-19:103-117 -- the governance agent context record shape.
 
     A governance agent context is the typed advisory descriptor the
-    (future) Slice 19 5th sub-slice agent-context builder emits when
-    projecting bounded governance context for a workflow agent task-
-    execute prompt. Per doc-19 § "Acceptance Criteria":
+    Slice 19 5th sub-slice agent-context builder emits when projecting
+    bounded governance context for reusable display/advisory use. Per
+    doc-19 § "Acceptance Criteria" as remediated by 19A-5:
 
-    * **AC3** -- *"Workflow agents can receive compact governance
-      context at task execute time."* (doc-19:227) -- enforced by this
-      typed shape (the compact-context surface).
+    * **AC3** -- Slice 19 provides a reusable display/advisory compact
+      context surface. Production task-execute consumption is deferred
+      to a later accepted source-of-truth slice.
 
     * **AC5** -- *"Workflow agents receive governance policy guidance
       only as advisory context; contracts, gates, router, and merge
@@ -781,12 +882,9 @@ class GovernanceAgentContext(BaseModel):
 
     **Slice 14 by-name reference contract.** :attr:`relevant_line_provenance`
     is ``list[dict[str, Any]]`` (free-form per-line-provenance-result
-    dict shape). Per doc-19:108 the typed Slice 14 line-provenance
-    shape lands at the future Slice 19 5th sub-slice agent-context
-    builder per doc-19:157-160 *"Add agent-context builder that selects
-    findings and provenance relevant to a task contract, repo, path, or
-    line range."*; the 1st sub-slice typed surface accepts the
-    free-form dict list.
+    dict shape). The Slice 19 5th sub-slice builder consumes typed Slice
+    14 :class:`LineProvenanceResult` rows and serializes them into this
+    refs-only reporting surface per doc-19 step 5.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -803,6 +901,16 @@ class GovernanceAgentContext(BaseModel):
     scoped to. ``None`` for cross-repo contexts. Per doc-19:144-146 the
     repo id is one of the 4 scoping axes."""
 
+    context_package: ContextLayerPackageSummary | None = None
+    """Doc-19:106 + doc-19:125-127 + Slice 21 -- optional citeable
+    Context Layer package summary for this advisory context response.
+
+    ``None`` means the caller did not provide a Slice 21 package summary
+    yet. When present, the summary remains advisory/read-only and does
+    not promote preview-only, unavailable, truncated, or paged context
+    into product-authoritative execution state.
+    """
+
     relevant_findings: list[GovernanceFinding]
     """Doc-19:107 -- the list of Slice 16 1st sub-slice typed
     :class:`GovernanceFinding` records relevant to the agent's
@@ -816,9 +924,9 @@ class GovernanceAgentContext(BaseModel):
 
     Per doc-19:204 *"Agent context builder returns task-relevant
     findings and line provenance under prompt budget."* the relevant-
-    findings list is the typed surface that future Slice 19 5th sub-
-    slice agent-context builder populates with the task-relevant
-    subset of the corpus's findings."""
+    findings list is the typed surface that the Slice 19 5th sub-slice
+    agent-context builder populates with the task-relevant subset of the
+    corpus's findings."""
 
     relevant_line_provenance: list[dict[str, Any]]
     """Doc-19:108 -- the list of per-line-provenance dict records
@@ -826,20 +934,16 @@ class GovernanceAgentContext(BaseModel):
 
     **By-name reference contract.** The field is
     ``list[dict[str, Any]]`` (free-form per-line-provenance-result
-    dict shape; the typed Slice 14
+    dict shape; the Slice 19 5th sub-slice builder consumes typed Slice
+    14
     :class:`~iriai_build_v2.execution_control.commit_provenance.LineProvenanceResult`
-    shape lands at the future Slice 19 5th sub-slice agent-context
-    builder per doc-19:157-160 *"Add agent-context builder that selects
-    findings and provenance relevant to a task contract, repo, path,
-    or line range."*); the 1st sub-slice typed surface accepts the
-    free-form dict list.
+    rows and serializes them to this refs-only reporting shape per
+    doc-19 step 5).
 
-    Per doc-19:108 the doc shape is ``list[LineProvenanceResult]``;
-    this 1st sub-slice exposes the free-form ``list[dict[str, Any]]``
-    surface so the typed-shape foundation can construct without the
-    Slice 14 commit_provenance import in this typed-shape-only
-    foundation; the future Slice 19 5th sub-slice agent-context
-    builder tightens the typed annotation."""
+    Per doc-19:108 the doc shape is ``list[LineProvenanceResult]``; this
+    model keeps the free-form ``list[dict[str, Any]]`` output surface so
+    governance-agent context remains JSON/prompt-ready and does not make
+    provider output authoritative."""
 
     policy_guidance: list[GovernancePolicyRecommendation]
     """Doc-19:109 -- the list of Slice 17 1st sub-slice typed
@@ -892,7 +996,7 @@ class GovernanceAgentContext(BaseModel):
 
     Per doc-19:111 + doc-19:124 *"with omitted refs instead of full
     evidence bodies"* the by-name reference shape is the typed surface
-    for omitted-evidence drilldown; the future Slice 19 5th sub-slice
+    for omitted-evidence drilldown; the Slice 19 5th sub-slice
     agent-context builder populates the list from the
     :class:`~iriai_build_v2.workflows.develop.governance.models.GovernanceEvidencePageRef`
     typed shape. The 1st sub-slice typed surface accepts the empty
@@ -925,8 +1029,9 @@ class GovernanceAgentContext(BaseModel):
     Per the Slice 13A invariant + doc-19:128-131 the typed completeness
     state is the AC2 enforcer for agent context: ``preview_only`` /
     ``unavailable`` agent contexts are display-only and cannot feed
-    task-execute consumers; ``complete`` / ``paged`` contexts may feed
-    downstream agent consumers."""
+    future production task-execute consumers; ``complete`` / ``paged``
+    contexts remain advisory until a later accepted source-of-truth slice
+    wires production consumption."""
 
     page_refs: list[str]
     """Doc-19:114 -- the list of typed page-ref string identifiers for
@@ -954,7 +1059,7 @@ class GovernanceAgentContext(BaseModel):
     hard-capped at 20,000 chars, with omitted refs instead of full
     evidence bodies."* the typed surface accepts any positive integer;
     the hard cap of :data:`GOVERNANCE_AGENT_CONTEXT_MAX_PROMPT_CHARS_CAP`
-    (20 000) is enforced at the future Slice 19 5th sub-slice agent-
+    (20 000) is enforced by the Slice 19 5th sub-slice agent-
     context builder (the typed-shape layer does NOT pre-emptively
     enforce the cap at construction; the typed surface exposes the
     constant so consumers can cross-check the per-context budget

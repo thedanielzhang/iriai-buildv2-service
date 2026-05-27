@@ -349,7 +349,11 @@ class SnapshotAPIInputs(BaseModel):
     """Optional caller-supplied completeness override. If ``None``
     (default) the API computes the completeness from the
     truncation discipline (``complete`` if no list was truncated;
-    ``paged`` otherwise). If set, the API uses the override verbatim.
+    ``paged`` if truncated with page refs; ``preview_only`` if
+    truncated without page refs). If set, the API uses the most
+    restrictive value between the derived completeness and the
+    override; an override may lower completeness but may not raise a
+    truncated snapshot to an authoritative state.
 
     Per doc-19:80 the typed :attr:`GovernanceSnapshot.completeness`
     field is the Slice 13a typed
@@ -529,6 +533,38 @@ class SnapshotAPICorpus(BaseModel):
     Per doc-19:87 + doc-19:186-194 the typed surface accepts the
     pre-populated list at construction; the API uses the list
     verbatim on :attr:`GovernanceSnapshot.blocked_by`."""
+
+
+_COMPLETENESS_AUTHORITY_RANK: dict[str, int] = {
+    "unavailable": 0,
+    "preview_only": 1,
+    "paged": 2,
+    "complete": 3,
+}
+"""Relative authority rank for completeness states.
+
+The snapshot API only uses this to prevent caller overrides from
+raising a derived incomplete snapshot above the state proven by the
+bounded-read projection.
+"""
+
+
+_TRUNCATED_WITHOUT_PAGE_REFS_BLOCKER = (
+    "governance_snapshot_truncated_without_page_refs"
+)
+"""Blocker emitted when omitted rows lack exact surviving page refs."""
+
+
+class _SerializedSnapshotBudgetExceeded(ValueError):
+    """Raised when row trimming cannot fit scalar snapshot metadata."""
+
+    def __init__(self, *, serialized_bytes: int, max_response_bytes: int) -> None:
+        super().__init__(
+            "serialized governance snapshot exceeds max_response_bytes "
+            f"after bounded row trimming: {serialized_bytes} > {max_response_bytes}"
+        )
+        self.serialized_bytes = serialized_bytes
+        self.max_response_bytes = max_response_bytes
 
 
 # --- SnapshotAPIGap (typed gap projection; doc-19:184-194 + doc-14:242-243)
@@ -731,8 +767,10 @@ class GovernanceSnapshotAPI:
            row counts into :attr:`omitted_counts`.
         3. Computes the typed completeness state from the truncation
            discipline (``complete`` if no list was truncated;
-           ``paged`` otherwise) -- unless the caller supplied a
-           completeness override.
+           ``paged`` when truncated with page refs; ``preview_only``
+           when truncated without page refs). A caller-supplied
+           completeness override may lower this state but may not
+           raise it above the bounded-read projection.
         4. Computes the typed
            :func:`compute_governance_snapshot_digest` from the bounded
            row ids + row digests + omitted-counts + evidence-quality
@@ -763,6 +801,22 @@ class GovernanceSnapshotAPI:
                 snapshot=None,
                 gap_findings=gap_findings,
             )
+        if inputs.max_response_bytes <= 0:
+            gap_findings.append(
+                SnapshotAPIGap(
+                    failure_id=SNAPSHOT_API_FAILURE_ID,
+                    corpus_id=inputs.corpus_id,
+                    reason="max_response_bytes_non_positive",
+                    observed_at=_utcnow(),
+                    evidence_payload={
+                        "max_response_bytes": inputs.max_response_bytes,
+                    },
+                )
+            )
+            return SnapshotAPIResult(
+                snapshot=None,
+                gap_findings=gap_findings,
+            )
 
         # Bounded-read truncation per the LIMIT cap+1 discipline.
         # For each of the 4 typed list dimensions: truncate at the
@@ -783,7 +837,7 @@ class GovernanceSnapshotAPI:
                 corpus.replay_results, inputs.max_replay_results
             )
         )
-        page_ref_ids, page_refs_omitted = self._truncate_page_refs(
+        page_refs, page_ref_ids, page_refs_omitted = self._truncate_page_ref_rows(
             corpus.page_refs, inputs.max_page_refs
         )
 
@@ -810,13 +864,27 @@ class GovernanceSnapshotAPI:
         # ANY level (this API or upstream).
         truncated: bool = any(count > 0 for count in omitted_counts.values())
 
-        # Completeness derivation: caller override wins; otherwise
-        # complete iff not truncated, paged otherwise.
-        completeness: CompletenessState
-        if inputs.completeness_override is not None:
-            completeness = inputs.completeness_override
+        # Completeness derivation: the bounded-read projection is the
+        # upper bound. A caller override may lower completeness (for
+        # stale/display-only callers) but may not turn a truncated
+        # snapshot back into ``complete``. If omitted rows exist and no
+        # exact page refs survive, the snapshot is display-only because a
+        # downstream consumer cannot drill into exact paged evidence.
+        exact_page_refs_cover_snapshot = self._page_refs_are_exact(page_refs)
+        truncated_without_page_refs = (
+            truncated and not exact_page_refs_cover_snapshot
+        )
+        derived_completeness: CompletenessState
+        if truncated_without_page_refs:
+            derived_completeness = "preview_only"
+        elif truncated:
+            derived_completeness = "paged"
         else:
-            completeness = "paged" if truncated else "complete"
+            derived_completeness = "complete"
+        completeness = self._restrict_completeness_override(
+            derived_completeness=derived_completeness,
+            override=inputs.completeness_override,
+        )
 
         # Evidence-quality derivation: caller override wins; otherwise
         # corpus-supplied value.
@@ -873,6 +941,13 @@ class GovernanceSnapshotAPI:
 
         # Construct the typed GovernanceSnapshot record (per doc-19:71-87).
         try:
+            blocked_by = list(corpus.blocked_by)
+            if (
+                truncated_without_page_refs
+                and _TRUNCATED_WITHOUT_PAGE_REFS_BLOCKER not in blocked_by
+            ):
+                blocked_by.append(_TRUNCATED_WITHOUT_PAGE_REFS_BLOCKER)
+
             snapshot = GovernanceSnapshot(
                 corpus_id=inputs.corpus_id,
                 snapshot_version=inputs.snapshot_version,
@@ -889,7 +964,28 @@ class GovernanceSnapshotAPI:
                 recommendations=recommendations,
                 replay_results=replay_results,
                 evidence_quality=evidence_quality,
-                blocked_by=list(corpus.blocked_by),
+                blocked_by=blocked_by,
+            )
+            snapshot = self._enforce_serialized_budget(
+                snapshot,
+                page_refs_are_exact=exact_page_refs_cover_snapshot,
+            )
+        except _SerializedSnapshotBudgetExceeded as exc:
+            gap_findings.append(
+                SnapshotAPIGap(
+                    failure_id=SNAPSHOT_API_FAILURE_ID,
+                    corpus_id=inputs.corpus_id,
+                    reason="serialized_response_budget_exceeded",
+                    observed_at=_utcnow(),
+                    evidence_payload={
+                        "serialized_bytes": exc.serialized_bytes,
+                        "max_response_bytes": exc.max_response_bytes,
+                    },
+                )
+            )
+            return SnapshotAPIResult(
+                snapshot=None,
+                gap_findings=gap_findings,
             )
         except (ValidationError, ValueError, TypeError) as exc:
             gap_findings.append(
@@ -915,6 +1011,161 @@ class GovernanceSnapshotAPI:
         )
 
     # --- Bounded-read truncation helpers (LIMIT cap+1 discipline) ---
+
+    @staticmethod
+    def _serialized_snapshot_bytes(snapshot: GovernanceSnapshot) -> int:
+        return len(snapshot.model_dump_json().encode("utf-8"))
+
+    @staticmethod
+    def _enforce_serialized_budget(
+        snapshot: GovernanceSnapshot,
+        *,
+        page_refs_are_exact: bool,
+    ) -> GovernanceSnapshot:
+        """Drop bounded list rows until the serialized snapshot fits.
+
+        If scalar metadata alone exceeds the caller's byte cap, fail closed
+        instead of returning an over-budget snapshot.
+        """
+
+        max_bytes = int(snapshot.max_response_bytes or 0)
+        if max_bytes <= 0:
+            return snapshot
+        if (
+            GovernanceSnapshotAPI._serialized_snapshot_bytes(snapshot)
+            <= max_bytes
+        ):
+            return snapshot
+
+        top_findings = list(snapshot.top_findings)
+        recommendations = list(snapshot.recommendations)
+        replay_results = list(snapshot.replay_results)
+        page_refs = list(snapshot.page_refs)
+        omitted_counts = dict(snapshot.omitted_counts)
+        blocked_by = list(snapshot.blocked_by)
+
+        def rebuild() -> GovernanceSnapshot:
+            budget_completeness: CompletenessState
+            if page_refs and page_refs_are_exact:
+                budget_completeness = "paged"
+            else:
+                budget_completeness = "preview_only"
+                if (
+                    _TRUNCATED_WITHOUT_PAGE_REFS_BLOCKER
+                    not in blocked_by
+                ):
+                    blocked_by.append(_TRUNCATED_WITHOUT_PAGE_REFS_BLOCKER)
+            completeness = min(
+                (snapshot.completeness, budget_completeness),
+                key=lambda state: _COMPLETENESS_AUTHORITY_RANK[state],
+            )
+            digest = compute_governance_snapshot_digest(
+                corpus_id=snapshot.corpus_id,
+                snapshot_version=snapshot.snapshot_version,
+                scorecard_id=snapshot.scorecard_id,
+                finding_idempotency_keys=[
+                    finding.idempotency_key for finding in top_findings
+                ],
+                recommendation_idempotency_keys=[
+                    recommendation.idempotency_key
+                    for recommendation in recommendations
+                ],
+                replay_result_ids=[
+                    result.result_id for result in replay_results
+                ],
+                replay_result_versions=[
+                    result.result_version for result in replay_results
+                ],
+                omitted_counts=omitted_counts,
+                evidence_quality=snapshot.evidence_quality,
+                completeness=completeness,
+            )
+            return snapshot.model_copy(
+                update={
+                    "snapshot_digest": digest,
+                    "truncated": True,
+                    "omitted_counts": dict(omitted_counts),
+                    "completeness": completeness,
+                    "page_refs": list(page_refs),
+                    "top_findings": list(top_findings),
+                    "recommendations": list(recommendations),
+                    "replay_results": list(replay_results),
+                    "blocked_by": list(blocked_by),
+                }
+            )
+
+        budgeted = snapshot
+        while (
+            GovernanceSnapshotAPI._serialized_snapshot_bytes(budgeted)
+            > max_bytes
+        ):
+            if replay_results:
+                replay_results.pop()
+                omitted_counts["replay_results"] = (
+                    omitted_counts.get("replay_results", 0) + 1
+                )
+            elif recommendations:
+                recommendations.pop()
+                omitted_counts["recommendations"] = (
+                    omitted_counts.get("recommendations", 0) + 1
+                )
+            elif top_findings:
+                top_findings.pop()
+                omitted_counts["findings"] = (
+                    omitted_counts.get("findings", 0) + 1
+                )
+            elif page_refs:
+                page_refs.pop()
+                omitted_counts["page_refs"] = (
+                    omitted_counts.get("page_refs", 0) + 1
+                )
+            else:
+                break
+            budgeted = rebuild()
+        serialized_bytes = GovernanceSnapshotAPI._serialized_snapshot_bytes(
+            budgeted
+        )
+        if serialized_bytes > max_bytes:
+            raise _SerializedSnapshotBudgetExceeded(
+                serialized_bytes=serialized_bytes,
+                max_response_bytes=max_bytes,
+            )
+        return budgeted
+
+    @staticmethod
+    def _page_refs_are_exact(rows: list[GovernanceEvidencePageRef]) -> bool:
+        """True when every surviving page ref is exact authoritative evidence."""
+
+        return bool(rows) and all(
+            row.exact
+            and row.completeness in ("complete", "paged")
+            and bool(row.page_ref_id.strip())
+            and bool(row.digest.strip())
+            for row in rows
+        )
+
+    @staticmethod
+    def _restrict_completeness_override(
+        *,
+        derived_completeness: CompletenessState,
+        override: CompletenessState | None,
+    ) -> CompletenessState:
+        """Return the most restrictive proven completeness state.
+
+        The derived state is computed from actual omitted counts and
+        page-ref coverage. Caller overrides are allowed to lower that
+        state, but never to raise it above the bounded evidence the API
+        observed.
+        """
+
+        if override is None:
+            return derived_completeness
+        if (
+            _COMPLETENESS_AUTHORITY_RANK[override]
+            > _COMPLETENESS_AUTHORITY_RANK[derived_completeness]
+        ):
+            return derived_completeness
+        return override
 
     @staticmethod
     def _truncate_findings(
@@ -980,18 +1231,27 @@ class GovernanceSnapshotAPI:
         (refs-only per the bounded-reads non-negotiable).
         """
 
+        _, ref_ids, omitted = GovernanceSnapshotAPI._truncate_page_ref_rows(
+            rows, cap
+        )
+        return ref_ids, omitted
+
+    @staticmethod
+    def _truncate_page_ref_rows(
+        rows: list[GovernanceEvidencePageRef], cap: int
+    ) -> tuple[list[GovernanceEvidencePageRef], list[str], int]:
+        """Truncate page refs and preserve typed rows for exactness checks."""
+
         if cap < 0:
-            return [], len(rows)
+            return [], [], len(rows)
         if len(rows) > cap:
             truncated_rows = rows[:cap]
             omitted = len(rows) - cap
         else:
             truncated_rows = list(rows)
             omitted = 0
-        ref_ids: list[str] = [
-            ref.page_ref_id for ref in truncated_rows
-        ]
-        return ref_ids, omitted
+        ref_ids: list[str] = [ref.page_ref_id for ref in truncated_rows]
+        return truncated_rows, ref_ids, omitted
 
 
 # --- Forward-reference resolution -------------------------------------------

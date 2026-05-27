@@ -214,20 +214,16 @@ def test_adapter_completeness_complete_for_carries_feature_and_task_scopes() -> 
 def test_adapter_state_paged_when_truncation_notes_non_empty() -> None:
     """Per doc-13a:115-118 + doc-13a:303-310: a non-empty
     ``truncation_notes`` signals the semantic context was bounded but
-    the page boundaries are recoverable; the adapter sets
-    ``state="paged"`` so the consumer may treat the bundle as
-    authoritative but MUST traverse the page-refs.
-
-    Critically: ``state="paged"`` is **authoritative** -- the consumer
-    may drive execution decisions from a paged bundle (per doc-13a:18-23
-    the Slice 13A invariant permits exact-or-paged evidence as
-    authority).
+    the adapter sets ``state="paged"``. A dispatcher may drive execution
+    from paged context only when exact page refs are present on
+    completeness; the dispatcher fails closed when the refs are absent.
     """
 
     legacy = _legacy_bundle(truncation_notes=["budget exhausted; 2 of 5 pages dropped"])
     bundle = _derive(legacy)
     assert bundle.completeness.state == "paged"
-    # Authority preserved -- paged evidence remains authoritative.
+    # Authority is preserved on the wrapper, but runtime dispatch also
+    # requires exact page refs for paged evidence.
     assert bundle.completeness.authority == "execution_authority"
     # And the legacy truncation_notes is preserved verbatim on the
     # display-only wrapper field per doc-13a:213-215.
@@ -482,6 +478,26 @@ def test_authoritative_wrapper_round_trips_with_excluded_evidence_refs() -> None
     restored = AuthoritativePromptContextBundle.model_validate_json(serialised)
     assert restored == bundle
     assert restored.excluded_evidence_refs == refs
+    assert restored.completeness.page_refs == refs
+
+
+def test_paged_authoritative_wrapper_carries_page_refs_in_completeness() -> None:
+    refs = [
+        EvidencePageRef(
+            ref_id="page-ref-paged-1",
+            source_kind="typed_row",
+            source_id=1001,
+            sha256="paged-sha",
+            reason="large-prompt-page",
+        ),
+    ]
+    bundle = _derive(
+        _legacy_bundle(truncation_notes=["large prompt paged"]),
+        excluded_evidence_refs=refs,
+    )
+
+    assert bundle.completeness.state == "paged"
+    assert bundle.completeness.page_refs == refs
 
 
 # ── (i) legacy PromptContextBundle NOT modified by adapter call ─────────────

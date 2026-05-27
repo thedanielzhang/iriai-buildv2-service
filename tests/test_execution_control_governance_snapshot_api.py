@@ -562,7 +562,8 @@ def test_build_snapshot_truncates_findings() -> None:
     ]
     inputs = SnapshotAPIInputs(corpus_id="c", max_findings=3)
     result = api.build_snapshot(
-        inputs, SnapshotAPICorpus(findings=findings)
+        inputs,
+        SnapshotAPICorpus(findings=findings, page_refs=[_page_ref()]),
     )
     s = result.snapshot
     assert s is not None
@@ -697,19 +698,83 @@ def test_build_snapshot_upstream_omitted_counts_added() -> None:
     assert s.truncated is True
 
 
-def test_build_snapshot_truncated_when_only_upstream_truncated() -> None:
+def test_build_snapshot_upstream_truncated_with_page_refs_is_paged() -> None:
     """Even with no per-call truncation, upstream-truncated rows
-    must make truncated=True + completeness=paged."""
+    must make truncated=True + completeness=paged when page refs cover
+    the paged evidence."""
 
     api = _api()
     inputs = SnapshotAPIInputs(corpus_id="c")
-    corpus = SnapshotAPICorpus(omitted_findings_count=3)
+    corpus = SnapshotAPICorpus(
+        omitted_findings_count=3,
+        page_refs=[_page_ref()],
+    )
     result = api.build_snapshot(inputs, corpus)
     s = result.snapshot
     assert s is not None
     assert s.truncated is True
     assert s.completeness == "paged"
     assert s.omitted_counts["findings"] == 3
+
+
+def test_build_snapshot_truncated_without_page_refs_is_display_only() -> None:
+    """19A-P2-004: omitted rows without page refs cannot remain
+    authoritative.
+
+    A truncated snapshot that exposes no page refs is display-only, even if
+    the caller attempts to raise completeness via an override.
+    """
+
+    api = _api()
+    inputs = SnapshotAPIInputs(
+        corpus_id="c",
+        max_findings=0,
+        completeness_override="complete",
+    )
+    result = api.build_snapshot(
+        inputs,
+        SnapshotAPICorpus(findings=[_finding()]),
+    )
+    s = result.snapshot
+    assert s is not None
+    assert s.truncated is True
+    assert s.page_refs == []
+    assert s.completeness == "preview_only"
+    assert (
+        "governance_snapshot_truncated_without_page_refs" in s.blocked_by
+    )
+
+
+def test_build_snapshot_truncated_with_non_exact_page_refs_is_display_only() -> None:
+    """19A-P2-013: non-exact refs cannot back paged snapshot authority."""
+
+    api = _api()
+    inputs = SnapshotAPIInputs(
+        corpus_id="c",
+        max_findings=0,
+        completeness_override="complete",
+    )
+    result = api.build_snapshot(
+        inputs,
+        SnapshotAPICorpus(
+            findings=[_finding()],
+            page_refs=[
+                _page_ref(
+                    page_ref_id="preview-page",
+                    completeness="preview_only",
+                    exact=False,
+                )
+            ],
+        ),
+    )
+    s = result.snapshot
+    assert s is not None
+    assert s.truncated is True
+    assert s.page_refs == ["preview-page"]
+    assert s.completeness == "preview_only"
+    assert (
+        "governance_snapshot_truncated_without_page_refs" in s.blocked_by
+    )
 
 
 # --- Section 8: completeness override + evidence_quality override --------
@@ -724,6 +789,51 @@ def test_completeness_override_wins() -> None:
     s = result.snapshot
     assert s is not None
     assert s.completeness == "preview_only"
+
+
+def test_completeness_override_cannot_raise_truncated_snapshot() -> None:
+    """19A-P2-004: caller override cannot raise derived truncation state."""
+
+    api = _api()
+    inputs = SnapshotAPIInputs(
+        corpus_id="c",
+        max_findings=0,
+        completeness_override="complete",
+    )
+    result = api.build_snapshot(
+        inputs,
+        SnapshotAPICorpus(
+            findings=[_finding()],
+            page_refs=[_page_ref()],
+        ),
+    )
+    s = result.snapshot
+    assert s is not None
+    assert s.truncated is True
+    assert s.page_refs == ["page-ref-19-2-1"]
+    assert s.completeness == "paged"
+
+
+def test_completeness_override_can_lower_truncated_snapshot() -> None:
+    """Overrides still may lower completeness for stale/display-only callers."""
+
+    api = _api()
+    inputs = SnapshotAPIInputs(
+        corpus_id="c",
+        max_findings=0,
+        completeness_override="unavailable",
+    )
+    result = api.build_snapshot(
+        inputs,
+        SnapshotAPICorpus(
+            findings=[_finding()],
+            page_refs=[_page_ref()],
+        ),
+    )
+    s = result.snapshot
+    assert s is not None
+    assert s.truncated is True
+    assert s.completeness == "unavailable"
 
 
 def test_evidence_quality_override_wins() -> None:
@@ -755,7 +865,11 @@ def test_completeness_derived_paged_when_truncated() -> None:
     api = _api()
     inputs = SnapshotAPIInputs(corpus_id="c", max_findings=0)
     result = api.build_snapshot(
-        inputs, SnapshotAPICorpus(findings=[_finding()])
+        inputs,
+        SnapshotAPICorpus(
+            findings=[_finding()],
+            page_refs=[_page_ref()],
+        ),
     )
     s = result.snapshot
     assert s is not None
@@ -1476,6 +1590,136 @@ def test_snapshot_max_response_bytes_passed_through() -> None:
     s = result.snapshot
     assert s is not None
     assert s.max_response_bytes == 99_999
+
+
+def test_snapshot_serialized_payload_honors_max_response_bytes() -> None:
+    api = _api()
+    findings = [
+        _finding(
+            idempotency_key=f"k-byte-{i}",
+            recommended_action_display="x" * 5000,
+        )
+        for i in range(8)
+    ]
+    inputs = SnapshotAPIInputs(
+        corpus_id="byte-budget",
+        max_response_bytes=6000,
+        max_findings=8,
+    )
+
+    result = api.build_snapshot(inputs, SnapshotAPICorpus(findings=findings))
+
+    s = result.snapshot
+    assert s is not None
+    assert len(s.model_dump_json().encode("utf-8")) <= s.max_response_bytes
+    assert s.truncated is True
+    assert s.omitted_counts["findings"] > 0
+
+
+def test_snapshot_irreducible_payload_over_budget_fails_closed() -> None:
+    api = _api()
+    result = api.build_snapshot(
+        SnapshotAPIInputs(corpus_id="byte-budget", max_response_bytes=1),
+        SnapshotAPICorpus(),
+    )
+
+    assert result.snapshot is None
+    assert len(result.gap_findings) == 1
+    gap = result.gap_findings[0]
+    assert gap.failure_id == SNAPSHOT_API_FAILURE_ID
+    assert gap.reason == "serialized_response_budget_exceeded"
+    assert gap.evidence_payload is not None
+    assert gap.evidence_payload["serialized_bytes"] > gap.evidence_payload[
+        "max_response_bytes"
+    ]
+
+
+@pytest.mark.parametrize("max_response_bytes", [0, -1])
+def test_snapshot_non_positive_max_response_bytes_fails_closed(
+    max_response_bytes: int,
+) -> None:
+    api = _api()
+    result = api.build_snapshot(
+        SnapshotAPIInputs(
+            corpus_id="byte-budget",
+            max_response_bytes=max_response_bytes,
+        ),
+        SnapshotAPICorpus(),
+    )
+
+    assert result.snapshot is None
+    assert len(result.gap_findings) == 1
+    gap = result.gap_findings[0]
+    assert gap.failure_id == SNAPSHOT_API_FAILURE_ID
+    assert gap.reason == "max_response_bytes_non_positive"
+    assert gap.evidence_payload == {"max_response_bytes": max_response_bytes}
+
+
+def test_snapshot_serialized_trimming_preserves_lowered_completeness() -> None:
+    api = _api()
+    findings = [
+        _finding(
+            idempotency_key=f"k-lowered-{i}",
+            recommended_action_display="x" * 5000,
+        )
+        for i in range(8)
+    ]
+    inputs = SnapshotAPIInputs(
+        corpus_id="byte-budget",
+        max_response_bytes=6000,
+        max_findings=8,
+        completeness_override="unavailable",
+    )
+
+    result = api.build_snapshot(
+        inputs,
+        SnapshotAPICorpus(findings=findings, page_refs=[_page_ref()]),
+    )
+
+    s = result.snapshot
+    assert s is not None
+    assert s.truncated is True
+    assert s.completeness == "unavailable"
+
+
+def test_snapshot_serialized_trimming_preserves_non_exact_preview_only() -> None:
+    api = _api()
+    findings = [
+        _finding(
+            idempotency_key=f"k-preview-{i}",
+            recommended_action_display="x" * 5000,
+        )
+        for i in range(8)
+    ]
+    inputs = SnapshotAPIInputs(
+        corpus_id="byte-budget",
+        max_response_bytes=6000,
+        max_findings=8,
+        completeness_override="complete",
+    )
+
+    result = api.build_snapshot(
+        inputs,
+        SnapshotAPICorpus(
+            findings=findings,
+            page_refs=[
+                _page_ref(
+                    page_ref_id="preview-page",
+                    completeness="preview_only",
+                    exact=False,
+                )
+            ],
+        ),
+    )
+
+    s = result.snapshot
+    assert s is not None
+    assert s.truncated is True
+    assert s.page_refs == ["preview-page"]
+    assert s.completeness == "preview_only"
+    assert (
+        "governance_snapshot_truncated_without_page_refs" in s.blocked_by
+    )
 
 
 # --- Section 19: ordering preserved ---------------------------------------

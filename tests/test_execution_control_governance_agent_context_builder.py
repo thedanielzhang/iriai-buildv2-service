@@ -1,7 +1,7 @@
 """Slice 19 5th sub-slice -- unit tests for the typed agent-context
 builder at ``execution_control/governance_agent_context_builder.py``.
 
-Covers the doc-19:157-160 step 5 + doc-19:124-127 + doc-19:144-146
+Covers the doc-19 step 5 + doc-19:124-127 + doc-19:144-146
 agent-context-builder surface:
 
 * :data:`AGENT_CONTEXT_BUILDER_FAILURE_ID` -- the typed failure id
@@ -28,7 +28,8 @@ agent-context-builder surface:
     ``upstream_snapshot_missing`` + propagated upstream gaps.
   * Renderer NEVER raises (typed gap projection on construction
     failure).
-  * Slice 21-conditional ContextLayerPackageSummary DEFERRED.
+  * Slice 21 ContextLayerPackageSummary WIRED as advisory reporting
+    context.
 * DIRECT annotation-identity REUSE assertions for Slice 19 1st
   GovernanceAgentContext + Slice 19 2nd SnapshotAPIResult /
   SnapshotAPIGap + Slice 13a CompletenessState + Slice 16
@@ -65,6 +66,7 @@ from iriai_build_v2.execution_control.finding_engine import (
 )
 from iriai_build_v2.execution_control.governance_agent import (
     GOVERNANCE_AGENT_CONTEXT_MAX_PROMPT_CHARS_CAP,
+    ContextLayerPackageSummary,
     GovernanceAgentContext,
 )
 from iriai_build_v2.execution_control.governance_agent_context_builder import (
@@ -91,6 +93,12 @@ from iriai_build_v2.workflows.develop.execution.failure_router import (
     ROUTE_TABLE,
     FailureType,
     RouteAction,
+)
+from iriai_build_v2.workflows.develop.context_layer.models import (
+    ContextEvidenceSnapshot,
+    ContextLayerPackage,
+    ContextLayerRequest,
+    ProviderStateRef,
 )
 from iriai_build_v2.workflows.develop.governance.models import (
     CompletenessState,
@@ -125,6 +133,81 @@ def _page_ref(**overrides: object) -> GovernanceEvidencePageRef:
     )
     base.update(overrides)
     return GovernanceEvidencePageRef(**base)
+
+
+def _context_package_summary(
+    **overrides: object,
+) -> ContextLayerPackageSummary:
+    base: dict[str, object] = dict(
+        package_id="ctxpkg-21-builder-1",
+        package_digest="1" * 64,
+        package_ref=_evidence_ref(ref_id="ctxpkg-ref-21-builder-1"),
+        source_dag_artifact_id=2100,
+        dag_sha256="2" * 64,
+        typed_evidence_digest="3" * 64,
+        provider_state_digest="4" * 64,
+        advisory_only=True,
+        omitted_counts={"provider_records": 2, "page_refs": 1},
+        page_refs=[_page_ref(page_ref_id="ctxpkg-page-ref-21-builder-1")],
+        completeness="paged",
+        truncated=True,
+    )
+    base.update(overrides)
+    return ContextLayerPackageSummary(**base)
+
+
+def _context_layer_package(**overrides: object) -> ContextLayerPackage:
+    evidence_snapshot = ContextEvidenceSnapshot(
+        source_dag_artifact_id=2100,
+        dag_sha256="2" * 64,
+        typed_journal_high_watermark=17,
+        typed_evidence_digest="3" * 64,
+        governance_snapshot_digest="6" * 64,
+    )
+    request = ContextLayerRequest(
+        feature_id="8ac124d6",
+        source_dag_artifact_id=2100,
+        dag_sha256="2" * 64,
+        evidence_snapshot=evidence_snapshot,
+        require_complete=True,
+    )
+    page_ref = _evidence_ref(
+        authority="git_provenance",
+        ref_id="review:context-package:ctxpkg-real-21:page:0",
+        digest="5" * 64,
+        completeness="complete",
+    )
+    provider_state_ref = ProviderStateRef(
+        provider="native_git",
+        repo_id="repo-21",
+        ref="HEAD",
+        state_digest="7" * 64,
+        status="available",
+    )
+    base: dict[str, object] = dict(
+        package_id="ctxpkg-real-21",
+        package_digest="8" * 64,
+        generated_at=datetime(2026, 5, 27, 12, 0, tzinfo=timezone.utc),
+        package_kind="manifest",
+        completeness="paged",
+        request=request,
+        source_dag_artifact_id=2100,
+        dag_sha256="2" * 64,
+        evidence_snapshot=evidence_snapshot,
+        provider_state_refs=[provider_state_ref],
+        provider_state_digest="9" * 64,
+        provider_order=["native_git"],
+        provider_records=[],
+        iriai_lineage=[],
+        rendered_preview=None,
+        page_refs=[page_ref],
+        omitted_refs=[page_ref],
+        omitted_counts={"provider_records": 1},
+        incomplete_reason=None,
+        advisory_only=True,
+    )
+    base.update(overrides)
+    return ContextLayerPackage(**base)
 
 
 def _finding(**overrides: object) -> GovernanceFinding:
@@ -331,7 +414,8 @@ def test_no_re_export_from_execution_control_init() -> None:
 
     from iriai_build_v2 import execution_control as pkg
 
-    init_exports = pkg.__all__ if hasattr(pkg, "__all__") else []
+    assert hasattr(pkg, "__all__")
+    init_exports = pkg.__all__
     forbidden = {
         "AGENT_CONTEXT_BUILDER_FAILURE_ID",
         "GovernanceAgentContextBuilder",
@@ -353,13 +437,13 @@ def test_module_carries_doc_19_step_5_citation() -> None:
     )
 
     assert mod.__doc__ is not None
-    assert "157-160" in mod.__doc__
+    assert "Refactoring Steps step 5" in mod.__doc__
     assert "step 5" in mod.__doc__.lower()
 
 
-def test_module_documents_slice_21_deferral() -> None:
-    """The module docstring must document the Slice 21-conditional
-    ContextLayerPackageSummary deferral per doc-19:89-101 +
+def test_module_documents_slice_21_wiring() -> None:
+    """The module docstring must document Slice 21
+    ContextLayerPackageSummary wiring per doc-19:89-101 +
     doc-19:125-127."""
 
     from iriai_build_v2.execution_control import (
@@ -367,7 +451,7 @@ def test_module_documents_slice_21_deferral() -> None:
     )
 
     assert mod.__doc__ is not None
-    assert "DEFERRED" in mod.__doc__
+    assert "WIRED" in mod.__doc__
     assert "ContextLayerPackageSummary" in mod.__doc__
     assert "Slice 21" in mod.__doc__
 
@@ -404,6 +488,21 @@ def test_scope_extra_forbid() -> None:
         AgentContextScope(unknown_field="x")  # type: ignore[call-arg]
 
 
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"line_start": 0},
+        {"line_start": -1},
+        {"line_end": 0},
+        {"line_end": -1},
+        {"line_start": 20, "line_end": 10},
+    ],
+)
+def test_scope_rejects_invalid_line_ranges(kwargs: dict[str, int]) -> None:
+    with pytest.raises(ValidationError):
+        AgentContextScope(path="src/foo.py", **kwargs)
+
+
 def test_scope_is_basemodel() -> None:
     assert issubclass(AgentContextScope, BaseModel)
 
@@ -428,6 +527,7 @@ def test_inputs_construction_minimal() -> None:
     assert inputs.line_provenance_results == []
     assert inputs.line_provenance_paths == []
     assert inputs.line_provenance_line_ranges == []
+    assert inputs.context_package is None
     assert (
         inputs.max_prompt_chars
         == GOVERNANCE_AGENT_CONTEXT_MAX_PROMPT_CHARS_CAP
@@ -463,6 +563,30 @@ def test_inputs_accepts_custom_max_prompt_chars() -> None:
         max_prompt_chars=5_000,
     )
     assert inputs.max_prompt_chars == 5_000
+
+
+def test_inputs_accepts_context_package_summary() -> None:
+    source = _build_snapshot_via_api()
+    summary = _context_package_summary()
+    inputs = AgentContextBuilderInputs(
+        source=source,
+        scope=AgentContextScope(),
+        context_package=summary,
+    )
+    assert inputs.context_package == summary
+    assert inputs.context_package.advisory_only is True
+
+
+def test_inputs_accepts_context_layer_package() -> None:
+    source = _build_snapshot_via_api()
+    package = _context_layer_package()
+    inputs = AgentContextBuilderInputs(
+        source=source,
+        scope=AgentContextScope(),
+        context_package=package,
+    )
+    assert inputs.context_package == package
+    assert inputs.context_package.advisory_only is True
 
 
 def test_inputs_line_provenance_default_empty() -> None:
@@ -804,6 +928,7 @@ def test_scope_filters_line_provenance_by_task_id() -> None:
             source=source,
             scope=AgentContextScope(task_id="task-1"),
             line_provenance_results=[lpr1, lpr2],
+            context_package=_context_package_summary(),
         )
     )
     assert result.context is not None
@@ -820,6 +945,7 @@ def test_scope_filters_line_provenance_by_path() -> None:
             scope=AgentContextScope(path="src/foo.py"),
             line_provenance_results=[lpr1, lpr2],
             line_provenance_paths=["src/foo.py", "src/bar.py"],
+            context_package=_context_package_summary(),
         )
     )
     assert result.context is not None
@@ -848,6 +974,7 @@ def test_scope_filters_line_provenance_by_line_range() -> None:
                 (100, 200),  # outside
                 (18, 25),  # overlaps with 10-20
             ],
+            context_package=_context_package_summary(),
         )
     )
     assert result.context is not None
@@ -1038,7 +1165,8 @@ def test_build_ranks_findings_by_severity_first() -> None:
         estimated_lost_hours=0.5,
     )
     source = _build_snapshot_via_api(findings=[f_low, f_high])
-    # Set a budget large enough for exactly one finding.
+    # Set a tight budget and assert ranking without assuming the current
+    # serialized size admits exactly one finding.
     result = _builder().build(
         AgentContextBuilderInputs(
             source=source,
@@ -1047,11 +1175,7 @@ def test_build_ranks_findings_by_severity_first() -> None:
         )
     )
     assert result.context is not None
-    # If only one fits, it should be the critical one.
-    if len(result.context.relevant_findings) == 1:
-        assert (
-            result.context.relevant_findings[0].idempotency_key == "f-high"
-        )
+    assert result.context.relevant_findings[0].idempotency_key == "f-high"
 
 
 def test_build_ranks_findings_by_confidence_second() -> None:
@@ -1273,6 +1397,14 @@ def test_reuses_agent_context_scope_directly() -> None:
     assert hints["scope"] is AgentContextScope
 
 
+def test_reuses_context_layer_package_summary_directly() -> None:
+    hints = typing.get_type_hints(AgentContextBuilderInputs)
+    union_args = typing.get_args(hints["context_package"])
+    assert ContextLayerPackageSummary in union_args
+    assert ContextLayerPackage in union_args
+    assert type(None) in union_args
+
+
 def test_reuses_line_provenance_result_directly() -> None:
     hints = typing.get_type_hints(AgentContextBuilderInputs)
     # The annotation is list[LineProvenanceResult]; check via
@@ -1454,8 +1586,8 @@ def test_ac1_bounded_reproducible_evidence_cited_structured_first() -> None:
 
 
 def test_ac2_truncated_carries_page_refs_when_paged() -> None:
-    """AC2 (doc-19:225-226): Truncated reports MUST carry exact page
-    refs and completeness metadata."""
+    """AC2 (doc-19:225-226): truncated contexts carry completeness plus
+    exact page-ref ids traceable to upstream page-ref rows."""
 
     page_ref = _page_ref()
     source = _build_snapshot_via_api(
@@ -1472,6 +1604,7 @@ def test_ac2_truncated_carries_page_refs_when_paged() -> None:
     assert result.context is not None
     assert result.context.truncated is True
     assert page_ref.page_ref_id in result.context.page_refs
+    assert result.context.page_refs == [page_ref.page_ref_id]
 
 
 def test_ac2_preview_only_completeness_propagated() -> None:
@@ -1489,9 +1622,10 @@ def test_ac2_preview_only_completeness_propagated() -> None:
     assert result.context.completeness == "preview_only"
 
 
-def test_ac3_compact_governance_context_at_task_execute_time() -> None:
-    """AC3 (doc-19:227): Workflow agents can receive compact governance
-    context. Verified by the typed GovernanceAgentContext shape itself."""
+def test_ac3_reusable_display_advisory_context_builder_only() -> None:
+    """19A-5 remediation of doc-19:227: Slice 19 provides a reusable
+    display/advisory builder only. Production task-execute consumption
+    is deferred to a later accepted source-of-truth slice."""
 
     source = _build_snapshot_via_api()
     result = _builder().build(
@@ -1671,46 +1805,199 @@ def test_ac7_does_not_extend_control_plane_writer_methods() -> None:
         )
 
 
-# --- Section 15: Slice 21-conditional ContextLayerPackageSummary deferral
+# --- Section 15: Slice 21 ContextLayerPackageSummary wiring -----------------
 
 
-def test_context_does_not_carry_context_package_field_yet() -> None:
-    """Per doc-19:89-101 + doc-19:125-127 the ContextLayerPackageSummary
-    field is DEFERRED to Slice 21. The Slice 19 1st sub-slice
-    GovernanceAgentContext typed shape does NOT include a
-    context_package attribute; this 5th sub-slice builder does NOT
-    populate it."""
+def test_context_carries_context_package_summary_when_provided() -> None:
+    """Slice 21: the builder carries the caller-provided package summary
+    onto the advisory governance-agent context surface.
+    """
 
     source = _build_snapshot_via_api()
+    summary = _context_package_summary()
     result = _builder().build(
         AgentContextBuilderInputs(
-            source=source, scope=AgentContextScope()
+            source=source,
+            scope=AgentContextScope(),
+            context_package=summary,
         )
     )
     assert result.context is not None
-    # The typed shape MUST NOT have a context_package field at this
-    # 5th sub-slice (Slice 21 will tighten the typed surface).
-    assert not hasattr(result.context, "context_package")
+    assert result.context.context_package == summary
+    assert result.context.context_package.package_id == "ctxpkg-21-builder-1"
+    assert result.context.context_package.package_digest == "1" * 64
+    assert result.context.context_package.source_dag_artifact_id == 2100
+    assert result.context.context_package.dag_sha256 == "2" * 64
+    assert result.context.context_package.typed_evidence_digest == "3" * 64
+    assert result.context.context_package.provider_state_digest == "4" * 64
+    assert result.context.context_package.advisory_only is True
+    assert result.context.policy_guidance_authority == "advisory_only"
 
 
-def test_slice_21_deferral_documented_in_module() -> None:
-    """The module MUST document the Slice 21-conditional deferral."""
+def test_context_projects_context_layer_package_to_summary() -> None:
+    """The Slice 21 builder consumes the real ContextLayerPackage shape
+    and returns only the compact governance-agent summary.
+    """
+
+    source = _build_snapshot_via_api()
+    package = _context_layer_package()
+    result = _builder().build(
+        AgentContextBuilderInputs(
+            source=source,
+            scope=AgentContextScope(),
+            context_package=package,
+        )
+    )
+
+    assert result.context is not None
+    summary = result.context.context_package
+    assert isinstance(summary, ContextLayerPackageSummary)
+    assert summary.package_id == package.package_id
+    assert summary.package_digest == package.package_digest
+    assert summary.package_ref.ref_id == package.review_ref
+    assert summary.source_dag_artifact_id == package.source_dag_artifact_id
+    assert summary.dag_sha256 == package.dag_sha256
+    assert summary.typed_evidence_digest == (
+        package.evidence_snapshot.typed_evidence_digest
+    )
+    assert summary.provider_state_digest == package.provider_state_digest
+    assert summary.advisory_only is True
+    assert summary.omitted_counts == package.omitted_counts
+    assert summary.completeness == package.completeness
+    assert summary.truncated is True
+    assert [ref.page_ref_id for ref in summary.page_refs] == [
+        ref.ref_id for ref in package.page_refs
+    ]
+    assert summary.page_refs[0].source_ref_id == package.package_id
+
+
+def test_line_provenance_requires_context_package_summary() -> None:
+    source = _build_snapshot_via_api()
+    lpr = _line_provenance_result(task_ids=["task-1"])
+    result = _builder().build(
+        AgentContextBuilderInputs(
+            source=source,
+            scope=AgentContextScope(task_id="task-1"),
+            line_provenance_results=[lpr],
+        )
+    )
+
+    assert result.context is None
+    assert len(result.gap_findings) == 1
+    gap = result.gap_findings[0]
+    assert gap.failure_id == AGENT_CONTEXT_BUILDER_FAILURE_ID
+    assert gap.reason == "missing_context_package_summary"
+    assert gap.corpus_id == source.snapshot.corpus_id
+    assert gap.evidence_payload == {
+        "line_provenance_results_count": 1,
+        "scoped_line_provenance_count": 1,
+        "line_provenance_paths_count": 0,
+        "line_provenance_line_ranges_count": 0,
+        "scope_task_id": "task-1",
+        "scope_repo_id": None,
+        "scope_path": None,
+        "scope_line_start": None,
+        "scope_line_end": None,
+    }
+
+
+def test_line_scope_without_matching_provenance_requires_context_package_summary() -> None:
+    source = _build_snapshot_via_api()
+    lpr = _line_provenance_result()
+    result = _builder().build(
+        AgentContextBuilderInputs(
+            source=source,
+            scope=AgentContextScope(
+                path="src/foo.py", line_start=100, line_end=200
+            ),
+            line_provenance_results=[lpr],
+            line_provenance_paths=["src/foo.py"],
+            line_provenance_line_ranges=[(1, 10)],
+        )
+    )
+
+    assert result.context is None
+    assert len(result.gap_findings) == 1
+    gap = result.gap_findings[0]
+    assert gap.reason == "missing_context_package_summary"
+    assert gap.evidence_payload["line_provenance_results_count"] == 1
+    assert gap.evidence_payload["scoped_line_provenance_count"] == 0
+    assert gap.evidence_payload["scope_path"] == "src/foo.py"
+    assert gap.evidence_payload["scope_line_start"] == 100
+    assert gap.evidence_payload["scope_line_end"] == 200
+
+
+def test_context_package_defaults_to_none_without_slice_21_input() -> None:
+    source = _build_snapshot_via_api()
+    result = _builder().build(
+        AgentContextBuilderInputs(
+            source=source,
+            scope=AgentContextScope(),
+        )
+    )
+    assert result.context is not None
+    assert result.context.context_package is None
+
+
+def test_context_package_completeness_and_refs_are_preserved_not_promoted() -> None:
+    """Preview-only package summaries remain advisory/read-only metadata;
+    the builder does not promote them into product-authoritative context.
+    """
+
+    source = _build_snapshot_via_api(completeness_override="complete")
+    page_ref = _page_ref(
+        page_ref_id="ctxpkg-preview-page-ref",
+        completeness="preview_only",
+        exact=False,
+    )
+    summary = _context_package_summary(
+        completeness="preview_only",
+        truncated=True,
+        omitted_counts={"provider_records": 7, "page_refs": 1},
+        page_refs=[page_ref],
+    )
+    result = _builder().build(
+        AgentContextBuilderInputs(
+            source=source,
+            scope=AgentContextScope(),
+            context_package=summary,
+        )
+    )
+
+    assert result.context is not None
+    assert result.context.completeness == "complete"
+    assert result.context.policy_guidance_authority == "advisory_only"
+    assert result.context.context_package is not None
+    assert result.context.context_package.completeness == "preview_only"
+    assert result.context.context_package.truncated is True
+    assert result.context.context_package.omitted_counts == {
+        "provider_records": 7,
+        "page_refs": 1,
+    }
+    assert result.context.context_package.page_refs == [page_ref]
+
+
+def test_slice_21_wiring_documented_in_module() -> None:
+    """The module MUST document the Slice 21 ContextLayerPackageSummary
+    advisory wiring."""
 
     from iriai_build_v2.execution_control import (
         governance_agent_context_builder as mod,
     )
 
     assert "Slice 21" in mod.__doc__
-    assert "DEFERRED" in mod.__doc__
+    assert "WIRED" in mod.__doc__
+    assert "advisory" in mod.__doc__
 
 
-def test_slice_21_deferral_documented_in_builder_class() -> None:
-    """The builder class docstring MUST document the Slice 21-conditional
-    deferral."""
+def test_slice_21_wiring_documented_in_builder_class() -> None:
+    """The builder class docstring MUST document the Slice 21 advisory
+    wiring."""
 
     assert GovernanceAgentContextBuilder.__doc__ is not None
     assert "Slice 21" in GovernanceAgentContextBuilder.__doc__
-    assert "DEFERRED" in GovernanceAgentContextBuilder.__doc__
+    assert "WIRED" in GovernanceAgentContextBuilder.__doc__
+    assert "advisory" in GovernanceAgentContextBuilder.__doc__
 
 
 # --- Section 16: Activation-authority boundary ---------------------------
@@ -1773,6 +2060,7 @@ def test_empty_line_provenance_with_scope_path_does_not_crash() -> None:
         AgentContextBuilderInputs(
             source=source,
             scope=AgentContextScope(path="src/foo.py"),
+            context_package=_context_package_summary(),
         )
     )
     # Even with no line provenance and scope.path set, the builder
@@ -1794,6 +2082,7 @@ def test_line_provenance_without_path_metadata_passes_through() -> None:
             scope=AgentContextScope(path="src/foo.py"),
             line_provenance_results=[lpr],
             # line_provenance_paths intentionally empty
+            context_package=_context_package_summary(),
         )
     )
     assert result.context is not None
@@ -1816,6 +2105,7 @@ def test_line_provenance_without_range_metadata_passes_through() -> None:
             line_provenance_results=[lpr],
             line_provenance_paths=["src/foo.py"],
             # line_provenance_line_ranges intentionally empty
+            context_package=_context_package_summary(),
         )
     )
     assert result.context is not None
@@ -1837,6 +2127,7 @@ def test_line_provenance_no_intersection_excluded() -> None:
             line_provenance_results=[lpr],
             line_provenance_paths=["src/foo.py"],
             line_provenance_line_ranges=[(1, 10)],  # outside
+            context_package=_context_package_summary(),
         )
     )
     assert result.context is not None
@@ -1960,6 +2251,7 @@ def test_line_provenance_serialised_to_dict() -> None:
             source=source,
             scope=AgentContextScope(),
             line_provenance_results=[lpr],
+            context_package=_context_package_summary(),
         )
     )
     assert result.context is not None
@@ -1978,6 +2270,7 @@ def test_line_provenance_dict_includes_completeness() -> None:
             source=source,
             scope=AgentContextScope(),
             line_provenance_results=[lpr],
+            context_package=_context_package_summary(),
         )
     )
     assert result.context is not None
@@ -1990,7 +2283,6 @@ def test_line_provenance_dict_includes_completeness() -> None:
 
 def test_builder_class_docstring_mentions_doc_19_step_5() -> None:
     assert GovernanceAgentContextBuilder.__doc__ is not None
-    assert "157-160" in GovernanceAgentContextBuilder.__doc__
     assert "step 5" in GovernanceAgentContextBuilder.__doc__.lower()
 
 
@@ -2043,6 +2335,7 @@ def test_scope_with_partial_line_range_no_filtering() -> None:
             line_provenance_results=[lpr],
             line_provenance_paths=["src/foo.py"],
             line_provenance_line_ranges=[(100, 200)],  # would NOT match if filtering
+            context_package=_context_package_summary(),
         )
     )
     assert result.context is not None
@@ -2261,7 +2554,7 @@ def test_builder_corpus_id_falls_back_to_first_upstream_gap() -> None:
 
 
 def test_failure_router_route_table_message_cites_slice_19_5th() -> None:
-    """The route table reason MUST cite Slice 19 5th + doc-19:157-160
+    """The route table reason MUST cite Slice 19 5th + doc-19 step 5
     so future readers can trace the failure id back to this sub-slice."""
 
     key = ("evidence_corruption", "governance_agent_context_builder_failed")
@@ -2269,7 +2562,7 @@ def test_failure_router_route_table_message_cites_slice_19_5th() -> None:
     route = ROUTE_TABLE[key]
     message = route.reason
     assert "Slice 19 5th" in message
-    assert "doc-19:157-160" in message
+    assert "doc-19 step 5" in message
     assert "non-blocking" in message
     assert "doc-14:242-243" in message
 
@@ -2358,9 +2651,9 @@ def test_propagated_upstream_gap_preserves_evidence_payload() -> None:
 
 
 def test_end_to_end_task_repo_scope_with_findings_and_recommendations() -> None:
-    """Realistic scenario: a task-execute agent asks for context
-    scoped to (task_id, repo_id); the builder returns relevant
-    findings + recommendations."""
+    """Realistic display/advisory projection: a caller asks for context
+    scoped to (task_id, repo_id); the builder returns relevant findings
+    + recommendations without wiring a production task-execute consumer."""
 
     f_match = _finding(
         idempotency_key="f-match",
@@ -2416,6 +2709,7 @@ def test_end_to_end_path_line_scope_with_provenance() -> None:
             line_provenance_results=[lpr_match, lpr_miss],
             line_provenance_paths=["src/foo.py", "src/bar.py"],
             line_provenance_line_ranges=[(5, 25), (1, 100)],
+            context_package=_context_package_summary(),
         )
     )
     assert result.context is not None

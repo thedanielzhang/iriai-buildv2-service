@@ -73,11 +73,10 @@ auto-memory ``feedback_no_refactor``):
   evidence after 13A is enabled"), :func:`derive_gate_companion`
   raises :class:`MissingGateCompanionFieldError` carrying the typed
   failure id ``verifier_context/companion_record_unavailable``.
-* When the gate-companion-record's ``required_complete_for`` cannot be
-  satisfied by the manifest's ``complete_for`` (per doc-13a:273-275
-  "model verifier input is either complete for the gate scope or
-  exactly paged"), :func:`derive_gate_companion` raises
-  :class:`MissingGateCompanionFieldError`.
+* When a paged gate-companion-record lacks exact page refs, lacks
+  upstream gate-scope coverage, still has missing required refs, or
+  lacks proof rows covering those exact page refs, :func:`derive_gate_companion`
+  raises :class:`MissingGateCompanionFieldError`.
 * When :func:`derive_proof_row` cannot find one or more of the 4
   mandatory fields per doc-13a:276-278 (``source_digest`` +
   ``page_refs`` + ``proof_algorithm`` + ``verification_time``), the
@@ -360,9 +359,9 @@ class AuthoritativeGateCompanionRecord(BaseModel):
       deterministic-summary proof rows per doc-13a:276-278 ("A
       summary can satisfy a required gate only if the proof row
       states the exact source digest, page refs, proof algorithm,
-      and verification time"). Empty list is valid -- a gate scope
-      may have NO deterministic-summary proof rows attached (the
-      typed companion record alone satisfies the gate).
+      and verification time"). Empty list is valid for complete gate
+      inputs; paged gate inputs require proof rows covering the exact
+      page refs.
 
     Per the Slice 13A invariant doc-13a:18-23: if the consumer can
     influence dispatch / verification / merge / checkpoint / routing /
@@ -415,12 +414,14 @@ class AuthoritativeGateCompanionRecord(BaseModel):
 
     proof_rows: list["AuthoritativeGateProofRow"] = Field(default_factory=list)
     """Doc-13a:276-278 -- the list of typed proof rows attached to
-    the gate companion record. Empty list is valid (a gate scope
-    may have NO deterministic-summary proof rows attached; the typed
-    companion record alone satisfies the gate). Per doc-13a:276-278
-    each proof row carries the 4 mandatory fields (``source_digest``
-    + ``page_refs`` + ``proof_algorithm`` + ``verification_time``)
-    that allow a deterministic summary to satisfy a required gate."""
+    the gate companion record. Empty list is valid for complete gate
+    inputs (a gate scope may have NO deterministic-summary proof rows
+    attached; the typed companion record alone satisfies the gate).
+    Paged gate inputs require proof rows that cover the exact
+    completeness page refs. Per doc-13a:276-278 each proof row carries
+    the 4 mandatory fields (``source_digest`` + ``page_refs`` +
+    ``proof_algorithm`` + ``verification_time``) that allow a
+    deterministic summary to satisfy a required gate."""
 
 
 # --- Step 6 typed shape (doc-13a:276-278) -----------------------------------
@@ -556,6 +557,138 @@ def _gate_input_digest_from_arg(gate_input_digest: str | None) -> str:
     return gate_input_digest
 
 
+def _gate_scope_coverage_gaps(
+    *,
+    bundle_completeness: EvidenceCompleteness,
+    context_manifest_ref: AuthoritativeContextRef,
+    gate_scope_id: str,
+    state_label: str,
+) -> tuple[list[str], list[str]]:
+    """Return missing-field evidence for upstream gate-scope coverage."""
+
+    missing: list[str] = []
+    reasons: list[str] = []
+
+    if bundle_completeness.missing_required_refs:
+        missing.append("completeness.missing_required_refs")
+        reasons.append(
+            f"{state_label} gate completeness still has missing required refs"
+        )
+
+    if gate_scope_id not in bundle_completeness.complete_for:
+        missing.append("completeness.complete_for")
+        reasons.append(
+            f"{state_label} completeness does not cover the gate scope"
+        )
+
+    if gate_scope_id not in context_manifest_ref.required_complete_for:
+        missing.append("context_manifest_ref.required_complete_for")
+        reasons.append("context ref does not require the gate scope")
+
+    return missing, reasons
+
+
+def _raise_gate_scope_gaps(
+    *,
+    missing: list[str],
+    reasons: list[str],
+    gate_scope_id: str,
+) -> None:
+    if missing:
+        raise MissingGateCompanionFieldError(
+            tuple(dict.fromkeys(missing)),
+            unavailable_reason="; ".join(reasons),
+            gate_scope_id=gate_scope_id,
+        )
+
+
+def _validate_complete_gate_scope(
+    *,
+    bundle_completeness: EvidenceCompleteness,
+    context_manifest_ref: AuthoritativeContextRef,
+    gate_scope_id: str,
+) -> None:
+    """Fail closed unless complete gate evidence covers the gate scope."""
+
+    missing, reasons = _gate_scope_coverage_gaps(
+        bundle_completeness=bundle_completeness,
+        context_manifest_ref=context_manifest_ref,
+        gate_scope_id=gate_scope_id,
+        state_label="complete",
+    )
+    _raise_gate_scope_gaps(
+        missing=missing,
+        reasons=reasons,
+        gate_scope_id=gate_scope_id,
+    )
+
+
+def _validate_paged_gate_scope(
+    *,
+    bundle_completeness: EvidenceCompleteness,
+    context_manifest_ref: AuthoritativeContextRef,
+    gate_scope_id: str,
+    proof_rows: Sequence[AuthoritativeGateProofRow],
+) -> None:
+    """Fail closed unless paged gate evidence is exact and gate-scoped."""
+
+    missing, reasons = _gate_scope_coverage_gaps(
+        bundle_completeness=bundle_completeness,
+        context_manifest_ref=context_manifest_ref,
+        gate_scope_id=gate_scope_id,
+        state_label="paged",
+    )
+
+    page_refs = tuple(bundle_completeness.page_refs)
+    if not page_refs:
+        missing.append("completeness.page_refs")
+        reasons.append("paged gate completeness has no exact page refs")
+    elif not all(_is_exact_page_ref(page_ref) for page_ref in page_refs):
+        missing.append("completeness.page_refs")
+        reasons.append("paged gate completeness includes non-exact page refs")
+
+    resolved_proof_rows = tuple(proof_rows)
+    if not resolved_proof_rows:
+        missing.append("proof_rows")
+        reasons.append("paged gate companion requires proof rows")
+    else:
+        proof_page_ref_keys = {
+            _page_ref_key(page_ref)
+            for proof_row in resolved_proof_rows
+            for page_ref in proof_row.page_refs
+            if _is_exact_page_ref(page_ref)
+        }
+        required_page_ref_keys = {
+            _page_ref_key(page_ref) for page_ref in page_refs
+        }
+        if not proof_page_ref_keys:
+            missing.append("proof_rows.page_refs")
+            reasons.append("paged gate proof rows contain no exact page refs")
+        elif not required_page_ref_keys.issubset(proof_page_ref_keys):
+            missing.append("proof_rows.page_refs")
+            reasons.append(
+                "paged gate proof rows do not cover all exact page refs"
+            )
+
+    _raise_gate_scope_gaps(
+        missing=missing,
+        reasons=reasons,
+        gate_scope_id=gate_scope_id,
+    )
+
+
+def _is_exact_page_ref(page_ref: EvidencePageRef) -> bool:
+    """True when the page ref has stable identity and content digest."""
+
+    return bool(page_ref.ref_id.strip()) and bool(page_ref.sha256.strip())
+
+
+def _page_ref_key(page_ref: EvidencePageRef) -> tuple[str, str]:
+    """Return exact page-ref identity used for proof-row coverage."""
+
+    return (page_ref.ref_id, page_ref.sha256)
+
+
 def derive_gate_companion(
     authoritative_bundle: AuthoritativePromptContextBundle,
     *,
@@ -593,14 +726,15 @@ def derive_gate_companion(
 
     **Approval contract** (doc-13a:273-275 + doc-13a:18-23):
 
-    * ``completeness.state == "complete"`` -> ``approval_routing.should_approve_gate=True``
-      (the consumer may approve the gate; the typed companion record
-      carries the exact-evidence proof).
-    * ``completeness.state == "paged"`` -> ``approval_routing.should_approve_gate=True``
-      (per doc-13a:273-275 "model verifier input is either complete
-      for the gate scope or exactly paged"; the consumer may approve
-      the gate; the typed companion record carries the page-refs the
-      consumer must traverse for the full content).
+    * ``completeness.state == "complete"`` ->
+      ``approval_routing.should_approve_gate=True`` only when upstream
+      completeness + context ref cover ``gate_scope_id``.
+    * ``completeness.state == "paged"`` ->
+      ``approval_routing.should_approve_gate=True`` only when the
+      upstream completeness + context ref cover ``gate_scope_id``, the
+      completeness carries non-empty exact page refs, no required refs
+      are missing, and proof rows cover those exact page refs. Otherwise
+      the helper raises :class:`MissingGateCompanionFieldError`.
 
     **Proof rows** (doc-13a:276-278 sibling). The optional
     ``proof_rows`` argument carries the list of typed
@@ -609,13 +743,14 @@ def derive_gate_companion(
     4 mandatory fields (``source_digest`` + ``page_refs`` +
     ``proof_algorithm`` + ``verification_time``) that allow a
     deterministic summary to satisfy a required gate. Empty list is
-    valid (a gate scope may have NO deterministic-summary proof rows
-    attached).
+    valid for complete gate inputs; paged gate inputs require proof
+    rows covering the exact page refs.
     """
 
     # --- Step 1: validate the gate-scope identity arguments ---------------
     validated_scope_id = _gate_scope_id_from_arg(gate_scope_id)
     validated_input_digest = _gate_input_digest_from_arg(gate_input_digest)
+    resolved_proof_rows = tuple(proof_rows)
 
     # --- Step 2: classify the upstream completeness state ----------------
     bundle_completeness = authoritative_bundle.completeness
@@ -647,6 +782,21 @@ def derive_gate_companion(
                 or "upstream bundle completeness.state='unavailable'"
             ),
             gate_scope_id=validated_scope_id,
+        )
+
+    if state == "complete":
+        _validate_complete_gate_scope(
+            bundle_completeness=bundle_completeness,
+            context_manifest_ref=authoritative_bundle.context_manifest_ref,
+            gate_scope_id=validated_scope_id,
+        )
+
+    if state == "paged":
+        _validate_paged_gate_scope(
+            bundle_completeness=bundle_completeness,
+            context_manifest_ref=authoritative_bundle.context_manifest_ref,
+            gate_scope_id=validated_scope_id,
+            proof_rows=resolved_proof_rows,
         )
 
     # --- Step 3: build the gate-scope completeness record ---------------
@@ -695,9 +845,8 @@ def derive_gate_companion(
     )
 
     # --- Step 5: build the approval routing (should_approve_gate=True) --
-    # We reached this point because state in {"complete", "paged"};
-    # both states allow gate approval per doc-13a:273-275 ("either
-    # complete for the gate scope or exactly paged").
+    # We reached this point because state=="complete" or a paged state
+    # passed the exact page-ref + gate-scope proof checks above.
     approval_routing = AuthoritativeGateApprovalRouting(
         should_approve_gate=True,
         typed_failure_class=None,
@@ -713,7 +862,7 @@ def derive_gate_companion(
         completeness=gate_completeness,
         context_manifest_ref=context_manifest_ref,
         approval_routing=approval_routing,
-        proof_rows=list(proof_rows),
+        proof_rows=list(resolved_proof_rows),
     )
 
 

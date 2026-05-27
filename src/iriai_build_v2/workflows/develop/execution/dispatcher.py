@@ -9,6 +9,7 @@ runtime adapters.
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
@@ -794,6 +795,7 @@ class RuntimeDispatcher:
         # Slice 05 22-passed baseline + the Slice 00-12 frozen V4
         # spot-check baseline per the chunk shape point 4 invariant).
         authoritative_prompt_builder: Any | None = None,
+        context_layer_builder: Any | None = None,
     ) -> None:
         """Create a dispatcher from narrow, fake-friendly execution ports.
 
@@ -809,6 +811,12 @@ class RuntimeDispatcher:
         ``state="unavailable"``. When ``None`` (default), the dispatcher
         falls through to the legacy prompt-builder path BYTE-IDENTICAL
         per the auto-memory ``feedback_no_refactor`` rule.
+
+        Optional ``context_layer_builder`` (Slice 21) is a duck-typed,
+        identity-only package hook. When unset, legacy prompt construction
+        is unchanged. When set, the dispatcher records only package identity
+        fields on the prompt-context bundle; provider records remain outside
+        dispatcher prompt context.
         """
 
         self._store = store
@@ -827,6 +835,7 @@ class RuntimeDispatcher:
         # None so the legacy Slice 05 _build_prompt path is BYTE-
         # IDENTICAL (per auto-memory feedback_no_refactor).
         self._authoritative_prompt_builder = authoritative_prompt_builder
+        self._context_layer_builder = context_layer_builder
 
     async def dispatch(self, request: DispatchRequest | Mapping[str, Any] | Any) -> DispatchOutcome:
         request = DispatchRequest.model_validate(request)
@@ -1149,6 +1158,19 @@ class RuntimeDispatcher:
         binding: RuntimeWorkspaceBinding,
     ) -> RuntimeInvocationRequest:
         invocation_id = self._key_factory.invocation_id(request, attempt_id)
+        metadata: dict[str, Any] = {
+            "created_at": self._clock.now().isoformat(),
+            "dispatch_retry_id": request.retry_identity.dispatch_retry_id,
+            "request_digest": request.request_digest,
+            "idempotency_key": request.idempotency_key,
+            "prompt_sha256": prompt_result.bundle.prompt_sha256,
+            "context_sha256": prompt_result.bundle.context_sha256,
+            "contract_ids": list(request.contract_ids),
+            "sandbox_id": request.sandbox_id,
+            "workspace_snapshot_ids": list(request.workspace_snapshot_ids),
+            "runtime_policy_digest": request.runtime_policy_digest,
+        }
+        metadata.update(_context_package_identity_for_prompt_metadata(prompt_result.bundle))
         return RuntimeInvocationRequest(
             attempt_id=attempt_id,
             invocation_id=invocation_id,
@@ -1165,18 +1187,7 @@ class RuntimeDispatcher:
             timeout_seconds=self._timeout_seconds,
             retry_within_invocation=True,
             cancellation_token=request.cancellation_token,
-            metadata={
-                "created_at": self._clock.now().isoformat(),
-                "dispatch_retry_id": request.retry_identity.dispatch_retry_id,
-                "request_digest": request.request_digest,
-                "idempotency_key": request.idempotency_key,
-                "prompt_sha256": prompt_result.bundle.prompt_sha256,
-                "context_sha256": prompt_result.bundle.context_sha256,
-                "contract_ids": list(request.contract_ids),
-                "sandbox_id": request.sandbox_id,
-                "workspace_snapshot_ids": list(request.workspace_snapshot_ids),
-                "runtime_policy_digest": request.runtime_policy_digest,
-            },
+            metadata=metadata,
         )
 
     async def _build_prompt(
@@ -1192,12 +1203,48 @@ class RuntimeDispatcher:
         # Slice 05 dispatcher baseline + the Slice 00-12 frozen V4
         # spot-check baseline per the chunk shape point 4 invariant).
         if self._authoritative_prompt_builder is not None:
-            return await self._build_prompt_authoritatively(request)
+            result = await self._build_prompt_authoritatively(request)
+            return await self._attach_context_layer_package_identity(
+                request,
+                binding,
+                result,
+            )
         try:
             result = await self._prompt_builder.build_prompt_context(request, binding)
         except TypeError:
             result = await self._prompt_builder.build_prompt_context(request)
-        return _coerce_prompt_result(result)
+        return await self._attach_context_layer_package_identity(
+            request,
+            binding,
+            _coerce_prompt_result(result),
+        )
+
+    async def _attach_context_layer_package_identity(
+        self,
+        request: DispatchRequest,
+        binding: RuntimeWorkspaceBinding,
+        prompt_result: PromptBuildResult,
+    ) -> PromptBuildResult:
+        if self._context_layer_builder is None:
+            return prompt_result
+        package = await _build_context_layer_package_for_dispatch(
+            self._context_layer_builder,
+            request=request,
+            binding=binding,
+            prompt_result=prompt_result,
+        )
+        if package is None:
+            raise ValueError("context layer package builder returned no package")
+        bundle_data = _strip_context_package_provider_payloads(
+            _to_jsonable(prompt_result.bundle)
+        )
+        if not isinstance(bundle_data, dict):
+            raise TypeError("prompt context bundle must be mapping-like")
+        bundle_data.update(
+            _context_package_identity_for_prompt_bundle(package, request=request)
+        )
+        bundle = PromptContextBundle.model_validate(bundle_data)
+        return prompt_result.model_copy(update={"bundle": bundle})
 
     async def _build_prompt_authoritatively(
         self,
@@ -2015,6 +2062,464 @@ def _stable_failure_signature_details(details: Mapping[str, Any]) -> dict[str, A
         for key, value in details.items()
         if str(key) not in unstable
     }
+
+
+_CONTEXT_PACKAGE_IDENTITY_ALIASES: dict[str, tuple[str, ...]] = {
+    "context_package_id": ("context_package_id", "package_id", "id"),
+    "context_package_digest": (
+        "context_package_digest",
+        "package_digest",
+        "package_hash",
+        "digest",
+    ),
+    "context_package_ref": (
+        "context_package_ref",
+        "package_ref",
+        "review_ref",
+        "ref",
+    ),
+    "context_package_kind": ("context_package_kind", "package_kind", "kind"),
+    "context_package_completeness": (
+        "context_package_completeness",
+        "completeness",
+    ),
+    "context_package_page_refs": (
+        "context_package_page_refs",
+        "page_refs",
+    ),
+    "context_package_feature_id": (
+        "context_package_feature_id",
+        "feature_id",
+        "request.feature_id",
+    ),
+    "context_package_task_id": (
+        "context_package_task_id",
+        "task_id",
+        "request.task_id",
+    ),
+    "context_package_source_dag_artifact_id": (
+        "context_package_source_dag_artifact_id",
+        "source_dag_artifact_id",
+        "request.source_dag_artifact_id",
+        "evidence_snapshot.source_dag_artifact_id",
+    ),
+    "context_package_dag_sha256": (
+        "context_package_dag_sha256",
+        "dag_sha256",
+        "source_dag_sha256",
+        "request.dag_sha256",
+        "evidence_snapshot.dag_sha256",
+    ),
+    "context_package_evidence_snapshot_digest": (
+        "context_package_evidence_snapshot_digest",
+        "evidence_snapshot_digest",
+        "typed_evidence_snapshot_digest",
+        "evidence_snapshot.typed_evidence_digest",
+    ),
+    "context_package_provider_state_digest": (
+        "context_package_provider_state_digest",
+        "provider_state_digest",
+    ),
+    "context_package_advisory_only": (
+        "context_package_advisory_only",
+        "advisory_only",
+    ),
+}
+
+
+_CONTEXT_PACKAGE_REQUIRED_IDENTITY_FIELDS = (
+    "context_package_id",
+    "context_package_digest",
+    "context_package_completeness",
+    "context_package_feature_id",
+    "context_package_task_id",
+    "context_package_source_dag_artifact_id",
+    "context_package_dag_sha256",
+    "context_package_evidence_snapshot_digest",
+    "context_package_provider_state_digest",
+    "context_package_advisory_only",
+)
+
+
+_CONTEXT_PACKAGE_PROVIDER_PAYLOAD_KEYS = {
+    "omitted_counts",
+    "omitted_ref_counts",
+    "omitted_refs",
+    "page_refs",
+    "payloads",
+    "provider_payloads",
+    "provider_order",
+    "provider_record_order",
+    "provider_records",
+    "provider_state",
+    "provider_state_order",
+    "provider_state_refs",
+    "records",
+    "rendered_context",
+    "rendered_preview",
+}
+
+
+_CONTEXT_PACKAGE_PAGE_REF_ALLOWED_KEYS = {
+    "artifact_id",
+    "authority",
+    "commit_hash",
+    "completeness",
+    "created_at",
+    "digest",
+    "event_id",
+    "feature_id",
+    "journal_anchor",
+    "page_ref_id",
+    "page_refs",
+    "preview_only",
+    "quality",
+    "ref_id",
+    "slice_id",
+    "source_ref_id",
+}
+
+
+async def _build_context_layer_package_for_dispatch(
+    builder: Any,
+    *,
+    request: DispatchRequest,
+    binding: RuntimeWorkspaceBinding,
+    prompt_result: PromptBuildResult,
+) -> Any | None:
+    for method_name in (
+        "build_dispatch_context_package",
+        "build_context_package",
+        "build_package",
+        "build",
+    ):
+        method = getattr(builder, method_name, None)
+        if callable(method):
+            return await _await_maybe(
+                _call_context_layer_builder(
+                    method,
+                    request=request,
+                    binding=binding,
+                    prompt_result=prompt_result,
+                )
+            )
+    if callable(builder):
+        return await _await_maybe(
+            _call_context_layer_builder(
+                builder,
+                request=request,
+                binding=binding,
+                prompt_result=prompt_result,
+            )
+        )
+    raise TypeError("context_layer_builder must expose a build method or be callable")
+
+
+def _call_context_layer_builder(
+    callable_obj: Any,
+    *,
+    request: DispatchRequest,
+    binding: RuntimeWorkspaceBinding,
+    prompt_result: PromptBuildResult,
+) -> Any:
+    try:
+        signature = inspect.signature(callable_obj)
+    except (TypeError, ValueError):
+        return callable_obj(request, binding, prompt_result)
+
+    parameters = signature.parameters
+    has_var_kwargs = any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    )
+    supported_kwargs = {
+        "request": request,
+        "dispatch_request": request,
+        "binding": binding,
+        "workspace_binding": binding,
+        "prompt_result": prompt_result,
+        "prompt_context": prompt_result,
+        "prompt": prompt_result.prompt,
+        "bundle": prompt_result.bundle,
+    }
+    kwargs = {
+        name: value
+        for name, value in supported_kwargs.items()
+        if has_var_kwargs or name in parameters
+    }
+    if kwargs:
+        return callable_obj(**kwargs)
+
+    positional = [
+        parameter
+        for parameter in parameters.values()
+        if parameter.kind
+        in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        )
+        and parameter.default is inspect.Parameter.empty
+    ]
+    if any(
+        parameter.kind == inspect.Parameter.VAR_POSITIONAL
+        for parameter in parameters.values()
+    ):
+        positional_count = 3
+    else:
+        positional_count = len(positional)
+    return callable_obj(*(request, binding, prompt_result)[:positional_count])
+
+
+async def _await_maybe(value: Any) -> Any:
+    if inspect.isawaitable(value):
+        return await value
+    return value
+
+
+def _strip_context_package_provider_payloads(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {
+            str(key): _strip_context_package_provider_payloads(item)
+            for key, item in value.items()
+            if str(key) not in _CONTEXT_PACKAGE_PROVIDER_PAYLOAD_KEYS
+        }
+    if isinstance(value, list):
+        return [_strip_context_package_provider_payloads(item) for item in value]
+    return value
+
+
+def _context_package_identity_for_prompt_bundle(
+    package: Any,
+    *,
+    request: DispatchRequest,
+) -> dict[str, Any]:
+    data = _to_jsonable(package)
+    if not isinstance(data, Mapping):
+        raise TypeError("context layer package must be a mapping-like object")
+    review_ref = getattr(package, "review_ref", None)
+    if review_ref and "review_ref" not in data:
+        data = {**data, "review_ref": review_ref}
+    identity = {
+        field: _first_present_value(data, aliases)
+        for field, aliases in _CONTEXT_PACKAGE_IDENTITY_ALIASES.items()
+    }
+    identity = {
+        field: _normalize_context_package_identity_value(field, value)
+        for field, value in identity.items()
+    }
+    _validate_context_package_identity_for_dispatch(identity, request, data=data)
+    return identity
+
+
+def _validate_context_package_identity_for_dispatch(
+    identity: Mapping[str, Any],
+    request: DispatchRequest,
+    *,
+    data: Mapping[str, Any] | None = None,
+) -> None:
+    missing = [
+        field
+        for field in _CONTEXT_PACKAGE_REQUIRED_IDENTITY_FIELDS
+        if identity.get(field) in (None, "")
+    ]
+    mismatches: list[str] = []
+
+    def _check(field: str, expected: Any) -> None:
+        actual = identity.get(field)
+        if actual is None or str(actual) != str(expected):
+            mismatches.append(f"{field}: expected {expected!s}, got {actual!s}")
+
+    _check("context_package_feature_id", request.feature_id)
+    _check("context_package_task_id", request.task_id)
+    _check("context_package_dag_sha256", request.dag_sha256)
+    completeness = str(identity.get("context_package_completeness") or "")
+    if completeness not in {"complete", "paged"}:
+        mismatches.append(
+            "context_package_completeness: expected complete or paged with exact refs"
+        )
+    elif completeness == "paged":
+        page_refs = identity.get("context_package_page_refs") or []
+        if not isinstance(page_refs, list) or not page_refs:
+            mismatches.append("context_package_completeness: paged package lacks exact page refs")
+    try:
+        if int(identity.get("context_package_source_dag_artifact_id")) <= 0:
+            mismatches.append("context_package_source_dag_artifact_id: expected positive integer")
+    except (TypeError, ValueError):
+        mismatches.append("context_package_source_dag_artifact_id: expected positive integer")
+    _check_context_package_embedded_identity(
+        data or {},
+        identity,
+        request,
+        mismatches,
+    )
+    if identity.get("context_package_advisory_only") is not True:
+        mismatches.append("context_package_advisory_only: expected true")
+    if missing or mismatches:
+        raise ValueError(
+            "context layer package identity is malformed for dispatch: "
+            f"missing={missing}; mismatches={mismatches}"
+        )
+
+
+def _check_context_package_embedded_identity(
+    data: Mapping[str, Any],
+    identity: Mapping[str, Any],
+    request: DispatchRequest,
+    mismatches: list[str],
+) -> None:
+    def _check_present(field: str, path: str, expected: Any) -> None:
+        if expected in (None, ""):
+            return
+        actual = _nested_context_package_value(data, path)
+        if actual is None:
+            return
+        normalized_actual = _normalize_context_package_identity_value(field, actual)
+        normalized_expected = _normalize_context_package_identity_value(field, expected)
+        if str(normalized_actual) != str(normalized_expected):
+            mismatches.append(
+                f"{path}: expected {normalized_expected!s}, got {normalized_actual!s}"
+            )
+
+    _check_present(
+        "context_package_feature_id",
+        "request.feature_id",
+        request.feature_id,
+    )
+    _check_present("context_package_task_id", "request.task_id", request.task_id)
+    _check_present(
+        "context_package_dag_sha256",
+        "request.dag_sha256",
+        request.dag_sha256,
+    )
+    _check_present(
+        "context_package_source_dag_artifact_id",
+        "request.source_dag_artifact_id",
+        identity.get("context_package_source_dag_artifact_id"),
+    )
+    _check_present(
+        "context_package_source_dag_artifact_id",
+        "evidence_snapshot.source_dag_artifact_id",
+        identity.get("context_package_source_dag_artifact_id"),
+    )
+    _check_present(
+        "context_package_dag_sha256",
+        "evidence_snapshot.dag_sha256",
+        identity.get("context_package_dag_sha256"),
+    )
+    _check_present(
+        "context_package_evidence_snapshot_digest",
+        "evidence_snapshot.typed_evidence_digest",
+        identity.get("context_package_evidence_snapshot_digest"),
+    )
+
+
+def _context_package_identity_for_prompt_metadata(
+    bundle: PromptContextBundle,
+) -> dict[str, Any]:
+    data = _to_jsonable(bundle)
+    if not isinstance(data, Mapping):
+        data = {}
+    identity = {
+        field: data.get(field)
+        for field in _CONTEXT_PACKAGE_IDENTITY_ALIASES
+    }
+    return {
+        field: value
+        for field, value in identity.items()
+        if value is not None and value != ""
+    }
+
+
+def _first_present_value(data: Mapping[str, Any], aliases: Sequence[str]) -> Any:
+    for alias in aliases:
+        if "." in alias:
+            value = _nested_context_package_value(data, alias)
+            if value is not None:
+                return value
+            continue
+        if alias in data:
+            return data[alias]
+    return None
+
+
+def _nested_context_package_value(data: Mapping[str, Any], path: str) -> Any:
+    current: Any = data
+    for part in path.split("."):
+        if not isinstance(current, Mapping) or part not in current:
+            return None
+        current = current[part]
+    return current
+
+
+def _normalize_context_package_identity_value(field: str, value: Any) -> Any:
+    if value is None:
+        return None
+    if field == "context_package_page_refs":
+        return _normalize_context_package_page_refs(value)
+    if field == "context_package_advisory_only":
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes"}
+        return bool(value)
+    if field == "context_package_source_dag_artifact_id":
+        if value == "":
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return str(value)
+    if isinstance(value, str):
+        value = value.strip()
+        return value or None
+    return str(value)
+
+
+def _normalize_context_package_page_refs(value: Any) -> list[dict[str, Any]]:
+    if not value:
+        return []
+    raw_refs = value if isinstance(value, list) else [value]
+    refs: list[dict[str, Any]] = []
+    for raw_ref in raw_refs:
+        data = _to_jsonable(raw_ref)
+        if not isinstance(data, Mapping):
+            raise ValueError("context package page refs must be mapping-like")
+        sanitized = {
+            str(key): _strip_context_package_provider_payloads(item)
+            for key, item in data.items()
+            if str(key) in _CONTEXT_PACKAGE_PAGE_REF_ALLOWED_KEYS
+            and item is not None
+            and item != ""
+        }
+        if not sanitized.get("ref_id") or not sanitized.get("digest"):
+            raise ValueError("context package page refs require ref_id and digest")
+        preview_only = _context_package_page_ref_preview_only(
+            sanitized.get("preview_only")
+        )
+        if preview_only is True:
+            raise ValueError("context package page refs must not be preview_only")
+        if preview_only is not None:
+            sanitized["preview_only"] = preview_only
+        completeness = sanitized.get("completeness")
+        if completeness is not None and completeness not in {"complete", "paged"}:
+            raise ValueError("context package page refs require exact completeness")
+        nested_page_refs = sanitized.get("page_refs")
+        if nested_page_refs:
+            sanitized["page_refs"] = _normalize_context_package_page_refs(nested_page_refs)
+        refs.append(sanitized)
+    return refs
+
+
+def _context_package_page_ref_preview_only(value: Any) -> bool | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes"}:
+            return True
+        if normalized in {"0", "false", "no"}:
+            return False
+    raise ValueError("context package page refs require boolean preview_only")
 
 
 def _coerce_prompt_result(value: PromptBuildResult | Mapping[str, Any] | Any) -> PromptBuildResult:

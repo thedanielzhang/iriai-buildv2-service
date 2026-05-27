@@ -1549,12 +1549,12 @@ def test_artifact_key_prefix_constant_immutable() -> None:
         governance_report_artifact as mod,
     )
 
-    # Re-importing must yield the same value (no module-level
-    # mutation).
+    # Re-importing must yield the same value without mutating the loaded
+    # module's class identities for later tests.
     import importlib
 
-    reloaded = importlib.reload(mod)
-    assert reloaded.REPORT_ARTIFACT_KEY_PREFIX == "review:governance-report:"
+    imported = importlib.import_module(mod.__name__)
+    assert imported.REPORT_ARTIFACT_KEY_PREFIX == "review:governance-report:"
 
 
 # --- Section 17: edge cases ------------------------------------------------

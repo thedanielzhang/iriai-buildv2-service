@@ -1,67 +1,31 @@
-"""Slice 13A eighth sub-slice (13An-2) -- P3-13A-6-3 binding closure wiring.
+"""Slice 13A eighth sub-slice (13An-2) dashboard display/advisory wrapper.
 
-This module CLOSES the P3-13A-6-3 dead-until-wired binding statement carried
-through the 6th sub-slice finalizer (per the reframed P2-V-1 finding) and the
-7th sub-slice deferral + the 8th sub-slice 13An-1 SPLIT decision. The
-binding statement at
-``docs/execution-control-plane/13a-acceptance.md:222-227`` says:
+This module provides an opt-in wrapper around
+:class:`~iriai_build_v2.public_dashboard.PublicDashboardOutbox` for the
+dashboard's bounded display mirror. Slice 19A source-of-truth
+``docs/execution-control-plane/19a-governance-implementation-reassessment.md``
+reopened the previous P3-13A-6-3 authority-sufficiency claim as
+``19A-P2-001``. The current wrapper is therefore display/advisory-only unless a
+future source-of-truth slice wires an actual authoritative gate / verifier /
+classifier consumer with durable failure observation.
 
-    The wiring target is likely either the supervisor classifier consumer
-    site (`src/iriai_build_v2/supervisor/classifier.py`) OR the dashboard
-    snapshot consumer site (`src/iriai_build_v2/public_dashboard.py`).
-    Per doc-13a:42-46 + 124-126 + ``feedback_no_refactor``, the wiring
-    **must land as a NEW external opt-in code path** (not an in-place
-    edit of either accepted Slice 10 module).
+Current behavior:
 
-**Wiring target chosen this iteration:**
-:mod:`iriai_build_v2.public_dashboard` (the dashboard snapshot consumer
-site). The supervisor classifier site is deferred to a future Slice 13A
-sub-slice or the Slice 17 policy interface per
-``13a-acceptance.md:222-227``.
-
-Rationale (recorded in the BEFORE journal entry per the user-prompt
-non-negotiable):
-
-1. **Discrete clean call site**:
-   :meth:`~iriai_build_v2.public_dashboard.PublicDashboardOutbox.project_control_plane_snapshot_changed`
-   (``public_dashboard.py:243-308``) takes a
-   :class:`~iriai_build_v2.workflows.develop.execution.snapshots.ControlPlaneSnapshot`
-   and emits a bounded display event -- exactly the snapshot whose
-   per-list-field completeness our 6th-sub-slice
-   :class:`~iriai_build_v2.execution_control.snapshot_companion.LegacySnapshotCompanionAdapter`
-   projects. A wrapper around this method is materially cleaner than
-   the 2699-line
-   :class:`~iriai_build_v2.supervisor.classifier.SupervisorClassifier.classify_typed`
-   consumer.
-
-2. **Smaller surface for byte-identical verification**.
-   ``public_dashboard.py`` is 786 lines vs ``supervisor/classifier.py``
-   2699 lines. The gate-5 byte-identical Slice 10 baseline proof is
-   materially easier to verify.
-
-3. **Existing env-flag opt-in pattern**. ``public_dashboard.py``
-   already uses env-flag opt-in toggles
-   (:data:`~iriai_build_v2.public_dashboard.PUBLIC_DASHBOARD_CONSUMER_ENV` +
-   :func:`~iriai_build_v2.public_dashboard._flag_enabled` at line 46).
-   The new wrapper follows the same pattern with a NEW env flag
-   :data:`DASHBOARD_COMPANION_WIRING_ENV`, keeping the opt-in
-   discipline uniform.
-
-4. **Per-list-field name alignment**. The snapshot's list-field names
-   on :class:`~iriai_build_v2.workflows.develop.execution.snapshots.ControlPlaneSnapshot`
-   (``latest_failures`` / ``merge_queue`` / ``retry_budgets`` /
-   ``active_attempts`` / ``workspace_snapshots`` / ``sandbox_leases``
-   / ``runtime_bindings`` / ``gates`` / ``checkpoints`` /
-   ``evidence_refs`` / ``cursors``) match VERBATIM the
-   ``_SLICE_10A_LIST_FIELD_NAMES`` tuple in
-   ``snapshot_companion.py:568-580``. The dashboard's ``counters`` dict
-   already projects these list fields to counts; the companion-record
-   derivation is the natural per-field completeness extension.
-
-5. **``feedback_no_refactor`` discipline**. The wrapper lives in this
-   NEW module under ``execution_control/`` -- it does NOT in-place-edit
-   ``public_dashboard.py``. The accepted Slice 10 byte-identical
-   baseline is preserved (gate 5 proof).
+1. The wrapper is opt-in through :data:`DASHBOARD_COMPANION_WIRING_ENV` and
+   delegates byte-identical to the legacy outbox while the flag is off.
+2. The production dashboard construction in ``dashboard.py`` does not supply a
+   durable failure port; the default
+   :class:`InMemoryDashboardCompanionFailurePort` is process-local.
+3. The dashboard projection is a read-path display mirror whose caller logs and
+   swallows display-outbox failures. It does not own gate approval, verifier
+   approval, classifier execution, policy activation, merge, or checkpoint
+   authority.
+4. This module does not in-place edit
+   ``src/iriai_build_v2/public_dashboard.py`` /
+   ``src/iriai_build_v2/supervisor/classifier.py`` /
+   ``src/iriai_build_v2/workflows/develop/execution/snapshots.py`` /
+   the 5 Slice 13A modules. The accepted Slice 10 surfaces remain wrapped by
+   composition.
 
 **Change-control non-negotiables** (doc-13a:42-46 + 124-126 +
 auto-memory ``feedback_no_refactor``):
@@ -78,7 +42,7 @@ auto-memory ``feedback_no_refactor``):
   shapes are preserved **verbatim**; the new wrapper carries the
   legacy outbox via composition (NOT replacement).
 
-**Fail-closed contract** (doc-13a:18-23 + 111-115 + 280-282 +
+**Opt-in display-wrapper contract** (doc-13a:18-23 + 111-115 + 280-282 +
 auto-memory ``feedback_no_silent_degradation``):
 
 * When the env flag :data:`DASHBOARD_COMPANION_WIRING_ENV` is OFF
@@ -90,8 +54,9 @@ auto-memory ``feedback_no_silent_degradation``):
   typed failure id ``evidence_corruption/list_field_incomplete``
   (per doc-13a:280-282 "classifier rules fail closed unless their
   required fields are complete") via the
-  :class:`~iriai_build_v2.workflows.develop.execution.failure_router.FailureRouter`
-  port.
+  :class:`DashboardCompanionFailurePort`. The production dashboard
+  construction currently leaves that port as in-memory display/advisory
+  observation, not a durable authoritative failure-router observation.
 * When the env flag is ON and the per-list-field completeness rule
   ``should_invoke_classifier`` is ``False``, the wrapper records the
   typed failure id ``evidence_corruption/classifier_rule_blocked``
@@ -234,7 +199,7 @@ __all__ = [
 
 
 DASHBOARD_COMPANION_WIRING_ENV = "IRIAI_EXEC_CONTROL_DASHBOARD_COMPANION_WIRING_ENABLED"
-"""Env flag name that enables the P3-13A-6-3 binding closure wiring.
+"""Env flag name for the opt-in dashboard display/advisory wrapper.
 
 Per the auto-memory ``feedback_no_refactor`` rule + per the
 ``public_dashboard.py:46-52`` opt-in env-flag precedent: the wiring is
@@ -246,11 +211,10 @@ When set to a truthy value (``1`` / ``true`` / ``yes`` / ``on`` --
 anything not in the off-truthy set), the wrapper invokes the composite
 :class:`~iriai_build_v2.execution_control.snapshot_companion.LegacyGateConsumerSnapshotAdapter`
 chain BEFORE delegating to the legacy outbox. A composite-chain failure
-records the typed failure id via the
-:class:`DashboardCompanionFailurePort` and raises a typed exception so
-the caller's projection transaction aborts (mirrors the legacy
-``project_control_plane_snapshot_changed`` fail-closed enqueue rule at
-``public_dashboard.py:263-271``).
+records the typed failure id via the configured
+:class:`DashboardCompanionFailurePort` and raises a typed exception. The
+production dashboard path currently uses the in-memory default port, so this
+does not become durable authoritative failure observation.
 """
 
 
@@ -299,7 +263,7 @@ def dashboard_companion_wiring_enabled() -> bool:
 #
 # All 4 route to ``quiesce`` per the
 # ``failure_router._ROUTE_ROWS`` at
-# ``src/iriai_build_v2/workflows/develop/execution/failure_router.py:1376-1434``.
+# ``src/iriai_build_v2/workflows/develop/execution/failure_router.py:2948-3005``.
 
 DashboardCompanionFailureClass = (
     "verifier_context",
@@ -356,9 +320,9 @@ class DashboardCompanionFailureRecord(BaseModel):
     Per the auto-memory ``feedback_no_silent_degradation`` rule the
     record carries EVERY field the caller needs to route a typed-
     failure-router observation without going back to the snapshot;
-    the wrapper records this BEFORE raising the typed exception so
-    the typed observation is durable even when the caller's
-    projection transaction aborts.
+    the wrapper records this BEFORE raising the typed exception so the
+    configured port can observe it. The default port is in-memory and is
+    display/advisory-only, not durable failure-router observation.
     """
 
     # ``extra="forbid"`` aligns with the sibling Slice 13A typed shapes
@@ -466,8 +430,9 @@ class InMemoryDashboardCompanionFailurePort:
 
         Per the auto-memory ``feedback_no_silent_degradation`` rule the
         port records the typed observation BEFORE the wrapper raises
-        the typed exception so the observation is durable even when
-        the caller's projection transaction aborts.
+        the typed exception. This implementation is intentionally in-memory;
+        durability requires a caller-supplied port from a future source-of-truth
+        slice.
         """
 
         self.records.append(failure_record)
@@ -630,14 +595,13 @@ def derive_snapshot_list_field_completeness_from_snapshot(
             if isinstance(maybe_ref, EvidencePageRef):
                 next_page_ref = maybe_ref
 
-        # Build a per-field completeness record. The complete_for is the
-        # single-element list naming this field's scope; the consumer's
-        # required_list_field_scopes tests against this list per the
-        # snapshot_companion._classify_routing rule.
+        # Build a per-field completeness record. The complete_for value uses
+        # the snapshot namespace consumed by snapshot_companion routing.
+        complete_for = [f"snapshot:{field_name}"]
         completeness_digest = compute_completeness_digest(
             state=field_state,  # type: ignore[arg-type]
             authority="routing_authority",
-            complete_for=[field_name],
+            complete_for=complete_for,
             missing_required_refs=[],
             page_refs=[next_page_ref] if next_page_ref is not None else [],
             preview_ref=None,
@@ -646,7 +610,7 @@ def derive_snapshot_list_field_completeness_from_snapshot(
         per_field_completeness = EvidenceCompleteness(
             state=field_state,  # type: ignore[arg-type]
             authority="routing_authority",
-            complete_for=[field_name],
+            complete_for=complete_for,
             missing_required_refs=[],
             page_refs=[next_page_ref] if next_page_ref is not None else [],
             preview_ref=None,
@@ -664,28 +628,22 @@ def derive_snapshot_list_field_completeness_from_snapshot(
     return out
 
 
-# --- The P3-13A-6-3 binding closure: external opt-in wrapper ---------------
+# --- P3-13A-6-3 display/advisory wrapper ----------------------------------
 
 
 class CompletenessAwareDashboardOutbox:
-    """The P3-13A-6-3 binding closure -- external opt-in wrapper around
+    """External opt-in display/advisory wrapper around
     :class:`~iriai_build_v2.public_dashboard.PublicDashboardOutbox`
     that composes the 6th-sub-slice
     :class:`~iriai_build_v2.execution_control.snapshot_companion.LegacyGateConsumerSnapshotAdapter`
     composite chain BEFORE delegating to the legacy outbox.
 
-    **Wires the composite chain into a real production caller.** This
-    closes the P3-13A-6-3 dead-until-wired binding statement (per
-    ``13a-acceptance.md:193-227`` + the
-    6th-sub-slice finalizer reframing of P2-V-1):
-
-    > The wiring closes:
-    >
-    > * The **doc-13a:18-23 + 111-115** invariant that gates may NOT
-    >   approve from `preview_only` evidence.
-    > * The **doc-13a:280-282** invariant that classifier rules MUST
-    >   fail closed when their required snapshot fields are
-    >   incomplete.
+    **Authority boundary.** Slice 19A source-of-truth
+    ``docs/execution-control-plane/19a-governance-implementation-reassessment.md``
+    reopens/removes the previous claim that this dashboard wrapper is enough to
+    close P3-13A-6-3 for authority purposes. This wrapper is not an
+    authoritative gate / verifier / classifier consumer, and the production
+    dashboard construction does not install durable failure observation.
 
     The wrapper composes two adapters:
 
@@ -707,7 +665,7 @@ class CompletenessAwareDashboardOutbox:
     method. When ON, the wrapper invokes the composite chain BEFORE
     delegating to the legacy outbox.
 
-    **Fail-closed contract** (doc-13a:18-23 + 111-115 + 280-282 +
+    **Opt-in display fail-closed behavior** (doc-13a:18-23 + 111-115 + 280-282 +
     auto-memory ``feedback_no_silent_degradation``): when the composite
     chain raises
     :class:`~iriai_build_v2.execution_control.snapshot_companion.MissingSnapshotCompanionFieldError`
@@ -718,9 +676,10 @@ class CompletenessAwareDashboardOutbox:
     the wrapper:
 
     1. Records the typed
-       :class:`DashboardCompanionFailureRecord` via the
-       :class:`DashboardCompanionFailurePort` (the typed-failure
-       observation is durable BEFORE the wrapper raises).
+       :class:`DashboardCompanionFailureRecord` via the configured
+       :class:`DashboardCompanionFailurePort`. The default port is
+       in-memory, so the production dashboard path has display/debug
+       observation only.
     2. Re-raises the typed exception (the caller's projection
        transaction aborts -- mirrors the legacy
        :meth:`~iriai_build_v2.public_dashboard.PublicDashboardOutbox.project_control_plane_snapshot_changed`
@@ -728,13 +687,11 @@ class CompletenessAwareDashboardOutbox:
     3. DOES NOT delegate to the legacy outbox (the bounded display
        event is NEVER enqueued when the composite chain fails).
 
-    **Use case.** The wrapper is the FIRST real production caller of
-    the composite chain. It satisfies the P3-13A-6-3 binding statement:
-    a future Slice 14-19 governance slice can now claim gate execution
-    authority because the composite chain has a real production caller
-    (this wrapper). The supervisor classifier site is deferred to a
-    future sub-slice or the Slice 17 policy interface per
-    ``13a-acceptance.md:222-227``.
+    **Use case.** The wrapper keeps the dashboard display mirror compatible
+    with the Slice 13A typed completeness shapes without granting new runtime
+    authority. A future source-of-truth slice must wire an actual authoritative
+    consumer with durable observation before any governance surface treats the
+    composite chain as execution authority.
 
     **NO change to the legacy outbox.** Per the auto-memory
     ``feedback_no_refactor`` rule the wrapper composes the legacy
@@ -753,9 +710,8 @@ class CompletenessAwareDashboardOutbox:
     * ``failure_port`` -- the
       :class:`DashboardCompanionFailurePort` used for typed-failure
       recording. Defaults to a fresh
-      :class:`InMemoryDashboardCompanionFailurePort`. Production
-      callers SHOULD supply a port that wraps a real
-      :class:`~iriai_build_v2.workflows.develop.execution.failure_router.FailureRouter`.
+      :class:`InMemoryDashboardCompanionFailurePort`; that default is
+      display/advisory-only and is not durable failure observation.
     * ``snapshot_adapter`` -- the
       :class:`~iriai_build_v2.execution_control.snapshot_companion.LegacySnapshotCompanionAdapter`
       (or a Protocol-compatible implementation). Defaults to a fresh
@@ -795,10 +751,9 @@ class CompletenessAwareDashboardOutbox:
             gate_consumer_adapter or LegacyGateConsumerSnapshotAdapter()
         )
 
-        # Default to an in-memory port so the wrapper is usable in tests
-        # without external dependencies. Production callers should
-        # supply a port that wraps a real
-        # `~iriai_build_v2.workflows.develop.execution.failure_router.FailureRouter`.
+        # Default to an in-memory port so the wrapper is usable in tests and
+        # display/debug flows without external dependencies. This default is
+        # not durable failure observation.
         self._failure_port: DashboardCompanionFailurePort = (
             failure_port or InMemoryDashboardCompanionFailurePort()
         )
@@ -812,9 +767,8 @@ class CompletenessAwareDashboardOutbox:
 
     @property
     def wiring_enabled(self) -> bool:
-        """True iff the wrapper's P3-13A-6-3 binding closure wiring is
-        opt-in enabled (via the env flag OR the explicit constructor
-        override).
+        """True iff the wrapper's display/advisory companion path is opt-in
+        enabled (via the env flag OR the explicit constructor override).
 
         Per the auto-memory ``feedback_no_refactor`` rule: when False
         (the default), the wrapper delegates byte-identical to the
@@ -851,12 +805,12 @@ class CompletenessAwareDashboardOutbox:
         (:func:`~iriai_build_v2.public_dashboard.project_control_plane_snapshot_if_changed`
         at ``public_dashboard.py:705``) check
         ``getattr(outbox, "outbox_enabled", False)`` as an early-return
-        guard, and the production callsite at ``dashboard.py:1542``
+        guard, and the production callsite at ``dashboard.py:1564``
         checks ``outbox.outbox_enabled`` directly. The
         :class:`CompletenessAwareDashboardOutbox` wrapper is used as a
-        drop-in replacement for :class:`PublicDashboardOutbox` at the
-        production callsite per the P2-13An-2-1 remediation; the wrapper
-        MUST expose the same ``outbox_enabled`` flag so the
+        drop-in display/advisory replacement for :class:`PublicDashboardOutbox`
+        at the dashboard callsite; the wrapper MUST expose the same
+        ``outbox_enabled`` flag so the
         early-return guard preserves byte-identical Slice 10 behaviour.
 
         Per the auto-memory ``feedback_no_refactor`` rule: this property
@@ -950,7 +904,7 @@ class CompletenessAwareDashboardOutbox:
         gate_proof_rows: Sequence[AuthoritativeGateProofRow] = (),
         required_snapshot_list_field_scopes_for_gate: Sequence[str] = (),
     ) -> str | None:
-        """The P3-13A-6-3 binding closure wrapper method.
+        """The display/advisory wrapper method.
 
         When :attr:`wiring_enabled` is False (the default), delegates
         byte-identical to
@@ -985,11 +939,12 @@ class CompletenessAwareDashboardOutbox:
            pass, delegate to the legacy outbox method byte-identical.
 
         On ANY composite-chain failure: record the typed
-        :class:`DashboardCompanionFailureRecord` via the
-        :class:`DashboardCompanionFailurePort` (the typed-failure
-        observation is durable BEFORE the wrapper raises) and re-raise
-        the typed exception. The legacy outbox is NEVER invoked when
-        the composite chain fails.
+        :class:`DashboardCompanionFailureRecord` via the configured
+        :class:`DashboardCompanionFailurePort` and re-raise the typed
+        exception. With the default in-memory port this is display/debug
+        observation only; durable authoritative observation requires future
+        source-of-truth wiring. The legacy outbox is NEVER invoked when the
+        composite chain fails.
 
         Returns the legacy outbox method's return value (the event_id
         string or None) on success. Raises the typed
@@ -1023,9 +978,8 @@ class CompletenessAwareDashboardOutbox:
         payload = control_plane_snapshot_changed_payload(snapshot)
         snapshot_version = str(payload.get("snapshot_version") or "")
         if not snapshot_version:
-            # Mirror the legacy outbox's fail-closed enqueue rule;
-            # also record the typed failure so the observation is
-            # durable.
+            # Mirror the legacy outbox's fail-closed enqueue rule; also record
+            # the typed failure to the configured display/advisory port.
             failure_record = DashboardCompanionFailureRecord(
                 failure_class="evidence_corruption",
                 failure_type="list_field_incomplete",

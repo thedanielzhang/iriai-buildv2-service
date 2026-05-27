@@ -352,6 +352,46 @@ async def test_scanner_detects_unresolved_p1_p2_findings_in_journal_tail(
     assert report.is_complete is False
 
 
+@pytest.mark.asyncio
+async def test_scanner_detects_active_19a_findings_from_status(
+    tmp_path,
+) -> None:
+    """Active Slice 19A reassessment ids in STATUS.md fail closed.
+
+    Slice 19A uses ids shaped like ``19A-P1-003`` rather than the
+    historical journal-parser shape ``P1-13a-1``. The scanner must read
+    that active restart-pointer shape from STATUS.md without broadening
+    journal-tail matching and reintroducing historical false positives.
+    """
+
+    status_text = (
+        _all_accepted_status_text()
+        + "\n# SLICE 19A OPEN -- REMEDIATION REQUIRED\n\n"
+        + "## Blocking P1s\n\n"
+        + "- **19A-P1-003**: exact global gate wrappers missing.\n"
+        + "- **19A-P1-001**: CLOSED by accepted 19A-2 remediation.\n"
+        + "- **19A-P3-001**: carried test hardening note.\n"
+    )
+    journal_text = (
+        "# Implementation Journal\n\n"
+        "## 2026-05-23 -- Slice 12 ACCEPTED\n\n"
+        "- Slice 12 closure; **0 P1 / 0 P2** in slice-end review.\n"
+    )
+    journal_path = _write_minimal_journal_and_status(
+        tmp_path, journal_text=journal_text, status_text=status_text
+    )
+
+    store = InMemoryGovernanceEvidenceStore()
+    await store.put(_make_minimal_evidence_set(corpus_id="19a:1"))
+
+    report = await scan_governance_completeness(
+        "19a:1", store, journal_path
+    )
+
+    assert report.unresolved_findings == ["19A-P1-003"]
+    assert report.is_complete is False
+
+
 # ── (d) governance_evidence_gap blockers in evidence set ──────────────────
 
 
@@ -545,49 +585,19 @@ async def test_scanner_real_corpus_against_live_status_and_journal() -> None:
     bundle is ACCEPTED + the Slice 13 governance phase is ACCEPTED;
     every required Slice 00-12 acceptance marker MUST be present.
 
-    Per the Slice 13A first-sub-slice finalizer P3-A6-1 remediation
-    this test was strengthened to also assert
-    :attr:`CompletenessScanReport.is_complete` is ``False`` on the
-    live corpus, with the explicit reason documented inline: the
-    live journal tail contains a class of STRUCTURAL false positives
-    that the current scanner's same-line-status-marker heuristic
-    cannot filter -- descriptive-text mentions of finding IDs
-    embedded in narrative prose, synthetic test-fixture markdown,
-    and historical reviewer entries (e.g. ``P1-13b-1`` cited as
-    test-fixture text under a 13j journal entry; ``P2-13a-1`` etc.
-    mentioned in historical implementer/reviewer narratives without
-    an inline ``CLOSED`` / ``FIXED`` / ``RESOLVED`` marker on the
-    same line).
+    The Slice 13A first-sub-slice finalizer originally carried
+    :data:`P3-13A-1` because the live journal tail contained structural
+    false positives that made :attr:`CompletenessScanReport.is_complete`
+    false. Slice 19A-3 confirmed that this historical false-positive
+    class is gone. The live-corpus expectation is now driven by the
+    current restart pointer: active 19A P1/P2 ids keep the report
+    incomplete; once STATUS has no active reassessment blockers, the
+    same clean corpus must report complete.
 
-    **This is the EXPECTED CURRENT BEHAVIOR** per the Slice 13A
-    first-sub-slice finalizer carry
-    :data:`P3-13A-1` (12 structural false positives carried with a
-    binding-on-future-slices statement). The carry's binding
-    statement, recorded in STATUS.md § "Carried-P3 ledger" + the
-    journal AFTER entry, requires future Slice 13A sub-slices to
-    design downstream consumers to either:
-
-    * (a) Ignore :attr:`is_complete` and consume the
-      :attr:`unresolved_findings` / :attr:`evidence_gaps` lists
-      directly (so the scanner becomes a presence-tagged report,
-      not a hard gate), OR
-    * (b) Add journal-section-aware filtering (e.g. skip findings
-      cited inside synthetic test-fixture code blocks; skip
-      historical "## CLOSED in this iteration" sections; skip the
-      "## Carried-P3 ledger" + "## Remaining" sections) to reduce
-      the false-positive count toward zero.
-
-    The Slice 13A first sub-slice INTENTIONALLY ships the scanner
-    as a conservative over-reporter per the auto-memory
-    ``feedback_no_silent_degradation`` rule (better to over-report
-    unresolved findings than to silently drop a real blocker). The
-    P2-A3-1 finalizer reduced the regex-noise class from 4 false
-    positives to 0; the remaining structural class is carried to
-    P3-13A-1.
-
-    The real-corpus check pins the missing-acceptance + evidence-gap
-    detection on the live corpus; the unresolved-findings detection
-    is exercised deterministically by the synthetic test
+    The real-corpus check pins the missing-acceptance,
+    unresolved-findings, and evidence-gap detection on the live corpus.
+    The fail-closed unresolved-findings path remains exercised
+    deterministically by the synthetic test
     :func:`test_scanner_detects_unresolved_p1_p2_findings_in_journal_tail`
     above.
     """
@@ -627,43 +637,43 @@ async def test_scanner_real_corpus_against_live_status_and_journal() -> None:
         f"Expected zero evidence gaps from the clean synthetic corpus; "
         f"got {report.evidence_gaps!r}"
     )
-    # Slice 13A first-sub-slice finalizer P3-A6-1 strengthening:
-    # pin the EXPECTED CURRENT BEHAVIOR that is_complete is False on
-    # the live corpus because of the structural-false-positive class
-    # carried as P3-13A-1. This assertion documents the carry as
-    # part of the test surface; a future sub-slice that closes
-    # P3-13A-1 via (a) journal-section-aware filtering will need to
-    # update this assertion (the structural false positives
-    # disappear) OR (b) refactoring downstream consumers to ignore
-    # ``is_complete`` will leave this assertion intact (the scanner
-    # remains conservative but consumers stop gating on it).
-    assert report.is_complete is False, (
-        f"Slice 13A first-sub-slice carry P3-13A-1 invariant: the live "
-        f"corpus is_complete is EXPECTED to be False because of the "
-        f"structural class of false positives (descriptive-text "
-        f"mentions of finding IDs embedded in narrative prose, "
-        f"synthetic test-fixture markdown, and historical entries) "
-        f"that the same-line-status-marker heuristic cannot filter. "
-        f"Got is_complete={report.is_complete!r}; "
-        f"unresolved_findings={report.unresolved_findings!r}. If this "
-        f"assertion is flipping to True, the structural class has "
-        f"been reduced to zero -- update STATUS.md § 'Carried-P3 "
-        f"ledger' P3-13A-1 closure + remove this assertion."
+    status_text = (journal_path.parent / "STATUS.md").read_text(
+        encoding="utf-8"
     )
-    # Additional sanity: the unresolved-findings list MUST be
-    # non-empty (the structural class produces several entries on
-    # the live corpus). A zero-entry list would mean the scanner
-    # silently degraded -- fail closed per
-    # feedback_no_silent_degradation.
-    assert len(report.unresolved_findings) > 0, (
-        f"P3-13A-1 carry invariant: the live corpus MUST surface "
-        f"at least one unresolved finding from the structural-class "
-        f"false positives (descriptive-text mentions of canonical "
-        f"P[12]-<slice>-<digit> IDs without same-line status "
-        f"markers). A zero-count would indicate the scanner has "
-        f"silently degraded. Got "
-        f"unresolved_findings={report.unresolved_findings!r}."
+    active_status_findings = scanner_module._detect_unresolved_findings(
+        journal_tail_text=status_text,
+        include_reassessment_ids=True,
     )
+    if active_status_findings:
+        assert set(active_status_findings).issubset(
+            set(report.unresolved_findings)
+        ), (
+            f"Expected active STATUS.md blockers to be surfaced by the "
+            f"live corpus scan; active_status_findings="
+            f"{active_status_findings!r}, report={report!r}."
+        )
+        assert report.is_complete is False, (
+            f"Expected active STATUS.md blockers to keep the live corpus "
+            f"incomplete; got is_complete={report.is_complete!r}."
+        )
+    else:
+        # Slice 19A-3 closure of P3-13A-1: when the active pointer has
+        # no open 19A P1/P2 ids, the live corpus no longer surfaces
+        # structural false positives. Synthetic tests above still prove
+        # that genuine unresolved P1/P2 finding ids fail closed.
+        assert report.unresolved_findings == [], (
+            f"Expected zero unresolved findings from the live corpus "
+            f"after P3-13A-1 closure and with no active STATUS.md "
+            f"blockers; got {report.unresolved_findings!r}."
+        )
+        assert report.is_complete is True, (
+            f"Expected the clean live corpus to be complete after "
+            f"P3-13A-1 closure when STATUS.md has no active blockers; "
+            f"got is_complete={report.is_complete!r}, "
+            f"missing_acceptance={report.missing_acceptance!r}, "
+            f"unresolved_findings={report.unresolved_findings!r}, "
+            f"evidence_gaps={report.evidence_gaps!r}."
+        )
 
 
 # ── (g) Typed-input validation ────────────────────────────────────────────

@@ -637,26 +637,66 @@ async def test_ingest_feature_window_under_max_chars_stays_exact() -> None:
 
 
 @pytest.mark.asyncio
-async def test_resolve_ref_truncates_body_to_max_chars() -> None:
-    """``resolve_ref`` truncates the body at ``max_chars`` and sets
-    ``preview_only=True`` + the embedded page-ref's exact=False."""
+async def test_resolve_ref_uses_reader_bounded_preview_body() -> None:
+    """``resolve_ref`` passes the max-char bound to the reader and
+    preserves an already-bounded preview body.
 
-    long_body = "y" * 2000
+    19A-P2-005: the boundary is the reader/source call, not local
+    truncation after a raw over-budget body has been hydrated.
+    """
+
+    bounded_body = "y" * 500
     reader = _RecordingReader(
-        rows=[{"body": long_body}], authority="typed_journal"
+        rows=[
+            {
+                "body": bounded_body,
+                "body_truncated": True,
+                "truncated_to_chars": 500,
+            }
+        ],
+        authority="typed_journal",
     )
     ingestor = DefaultGovernanceEvidenceIngestor(reader, max_chars_per_ref=500)
     ref = _make_ref()
 
     slice_ = await ingestor.resolve_ref(ref, max_chars=500)
 
+    selectors = reader.calls[-1].kwargs["selectors"]
+    assert selectors["max_chars"] == 500
+    assert selectors["body_max_chars"] == 500
+    assert selectors["body_slice"] == {"byte_start": 0, "max_chars": 500}
     assert isinstance(slice_, GovernanceEvidenceSlice)
     assert len(slice_.body) == 500
+    assert slice_.body == bounded_body
     assert slice_.truncated_to_chars == 500
     assert slice_.preview_only is True
     page = slice_.pages[0]
     assert page.completeness == "preview_only"
     assert page.exact is False
+
+
+@pytest.mark.asyncio
+async def test_resolve_ref_marks_over_budget_reader_body_unavailable() -> None:
+    """19A-P2-005: a reader that returns an over-budget body is
+    fail-closed instead of locally slicing and surfacing the body."""
+
+    reader = _RecordingReader(
+        rows=[{"body": "x" * 501}], authority="typed_journal"
+    )
+    ingestor = DefaultGovernanceEvidenceIngestor(reader, max_chars_per_ref=500)
+    ref = _make_ref()
+
+    slice_ = await ingestor.resolve_ref(ref, max_chars=500)
+
+    assert slice_.body == ""
+    assert slice_.truncated_to_chars == 500
+    assert slice_.preview_only is True
+    page = slice_.pages[0]
+    assert page.completeness == "unavailable"
+    assert page.exact is False
+    assert page.byte_end == 0
+    assert page.stale_check["over_budget_body_returned"] is True
+    assert page.stale_check["observed_body_chars"] == 501
 
 
 @pytest.mark.asyncio
@@ -686,15 +726,28 @@ async def test_resolve_ref_max_chars_clamped_down_to_constructor_cap() -> None:
     request a tighter cap, never a wider one.
     """
 
-    long_body = "z" * 5000
-    reader = _RecordingReader(rows=[{"body": long_body}], authority="typed_journal")
+    bounded_body = "z" * 100
+    reader = _RecordingReader(
+        rows=[
+            {
+                "body": bounded_body,
+                "body_truncated": True,
+                "truncated_to_chars": 100,
+            }
+        ],
+        authority="typed_journal",
+    )
     ingestor = DefaultGovernanceEvidenceIngestor(reader, max_chars_per_ref=100)
     ref = _make_ref()
 
     # Caller asks for 10_000 but the constructor cap is 100 -- effective cap is 100.
     slice_ = await ingestor.resolve_ref(ref, max_chars=10_000)
 
+    selectors = reader.calls[-1].kwargs["selectors"]
+    assert selectors["max_chars"] == 100
+    assert selectors["body_max_chars"] == 100
     assert len(slice_.body) == 100
+    assert slice_.body == bounded_body
     assert slice_.truncated_to_chars == 100
     assert slice_.preview_only is True
 

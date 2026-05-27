@@ -34,16 +34,12 @@ from iriai_build_v2.public_dashboard import (
     PublicDashboardOutbox,
     project_control_plane_snapshot_if_changed,
 )
-# Slice 13A 8th sub-slice 13An-2 (P3-13A-6-3 binding closure wiring) -- the
-# production-callsite swap at line 1541 wraps the legacy `PublicDashboardOutbox`
-# with `CompletenessAwareDashboardOutbox` so the composite
-# `LegacyGateConsumerSnapshotAdapter` chain has a real production caller.
-# Per the env flag `IRIAI_EXEC_CONTROL_DASHBOARD_COMPANION_WIRING_ENABLED`
-# (default OFF) the wrapper delegates byte-identical to the legacy outbox
-# until the wiring is opt-in enabled, preserving Slice 10 baseline behaviour.
-# Closes the binding statement at `13a-acceptance.md:222-227` by making the
-# composite chain reachable from a real production caller (the dashboard's
-# `_project_control_plane_snapshot_event` ETag-path projection).
+# Slice 13A 8th sub-slice 13An-2 installed an opt-in dashboard display wrapper
+# around the legacy `PublicDashboardOutbox`. Slice 19A source-of-truth
+# `19a-governance-implementation-reassessment.md` reopened the old authority
+# sufficiency claim as 19A-P2-001: this call site is display/advisory-only and
+# is not an authoritative gate / verifier / classifier consumer with durable
+# failure observation.
 from iriai_build_v2.execution_control.dashboard_wrapper import (
     CompletenessAwareDashboardOutbox,
 )
@@ -1551,13 +1547,12 @@ async def _project_control_plane_snapshot_event(
     if not typed_control_plane_version:
         return
     try:
-        # Slice 13A 8th sub-slice 13An-2 (P3-13A-6-3 binding closure wiring) --
-        # wrap the legacy outbox with `CompletenessAwareDashboardOutbox` so the
-        # composite `LegacyGateConsumerSnapshotAdapter` chain has a real
-        # production caller. Env flag default OFF -> byte-identical Slice 10
-        # legacy behaviour at this callsite; env flag ON -> the wrapper invokes
-        # the composite chain BEFORE delegating to the legacy outbox per the
-        # fail-closed contract at doc-13a:18-23 + 111-115 + 280-282.
+        # Slice 13A 8th sub-slice 13An-2 wraps the legacy outbox with
+        # `CompletenessAwareDashboardOutbox` for the dashboard display mirror.
+        # Per Slice 19A 19A-P2-001, this is advisory/display wiring only: the
+        # default failure port is in-memory, this read-path mirror logs and
+        # swallows enqueue failures below, and no authoritative gate / verifier
+        # / classifier consumer is wired here.
         # `outbox.outbox_enabled` below + the
         # `project_control_plane_snapshot_if_changed` driver's
         # `getattr(outbox, "outbox_enabled", False)` early-return guard at

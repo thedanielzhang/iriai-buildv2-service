@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -372,10 +373,7 @@ def test_cli_module_does_not_redefine_governance_snapshot() -> None:
 
     from iriai_build_v2.workflows.develop.governance import cli as mod
 
-    if hasattr(mod, "GovernanceSnapshot"):
-        # If imported, MUST be the same class object as the Slice 19
-        # 1st sub-slice shape.
-        assert mod.GovernanceSnapshot is GovernanceSnapshot
+    assert mod.GovernanceSnapshot is GovernanceSnapshot
 
 
 def test_cli_module_does_not_redefine_snapshot_api_result() -> None:
@@ -383,8 +381,7 @@ def test_cli_module_does_not_redefine_snapshot_api_result() -> None:
 
     from iriai_build_v2.workflows.develop.governance import cli as mod
 
-    if hasattr(mod, "SnapshotAPIResult"):
-        assert mod.SnapshotAPIResult is SnapshotAPIResult
+    assert mod.SnapshotAPIResult is SnapshotAPIResult
 
 
 def test_cli_module_does_not_redefine_report_artifact() -> None:
@@ -392,8 +389,7 @@ def test_cli_module_does_not_redefine_report_artifact() -> None:
 
     from iriai_build_v2.workflows.develop.governance import cli as mod
 
-    if hasattr(mod, "GovernanceReportArtifact"):
-        assert mod.GovernanceReportArtifact is GovernanceReportArtifact
+    assert mod.GovernanceReportArtifact is GovernanceReportArtifact
 
 
 def test_cli_module_does_not_redefine_line_provenance_read_result() -> None:
@@ -401,8 +397,7 @@ def test_cli_module_does_not_redefine_line_provenance_read_result() -> None:
 
     from iriai_build_v2.workflows.develop.governance import cli as mod
 
-    if hasattr(mod, "LineProvenanceReadResult"):
-        assert mod.LineProvenanceReadResult is LineProvenanceReadResult
+    assert mod.LineProvenanceReadResult is LineProvenanceReadResult
 
 
 def test_cli_module_does_not_redefine_metrics_comparator_result() -> None:
@@ -410,8 +405,7 @@ def test_cli_module_does_not_redefine_metrics_comparator_result() -> None:
 
     from iriai_build_v2.workflows.develop.governance import cli as mod
 
-    if hasattr(mod, "MetricsComparatorResult"):
-        assert mod.MetricsComparatorResult is MetricsComparatorResult
+    assert mod.MetricsComparatorResult is MetricsComparatorResult
 
 
 # ============================================================================
@@ -575,13 +569,45 @@ def test_default_factories_are_frozen() -> None:
         factories.snapshot_api_factory = lambda: None  # type: ignore[misc]
 
 
-def test_default_snapshot_corpus_loader_raises() -> None:
-    """The default snapshot corpus loader MUST raise NotImplementedError
-    (fail-loud per the READ-ONLY discipline)."""
+def test_default_snapshot_corpus_loader_raises_for_unknown_feature() -> None:
+    """Unknown feature ids still fail loud rather than returning an
+    empty corpus."""
 
     factories = default_provider_factories()
-    with pytest.raises(NotImplementedError, match="SnapshotAPICorpus"):
+    with pytest.raises(FileNotFoundError, match="bounded governance fixture"):
         factories.snapshot_corpus_loader("any-feature")
+
+
+def test_default_snapshot_corpus_loader_reads_8ac_fixture() -> None:
+    """19A-2 -- the accepted 8ac124d6 default report path has a real
+    bounded summary corpus instead of the historical placeholder."""
+
+    factories = default_provider_factories()
+    corpus = factories.snapshot_corpus_loader("8ac124d6")
+
+    assert isinstance(corpus, SnapshotAPICorpus)
+    assert len(corpus.findings) == 11
+    assert len(corpus.page_refs) == 11
+    assert corpus.recommendations == []
+    assert corpus.replay_results == []
+    assert corpus.corpus_evidence_quality == "canonical"
+    assert all(ref.exact for ref in corpus.page_refs)
+    assert all(ref.completeness == "paged" for ref in corpus.page_refs)
+
+
+def test_fixture_evidence_tokens_require_existing_digest() -> None:
+    """19A-2 -- fixture evidence must fail closed when a digest is missing."""
+
+    from iriai_build_v2.workflows.develop.governance import cli as mod
+
+    with pytest.raises(ValueError, match="no digest"):
+        mod._evidence_ref_from_fixture_token(
+            "8ac124d6",
+            "artifact:missing",
+            artifact_digests={},
+            event_digests={},
+            slice_digests={},
+        )
 
 
 def test_default_line_provenance_reader_factory_raises() -> None:
@@ -940,7 +966,7 @@ def test_cmd_analyze_corpus_id_empty_returns_blocked() -> None:
 
 
 def test_cmd_analyze_default_loader_raises_returns_exit_three() -> None:
-    """The default loader raises NotImplementedError -> EXIT_UPSTREAM_EXCEPTION."""
+    """Unknown feature default-loader gaps still return EXIT_UPSTREAM_EXCEPTION."""
 
     factories = default_provider_factories()
     stdout = _capture_stdout()
@@ -954,7 +980,7 @@ def test_cmd_analyze_default_loader_raises_returns_exit_three() -> None:
 
     assert code == EXIT_UPSTREAM_EXCEPTION
     payload = json.loads(stdout.getvalue())
-    assert payload["exception_type"] == "NotImplementedError"
+    assert payload["exception_type"] == "FileNotFoundError"
     assert payload["reason"] == "upstream_snapshot_construction_exception"
 
 
@@ -1159,6 +1185,35 @@ def test_cmd_report_default_loader_raises_returns_exit_three() -> None:
     )
 
     assert code == EXIT_UPSTREAM_EXCEPTION
+
+
+def test_cmd_report_default_loader_for_8ac_fixture_exits_zero() -> None:
+    """19A-2 -- the default report path for the accepted fixture emits
+    the bounded summary report without injected test factories."""
+
+    factories = default_provider_factories()
+    stdout = _capture_stdout()
+
+    code = cmd_report(
+        feature_id="8ac124d6",
+        fmt="json",
+        factories=factories,
+        stdout=stdout,
+    )
+
+    assert code == EXIT_OK
+    payload = json.loads(stdout.getvalue())
+    assert payload["artifact_key"] == "review:governance-report:8ac124d6"
+    assert payload["corpus_id"] == "8ac124d6"
+    assert payload["completeness"] == "paged"
+    assert payload["evidence_quality"] == "canonical"
+    assert payload["blocked_by"] == []
+    assert payload["truncated"] is True
+    assert payload["omitted_counts"]["page_refs"] == 1
+    assert len(payload["top_finding_keys"]) == 11
+    assert len(payload["page_refs"]) == 10
+    assert "artifact_body" not in stdout.getvalue()
+    assert "raw_body" not in stdout.getvalue()
 
 
 def test_cmd_report_empty_corpus_id_returns_blocked() -> None:
@@ -1691,7 +1746,7 @@ def test_python_dash_m_invocation_works() -> None:
 
 
 def test_python_dash_m_analyze_default_loader_returns_three() -> None:
-    """E2E: default loader raises NotImplementedError -> exit 3 +
+    """E2E: unknown feature default loader raises -> exit 3 +
     valid JSON gap on stdout per doc-19:198."""
 
     proc = subprocess.run(
@@ -1710,7 +1765,7 @@ def test_python_dash_m_analyze_default_loader_returns_three() -> None:
     assert proc.returncode == EXIT_UPSTREAM_EXCEPTION
     # Stdout MUST be parseable JSON per doc-19:150 + doc-19:198.
     payload = json.loads(proc.stdout)
-    assert payload["exception_type"] == "NotImplementedError"
+    assert payload["exception_type"] == "FileNotFoundError"
     assert payload["subcommand"] == "analyze"
 
 
@@ -1789,6 +1844,49 @@ def test_python_dash_m_report_default_loader_returns_three() -> None:
     assert payload["subcommand"] == "report"
 
 
+def test_exact_python_dash_m_report_8ac124d6_default_path_exits_zero() -> None:
+    """19A-2 exact command regression for the default accepted report path."""
+
+    repo_root = Path(__file__).resolve().parents[1]
+    env = os.environ.copy()
+    src_path = str(repo_root / "src")
+    env["PYTHONPATH"] = (
+        src_path
+        if not env.get("PYTHONPATH")
+        else f"{src_path}{os.pathsep}{env['PYTHONPATH']}"
+    )
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "iriai_build_v2.workflows.develop.governance",
+            "report",
+            "--feature-id",
+            "8ac124d6",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        cwd=repo_root,
+        env=env,
+    )
+
+    assert proc.returncode == EXIT_OK, proc.stderr
+    payload = json.loads(proc.stdout)
+    assert payload["artifact_key"] == "review:governance-report:8ac124d6"
+    assert payload["corpus_id"] == "8ac124d6"
+    assert payload["completeness"] == "paged"
+    assert payload["evidence_quality"] == "canonical"
+    assert payload["blocked_by"] == []
+    assert payload["truncated"] is True
+    assert payload["omitted_counts"]["page_refs"] == 1
+    assert len(payload["top_finding_keys"]) == 11
+    assert len(payload["page_refs"]) == 10
+    assert "artifact_body" not in proc.stdout
+    assert "raw_body" not in proc.stdout
+
+
 # ============================================================================
 # Section 12: JSON-first contract preservation
 # ============================================================================
@@ -1806,9 +1904,10 @@ def test_argparse_usage_error_emits_typed_json() -> None:
     assert code == EXIT_USAGE_ERROR
     # stdout MUST contain the typed gap JSON.
     out = stdout.getvalue().strip()
-    if out:  # argparse may print to stderr only; the runner appends to stdout
-        payload = json.loads(out)
-        assert payload["cli_failure_class"] == "governance_cli_blocked_or_unavailable"
+    assert out
+    payload = json.loads(out)
+    assert payload["cli_failure_class"] == "governance_cli_blocked_or_unavailable"
+    assert payload["reason"] == "argparse_usage_error"
 
 
 def test_all_subcommands_emit_parseable_json_on_blocked() -> None:
@@ -2115,8 +2214,8 @@ def test_each_format_works_for_compare(fmt: str) -> None:
 def test_main_with_default_factories_returns_nonzero(
     subcommand: str, argv: list[str]
 ) -> None:
-    """Per the READ-ONLY discipline the default factories raise
-    NotImplementedError -> EXIT_UPSTREAM_EXCEPTION."""
+    """Per the READ-ONLY discipline unsupported default paths fail
+    loud and return EXIT_UPSTREAM_EXCEPTION."""
 
     stdout = _capture_stdout()
     code = main(argv, stdout=stdout)

@@ -314,6 +314,19 @@ class PromptContextEvidence:
     included_evidence_ids: list[int] = field(default_factory=list)
     excluded_evidence_ids: list[int] = field(default_factory=list)
     truncation_notes: list[str] = field(default_factory=list)
+    context_package_id: str | None = None
+    context_package_digest: str | None = None
+    context_package_ref: str | None = None
+    context_package_kind: str | None = None
+    context_package_completeness: str | None = None
+    context_package_page_refs: list[Any] = field(default_factory=list)
+    context_package_feature_id: str | None = None
+    context_package_task_id: str | None = None
+    context_package_source_dag_artifact_id: int | str | None = None
+    context_package_dag_sha256: str | None = None
+    context_package_evidence_snapshot_digest: str | None = None
+    context_package_provider_state_digest: str | None = None
+    context_package_advisory_only: bool | None = None
     idempotency_key: str = ""
     stage: str = "pre_runtime"
     metadata: dict[str, Any] = field(default_factory=dict)
@@ -323,10 +336,13 @@ class PromptContextEvidence:
     def stable_idempotency_key(self) -> str:
         if self.idempotency_key:
             return self.idempotency_key
-        return (
+        base_key = (
             f"idem:dispatch-prompt-context:{self.attempt_id}:"
             f"{self.prompt_sha256}:{self.context_sha256 or '-'}"
         )
+        if self.context_package_digest:
+            return f"{base_key}:context-package:{self.context_package_digest}"
+        return base_key
 
 
 @dataclass(frozen=True)

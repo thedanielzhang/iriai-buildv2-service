@@ -1,5 +1,5 @@
 """Slice 13A 8th sub-slice 13An-2 -- unit tests for the P3-13A-6-3
-binding closure wiring (the
+dashboard display/advisory wrapper (the
 :mod:`iriai_build_v2.execution_control.dashboard_wrapper` module).
 
 Covers the user-prompt chunk-shape point 4 test surface:
@@ -15,12 +15,11 @@ Covers the user-prompt chunk-shape point 4 test surface:
 Plus typed-failure recording (durability) + env-flag opt-in
 (default OFF) + byte-identical legacy-passthrough tests.
 
-Per ``13a-acceptance.md:222-227`` the wrapper closes the dead-until-
-wired binding statement by wiring the composite
-:class:`~iriai_build_v2.execution_control.snapshot_companion.LegacyGateConsumerSnapshotAdapter`
-into a real production consumer site (the
-:class:`~iriai_build_v2.public_dashboard.PublicDashboardOutbox`
-dashboard snapshot consumer at ``public_dashboard.py:243-308``).
+Per Slice 19A source-of-truth
+``docs/execution-control-plane/19a-governance-implementation-reassessment.md``
+(``19A-P2-001``), the current wrapper is display/advisory-only. It does not
+wire an authoritative gate / verifier / classifier consumer with durable
+failure observation.
 
 Per the auto-memory ``feedback_no_refactor`` rule the wrapper lives in
 a NEW module (``src/iriai_build_v2/execution_control/dashboard_wrapper.py``)
@@ -318,8 +317,8 @@ def test_module_all_lists_documented_surface_exactly() -> None:
 def test_module_lives_in_execution_control_namespace() -> None:
     """The wrapper module lives at
     ``src/iriai_build_v2/execution_control/dashboard_wrapper.py``
-    alongside the 5 prior Slice 13A modules per
-    ``13a-acceptance.md:222-227`` namespace decision.
+    alongside the 5 prior Slice 13A modules per the
+    ``13a-acceptance.md`` re-export-discipline section.
     """
 
     from iriai_build_v2.execution_control import dashboard_wrapper as mod
@@ -905,10 +904,14 @@ async def test_composite_chain_executes_under_wiring_on() -> None:
     )
     assert helper_output["latest_failures"].item_count == 1
     assert helper_output["latest_failures"].completeness.state == "complete"
+    assert helper_output["latest_failures"].completeness.complete_for == [
+        "snapshot:latest_failures"
+    ]
 
     event_id = await wrapper.project_control_plane_snapshot_changed(
         feature_id="feature-1",
         snapshot=snapshot,
+        required_list_field_scopes=("latest_failures",),
     )
     assert event_id is not None
 
@@ -1313,22 +1316,18 @@ def test_wrapper_method_signature_matches_legacy_outbox_kwargs() -> None:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# Composite adapter chain HAS PRODUCTION CALLERS (closes P3-13A-6-3)
+# Composite adapter chain is reachable only through display/advisory wiring
 # ════════════════════════════════════════════════════════════════════════════
 
 
-def test_wrapper_is_real_production_caller_of_composite_chain() -> None:
+def test_wrapper_composes_composite_chain_without_authority_claim() -> None:
     """The
     :class:`~iriai_build_v2.execution_control.dashboard_wrapper.CompletenessAwareDashboardOutbox`
-    wrapper IS a real production caller of the
+    wrapper composes the
     :class:`~iriai_build_v2.execution_control.snapshot_companion.LegacyGateConsumerSnapshotAdapter`
-    composite chain.
-
-    Closes the P3-13A-6-3 dead-until-wired binding statement (per
-    ``13a-acceptance.md:222-227``). Prior to this sub-slice the
-    composite chain was dead-until-wired (no external production
-    callers); this test pins the composite chain has a real production
-    caller now.
+    composite chain but still defaults to in-memory display/advisory
+    observation. Per Slice 19A ``19A-P2-001``, this is not an authority
+    closure.
     """
 
     pool = _RecordingPool()
@@ -1339,25 +1338,20 @@ def test_wrapper_is_real_production_caller_of_composite_chain() -> None:
         wrapper._gate_consumer_adapter, LegacyGateConsumerSnapshotAdapter
     )
     # The composite chain's gate_adapter is the 5th-sub-slice
-    # LegacyGateCompanionAdapter (the binding closure couples the two).
+    # LegacyGateCompanionAdapter (the advisory composition couples the two).
     assert isinstance(
         wrapper._gate_consumer_adapter._gate_adapter,
         LegacyGateCompanionAdapter,
     )
+    assert isinstance(wrapper.failure_port, InMemoryDashboardCompanionFailurePort)
 
 
 @pytest.mark.asyncio
-async def test_composite_chain_production_caller_is_invoked_at_real_call_site() -> None:
+async def test_composite_chain_is_invoked_only_on_opt_in_display_path() -> None:
     """The wrapper's
-    :meth:`project_control_plane_snapshot_changed` method (the REAL
-    dashboard call site) invokes the composite chain under the
-    wiring-ON path.
-
-    Per ``13a-acceptance.md:222-227`` the binding closure requires the
-    composite chain to be invoked at the real call site. This test
-    asserts the real call site (the dashboard's
-    project_control_plane_snapshot_changed method) actually invokes
-    the composite chain (not just instantiates it).
+    :meth:`project_control_plane_snapshot_changed` method invokes the
+    composite chain under the wiring-ON display path. This pins behavior without
+    upgrading the wrapper into an authoritative consumer.
     """
 
     pool = _RecordingPool()
@@ -1386,7 +1380,7 @@ async def test_composite_chain_production_caller_is_invoked_at_real_call_site() 
         gate_input_digest="gate-input-digest",
         gate_authoritative_bundle=bundle,
     )
-    # The composite was invoked once at the real call site.
+    # The composite was invoked once on the opt-in display path.
     assert composite_invocation_count == 1
 
 
@@ -1425,28 +1419,48 @@ def test_dashboard_companion_failure_record_maps_to_failure_router_keys() -> Non
         assert route.action == "quiesce"
 
 
+def test_dashboard_wrapper_source_pins_19a_display_advisory_boundary() -> None:
+    """The wrapper source must not reintroduce the old authority-closure claim."""
+
+    source_path = pathlib.Path(
+        inspect.getsourcefile(CompletenessAwareDashboardOutbox) or ""
+    )
+    source = source_path.read_text(encoding="utf-8")
+    normalized_source = " ".join(source.split())
+
+    assert "19A-P2-001" in source
+    assert "display/advisory-only" in source
+    assert (
+        "not an authoritative gate / verifier / classifier consumer"
+        in normalized_source
+    )
+    assert "default port is in-memory" in normalized_source
+    for forbidden in (
+        "closes the " + "P3-13A-6-3",
+        "FIRST real " + "production caller",
+        "can " + "now " + "claim " + "gate " + "execution " + "authority",
+    ):
+        assert forbidden not in source, (
+            f"{source_path.name} reintroduced stale authority wording: {forbidden!r}"
+        )
+
+
 # ════════════════════════════════════════════════════════════════════════════
-# P2-13An-2-1 REMEDIATION: production callsite wiring at dashboard.py:1541
+# 19A-4 guardrail: dashboard.py remains display/advisory-only
 # ════════════════════════════════════════════════════════════════════════════
 #
-# These integration tests prove the P3-13A-6-3 binding is ACTUALLY CLOSED at a
-# real production callsite (not merely against the in-test wrapper module).
-# The reviewer's P2-13An-2-1 mandates a production-site swap; these tests
-# verify the swap landed and preserves byte-identical Slice 10 behaviour when
-# the env flag is OFF (the default).
+# These integration tests pin the current dashboard construction without
+# treating it as authority closure. Slice 19A 19A-P2-001 says this wrapper is
+# display/advisory-only unless a future source-of-truth slice wires an actual
+# authoritative consumer with durable failure observation.
 
 
-def test_dashboard_module_constructs_completeness_aware_wrapper() -> None:
-    """The production callsite at ``dashboard.py:1541`` (around the
-    ``_project_control_plane_snapshot_event`` helper) MUST construct
-    :class:`CompletenessAwareDashboardOutbox` -- proving the
-    P3-13A-6-3 binding closure is wired into a real production caller.
-
-    Per the reviewer's P2-13An-2-1 finding: prior to this remediation
-    the wrapper was instantiated ONLY in tests; the production
-    callsite still constructed bare ``PublicDashboardOutbox(pool)``,
-    leaving the composite chain dead-until-wired. The grep here is
-    the durable production-callsite proof.
+def test_dashboard_module_constructs_advisory_wrapper_without_durable_port() -> None:
+    """The production callsite at ``dashboard.py:1563`` (around the
+    ``_project_control_plane_snapshot_event`` helper) constructs
+    :class:`CompletenessAwareDashboardOutbox` as a display/advisory wrapper.
+    The construction does not pass a durable failure port and therefore is not
+    authority closure per Slice 19A ``19A-P2-001``.
     """
 
     repo_root = pathlib.Path(__file__).resolve().parent.parent
@@ -1462,7 +1476,7 @@ def test_dashboard_module_constructs_completeness_aware_wrapper() -> None:
     )
     assert "CompletenessAwareDashboardOutbox" in dashboard_source, (
         "dashboard.py must reference CompletenessAwareDashboardOutbox "
-        "(the P2-13An-2-1 remediation requires the production-callsite swap)"
+        "(the dashboard display wrapper remains constructed)"
     )
     # The wrapper is constructed via composition with PublicDashboardOutbox.
     # We accept any whitespace between the class name and the inner
@@ -1473,21 +1487,29 @@ def test_dashboard_module_constructs_completeness_aware_wrapper() -> None:
     ), (
         "dashboard.py must construct "
         "CompletenessAwareDashboardOutbox(PublicDashboardOutbox(pool)) "
-        "at the production callsite (per the P2-13An-2-1 remediation closes "
-        "P3-13A-6-3 binding by making the composite chain reachable from a "
-        "real production caller)"
+        "at the dashboard display callsite without a caller-supplied durable "
+        "failure port"
+    )
+    construction_line = next(
+        line
+        for line in dashboard_source.splitlines()
+        if "CompletenessAwareDashboardOutbox(PublicDashboardOutbox(pool))" in line
+    )
+    assert "failure_port" not in construction_line, (
+        "dashboard.py must not imply durable failure observation for the "
+        f"current display/advisory wrapper; got {construction_line!r}"
+    )
+    assert "19A-P2-001" in dashboard_source and "display/advisory" in dashboard_source, (
+        "dashboard.py comments must pin the Slice 19A advisory-only boundary "
+        "for the current dashboard wrapper."
     )
 
 
 def test_dashboard_module_no_longer_constructs_bare_outbox_at_projection_site() -> None:
     """The production callsite that previously constructed
     ``outbox = PublicDashboardOutbox(pool)`` MUST NOT do so anymore --
-    it must be wrapped with :class:`CompletenessAwareDashboardOutbox`.
-
-    Per the reviewer's P2-13An-2-1: the prior implementer left
-    ``dashboard.py:1541`` constructing the bare legacy outbox, which
-    is exactly the dead-until-wired condition the binding statement
-    forbids. This regression test pins that the swap landed.
+    it must be wrapped with :class:`CompletenessAwareDashboardOutbox` for the
+    dashboard display mirror. This does not grant new authority.
     """
 
     repo_root = pathlib.Path(__file__).resolve().parent.parent
@@ -1507,7 +1529,7 @@ def test_dashboard_module_no_longer_constructs_bare_outbox_at_projection_site() 
                 f"dashboard.py still contains the bare production-callsite "
                 f"construction `{bare_construction}` without the "
                 f"`CompletenessAwareDashboardOutbox(...)` wrapper "
-                f"(P2-13An-2-1 remediation regression). Offending line: "
+                f"(display-wrapper regression). Offending line: "
                 f"{line!r}"
             )
 
@@ -1515,7 +1537,7 @@ def test_dashboard_module_no_longer_constructs_bare_outbox_at_projection_site() 
 def test_dashboard_module_imports_wrapper_at_top() -> None:
     """The production callsite swap requires the wrapper class to be
     importable at the top of ``dashboard.py``. The import landed at
-    finalizer time per the P2-13An-2-1 remediation.
+    finalizer time for the display-wrapper construction.
 
     AST-based assertion (not a substring) so this test catches a
     later rename / removal of the import alias.
@@ -1536,8 +1558,7 @@ def test_dashboard_module_imports_wrapper_at_top() -> None:
     assert found_import, (
         "dashboard.py must contain a top-level "
         "`from iriai_build_v2.execution_control.dashboard_wrapper import "
-        "CompletenessAwareDashboardOutbox` import (per the P2-13An-2-1 "
-        "remediation; the production callsite swap requires the import)"
+        "CompletenessAwareDashboardOutbox` import for the display wrapper"
     )
 
 
@@ -1546,7 +1567,7 @@ async def test_production_callsite_wrapping_preserves_legacy_byte_identical(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """With the env flag default OFF, the wrapper used at the
-    production callsite preserves the legacy outbox's SQL + args +
+    dashboard display callsite preserves the legacy outbox's SQL + args +
     JSON payload trace byte-identical to bare
     :class:`~iriai_build_v2.public_dashboard.PublicDashboardOutbox`.
 
@@ -1559,9 +1580,8 @@ async def test_production_callsite_wrapping_preserves_legacy_byte_identical(
     baseline byte-for-byte (modulo the per-invocation
     ``projected_at`` timestamp).
 
-    Per the user-prompt non-negotiable + the reviewer's P2-13An-2-1
-    finding: this is the byte-identical legacy-path proof AT THE
-    PRODUCTION CALLSITE.
+    This is the byte-identical legacy-path proof for the current
+    display/advisory callsite.
     """
 
     monkeypatch.delenv(DASHBOARD_COMPANION_WIRING_ENV, raising=False)
@@ -1571,7 +1591,7 @@ async def test_production_callsite_wrapping_preserves_legacy_byte_identical(
     # the prior production callsite shape exactly).
     baseline_pool = _RecordingPool()
     baseline_outbox = PublicDashboardOutbox(baseline_pool, outbox_enabled=True)
-    # Mirrors `outbox.outbox_enabled` early-return check at dashboard.py:1542.
+    # Mirrors `outbox.outbox_enabled` early-return check at dashboard.py:1564.
     assert baseline_outbox.outbox_enabled is True
     baseline_event_id = await baseline_outbox.project_control_plane_snapshot_changed(
         feature_id="feature-1",
@@ -1580,7 +1600,7 @@ async def test_production_callsite_wrapping_preserves_legacy_byte_identical(
 
     # Production-callsite shape: wrap with
     # `CompletenessAwareDashboardOutbox(PublicDashboardOutbox(pool))`
-    # exactly as `dashboard.py:1541` does now.
+    # exactly as `dashboard.py:1563` does now.
     wrapped_pool = _RecordingPool()
     wrapped_outbox = CompletenessAwareDashboardOutbox(
         PublicDashboardOutbox(wrapped_pool, outbox_enabled=True),
@@ -1618,11 +1638,11 @@ def test_wrapper_outbox_enabled_property_delegates_to_legacy_outbox() -> None:
     that forwards to the wrapped legacy outbox's flag.
 
     This property is required so the production callsite's early-return
-    guard (``dashboard.py:1542`` ``if not outbox.outbox_enabled: return``)
+    guard (``dashboard.py:1564`` ``if not outbox.outbox_enabled: return``)
     + the projection driver's
     ``getattr(outbox, "outbox_enabled", False)`` early-return at
     ``public_dashboard.py:705`` both preserve byte-identical Slice 10
-    behaviour after the P2-13An-2-1 swap.
+    behaviour after the display-wrapper construction.
 
     Per the auto-memory ``feedback_no_refactor`` rule: the property is
     a pure forward-add (composes the legacy outbox's flag via

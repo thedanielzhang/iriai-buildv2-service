@@ -95,14 +95,15 @@ local ``CompletenessState`` / ``EvidenceCompleteness`` /
 ``AuthoritativeSnapshotListFieldCompleteness`` /
 ``AuthoritativeSnapshotClassifierRouting`` redefinition.
 
-Per doc-16:283-287 the **P3-13A-6-3 dead-until-wired binding
-statement** is CLOSED: the composite adapter chain is wired into a
-real consumer site at ``dashboard.py:1568`` per the Slice 13A 8th
-sub-slice 13An-2 finalizer landing. Finding rules MAY now treat the
-Slice 13A typed completeness shapes as execution authority for the
-evidence-gap classifier; this first sub-slice exposes the typed
-surface but the wiring + classifier rules land in subsequent
-sub-slices per doc-16:155-169.
+Per Slice 19A source-of-truth
+``docs/execution-control-plane/19a-governance-implementation-reassessment.md``
+(``19A-P2-001``), the dashboard wrapper at ``dashboard.py:1563`` is
+display/advisory-only and does not close P3-13A-6-3 for authority purposes.
+Finding rules must not treat the Slice 13A typed completeness shapes as
+execution authority for the evidence-gap classifier until a future
+source-of-truth slice wires an actual authoritative consumer with durable
+failure observation. This first sub-slice exposes the typed surface but the
+wiring + classifier rules land in subsequent sub-slices per doc-16:155-169.
 
 **Implementation discipline.** Stdlib (``hashlib`` + ``json`` +
 ``datetime``) + Pydantic v2 + Slice 13a modules

@@ -948,15 +948,12 @@ def test_real_jsonl_parses_cleanly_with_anchor_count_matching_rows() -> None:
     raw_lines = _REAL_JSONL_PATH.read_text(encoding="utf-8").split("\n")
     non_blank_rows = sum(1 for line in raw_lines if line.strip())
 
-    # Every non-blank row produces one main anchor.
-    main_anchors = [a for a in anchors if a.event != "finding"]
-    # The main-anchor count equals the non-blank row count exactly,
-    # because the parser emits one main anchor per row (cross-slice
-    # findings are emitted ADDITIONALLY under event="finding").
-    assert len(main_anchors) == non_blank_rows, (
-        f"main anchor count {len(main_anchors)} != non-blank row "
-        f"count {non_blank_rows}"
-    )
+    # Every non-blank row produces at least one anchor at that row's line.
+    # Some primary rows legitimately project to event="finding" when their
+    # stage contains the parser-reserved finding substring, so row coverage is
+    # pinned by decision_log_line rather than by filtering event names.
+    anchor_lines = {a.decision_log_line for a in anchors}
+    assert anchor_lines == set(range(1, non_blank_rows + 1))
 
     # Total anchor count is >= row count (the finding anchors are
     # additional).

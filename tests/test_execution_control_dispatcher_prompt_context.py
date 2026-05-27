@@ -13,12 +13,11 @@ Test surface (12-20 tests per implementer prompt point 5):
   :class:`MissingPromptContextFieldError`) routes to typed failure
   ``runtime_context/context_incomplete`` WITHOUT invoking the runtime
   per doc-13a:269-272.
-* (d) `state="paged"` proceeds through the runtime with the
-  authoritative companion record attached (legacy `truncation_notes`
-  non-empty).
-* (e) `state="preview_only"` proceeds + authoritative companion record's
-  `authority="display_only"` forced per doc-13a:111-115 (override-
-  resistant Slice 13A invariant).
+* (d) `state="paged"` proceeds only when the authoritative completeness
+  carries nonempty exact page refs; paged-without-page-refs fails closed.
+* (e) `state="preview_only"` fails closed to
+  `runtime_context/context_incomplete`; the display-only authority is
+  preserved but cannot invoke the runtime.
 * (f) Legacy `PromptBuildResult` preserved verbatim in new
   `AuthoritativePromptBuildResult` (composition invariant per
   doc-13a:42-46 + 124-126).
@@ -48,6 +47,8 @@ from pydantic import ValidationError
 
 from iriai_build_v2.execution_control.completeness import (
     EvidenceCompleteness,
+    EvidencePageRef,
+    compute_completeness_digest,
 )
 from iriai_build_v2.execution_control.dispatcher_prompt_context import (
     AuthoritativePromptBuildResult,
@@ -255,6 +256,264 @@ def test_authoritative_result_authoritative_bundle_optional_when_runtime_skipped
     assert result.authoritative_bundle is None
 
 
+def test_authoritative_result_fail_closes_preview_only_even_when_runtime_requested() -> None:
+    """Slice 19A-P1-002 -- preview-only prompt context cannot invoke runtime.
+
+    This protects direct :class:`AuthoritativePromptBuilderPort`
+    implementations as well as the bundled legacy adapter: even if the
+    producer asks for runtime invocation, the typed result normalizes the
+    route to ``runtime_context/context_incomplete``.
+    """
+
+    legacy = _legacy_prompt_build_result(
+        bundle=_legacy_bundle(context_file_refs=[], context_file_paths=[])
+    )
+    bundle = derive_authoritative_prompt_context_bundle(
+        legacy.bundle,
+        manifest_id="m-preview",
+        manifest_digest="md-preview",
+        feature_id="feature-1",
+        dag_sha256="dag-sha",
+        task_id="TASK-1",
+    )
+    assert bundle.completeness.state == "preview_only"
+
+    result = AuthoritativePromptBuildResult(
+        legacy_result=legacy,
+        authoritative_bundle=bundle,
+        routing=AuthoritativePromptContextRouting(should_invoke_runtime=True),
+    )
+
+    assert result.routing.should_invoke_runtime is False
+    assert result.routing.typed_failure_class == "runtime_context"
+    assert result.routing.typed_failure_type == "context_incomplete"
+    assert result.routing.missing_field_names == ("page_refs",)
+
+
+def test_authoritative_result_paged_requires_exact_page_refs() -> None:
+    """Slice 19A-P1-002 -- paged runtime context needs exact page refs."""
+
+    legacy = _legacy_prompt_build_result(
+        bundle=_legacy_bundle(truncation_notes=["large prompt paged"])
+    )
+    bundle = derive_authoritative_prompt_context_bundle(
+        legacy.bundle,
+        manifest_id="m-paged",
+        manifest_digest="md-paged",
+        feature_id="feature-1",
+        dag_sha256="dag-sha",
+        task_id="TASK-1",
+    )
+    assert bundle.completeness.state == "paged"
+    assert bundle.completeness.page_refs == []
+
+    blocked = AuthoritativePromptBuildResult(
+        legacy_result=legacy,
+        authoritative_bundle=bundle,
+        routing=AuthoritativePromptContextRouting(should_invoke_runtime=True),
+    )
+    assert blocked.routing.should_invoke_runtime is False
+    assert blocked.routing.missing_field_names == ("page_refs",)
+
+    with_refs = bundle.model_copy(
+        update={
+            "completeness": _completeness_with_page_refs(
+                bundle.completeness,
+                [_page_ref()],
+            )
+        }
+    )
+    allowed = AuthoritativePromptBuildResult(
+        legacy_result=legacy,
+        authoritative_bundle=with_refs,
+        routing=AuthoritativePromptContextRouting(should_invoke_runtime=True),
+    )
+    assert allowed.routing.should_invoke_runtime is True
+    assert allowed.routing.typed_failure_class is None
+    assert allowed.routing.typed_failure_type is None
+
+
+def test_authoritative_result_non_exact_paged_page_refs_fail_closed() -> None:
+    """A paged context with blank page-ref digest is not exact enough."""
+
+    legacy = _legacy_prompt_build_result(
+        bundle=_legacy_bundle(truncation_notes=["large prompt paged"])
+    )
+    bundle = derive_authoritative_prompt_context_bundle(
+        legacy.bundle,
+        manifest_id="m-paged",
+        manifest_digest="md-paged",
+        feature_id="feature-1",
+        dag_sha256="dag-sha",
+        task_id="TASK-1",
+    )
+    non_exact = bundle.model_copy(
+        update={
+            "completeness": _completeness_with_page_refs(
+                bundle.completeness,
+                [_page_ref(sha256="")],
+            )
+        }
+    )
+
+    result = AuthoritativePromptBuildResult(
+        legacy_result=legacy,
+        authoritative_bundle=non_exact,
+        routing=AuthoritativePromptContextRouting(should_invoke_runtime=True),
+    )
+
+    assert result.routing.should_invoke_runtime is False
+    assert result.routing.typed_failure_class == "runtime_context"
+    assert result.routing.typed_failure_type == "context_incomplete"
+    assert result.routing.missing_field_names == ("page_refs",)
+
+
+def test_authoritative_result_mixed_paged_page_refs_fail_closed() -> None:
+    """Mixed exact/non-exact paged refs are still non-exact context."""
+
+    legacy = _legacy_prompt_build_result(
+        bundle=_legacy_bundle(truncation_notes=["large prompt paged"])
+    )
+    bundle = derive_authoritative_prompt_context_bundle(
+        legacy.bundle,
+        manifest_id="m-paged",
+        manifest_digest="md-paged",
+        feature_id="feature-1",
+        dag_sha256="dag-sha",
+        task_id="TASK-1",
+    )
+    mixed = bundle.model_copy(
+        update={
+            "completeness": _completeness_with_page_refs(
+                bundle.completeness,
+                [
+                    _page_ref(ref_id="exact-page"),
+                    _page_ref(ref_id="blank-digest-page", sha256=""),
+                ],
+            )
+        }
+    )
+
+    result = AuthoritativePromptBuildResult(
+        legacy_result=legacy,
+        authoritative_bundle=mixed,
+        routing=AuthoritativePromptContextRouting(should_invoke_runtime=True),
+    )
+
+    assert result.routing.should_invoke_runtime is False
+    assert result.routing.typed_failure_class == "runtime_context"
+    assert result.routing.typed_failure_type == "context_incomplete"
+    assert result.routing.missing_field_names == ("page_refs",)
+
+
+def test_authoritative_result_paged_missing_required_refs_fail_closed() -> None:
+    """A paged context with unresolved required refs is not executable."""
+
+    legacy = _legacy_prompt_build_result(
+        bundle=_legacy_bundle(truncation_notes=["large prompt paged"])
+    )
+    bundle = derive_authoritative_prompt_context_bundle(
+        legacy.bundle,
+        manifest_id="m-paged",
+        manifest_digest="md-paged",
+        feature_id="feature-1",
+        dag_sha256="dag-sha",
+        task_id="TASK-1",
+    )
+    missing_ref = _page_ref(ref_id="missing-page")
+    incomplete = bundle.model_copy(
+        update={
+            "completeness": _completeness_with_page_refs(
+                bundle.completeness,
+                [_page_ref()],
+                missing_required_refs=[missing_ref],
+            )
+        }
+    )
+
+    result = AuthoritativePromptBuildResult(
+        legacy_result=legacy,
+        authoritative_bundle=incomplete,
+        routing=AuthoritativePromptContextRouting(should_invoke_runtime=True),
+    )
+
+    assert result.routing.should_invoke_runtime is False
+    assert result.routing.typed_failure_class == "runtime_context"
+    assert result.routing.typed_failure_type == "context_incomplete"
+    assert result.routing.missing_field_names == ("missing_required_refs",)
+
+
+def test_authoritative_result_paged_required_scope_mismatch_fail_closed() -> None:
+    """Paged context must cover the manifest's required scopes."""
+
+    legacy = _legacy_prompt_build_result(
+        bundle=_legacy_bundle(truncation_notes=["large prompt paged"])
+    )
+    bundle = derive_authoritative_prompt_context_bundle(
+        legacy.bundle,
+        manifest_id="m-paged",
+        manifest_digest="md-paged",
+        feature_id="feature-1",
+        dag_sha256="dag-sha",
+        task_id="TASK-1",
+    )
+    mismatched_ref = bundle.context_manifest_ref.model_copy(
+        update={"required_complete_for": ["task:OTHER"]}
+    )
+    mismatched = bundle.model_copy(
+        update={
+            "context_manifest_ref": mismatched_ref,
+            "completeness": _completeness_with_page_refs(
+                bundle.completeness,
+                [_page_ref()],
+            ),
+        }
+    )
+
+    result = AuthoritativePromptBuildResult(
+        legacy_result=legacy,
+        authoritative_bundle=mismatched,
+        routing=AuthoritativePromptContextRouting(should_invoke_runtime=True),
+    )
+
+    assert result.routing.should_invoke_runtime is False
+    assert result.routing.typed_failure_class == "runtime_context"
+    assert result.routing.typed_failure_type == "context_incomplete"
+    assert result.routing.missing_field_names == ("required_complete_for",)
+
+
+def test_authoritative_result_complete_required_scope_mismatch_fail_closed() -> None:
+    """Complete context still must cover the manifest's required scopes."""
+
+    legacy = _legacy_prompt_build_result(bundle=_legacy_bundle())
+    bundle = derive_authoritative_prompt_context_bundle(
+        legacy.bundle,
+        manifest_id="m-complete",
+        manifest_digest="md-complete",
+        feature_id="feature-1",
+        dag_sha256="dag-sha",
+        task_id="TASK-1",
+    )
+    assert bundle.completeness.state == "complete"
+    mismatched_ref = bundle.context_manifest_ref.model_copy(
+        update={"required_complete_for": ["task:OTHER"]}
+    )
+    mismatched = bundle.model_copy(
+        update={"context_manifest_ref": mismatched_ref}
+    )
+
+    result = AuthoritativePromptBuildResult(
+        legacy_result=legacy,
+        authoritative_bundle=mismatched,
+        routing=AuthoritativePromptContextRouting(should_invoke_runtime=True),
+    )
+
+    assert result.routing.should_invoke_runtime is False
+    assert result.routing.typed_failure_class == "runtime_context"
+    assert result.routing.typed_failure_type == "context_incomplete"
+    assert result.routing.missing_field_names == ("required_complete_for",)
+
+
 # ── legacy adapter wraps Slice 05 port ─────────────────────────────────────
 
 
@@ -284,15 +543,14 @@ async def test_legacy_adapter_calls_through_to_legacy_port_and_derives_authorita
 
 
 @pytest.mark.asyncio
-async def test_legacy_adapter_paged_state_when_truncation_notes_non_empty() -> None:
+async def test_legacy_adapter_paged_state_without_page_refs_blocks_runtime() -> None:
     """The legacy adapter sets ``state="paged"`` when the legacy bundle's
     ``truncation_notes`` is non-empty (per doc-13a:115-118 + the
     third-sub-slice adapter's exact-vs-preview boundary rule).
 
-    Per doc-13a:269-272 the runtime PROCEEDS with the authoritative
-    companion record attached (the paged evidence is still
-    authoritative; the consumer MUST traverse the page-refs to gather
-    the full content).
+    Slice 19A-P1-002 remediation: because this legacy-derived paged
+    bundle has no authoritative ``completeness.page_refs``, the routing
+    must fail closed to ``runtime_context/context_incomplete``.
     """
 
     legacy_port = _FakeLegacyPromptBuilder(
@@ -302,23 +560,25 @@ async def test_legacy_adapter_paged_state_when_truncation_notes_non_empty() -> N
 
     result = await adapter.build_prompt_context(_request())
 
-    assert result.routing.should_invoke_runtime is True
+    assert result.routing.should_invoke_runtime is False
+    assert result.routing.typed_failure_class == "runtime_context"
+    assert result.routing.typed_failure_type == "context_incomplete"
+    assert result.routing.missing_field_names == ("page_refs",)
     assert result.authoritative_bundle is not None
     assert result.authoritative_bundle.completeness.state == "paged"
+    assert result.authoritative_bundle.completeness.page_refs == []
     # Legacy truncation_notes preserved verbatim per doc-13a:213-215.
     assert result.authoritative_bundle.truncation_notes == ["large prompt truncated"]
 
 
 @pytest.mark.asyncio
-async def test_legacy_adapter_preview_only_forces_display_only_authority() -> None:
+async def test_legacy_adapter_preview_only_forces_display_only_and_blocks_runtime() -> None:
     """The legacy adapter forces ``authority="display_only"`` when the
     state is ``"preview_only"`` (no context_file_refs).
 
-    Per doc-13a:18-23 (Slice 13A invariant; override-resistant) +
-    doc-13a:111-115 (Blocking deviations): a preview cannot carry
-    execution authority. The runtime still proceeds (the preview is
-    not blocking by itself); downstream consumers MUST check the
-    authority/state to decide whether to drive authoritative decisions.
+    Slice 19A-P1-002 remediation: preview-only context cannot invoke the
+    runtime; it routes to ``runtime_context/context_incomplete`` while
+    preserving the display-only authority for observability.
     """
 
     legacy_port = _FakeLegacyPromptBuilder(
@@ -328,7 +588,10 @@ async def test_legacy_adapter_preview_only_forces_display_only_authority() -> No
 
     result = await adapter.build_prompt_context(_request())
 
-    assert result.routing.should_invoke_runtime is True
+    assert result.routing.should_invoke_runtime is False
+    assert result.routing.typed_failure_class == "runtime_context"
+    assert result.routing.typed_failure_type == "context_incomplete"
+    assert result.routing.missing_field_names == ("page_refs",)
     assert result.authoritative_bundle is not None
     assert result.authoritative_bundle.completeness.state == "preview_only"
     # Override-resistant Slice 13A invariant: preview_only forces
@@ -527,16 +790,18 @@ async def test_dispatcher_records_runtime_context_context_incomplete_failure() -
 
 
 @pytest.mark.asyncio
-async def test_dispatcher_state_paged_proceeds_with_authoritative_companion_record() -> None:
-    """When the adapter returns ``state="paged"`` the dispatcher
-    proceeds through the runtime (per doc-13a:269-272 "a large prompt
-    emits a compact preview plus exact page refs").
+async def test_dispatcher_state_paged_without_page_refs_blocks_runtime() -> None:
+    """Paged dispatcher context without exact page refs blocks runtime.
 
-    The runtime IS invoked (the paged evidence is authoritative).
+    Slice 19A-P1-002 remediation: the original test accepted runtime
+    invocation from a paged bundle whose authoritative
+    ``completeness.page_refs`` was empty. That is now routed to
+    ``runtime_context/context_incomplete``.
     """
 
     log: list[str] = []
     legacy_port = _FakeLegacyPromptBuilder(log=log)
+    store = _FakeStore(log=log)
     # Synthesize a paged authoritative bundle via the third-sub-slice
     # adapter (truncation_notes non-empty -> state="paged").
     legacy = _legacy_prompt_build_result(
@@ -551,6 +816,57 @@ async def test_dispatcher_state_paged_proceeds_with_authoritative_companion_reco
         task_id="TASK-1",
     )
     assert paged_bundle.completeness.state == "paged"
+    assert paged_bundle.completeness.page_refs == []
+    new_port = _FakeAuthoritativePromptBuilder(
+        log=log,
+        result=AuthoritativePromptBuildResult(
+            legacy_result=legacy,
+            authoritative_bundle=paged_bundle,
+            routing=AuthoritativePromptContextRouting(should_invoke_runtime=True),
+        ),
+    )
+    dispatcher = _build_dispatcher(
+        log,
+        store=store,
+        prompt_builder=legacy_port,
+        authoritative_prompt_builder=new_port,
+    )
+
+    outcome = await dispatcher.dispatch(_request())
+
+    assert outcome.status == "failed"
+    assert "runtime" not in log
+    failure = store.failures[0]
+    assert failure.failure_class == "runtime_context"
+    assert failure.failure_type == "context_incomplete"
+    assert failure.details["missing_field_names"] == ["page_refs"]
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_state_paged_with_exact_page_refs_proceeds() -> None:
+    """Paged dispatcher context can run when exact page refs are present."""
+
+    log: list[str] = []
+    legacy_port = _FakeLegacyPromptBuilder(log=log)
+    legacy = _legacy_prompt_build_result(
+        bundle=_legacy_bundle(truncation_notes=["large prompt paged"])
+    )
+    paged_bundle = derive_authoritative_prompt_context_bundle(
+        legacy.bundle,
+        manifest_id="m-paged",
+        manifest_digest="md-paged",
+        feature_id="feature-1",
+        dag_sha256="dag-sha",
+        task_id="TASK-1",
+    )
+    paged_bundle = paged_bundle.model_copy(
+        update={
+            "completeness": _completeness_with_page_refs(
+                paged_bundle.completeness,
+                [_page_ref()],
+            )
+        }
+    )
     new_port = _FakeAuthoritativePromptBuilder(
         log=log,
         result=AuthoritativePromptBuildResult(
@@ -568,25 +884,21 @@ async def test_dispatcher_state_paged_proceeds_with_authoritative_companion_reco
     outcome = await dispatcher.dispatch(_request())
 
     assert outcome.status == "succeeded"
-    # Runtime IS invoked when state="paged".
     assert "runtime" in log
 
 
 @pytest.mark.asyncio
-async def test_dispatcher_state_preview_only_proceeds_with_display_only_authority() -> None:
-    """When the adapter returns ``state="preview_only"`` the dispatcher
-    proceeds through the runtime; the authoritative companion record's
-    ``authority="display_only"`` is forced per doc-13a:111-115 +
-    doc-13a:18-23 (Slice 13A invariant; override-resistant).
+async def test_dispatcher_state_preview_only_blocks_runtime() -> None:
+    """Preview-only dispatcher context is display-only and blocks runtime.
 
-    Per the chunk shape point 5 (e). The runtime IS invoked (the
-    preview is not blocking by itself); downstream consumers MUST
-    check the authority/state to decide whether to drive authoritative
-    decisions.
+    The authoritative companion record's ``authority="display_only"``
+    is still forced per doc-13a:111-115 + doc-13a:18-23, but Slice
+    19A-P1-002 requires dispatcher execution to fail closed.
     """
 
     log: list[str] = []
     legacy_port = _FakeLegacyPromptBuilder(log=log)
+    store = _FakeStore(log=log)
     # Synthesize a preview_only authoritative bundle via the
     # third-sub-slice adapter (no context_file_refs -> state="preview_only"
     # + authority="display_only" forced).
@@ -615,17 +927,19 @@ async def test_dispatcher_state_preview_only_proceeds_with_display_only_authorit
     )
     dispatcher = _build_dispatcher(
         log,
+        store=store,
         prompt_builder=legacy_port,
         authoritative_prompt_builder=new_port,
     )
 
     outcome = await dispatcher.dispatch(_request())
 
-    assert outcome.status == "succeeded"
-    # Runtime IS invoked when state="preview_only" (the preview is
-    # display-only; downstream consumers check the authority to
-    # decide whether to drive authoritative decisions).
-    assert "runtime" in log
+    assert outcome.status == "failed"
+    assert "runtime" not in log
+    failure = store.failures[0]
+    assert failure.failure_class == "runtime_context"
+    assert failure.failure_type == "context_incomplete"
+    assert failure.details["missing_field_names"] == ["page_refs"]
 
 
 # ── adapter wrapping the dispatcher's full legacy port path ────────────────
@@ -825,6 +1139,47 @@ def _legacy_bundle(**overrides: Any) -> PromptContextBundle:
     }
     data.update(overrides)
     return PromptContextBundle(**data)
+
+
+def _page_ref(**overrides: Any) -> EvidencePageRef:
+    data: dict[str, Any] = {
+        "ref_id": "page-ref-1",
+        "source_kind": "typed_row",
+        "source_id": 31,
+        "sha256": "page-sha",
+        "start": 0,
+        "end": 100,
+        "item_count": 1,
+        "bytes": 100,
+        "reason": "required-runtime-context",
+    }
+    data.update(overrides)
+    return EvidencePageRef(**data)
+
+
+def _completeness_with_page_refs(
+    completeness: EvidenceCompleteness,
+    page_refs: list[EvidencePageRef],
+    *,
+    missing_required_refs: list[EvidencePageRef] | None = None,
+) -> EvidenceCompleteness:
+    resolved_missing_refs = list(missing_required_refs or [])
+    digest = compute_completeness_digest(
+        state=completeness.state,
+        authority=completeness.authority,
+        complete_for=list(completeness.complete_for),
+        missing_required_refs=resolved_missing_refs,
+        page_refs=list(page_refs),
+        preview_ref=completeness.preview_ref,
+        unavailable_reason=completeness.unavailable_reason,
+    )
+    return completeness.model_copy(
+        update={
+            "missing_required_refs": resolved_missing_refs,
+            "page_refs": list(page_refs),
+            "completeness_digest": digest,
+        }
+    )
 
 
 def _legacy_prompt_build_result(

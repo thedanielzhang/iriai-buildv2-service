@@ -237,12 +237,12 @@ more evidence."* — the "evidence not in corpus" check is precisely the
 shared `CompletenessState="unavailable"` state. This dependency
 reference makes that mapping explicit.
 
-Per **P3-13A-6-3 dead-until-wired binding statement** (see
-`13a-acceptance.md:193-227`), the composite adapter chain must be
-wired into a real consumer site before replay results citing 13A typed
-completeness can feed Slice 17 policy recommendations as runtime
-authority. The wiring is the **Slice 13A 8th sub-slice 13An-2**
-deliverable.
+Per P3-13A-6-3 and Slice 19A source-of-truth
+`19a-governance-implementation-reassessment.md` (`19A-P2-001`), the current
+dashboard wrapper is display/advisory-only and does not let replay results
+citing 13A typed completeness feed policy recommendations as runtime authority.
+Authority use must wait for a future source-of-truth slice that wires an actual
+authoritative consumer with durable failure observation.
 
 This dependency-reconciliation reference was added by
 **Slice 13A 8th sub-slice 13An-1** (this iteration) per

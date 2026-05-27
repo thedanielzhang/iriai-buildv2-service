@@ -23,11 +23,10 @@ Per the auto-memory ``feedback_cite_everything`` rule: every claim in
 each per-doc reference must cite ``doc-13a:285-287`` so the dependency
 chain is auditable.
 
-Per the user-prompt **non-negotiables** + the **P3-13A-6-3** binding
-statement at ``docs/execution-control-plane/13a-acceptance.md:193-227``,
-the references pin the dead-until-wired status of the composite
-``LegacyGateConsumerSnapshotAdapter`` chain -- the binding closure is
-the **Slice 13A 8th sub-slice 13An-2** deliverable, NOT this iteration.
+Per Slice 19A source-of-truth
+``docs/execution-control-plane/19a-governance-implementation-reassessment.md``
+(``19A-P2-001``), the owned Slice 13-19 references now pin that the current
+dashboard wrapper is display/advisory-only and is not authority closure.
 
 Author: Slice 13A 8th sub-slice 13An-1 (implementer).
 """
@@ -58,6 +57,8 @@ TOUCHED_DOCS: dict[str, pathlib.Path] = {
     "20": DOCS_DIR / "20-governance-acceptance-and-adoption.md",
     "21": DOCS_DIR / "21-iriai-context-layer.md",
 }
+
+OWNED_19A4_DOC_IDS = frozenset({"13", "14", "15", "16", "17", "18", "19", "20"})
 
 
 # ---------------------------------------------------------------------------
@@ -224,36 +225,59 @@ def test_touched_doc_names_adapter_module(
 
 
 # ---------------------------------------------------------------------------
-# (e) Each reference must preserve the P3-13A-6-3 binding statement
+# (e) Each owned reference must preserve the 19A authority boundary
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("slice_id,doc_path", TOUCHED_DOCS.items())
-def test_touched_doc_preserves_p3_13a_6_3_binding(
+def test_touched_doc_preserves_p3_13a_6_3_authority_boundary(
     slice_id: str, doc_path: pathlib.Path
 ) -> None:
-    """Per the user-prompt non-negotiables, the P3-13A-6-3 binding
-    statement must be preserved verbatim through this sub-slice.
+    """Owned Slice 13-19 docs must pin the Slice 19A authority correction.
 
-    The binding closure is the **Slice 13A 8th sub-slice 13An-2**
-    deliverable, NOT this iteration. The references in each touched
-    doc MUST name P3-13A-6-3 so future readers know the wiring is
-    still pending.
+    Slice 21 remains outside the 19A-4 owned edit scope, so this test keeps its
+    historical P3-13A-6-3 reference requirement without requiring a source-doc
+    edit there. Slice 20 is active and now pins the accepted 19A boundary.
     """
     text = doc_path.read_text(encoding="utf-8")
-    assert "P3-13A-6-3" in text, (
-        f"Slice {slice_id} doc {doc_path.name} shared-completeness "
-        f"reference does not name P3-13A-6-3. Per the user-prompt "
-        f"non-negotiables, the dead-until-wired binding statement "
-        f"MUST be preserved verbatim through this sub-slice; the "
-        f"binding closure is deferred to 13An-2."
+    normalized_text = " ".join(text.split())
+    if slice_id not in OWNED_19A4_DOC_IDS:
+        assert "P3-13A-6-3" in text, (
+            f"Slice {slice_id} doc {doc_path.name} must preserve its historical "
+            "P3-13A-6-3 reference."
+        )
+        assert "13An-2" in text, (
+            f"Slice {slice_id} doc {doc_path.name} must preserve its historical "
+            "13An-2 reference."
+        )
+        return
+
+    assert "19A-P2-001" in text, (
+        f"Slice {slice_id} doc {doc_path.name} must point to the active "
+        "Slice 19A authority-sufficiency item."
     )
-    assert "13An-2" in text, (
-        f"Slice {slice_id} doc {doc_path.name} shared-completeness "
-        f"reference does not name 13An-2 as the binding-closure "
-        f"deliverable. Per doc-13a:285-287 + the P2-13A-7-1 mitigation "
-        f"in 13a-acceptance.md:285-306, the SPLIT decision names 13An-2 "
-        f"as the wiring closure iteration."
+    assert "19a-governance-implementation-reassessment.md" in text, (
+        f"Slice {slice_id} doc {doc_path.name} must point to the Slice 19A "
+        "source doc instead of restating the remediation criteria."
+    )
+    assert "display/advisory-only" in normalized_text, (
+        f"Slice {slice_id} doc {doc_path.name} must state the current dashboard "
+        "wrapper is display/advisory-only."
+    )
+    assert "durable failure observation" in normalized_text, (
+        f"Slice {slice_id} doc {doc_path.name} must keep durable failure "
+        "observation as future authority wiring."
+    )
+    assert "future source-of-truth slice" in normalized_text, (
+        f"Slice {slice_id} doc {doc_path.name} must defer authority wiring to a "
+        "future source-of-truth slice."
+    )
+
+    # Historical 13An references remain allowed but are no longer sufficient for
+    # the owned Slice 13-19 authority boundary after Slice 19A.
+    assert "P3-13A-6-3" in text, (
+        f"Slice {slice_id} doc {doc_path.name} must still name P3-13A-6-3 "
+        "near the authority correction."
     )
 
 
@@ -393,10 +417,11 @@ def test_acceptance_artifact_step_9_satisfied_after_13an_split() -> None:
 
     13An-1 (FIRST iteration of the SPLIT) delivered the plan-doc
     references (this test module + the 9 uniform per-doc sub-sections);
-    13An-2 (SECOND iteration) landed the P3-13A-6-3 binding closure via
-    the production-callsite swap at dashboard.py:1568; 13An-3 (THIRD
-    iteration; slice-end finalizer) updates the acceptance artifact's
-    per-step status table to SATISFIED per the SPLIT.
+    13An-2 (SECOND iteration) recorded the dashboard wrapper at
+    dashboard.py:1563; 13An-3 (THIRD iteration; slice-end finalizer) updates
+    the acceptance artifact's per-step status table to SATISFIED per the SPLIT.
+    Slice 19A later reopened the wrapper's authority sufficiency as
+    19A-P2-001.
     """
     text = ACCEPTANCE_ARTIFACT_PATH.read_text(encoding="utf-8")
     rows = [
@@ -413,28 +438,38 @@ def test_acceptance_artifact_step_9_satisfied_after_13an_split() -> None:
     assert "13An-1" in row_text, (
         "Step 9 row must reference 13An-1 (step 9 reconciliation)."
     )
+    assert "19A-P2-001" in row_text, (
+        "Step 9 row must preserve the Slice 19A authority-sufficiency "
+        "correction for the dashboard wrapper."
+    )
 
 
-def test_p3_13a_6_3_binding_statement_unchanged() -> None:
-    """The P3-13A-6-3 dead-until-wired binding statement must be
-    preserved verbatim through 13An-1.
+def test_p3_13a_6_3_binding_statement_pins_19a_boundary() -> None:
+    """The P3-13A-6-3 binding statement must pin the Slice 19A correction.
 
-    Per the user-prompt non-negotiables, the binding closure is the
-    13An-2 deliverable. 13An-1 only adds plan-doc references; it does
-    NOT close the binding statement.
+    The current dashboard wrapper is display/advisory-only and not an
+    authoritative consumer with durable failure observation.
     """
     text = ACCEPTANCE_ARTIFACT_PATH.read_text(encoding="utf-8")
     assert "Dead-until-wired binding statement (P3-13A-6-3)" in text, (
         "Acceptance artifact's P3-13A-6-3 binding statement header is "
-        "missing. The binding statement MUST be preserved verbatim "
-        "through 13An-1; binding closure is the 13An-2 deliverable."
+        "missing."
     )
-    # The binding statement's key sentence must still claim
-    # dead-until-wired (not "WIRED" or "CLOSED").
     assert "dead-until-wired" in text, (
         "Acceptance artifact's P3-13A-6-3 binding statement no longer "
-        "claims 'dead-until-wired'. Per the user-prompt non-negotiables, "
-        "the binding closure is deferred to 13An-2."
+        "mentions the historical dead-until-wired state."
+    )
+    assert "19A-P2-001" in text, (
+        "Acceptance artifact must point the P3-13A-6-3 boundary to the active "
+        "Slice 19A authority-sufficiency item."
+    )
+    assert "display/advisory-only" in text, (
+        "Acceptance artifact must state the current dashboard wrapper is "
+        "display/advisory-only."
+    )
+    assert "durable failure observation" in text, (
+        "Acceptance artifact must keep durable failure observation as future "
+        "authority wiring."
     )
 
 

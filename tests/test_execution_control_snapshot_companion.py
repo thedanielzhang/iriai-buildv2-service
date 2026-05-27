@@ -560,33 +560,79 @@ def test_derive_snapshot_companion_blocks_when_required_scope_paged_not_complete
     list-field's state is complete/paged.
     """
 
-    # Per-field "merge_queue" is paged but covers scope
-    # "snapshot:merge_queue" -- caller requires "merge_queue" which is
-    # the field name (and matches the key in the dict).
-    # However if the field state is preview_only, the routing blocks.
+    page_ref = _page_ref()
     fields = {
         "merge_queue": AuthoritativeSnapshotListFieldCompleteness(
             field_name="merge_queue",
             completeness=_completeness(
-                state="preview_only",
-                authority="display_only",
+                state="paged",
+                page_refs=[page_ref],
                 complete_for=[],
             ),
-            item_count=0,
+            item_count=10,
+            next_page_ref=page_ref,
         ),
     }
-    # The snapshot's aggregate state will be preview_only; required
-    # scope = merge_queue is included; helper fails closed BEFORE
-    # constructing the record.
-    with pytest.raises(MissingSnapshotCompanionFieldError):
-        derive_snapshot_companion(
-            fields,
-            snapshot_scope_id="snapshot:s",
-            snapshot_digest="d",
-            manifest_id="m",
-            manifest_digest="md",
-            required_list_field_scopes=("merge_queue",),
-        )
+    record = derive_snapshot_companion(
+        fields,
+        snapshot_scope_id="snapshot:s",
+        snapshot_digest="d",
+        manifest_id="m",
+        manifest_digest="md",
+        required_list_field_scopes=("merge_queue",),
+    )
+    assert record.classifier_routing.should_invoke_classifier is False
+    assert "merge_queue" in record.classifier_routing.missing_field_names
+
+
+def test_derive_snapshot_companion_blocks_required_paged_without_page_refs() -> None:
+    fields = {
+        "merge_queue": AuthoritativeSnapshotListFieldCompleteness(
+            field_name="merge_queue",
+            completeness=_completeness(
+                state="paged",
+                complete_for=["snapshot:merge_queue"],
+            ),
+            item_count=10,
+            next_page_ref=None,
+        ),
+    }
+    record = derive_snapshot_companion(
+        fields,
+        snapshot_scope_id="snapshot:s",
+        snapshot_digest="d",
+        manifest_id="m",
+        manifest_digest="md",
+        required_list_field_scopes=("merge_queue",),
+    )
+    assert record.classifier_routing.should_invoke_classifier is False
+    assert "merge_queue" in record.classifier_routing.missing_field_names
+
+
+def test_derive_snapshot_companion_blocks_required_paged_with_non_exact_page_ref() -> None:
+    page_ref = _page_ref(sha256="")
+    fields = {
+        "merge_queue": AuthoritativeSnapshotListFieldCompleteness(
+            field_name="merge_queue",
+            completeness=_completeness(
+                state="paged",
+                page_refs=[page_ref],
+                complete_for=["snapshot:merge_queue"],
+            ),
+            item_count=10,
+            next_page_ref=page_ref,
+        ),
+    }
+    record = derive_snapshot_companion(
+        fields,
+        snapshot_scope_id="snapshot:s",
+        snapshot_digest="d",
+        manifest_id="m",
+        manifest_digest="md",
+        required_list_field_scopes=("merge_queue",),
+    )
+    assert record.classifier_routing.should_invoke_classifier is False
+    assert "merge_queue" in record.classifier_routing.missing_field_names
 
 
 # ── (c) companion record allows partial display when required fields complete
@@ -1170,11 +1216,11 @@ def test_legacy_gate_consumer_snapshot_adapter_composes_complete_records() -> No
     gate_record = wrapper.derive_gate_with_snapshot(
         snap_record,
         prompt_bundle,
-        gate_scope_id="gate:atomic_landing",
+        gate_scope_id="task:TASK-1",
         gate_input_digest="gate-input-digest",
     )
     assert isinstance(gate_record, AuthoritativeGateCompanionRecord)
-    assert gate_record.gate_scope_id == "gate:atomic_landing"
+    assert gate_record.gate_scope_id == "task:TASK-1"
     assert gate_record.approval_routing.should_approve_gate is True
 
 
@@ -1237,7 +1283,7 @@ def test_derive_gate_companion_with_snapshot_helper_composes() -> None:
     gate_record = derive_gate_companion_with_snapshot(
         snap_record,
         prompt_bundle,
-        gate_scope_id="gate:atomic_landing",
+        gate_scope_id="task:TASK-1",
         gate_input_digest="gate-input-digest",
     )
     assert isinstance(gate_record, AuthoritativeGateCompanionRecord)
@@ -1260,7 +1306,7 @@ def test_derive_gate_companion_with_snapshot_helper_carries_proof_rows() -> None
     gate_record = derive_gate_companion_with_snapshot(
         snap_record,
         prompt_bundle,
-        gate_scope_id="gate:atomic_landing",
+        gate_scope_id="task:TASK-1",
         gate_input_digest="gate-input-digest",
         proof_rows=[proof_row],
     )
@@ -1310,7 +1356,7 @@ def test_legacy_gate_consumer_snapshot_wires_default_when_required_scopes_empty(
     gate_record = wrapper.derive_gate_with_snapshot(
         snap_record,
         prompt_bundle,
-        gate_scope_id="gate:s",
+        gate_scope_id="task:TASK-1",
         gate_input_digest="d",
         required_snapshot_list_field_scopes=(),
     )

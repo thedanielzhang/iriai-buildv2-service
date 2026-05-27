@@ -132,8 +132,9 @@ from pydantic import BaseModel
 
 SLICE_19_MODULES: tuple[str, ...] = (
     # Slice 19 1st sub-slice -- typed shape foundation
-    # (GovernanceSnapshot + GovernanceAgentContext + digest helpers +
-    # 5 default-budget constants; 9 __all__; 1170 lines; 118 tests).
+    # (GovernanceSnapshot + GovernanceAgentContext +
+    # ContextLayerPackageSummary + digest helpers + 5 default-budget
+    # constants; 10 __all__; 1170 lines; 118 tests).
     "iriai_build_v2.execution_control.governance_agent",
     # Slice 19 2nd sub-slice -- typed snapshot API
     # (GovernanceSnapshotAPI.build_snapshot; 6 __all__; 1022 lines;
@@ -448,7 +449,7 @@ def test_slice_19_modules_list_all_modules_have_all_exports() -> None:
 def test_slice_19_total_all_exports_count_matches_inventory() -> None:
     """Sentinel: the total count of __all__ exports across all 6
     Slice 19 source modules MUST match the documented inventory
-    (47 total: 9 + 6 + 9 + 10 + 6 + 7).
+    (48 total: 10 + 6 + 9 + 10 + 6 + 7).
 
     If this count shifts unexpectedly the public-surface contract
     has drifted and the STATUS.md inventory needs to be updated.
@@ -458,9 +459,9 @@ def test_slice_19_total_all_exports_count_matches_inventory() -> None:
         len(importlib.import_module(m).__all__)
         for m in SLICE_19_MODULES
     )
-    assert total == 47, (
-        f"Slice 19 total __all__ count is {total} (expected 47: "
-        f"9 + 6 + 9 + 10 + 6 + 7 across 1st-6th sub-slices); the "
+    assert total == 48, (
+        f"Slice 19 total __all__ count is {total} (expected 48: "
+        f"10 + 6 + 9 + 10 + 6 + 7 across 1st-6th sub-slices); the "
         f"STATUS.md inventory has drifted"
     )
 

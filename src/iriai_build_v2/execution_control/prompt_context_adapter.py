@@ -42,11 +42,10 @@ wrapper.
   ``authority="execution_authority"`` -- the consumer may treat the
   bundle as authoritative.
 * ``state="paged"`` when the legacy bundle's ``truncation_notes`` is
-  non-empty -- the semantic context was bounded but the page boundaries
-  are recoverable from the existing ``context_file_refs`` +
-  ``context_sha256``; the consumer may treat the bundle as authoritative
-  but MUST traverse the page-refs (recorded in
-  ``excluded_evidence_refs``) to gather the full content.
+  non-empty -- the semantic context was bounded; the consumer may treat
+  the bundle as authoritative only when exact page refs are supplied in
+  ``excluded_evidence_refs`` and carried into completeness. Dispatch
+  consumers fail closed when paged completeness has no page refs.
 * ``state="preview_only"`` when the legacy bundle carries
   ``prompt_summary`` (rendered as ``display_prompt_summary`` on the
   wrapper per doc-13a:201) without ``context_file_refs`` (legacy
@@ -321,8 +320,8 @@ def _has_truncation(legacy_bundle: PromptContextBundle) -> bool:
     Per doc-13a:115-118 + doc-13a:303-310: a non-empty
     ``truncation_notes`` signals that the semantic context was bounded;
     the adapter then sets :data:`EvidenceCompleteness.state` to
-    ``"paged"`` (the page boundaries are recoverable from the existing
-    ``context_file_refs`` + ``context_sha256``).
+    ``"paged"``. Runtime dispatch treats that as authoritative only
+    when exact page refs are carried into completeness.
     """
 
     return bool(legacy_bundle.truncation_notes)
@@ -413,10 +412,10 @@ def derive_authoritative_prompt_context_bundle(
       carry through to the typed-failure router via subsequent Slice 13A
       sub-slices that wire dispatch consumers).
     * Non-empty ``truncation_notes`` -> ``completeness.state="paged"``
-      (the page boundaries are recoverable from ``context_file_refs`` +
-      ``context_sha256``; the consumer may treat the bundle as
-      authoritative but MUST traverse the page-refs in
-      :data:`excluded_evidence_refs` to gather the full content).
+      (the consumer may treat the bundle as authoritative only when
+      exact page refs are supplied via :data:`excluded_evidence_refs`;
+      dispatch consumers fail closed when paged completeness has no
+      page refs).
     * Empty ``context_file_refs`` AND non-empty ``prompt_summary`` ->
       ``completeness.state="preview_only"`` (legacy fallback; per the
       Slice 13A invariant doc-13a:18-23 the consumer MUST NOT treat
@@ -460,9 +459,9 @@ def derive_authoritative_prompt_context_bundle(
     has_context_file_refs = _has_context_file_refs(legacy_bundle)
 
     if has_truncation:
-        # Doc-13a:115-118 + doc-13a:303-310: bounded semantic context with
-        # recoverable page boundaries; the consumer may treat the bundle as
-        # authoritative but MUST traverse the page-refs.
+        # Doc-13a:115-118 + doc-13a:303-310: bounded semantic context.
+        # Runtime consumers treat paged context as authoritative only when
+        # exact page refs are carried into completeness.
         completeness_state = "paged"
         completeness_authority = authority
     elif not has_context_file_refs:
@@ -499,7 +498,7 @@ def derive_authoritative_prompt_context_bundle(
         authority=completeness_authority,
         complete_for=complete_for,
         missing_required_refs=[],
-        page_refs=[],
+        page_refs=resolved_excluded_refs,
         preview_ref=None,
         unavailable_reason=None,
     )
@@ -509,7 +508,7 @@ def derive_authoritative_prompt_context_bundle(
         authority=completeness_authority,
         complete_for=complete_for,
         missing_required_refs=[],
-        page_refs=[],
+        page_refs=resolved_excluded_refs,
         preview_ref=None,
         unavailable_reason=None,
         completeness_digest=completeness_digest,

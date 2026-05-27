@@ -218,8 +218,8 @@ def test_acceptance_artifact_pins_step_satisfied(step: int) -> None:
 def test_step_9_satisfied_by_13an_split() -> None:
     """Step 9 must be pinned SATISFIED by the 13An SPLIT (13An-1
     appended uniform Slice 13A Shared Completeness Model Dependency
-    sub-section to 9 plan docs; 13An-2 finalizer landed the P3-13A-6-3
-    binding closure via production-callsite swap at dashboard.py:1568;
+    sub-section to 9 plan docs; 13An-2 recorded the opt-in dashboard wrapper
+    at dashboard.py:1563; Slice 19A reopened the authority sufficiency claim;
     13An-3 slice-end finalizer updates the per-step status table per
     the SPLIT)."""
     text = ARTIFACT_PATH.read_text(encoding="utf-8")
@@ -232,12 +232,16 @@ def test_step_9_satisfied_by_13an_split() -> None:
     row_text = " ".join(rows)
     assert "SATISFIED" in row_text, (
         "Step 9 row must claim SATISFIED (delivered by the 13An SPLIT: "
-        "13An-1 step 9 reconciliation + 13An-2 P3-13A-6-3 binding "
-        "closure wiring + 13An-3 slice-end SIX-VECTOR review per "
+        "13An-1 step 9 reconciliation + 13An-2 dashboard wrapper recording "
+        "+ 13An-3 slice-end SIX-VECTOR review per "
         "doc-13a:285-287)."
     )
     assert "13An" in row_text, (
         "Step 9 row must reference the LAST sub-slice 13An SPLIT."
+    )
+    assert "19A-P2-001" in row_text, (
+        "Step 9 row must preserve the Slice 19A authority-sufficiency "
+        "correction for the dashboard wrapper."
     )
 
 
@@ -383,11 +387,11 @@ def test_acceptance_artifact_pins_module_all_count(
 
 
 # ---------------------------------------------------------------------------
-# (g) Carried-P3 ledger pins
+# (g) P3 ledger pins
 # ---------------------------------------------------------------------------
 
 
-_CARRIED_P3_IDS: tuple[str, ...] = (
+_P3_LEDGER_IDS: tuple[str, ...] = (
     "P3-13A-1",
     "P3-13A-5-1",
     "P3-13A-5-2",
@@ -398,14 +402,32 @@ _CARRIED_P3_IDS: tuple[str, ...] = (
 )
 
 
-@pytest.mark.parametrize("p3_id", _CARRIED_P3_IDS)
-def test_acceptance_artifact_pins_carried_p3(p3_id: str) -> None:
-    """Each carried-P3 id from Slice 13A must be pinned in the artifact."""
+@pytest.mark.parametrize("p3_id", _P3_LEDGER_IDS)
+def test_acceptance_artifact_pins_p3_ledger_item(p3_id: str) -> None:
+    """Each Slice 13A P3 ledger id must be pinned in the artifact."""
     text = ARTIFACT_PATH.read_text(encoding="utf-8")
     assert p3_id in text, (
         f"Slice 13A acceptance artifact missing carried-P3 ledger entry "
-        f"{p3_id!r}. The artifact must enumerate the full Slice 13A "
-        f"carried-P3 ledger."
+        f"{p3_id!r}. The artifact must enumerate the full Slice 13A P3 "
+        f"ledger, including items later closed or downgraded in place."
+    )
+
+
+def test_acceptance_artifact_pins_p3_13a_1_closed_status() -> None:
+    """The P3-13A-1 closure from Slice 19A-3 must stay explicit."""
+
+    text = ARTIFACT_PATH.read_text(encoding="utf-8")
+    row = next(
+        (line for line in text.splitlines() if "| **P3-13A-1** |" in line),
+        "",
+    )
+    assert "| **CLOSED** |" in row, (
+        "Acceptance artifact must explicitly pin P3-13A-1 as CLOSED; "
+        f"got row={row!r}."
+    )
+    assert "Slice 19A-3" in row, (
+        "Acceptance artifact must name Slice 19A-3 as the P3-13A-1 "
+        f"closure point; got row={row!r}."
     )
 
 
@@ -430,13 +452,11 @@ def test_acceptance_artifact_pins_p3_13A_5_4_downgrade() -> None:
 
 
 def test_acceptance_artifact_pins_dead_until_wired_binding_statement() -> None:
-    """The P3-13A-6-3 dead-until-wired binding statement must be explicit.
+    """The P3-13A-6-3 authority boundary must be explicit.
 
-    Per the sixth-sub-slice finalizer P2-V-1 reframing, the composite
-    `LegacyGateConsumerSnapshotAdapter` chain remains dead-until-wired
-    because NEITHER underlying adapter has external production callers.
-    The acceptance artifact must record this binding statement so a
-    future reader cannot miss the production-wiring prerequisite.
+    Slice 19A reopened the dashboard-wrapper authority claim. The acceptance
+    artifact must record that the current wrapper is display/advisory-only so a
+    future reader does not treat it as an authoritative consumer.
     """
     text = ARTIFACT_PATH.read_text(encoding="utf-8")
     assert "dead-until-wired" in text, (
@@ -448,14 +468,21 @@ def test_acceptance_artifact_pins_dead_until_wired_binding_statement() -> None:
         "Acceptance artifact must name the composite adapter chain by "
         "type (LegacyGateConsumerSnapshotAdapter)."
     )
-    # The wiring target options must be named so the LAST sub-slice
-    # implementer knows where the wiring lands.
-    assert (
-        "supervisor/classifier.py" in text
-        and "public_dashboard.py" in text
-    ), (
-        "Acceptance artifact must name the wiring target options "
-        "(supervisor/classifier.py + public_dashboard.py)."
+    assert "19A-P2-001" in text, (
+        "Acceptance artifact must point readers to the active Slice 19A "
+        "authority-sufficiency item."
+    )
+    assert "display/advisory-only" in text, (
+        "Acceptance artifact must state the current dashboard wrapper is "
+        "display/advisory-only."
+    )
+    assert "durable failure observation" in text, (
+        "Acceptance artifact must keep durable failure observation as future "
+        "authority wiring, not a current dashboard-wrapper property."
+    )
+    assert "supervisor/classifier.py" in text, (
+        "Acceptance artifact must keep the supervisor/classifier.py future "
+        "authority target visible."
     )
 
 

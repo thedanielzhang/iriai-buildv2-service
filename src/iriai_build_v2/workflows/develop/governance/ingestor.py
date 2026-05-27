@@ -132,12 +132,16 @@ class GovernanceEvidenceSlice(BaseModel):
     :meth:`GovernanceEvidenceIngestor.resolve_ref` parameter and the
     governance prompt § "Bounded reads" non-negotiable).
 
-    When the underlying body exceeds ``max_chars``, ``truncated_to_chars``
-    is set to the cap and ``preview_only`` is ``True``; the corresponding
+    The default ingestor asks the source reader to enforce the
+    ``max_chars`` cap before returning the row body. When the source
+    reader returns an already-bounded preview, ``truncated_to_chars`` is
+    set to the cap and ``preview_only`` is ``True``; the corresponding
     :class:`GovernanceEvidencePageRef` carries
     ``completeness="preview_only"`` + ``exact=False`` per the Slice 13A
     invariant precursor at ``models.py:_exact_completeness_consistency``
-    (doc-13a:24, 109-118).
+    (doc-13a:24, 109-118). If a reader ignores the requested cap and
+    returns an over-budget body, the slice is marked unavailable and the
+    over-budget body is not surfaced to callers.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -292,14 +296,17 @@ class GovernanceEvidenceIngestor(ABC):
         """Doc-13:170 -- resolve one :class:`GovernanceEvidenceRef` to a
         bounded :class:`GovernanceEvidenceSlice`.
 
-        The implementation MUST truncate the per-row text body at
-        ``max_chars``. When the body exceeds ``max_chars`` the returned
-        slice carries ``truncated_to_chars=max_chars`` +
+        The implementation MUST enforce the per-row text body cap at
+        ``max_chars`` at the reader/source boundary. When the source
+        reader returns an already-bounded preview, the returned slice
+        carries ``truncated_to_chars=max_chars`` +
         ``preview_only=True``, and the embedded
         :class:`~iriai_build_v2.workflows.develop.governance.models.GovernanceEvidencePageRef`
         records set ``completeness="preview_only"`` + ``exact=False`` per
         the Slice 13A invariant precursor at
-        ``models.py:_exact_completeness_consistency``.
+        ``models.py:_exact_completeness_consistency``. If the reader
+        returns an over-budget body despite the requested bound, the
+        implementation must fail closed or mark the slice unavailable.
         """
 
 
@@ -841,10 +848,11 @@ class DefaultGovernanceEvidenceIngestor(GovernanceEvidenceIngestor):
         max_chars: int,
     ) -> GovernanceEvidenceSlice:
         # Doc-13:170. The resolve_ref path reads the source body for one
-        # already-cited ref. Per the governance prompt § "Bounded reads"
-        # the truncation cap is enforced HERE -- the reader does its own
-        # raw read; the ingestor truncates before composing the typed
-        # slice.
+        # already-cited ref. Per the governance prompt § "Bounded reads",
+        # the max-char cap is sent to the source reader so the source
+        # boundary can return an already-bounded body. The fallback guard
+        # below marks the slice unavailable if the reader still returns an
+        # over-budget body.
         if max_chars <= 0:
             raise ValueError(
                 "resolve_ref max_chars must be positive "
@@ -857,8 +865,8 @@ class DefaultGovernanceEvidenceIngestor(GovernanceEvidenceIngestor):
         # workflows/develop/execution/snapshots.py:202-214.
         effective_cap = min(int(max_chars), self._max_chars_per_ref)
         # We invoke the same reader with a single-row selector keyed by the
-        # ref's authority / source ids. The reader returns a row whose
-        # ``body`` text field is the raw source slice; we truncate it here.
+        # ref's authority / source ids. The selector includes the body cap
+        # so the reader can enforce the bound before returning the row.
         selectors: dict[str, Any] = {
             "ref_id": ref.ref_id,
             "authority": ref.authority,
@@ -867,6 +875,9 @@ class DefaultGovernanceEvidenceIngestor(GovernanceEvidenceIngestor):
             "event_id": ref.event_id,
             "commit_hash": ref.commit_hash,
             "journal_anchor": ref.journal_anchor,
+            "max_chars": effective_cap,
+            "body_max_chars": effective_cap,
+            "body_slice": {"byte_start": 0, "max_chars": effective_cap},
         }
         result = await self._invoke_reader(
             authority=ref.authority,
@@ -876,14 +887,55 @@ class DefaultGovernanceEvidenceIngestor(GovernanceEvidenceIngestor):
             budget_caps={"limit": 1},
         )
         rows = result.rows
+        first_row: dict[str, Any] = rows[0] if rows else {}
         body_text = ""
         if rows:
-            # The reader's first row carries the raw body; extra rows past
-            # the first signal a ref-id collision and force preview_only.
-            body_text = str(rows[0].get("body") or "")
-        body_truncated = len(body_text) > effective_cap
-        truncated_body = body_text[:effective_cap] if body_truncated else body_text
-        preview_only_flag = body_truncated or len(rows) > 1
+            # The reader's first row carries the source-bounded body; extra
+            # rows past the first signal a ref-id collision and force
+            # preview_only.
+            body_text = str(first_row.get("body") or "")
+        if len(body_text) > effective_cap:
+            page_ref = GovernanceEvidencePageRef(
+                page_ref_id=f"{ref.ref_id}:slice",
+                authority=ref.authority,
+                source_ref_id=ref.ref_id,
+                byte_start=0,
+                byte_end=0,
+                digest=ref.digest,
+                completeness="unavailable",
+                exact=False,
+                stale_check={
+                    "ref_digest": ref.digest,
+                    "source_row_count": len(rows),
+                    "max_chars": effective_cap,
+                    "body_max_chars": effective_cap,
+                    "observed_body_chars": len(body_text),
+                    "over_budget_body_returned": True,
+                },
+            )
+            return GovernanceEvidenceSlice(
+                source_ref=ref,
+                pages=[page_ref],
+                body="",
+                truncated_to_chars=effective_cap,
+                preview_only=True,
+            )
+
+        source_truncated = bool(
+            first_row.get("body_truncated")
+            or first_row.get("preview_only")
+            or first_row.get("truncated_to_chars") is not None
+        )
+        declared_truncated_to_chars: int | None = None
+        if first_row.get("truncated_to_chars") is not None:
+            try:
+                declared_truncated_to_chars = min(
+                    int(first_row["truncated_to_chars"]), effective_cap
+                )
+            except (TypeError, ValueError):
+                declared_truncated_to_chars = effective_cap
+        truncated_body = body_text
+        preview_only_flag = source_truncated or len(rows) > 1
         # Per doc-13a:24, 109-118 (Slice 13A invariant precursor) the
         # returned page-ref's completeness + exact MUST agree with
         # preview_only=True when the body was truncated. The cross-validator
@@ -907,11 +959,17 @@ class DefaultGovernanceEvidenceIngestor(GovernanceEvidenceIngestor):
             exact=page_exact,
             stale_check={"ref_digest": ref.digest, "source_row_count": len(rows)},
         )
+        if declared_truncated_to_chars is not None:
+            resolved_truncated_to_chars = declared_truncated_to_chars
+        elif source_truncated:
+            resolved_truncated_to_chars = effective_cap
+        else:
+            resolved_truncated_to_chars = None
         return GovernanceEvidenceSlice(
             source_ref=ref,
             pages=[page_ref],
             body=truncated_body,
-            truncated_to_chars=effective_cap if body_truncated else None,
+            truncated_to_chars=resolved_truncated_to_chars,
             preview_only=preview_only_flag,
         )
 
