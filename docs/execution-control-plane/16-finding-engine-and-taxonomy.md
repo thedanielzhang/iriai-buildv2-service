@@ -224,3 +224,69 @@ and mark prior findings superseded rather than rewriting history.
 - Slice 09 supplies scheduler policy context.
 - Slice 10 supplies supervisor classes and read-only guidance.
 - Slice 12 supplies acceptance/adoption constraints.
+
+## Slice 13A Shared Completeness Model Dependency
+
+Per **doc-13a:285-287 § Refactoring Steps step 9** — *"Update governance
+Slices 13-20 and context Slice 21 to depend on this shared completeness
+model instead of redefining authority semantics locally."* — this
+slice's finding-engine evidence reconciliation (every finding cites
+evidence refs + metric refs + implementation-log anchors per
+§ "Persistence And Artifact Compatibility") depends on the Slice 13A
+shared completeness model.
+
+Source-of-truth modules:
+
+- `src/iriai_build_v2/execution_control/completeness.py` (Slice 13A
+  2nd sub-slice) — `CompletenessState`, `EvidenceCompleteness`,
+  `AuthoritativeContextRef`, `EvidencePageRef`, `ExactEvidenceManifest`,
+  `compute_completeness_digest`. Findings cite evidence refs whose
+  completeness-state is one of the shared 4 values: `complete`,
+  `paged`, `preview_only`, `unavailable`.
+- The shared `EvidenceCompleteness` field-level state is the source-of-
+  truth shape for any finding rule that distinguishes "evidence-gap"
+  findings from substantive findings. The
+  `governance_evidence_gap:<auth>:<ref_id>` canonical blocker form
+  pinned by Slice 13e (doc-13:209-210) consumes the typed
+  `CompletenessState` to decide when an evidence ref is incomplete
+  enough to emit a gap finding.
+
+Per-purpose adapter modules consumed (READ-ONLY references):
+
+- `src/iriai_build_v2/execution_control/dispatcher_prompt_context.py`
+  (Slice 13A 4th sub-slice) — prompt-context findings (the
+  `runtime_context/context_incomplete` typed failure id observation
+  class) consume the typed `AuthoritativePromptContextRouting`
+  shape; finding rules MUST not classify prompt-context incompleteness
+  from `truncation_notes` alone (doc-13a:110-111 blocking deviation).
+- `src/iriai_build_v2/execution_control/gate_companion.py` (Slice 13A
+  5th sub-slice) — gate-derived findings (the
+  `verifier_context/companion_record_unavailable` +
+  `verifier_context/proof_row_required` typed failure id observation
+  classes) consume the typed `AuthoritativeGateCompanionRecord` +
+  `AuthoritativeGateProofRow` shapes.
+- `src/iriai_build_v2/execution_control/snapshot_companion.py`
+  (Slice 13A 6th sub-slice) — snapshot-derived findings (the
+  `evidence_corruption/list_field_incomplete` +
+  `evidence_corruption/classifier_rule_blocked` typed failure id
+  observation classes) consume the typed
+  `AuthoritativeSnapshotListFieldCompleteness` +
+  `AuthoritativeSnapshotClassifierRouting` shapes per
+  doc-13a:280-282.
+
+The `implementation_journal_gap` finding kind (per § "Edge Cases And
+Failure Handling": *"Missing implementation logs: emit
+`implementation_journal_gap` and block plan-vs-actual recommendations"*)
+already maps onto the shared `CompletenessState="unavailable"` state
+for implementation-log anchors.
+
+Per P3-13A-6-3 and Slice 19A source-of-truth
+`19a-governance-implementation-reassessment.md` (`19A-P2-001`), the current
+dashboard wrapper is display/advisory-only and does not let finding rules treat
+13A typed completeness as execution authority for the evidence-gap classifier.
+Authority use must wait for a future source-of-truth slice that wires an actual
+authoritative consumer with durable failure observation.
+
+This dependency-reconciliation reference was added by
+**Slice 13A 8th sub-slice 13An-1** (this iteration) per
+doc-13a:285-287 step 9.

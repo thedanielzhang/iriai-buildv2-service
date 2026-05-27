@@ -34,6 +34,15 @@ from iriai_build_v2.public_dashboard import (
     PublicDashboardOutbox,
     project_control_plane_snapshot_if_changed,
 )
+# Slice 13A 8th sub-slice 13An-2 installed an opt-in dashboard display wrapper
+# around the legacy `PublicDashboardOutbox`. Slice 19A source-of-truth
+# `19a-governance-implementation-reassessment.md` reopened the old authority
+# sufficiency claim as 19A-P2-001: this call site is display/advisory-only and
+# is not an authoritative gate / verifier / classifier consumer with durable
+# failure observation.
+from iriai_build_v2.execution_control.dashboard_wrapper import (
+    CompletenessAwareDashboardOutbox,
+)
 from iriai_build_v2.storage.artifacts import (
     _SPILL_SQL_PREFIX,
     _content_ref_from_stored_value,
@@ -1538,7 +1547,20 @@ async def _project_control_plane_snapshot_event(
     if not typed_control_plane_version:
         return
     try:
-        outbox = PublicDashboardOutbox(pool)
+        # Slice 13A 8th sub-slice 13An-2 wraps the legacy outbox with
+        # `CompletenessAwareDashboardOutbox` for the dashboard display mirror.
+        # Per Slice 19A 19A-P2-001, this is advisory/display wiring only: the
+        # default failure port is in-memory, this read-path mirror logs and
+        # swallows enqueue failures below, and no authoritative gate / verifier
+        # / classifier consumer is wired here.
+        # `outbox.outbox_enabled` below + the
+        # `project_control_plane_snapshot_if_changed` driver's
+        # `getattr(outbox, "outbox_enabled", False)` early-return guard at
+        # `public_dashboard.py:705` both consume the wrapper's delegating
+        # `outbox_enabled` property which forwards to the wrapped legacy
+        # outbox's flag, preserving Slice 10 behaviour byte-identical when
+        # the wiring is OFF.
+        outbox = CompletenessAwareDashboardOutbox(PublicDashboardOutbox(pool))
         if not outbox.outbox_enabled:
             return
         store = ExecutionControlStore(conn)

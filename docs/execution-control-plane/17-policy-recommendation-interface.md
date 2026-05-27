@@ -234,3 +234,66 @@ rollback belongs to the owning consumer, not the governance analyzer.
 - Slice 09 owns scheduler policy.
 - Slice 10 owns supervisor/dashboard consumption.
 - Slice 12 owns activation and adoption constraints.
+
+## Slice 13A Shared Completeness Model Dependency
+
+Per **doc-13a:285-287 § Refactoring Steps step 9** — *"Update governance
+Slices 13-20 and context Slice 21 to depend on this shared completeness
+model instead of redefining authority semantics locally."* — this
+slice's policy recommendation interface depends on the Slice 13A
+shared completeness model in two specific places:
+
+1. Every `GovernancePolicyRecommendation.source_finding_ids` /
+   `source_metric_refs` / `counterfactual_result_refs` ultimately
+   chains back to typed governance evidence whose
+   `CompletenessState` is one of the shared 4 values (`complete`,
+   `paged`, `preview_only`, `unavailable`). A recommendation cannot
+   activate runtime policy from evidence whose completeness-state is
+   `preview_only` or `unavailable`; that fail-closed disposition is
+   the doc-13a:18-23 invariant.
+2. Per **doc-13a:285-287 explicitly names Slice 17** as one of the
+   slices that MUST consume the shared completeness model. Slice 19A
+   later reopened the P3-13A-6-3 dashboard-wrapper authority claim as
+   `19A-P2-001`;
+   until a future source-of-truth slice wires an actual authoritative
+   consumer with durable failure observation, the Slice 13A typed
+   surfaces are advisory inputs for recommendations and not runtime
+   activation authority.
+
+Source-of-truth modules:
+
+- `src/iriai_build_v2/execution_control/completeness.py` (Slice 13A
+  2nd sub-slice) — `CompletenessState`, `EvidenceCompleteness`,
+  `AuthoritativeContextRef`, `EvidencePageRef`, `ExactEvidenceManifest`,
+  `compute_completeness_digest`.
+- `src/iriai_build_v2/execution_control/gate_companion.py` (Slice 13A
+  5th sub-slice) — `AuthoritativeGateProofRow` is the only typed
+  shape by which a deterministic summary can satisfy a required gate
+  per doc-13a:276-278. Policy recommendations that would activate
+  runtime behavior must cite typed proof rows, not summary-only
+  evidence.
+- `src/iriai_build_v2/execution_control/snapshot_companion.py` (Slice
+  13A 6th sub-slice) — `AuthoritativeSnapshotClassifierRouting` carries
+  the fail-closed disposition for classifier rules consuming incomplete
+  snapshot fields. Per doc-13a:280-282, classifier rules MUST fail
+  closed when their required snapshot fields are incomplete; policy
+  recommendations that consume classifier-driven evidence must respect
+  the same fail-closed disposition.
+- `src/iriai_build_v2/execution_control/dispatcher_prompt_context.py`
+  (Slice 13A 4th sub-slice) — policy recommendations that would
+  alter dispatcher-prompt context budgets (e.g. raising
+  `required_complete_for` for a specific task class) must consume
+  the typed `AuthoritativePromptContextRouting` shape so the
+  recommendation's expected impact on
+  `runtime_context/context_incomplete` failure routing is auditable.
+
+Per P3-13A-6-3 and Slice 19A source-of-truth
+`19a-governance-implementation-reassessment.md` (`19A-P2-001`), the current
+dashboard wrapper is display/advisory-only and does not let any Slice 17 policy
+recommendation claim runtime activation authority. Authority use must wait for
+a future source-of-truth slice that wires an actual authoritative consumer with
+durable failure observation.
+
+This dependency-reconciliation reference was added by
+**Slice 13A 8th sub-slice 13An-1** (this iteration) per
+doc-13a:285-287 step 9.

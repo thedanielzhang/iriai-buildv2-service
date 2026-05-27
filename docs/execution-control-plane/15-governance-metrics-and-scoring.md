@@ -197,3 +197,69 @@ failure routing, or workflow policy without Slice 17 policy artifacts.
 - Slice 08 provides merge/commit/checkpoint timing.
 - Slice 09 provides scheduler feedback baselines.
 - Slice 12 provides acceptance metrics and landing records.
+
+## Slice 13A Shared Completeness Model Dependency
+
+Per **doc-13a:285-287 § Refactoring Steps step 9** — *"Update governance
+Slices 13-20 and context Slice 21 to depend on this shared completeness
+model instead of redefining authority semantics locally."* — this
+slice's "evidence completeness" confidence inputs (see
+`15-governance-metrics-and-scoring.md` § Refactoring Step 5, line 131:
+*"Add confidence scoring from evidence completeness, sample count,
+freshness, typed-vs-legacy source mix, and implementation-log
+completeness."*) and the metric scorecard's typed-vs-legacy source-mix
+discrimination depend on the Slice 13A shared completeness model.
+
+Source-of-truth modules:
+
+- `src/iriai_build_v2/execution_control/completeness.py` (Slice 13A
+  2nd sub-slice) — `CompletenessState`, `EvidenceCompleteness`,
+  `AuthoritativeContextRef`, `EvidencePageRef`, `ExactEvidenceManifest`,
+  `compute_completeness_digest`.
+- The shared `EvidenceCompleteness` Pydantic model is the source-of-truth
+  shape that metric extractors consume to compute the
+  evidence-completeness confidence input. Metric extractors must not
+  re-derive completeness from raw artifact bodies or compatibility
+  projections alone; they must consume the typed `EvidenceCompleteness`
+  attached to the governance evidence-set refs.
+- The shared `ExactEvidenceManifest` is the source-of-truth shape for
+  the "typed-vs-legacy source mix" discrimination: rows backed by an
+  `ExactEvidenceManifest` are typed; rows backed only by a
+  compatibility-projection summary count as legacy/derived for the
+  scorecard's `source_mix` dict (per Slice 13's
+  `GovernanceEvidenceSet.source_mix: dict[EvidenceAuthority, int]`).
+- The shared `AuthoritativeContextRef` is the source-of-truth shape
+  for metric scorecards that cite a specific evidence ref's
+  completeness; the metric extractor must not store a bare ref id
+  without the typed completeness wrapper.
+
+Per-purpose adapter modules consumed (READ-ONLY references):
+
+- `src/iriai_build_v2/execution_control/dispatcher_prompt_context.py`
+  (Slice 13A 4th sub-slice) — the metric extractor must not consume
+  prompt-context evidence whose typed
+  `AuthoritativePromptContextRouting` reports
+  `runtime_context/context_incomplete`; such evidence is excluded
+  from confidence scoring per the fail-closed rule at
+  doc-13a:269-272.
+- `src/iriai_build_v2/execution_control/gate_companion.py` (Slice 13A
+  5th sub-slice) — gate-derived metric inputs (gate verdict timing,
+  retry counts, proof rows) must consume the typed
+  `AuthoritativeGateCompanionRecord` + `AuthoritativeGateProofRow`
+  shapes; summary-only gate metrics cannot feed confidence scoring.
+- `src/iriai_build_v2/execution_control/snapshot_companion.py`
+  (Slice 13A 6th sub-slice) — snapshot-derived metric inputs
+  (resource snapshots, scheduler-feedback snapshots) must consume the
+  typed `AuthoritativeSnapshotListFieldCompleteness` shape so the
+  per-list-field completeness disciplines confidence scoring.
+
+Per P3-13A-6-3 and Slice 19A source-of-truth
+`19a-governance-implementation-reassessment.md` (`19A-P2-001`), the current
+dashboard wrapper is display/advisory-only and does not let metric extractors
+consume 13A typed completeness as execution authority for confidence scoring.
+Authority use must wait for a future source-of-truth slice that wires an actual
+authoritative consumer with durable failure observation.
+
+This dependency-reconciliation reference was added by
+**Slice 13A 8th sub-slice 13An-1** (this iteration) per
+doc-13a:285-287 step 9.

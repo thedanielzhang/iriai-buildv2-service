@@ -33,13 +33,36 @@ from pydantic import BaseModel, Field
 try:
     from ..execution.workspace_authority import (
         PathTarget as WorkspaceAuthorityPathTarget,
+        RepoIdentity as WorkspaceAuthorityRepoIdentity,
         WorkspaceAuthority,
         WorkspaceSnapshot as WorkspaceAuthoritySnapshot,
     )
 except ImportError:  # pragma: no cover - Slice 02 module may be absent in old installs.
     WorkspaceAuthority = None  # type: ignore[assignment]
     WorkspaceAuthorityPathTarget = None  # type: ignore[assignment]
+    WorkspaceAuthorityRepoIdentity = None  # type: ignore[assignment]
     WorkspaceAuthoritySnapshot = None  # type: ignore[assignment]
+
+try:
+    from ..context_layer import (
+        CodeSpanRef as ContextLayerCodeSpanRef,
+        ContextEvidenceSnapshot as ContextLayerEvidenceSnapshot,
+        ContextLayerBudget,
+        ContextLayerRequest,
+        ContextLayerService,
+        ContextPageStore as ContextLayerPageStore,
+        IriAILineagePlugin as ContextLayerIriAILineagePlugin,
+        NativeGitProvider as ContextLayerNativeGitProvider,
+    )
+except ImportError:  # pragma: no cover - Slice 21 module may be absent in old installs.
+    ContextLayerBudget = None  # type: ignore[assignment]
+    ContextLayerCodeSpanRef = None  # type: ignore[assignment]
+    ContextLayerEvidenceSnapshot = None  # type: ignore[assignment]
+    ContextLayerIriAILineagePlugin = None  # type: ignore[assignment]
+    ContextLayerNativeGitProvider = None  # type: ignore[assignment]
+    ContextLayerPageStore = None  # type: ignore[assignment]
+    ContextLayerRequest = None  # type: ignore[assignment]
+    ContextLayerService = None  # type: ignore[assignment]
 
 try:
     from ..execution.task_contracts import (
@@ -7739,6 +7762,373 @@ class _ImplementationPromptBuilder:
         return DispatcherPromptBuildResult(prompt=prompt, bundle=bundle)
 
 
+class _ImplementationContextLayerBuilder:
+    def __init__(
+        self,
+        *,
+        runner: WorkflowRunner,
+        feature: Feature,
+        workspace_root: Path | None,
+        feature_root: Path | None,
+        dag_sha256: str,
+        group_idx: int,
+        task_idx: int,
+        attempt: int,
+        task: ImplementationTask,
+        task_contract: Any | None,
+        ws_path: str | None,
+        snapshots: list[Any],
+        repo_prefix: str,
+    ) -> None:
+        self._runner = runner
+        self._feature = feature
+        self._workspace_root = workspace_root
+        self._feature_root = feature_root
+        self._dag_sha256 = dag_sha256
+        self._group_idx = group_idx
+        self._task_idx = task_idx
+        self._attempt = attempt
+        self._task = task
+        self._task_contract = task_contract
+        self._ws_path = ws_path
+        self._snapshots = list(snapshots)
+        self._repo_prefix = repo_prefix
+
+    async def build_dispatch_context_package(
+        self,
+        *,
+        request: Any,
+        binding: Any | None = None,
+        prompt_result: Any | None = None,
+    ) -> Any:
+        del prompt_result
+        if (
+            ContextLayerBudget is None
+            or ContextLayerCodeSpanRef is None
+            or ContextLayerEvidenceSnapshot is None
+            or ContextLayerNativeGitProvider is None
+            or ContextLayerPageStore is None
+            or ContextLayerRequest is None
+            or ContextLayerService is None
+            or WorkspaceAuthorityRepoIdentity is None
+        ):
+            raise _sandbox_blocker(
+                "Context layer is unavailable for implementation dispatch.",
+                task_id=self._task.id,
+            )
+        context_request, repos = await _context_layer_request_for_dispatch(
+            runner=self._runner,
+            feature=self._feature,
+            dispatch_request=request,
+            workspace_root=self._workspace_root,
+            feature_root=self._feature_root,
+            dag_sha256=self._dag_sha256,
+            group_idx=self._group_idx,
+            task_idx=self._task_idx,
+            attempt=self._attempt,
+            task=self._task,
+            task_contract=self._task_contract,
+            ws_path=self._ws_path,
+            snapshots=self._snapshots,
+            repo_prefix=self._repo_prefix,
+        )
+        provider = ContextLayerNativeGitProvider(repos)
+        lineage_plugin = (
+            ContextLayerIriAILineagePlugin()
+            if ContextLayerIriAILineagePlugin is not None
+            else None
+        )
+        page_store_root = _context_layer_page_store_root(
+            binding=binding,
+            workspace_root=self._workspace_root,
+            feature=self._feature,
+            task_id=self._task.id,
+        )
+        service = ContextLayerService(
+            [provider],
+            repos=repos,
+            lineage_plugin=lineage_plugin,
+            page_store=ContextLayerPageStore(root=page_store_root),
+        )
+        return await service.build_context_package(context_request)
+
+
+def _context_layer_page_store_root(
+    *,
+    binding: Any | None,
+    workspace_root: Path | None,
+    feature: Feature,
+    task_id: str,
+) -> Path:
+    for candidate in (
+        getattr(binding, "workspace_override", None),
+        getattr(binding, "cwd", None),
+        workspace_root,
+    ):
+        if candidate:
+            base = Path(str(candidate))
+            break
+    else:
+        base = Path.cwd()
+    safe_feature = _context_layer_safe_path_component(str(getattr(feature, "id", "") or "feature"))
+    safe_task = _context_layer_safe_path_component(task_id or "task")
+    return base / ".iriai-context-pages" / safe_feature / safe_task
+
+
+def _context_layer_safe_path_component(value: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "-", value.strip())
+    return safe.strip(".-") or "context"
+
+
+async def _context_layer_request_for_dispatch(
+    *,
+    runner: WorkflowRunner,
+    feature: Feature,
+    dispatch_request: Any,
+    workspace_root: Path | None,
+    feature_root: Path | None,
+    dag_sha256: str,
+    group_idx: int,
+    task_idx: int,
+    attempt: int,
+    task: ImplementationTask,
+    task_contract: Any | None,
+    ws_path: str | None,
+    snapshots: list[Any],
+    repo_prefix: str,
+) -> tuple[Any, list[Any]]:
+    del task_idx
+    source_dag_artifact_id = await _source_dag_artifact_id_for_context_layer(
+        runner,
+        feature,
+        task_contract,
+    )
+    repo_id = _contract_repo_id(task_contract) or task.repo_path or repo_prefix or "repo"
+    repo_root = _context_layer_repo_root(
+        workspace_root=workspace_root,
+        feature_root=feature_root,
+        ws_path=ws_path,
+        repo_prefix=repo_prefix,
+        task=task,
+    )
+    repo = WorkspaceAuthorityRepoIdentity(
+        repo_id=repo_id,
+        repo_name=repo_id,
+        workspace_relative_path=repo_prefix or task.repo_path or ".",
+        canonical_path=str(repo_root),
+        safety_status="ok",
+    )
+    snapshot_ids = _workspace_snapshot_ids_for_dispatch(snapshots, repo_id)
+    contract_ids = _task_contract_ids_for_dispatch(task_contract)
+    typed_evidence_digest = _context_layer_typed_evidence_digest(
+        dispatch_request=dispatch_request,
+        source_dag_artifact_id=source_dag_artifact_id,
+        contract_ids=contract_ids,
+        snapshot_ids=snapshot_ids,
+        attempt=attempt,
+    )
+    high_watermark = max(
+        [source_dag_artifact_id, *contract_ids, *snapshot_ids, 0]
+    )
+    evidence_snapshot = ContextLayerEvidenceSnapshot(
+        source_dag_artifact_id=source_dag_artifact_id,
+        dag_sha256=dag_sha256,
+        typed_journal_high_watermark=high_watermark,
+        typed_evidence_digest=typed_evidence_digest,
+    )
+    spans = _context_layer_spans_for_task(
+        task,
+        repo_id=repo_id,
+        repo_prefix=repo_prefix,
+    )
+    changed_paths = [span.path for span in spans]
+    request = ContextLayerRequest(
+        feature_id=str(getattr(feature, "id", "")),
+        source_dag_artifact_id=source_dag_artifact_id,
+        dag_sha256=dag_sha256,
+        evidence_snapshot=evidence_snapshot,
+        task_id=task.id,
+        group_idx=group_idx,
+        repo_ids=[repo_id],
+        spans=spans,
+        changed_paths=changed_paths,
+        include_governance=True,
+        require_complete=True,
+        budget=ContextLayerBudget(),
+    )
+    return request, [repo]
+
+
+async def _source_dag_artifact_id_for_context_layer(
+    runner: WorkflowRunner,
+    feature: Feature,
+    task_contract: Any | None,
+) -> int:
+    contract_data = _model_json_dict(task_contract) if task_contract is not None else {}
+    source_dag_artifact_id = _positive_context_layer_id(
+        getattr(task_contract, "source_dag_artifact_id", None)
+        if task_contract is not None
+        else None
+    ) or _positive_context_layer_id(contract_data.get("source_dag_artifact_id"))
+    if source_dag_artifact_id is not None:
+        return source_dag_artifact_id
+    source_record = await _dag_artifact_record_for_key(runner, feature, "dag")
+    source_dag_artifact_id = _positive_context_layer_id(
+        source_record.get("id") if source_record else None
+    )
+    if source_dag_artifact_id is None:
+        return await _compatibility_source_dag_artifact_id_for_context_layer(
+            runner,
+            feature,
+            task_contract,
+            source_record=source_record,
+        )
+    return source_dag_artifact_id
+
+
+async def _compatibility_source_dag_artifact_id_for_context_layer(
+    runner: WorkflowRunner,
+    feature: Feature,
+    task_contract: Any | None,
+    *,
+    source_record: dict[str, Any] | None,
+) -> int:
+    contract_data = _model_json_dict(task_contract) if task_contract is not None else {}
+    material = {
+        "artifact_schema": "context-source-dag-compatibility-v1",
+        "feature_id": str(getattr(feature, "id", "") or ""),
+        "dag_sha256": str(contract_data.get("dag_sha256") or ""),
+        "source_dag_sha256": str(
+            contract_data.get("source_dag_sha256")
+            or (source_record or {}).get("sha256")
+            or ""
+        ),
+        "task_id": str(contract_data.get("task_id") or ""),
+    }
+    digest = _sha256_text(json.dumps(material, sort_keys=True, default=str))
+    compatibility_id = int(digest[:12], 16) or 1
+    artifact_key = f"review:context-source-dag:{digest[:16]}"
+    await runner.artifacts.put(
+        artifact_key,
+        _workspace_authority_json(
+            {
+                **material,
+                "source_dag_artifact_id": compatibility_id,
+                "source": "artifact_compatibility",
+                "digest": digest,
+            }
+        ),
+        feature=feature,
+    )
+    return compatibility_id
+
+
+def _positive_context_layer_id(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        result = int(value)
+    except (TypeError, ValueError):
+        return None
+    return result if result > 0 else None
+
+
+def _context_layer_repo_root(
+    *,
+    workspace_root: Path | None,
+    feature_root: Path | None,
+    ws_path: str | None,
+    repo_prefix: str,
+    task: ImplementationTask,
+) -> Path:
+    candidates: list[Path] = []
+    if ws_path:
+        candidates.append(Path(ws_path))
+    if feature_root is not None and repo_prefix:
+        candidates.append(feature_root / repo_prefix)
+    if feature_root is not None and task.repo_path:
+        candidates.append(feature_root / task.repo_path)
+    if feature_root is not None:
+        candidates.append(feature_root)
+    if workspace_root is not None:
+        candidates.append(workspace_root)
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[0] if candidates else Path.cwd()
+
+
+def _context_layer_typed_evidence_digest(
+    *,
+    dispatch_request: Any,
+    source_dag_artifact_id: int,
+    contract_ids: list[int],
+    snapshot_ids: list[int],
+    attempt: int,
+) -> str:
+    material = {
+        "attempt": attempt,
+        "contract_ids": list(contract_ids),
+        "dag_sha256": str(getattr(dispatch_request, "dag_sha256", "")),
+        "feature_id": str(getattr(dispatch_request, "feature_id", "")),
+        "group_idx": int(getattr(dispatch_request, "group_idx", 0) or 0),
+        "request_digest": str(getattr(dispatch_request, "request_digest", "")),
+        "source_dag_artifact_id": source_dag_artifact_id,
+        "task_id": str(getattr(dispatch_request, "task_id", "")),
+        "workspace_snapshot_ids": list(snapshot_ids),
+    }
+    if dispatcher_stable_digest is not None:
+        return dispatcher_stable_digest(material)
+    return _sha256_text(json.dumps(material, sort_keys=True, default=str))
+
+
+def _context_layer_spans_for_task(
+    task: ImplementationTask,
+    *,
+    repo_id: str,
+    repo_prefix: str,
+) -> list[Any]:
+    spans: list[Any] = []
+    seen: set[str] = set()
+    for scope in list(getattr(task, "file_scope", []) or []):
+        path = _context_layer_repo_relative_path(
+            str(getattr(scope, "path", "") or ""),
+            repo_prefix=repo_prefix,
+        )
+        if not path or path in seen:
+            continue
+        seen.add(path)
+        try:
+            spans.append(
+                ContextLayerCodeSpanRef(
+                    repo_id=repo_id,
+                    path=path,
+                    start_line=1,
+                    end_line=1,
+                )
+            )
+        except ValueError:
+            continue
+    return spans
+
+
+def _context_layer_repo_relative_path(path: str, *, repo_prefix: str) -> str:
+    normalized = path.strip().replace("\\", "/").strip("/")
+    prefix = repo_prefix.strip().replace("\\", "/").strip("/")
+    if prefix and normalized == prefix:
+        return ""
+    if prefix and normalized.startswith(f"{prefix}/"):
+        normalized = normalized[len(prefix) + 1 :]
+    parts: list[str] = []
+    for part in normalized.split("/"):
+        if not part or part == ".":
+            continue
+        if part == "..":
+            return ""
+        parts.append(part)
+    return "/".join(parts)
+
+
 class _ImplementationRuntimeClient:
     def __init__(
         self,
@@ -8151,6 +8541,45 @@ class _ExecutionControlDispatchJournalPort:
                 included_evidence_ids=list(getattr(bundle, "included_evidence_ids", []) or []),
                 excluded_evidence_ids=list(getattr(bundle, "excluded_evidence_ids", []) or []),
                 truncation_notes=list(getattr(bundle, "truncation_notes", []) or []),
+                context_package_id=getattr(bundle, "context_package_id", None),
+                context_package_digest=getattr(bundle, "context_package_digest", None),
+                context_package_ref=getattr(bundle, "context_package_ref", None),
+                context_package_kind=getattr(bundle, "context_package_kind", None),
+                context_package_completeness=getattr(
+                    bundle,
+                    "context_package_completeness",
+                    None,
+                ),
+                context_package_page_refs=list(
+                    getattr(bundle, "context_package_page_refs", []) or []
+                ),
+                context_package_feature_id=getattr(bundle, "context_package_feature_id", None),
+                context_package_task_id=getattr(bundle, "context_package_task_id", None),
+                context_package_source_dag_artifact_id=getattr(
+                    bundle,
+                    "context_package_source_dag_artifact_id",
+                    None,
+                ),
+                context_package_dag_sha256=getattr(
+                    bundle,
+                    "context_package_dag_sha256",
+                    None,
+                ),
+                context_package_evidence_snapshot_digest=getattr(
+                    bundle,
+                    "context_package_evidence_snapshot_digest",
+                    None,
+                ),
+                context_package_provider_state_digest=getattr(
+                    bundle,
+                    "context_package_provider_state_digest",
+                    None,
+                ),
+                context_package_advisory_only=getattr(
+                    bundle,
+                    "context_package_advisory_only",
+                    None,
+                ),
             )
         )
         return result.evidence.id
@@ -8529,6 +8958,21 @@ async def _dispatch_task_attempt_via_runtime_dispatcher(
             log_label=log_label,
         ),
         output_normalizer=normalizer,
+        context_layer_builder=_ImplementationContextLayerBuilder(
+            runner=runner,
+            feature=feature,
+            workspace_root=workspace_root,
+            feature_root=feature_root,
+            dag_sha256=dag_sha256,
+            group_idx=group_idx,
+            task_idx=task_idx,
+            attempt=attempt,
+            task=task,
+            task_contract=task_contract,
+            ws_path=ws_path,
+            snapshots=snapshots,
+            repo_prefix=repo_prefix,
+        ),
     )
     outcome = await dispatcher.dispatch(request)
     result = normalizer.result

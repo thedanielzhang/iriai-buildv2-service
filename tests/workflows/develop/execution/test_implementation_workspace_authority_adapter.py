@@ -241,6 +241,109 @@ def _patch_git_evidence(
 
 
 @pytest.mark.asyncio
+async def test_context_layer_uses_bounded_review_source_id_without_typed_store(
+    tmp_path: Path,
+) -> None:
+    workspace_root = tmp_path / "workspace"
+    artifacts = _Artifacts()
+    feature = _feature()
+    runner = _runner(workspace_root, artifacts)
+    contract = SimpleNamespace(
+        source_dag_artifact_id=0,
+        source_dag_sha256="source-sha",
+        dag_sha256="dag-sha",
+        task_id="TASK-context",
+    )
+
+    first = await implementation_module._source_dag_artifact_id_for_context_layer(
+        runner,
+        feature,
+        contract,
+    )
+    second = await implementation_module._source_dag_artifact_id_for_context_layer(
+        runner,
+        feature,
+        contract,
+    )
+
+    assert first > 0
+    assert second == first
+    keys = [
+        key
+        for key in artifacts.store
+        if key.startswith("review:context-source-dag:")
+    ]
+    assert len(keys) == 1
+    payload = json.loads(artifacts.store[keys[0]])
+    assert payload["artifact_schema"] == "context-source-dag-compatibility-v1"
+    assert payload["source_dag_artifact_id"] == first
+    assert payload["source"] == "artifact_compatibility"
+
+
+@pytest.mark.asyncio
+async def test_context_layer_boolean_source_id_uses_review_source_artifact(
+    tmp_path: Path,
+) -> None:
+    workspace_root = tmp_path / "workspace"
+    artifacts = _Artifacts()
+    feature = _feature()
+    runner = _runner(workspace_root, artifacts)
+    contract = SimpleNamespace(
+        source_dag_artifact_id=True,
+        source_dag_sha256="source-sha",
+        dag_sha256="dag-sha",
+        task_id="TASK-context",
+    )
+
+    source_id = await implementation_module._source_dag_artifact_id_for_context_layer(
+        runner,
+        feature,
+        contract,
+    )
+
+    assert source_id > 1
+    keys = [
+        key
+        for key in artifacts.store
+        if key.startswith("review:context-source-dag:")
+    ]
+    assert len(keys) == 1
+
+
+@pytest.mark.asyncio
+async def test_context_layer_uses_review_source_id_when_typed_store_lacks_source_row(
+    tmp_path: Path,
+) -> None:
+    workspace_root = tmp_path / "workspace"
+    artifacts = _Artifacts()
+    feature = _feature()
+    runner = _runner(workspace_root, artifacts)
+    runner.services["execution_control_store"] = _BridgeExecutionControlStore()
+    contract = SimpleNamespace(
+        source_dag_artifact_id=0,
+        source_dag_sha256="source-sha",
+        dag_sha256="dag-sha",
+        task_id="TASK-context",
+    )
+
+    source_id = await implementation_module._source_dag_artifact_id_for_context_layer(
+        runner,
+        feature,
+        contract,
+    )
+
+    assert source_id > 0
+    keys = [
+        key
+        for key in artifacts.store
+        if key.startswith("review:context-source-dag:")
+    ]
+    assert len(keys) == 1
+    payload = json.loads(artifacts.store[keys[0]])
+    assert payload["source_dag_artifact_id"] == source_id
+
+
+@pytest.mark.asyncio
 async def test_authority_preflight_artifacts_are_bounded_and_deterministic(
     tmp_path: Path,
 ) -> None:

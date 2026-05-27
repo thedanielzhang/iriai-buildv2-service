@@ -269,3 +269,56 @@ history. It must not mutate execution-control rows, checkpoints, or Git commits.
 - Slice 09 provides scheduler feedback evidence.
 - Slice 10 provides bounded supervisor/dashboard summaries.
 - Slice 12 provides the landing record and acceptance metrics.
+
+## Slice 13A Shared Completeness Model Dependency
+
+Per **doc-13a:285-287 § Refactoring Steps step 9** — *"Update governance
+Slices 13-20 and context Slice 21 to depend on this shared completeness
+model instead of redefining authority semantics locally."* — this doc's
+governance authority semantics depend on the Slice 13A shared
+completeness model. The source-of-truth modules are:
+
+- `src/iriai_build_v2/execution_control/completeness.py` (Slice 13A 2nd
+  sub-slice; 7 `__all__` surfaces): `CompletenessState`,
+  `EvidenceAuthority` (execution-control 5-value namespace alias),
+  `EvidencePageRef`, `EvidenceCompleteness`, `ExactEvidenceManifest`,
+  `AuthoritativeContextRef`, and `compute_completeness_digest`.
+- `src/iriai_build_v2/execution_control/prompt_context_adapter.py`
+  (Slice 13A 3rd sub-slice; 3 `__all__` surfaces): adapter from the
+  Slice 05 `PromptContextBundle` to `AuthoritativePromptContextBundle`
+  with field-level completeness tags.
+- `src/iriai_build_v2/execution_control/dispatcher_prompt_context.py`
+  (Slice 13A 4th sub-slice; 6 `__all__` surfaces): opt-in port that
+  records `runtime_context/context_incomplete` when
+  `required_complete_for` cannot be satisfied (per doc-13a:269-272).
+- `src/iriai_build_v2/execution_control/gate_companion.py` (Slice 13A
+  5th sub-slice; 9 `__all__` surfaces): typed gate-companion record +
+  typed proof row + 2 typed failure ids
+  (`verifier_context/companion_record_unavailable` +
+  `verifier_context/proof_row_required`) (per doc-13a:273-279).
+- `src/iriai_build_v2/execution_control/snapshot_companion.py`
+  (Slice 13A 6th sub-slice; 9 `__all__` surfaces): typed
+  snapshot-companion record + per-list-field completeness + classifier
+  routing + 2 typed failure ids
+  (`evidence_corruption/list_field_incomplete` +
+  `evidence_corruption/classifier_rule_blocked`) (per doc-13a:280-282).
+
+**Namespace coexistence note**: the governance-namespace
+`EvidenceAuthority = Literal[...]` defined in this doc at
+`13-governance-evidence-model.md:74-84` (9 values) coexists with the
+execution-control namespace `EvidenceAuthority` (5 values per the
+Slice 13A 2nd sub-slice). The two aliases are intentionally distinct
+and the distinction is pinned by
+`tests/test_execution_control_completeness.py::test_evidence_authority_is_distinct_from_governance_namespace`.
+Per P3-13A-6-3 and Slice 19A source-of-truth
+`19a-governance-implementation-reassessment.md` (`19A-P2-001`), the current
+dashboard wrapper is display/advisory-only and does not let any governance
+slice consume 13A-derived evidence as execution authority. Authority use must
+wait for a future source-of-truth slice that wires an actual authoritative
+consumer with durable failure observation.
+
+This dependency-reconciliation reference was added by
+**Slice 13A 8th sub-slice 13An-1** (this iteration) per
+doc-13a:285-287 step 9 and the
+`docs/execution-control-plane/13a-acceptance.md` § "Pending after this
+sub-slice" SPLIT authorization (lines 285-306).

@@ -167,6 +167,7 @@ class FakeStore:
         self.failures: list[RuntimeFailureRecord] = []
         self.projections: list[tuple[StructuredOutputRecord, PatchCaptureRecord]] = []
         self.finished: list[DispatchOutcome] = []
+        self.prompt_contexts: list[PromptContextBundle] = []
 
     async def start_dispatch_attempt(self, request: DispatchRequest) -> DispatchAttemptRecord:
         self.log.append("start")
@@ -206,8 +207,9 @@ class FakeStore:
         prompt: str,
         bundle: PromptContextBundle,
     ) -> int:
-        del attempt_id, request, prompt, bundle
+        del attempt_id, request, prompt
         self.log.append("record_prompt")
+        self.prompt_contexts.append(bundle)
         return 201
 
     async def record_runtime_invocation(
@@ -300,6 +302,19 @@ class FakePromptBuilder:
         return PromptBuildResult(prompt="Do the bounded task.", bundle=_bundle())
 
 
+class FakeProviderPayloadPromptBuilder(FakePromptBuilder):
+    async def build_prompt_context(self, request: DispatchRequest) -> PromptBuildResult:
+        del request
+        self.calls += 1
+        self.log.append("prompt")
+        bundle_data = _bundle().model_dump(mode="json")
+        bundle_data["provider_records"] = [{"body": "must not enter bundle"}]
+        return PromptBuildResult(
+            prompt="Do the bounded task.",
+            bundle=PromptContextBundle.model_validate(bundle_data),
+        )
+
+
 class FakeSandbox:
     def __init__(self, log: list[str]) -> None:
         self.log = log
@@ -346,9 +361,11 @@ class FakeRuntime:
         self.log = log
         self.mode = mode
         self.calls = 0
+        self.invocations: list[RuntimeInvocationRequest] = []
 
     async def invoke(self, request: RuntimeInvocationRequest) -> RuntimeInvocationResponse:
         self.calls += 1
+        self.invocations.append(request)
         self.log.append("runtime")
         if self.mode == "failure":
             return _failure_response(request)
@@ -362,6 +379,7 @@ def _dispatcher(
     runtime: FakeRuntime | None = None,
     prompt_builder: FakePromptBuilder | None = None,
     sandbox: FakeSandbox | None = None,
+    context_layer_builder: object | None = None,
 ) -> RuntimeDispatcher:
     return RuntimeDispatcher(
         store=store or FakeStore(log),
@@ -369,7 +387,92 @@ def _dispatcher(
         runtime=runtime or FakeRuntime(log),
         prompt_builder=prompt_builder or FakePromptBuilder(log),
         output_schema_digest="schema-sha",
+        context_layer_builder=context_layer_builder,
     )
+
+
+class FakeContextLayerBuilder:
+    async def build_context_package(
+        self,
+        *,
+        request: DispatchRequest,
+        binding: RuntimeWorkspaceBinding,
+        prompt_result: PromptBuildResult,
+    ) -> SimpleNamespace:
+        assert binding.sandbox_id == "sandbox-1"
+        assert prompt_result.bundle.context_sha256 == "context-sha"
+        return SimpleNamespace(
+            package_id="ctxpkg-1",
+            package_digest="ctxpkg-digest",
+            review_ref="context-package://ctxpkg-1",
+            package_kind="dispatcher_prompt_context",
+            completeness="complete",
+            source_dag_artifact_id=501,
+            dag_sha256=request.dag_sha256,
+            request=SimpleNamespace(
+                feature_id=request.feature_id,
+                task_id=request.task_id,
+            ),
+            evidence_snapshot=SimpleNamespace(
+                typed_evidence_digest="typed-evidence-digest"
+            ),
+            provider_state_digest="provider-state-digest",
+            advisory_only=True,
+            provider_records=[{"body": "must not enter PromptContextBundle"}],
+            provider_state_refs=[{"id": "provider-state"}],
+            rendered_preview="provider body",
+        )
+
+
+class FakeMalformedContextLayerBuilder(FakeContextLayerBuilder):
+    async def build_context_package(
+        self,
+        *,
+        request: DispatchRequest,
+        binding: RuntimeWorkspaceBinding,
+        prompt_result: PromptBuildResult,
+    ) -> SimpleNamespace:
+        package = await super().build_context_package(
+            request=request,
+            binding=binding,
+            prompt_result=prompt_result,
+        )
+        return SimpleNamespace(
+            **{
+                **package.__dict__,
+                "feature_id": request.feature_id,
+                "request": SimpleNamespace(
+                    feature_id="other-feature",
+                    task_id=request.task_id,
+                ),
+            }
+        )
+
+
+class FakeCompletenessContextLayerBuilder(FakeContextLayerBuilder):
+    def __init__(self, *, completeness: str, page_refs: list[object] | None = None) -> None:
+        self._completeness = completeness
+        self._page_refs = [] if page_refs is None else page_refs
+
+    async def build_context_package(
+        self,
+        *,
+        request: DispatchRequest,
+        binding: RuntimeWorkspaceBinding,
+        prompt_result: PromptBuildResult,
+    ) -> SimpleNamespace:
+        package = await super().build_context_package(
+            request=request,
+            binding=binding,
+            prompt_result=prompt_result,
+        )
+        return SimpleNamespace(
+            **{
+                **package.__dict__,
+                "completeness": self._completeness,
+                "page_refs": self._page_refs,
+            }
+        )
 
 
 @pytest.mark.asyncio
@@ -382,6 +485,172 @@ async def test_dispatch_starts_attempt_before_side_effects() -> None:
     assert log.index("start") < log.index("prompt")
     assert log.index("start") < log.index("bind")
     assert log.index("start") < log.index("runtime")
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_records_context_layer_identity_without_provider_payloads() -> None:
+    log: list[str] = []
+    store = FakeStore(log)
+    runtime = FakeRuntime(log)
+
+    outcome = await _dispatcher(
+        log,
+        store=store,
+        runtime=runtime,
+        prompt_builder=FakeProviderPayloadPromptBuilder(log),
+        context_layer_builder=FakeContextLayerBuilder(),
+    ).dispatch(_request())
+
+    assert outcome.status == "succeeded"
+    bundle = store.prompt_contexts[0]
+    assert bundle.context_package_id == "ctxpkg-1"
+    assert bundle.context_package_digest == "ctxpkg-digest"
+    assert bundle.context_package_ref == "context-package://ctxpkg-1"
+    assert bundle.context_package_completeness == "complete"
+    assert bundle.context_package_feature_id == "feature-1"
+    assert bundle.context_package_task_id == "TASK-1"
+    assert bundle.context_package_provider_state_digest == "provider-state-digest"
+    dumped = bundle.model_dump(mode="json")
+    assert "provider_records" not in dumped
+    assert "provider_state_refs" not in dumped
+    assert "rendered_preview" not in dumped
+    assert runtime.invocations[0].metadata["context_package_id"] == "ctxpkg-1"
+    assert runtime.invocations[0].metadata["context_package_digest"] == "ctxpkg-digest"
+    assert runtime.invocations[0].metadata["context_package_completeness"] == "complete"
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_rejects_malformed_context_layer_identity_before_runtime() -> None:
+    log: list[str] = []
+    store = FakeStore(log)
+    runtime = FakeRuntime(log)
+
+    outcome = await _dispatcher(
+        log,
+        store=store,
+        runtime=runtime,
+        context_layer_builder=FakeMalformedContextLayerBuilder(),
+    ).dispatch(_request())
+
+    assert outcome.status == "failed"
+    assert runtime.calls == 0
+    assert store.prompt_contexts == []
+    assert store.failures[0].failure_class == "runtime_context"
+    assert store.failures[0].failure_type == "context_materialization_failed"
+    assert "context layer package identity is malformed" in store.failures[0].details["message"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("completeness", ["preview_only", "unavailable", "paged"])
+async def test_dispatcher_rejects_non_executable_context_layer_completeness_before_runtime(
+    completeness: str,
+) -> None:
+    log: list[str] = []
+    store = FakeStore(log)
+    runtime = FakeRuntime(log)
+
+    outcome = await _dispatcher(
+        log,
+        store=store,
+        runtime=runtime,
+        context_layer_builder=FakeCompletenessContextLayerBuilder(
+            completeness=completeness,
+        ),
+    ).dispatch(_request())
+
+    assert outcome.status == "failed"
+    assert runtime.calls == 0
+    assert store.prompt_contexts == []
+    assert store.failures[0].failure_type == "context_materialization_failed"
+    assert "context_package_completeness" in store.failures[0].details["message"]
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_passes_paged_context_layer_refs_to_runtime_metadata() -> None:
+    log: list[str] = []
+    store = FakeStore(log)
+    runtime = FakeRuntime(log)
+    page_ref = {
+        "ref_id": "review:context-package:ctxpkg-1:page:0:abc",
+        "digest": "page-digest",
+        "completeness": "complete",
+        "preview_only": False,
+        "provider_records": [{"body": "must not enter metadata"}],
+        "rendered_preview": "must not enter metadata",
+    }
+
+    outcome = await _dispatcher(
+        log,
+        store=store,
+        runtime=runtime,
+        context_layer_builder=FakeCompletenessContextLayerBuilder(
+            completeness="paged",
+            page_refs=[page_ref],
+        ),
+    ).dispatch(_request())
+
+    assert outcome.status == "succeeded"
+    bundle = store.prompt_contexts[0]
+    assert bundle.context_package_completeness == "paged"
+    assert bundle.context_package_page_refs[0]["ref_id"] == page_ref["ref_id"]
+    assert "provider_records" not in bundle.context_package_page_refs[0]
+    assert "rendered_preview" not in bundle.context_package_page_refs[0]
+    assert runtime.invocations[0].metadata["context_package_completeness"] == "paged"
+    runtime_page_ref = runtime.invocations[0].metadata["context_package_page_refs"][0]
+    assert runtime_page_ref["digest"] == "page-digest"
+    assert "provider_records" not in runtime_page_ref
+    assert "rendered_preview" not in runtime_page_ref
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_rejects_malformed_paged_context_layer_refs_before_runtime() -> None:
+    log: list[str] = []
+    store = FakeStore(log)
+    runtime = FakeRuntime(log)
+
+    outcome = await _dispatcher(
+        log,
+        store=store,
+        runtime=runtime,
+        context_layer_builder=FakeCompletenessContextLayerBuilder(
+            completeness="paged",
+            page_refs=[{"ref_id": "page-without-digest"}],
+        ),
+    ).dispatch(_request())
+
+    assert outcome.status == "failed"
+    assert runtime.calls == 0
+    assert store.prompt_contexts == []
+    assert "page refs require ref_id and digest" in store.failures[0].details["message"]
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_rejects_preview_only_paged_context_layer_refs_before_runtime() -> None:
+    log: list[str] = []
+    store = FakeStore(log)
+    runtime = FakeRuntime(log)
+
+    outcome = await _dispatcher(
+        log,
+        store=store,
+        runtime=runtime,
+        context_layer_builder=FakeCompletenessContextLayerBuilder(
+            completeness="paged",
+            page_refs=[
+                {
+                    "ref_id": "review:context-package:ctxpkg-1:page:0:preview",
+                    "digest": "page-digest",
+                    "completeness": "complete",
+                    "preview_only": "true",
+                }
+            ],
+        ),
+    ).dispatch(_request())
+
+    assert outcome.status == "failed"
+    assert runtime.calls == 0
+    assert store.prompt_contexts == []
+    assert "must not be preview_only" in store.failures[0].details["message"]
 
 
 @pytest.mark.asyncio

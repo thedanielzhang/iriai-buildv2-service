@@ -481,3 +481,84 @@ gates, merge queue, or checkpoints.
 - Slice 19 supplies agent-context reporting constraints.
 - Slice 20 governs all-at-once governance acceptance before this slice becomes
   available.
+
+## Slice 13A Shared Completeness Model Dependency
+
+Per **doc-13a:285-287 § Refactoring Steps step 9** — *"Update governance
+Slices 13-20 and context Slice 21 to depend on this shared completeness
+model instead of redefining authority semantics locally."* — this
+slice's context-layer authority semantics depend on the Slice 13A
+shared completeness model.
+
+### `ContextCompleteness` is a structural alias of the shared `CompletenessState`
+
+The locally-defined alias at
+`21-iriai-context-layer.md:92` —
+
+```python
+ContextCompleteness = Literal["complete", "paged", "preview_only", "unavailable"]
+```
+
+is **structurally identical** to the shared `CompletenessState` alias
+defined in
+`src/iriai_build_v2/execution_control/completeness.py` (Slice 13A 2nd
+sub-slice). The two aliases coexist for namespace cohesion (a context-
+layer reader benefits from the name `ContextCompleteness` in the
+context-layer surface), but they are **semantically identical** and
+must remain in lock-step. If the shared `CompletenessState` enum gains
+or loses values, `ContextCompleteness` MUST track that change in the
+same migration.
+
+A future Slice 13A maintenance pass or a Slice 21 implementer MAY
+collapse the duplicate alias to a direct
+`from src.iriai_build_v2.execution_control.completeness import CompletenessState`
+import and re-export under the local name. Until then, the
+test surface at
+`tests/test_governance_13a_step9_reconciliation.py::test_slice21_context_completeness_matches_shared`
+pins the structural equality so the duplicate cannot drift.
+
+### Source-of-truth modules for the rest of the context-layer surface
+
+- `src/iriai_build_v2/execution_control/completeness.py` (Slice 13A
+  2nd sub-slice) — `CompletenessState`, `EvidenceCompleteness`,
+  `AuthoritativeContextRef`, `EvidencePageRef`, `ExactEvidenceManifest`,
+  `compute_completeness_digest`. The context-layer's
+  `IriAILineageRecord.evidence_refs: list[GovernanceEvidenceRef]`
+  (defined at lines 135-154) and `omitted_refs` budget surface
+  consume the typed `EvidenceCompleteness` model rather than re-
+  deriving completeness from raw provider output.
+- `src/iriai_build_v2/execution_control/prompt_context_adapter.py` +
+  `dispatcher_prompt_context.py` (Slice 13A 3rd-4th sub-slices) —
+  context-layer outputs that feed task-execute prompts must route
+  through the dispatcher-prompt adapter chain. The doc's existing
+  rule at lines 461 (*"No context-layer output mutates workflow state
+  or changes execution authority."*) is preserved by the
+  `AuthoritativePromptContextRouting` fail-closed disposition.
+- `src/iriai_build_v2/execution_control/gate_companion.py` +
+  `snapshot_companion.py` (Slice 13A 5th-6th sub-slices) — the gate
+  companion record + snapshot companion record are the typed contracts
+  the context-layer-derived evidence must conform to when it is
+  consumed by a gate / verifier / classifier.
+
+### Provider-status `preview_only` discipline
+
+The doc's existing § "Provider availability" + § "Edge Cases" rules
+already require that context packages with incomplete provider output
+either omit `rendered_preview` or mark
+`completeness="preview_only"` (see line 414). That rule is exactly
+the shared `CompletenessState="preview_only"` state. This dependency
+reference makes the source-of-truth pointer explicit and pins the
+structural alignment.
+
+Per **P3-13A-6-3 dead-until-wired binding statement** (see
+`13a-acceptance.md:193-227`), the composite adapter chain must be
+wired into a real consumer site before context-layer outputs can be
+consumed as execution authority by a gate / verifier / classifier.
+The context-layer remains advisory/display-only per doc-13a:50-54
+until 13A remediation is complete AND the Slice 20 all-at-once
+acceptance gate has passed. The wiring is the **Slice 13A 8th
+sub-slice 13An-2** deliverable.
+
+This dependency-reconciliation reference was added by
+**Slice 13A 8th sub-slice 13An-1** (this iteration) per
+doc-13a:285-287 step 9.

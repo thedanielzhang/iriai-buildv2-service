@@ -114,6 +114,16 @@ class FakeContextGateway:
         raise AssertionError("broad artifact scans are forbidden")
 
 
+class FakeContextLayerPackageBuilder:
+    def __init__(self, **identity) -> None:
+        self.identity = identity
+
+    def build(self, refs):
+        del refs
+        package = ContextPackageBuilder(FakeContextGateway()).build([])
+        return package.model_copy(update=self.identity)
+
+
 def _request(**overrides) -> GateRequest:
     data = {
         "feature_id": FEATURE_ID,
@@ -365,6 +375,118 @@ def test_context_package_uses_only_explicit_refs() -> None:
         "event",
         "file",
     ]
+
+
+def _context_layer_identity(**overrides):
+    data = {
+        "package_id": "ctxpkg-1",
+        "package_digest": "ctxpkg-digest",
+        "package_ref": "context-package://ctxpkg-1",
+        "package_kind": "gate_context",
+        "completeness": "complete",
+        "feature_id": FEATURE_ID,
+        "task_id": "TASK-1",
+        "source_dag_artifact_id": 55,
+        "dag_sha256": DAG_SHA,
+        "evidence_snapshot_digest": "typed-evidence-digest",
+        "provider_state_digest": "provider-state-digest",
+        "advisory_only": True,
+        "provider_records": [{"body": "must not enter gate node metadata"}],
+        "provider_state_refs": [{"id": "provider-state"}],
+        "rendered_preview": "provider body",
+    }
+    data.update(overrides)
+    return data
+
+
+def test_gate_records_context_layer_identity_without_provider_payloads() -> None:
+    request = _request(
+        source_dag_artifact_id=55,
+        evidence_snapshot_digest="typed-evidence-digest",
+        provider_state_digest="provider-state-digest",
+    )
+    runner = GateRunner(
+        _gateway(),
+        context_builder=FakeContextLayerPackageBuilder(**_context_layer_identity()),
+    )
+
+    result = runner.run_preflight(request)
+
+    assert result.approved
+    context_node = next(
+        node for node in result.nodes if node.name == "bounded_context_package"
+    )
+    assert context_node.metadata["package_id"] == "ctxpkg-1"
+    assert context_node.metadata["package_digest"] == "ctxpkg-digest"
+    assert context_node.metadata["completeness"] == "complete"
+    assert "provider_records" not in context_node.metadata
+    assert "provider_state_refs" not in context_node.metadata
+    assert "rendered_preview" not in context_node.metadata
+
+
+def test_gate_rejects_stale_context_layer_identity() -> None:
+    request = _request(
+        source_dag_artifact_id=55,
+        evidence_snapshot_digest="typed-evidence-digest",
+        provider_state_digest="provider-state-digest",
+    )
+    runner = GateRunner(
+        _gateway(),
+        context_builder=FakeContextLayerPackageBuilder(
+            **_context_layer_identity(feature_id="other-feature")
+        ),
+    )
+
+    result = runner.run_preflight(request)
+
+    assert not result.approved
+    assert result.failure is not None
+    assert result.failure.local_code == "context_package.stale"
+    assert result.failure.failure_class == "stale_projection"
+    assert {
+        "field": "feature_id",
+        "expected": FEATURE_ID,
+        "actual": "other-feature",
+    } in result.failure.details["mismatches"]
+
+
+@pytest.mark.parametrize(
+    ("identity_override", "expected_field"),
+    [
+        ({"task_id": "TASK-other"}, "task_id"),
+        ({"source_dag_artifact_id": 56}, "source_dag_artifact_id"),
+        ({"dag_sha256": "other-dag"}, "dag_sha256"),
+        ({"evidence_snapshot_digest": "other-evidence"}, "evidence_snapshot_digest"),
+        ({"provider_state_digest": "other-provider"}, "provider_state_digest"),
+        ({"advisory_only": "false"}, "advisory_only"),
+        ({"completeness": "preview_only"}, "completeness"),
+    ],
+)
+def test_gate_rejects_stale_context_layer_identity_dimensions(
+    identity_override,
+    expected_field,
+) -> None:
+    request = _request(
+        source_dag_artifact_id=55,
+        evidence_snapshot_digest="typed-evidence-digest",
+        provider_state_digest="provider-state-digest",
+    )
+    runner = GateRunner(
+        _gateway(),
+        context_builder=FakeContextLayerPackageBuilder(
+            **_context_layer_identity(**identity_override)
+        ),
+    )
+
+    result = runner.run_preflight(request)
+
+    assert not result.approved
+    assert result.failure is not None
+    assert result.failure.local_code == "context_package.stale"
+    mismatch_fields = {
+        mismatch["field"] for mismatch in result.failure.details["mismatches"]
+    }
+    assert expected_field in mismatch_fields
 
 
 def test_context_package_budget_records_omitted_optional_refs() -> None:

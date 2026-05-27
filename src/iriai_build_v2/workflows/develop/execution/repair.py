@@ -82,6 +82,7 @@ RetryKind = Literal[
     "merge",
     "sandbox_capture",
     "sandbox_cleanup",
+    "governance_projection",
 ]
 
 RetryRequestStatus = Literal["requested", "started", "succeeded", "failed", "quiesced"]
@@ -324,6 +325,26 @@ class RouteExecutor:
         action = _decision_action(decision)
         if action not in _RETRY_ACTIONS:
             raise RouteExecutorError(f"route action {action!r} does not build RetryRequest")
+        if action == "retry_governance_projection":
+            try:
+                budget_remaining = int(_field(decision, "budget_remaining"))
+            except (TypeError, ValueError):
+                budget_remaining = 0
+            try:
+                reservation_ordinal = int(
+                    _field(decision, "reservation_ordinal") or 0
+                )
+            except (TypeError, ValueError):
+                reservation_ordinal = 0
+            budget_exhausted = bool(_field(decision, "budget_exhausted"))
+            stale_zero_budget = (
+                budget_remaining <= 0 and reservation_ordinal <= 0
+            )
+            if budget_exhausted or stale_zero_budget:
+                raise RouteExecutorError(
+                    "retry_governance_projection budget exhausted; "
+                    "no executable retry request can be built"
+                )
         scope = _scope(decision)
         _assert_route_table_consistency(action, scope)
         common = _common_request_fields(decision, route_decision_id, scope)
@@ -373,6 +394,13 @@ class RouteExecutor:
         elif action == "run_sandbox_cleanup":
             retry_kind = "sandbox_cleanup"
             attempt_kind = "repair"
+        elif action == "retry_governance_projection":
+            retry_kind = "governance_projection"
+            attempt_kind = "verify"
+            reset_context = False
+            allocate_new_sandbox = False
+            preserve_sandbox_lease_id = None
+            preserve_merge_queue_item_id = None
         else:  # pragma: no cover - guarded by _RETRY_ACTIONS.
             raise RouteExecutorError(f"unsupported retry action {action!r}")
 
@@ -522,6 +550,7 @@ class RouteExecutor:
             raise RouteExecutorError("retry_merge source queue item must not have result_commit")
         if _truthy(scope, "replacement_chain_active", "already_superseded"):
             raise RouteExecutorError("retry_merge source queue item is already superseded")
+        _validate_retry_merge_replacement_lineage(scope)
 
 
 _REPAIR_ACTIONS = {
@@ -537,6 +566,7 @@ _RETRY_ACTIONS = {
     "retry_merge",
     "retry_sandbox_capture",
     "run_sandbox_cleanup",
+    "retry_governance_projection",
 }
 
 
@@ -569,10 +599,14 @@ def _assert_route_table_consistency(action: str, scope: Mapping[str, Any]) -> No
     failure_class = str(scope.get("failure_class") or "")
     failure_type = str(scope.get("failure_type") or "")
     if not failure_class or not failure_type:
-        return
+        raise RouteExecutorError(
+            "route decision repair_scope must include failure_class and failure_type"
+        )
     policy = ROUTE_TABLE.get((failure_class, failure_type))
     if policy is None:
-        return
+        raise RouteExecutorError(
+            f"unknown route policy for {failure_class}/{failure_type}"
+        )
     if policy.action != action:
         raise RouteExecutorError(
             f"route action {action!r} contradicts route table action "
@@ -697,6 +731,197 @@ def _required_evidence(decision: RouteDecision, scope: Mapping[str, Any]) -> lis
     )
 
 
+def _validate_retry_merge_replacement_lineage(scope: Mapping[str, Any]) -> None:
+    _assert_matching_text_value(
+        scope,
+        "feature id",
+        source_keys=("source_feature_id", "failed_source_feature_id", "source_queue_item_feature_id", "feature_id"),
+        replacement_keys=("replacement_feature_id", "replacement_queue_item_feature_id"),
+        required=True,
+    )
+    _assert_matching_text_value(
+        scope,
+        "DAG sha",
+        source_keys=("source_dag_sha256", "failed_source_dag_sha256", "source_queue_item_dag_sha256", "dag_sha256"),
+        replacement_keys=("replacement_dag_sha256", "replacement_queue_item_dag_sha256"),
+        required=True,
+    )
+    _assert_matching_int_set(
+        scope,
+        "group id",
+        source_keys=("source_group_idx", "failed_source_group_idx", "source_queue_item_group_idx", "group_idx"),
+        replacement_keys=("replacement_group_idx", "replacement_queue_item_group_idx"),
+        required=True,
+    )
+    _assert_matching_text_set(
+        scope,
+        "task coverage",
+        source_keys=("source_task_ids", "failed_source_task_ids", "source_task_id", "task_ids", "task_id"),
+        replacement_keys=("replacement_task_ids", "replacement_queue_item_task_ids", "replacement_task_id"),
+        required=True,
+    )
+    _assert_matching_int_set(
+        scope,
+        "contract coverage",
+        source_keys=(
+            "source_contract_ids",
+            "failed_source_contract_ids",
+            "source_queue_item_contract_ids",
+            "preserve_contract_ids",
+            "contract_ids",
+            "target_contract_ids",
+        ),
+        replacement_keys=("replacement_contract_ids", "replacement_queue_item_contract_ids"),
+        required=True,
+    )
+    _assert_matching_text_set(
+        scope,
+        "gate requirements",
+        source_keys=(
+            "source_gate_ids",
+            "failed_source_gate_ids",
+            "source_queue_item_gate_ids",
+            "preserve_gate_ids",
+            "gate_ids",
+            "required_gate_ids",
+        ),
+        replacement_keys=("replacement_gate_ids", "replacement_queue_item_gate_ids"),
+        required=True,
+    )
+    _assert_matching_text_value(
+        scope,
+        "queue lane",
+        source_keys=("source_queue_lane", "failed_source_queue_lane", "queue_lane"),
+        replacement_keys=("replacement_queue_lane",),
+        required=True,
+    )
+    _assert_matching_int_set(
+        scope,
+        "route-decision evidence",
+        source_keys=(
+            "source_route_decision_evidence_ids",
+            "failed_source_route_decision_evidence_ids",
+            "route_decision_evidence_ids",
+            "evidence_ids",
+        ),
+        replacement_keys=("replacement_route_decision_evidence_ids",),
+        required=True,
+    )
+
+
+def _assert_matching_int_set(
+    scope: Mapping[str, Any],
+    label: str,
+    *,
+    source_keys: tuple[str, ...],
+    replacement_keys: tuple[str, ...],
+    required: bool = False,
+) -> None:
+    source_present, source = _strict_lineage_ints(scope, label, *source_keys)
+    replacement_present, replacement = _strict_lineage_ints(scope, label, *replacement_keys)
+    if required and (not source_present or not replacement_present):
+        raise RouteExecutorError(f"retry_merge replacement must preserve {label}")
+    if source_present != replacement_present:
+        raise RouteExecutorError(f"retry_merge replacement must preserve {label}")
+    if set(source) != set(replacement):
+        raise RouteExecutorError(f"retry_merge replacement must preserve {label}")
+
+
+def _assert_matching_text_set(
+    scope: Mapping[str, Any],
+    label: str,
+    *,
+    source_keys: tuple[str, ...],
+    replacement_keys: tuple[str, ...],
+    required: bool = False,
+) -> None:
+    source_present, source = _strict_lineage_texts(scope, *source_keys)
+    replacement_present, replacement = _strict_lineage_texts(scope, *replacement_keys)
+    if required and (not source_present or not replacement_present):
+        raise RouteExecutorError(f"retry_merge replacement must preserve {label}")
+    if source_present != replacement_present:
+        raise RouteExecutorError(f"retry_merge replacement must preserve {label}")
+    if set(source) != set(replacement):
+        raise RouteExecutorError(f"retry_merge replacement must preserve {label}")
+
+
+def _assert_matching_text_value(
+    scope: Mapping[str, Any],
+    label: str,
+    *,
+    source_keys: tuple[str, ...],
+    replacement_keys: tuple[str, ...],
+    required: bool = False,
+) -> None:
+    source_present, source_values = _strict_lineage_texts(scope, *source_keys)
+    replacement_present, replacement_values = _strict_lineage_texts(scope, *replacement_keys)
+    if required and (not source_present or not replacement_present):
+        raise RouteExecutorError(f"retry_merge replacement must preserve {label}")
+    if source_present != replacement_present:
+        raise RouteExecutorError(f"retry_merge replacement must preserve {label}")
+    if not source_present:
+        return
+    if len(source_values) != 1 or len(replacement_values) != 1:
+        raise RouteExecutorError(f"retry_merge replacement must preserve {label}")
+    source = source_values[0]
+    replacement = replacement_values[0]
+    if source != replacement:
+        raise RouteExecutorError(f"retry_merge replacement must preserve {label}")
+
+
+def _strict_lineage_ints(
+    scope: Mapping[str, Any],
+    label: str,
+    *keys: str,
+) -> tuple[bool, list[int]]:
+    raw_values = _lineage_values(scope, *keys)
+    if not raw_values:
+        return False, []
+    values: list[int] = []
+    for item in raw_values:
+        try:
+            parsed = int(item)
+        except (TypeError, ValueError):
+            raise RouteExecutorError(f"retry_merge replacement must preserve {label}") from None
+        if parsed <= 0:
+            raise RouteExecutorError(f"retry_merge replacement must preserve {label}")
+        values.append(parsed)
+    return True, _unique_ints(values)
+
+
+def _strict_lineage_texts(scope: Mapping[str, Any], *keys: str) -> tuple[bool, list[str]]:
+    values = [str(item).strip() for item in _lineage_values(scope, *keys)]
+    values = [item for item in values if item]
+    return bool(values), _unique_text(values)
+
+
+def _lineage_values(scope: Mapping[str, Any], *keys: str) -> list[Any]:
+    values: list[Any] = []
+    for key in keys:
+        if key not in scope:
+            continue
+        value = scope.get(key)
+        if value is None:
+            continue
+        if isinstance(value, str):
+            if value.strip():
+                values.append(value)
+            continue
+        if isinstance(value, Mapping):
+            iterable = value.values()
+        elif isinstance(value, (list, tuple, set)):
+            iterable = value
+        else:
+            iterable = [value]
+        for item in iterable:
+            if item is None:
+                continue
+            if isinstance(item, str) and not item.strip():
+                continue
+            values.append(item)
+    return values
+
+
 def _required_evidence_ids_from_scope(scope: Mapping[str, Any], *keys: str) -> list[int]:
     values: list[int] = []
     for key in keys:
@@ -773,6 +998,16 @@ def _optional_str(scope: Mapping[str, Any], key: str) -> str | None:
         return None
     text = str(value).strip()
     return text or None
+
+
+def _first_text(scope: Mapping[str, Any], *keys: str) -> str | None:
+    for key in keys:
+        if key not in scope:
+            continue
+        values = _list_strs(scope.get(key))
+        if values:
+            return str(values[0]).strip() or None
+    return None
 
 
 def _truthy(scope: Mapping[str, Any], *keys: str) -> bool:

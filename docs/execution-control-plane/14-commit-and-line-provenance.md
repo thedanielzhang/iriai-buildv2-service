@@ -259,3 +259,53 @@ during rollback.
 - Slice 13 defines governance evidence refs that cite Git provenance.
 - Slice 21 consumes this slice through provider adapters and the IriAI lineage
   plugin.
+
+## Slice 13A Shared Completeness Model Dependency
+
+Per **doc-13a:285-287 § Refactoring Steps step 9** — *"Update governance
+Slices 13-20 and context Slice 21 to depend on this shared completeness
+model instead of redefining authority semantics locally."* — this
+slice's `LineProvenanceResult.completeness: CompletenessState` field
+(see lines 124-132 above) and its `page_refs:
+list[GovernanceEvidencePageRef]` field both depend on the Slice 13A
+shared completeness model.
+
+Source-of-truth modules:
+
+- `src/iriai_build_v2/execution_control/completeness.py` (Slice 13A
+  2nd sub-slice) — `CompletenessState`, `EvidencePageRef`,
+  `EvidenceCompleteness`, `ExactEvidenceManifest`,
+  `AuthoritativeContextRef`, `compute_completeness_digest`.
+- `src/iriai_build_v2/execution_control/gate_companion.py` (Slice 13A
+  5th sub-slice) — `AuthoritativeGateProofRow` is the **only** typed
+  shape by which a deterministic line-provenance summary can satisfy
+  a required gate per doc-13a:276-278; line-provenance summaries that
+  are not backed by an `AuthoritativeGateProofRow` cannot feed gate
+  authority.
+- `src/iriai_build_v2/execution_control/snapshot_companion.py` (Slice
+  13A 6th sub-slice) — `AuthoritativeSnapshotListFieldCompleteness`
+  carries per-list-field completeness for any list field (including
+  line-provenance result lists) that classifier rules consume.
+- `src/iriai_build_v2/execution_control/dispatcher_prompt_context.py`
+  (Slice 13A 4th sub-slice) — line-provenance evidence that feeds the
+  dispatcher's prompt-context bundle (via the typed
+  `AuthoritativePromptContextBundle` adapter) is governed by the
+  same completeness contract; line-provenance inputs that the
+  dispatcher cannot exact-cite must route through the
+  `runtime_context/context_incomplete` typed failure id per
+  doc-13a:269-272.
+
+The doc's existing `completeness="paged"` + `GovernanceEvidencePageRef`
+wording at lines 200-203 already maps onto the shared model's
+`CompletenessState = Literal["complete", "paged", "preview_only",
+"unavailable"]` enum; this dependency reference makes that mapping
+explicit. Per P3-13A-6-3 and Slice 19A source-of-truth
+`19a-governance-implementation-reassessment.md` (`19A-P2-001`), the current
+dashboard wrapper is display/advisory-only and does not let line-provenance
+evidence become execution authority. Authority use must wait for a future
+source-of-truth slice that wires an actual authoritative consumer with durable
+failure observation.
+
+This dependency-reconciliation reference was added by
+**Slice 13A 8th sub-slice 13An-1** (this iteration) per
+doc-13a:285-287 step 9.

@@ -3,8 +3,9 @@
 ## Objective
 
 Define the governance CLI/API, dashboard integration, Slack/report output, and
-agent-readable summaries. The main consumer is the workflow itself, so structured
-governance records are primary and prose reports are secondary.
+agent-readable summaries. Structured governance records are primary and prose
+reports are secondary; production workflow consumption remains gated by later
+accepted source-of-truth wiring.
 
 Governance reporting must be bounded, reproducible, evidence-cited, and
 compatible with the supervisor/dashboard read-only contract.
@@ -78,7 +79,7 @@ class GovernanceSnapshot(BaseModel):
     truncated: bool
     omitted_counts: dict[str, int]
     completeness: CompletenessState
-    page_refs: list[GovernanceEvidencePageRef]
+    page_refs: list[str]
     next_cursor: str | None = None
     top_findings: list[GovernanceFinding]
     recommendations: list[GovernancePolicyRecommendation]
@@ -87,6 +88,7 @@ class GovernanceSnapshot(BaseModel):
     blocked_by: list[str]
 
 class ContextLayerPackageSummary(BaseModel):
+    # Post-Slice-21 context package summary shape.
     package_id: str
     package_digest: str
     package_ref: GovernanceEvidenceRef
@@ -103,15 +105,14 @@ class ContextLayerPackageSummary(BaseModel):
 class GovernanceAgentContext(BaseModel):
     task_id: str | None
     repo_id: str | None
-    context_package: ContextLayerPackageSummary | None = None
     relevant_findings: list[GovernanceFinding]
     relevant_line_provenance: list[LineProvenanceResult]
     policy_guidance: list[GovernancePolicyRecommendation]
     policy_guidance_authority: Literal["advisory_only"] = "advisory_only"
-    omitted_detail_refs: list[GovernanceEvidencePageRef]
+    omitted_detail_refs: list[str]
     omitted_counts: dict[str, int]
     completeness: CompletenessState
-    page_refs: list[GovernanceEvidencePageRef]
+    page_refs: list[str]
     truncated: bool
     max_prompt_chars: int
 ```
@@ -126,9 +127,10 @@ Default response budgets:
   response must include `ContextLayerPackageSummary` so agents and gates can
   cite and stale-check the exact context package they consumed.
 - Reporting budgets are preview/display budgets. Any truncated snapshot or
-  agent context must include exact `GovernanceEvidencePageRef` rows plus
-  `completeness`; without those refs the response is display-only and cannot
-  feed acceptance, recommendations, policy guidance, or task-execute context.
+  agent context must include completeness plus exact page-ref metadata or
+  page-ref ids traceable to exact `GovernanceEvidencePageRef` rows; without
+  those refs the response is display-only and cannot feed acceptance,
+  recommendations, policy guidance, or future production task-execute context.
 - Dashboard detail panes fetch bounded slices by evidence ref and never expand
   full artifact bodies by default.
 
@@ -140,8 +142,10 @@ Reporting surfaces:
 - Slack digest with dedupe key from `snapshot_digest`, not only corpus id or top
   ids, so material changes in evidence quality, replay confidence, omitted
   detail counts, or implementation-deviation summaries are not suppressed.
-- Agent context endpoint that returns compact governance context for a task,
-  repo, file, or line range. After Slice 21, this endpoint is backed by the
+- Agent context builder/API surface that returns compact display/advisory
+  governance context for a task, repo, file, or line range. Production
+  task-execute consumption is deferred until a later accepted source-of-truth
+  slice wires an actual consumer. After Slice 21, this surface is backed by the
   IriAI Context Layer package API rather than independently assembling
   provider-specific context.
 
@@ -158,6 +162,8 @@ Reporting surfaces:
    task contract, repo, path, or line range. After Slice 21, this builder must
    call the Context Layer package API and return `ContextLayerPackageSummary`
    rather than assembling uncited provider context locally.
+   The Slice 19 builder is reusable display/advisory projection only; it is not
+   production task-execute wiring.
 6. Add report artifacts such as `review:governance-report:{corpus_id}` with
    bounded summary only.
 7. Keep governance agent/tooling read-only. If future self-healing is added, it
@@ -224,7 +230,9 @@ Reporting surfaces:
 - Reports are bounded, reproducible, evidence-cited, and structured first.
 - Truncated or preview reports are never authoritative unless exact page refs
   and completeness metadata cover the consumer's required scope.
-- Workflow agents can receive compact governance context at task execute time.
+- Slice 19 provides a reusable display/advisory builder for compact governance
+  context; production task-execute consumption is deferred to a later accepted
+  source-of-truth slice.
 - After Slice 21, every context response that uses line/context-layer provenance
   carries a citeable context package id and digest.
 - Workflow agents receive governance policy guidance only as advisory context;
@@ -233,6 +241,128 @@ Reporting surfaces:
   evidence quality or omitted details.
 - Reporting honors Slice 10 read-only and bounded-read guarantees.
 - Implementation-log anchors are visible in plan-vs-actual reports.
+
+### Acceptance Criteria — Activation-Authority Boundary Elaboration
+
+The Slice 10 read-only and bounded-read guarantees enumerated in the bullet
+*"Reporting honors Slice 10 read-only and bounded-read guarantees"* above
+expand, for the Slice 19 governance agent + reporting layer specifically,
+into the following enumerated activation-authority-boundary acceptance
+criteria. Every one of these is a hard structural requirement that the
+typed-shape layer, the typed projection layer, the typed read-only API
+surface, the typed Slack/dashboard rendering layer, the typed agent-context
+builder layer, the typed report-artifact emitter layer, and the typed CLI
+layer (8th sub-slice) MUST preserve at module-import time and across every
+public method call:
+
+- The governance agent + reporting layer is READ-ONLY / ADVISORY for the
+  workflow's primary mutation authorities (executor / dispatcher / verify
+  routing / merge queue / regroup overlay / supervisor action state /
+  failure router route table). Governance reads typed Slice 13-18 surfaces
+  and projects bounded, refs-only, exact-vs-preview-distinguished snapshots
+  for advisory consumption; it never mutates a primary-authority surface.
+- The governance agent + reporting layer's typed BaseModels are
+  `model_config = ConfigDict(extra="forbid")` across the surface (no silent
+  field gain; no schema drift; no silent migration of in-flight features).
+- The governance agent + reporting layer's typed read-only API surface
+  exposes a narrow public-method roster per class (1-2 public methods on
+  each emitter / projector / renderer / builder / view). No mutation
+  methods on any BaseModel; no writer-call patterns on any typed surface.
+- The governance agent + reporting layer's typed artifact-key prefix for
+  report artifacts is `review:*` (specifically
+  `REPORT_ARTIFACT_KEY_PREFIX = "review:governance-report:"` as a typed
+  Literal). The layer does NOT emit any `dag-*` artifact keys; this
+  partitions the report-artifact identity space from the primary
+  dispatcher / verify / merge / regroup artifact-key space.
+- The governance agent + reporting layer's typed
+  `policy_guidance_authority: Literal["advisory_only"]` field on
+  `GovernanceAgentContext` (per the doc-19:103-117
+  `GovernanceAgentContext` shape) enforces, at the typed-shape layer, that
+  prompts and downstream consumers cannot treat the policy guidance as
+  activated policy. Pydantic ValidationError fires on any other Literal
+  value; the field's hardcoded default is `"advisory_only"` everywhere the
+  builder constructs the typed shape.
+- The governance agent + reporting layer's typed Slack rendering and
+  dashboard view consume only typed `GovernanceSnapshot` rows + bounded
+  evidence refs. Dashboard ETag seed is `snapshot_digest` per the
+  doc-19:171-173 dashboard contract. Slack dedupe key is `snapshot_digest`
+  per the doc-19:140-142 Slack contract.
+- The governance agent + reporting layer's typed agent-context builder
+  enforces the doc-19:124-127 hard cap (20 000 chars) on the
+  `max_prompt_chars` field of `GovernanceAgentContext`. The builder is
+  stateless; reusing the same instance produces consistent results;
+  prompt-budget enforcement is iterative truncation with exact omitted
+  refs.
+- The governance agent + reporting layer's typed shapes propagate the
+  Slice 13A shared completeness model (`CompletenessState` enum +
+  `EvidencePageRef` shape + `EvidenceCompleteness` record) into every
+  reporting surface. The exact-vs-preview distinction per doc-13a:128-131
+  is preserved structurally: every truncated snapshot or agent context
+  carries completeness plus exact page-ref metadata or page-ref ids traceable
+  to exact `GovernanceEvidencePageRef` rows; without those refs the response
+  is display-only and cannot feed acceptance / recommendations / policy
+  guidance / future production task-execute context.
+- The governance agent + reporting layer's typed CLI (8th sub-slice per
+  doc-19:59-66 + step 1 line 150 + doc-19:198 test contract) emits stable
+  JSON first and prose second, returns nonzero exit codes for blocked
+  evidence, and projects from the typed `GovernanceSnapshot` /
+  `GovernanceAgentContext` / `LineProvenanceResult` / `CounterfactualResult`
+  shapes. The CLI does NOT introduce new mutation authority; it does NOT
+  extend the Slice 10c-1 `CONTROL_PLANE_WRITER_METHODS` set; it does NOT
+  emit `dag-*` artifact keys; it reads typed projections only.
+- The governance agent + reporting layer's typed surface depends only on
+  Slice 01-12 typed contracts plus the typed Slice 13-18 governance
+  layer; no Slice 19 module imports `dashboard.py`, `supervisor/actions/`,
+  `merge_queue_store.py`, `regroup_overlay_store.py`, or
+  `workflows/develop/execution/failure_router.py` writer surfaces.
+  Failure-router additions for governance failure ids are 4-pure-data
+  add-points (`FAILURE_TYPES`, `ROUTE_TABLE`, `Literal["..."]`, reason
+  string) per the Slice 14 2nd + Slice 19 2nd-6th sub-slice precedent;
+  the route table is NOT redefined; existing routes are NOT mutated.
+
+### Acceptance Criteria — Supervisor / Dashboard Read-Only Pin
+
+The supervisor / dashboard read-only contract is the single hardest
+invariant the Slice 19 governance agent + reporting layer must preserve.
+The Slice 10c-1 typed read-only surface declares the
+`CONTROL_PLANE_WRITER_METHODS` frozenset at
+`src/iriai_build_v2/supervisor/read_only.py` as the authoritative roster
+of methods that may mutate the supervisor / dashboard / merge-queue /
+regroup-overlay state on behalf of any non-primary subsystem. Per the
+Slice 10 read-only and bounded-read guarantees pinned in the bullet
+*"Reporting honors Slice 10 read-only and bounded-read guarantees"*
+above, the Slice 19 governance layer is one such non-primary subsystem:
+it reads typed Slice 13-18 surfaces, projects bounded snapshots, and
+renders dashboard / Slack / agent-context / report-artifact / CLI
+surfaces on top of those projections. None of the Slice 19 typed surfaces
+may EXTEND the `CONTROL_PLANE_WRITER_METHODS` frozenset; none may
+WIDEN the writer-method roster; none may MUTATE the frozenset in any
+way (including via `add` / `update` / augmented assignment / direct
+re-binding). The Slice 19 7th sub-slice test surface enforces this
+STRUCTURALLY via runtime frozenset-identity assertions BEFORE + AFTER
+all 6 Slice 19 source modules are imported, and AST-based scans for
+mutation patterns on the symbol. The Slice 19 8th sub-slice CLI must
+preserve this invariant; it forward-applies the same test surface to
+the CLI module once it lands.
+
+This invariant rules out: direct mutations of the frozenset; parallel
+writer-method sets under a different name; subclassing a supervisor /
+dashboard writer class and overriding its public mutation surface;
+importing the writer-side modules from any Slice 19 source file; and
+emitting `dag-*` artifact keys (which would imply primary-authority
+identity rather than `review:*` advisory identity). The Slice 19 7th
+sub-slice test surface flags every such pattern structurally. The
+enumerated AC bullet form of this invariant is:
+
+- Supervisor/dashboard read-only contract preserved (no governance writer
+  extends the Slice 10c-1 `CONTROL_PLANE_WRITER_METHODS` set).
+- The slice-wide cross-cutting + forward-applicable test surface at
+  `tests/test_execution_control_governance_19_activation_boundary.py`
+  (Slice 19 7th sub-slice) asserts ALL of the activation-authority
+  boundary criteria above STRUCTURALLY across all 6 Slice 19 source
+  modules at module-import time, mirroring the Slice 17 7th sub-slice
+  test-only precedent and forward-applying to the Slice 19 8th sub-slice
+  CLI module once it lands.
 
 ## Rollout And Rollback Notes
 
@@ -252,3 +382,65 @@ delete governance findings or evidence sets during rollback.
 - Slice 18 supplies replay results.
 - Slice 21 supplies the provider-backed IriAI Context Layer for task-execute
   context packages.
+
+## Slice 13A Shared Completeness Model Dependency
+
+Per **doc-13a:285-287 § Refactoring Steps step 9** — *"Update governance
+Slices 13-20 and context Slice 21 to depend on this shared completeness
+model instead of redefining authority semantics locally."* — this
+slice's reporting surfaces (`GovernanceSnapshot`,
+`ContextLayerPackageSummary`, `GovernanceAgentContext` — all defined
+at lines 71-117) depend on the Slice 13A shared completeness model.
+Current Slice 19 snapshot and agent-context shapes carry a
+`completeness: CompletenessState` field and `page_refs: list[str]` page-ref ids
+that map onto exact `GovernanceEvidencePageRef` rows. The post-Slice-21
+`ContextLayerPackageSummary` shape carries typed page-ref metadata directly.
+
+Source-of-truth modules:
+
+- `src/iriai_build_v2/execution_control/completeness.py` (Slice 13A
+  2nd sub-slice) — `CompletenessState`, `EvidencePageRef`,
+  `EvidenceCompleteness`, `ExactEvidenceManifest`,
+  `AuthoritativeContextRef`, `compute_completeness_digest`.
+- `src/iriai_build_v2/execution_control/snapshot_companion.py` (Slice
+  13A 6th sub-slice) — `AuthoritativeSnapshotListFieldCompleteness`
+  carries the per-list-field completeness that dashboard truncation
+  metadata reports. The doc's existing rule (lines 128-131:
+  *"Reporting budgets are preview/display budgets. Any truncated
+  snapshot or agent context must include completeness plus exact page-ref
+  metadata or page-ref ids traceable to exact `GovernanceEvidencePageRef`
+  rows; without those refs the response is display-only and cannot feed
+  acceptance, recommendations, policy guidance, or future production
+  task-execute context."*) is exactly the shared preview-vs-exact distinction
+  enforced by the Slice 13A 6th sub-slice's snapshot companion record.
+- `src/iriai_build_v2/execution_control/dispatcher_prompt_context.py`
+  (Slice 13A 4th sub-slice) — `AuthoritativePromptContextRouting` is
+  the source-of-truth shape for the `GovernanceAgentContext`
+  fail-closed disposition when `required_complete_for` cannot be
+  satisfied (per doc-13a:269-272).
+- `src/iriai_build_v2/execution_control/gate_companion.py` (Slice 13A
+  5th sub-slice) — `AuthoritativeGateProofRow` is the source-of-truth
+  shape for any reporting surface that summarizes gate evidence; gate
+  summaries that are not backed by a typed proof row remain
+  display-only per doc-13a:276-278. The `GovernanceAgentContext`
+  `policy_guidance_authority: Literal["advisory_only"]` field aligns
+  with the typed gate-companion record's advisory-only disposition
+  when the record is missing.
+
+The doc's existing § "Dashboard / Slack / agent context budget" rules
+already use the shared `CompletenessState` 4 values implicitly; this
+dependency reference makes the source-of-truth pointer explicit and
+aligns the reporting-surface shapes with the typed contract enforced
+by the Slice 13A 4th-6th sub-slices.
+
+Per P3-13A-6-3 and Slice 19A source-of-truth
+`19a-governance-implementation-reassessment.md` (`19A-P2-001`), the current
+dashboard wrapper is display/advisory-only and does not let reporting surfaces
+consume 13A typed completeness as execution authority for the
+`task-execute-agent-context` channel. Authority use must wait for a future
+source-of-truth slice that wires an actual authoritative consumer with durable
+failure observation.
+
+This dependency-reconciliation reference was added by
+**Slice 13A 8th sub-slice 13An-1** (this iteration) per
+doc-13a:285-287 step 9.

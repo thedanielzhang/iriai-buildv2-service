@@ -894,3 +894,65 @@ CREATE INDEX IF NOT EXISTS idx_scheduler_feedback_window
     );
 CREATE INDEX IF NOT EXISTS idx_scheduler_feedback_lane_barrier
     ON execution_scheduler_feedback(feature_id, lane, barrier, created_at DESC);
+
+-- Typed-row storage of governance evidence sets (Slice 13i / doc-13:188-190).
+-- Mirrors the doc-13:128-141 GovernanceEvidenceSet typed shape verbatim:
+-- the corpus-level evidence container the governance layer ingests +
+-- the Slice-15 metrics / Slice-16 finding-engine consumer reads.
+-- Per doc-13:188-190 § "Refactoring Steps" step 6: "Store governance
+-- evidence sets as typed rows once the Slice 01 store exists, and project
+-- bounded review artifacts such as ``review:governance-evidence:{corpus_id}``."
+-- The 13g sub-slice landed the ABC + the in-memory concrete + the
+-- project_review_artifact helper; 13i lands this Postgres-backed concrete
+-- (PostgresGovernanceEvidenceStore) over this table.
+--
+-- Idempotency contract (doc-13:188-190 + auto-memory feedback_no_silent_degradation):
+-- * idempotency_key is the 13e SHA-256-over-sorted-per-ref-digest content
+--   fingerprint of the typed evidence set; it is UNIQUE so two distinct
+--   content snapshots cannot collide.
+-- * (corpus_id, idempotency_key) is also UNIQUE so a re-put with the same
+--   identity is a no-op (legitimate retry) and a re-put with the same
+--   corpus_id but a different idempotency_key fails closed via the typed
+--   GovernanceEvidenceStoreIdempotencyConflict raised by the Python concrete
+--   (the SELECT-then-raise check inside the store's transaction is the
+--   semantic guard; the composite UNIQUE constraint is the typed-row-level
+--   belt-and-suspenders safety net).
+--
+-- Per doc-13:201-203 the typed-row storage is READ-only authority until
+-- Slice 13A's evidence-completeness invariant lands; this table NEVER
+-- writes dag-* execution / checkpoint / regroup activation / merge
+-- artifacts (those live in the artifacts / merge_queue_items / etc.
+-- tables above; the governance layer is analytical / advisory only).
+CREATE TABLE IF NOT EXISTS governance_evidence_sets (
+    id                     BIGSERIAL PRIMARY KEY,
+    idempotency_key        TEXT NOT NULL UNIQUE,
+    feature_id             TEXT,
+    corpus_id              TEXT NOT NULL,
+    generated_at           TIMESTAMPTZ NOT NULL,
+    source_window          JSONB NOT NULL,
+    refs                   JSONB NOT NULL,
+    omitted_refs           JSONB NOT NULL,
+    completeness           TEXT NOT NULL,
+    source_mix             JSONB NOT NULL,
+    read_budget            JSONB NOT NULL,
+    read_budget_exhausted  BOOLEAN NOT NULL DEFAULT FALSE,
+    quality                TEXT NOT NULL,
+    blockers               JSONB NOT NULL,
+    created_at             TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT governance_evidence_sets_corpus_idempotency
+        UNIQUE (corpus_id, idempotency_key),
+    CONSTRAINT governance_evidence_sets_completeness_check
+        CHECK (completeness IN (
+            'complete', 'paged', 'preview_only', 'unavailable'
+        )),
+    CONSTRAINT governance_evidence_sets_quality_check
+        CHECK (quality IN (
+            'canonical', 'derived', 'sampled', 'advisory',
+            'stale', 'insufficient'
+        ))
+);
+CREATE INDEX IF NOT EXISTS idx_governance_evidence_sets_corpus
+    ON governance_evidence_sets(corpus_id, id DESC);
+CREATE INDEX IF NOT EXISTS idx_governance_evidence_sets_feature
+    ON governance_evidence_sets(feature_id, id DESC)
+    WHERE feature_id IS NOT NULL;

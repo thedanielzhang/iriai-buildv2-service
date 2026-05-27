@@ -2372,6 +2372,7 @@ class ExecutionControlStore:
                     execution_row=row,
                     kind="context_package",
                 )
+                context_package_identity = _prompt_context_identity_payload(evidence)
                 updated = await self._update_dispatch_attempt_row(
                     conn,
                     row,
@@ -2383,6 +2384,7 @@ class ExecutionControlStore:
                         "prompt_context_evidence_id": evidence_row.id,
                         "prompt_ref": evidence.prompt_ref,
                         "prompt_sha256": evidence.prompt_sha256,
+                        **context_package_identity,
                     },
                 )
                 return EvidenceNodeResult(
@@ -7418,6 +7420,7 @@ def _prompt_context_fields(
     evidence: PromptContextEvidence,
     row: ExecutionJournalRow,
 ) -> dict[str, Any]:
+    context_package_identity = _prompt_context_identity_payload(evidence)
     payload = {
         "context_file_paths": [str(item) for item in evidence.context_file_paths],
         "context_file_refs": [int(item) for item in evidence.context_file_refs],
@@ -7430,8 +7433,13 @@ def _prompt_context_fields(
         "prompt_summary": evidence.prompt_summary,
         "truncation_notes": [str(item) for item in evidence.truncation_notes],
     }
-    payload.update(_json_dict(evidence.payload))
-    content_hash = evidence.context_sha256 or stable_digest(payload)
+    payload.update(_prompt_context_payload_without_provider_payloads(evidence.payload))
+    payload.update(context_package_identity)
+    content_hash = (
+        stable_digest(payload)
+        if context_package_identity
+        else evidence.context_sha256 or stable_digest(payload)
+    )
     return {
         "feature_id": row.feature_id,
         "idempotency_key": evidence.stable_idempotency_key,
@@ -7448,9 +7456,126 @@ def _prompt_context_fields(
         "output_refs": payload["context_file_refs"],
         "content_hash": content_hash,
         "summary": evidence.prompt_summary,
-        "metadata": _json_dict(evidence.metadata),
+        "metadata": _prompt_context_payload_without_provider_payloads(evidence.metadata),
         "payload": payload,
     }
+
+
+_PROMPT_CONTEXT_PROVIDER_PAYLOAD_KEYS = {
+    "omitted_ref_counts",
+    "omitted_refs",
+    "page_refs",
+    "payloads",
+    "provider_payloads",
+    "provider_record_order",
+    "provider_records",
+    "provider_state",
+    "provider_state_order",
+    "provider_state_refs",
+    "records",
+    "rendered_context",
+    "rendered_preview",
+}
+
+
+def _prompt_context_identity_payload(evidence: PromptContextEvidence) -> dict[str, Any]:
+    fields = (
+        "context_package_id",
+        "context_package_digest",
+        "context_package_ref",
+        "context_package_kind",
+        "context_package_completeness",
+        "context_package_page_refs",
+        "context_package_feature_id",
+        "context_package_task_id",
+        "context_package_source_dag_artifact_id",
+        "context_package_dag_sha256",
+        "context_package_evidence_snapshot_digest",
+        "context_package_provider_state_digest",
+        "context_package_advisory_only",
+    )
+    payload: dict[str, Any] = {}
+    for field in fields:
+        value = getattr(evidence, field, None)
+        if value is None or value == "":
+            continue
+        if field == "context_package_page_refs":
+            value = _prompt_context_page_ref_identity(value)
+            if not value:
+                continue
+        payload[field] = value
+    return payload
+
+
+def _prompt_context_page_ref_identity(value: Any) -> list[dict[str, Any]]:
+    raw_refs = value if isinstance(value, list) else [value]
+    allowed = {
+        "artifact_id",
+        "authority",
+        "commit_hash",
+        "completeness",
+        "created_at",
+        "digest",
+        "event_id",
+        "feature_id",
+        "journal_anchor",
+        "page_ref_id",
+        "page_refs",
+        "preview_only",
+        "quality",
+        "ref_id",
+        "slice_id",
+        "source_ref_id",
+    }
+    refs: list[dict[str, Any]] = []
+    for raw_ref in raw_refs:
+        data = _json_dict(raw_ref)
+        ref = {
+            str(key): _strip_prompt_context_provider_payloads(item)
+            for key, item in data.items()
+            if str(key) in allowed and item is not None and item != ""
+        }
+        if "preview_only" in ref:
+            preview_only = _prompt_context_page_ref_preview_only(ref["preview_only"])
+            if preview_only is True:
+                continue
+            if preview_only is not None:
+                ref["preview_only"] = preview_only
+        if ref:
+            refs.append(ref)
+    return refs
+
+
+def _prompt_context_page_ref_preview_only(value: Any) -> bool | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes"}:
+            return True
+        if normalized in {"0", "false", "no"}:
+            return False
+    return bool(value)
+
+
+def _prompt_context_payload_without_provider_payloads(value: Any) -> dict[str, Any]:
+    payload = _json_dict(value)
+    stripped = _strip_prompt_context_provider_payloads(payload)
+    return stripped if isinstance(stripped, dict) else {}
+
+
+def _strip_prompt_context_provider_payloads(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            str(key): _strip_prompt_context_provider_payloads(item)
+            for key, item in value.items()
+            if str(key) not in _PROMPT_CONTEXT_PROVIDER_PAYLOAD_KEYS
+        }
+    if isinstance(value, list):
+        return [_strip_prompt_context_provider_payloads(item) for item in value]
+    return value
 
 
 def _raw_output_fields(

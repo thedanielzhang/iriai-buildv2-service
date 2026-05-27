@@ -245,6 +245,16 @@ debugging, and rollback-safe internal validation.
     records the post-00-12 change-control remediation for exact-or-paged
     evidence, display previews, and completeness semantics before
     governance/context surfaces can use that evidence as execution authority.
+    - **13A acceptance artifact**:
+      [13a-acceptance.md](13a-acceptance.md) — pins doc-13a § Refactoring
+      Steps 2 + 3 + 4 + 5 + 6 + 7 + 8 SATISFIED (step 1 is the
+      foundational doc itself; step 9 deferred to the LAST sub-slice
+      13An), the per-sub-slice module `__all__` projections, the typed
+      failure ids registered by Slice 13A, the carried-P3 ledger, and
+      the dead-until-wired binding statement (P3-13A-6-3) for the
+      composite `LegacyGateConsumerSnapshotAdapter` chain. Authority
+      remains doc 13A (the line above); STATUS, journal, and
+      decision-log live alongside.
 15. [Governance evidence model](13-governance-evidence-model.md): defines the
     evidence model for governance analysis over typed journal rows, compatibility
     projections, commit proof, supervisor signals, resource metrics, and
@@ -265,10 +275,13 @@ debugging, and rollback-safe internal validation.
     influence future workflow policy.
 21. [Governance agent and reporting](19-governance-agent-and-reporting.md):
     defines governance CLI/API, dashboard, Slack, and agent-readable summaries.
-22. [Governance acceptance and adoption](20-governance-acceptance-and-adoption.md):
+22. [Governance implementation reassessment](19a-governance-implementation-reassessment.md):
+    defines the blocking reassessment gate over Slices 13, 13A, and 14-19
+    before governance acceptance/adoption can begin.
+23. [Governance acceptance and adoption](20-governance-acceptance-and-adoption.md):
     defines the all-at-once acceptance gate for the governance tool after
-    Slices 00-12 and required 13A remediation are complete.
-23. [IriAI context layer](21-iriai-context-layer.md): defines the
+    Slices 00-12, required 13A remediation, and Slice 19A are complete.
+24. [IriAI context layer](21-iriai-context-layer.md): defines the
     provider-backed context service, optional GitAI/Engram/H5i adapters,
     NativeGit fallback, and IriAI lineage plugin that maps workflow evidence onto
     code spans for task-execute context.
@@ -302,11 +315,16 @@ Use the slice docs this way:
   Accepted/in-flight slice plans should not be silently rewritten; exactness
   remediation belongs in 13A after the 00-12 landing or in an active slice's own
   review loop if that loop independently accepts it.
-- Use Slices 13-20 after Slice 12 is complete. They are the governance tool
+- Use Slices 13-19 after Slice 12 is complete. They are the governance tool
   feature family: analytical and advisory first, with implementation
   journals/logs treated as first-class evidence for plan-vs-actual analysis.
   Governance/context surfaces may not treat exact/paged evidence as execution
   authority until required 13A remediation is complete.
+- Use Slice 19A after Slice 19 and before Slice 20. It reassesses the actual
+  landed governance implementation, journals, tests, reviewer findings, and
+  carried P3s. Slice 20 is blocked until Slice 19A is accepted.
+- Use Slice 20 only after Slice 19A acceptance. It remains the all-at-once
+  governance acceptance and adoption gate.
 - Use Slice 21 after governance acceptance when agents need line-aware,
   workflow-aware task context. The context layer is advisory and provider-backed;
   `NativeGitProvider` is mandatory, while GitAI, Engram, and H5i are optional
@@ -314,8 +332,8 @@ Use the slice docs this way:
 
 ## Governance Slice Review And Revision Cycle
 
-Governance Slices 13-20 inherit the implementation journal discipline from
-Slices 00-12. Each governance slice must add a slice execution brief to
+Governance Slices 13-20 and Slice 19A inherit the implementation journal
+discipline from Slices 00-12. Each governance slice must add a slice execution brief to
 `implementation-journal.md` and a decision row to
 `implementation-decisions.jsonl` before implementation work starts.
 
@@ -353,7 +371,7 @@ the real workflow implementation, not just the intended architecture.
 | Post-DAG and post-test gates | 01, 05, 06, 07, 08, 10, 11, 12 | Existing code review/security/test authoring/QA/integration/verifier/report/notification semantics preserved through typed evidence and effective-DAG completion guards |
 | Regroup, dashboard, supervisor | 01, 06, 07, 08, 09, 10 | Bounded read models, advisory feedback, audit records, operator visibility |
 | Refactor and landing gate | 01-10, 11, 12 | Extracted module boundaries, complete-bundle acceptance, whole-feature rollback plan |
-| Governance analysis | 00-12, 13-20 | Evidence sets, commit/line provenance, metrics, findings, recommendations, replay, reporting, and governance acceptance |
+| Governance analysis | 00-12, 13-19, 19A, 20 | Evidence sets, commit/line provenance, metrics, findings, recommendations, replay, reporting, reassessment, and governance acceptance |
 | IriAI context layer | 03, 05, 06, 08, 13, 14, 16, 19, 20, 21 | Provider-backed task-execute context packages, NativeGit fallback, optional GitAI/Engram/H5i adapters, and IriAI lineage mapping from workflow evidence to code spans |
 
 ## Implementation Readiness Checklist
