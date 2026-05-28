@@ -1361,8 +1361,16 @@ class _FakeConnection:
         return matches[-1] if matches else None
 
     def _select_evidence_node(self, args: tuple[object, ...]) -> dict[str, Any] | None:
-        evidence_id = args[0] if args and isinstance(args[0], int) else None
+        int_args = [arg for arg in args if isinstance(arg, int)]
+        evidence_id = int_args[0] if int_args else None
         feature_id = _first_matching(args, lambda value: value == FEATURE_ID)
+        if (
+            feature_id is None
+            and args
+            and isinstance(args[0], str)
+            and not _looks_like_idempotency_key(args[0])
+        ):
+            feature_id = args[0]
         idempotency_key = _first_matching(args, _looks_like_idempotency_key)
         matches = [
             row for row in self.evidence_nodes
@@ -1468,6 +1476,75 @@ def _store(pool: _FakePool):
             "ExecutionControlStore must be constructible with an asyncpg-style pool "
             f"for these contract tests: {exc}"
         )
+
+
+@pytest.mark.asyncio
+async def test_runtime_failure_context_reader_scopes_and_bounds_details() -> None:
+    conn = _FakeConnection()
+    store = _store(_FakePool(conn))
+    long_detail = "x" * 4500
+    collision_message = (
+        "Sandbox binding failed: sandbox path already belongs to a different lease: "
+        "/tmp/workspace/.iriai/features/feature/sandboxes/g77/attempt-2"
+    )
+    conn.evidence_nodes.append(
+        {
+            "id": 501,
+            "feature_id": FEATURE_ID,
+            "idempotency_key": "idem:failure:501",
+            "execution_journal_row_id": 301,
+            "attempt_id": 301,
+            "contract_id": None,
+            "snapshot_id": None,
+            "group_idx": 77,
+            "stage": "implementation",
+            "kind": "runtime_failure_context",
+            "name": "runtime failure",
+            "status": "failed",
+            "deterministic": True,
+            "source_ref": "runtime",
+            "artifact_id": None,
+            "artifact_key": "",
+            "event_id": None,
+            "input_refs": "[]",
+            "output_refs": "[]",
+            "failure_id": None,
+            "verdict_id": None,
+            "content_hash": "failure-hash",
+            "summary": "Sandbox binding failed",
+            "metadata": "{}",
+            "payload": json.dumps(
+                {
+                    "failure_class": "sandbox_binding",
+                    "failure_type": "runtime_workspace_binding_failed",
+                    "terminal_reason": "sandbox_binding_failed",
+                    "details": {
+                        "message": collision_message,
+                        "large": long_detail,
+                    },
+                }
+            ),
+            "started_at": None,
+            "finished_at": None,
+            "created_at": datetime(2026, 5, 27, tzinfo=timezone.utc),
+            "updated_at": datetime(2026, 5, 27, tzinfo=timezone.utc),
+        }
+    )
+
+    context = await store.get_runtime_failure_context(
+        feature_id=FEATURE_ID,
+        failure_id=501,
+    )
+
+    assert context is not None
+    assert context["id"] == 501
+    assert context["feature_id"] == FEATURE_ID
+    assert "sandbox path already belongs" in context["details"]["message"]
+    assert context["details"]["large"].endswith("...[truncated 500 chars]")
+    assert await store.get_runtime_failure_context(
+        feature_id="other-feature",
+        failure_id=501,
+    ) is None
 
 
 def _fake_dispatcher_state_rank(dispatcher_state: str) -> int:

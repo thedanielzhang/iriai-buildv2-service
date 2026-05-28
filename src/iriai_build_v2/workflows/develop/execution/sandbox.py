@@ -314,6 +314,16 @@ class SandboxRunner:
             if manifest_path.exists():
                 manifest = self._read_manifest(manifest_path)
                 if manifest.get("idempotency_key") != idempotency_key:
+                    terminal_status = str(manifest.get("status") or "")
+                    if terminal_status in _TERMINAL_STATUSES:
+                        if terminal_status == "poisoned":
+                            raise SandboxAllocationError(
+                                f"sandbox path belongs to poisoned lease: {sandbox_root}"
+                            )
+                        raise SandboxAllocationError(
+                            "terminal sandbox lease requires a new attempt idempotency key: "
+                            f"{sandbox_root}"
+                        )
                     raise SandboxAllocationError(
                         f"sandbox path already belongs to a different lease: {sandbox_root}"
                     )

@@ -13,6 +13,10 @@ from iriai_build_v2.workflows.develop.phases.implementation import (
     _implement_dag,
     _run_workspace_authority_pre_dispatch_adapter,
 )
+from iriai_build_v2.workflows.develop.execution.task_contracts import (
+    ContractCompileRequest,
+    ContractCompiler,
+)
 from iriai_build_v2.workflows.develop.execution.workspace_authority import (
     CanonicalRepoRegistry,
     RepoIdentity,
@@ -58,7 +62,14 @@ class _BridgeExecutionControlStore:
         self.contract_verdicts = []
         self.finished = []
         self.projected_attempts = []
+        self.revalidation_inputs = None
+        self.revalidation_requests = []
+        self.pending_merge_patch_evidence = None
+        self.pending_merge_patch_requests = []
+        self.runtime_failure_contexts = {}
+        self.runtime_failure_context_requests = []
         self._next_contract_id = 100
+        self._next_attempt_id = 0
         self._next_evidence_id = 1000
         self._next_failure_id = 2000
 
@@ -81,6 +92,7 @@ class _BridgeExecutionControlStore:
 
     async def start_dispatch_attempt(self, request):
         self.start_requests.append(request)
+        self._next_attempt_id += 1
         row = SimpleNamespace(
             status="started",
             dispatcher_state="attempt_started",
@@ -88,7 +100,7 @@ class _BridgeExecutionControlStore:
             request_digest=request.request_digest,
         )
         return SimpleNamespace(
-            attempt_id=1,
+            attempt_id=self._next_attempt_id,
             created=not self.duplicate_nonterminal,
             attempt=row,
         )
@@ -126,6 +138,19 @@ class _BridgeExecutionControlStore:
         self.projected_attempts.append(projection)
         return SimpleNamespace(projection_links=[])
 
+    async def get_pre_promotion_contract_revalidation_inputs(self, **kwargs):
+        self.revalidation_requests.append(kwargs)
+        return self.revalidation_inputs
+
+    async def get_pending_durable_merge_patch_evidence(self, **kwargs):
+        self.pending_merge_patch_requests.append(kwargs)
+        return self.pending_merge_patch_evidence
+
+    async def get_runtime_failure_context(self, **kwargs):
+        self.runtime_failure_context_requests.append(kwargs)
+        failure_id = int(kwargs.get("failure_id") or 0)
+        return self.runtime_failure_contexts.get(failure_id)
+
     async def finish_dispatch_attempt(self, outcome):
         self.finished.append(outcome)
         return SimpleNamespace(
@@ -145,10 +170,13 @@ def _runner(
     artifacts: _Artifacts,
     *,
     allow_sandbox_patch_promotion_bridge: bool = True,
+    execution_control_store: object | None = None,
 ) -> SimpleNamespace:
     services = {"workspace_manager": SimpleNamespace(_base=workspace_root)}
     if allow_sandbox_patch_promotion_bridge:
         services["test_allow_sandbox_patch_promotion_bridge"] = True
+    if execution_control_store is not None:
+        services["execution_control_store"] = execution_control_store
     return SimpleNamespace(
         artifacts=artifacts,
         services=services,
@@ -272,6 +300,179 @@ def test_retryable_dispatch_terminal_reason_stops_at_budget() -> None:
     )
 
 
+def test_contract_workspace_snapshot_includes_tracked_required_paths(tmp_path: Path) -> None:
+    workspace_root, feature_root = _workspace(tmp_path)
+    del workspace_root
+    repo = _repo(feature_root, "app")
+    (repo / "tests" / "fixtures" / "catalog").mkdir(parents=True)
+    (repo / "tests" / "fixtures" / "catalog" / ".gitkeep").write_text("", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "add fixture"], cwd=repo, check=True)
+    contract = SimpleNamespace(
+        required_paths=[
+            SimpleNamespace(path="tests/fixtures/catalog/.gitkeep"),
+        ],
+        allowed_paths=[SimpleNamespace(path="tests/conftest.py")],
+        read_only_paths=[],
+        generated_outputs=[],
+    )
+
+    snapshot = implementation_module._contract_workspace_snapshot(
+        _feature(),
+        "dag-sha",
+        0,
+        "implementation",
+        "app",
+        "app",
+        repo,
+        ["tests/conftest.py"],
+        contract=contract,
+        snapshots=[],
+    )
+
+    assert "tests/fixtures/catalog/.gitkeep" in snapshot.present_paths
+    assert "tests/conftest.py" in snapshot.dirty_paths
+
+
+@pytest.mark.asyncio
+async def test_pre_promotion_contract_failure_revalidates_and_synthesizes_result(
+    tmp_path: Path,
+) -> None:
+    workspace_root, feature_root = _workspace(tmp_path)
+    repo = _repo(feature_root, "app")
+    (repo / "tests" / "fixtures" / "catalog").mkdir(parents=True)
+    (repo / "tests" / "fixtures" / "catalog" / ".gitkeep").write_text("", encoding="utf-8")
+    (repo / "tests" / "conftest.py").write_text("# base\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "add test files"], cwd=repo, check=True)
+    task = ImplementationTask(
+        id="TASK-revalidate",
+        name="revalidate",
+        description="revalidate retained patch",
+        repo_path="app",
+        file_scope=[
+            TaskFileScope(path="app/tests/conftest.py", action="modify"),
+            TaskFileScope(path="app/tests/fixtures/catalog/.gitkeep", action="create"),
+        ],
+    )
+    contract = _compiled_contract_for_task(feature_root, repo, task)
+    store = _BridgeExecutionControlStore()
+    store.revalidation_inputs = {
+        "patch_summary": SimpleNamespace(
+            id=701,
+            payload={
+                "sandbox_id": "sandbox-23",
+                "contract_ids": [104],
+                "repo_id": "app",
+                "base_commit": "base",
+                "changed_paths": ["tests/conftest.py"],
+                "created_paths": [],
+                "modified_paths": ["tests/conftest.py"],
+                "deleted_paths": [],
+                "renamed_paths": {},
+                "diff_sha256": "diff",
+                "diff_artifact_id": 9001,
+            },
+        ),
+        "runtime_failure": SimpleNamespace(
+            id=35,
+            payload={},
+            summary="Task contract validation failed before sandbox promotion",
+        ),
+        "contract_verdict": SimpleNamespace(id=34, payload={}, metadata={}),
+    }
+    artifacts = _Artifacts()
+    runner = _runner(workspace_root, artifacts)
+    runner.services["execution_control_store"] = store
+
+    result = await implementation_module._recover_pre_promotion_contract_revalidation(
+        runner=runner,
+        feature=_feature(),
+        task=task,
+        task_contract=contract,
+        feature_root=feature_root,
+        dag_sha256="dag-sha",
+        group_idx=0,
+        stage="implementation",
+        snapshots=[],
+        repo_prefix="app",
+        outcome=SimpleNamespace(attempt_id=23, runtime_terminal_reason="patch_capture_failed"),
+    )
+
+    assert result is not None
+    assert result.status == "completed"
+    assert result.files_modified == ["app/tests/conftest.py"]
+    assert "patch_summary_ids=701" in result.notes
+    assert json.loads(artifacts.store["dag-task:TASK-revalidate"])["status"] == "completed"
+    assert store.contract_verdicts[-1].approved is True
+    assert store.contract_verdicts[-1].metadata["revalidated_from_runtime_failure_id"] == 35
+    assert store.contract_verdicts[-1].metadata["revalidated_from_contract_verdict_id"] == 34
+
+
+@pytest.mark.asyncio
+async def test_pre_promotion_contract_failure_revalidation_blocks_when_still_invalid(
+    tmp_path: Path,
+) -> None:
+    workspace_root, feature_root = _workspace(tmp_path)
+    repo = _repo(feature_root, "app")
+    (repo / "tests").mkdir(exist_ok=True)
+    (repo / "tests" / "conftest.py").write_text("# base\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "add conftest"], cwd=repo, check=True)
+    task = ImplementationTask(
+        id="TASK-invalid-revalidate",
+        name="invalid",
+        description="invalid retained patch",
+        repo_path="app",
+        file_scope=[TaskFileScope(path="app/tests/conftest.py", action="modify")],
+    )
+    contract = _compiled_contract_for_task(feature_root, repo, task)
+    store = _BridgeExecutionControlStore()
+    store.revalidation_inputs = {
+        "patch_summary": SimpleNamespace(
+            id=702,
+            payload={
+                "sandbox_id": "sandbox-24",
+                "contract_ids": [104],
+                "repo_id": "app",
+                "changed_paths": ["src/outside.py"],
+                "created_paths": [],
+                "modified_paths": ["src/outside.py"],
+                "deleted_paths": [],
+                "renamed_paths": {},
+                "diff_sha256": "diff",
+            },
+        ),
+        "runtime_failure": SimpleNamespace(
+            id=36,
+            payload={},
+            summary="Task contract validation failed before sandbox promotion",
+        ),
+        "contract_verdict": SimpleNamespace(id=37, payload={}, metadata={}),
+    }
+    artifacts = _Artifacts()
+    runner = _runner(workspace_root, artifacts)
+    runner.services["execution_control_store"] = store
+
+    result = await implementation_module._recover_pre_promotion_contract_revalidation(
+        runner=runner,
+        feature=_feature(),
+        task=task,
+        task_contract=contract,
+        feature_root=feature_root,
+        dag_sha256="dag-sha",
+        group_idx=0,
+        stage="implementation",
+        snapshots=[],
+        repo_prefix="app",
+        outcome=SimpleNamespace(attempt_id=24, runtime_terminal_reason="patch_capture_failed"),
+    )
+
+    assert result is None
+    assert "dag-task:TASK-invalid-revalidate" not in artifacts.store
+    assert store.contract_verdicts == []
+
+
 def _authority_repo(
     feature_root: Path,
     name: str,
@@ -310,6 +511,47 @@ def _authority_registry(
         repos=repos,
         registry_digest="registry:digest",
     )
+
+
+def _compiled_contract_for_task(
+    feature_root: Path,
+    repo: Path,
+    task: ImplementationTask,
+    *,
+    contract_id: int = 104,
+):
+    registry = CanonicalRepoRegistry(
+        feature_id="feature-slice-02",
+        feature_slug="slice-02",
+        feature_root=str(feature_root),
+        repos=[
+            RepoIdentity(
+                repo_id=repo.name,
+                repo_name=repo.name,
+                role="execution",
+                workspace_relative_path=repo.name,
+                canonical_path=str(repo),
+                identity_kind="source_path",
+                identity_value=str(repo),
+                safety_status="ok",
+                identity_evidence_digest=f"identity:{repo.name}",
+            )
+        ],
+        registry_digest="registry:digest",
+    )
+    contract = ContractCompiler().compile_task(
+        ContractCompileRequest(
+            feature_id="feature-slice-02",
+            dag_sha256="dag-sha",
+            source_dag_artifact_id=42,
+            source_dag_sha256="source-dag-sha",
+            group_idx=0,
+            task=task,
+            all_task_ids=[task.id],
+            workspace_registry=registry,
+        )
+    )
+    return contract.model_copy(update={"id": contract_id})
 
 
 async def _compile_single_contract_with_registry(
@@ -2005,6 +2247,46 @@ async def test_live_dag_dispatch_uses_dispatcher_not_direct_runner_run(
 
 
 @pytest.mark.asyncio
+async def test_implementation_sandbox_port_uses_dispatcher_attempt_id(
+    tmp_path: Path,
+) -> None:
+    workspace_root, feature_root = _workspace(tmp_path)
+    repo = _repo(feature_root, "app")
+    runner = _runner(workspace_root, _Artifacts())
+    feature = _feature()
+    task = ImplementationTask(
+        id="TASK-dispatch-attempt-sandbox",
+        name="dispatch attempt sandbox",
+        description="dispatch attempt sandbox",
+        repo_path="app",
+        file_scope=[TaskFileScope(path="app/src/generated.py", action="create")],
+    )
+    port = implementation_module._ImplementationSandboxPort(
+        runner=runner,
+        feature=feature,
+        workspace_root=workspace_root,
+        feature_root=feature_root,
+        dag_sha256="d" * 64,
+        group_idx=77,
+        task_idx=2,
+        attempt=0,
+        task=task,
+        task_contract=None,
+        repo_id="app",
+        ws_path=str(repo),
+        snapshots=[],
+        runtime="codex",
+        stage="implementation",
+    )
+
+    await port.bind_runtime(SimpleNamespace(), 39)
+
+    assert port.task_binding is not None
+    assert port.task_binding.lease.attempt_no == 39
+    assert Path(port.task_binding.lease.root).name == "attempt-39"
+
+
+@pytest.mark.asyncio
 async def test_live_dag_dispatch_retries_retryable_terminal_outcome(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -2089,6 +2371,104 @@ async def test_live_dag_dispatch_retries_retryable_terminal_outcome(
     assert [request.retry for request in dispatch_requests] == [0, 1]
     assert dispatch_requests[0].idempotency_key != dispatch_requests[1].idempotency_key
     assert dispatch_requests[0].sandbox_id != dispatch_requests[1].sandbox_id
+
+
+@pytest.mark.asyncio
+async def test_live_dag_dispatch_retries_legacy_sandbox_path_collision(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    workspace_root, feature_root = _workspace(tmp_path)
+    _repo(feature_root, "app")
+    artifacts = _Artifacts()
+    feature = _feature()
+    store = _BridgeExecutionControlStore()
+    store.runtime_failure_contexts[49] = {
+        "summary": "Sandbox binding failed",
+        "details": {
+            "message": (
+                "sandbox path already belongs to a different lease: "
+                "/tmp/workspace/.iriai/features/feature/sandboxes/g77/attempt-2"
+            ),
+        },
+    }
+    dispatch_requests: list[object] = []
+
+    async def _noop_worktrees(*_args, **_kwargs) -> None:
+        return None
+
+    async def _alias_guard_ok(*_args, **_kwargs):
+        return True, {"blockers": []}
+
+    class _RetryRuntimeDispatcher:
+        def __init__(self, **kwargs):
+            self._normalizer = kwargs["output_normalizer"]
+
+        async def dispatch(self, request):
+            dispatch_requests.append(request)
+            if request.retry == 0:
+                return implementation_module.DispatcherOutcome(
+                    attempt_id=39,
+                    state="failed",
+                    status="failed",
+                    runtime_terminal_reason="sandbox_binding_failed",
+                    structured_result_evidence_id=None,
+                    raw_text_ref=None,
+                    patch_summary_ids=[],
+                    compatibility_artifact_ids=[],
+                    runtime_failure_id=49,
+                    typed_failure_id=49,
+                    idempotency_key=request.idempotency_key,
+                )
+            self._normalizer.result = implementation_module.ImplementationResult(
+                task_id=request.task_id,
+                summary="done after lease-collision retry",
+                status="completed",
+                files_created=["app/src/generated.py"],
+            )
+            return implementation_module.DispatcherOutcome(
+                attempt_id=40,
+                state="succeeded",
+                status="succeeded",
+                runtime_terminal_reason="completed",
+                structured_result_evidence_id=301,
+                raw_text_ref=None,
+                patch_summary_ids=[701],
+                compatibility_artifact_ids=[],
+                runtime_failure_id=None,
+                typed_failure_id=None,
+                idempotency_key=request.idempotency_key,
+            )
+
+    monkeypatch.setattr(implementation_module, "_ensure_task_worktrees", _noop_worktrees)
+    monkeypatch.setattr(
+        implementation_module,
+        "_run_worktree_alias_pre_dispatch_guard",
+        _alias_guard_ok,
+    )
+    monkeypatch.setattr(implementation_module, "RuntimeDispatcher", _RetryRuntimeDispatcher)
+    runner = _runner(workspace_root, artifacts, execution_control_store=store)
+    dag = implementation_module.ImplementationDAG(
+        tasks=[
+            ImplementationTask(
+                id="TASK-lease-collision",
+                name="lease collision",
+                description="lease collision",
+                repo_path="app",
+                file_scope=[TaskFileScope(path="app/src/generated.py", action="create")],
+            )
+        ],
+        execution_order=[["TASK-lease-collision"]],
+        complete=True,
+    )
+
+    outcome = await _implement_dag(runner, feature, dag)
+
+    _assert_pending_merge_queue_blocker(outcome)
+    assert [request.retry for request in dispatch_requests] == [0, 1]
+    assert store.runtime_failure_context_requests == [
+        {"feature_id": feature.id, "failure_id": 49}
+    ]
 
 
 @pytest.mark.asyncio
@@ -2522,6 +2902,41 @@ async def test_dispatch_bridge_reconstructs_terminal_success_from_projection(
     assert result.summary == "replayed success"
     assert "dispatcher_attempt_id=88" in result.notes
     assert "canonical_mutation=pending_durable_merge_queue" in result.notes
+
+
+def test_output_normalizer_persists_patch_summary_ids_before_projection() -> None:
+    normalizer = implementation_module._ImplementationOutputNormalizer(
+        task=ImplementationTask(
+            id="TASK-normalize",
+            name="normalize",
+            description="normalize",
+        ),
+        repo_prefix="app",
+    )
+
+    record = normalizer.normalize(
+        request=SimpleNamespace(task_id="TASK-normalize"),
+        response=SimpleNamespace(
+            structured_output={
+                "task_id": "TASK-normalize",
+                "summary": "done",
+                "status": "completed",
+            },
+            raw_text_ref=None,
+            raw_artifact_id=None,
+        ),
+        schema_name="ImplementationResult",
+        schema_digest="digest",
+        patch_capture=SimpleNamespace(
+            patch_summary_ids=[702, 701, 701],
+            changed_paths=["src/generated.py"],
+        ),
+    )
+
+    projected = json.loads(record.projection_body)
+    assert "patch_summary_ids=701,702" in projected["notes"]
+    assert "canonical_mutation=pending_durable_merge_queue" in projected["notes"]
+    assert projected["files_modified"] == ["app/src/generated.py"]
 
 
 @pytest.mark.asyncio
@@ -3522,6 +3937,376 @@ async def test_live_dag_dispatch_blocks_completed_task_pending_durable_merge_que
 
     _assert_pending_merge_queue_blocker(second)
     assert run_count == first_run_count
+
+
+@pytest.mark.asyncio
+async def test_completed_pending_merge_task_with_patch_ids_enters_queue(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    workspace_root, feature_root = _workspace(tmp_path)
+    repo = _repo(feature_root, "app")
+    (repo / "src" / "main.py").write_text("value = 'base'\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "add main"], cwd=repo, check=True)
+    artifacts = _Artifacts()
+    feature = _feature()
+    queued_results = []
+
+    async def _noop_worktrees(*_args, **_kwargs) -> None:
+        return None
+
+    async def _authority_ok(*_args, **_kwargs):
+        return implementation_module.WorkspaceAuthorityCompatibilityOutcome(
+            approved=True,
+            registry=_authority_registry(
+                feature_root,
+                [
+                    _authority_repo(
+                        feature_root,
+                        "app",
+                        "app",
+                        writable_task_ids=["TASK-contract"],
+                        task_ids=["TASK-contract"],
+                    )
+                ],
+            ),
+            snapshots=[],
+        )
+
+    async def _alias_guard_ok(*_args, **_kwargs):
+        return True, {"blockers": []}
+
+    async def _acl_ok(*_args, **_kwargs):
+        return {"operator_required": False, "problems": []}
+
+    async def _unexpected_runtime(*_args, **_kwargs):
+        raise AssertionError("completed pending-queue marker must not invoke runtime")
+
+    async def _enqueue(_runner, _feature, pending_results, **_kwargs):
+        queued_results.extend(pending_results)
+        return [501]
+
+    async def _drain(*_args, **_kwargs):
+        return [SimpleNamespace(succeeded=True, item_id=501, terminal_status="integrated")]
+
+    async def _checkpoint(*_args, **_kwargs):
+        return SimpleNamespace(
+            checkpointed=True,
+            done_queue_item_ids=[501],
+            result_commit="abc123",
+            detail="",
+            routed_failure={},
+        )
+
+    async def _noop_refresh(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(implementation_module, "_ensure_task_worktrees", _noop_worktrees)
+    monkeypatch.setattr(
+        implementation_module,
+        "_run_workspace_authority_pre_dispatch_adapter",
+        _authority_ok,
+    )
+    monkeypatch.setattr(
+        implementation_module,
+        "_run_worktree_alias_pre_dispatch_guard",
+        _alias_guard_ok,
+    )
+    monkeypatch.setattr(implementation_module, "_normalize_dag_workspace_acl", _acl_ok)
+    monkeypatch.setattr(
+        implementation_module,
+        "_dag_workspace_writeability_problems",
+        lambda *_args, **_kwargs: [],
+    )
+    monkeypatch.setattr(
+        implementation_module,
+        "_enqueue_durable_merge_queue_for_results",
+        _enqueue,
+    )
+    monkeypatch.setattr(
+        implementation_module,
+        "_drain_durable_merge_queue_for_feature",
+        _drain,
+    )
+    monkeypatch.setattr(
+        implementation_module,
+        "_checkpoint_durable_merge_queue_group",
+        _checkpoint,
+    )
+    monkeypatch.setattr(implementation_module, "enqueue_public_exhibit_refresh", _noop_refresh)
+    runner = _runner(workspace_root, artifacts)
+    runner.run = _unexpected_runtime
+    artifacts.store["dag-task:TASK-contract"] = implementation_module.ImplementationResult(
+        task_id="TASK-contract",
+        summary="sandbox evidence captured",
+        status="completed",
+        files_modified=["app/src/main.py"],
+        notes=(
+            "patch_summary_ids=701\n"
+            "canonical_mutation=pending_durable_merge_queue"
+        ),
+    ).model_dump_json()
+    dag = implementation_module.ImplementationDAG(
+        tasks=[
+            ImplementationTask(
+                id="TASK-contract",
+                name="contract",
+                description="contract",
+                repo_path="app",
+                file_scope=[TaskFileScope(path="app/src/main.py", action="modify")],
+            )
+        ],
+        execution_order=[["TASK-contract"]],
+        complete=True,
+    )
+
+    outcome = await _implement_dag(runner, feature, dag)
+
+    assert outcome.terminal_state == "complete"
+    assert [result.task_id for result in queued_results] == ["TASK-contract"]
+    assert "patch_summary_ids=701" in queued_results[0].notes
+
+
+@pytest.mark.asyncio
+async def test_completed_pending_merge_task_without_patch_ids_rehydrates_from_store(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    workspace_root, feature_root = _workspace(tmp_path)
+    repo = _repo(feature_root, "app")
+    (repo / "src" / "main.py").write_text("value = 'base'\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "add main"], cwd=repo, check=True)
+    artifacts = _Artifacts()
+    feature = _feature()
+    store = _BridgeExecutionControlStore()
+    store.pending_merge_patch_evidence = {
+        "dispatch_attempt_id": 88,
+        "patch_summary_ids": [701],
+        "structured_result_evidence_id": 301,
+    }
+    queued_results = []
+
+    async def _noop_worktrees(*_args, **_kwargs) -> None:
+        return None
+
+    async def _authority_ok(*_args, **_kwargs):
+        return implementation_module.WorkspaceAuthorityCompatibilityOutcome(
+            approved=True,
+            registry=_authority_registry(
+                feature_root,
+                [
+                    _authority_repo(
+                        feature_root,
+                        "app",
+                        "app",
+                        writable_task_ids=["TASK-contract"],
+                        task_ids=["TASK-contract"],
+                    )
+                ],
+            ),
+            snapshots=[],
+        )
+
+    async def _alias_guard_ok(*_args, **_kwargs):
+        return True, {"blockers": []}
+
+    async def _enqueue(_runner, _feature, pending_results, **_kwargs):
+        queued_results.extend(pending_results)
+        return [501]
+
+    async def _drain(*_args, **_kwargs):
+        return [SimpleNamespace(succeeded=True, item_id=501, terminal_status="integrated")]
+
+    async def _checkpoint(*_args, **_kwargs):
+        return SimpleNamespace(
+            checkpointed=True,
+            done_queue_item_ids=[501],
+            result_commit="abc123",
+            detail="",
+            routed_failure={},
+        )
+
+    async def _noop_refresh(*_args, **_kwargs):
+        return None
+
+    class _UnexpectedRuntimeDispatcher:
+        def __init__(self, **_kwargs):
+            raise AssertionError(
+                "stored pending-queue evidence must not redispatch runtime"
+            )
+
+    monkeypatch.setattr(implementation_module, "_ensure_task_worktrees", _noop_worktrees)
+    monkeypatch.setattr(
+        implementation_module,
+        "_run_workspace_authority_pre_dispatch_adapter",
+        _authority_ok,
+    )
+    monkeypatch.setattr(
+        implementation_module,
+        "_run_worktree_alias_pre_dispatch_guard",
+        _alias_guard_ok,
+    )
+    monkeypatch.setattr(
+        implementation_module,
+        "_enqueue_durable_merge_queue_for_results",
+        _enqueue,
+    )
+    monkeypatch.setattr(
+        implementation_module,
+        "_drain_durable_merge_queue_for_feature",
+        _drain,
+    )
+    monkeypatch.setattr(
+        implementation_module,
+        "_checkpoint_durable_merge_queue_group",
+        _checkpoint,
+    )
+    monkeypatch.setattr(implementation_module, "enqueue_public_exhibit_refresh", _noop_refresh)
+    monkeypatch.setattr(
+        implementation_module,
+        "RuntimeDispatcher",
+        _UnexpectedRuntimeDispatcher,
+    )
+    runner = _runner(workspace_root, artifacts, execution_control_store=store)
+
+    async def _unexpected_runtime(*_args, **_kwargs):
+        raise AssertionError("rehydration must use store evidence, not runner.run")
+
+    runner.run = _unexpected_runtime
+    artifacts.store["dag-task:TASK-contract"] = implementation_module.ImplementationResult(
+        task_id="TASK-contract",
+        summary="sandbox evidence captured",
+        status="completed",
+        files_modified=["app/src/main.py"],
+        notes="canonical_mutation=pending_durable_merge_queue",
+    ).model_dump_json()
+    dag = implementation_module.ImplementationDAG(
+        tasks=[
+            ImplementationTask(
+                id="TASK-contract",
+                name="contract",
+                description="contract",
+                repo_path="app",
+                file_scope=[TaskFileScope(path="app/src/main.py", action="modify")],
+            )
+        ],
+        execution_order=[["TASK-contract"]],
+        complete=True,
+    )
+
+    outcome = await _implement_dag(runner, feature, dag)
+
+    assert outcome.terminal_state == "complete"
+    assert len(store.pending_merge_patch_requests) == 1
+    assert store.pending_merge_patch_requests[0]["feature_id"] == feature.id
+    assert store.pending_merge_patch_requests[0]["group_idx"] == 0
+    assert store.pending_merge_patch_requests[0]["task_id"] == "TASK-contract"
+    assert [result.task_id for result in queued_results] == ["TASK-contract"]
+    assert "dispatcher_attempt_id=88" in queued_results[0].notes
+    assert "patch_summary_ids=701" in queued_results[0].notes
+
+
+@pytest.mark.asyncio
+async def test_completed_pending_merge_task_without_rehydratable_patch_ids_blocks(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    workspace_root, feature_root = _workspace(tmp_path)
+    repo = _repo(feature_root, "app")
+    (repo / "src" / "main.py").write_text("value = 'base'\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "add main"], cwd=repo, check=True)
+    artifacts = _Artifacts()
+    feature = _feature()
+    store = _BridgeExecutionControlStore()
+    queued_results = []
+
+    async def _noop_worktrees(*_args, **_kwargs) -> None:
+        return None
+
+    async def _authority_ok(*_args, **_kwargs):
+        return implementation_module.WorkspaceAuthorityCompatibilityOutcome(
+            approved=True,
+            registry=_authority_registry(
+                feature_root,
+                [
+                    _authority_repo(
+                        feature_root,
+                        "app",
+                        "app",
+                        writable_task_ids=["TASK-contract"],
+                        task_ids=["TASK-contract"],
+                    )
+                ],
+            ),
+            snapshots=[],
+        )
+
+    async def _alias_guard_ok(*_args, **_kwargs):
+        return True, {"blockers": []}
+
+    async def _enqueue(_runner, _feature, pending_results, **_kwargs):
+        queued_results.extend(pending_results)
+        return [501]
+
+    class _UnexpectedRuntimeDispatcher:
+        def __init__(self, **_kwargs):
+            raise AssertionError(
+                "missing stored patch evidence must fail closed without redispatch"
+            )
+
+    monkeypatch.setattr(implementation_module, "_ensure_task_worktrees", _noop_worktrees)
+    monkeypatch.setattr(
+        implementation_module,
+        "_run_workspace_authority_pre_dispatch_adapter",
+        _authority_ok,
+    )
+    monkeypatch.setattr(
+        implementation_module,
+        "_run_worktree_alias_pre_dispatch_guard",
+        _alias_guard_ok,
+    )
+    monkeypatch.setattr(
+        implementation_module,
+        "_enqueue_durable_merge_queue_for_results",
+        _enqueue,
+    )
+    monkeypatch.setattr(
+        implementation_module,
+        "RuntimeDispatcher",
+        _UnexpectedRuntimeDispatcher,
+    )
+    runner = _runner(workspace_root, artifacts, execution_control_store=store)
+    artifacts.store["dag-task:TASK-contract"] = implementation_module.ImplementationResult(
+        task_id="TASK-contract",
+        summary="sandbox evidence captured",
+        status="completed",
+        files_modified=["app/src/main.py"],
+        notes="canonical_mutation=pending_durable_merge_queue",
+    ).model_dump_json()
+    dag = implementation_module.ImplementationDAG(
+        tasks=[
+            ImplementationTask(
+                id="TASK-contract",
+                name="contract",
+                description="contract",
+                repo_path="app",
+                file_scope=[TaskFileScope(path="app/src/main.py", action="modify")],
+            )
+        ],
+        execution_order=[["TASK-contract"]],
+        complete=True,
+    )
+
+    outcome = await _implement_dag(runner, feature, dag)
+
+    assert outcome.terminal_state == "workflow_blocked"
+    assert "missing_patch_evidence" in outcome.failure
+    assert "patch_summary_ids" in outcome.failure
+    assert len(store.pending_merge_patch_requests) == 1
+    assert queued_results == []
 
 
 @pytest.mark.asyncio

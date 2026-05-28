@@ -1384,6 +1384,13 @@ def _typed_int_list(value: Any, *, cap: int) -> list[int]:
     return out
 
 
+def _bounded_runtime_failure_context_text(value: Any, *, max_chars: int = 4000) -> str:
+    text = str(value or "")
+    if len(text) <= max_chars:
+        return text
+    return f"{text[:max_chars]}...[truncated {len(text) - max_chars} chars]"
+
+
 def _typed_str_sample(value: Any, *, cap: int) -> tuple[int, list[str]]:
     """Return ``(count, bounded_sample)`` for a JSONB string list.
 
@@ -2328,6 +2335,226 @@ class ExecutionControlStore:
             row = self._row_from_record(record)
             links = await self._fetch_projection_links(conn, row.id)
             return ExecutionJournalResult(row=row, projection_links=tuple(links), created=False)
+
+    async def get_pre_promotion_contract_revalidation_inputs(
+        self,
+        *,
+        feature_id: str,
+        attempt_id: int,
+        task_id: str,
+        contract_id: int | None = None,
+    ) -> dict[str, Any] | None:
+        async with self._connection() as conn:
+            attempt = await self._fetch_dispatch_attempt_by_id(conn, int(attempt_id))
+            if attempt.feature_id != feature_id or str(attempt.task_id or "") != str(task_id):
+                return None
+            failure_id = (
+                attempt.payload.get("typed_failure_id")
+                or attempt.payload.get("runtime_failure_id")
+            )
+            if failure_id is None:
+                return None
+            failure = await self._fetch_evidence_node_by_id(conn, int(failure_id))
+            if failure is None or failure.kind != "runtime_failure_context":
+                return None
+            failure_payload = _json_dict(failure.payload)
+            failure_details = _json_dict(failure_payload.get("details"))
+            failure_message = str(
+                failure.summary
+                or failure_details.get("message")
+                or failure_payload.get("message")
+                or ""
+            )
+            if (
+                failure_payload.get("terminal_reason") != "patch_capture_failed"
+                or "Task contract validation failed before sandbox promotion"
+                not in failure_message
+            ):
+                return None
+
+            verdict_rows = await conn.fetch(
+                """
+                SELECT *
+                FROM evidence_nodes
+                WHERE feature_id = $1
+                  AND kind = 'contract_verdict'
+                  AND status = 'rejected'
+                  AND group_idx = $2
+                  AND metadata->>'capture_validated_before_promotion' = 'true'
+                ORDER BY id DESC
+                LIMIT 50
+                """,
+                feature_id,
+                attempt.group_idx,
+            )
+            expected_prefix = (
+                f"dag-contract-verdict:g{attempt.group_idx if attempt.group_idx is not None else '-'}:"
+                f"{task_id}:"
+            )
+            for verdict_record in verdict_rows:
+                verdict = self._evidence_node_from_record(verdict_record)
+                verdict_payload = _json_dict(verdict.payload)
+                verdict_metadata = _json_dict(verdict.metadata)
+                if contract_id is not None:
+                    try:
+                        verdict_contract_id = int(
+                            verdict.contract_id
+                            or verdict_payload.get("contract_id")
+                            or 0
+                        )
+                    except (TypeError, ValueError):
+                        verdict_contract_id = 0
+                    if verdict_contract_id != int(contract_id):
+                        continue
+                task_ids = [str(item) for item in _json_list(verdict_metadata.get("task_ids"))]
+                verdict_key = verdict.artifact_key or verdict.name
+                if task_id not in task_ids and not str(verdict_key).startswith(expected_prefix):
+                    continue
+                patch_summary_id = (
+                    verdict_metadata.get("captured_patch_summary_id")
+                    or verdict_payload.get("captured_patch_summary_id")
+                    or verdict_payload.get("patch_summary_id")
+                )
+                try:
+                    patch_summary_id_int = int(patch_summary_id)
+                except (TypeError, ValueError):
+                    continue
+                if patch_summary_id_int <= 0:
+                    continue
+                patch_summary = await self._fetch_evidence_node_by_id(
+                    conn,
+                    patch_summary_id_int,
+                )
+                if patch_summary is None or patch_summary.kind != "sandbox_patch_summary":
+                    continue
+                return {
+                    "dispatch_attempt": attempt,
+                    "runtime_failure": failure,
+                    "contract_verdict": verdict,
+                    "patch_summary": patch_summary,
+                }
+            return None
+
+    async def get_pending_durable_merge_patch_evidence(
+        self,
+        *,
+        feature_id: str,
+        dag_sha256: str,
+        group_idx: int,
+        task_id: str,
+    ) -> dict[str, Any] | None:
+        """Recover patch-summary ids from the latest succeeded dispatch attempt.
+
+        This is intentionally narrow: resume may use it only to enqueue an
+        already-captured sandbox patch into the durable merge queue when a stale
+        ``dag-task:*`` projection has the pending-queue note but lacks
+        machine-readable ``patch_summary_ids``.
+        """
+
+        async with self._connection() as conn:
+            record = await conn.fetchrow(
+                """
+                SELECT *
+                FROM execution_journal_rows
+                WHERE feature_id = $1
+                  AND entry_type = 'dispatch_attempt'
+                  AND dag_sha256 = $2
+                  AND group_idx = $3
+                  AND task_id = $4
+                  AND status = 'succeeded'
+                ORDER BY updated_at DESC NULLS LAST, id DESC
+                LIMIT 1
+                """,
+                feature_id,
+                dag_sha256,
+                int(group_idx),
+                task_id,
+            )
+            if record is None:
+                return None
+            attempt = self._row_from_record(record)
+            outcome = _json_dict(attempt.payload.get("dispatch_outcome"))
+            if outcome.get("status") != "succeeded":
+                return None
+            patch_summary_ids = sorted(set(
+                _typed_int_list(outcome.get("patch_summary_ids"), cap=100)
+            ))
+            if not patch_summary_ids:
+                return None
+            for patch_summary_id in patch_summary_ids:
+                patch_summary = await self._fetch_evidence_node_by_id(
+                    conn,
+                    patch_summary_id,
+                )
+                if (
+                    patch_summary is None
+                    or patch_summary.kind != "sandbox_patch_summary"
+                    or patch_summary.feature_id != feature_id
+                ):
+                    return None
+            return {
+                "dispatch_attempt_id": attempt.id,
+                "idempotency_key": outcome.get("idempotency_key") or attempt.idempotency_key,
+                "patch_summary_ids": patch_summary_ids,
+                "structured_result_evidence_id": _typed_int(
+                    outcome.get("structured_result_evidence_id")
+                ),
+            }
+
+    async def get_runtime_failure_context(
+        self,
+        *,
+        feature_id: str,
+        failure_id: int,
+    ) -> dict[str, Any] | None:
+        """Return bounded runtime-failure details for same-feature replay checks."""
+
+        try:
+            failure_id_int = int(failure_id)
+        except (TypeError, ValueError):
+            return None
+        if failure_id_int <= 0:
+            return None
+        async with self._connection() as conn:
+            record = await conn.fetchrow(
+                """
+                SELECT *
+                FROM evidence_nodes
+                WHERE feature_id = $1
+                  AND id = $2
+                  AND kind = 'runtime_failure_context'
+                LIMIT 1
+                """,
+                feature_id,
+                failure_id_int,
+            )
+            if record is None:
+                return None
+            failure = self._evidence_node_from_record(record)
+        payload = _json_dict(failure.payload)
+        details = _json_dict(payload.get("details"))
+        bounded_details = {
+            str(key): _bounded_runtime_failure_context_text(value)
+            for key, value in list(details.items())[:20]
+        }
+        return {
+            "id": failure.id,
+            "feature_id": failure.feature_id,
+            "attempt_id": failure.attempt_id,
+            "group_idx": failure.group_idx,
+            "summary": _bounded_runtime_failure_context_text(failure.summary),
+            "failure_class": _bounded_runtime_failure_context_text(
+                payload.get("failure_class")
+            ),
+            "failure_type": _bounded_runtime_failure_context_text(
+                payload.get("failure_type")
+            ),
+            "terminal_reason": _bounded_runtime_failure_context_text(
+                payload.get("terminal_reason")
+            ),
+            "message": _bounded_runtime_failure_context_text(payload.get("message")),
+            "details": bounded_details,
+        }
 
     async def start_dispatch_attempt(
         self,

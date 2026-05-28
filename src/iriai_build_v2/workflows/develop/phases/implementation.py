@@ -3654,9 +3654,47 @@ def _contract_workspace_snapshot(
     repo_path: str,
     repo_dir: Path,
     paths: list[str],
+    *,
+    contract: Any | None = None,
+    snapshots: list[Any] | None = None,
 ) -> Any:
     if WorkspaceAuthoritySnapshot is None:
         return None
+    base_snapshot = _workspace_snapshot_for_repo(snapshots or [], repo_id)
+    tracked_paths = _git_tracked_paths_for_contract_snapshot(repo_dir)
+    probe_paths = _dedupe_preserving_order(
+        [
+            *_contract_rule_probe_paths(contract),
+            *_contract_snapshot_path_list(paths, repo_dir=repo_dir),
+        ]
+    )
+    present_paths = _dedupe_preserving_order(
+        [
+            *_workspace_snapshot_existing_paths(base_snapshot, repo_dir=repo_dir),
+            *tracked_paths,
+            *_existing_contract_probe_paths(repo_dir, probe_paths),
+        ]
+    )
+    dirty_paths = _dedupe_preserving_order(
+        [
+            *_workspace_snapshot_field_paths(base_snapshot, "dirty_paths", repo_dir=repo_dir),
+            *_contract_snapshot_path_list(paths, repo_dir=repo_dir),
+        ]
+    )
+    staged_paths = _workspace_snapshot_field_paths(
+        base_snapshot,
+        "staged_paths",
+        repo_dir=repo_dir,
+    )
+    untracked_paths = _workspace_snapshot_field_paths(
+        base_snapshot,
+        "untracked_paths",
+        repo_dir=repo_dir,
+    )
+    case_sensitivity = str(
+        _workspace_snapshot_attr(base_snapshot, "case_sensitivity", "unknown")
+        or "unknown"
+    )
     return WorkspaceAuthoritySnapshot(
         feature_id=str(getattr(feature, "id", "")),
         dag_sha256=dag_sha256,
@@ -3666,13 +3704,149 @@ def _contract_workspace_snapshot(
         role="execution",
         canonical_path=str(repo_dir),
         workspace_relative_path=repo_path,
-        case_sensitivity="unknown",
-        dirty_paths=paths,
-        present_paths=paths,
-        no_dirty=not paths,
+        case_sensitivity=case_sensitivity,
+        dirty_paths=dirty_paths,
+        staged_paths=staged_paths,
+        untracked_paths=untracked_paths,
+        tracked_paths=tracked_paths,
+        present_paths=present_paths,
+        probe_paths=probe_paths,
+        no_dirty=not dirty_paths and not staged_paths and not untracked_paths,
+        base_snapshot_id=_workspace_snapshot_attr(base_snapshot, "id", None),
         captured_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         validated_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     )
+
+
+def _workspace_snapshot_for_repo(snapshots: list[Any], repo_id: str) -> Any | None:
+    for snapshot in snapshots:
+        if str(_workspace_snapshot_attr(snapshot, "repo_id", "") or "") == str(repo_id):
+            return snapshot
+    return None
+
+
+def _workspace_snapshot_attr(snapshot: Any | None, field_name: str, default: Any = None) -> Any:
+    if snapshot is None:
+        return default
+    if isinstance(snapshot, dict):
+        return snapshot.get(field_name, default)
+    return getattr(snapshot, field_name, default)
+
+
+def _workspace_snapshot_field_paths(
+    snapshot: Any | None,
+    field_name: str,
+    *,
+    repo_dir: Path,
+) -> list[str]:
+    value = _workspace_snapshot_attr(snapshot, field_name, [])
+    return _contract_snapshot_path_list(value, repo_dir=repo_dir)
+
+
+def _workspace_snapshot_existing_paths(snapshot: Any | None, *, repo_dir: Path) -> list[str]:
+    paths: list[str] = []
+    for field_name in ("present_paths", "tracked_paths", "all_paths", "existing_paths"):
+        paths.extend(_workspace_snapshot_field_paths(snapshot, field_name, repo_dir=repo_dir))
+    path_exists = _workspace_snapshot_attr(snapshot, "path_exists", {})
+    if isinstance(path_exists, dict):
+        paths.extend(
+            _contract_snapshot_path_list(
+                [path for path, exists in path_exists.items() if exists],
+                repo_dir=repo_dir,
+            )
+        )
+    return _dedupe_preserving_order(paths)
+
+
+def _contract_rule_probe_paths(contract: Any | None) -> list[str]:
+    if contract is None:
+        return []
+    paths: list[str] = []
+    payload = _model_json_dict(contract)
+    for field_name in (
+        "required_paths",
+        "allowed_paths",
+        "read_only_paths",
+        "generated_outputs",
+    ):
+        values = getattr(contract, field_name, None)
+        if values is None:
+            values = payload.get(field_name, [])
+        for rule in list(values or []):
+            rule_path = getattr(rule, "path", None)
+            if rule_path is None and isinstance(rule, dict):
+                rule_path = rule.get("path")
+            if rule_path is None:
+                rule_path = _model_json_dict(rule).get("path")
+            if str(rule_path or "").strip():
+                paths.append(str(rule_path))
+    return _dedupe_preserving_order(paths)
+
+
+def _git_tracked_paths_for_contract_snapshot(repo_dir: Path) -> list[str]:
+    if not repo_dir.exists():
+        raise RuntimeError(f"contract validation repo root is missing: {repo_dir}")
+    proc = subprocess.run(
+        ["git", "ls-files", "-z"],
+        cwd=repo_dir,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            "contract validation could not inspect git tracked paths for "
+            f"{repo_dir}: {proc.stderr.decode('utf-8', errors='replace').strip()}"
+        )
+    return _dedupe_preserving_order(
+        _contract_snapshot_path_list(
+            [
+                item.decode("utf-8", errors="replace")
+                for item in proc.stdout.split(b"\0")
+                if item
+            ],
+            repo_dir=repo_dir,
+        )
+    )
+
+
+def _existing_contract_probe_paths(repo_dir: Path, probe_paths: list[str]) -> list[str]:
+    existing: list[str] = []
+    for path in probe_paths:
+        candidate = repo_dir / path.rstrip("/")
+        if candidate.exists():
+            existing.append(path)
+    return _dedupe_preserving_order(existing)
+
+
+def _contract_snapshot_path_list(value: Any, *, repo_dir: Path) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, (str, bytes)):
+        raw_values = [value.decode("utf-8", errors="replace") if isinstance(value, bytes) else value]
+    elif isinstance(value, dict):
+        raw_values = list(value)
+    else:
+        try:
+            raw_values = list(value)
+        except TypeError:
+            raw_values = [value]
+    paths: list[str] = []
+    repo_resolved = repo_dir.resolve(strict=False)
+    for raw in raw_values:
+        text = str(raw or "").strip().replace("\\", "/")
+        if not text:
+            continue
+        if text.startswith("/") or re.match(r"^[A-Za-z]:[/\\]", text):
+            try:
+                text = Path(text).resolve(strict=False).relative_to(repo_resolved).as_posix()
+            except (OSError, ValueError):
+                continue
+        parts = text.strip("/").split("/")
+        if not parts or any(part in {"", ".", ".."} for part in parts):
+            continue
+        paths.append("/".join(parts))
+    return _dedupe_preserving_order(paths)
 
 
 async def _record_contract_patch_summary(
@@ -4068,16 +4242,25 @@ async def _record_precommit_contract_verdicts(
         contract_id = _task_contract_id(contract)
         contract_ids = [contract_id] if contract_id is not None else []
         repo_dir = feature_root / repo_path if repo_path else feature_root
-        snapshot = _contract_workspace_snapshot(
-            feature,
-            dag_sha256,
-            group_idx,
-            stage,
-            repo_id,
-            repo_path,
-            repo_dir,
-            changed_paths,
-        )
+        try:
+            snapshot = _contract_workspace_snapshot(
+                feature,
+                dag_sha256,
+                group_idx,
+                stage,
+                repo_id,
+                repo_path,
+                repo_dir,
+                changed_paths,
+                contract=contract,
+                snapshots=workspace_snapshots,
+            )
+        except Exception as exc:
+            all_violation_codes.append("contract_validation_unavailable")
+            failure_lines.append(
+                f"{result.task_id}: contract validation snapshot unavailable: {exc}"
+            )
+            continue
         if snapshot is None:
             all_violation_codes.append("contract_validation_unavailable")
             failure_lines.append(f"{result.task_id}: contract validation unavailable")
@@ -5122,6 +5305,61 @@ def _parse_patch_evidence_ids_from_notes(notes: Any) -> list[int]:
                 continue
     # Stable + de-duplicated so the enqueue request digest is deterministic.
     return sorted(set(ids))
+
+
+async def _rehydrate_pending_merge_queue_result_from_dispatch_evidence(
+    runner: WorkflowRunner,
+    feature: Feature,
+    result: ImplementationResult,
+    *,
+    dag_sha256: str,
+    group_idx: int,
+    task_id: str,
+) -> ImplementationResult | None:
+    store = _execution_control_store_for_runner(runner)
+    reader = getattr(store, "get_pending_durable_merge_patch_evidence", None)
+    if not callable(reader):
+        return None
+    try:
+        evidence = await reader(
+            feature_id=feature.id,
+            dag_sha256=dag_sha256,
+            group_idx=group_idx,
+            task_id=task_id,
+        )
+    except Exception:
+        logger.warning(
+            "Unable to rehydrate pending durable-merge patch evidence for "
+            "task %s in group %s",
+            task_id,
+            group_idx,
+            exc_info=True,
+        )
+        return None
+    if not isinstance(evidence, dict):
+        return None
+    patch_summary_ids: list[int] = []
+    for raw in evidence.get("patch_summary_ids") or []:
+        try:
+            patch_summary_ids.append(int(raw))
+        except (TypeError, ValueError):
+            continue
+    patch_summary_ids = sorted(set(patch_summary_ids))
+    if not patch_summary_ids:
+        return None
+    notes = str(result.notes or "")
+    try:
+        dispatch_attempt_id = int(evidence.get("dispatch_attempt_id"))
+    except (TypeError, ValueError):
+        dispatch_attempt_id = None
+    if dispatch_attempt_id is not None:
+        notes = _append_note_once(notes, f"dispatcher_attempt_id={dispatch_attempt_id}")
+    notes = _append_note_once(
+        notes,
+        "patch_summary_ids=" + ",".join(str(item) for item in patch_summary_ids),
+    )
+    notes = _append_note_once(notes, _PENDING_DURABLE_MERGE_QUEUE_NOTE)
+    return result.model_copy(update={"notes": notes})
 
 
 @asynccontextmanager
@@ -7635,16 +7873,24 @@ async def _validate_sandbox_capture_against_contract(
             diff_artifact_id=diff_artifact_id,
         )
         repo_dir = feature_root / repo_path if repo_path else feature_root
-        snapshot = _contract_workspace_snapshot(
-            feature,
-            dag_sha256,
-            group_idx,
-            stage,
-            repo_id,
-            repo_path,
-            repo_dir,
-            changed_paths,
-        )
+        try:
+            snapshot = _contract_workspace_snapshot(
+                feature,
+                dag_sha256,
+                group_idx,
+                stage,
+                repo_id,
+                repo_path,
+                repo_dir,
+                changed_paths,
+                contract=task_contract,
+                snapshots=snapshots,
+            )
+        except Exception as exc:
+            raise _sandbox_blocker(
+                f"Task contract validation snapshot unavailable for task {task_id}: {exc}",
+                task_id=task_id,
+            ) from exc
         if snapshot is None:
             raise _sandbox_blocker(
                 f"Task contract validation unavailable for task {task_id} before promotion.",
@@ -7819,6 +8065,7 @@ async def _bind_task_sandbox(
     runtime: str | None,
     repo_id_hint: str | None = None,
     sandbox_mode: str = "task",
+    sandbox_attempt_no: int | None = None,
 ) -> RuntimeSandboxTaskBinding | None:
     if SandboxRunner is None or SandboxSpec is None:
         raise _sandbox_blocker(
@@ -7869,11 +8116,16 @@ async def _bind_task_sandbox(
         task_contract,
         repo_id=repo_id,
     )
+    attempt_no = (
+        (attempt * 1000) + task_idx
+        if sandbox_attempt_no is None
+        else int(sandbox_attempt_no)
+    )
     spec = SandboxSpec(
         feature_id=feature.id,
         dag_sha256=dag_sha256,
         group_idx=group_idx,
-        attempt_no=(attempt * 1000) + task_idx,
+        attempt_no=attempt_no,
         task_ids=[task.id],
         repo_ids=[repo_id],
         base_snapshot_ids=[_snapshot_id_for_repo(snapshots, repo_id)],
@@ -8112,6 +8364,332 @@ def _should_retry_implementation_dispatch_outcome(
         getattr(outcome, "runtime_terminal_reason", "") or ""
     )
     return terminal_reason in _RETRYABLE_IMPLEMENTATION_DISPATCH_TERMINAL_REASONS
+
+
+_LEGACY_SANDBOX_LEASE_COLLISION_MARKER = "sandbox path already belongs to a different lease"
+
+
+def _contains_legacy_sandbox_lease_collision(*values: Any) -> bool:
+    marker = _LEGACY_SANDBOX_LEASE_COLLISION_MARKER
+    for value in values:
+        if value is None:
+            continue
+        if marker in str(value).lower():
+            return True
+    return False
+
+
+async def _should_retry_implementation_dispatch_result(
+    runner: WorkflowRunner,
+    feature: Feature,
+    result: ImplementationResult,
+    outcome: Any,
+    *,
+    attempt: int,
+    max_retries: int,
+) -> bool:
+    if _should_retry_implementation_dispatch_outcome(
+        outcome,
+        attempt=attempt,
+        max_retries=max_retries,
+    ):
+        return True
+    if attempt >= max_retries:
+        return False
+    if str(getattr(outcome, "status", "") or "") != "failed":
+        return False
+    terminal_reason = str(getattr(outcome, "runtime_terminal_reason", "") or "")
+    if terminal_reason != "sandbox_binding_failed":
+        return False
+    if _contains_legacy_sandbox_lease_collision(result.summary, result.notes, outcome):
+        return True
+    store = _execution_control_store_for_runner(runner)
+    reader = getattr(store, "get_runtime_failure_context", None)
+    if not callable(reader):
+        return False
+    failure_ids: list[int] = []
+    for raw in (
+        getattr(outcome, "runtime_failure_id", None),
+        getattr(outcome, "typed_failure_id", None),
+    ):
+        try:
+            failure_id = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if failure_id > 0 and failure_id not in failure_ids:
+            failure_ids.append(failure_id)
+    for failure_id in failure_ids:
+        try:
+            context = await _maybe_await_workspace_authority(
+                reader(feature_id=feature.id, failure_id=failure_id)
+            )
+        except Exception:
+            logger.warning(
+                "Unable to inspect runtime failure %s for sandbox-binding retry",
+                failure_id,
+                exc_info=True,
+            )
+            continue
+        if _contains_legacy_sandbox_lease_collision(context):
+            return True
+    return False
+
+
+async def _recover_pre_promotion_contract_revalidation(
+    *,
+    runner: WorkflowRunner,
+    feature: Feature,
+    task: ImplementationTask,
+    task_contract: Any | None,
+    feature_root: Path | None,
+    dag_sha256: str,
+    group_idx: int,
+    stage: str,
+    snapshots: list[Any] | None,
+    repo_prefix: str,
+    outcome: Any,
+) -> ImplementationResult | None:
+    if (
+        task_contract is None
+        or feature_root is None
+        or ContractCompiler is None
+        or CompiledPatchSummary is None
+    ):
+        return None
+    if str(getattr(outcome, "runtime_terminal_reason", "") or "") != "patch_capture_failed":
+        return None
+    store = _execution_control_store_for_runner(runner)
+    reader = getattr(store, "get_pre_promotion_contract_revalidation_inputs", None)
+    if store is None or not callable(reader):
+        return None
+    contract_id = _task_contract_id(task_contract)
+    try:
+        replay_inputs = await reader(
+            feature_id=str(getattr(feature, "id", "")),
+            attempt_id=int(getattr(outcome, "attempt_id")),
+            task_id=task.id,
+            contract_id=contract_id,
+        )
+    except Exception:
+        logger.warning(
+            "Task %s failed to load pre-promotion contract revalidation inputs",
+            task.id,
+            exc_info=True,
+        )
+        return None
+    if not replay_inputs:
+        return None
+
+    patch_node = _revalidation_input_node(replay_inputs, "patch_summary")
+    failure_node = _revalidation_input_node(replay_inputs, "runtime_failure")
+    rejected_verdict_node = _revalidation_input_node(replay_inputs, "contract_verdict")
+    patch_payload = _revalidation_node_payload(patch_node)
+    repo_id = _contract_repo_id(task_contract)
+    if str(patch_payload.get("repo_id") or "") != repo_id:
+        return None
+    patch_summary_id = _revalidation_node_id(patch_node)
+    if patch_summary_id is None:
+        return None
+    patch_contract_ids = [
+        int(item)
+        for item in _revalidation_list(patch_payload.get("contract_ids"))
+        if item is not None
+    ]
+    if contract_id is not None and contract_id not in patch_contract_ids:
+        patch_contract_ids.append(contract_id)
+    changed_paths = [str(item) for item in _revalidation_list(patch_payload.get("changed_paths"))]
+    created_paths = [str(item) for item in _revalidation_list(patch_payload.get("created_paths"))]
+    modified_paths = [str(item) for item in _revalidation_list(patch_payload.get("modified_paths"))]
+    deleted_paths = [str(item) for item in _revalidation_list(patch_payload.get("deleted_paths"))]
+    renamed_paths = {
+        str(key): str(value)
+        for key, value in _revalidation_dict(patch_payload.get("renamed_paths")).items()
+    }
+    patch = CompiledPatchSummary(
+        id=patch_summary_id,
+        sandbox_id=str(patch_payload.get("sandbox_id") or ""),
+        contract_ids=patch_contract_ids,
+        repo_id=repo_id,
+        base_commit=str(patch_payload.get("base_commit") or "") or None,
+        changed_paths=changed_paths,
+        created_paths=created_paths,
+        modified_paths=modified_paths,
+        deleted_paths=deleted_paths,
+        renamed_paths=renamed_paths,
+        diff_sha256=str(patch_payload.get("diff_sha256") or ""),
+        diff_artifact_id=_optional_int(patch_payload.get("diff_artifact_id")),
+    )
+    repo_path = _contract_repo_path(task_contract)
+    repo_dir = feature_root / repo_path if repo_path else feature_root
+    try:
+        snapshot = _contract_workspace_snapshot(
+            feature,
+            dag_sha256,
+            group_idx,
+            stage,
+            repo_id,
+            repo_path,
+            repo_dir,
+            changed_paths,
+            contract=task_contract,
+            snapshots=list(snapshots or []),
+        )
+    except Exception:
+        logger.warning(
+            "Task %s failed to build contract revalidation snapshot",
+            task.id,
+            exc_info=True,
+        )
+        return None
+    if snapshot is None:
+        return None
+    verdict = ContractCompiler().validate_patch(task_contract, patch, snapshot)
+    if not bool(getattr(verdict, "approved", False)):
+        return None
+
+    projection_sandbox_id = _contract_stage_sandbox_id(group_idx, stage, repo_id)
+    workspace_snapshot_id = _snapshot_id_for_repo(list(snapshots or []), repo_id)
+    metadata = {
+        "stage": stage,
+        "task_ids": [task.id],
+        "actual_sandbox_id": str(patch_payload.get("sandbox_id") or ""),
+        "projection_sandbox_id": projection_sandbox_id,
+        "captured_patch_summary_id": patch_summary_id,
+        "diff_artifact_id": _optional_int(patch_payload.get("diff_artifact_id")),
+        "diff_sha256": str(patch_payload.get("diff_sha256") or ""),
+        "capture_revalidated_before_promotion": True,
+        "stale_contract_validation_recovered": True,
+        "revalidated_from_dispatcher_attempt_id": _optional_int(
+            getattr(outcome, "attempt_id", None)
+        ),
+        "revalidated_from_runtime_failure_id": _revalidation_node_id(failure_node),
+        "revalidated_from_contract_verdict_id": _revalidation_node_id(rejected_verdict_node),
+        "revalidated_from_patch_summary_id": patch_summary_id,
+        "changed_paths": changed_paths[:50],
+    }
+    if workspace_snapshot_id:
+        metadata.update(
+            {
+                "workspace_snapshot_id": workspace_snapshot_id,
+                "base_snapshot_id": workspace_snapshot_id,
+                "base_snapshot_ids": [workspace_snapshot_id],
+            }
+        )
+    await _record_contract_verdict_projection(
+        runner,
+        feature,
+        task_contract,
+        verdict,
+        feature_id=str(getattr(feature, "id", "")),
+        dag_sha256=dag_sha256,
+        group_idx=group_idx,
+        stage=stage,
+        sandbox_id=projection_sandbox_id,
+        patch_summary_id=patch_summary_id,
+        metadata=metadata,
+    )
+
+    result_created = _prefix_result_paths(repo_prefix, created_paths)
+    modified_candidates = [
+        path
+        for path in changed_paths
+        if path not in set(created_paths) and path not in set(deleted_paths)
+    ]
+    result_modified = _prefix_result_paths(repo_prefix, modified_candidates)
+    evidence_note = (
+        f"dispatcher_attempt_id={getattr(outcome, 'attempt_id', None)}; "
+        f"patch_summary_ids={patch_summary_id}; "
+        f"revalidated_from_runtime_failure_id={_revalidation_node_id(failure_node)}; "
+        f"revalidated_from_contract_verdict_id={_revalidation_node_id(rejected_verdict_node)}"
+    )
+    result = ImplementationResult(
+        task_id=task.id,
+        summary=(
+            "Recovered retained sandbox patch after approved pre-promotion "
+            "contract revalidation."
+        ),
+        status="completed",
+        files_created=result_created,
+        files_modified=result_modified,
+        notes=_append_note_once(evidence_note, _PENDING_DURABLE_MERGE_QUEUE_NOTE),
+    )
+    artifacts = getattr(runner, "artifacts", None)
+    put = getattr(artifacts, "put", None)
+    if not callable(put):
+        return None
+    try:
+        await put(f"dag-task:{task.id}", result.model_dump_json(), feature=feature)
+    except Exception:
+        logger.warning(
+            "Task %s failed to persist synthesized revalidation result",
+            task.id,
+            exc_info=True,
+        )
+        return None
+    return result
+
+
+def _revalidation_input_node(inputs: Any, key: str) -> Any:
+    if isinstance(inputs, dict):
+        return inputs.get(key)
+    return getattr(inputs, key, None)
+
+
+def _revalidation_node_payload(node: Any) -> dict[str, Any]:
+    if node is None:
+        return {}
+    if isinstance(node, dict):
+        value = node.get("payload", {})
+    else:
+        value = getattr(node, "payload", {})
+    return _revalidation_dict(value)
+
+
+def _revalidation_node_id(node: Any) -> int | None:
+    if node is None:
+        return None
+    value = node.get("id") if isinstance(node, dict) else getattr(node, "id", None)
+    return _optional_int(value)
+
+
+def _revalidation_list(value: Any) -> list[Any]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return list(value)
+    if isinstance(value, tuple):
+        return list(value)
+    return [value]
+
+
+def _revalidation_dict(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return dict(value)
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except Exception:
+            return {}
+        return dict(parsed) if isinstance(parsed, dict) else {}
+    return {}
+
+
+def _prefix_result_paths(repo_prefix: str, paths: list[str]) -> list[str]:
+    prefix = repo_prefix.strip("/")
+    result: list[str] = []
+    for path in paths:
+        clean = str(path or "").strip().strip("/")
+        if not clean:
+            continue
+        result.append(f"{prefix}/{clean}" if prefix else clean)
+    return _dedupe_preserving_order(result)
+
+
+def _optional_int(value: Any) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 class _ImplementationPromptBuilder:
@@ -8791,6 +9369,7 @@ class _ImplementationSandboxPort:
                 snapshots=self._snapshots,
                 runtime=self._runtime,
                 repo_id_hint=self._repo_id,
+                sandbox_attempt_no=int(_attempt_id),
             )
         except Exception as exc:
             self.last_failure_message = str(exc)
@@ -8892,6 +9471,17 @@ class _ImplementationOutputNormalizer:
                 result.files_modified = [f"{prefix}{path}" for path in changed_paths[:50]]
                 corrected_fields["files_modified"] = result.files_modified
         if result is not None:
+            patch_summary_ids = [
+                int(item)
+                for item in list(getattr(patch_capture, "patch_summary_ids", []) or [])
+                if item is not None
+            ]
+            if patch_summary_ids:
+                result.notes = _append_note_once(
+                    result.notes,
+                    "patch_summary_ids="
+                    + ",".join(str(item) for item in sorted(set(patch_summary_ids))),
+                )
             result.notes = _append_note_once(
                 result.notes,
                 _PENDING_DURABLE_MERGE_QUEUE_NOTE,
@@ -9320,13 +9910,15 @@ class _ArtifactDispatchJournalPort:
         self._runner = runner
         self._feature = feature
         self._attempts: dict[int, dict[str, Any]] = {}
-        self._next_attempt_id = 1
         self._structured: dict[int, Any] = {}
         self._next_evidence_id = 1000
 
     async def start_dispatch_attempt(self, request: Any) -> Any:
-        attempt_id = self._next_attempt_id
-        self._next_attempt_id += 1
+        services = getattr(self._runner, "services", None)
+        if not isinstance(services, dict):
+            services = {}
+        attempt_id = int(services.get("_artifact_dispatch_next_attempt_id", 1) or 1)
+        services["_artifact_dispatch_next_attempt_id"] = attempt_id + 1
         self._attempts[attempt_id] = {
             "request": request,
             "request_digest": request.request_digest,
@@ -9518,6 +10110,21 @@ async def _dispatch_task_attempt_via_runtime_dispatcher(
     )
     outcome = await dispatcher.dispatch(request)
     result = normalizer.result
+    recovered_result = await _recover_pre_promotion_contract_revalidation(
+        runner=runner,
+        feature=feature,
+        task=task,
+        task_contract=task_contract,
+        feature_root=feature_root,
+        dag_sha256=dag_sha256,
+        group_idx=group_idx,
+        stage=stage,
+        snapshots=snapshots,
+        repo_prefix=repo_prefix,
+        outcome=outcome,
+    )
+    if recovered_result is not None:
+        return recovered_result, outcome
     if outcome.status == "succeeded" and result is None:
         try:
             legacy_result = await runner.artifacts.get(f"dag-task:{task.id}", feature=feature)
@@ -17739,6 +18346,7 @@ async def _implement_dag(
         # ── Per-task resume: check which tasks already completed ─────
         pending_tasks: list[ImplementationTask] = []
         completed_results: list[ImplementationResult] = []
+        pending_merge_queue_resume_results: list[ImplementationResult] = []
         stable_task_indices = {tid: idx for idx, tid in enumerate(group)}
         for tid in group:
             task_marker = await runner.artifacts.get(
@@ -17767,18 +18375,55 @@ async def _implement_dag(
                     # Only skip if the task actually completed successfully
                     if result.status == "completed":
                         if _result_requires_durable_merge_queue(result):
+                            if _parse_patch_evidence_ids_from_notes(result.notes):
+                                completed_results.append(result)
+                                all_results.append(result)
+                                handover.record_success(result)
+                                pending_merge_queue_resume_results.append(result)
+                                continue
+                            rehydrated_result = (
+                                await _rehydrate_pending_merge_queue_result_from_dispatch_evidence(
+                                    runner,
+                                    feature,
+                                    result,
+                                    dag_sha256=dag_sha256,
+                                    group_idx=group_idx,
+                                    task_id=tid,
+                                )
+                            )
+                            if rehydrated_result is not None:
+                                completed_results.append(rehydrated_result)
+                                all_results.append(rehydrated_result)
+                                handover.record_success(rehydrated_result)
+                                pending_merge_queue_resume_results.append(rehydrated_result)
+                                logger.info(
+                                    "Task %s pending durable-merge marker "
+                                    "rehydrated patch evidence ids from "
+                                    "terminal dispatch evidence",
+                                    tid,
+                                )
+                                continue
                             return DagExecutionOutcome(
-                                implementation_text="\n\n".join(to_str(r) for r in all_results),
-                                failure=_durable_merge_queue_blocker_for_results([result]),
+                                implementation_text="\n\n".join(
+                                    to_str(r) for r in all_results
+                                ),
+                                failure=_workflow_blocker_text(
+                                    "Completed task marker is pending the "
+                                    "durable merge queue but lacks "
+                                    "machine-readable patch_summary_ids, and "
+                                    "terminal dispatch evidence could not "
+                                    "rehydrate them. missing_patch_evidence "
+                                    f"task_id={tid} group_idx={group_idx}"
+                                ),
                                 handover=handover,
                                 terminal_state="workflow_blocked",
                             )
-                        if workspace_mgr is None or feature_root is None:
+                        elif workspace_mgr is None or feature_root is None:
                             completed_results.append(result)
                             all_results.append(result)
                             handover.record_success(result)
                             continue
-                        if await _completed_task_marker_has_current_lineage(
+                        elif await _completed_task_marker_has_current_lineage(
                             runner,
                             feature,
                             contracts_by_task_id.get(tid),
@@ -17877,7 +18522,7 @@ async def _implement_dag(
         results: list[object] = list(completed_results)
         initial_verdict: object | None = None
         initial_verdict_key: str | None = None
-        if pending_tasks:
+        if pending_tasks or pending_merge_queue_resume_results:
             await _log_feature_event(
                 runner,
                 feature.id,
@@ -17964,7 +18609,10 @@ async def _implement_dag(
                         if (
                             isinstance(result, ImplementationResult)
                             and result.status == "blocked"
-                            and _should_retry_implementation_dispatch_outcome(
+                            and await _should_retry_implementation_dispatch_result(
+                                runner,
+                                feature,
+                                result,
                                 dispatch_outcome,
                                 attempt=attempt,
                                 max_retries=TASK_MAX_RETRIES,
@@ -18220,7 +18868,7 @@ async def _implement_dag(
                 )
             pending_merge_queue = [
                 r
-                for r in new_results
+                for r in [*pending_merge_queue_resume_results, *new_results]
                 if isinstance(r, ImplementationResult)
                 and _result_requires_durable_merge_queue(r)
             ]

@@ -30,8 +30,12 @@ import pytest
 
 from iriai_build_v2.execution_control import (
     ContractVerdict,
+    DispatchAttemptRequest,
+    DispatchOutcome,
     ExecutionControlStore,
     PatchSummary,
+    RuntimeFailureEvidence,
+    StructuredOutputEvidence,
 )
 from iriai_build_v2.execution_control.merge_queue_store import (
     MergeQueueItemCreate,
@@ -1455,3 +1459,177 @@ async def test_record_contract_verdict_persists_started_at_on_real_postgres(
     assert row["kind"] == "contract_verdict"
     # The COALESCE fix restores the schema default; the column is NOT NULL.
     assert row["started_at"] is not None
+
+
+@pytest.mark.asyncio
+async def test_pre_promotion_revalidation_reader_returns_failure_verdict_and_patch(
+    mq_conn,
+) -> None:
+    feature_id = "feat-pre-promotion-revalidation-reader"
+    await _insert_feature(mq_conn, feature_id)
+    contract_id = await _insert_contract(mq_conn, feature_id, "TASK-1")
+    store = ExecutionControlStore(mq_conn)
+    attempt = await store.start_dispatch_attempt(
+        DispatchAttemptRequest(
+            feature_id=feature_id,
+            dag_sha256=_DAG,
+            group_idx=1,
+            task_id="TASK-1",
+            task_name="task",
+            retry=1,
+            retry_identity={"retry": 1},
+            contract_ids=[contract_id],
+            sandbox_id="sandbox-1",
+            actor_role="implementer",
+            actor_metadata={"runtime": "codex"},
+            request_digest="request-digest",
+            idempotency_key=f"idem:dispatch:{feature_id}:TASK-1:1",
+        )
+    )
+    patch = await store.record_patch_summary(
+        PatchSummary(
+            feature_id=feature_id,
+            dag_sha256=_DAG,
+            group_idx=1,
+            attempt_no=1,
+            sandbox_id="sandbox-1",
+            task_id="TASK-1",
+            contract_ids=[contract_id],
+            repo_id="repo-a",
+            changed_paths=["service.py"],
+            modified_paths=["service.py"],
+            diff_sha256="d" * 64,
+            stage="sandbox_capture",
+        )
+    )
+    rejected = await store.record_contract_verdict(
+        ContractVerdict(
+            feature_id=feature_id,
+            dag_sha256=_DAG,
+            group_idx=1,
+            task_id="TASK-1",
+            sandbox_id="canonical-precommit-g1-implementation-repo-repo-a",
+            contract_id=contract_id,
+            patch_summary_id=patch.evidence.id,
+            approved=False,
+            violation_codes=["required_path_missing"],
+            stage="implementation",
+            summary="required_path_missing",
+            metadata={
+                "capture_validated_before_promotion": True,
+                "captured_patch_summary_id": patch.evidence.id,
+                "task_ids": ["TASK-1"],
+            },
+        )
+    )
+    message = (
+        "Task contract validation failed before sandbox promotion "
+        "for TASK-1: required_path_missing"
+    )
+    failure = await store.record_runtime_failure(
+        RuntimeFailureEvidence(
+            attempt_id=attempt.attempt_id,
+            failure_class="sandbox_capture",
+            failure_type="patch_capture_failed",
+            retryable=True,
+            deterministic=False,
+            runtime="codex",
+            terminal_reason="patch_capture_failed",
+            summary=message,
+            payload={"details": {"message": message}},
+        )
+    )
+
+    replay = await store.get_pre_promotion_contract_revalidation_inputs(
+        feature_id=feature_id,
+        attempt_id=attempt.attempt_id,
+        task_id="TASK-1",
+        contract_id=contract_id,
+    )
+
+    assert replay is not None
+    assert replay["runtime_failure"].id == failure.failure_id
+    assert replay["contract_verdict"].id == rejected.evidence.id
+    assert replay["patch_summary"].id == patch.evidence.id
+
+
+@pytest.mark.asyncio
+async def test_pending_durable_merge_reader_recovers_latest_succeeded_patch_ids(
+    mq_conn,
+) -> None:
+    feature_id = "feat-pending-merge-reader"
+    await _insert_feature(mq_conn, feature_id)
+    contract_id = await _insert_contract(mq_conn, feature_id, "TASK-1")
+    store = ExecutionControlStore(mq_conn)
+    attempt = await store.start_dispatch_attempt(
+        DispatchAttemptRequest(
+            feature_id=feature_id,
+            dag_sha256=_DAG,
+            group_idx=1,
+            task_id="TASK-1",
+            task_name="task",
+            retry=0,
+            retry_identity={"retry": 0},
+            contract_ids=[contract_id],
+            sandbox_id="sandbox-1",
+            actor_role="implementer",
+            actor_metadata={"runtime": "codex"},
+            request_digest="request-digest",
+            idempotency_key=f"idem:dispatch:{feature_id}:TASK-1:0",
+        )
+    )
+    structured = await store.record_structured_output(
+        StructuredOutputEvidence(
+            attempt_id=attempt.attempt_id,
+            schema_name="ImplementationResult",
+            schema_digest="schema-digest",
+            valid=True,
+            normalized_payload={
+                "task_id": "TASK-1",
+                "summary": "implemented",
+                "status": "completed",
+                "files_modified": ["repo/app.py"],
+                "notes": "canonical_mutation=pending_durable_merge_queue",
+            },
+        )
+    )
+    patch = await store.record_patch_summary(
+        PatchSummary(
+            feature_id=feature_id,
+            dag_sha256=_DAG,
+            group_idx=1,
+            attempt_no=0,
+            sandbox_id="sandbox-1",
+            task_id="TASK-1",
+            contract_ids=[contract_id],
+            repo_id="repo-a",
+            base_commit="base",
+            changed_paths=["repo/app.py"],
+            modified_paths=["repo/app.py"],
+            diff_sha256="a" * 64,
+            payload={"patch": "diff --git a/repo/app.py b/repo/app.py\n"},
+        )
+    )
+    await store.finish_dispatch_attempt(
+        DispatchOutcome(
+            attempt_id=attempt.attempt_id,
+            state="succeeded",
+            status="succeeded",
+            runtime_terminal_reason="completed",
+            structured_result_evidence_id=structured.evidence.id,
+            patch_summary_ids=[patch.evidence.id],
+            idempotency_key=f"idem:dispatch:{feature_id}:TASK-1:0",
+        )
+    )
+
+    recovered = await store.get_pending_durable_merge_patch_evidence(
+        feature_id=feature_id,
+        dag_sha256=_DAG,
+        group_idx=1,
+        task_id="TASK-1",
+    )
+
+    assert recovered is not None
+    assert recovered["dispatch_attempt_id"] == attempt.attempt_id
+    assert recovered["structured_result_evidence_id"] == structured.evidence.id
+    assert recovered["patch_summary_ids"] == [patch.evidence.id]

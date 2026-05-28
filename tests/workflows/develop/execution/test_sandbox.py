@@ -756,6 +756,50 @@ def test_retained_durable_lease_preserves_evidence_on_same_key_retry(
     assert json.loads(manifest_path.read_text(encoding="utf-8"))["status"] == "retained"
 
 
+def test_retained_mismatched_manifest_requires_new_attempt_without_mutation(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "canonical" / "app"
+    base = init_repo(source)
+    spec = spec_for(base)
+    runner = runner_for(tmp_path, source)
+    lease = run(runner.allocate(spec))
+    root = Path(lease.root)
+    manifest_path = root / "sandbox-manifest.json"
+    run(runner.release(lease, "retain"))
+    retained_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    next_spec = spec.model_copy(update={"contract_ids": [99]})
+
+    with pytest.raises(
+        SandboxAllocationError,
+        match="terminal sandbox lease requires a new attempt",
+    ):
+        run(runner_for(tmp_path, source).allocate(next_spec))
+
+    assert root.exists()
+    assert json.loads(manifest_path.read_text(encoding="utf-8")) == retained_manifest
+
+
+def test_active_mismatched_manifest_still_fails_as_different_lease(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "canonical" / "app"
+    base = init_repo(source)
+    spec = spec_for(base)
+    runner = runner_for(tmp_path, source)
+    lease = run(runner.allocate(spec))
+    root = Path(lease.root)
+    manifest_path = root / "sandbox-manifest.json"
+    active_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    next_spec = spec.model_copy(update={"contract_ids": [99]})
+
+    with pytest.raises(SandboxAllocationError, match="sandbox path already belongs"):
+        run(runner_for(tmp_path, source).allocate(next_spec))
+
+    assert root.exists()
+    assert json.loads(manifest_path.read_text(encoding="utf-8")) == active_manifest
+
+
 def test_recover_scopes_durable_leases_by_feature_and_owner_prefix(
     tmp_path: Path,
 ) -> None:

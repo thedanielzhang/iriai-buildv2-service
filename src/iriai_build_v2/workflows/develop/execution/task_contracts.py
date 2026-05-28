@@ -350,6 +350,19 @@ class ContractCompiler:
                 source=f"file_scope[{idx}].path",
                 match_kind=_declared_match_kind(scope),
             )
+            if action in {"modify", "read_only"}:
+                aliased_path = _resolve_existing_file_scope_alias(
+                    path,
+                    match_kind,
+                    context,
+                    source=f"file_scope[{idx}].path",
+                )
+                if aliased_path != path:
+                    compile_warnings.append(
+                        f"{task_id} file_scope[{idx}].path resolved existing path alias "
+                        f"{path} -> {aliased_path}"
+                    )
+                    path = aliased_path
             if action == "read_only":
                 read_only_paths.append(
                     ContractPathRule(
@@ -708,16 +721,52 @@ class ContractCompiler:
         case_sensitivity = workspace.case_sensitivity or "unknown"
         normalized_patch = _normalize_patch_paths(contract, patch, workspace, violations)
         _validate_patch_case_collisions(normalized_patch, case_sensitivity, violations)
+        base_present_paths = _snapshot_base_present_paths(workspace)
 
         for operation, path in normalized_patch.created:
-            self._validate_patch_operation(contract, path, operation, case_sensitivity, violations)
+            self._validate_patch_operation(
+                contract,
+                path,
+                operation,
+                case_sensitivity,
+                violations,
+                base_present_paths=base_present_paths,
+            )
         for operation, path in normalized_patch.modified:
-            self._validate_patch_operation(contract, path, operation, case_sensitivity, violations)
+            self._validate_patch_operation(
+                contract,
+                path,
+                operation,
+                case_sensitivity,
+                violations,
+                base_present_paths=base_present_paths,
+            )
         for operation, path in normalized_patch.deleted:
-            self._validate_patch_operation(contract, path, operation, case_sensitivity, violations)
+            self._validate_patch_operation(
+                contract,
+                path,
+                operation,
+                case_sensitivity,
+                violations,
+                base_present_paths=base_present_paths,
+            )
         for old_path, new_path in normalized_patch.renamed:
-            self._validate_patch_operation(contract, old_path, "rename_from", case_sensitivity, violations)
-            self._validate_patch_operation(contract, new_path, "rename_to", case_sensitivity, violations)
+            self._validate_patch_operation(
+                contract,
+                old_path,
+                "rename_from",
+                case_sensitivity,
+                violations,
+                base_present_paths=base_present_paths,
+            )
+            self._validate_patch_operation(
+                contract,
+                new_path,
+                "rename_to",
+                case_sensitivity,
+                violations,
+                base_present_paths=base_present_paths,
+            )
 
         changed_count = normalized_patch.change_count
         if changed_count == 0 and _contract_requires_mutation(contract):
@@ -778,6 +827,8 @@ class ContractCompiler:
         operation: str,
         case_sensitivity: CaseSensitivity,
         violations: list[dict[str, str]],
+        *,
+        base_present_paths: set[str] | None = None,
     ) -> None:
         forbidden = _first_matching_rule(contract.forbidden_paths, path, case_sensitivity=case_sensitivity)
         if forbidden is not None:
@@ -854,6 +905,18 @@ class ContractCompiler:
             permitted = any(rule.allow_create for rule in matching)
         elif operation in {"modify"}:
             permitted = any(rule.allow_modify for rule in matching)
+            if not permitted and base_present_paths is not None:
+                permitted = any(
+                    rule.allow_create
+                    and rule.match_kind == "file"
+                    and _same_path(rule.path, path, case_sensitivity)
+                    and _path_present_exact(
+                        base_present_paths,
+                        path,
+                        case_sensitivity=case_sensitivity,
+                    )
+                    for rule in matching
+                )
         elif operation in {"delete", "rename_from"}:
             permitted = any(rule.allow_delete for rule in matching)
         else:
@@ -1138,12 +1201,20 @@ def _compile_legacy_files(
             source=f"legacy files[{idx}]",
             match_kind="directory" if raw_path.strip().endswith("/") else None,
         )
+        comparison_path = path
+        if has_writable_scope:
+            comparison_path = _resolve_existing_file_scope_alias(
+                path,
+                match_kind,
+                context,
+                source=f"legacy files[{idx}]",
+            )
         if has_writable_scope and not any(
-            _rule_matches_path(rule, path, case_sensitivity=context.case_sensitivity)
+            _rule_matches_path(rule, comparison_path, case_sensitivity=context.case_sensitivity)
             for rule in file_scope_rules
         ):
             warnings.append(
-                f"{task_id} legacy files[{idx}]={path} widens non-empty file_scope"
+                f"{task_id} legacy files[{idx}]={comparison_path} widens non-empty file_scope"
             )
             continue
         if not has_writable_scope:
@@ -1398,6 +1469,84 @@ def _normalize_contract_path(
 
     _reject_symlink_escape(context.repo, normalized, source=source)
     return normalized, resolved_kind
+
+
+def _resolve_existing_file_scope_alias(
+    normalized_path: str,
+    match_kind: PathMatchKind,
+    context: _PathContext,
+    *,
+    source: str,
+) -> str:
+    if match_kind != "file" or not context.repo.canonical_path:
+        return normalized_path
+    root = Path(context.repo.canonical_path)
+    if not root.exists():
+        return normalized_path
+    if (root / normalized_path).exists():
+        return normalized_path
+
+    package_roots = _existing_package_roots(root, context.repo)
+    candidates: list[str] = []
+    for package_root in package_roots:
+        candidate = package_root / normalized_path
+        if candidate.is_file():
+            try:
+                candidates.append(candidate.relative_to(root).as_posix())
+            except ValueError:
+                continue
+    candidates = sorted(dict.fromkeys(candidates))
+    if not candidates:
+        return normalized_path
+    if len(candidates) > 1:
+        _raise_compile(
+            "contract_invalid_path",
+            f"{source} has ambiguous existing path aliases for {normalized_path}: "
+            + ", ".join(candidates[:10]),
+            path=normalized_path,
+        )
+    aliased = candidates[0]
+    _reject_symlink_escape(context.repo, aliased, source=source)
+    return aliased
+
+
+def _existing_package_roots(root: Path, repo: RepoIdentity) -> list[Path]:
+    names: list[str] = []
+    for raw in (
+        repo.repo_name,
+        Path(repo.workspace_relative_path).name if repo.workspace_relative_path else "",
+        root.name,
+    ):
+        text = str(raw or "").strip()
+        if not text:
+            continue
+        names.append(text)
+        names.append(text.replace("-", "_"))
+    candidates: list[Path] = []
+    for name in dict.fromkeys(names):
+        for base in (root, root / "src"):
+            candidate = base / name
+            if candidate.is_dir() and (candidate / "__init__.py").exists():
+                candidates.append(candidate)
+    try:
+        for child in root.iterdir():
+            if child.is_dir() and (child / "__init__.py").exists():
+                candidates.append(child)
+        src = root / "src"
+        if src.is_dir():
+            for child in src.iterdir():
+                if child.is_dir() and (child / "__init__.py").exists():
+                    candidates.append(child)
+    except OSError:
+        return []
+    deduped: dict[str, Path] = {}
+    for candidate in candidates:
+        try:
+            key = candidate.resolve(strict=False).as_posix()
+        except OSError:
+            key = candidate.as_posix()
+        deduped[key] = candidate
+    return [deduped[key] for key in sorted(deduped)]
 
 
 def _normalize_patch_paths(
@@ -1896,6 +2045,44 @@ def _snapshot_present_paths(snapshot: WorkspaceSnapshot) -> set[str]:
         if normalized:
             present.add(normalized)
     return present
+
+
+def _snapshot_base_present_paths(snapshot: WorkspaceSnapshot) -> set[str]:
+    present: set[str] = set()
+    for field_name in (
+        "present_paths",
+        "tracked_paths",
+        "all_paths",
+        "existing_paths",
+    ):
+        for path in _string_list(_extra_attr(snapshot, field_name, [])):
+            normalized = _normalize_snapshot_path(path, snapshot)
+            if normalized:
+                present.add(normalized)
+    path_exists = _extra_attr(snapshot, "path_exists", {})
+    if isinstance(path_exists, dict):
+        for path, exists in path_exists.items():
+            if exists:
+                normalized = _normalize_snapshot_path(str(path), snapshot)
+                if normalized:
+                    present.add(normalized)
+    if snapshot.canonical_path:
+        root = Path(snapshot.canonical_path)
+        if root.exists():
+            for rule_path in _string_list(_extra_attr(snapshot, "probe_paths", [])):
+                candidate = _normalize_snapshot_path(rule_path, snapshot)
+                if candidate and (root / candidate.rstrip("/")).exists():
+                    present.add(candidate)
+    return present
+
+
+def _path_present_exact(
+    present_paths: set[str],
+    path: str,
+    *,
+    case_sensitivity: CaseSensitivity,
+) -> bool:
+    return any(_same_path(existing, path, case_sensitivity) for existing in present_paths)
 
 
 def _normalize_snapshot_path(path: str, snapshot: WorkspaceSnapshot) -> str | None:

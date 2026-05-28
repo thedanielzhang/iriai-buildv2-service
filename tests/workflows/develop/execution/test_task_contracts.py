@@ -784,6 +784,207 @@ def test_patch_validation_rejects_forbidden_before_allowed_read_only_and_bad_ope
     assert "rename_to_outside_allowed_paths" in renamed.violation_codes
 
 
+def test_required_create_path_can_be_satisfied_by_base_snapshot_presence(tmp_path: Path) -> None:
+    registry, _feature_root = _registry(tmp_path)
+    repo = registry.repos[0]
+    task = _task(
+        file_scope=[
+            _scope("tests/conftest.py", "modify"),
+            _scope("tests/fixtures/catalog/.gitkeep", "create"),
+        ],
+        acceptance_criteria=[SimpleNamespace(description="Fixture catalog remains available.")],
+    )
+    contract = ContractCompiler().compile_task(_request(registry, task))
+    patch = PatchSummary(
+        sandbox_id="sandbox-required-present",
+        repo_id=repo.repo_id,
+        modified_paths=["tests/conftest.py"],
+        diff_sha256="digest",
+    )
+
+    present = ContractCompiler().validate_patch(
+        contract,
+        patch,
+        _snapshot(
+            repo,
+            present_paths=["tests/conftest.py", "tests/fixtures/catalog/.gitkeep"],
+        ),
+    )
+    assert present.approved is True
+
+    missing = ContractCompiler().validate_patch(
+        contract,
+        patch,
+        _snapshot(repo, present_paths=["tests/conftest.py"]),
+    )
+    assert "required_path_missing" in missing.violation_codes
+
+
+def test_existing_create_deliverable_accepts_modify_during_resume(tmp_path: Path) -> None:
+    registry, _feature_root = _registry(tmp_path)
+    repo = registry.repos[0]
+    task = _task(
+        file_scope=[_scope("src/new.py", "create")],
+        acceptance_criteria=[SimpleNamespace(description="New module is present.")],
+    )
+    contract = ContractCompiler().compile_task(_request(registry, task))
+    patch = PatchSummary(
+        sandbox_id="sandbox-create-resume",
+        repo_id=repo.repo_id,
+        modified_paths=["src/new.py"],
+        diff_sha256="digest",
+    )
+
+    present = ContractCompiler().validate_patch(
+        contract,
+        patch,
+        _snapshot(repo, present_paths=["src/new.py"]),
+    )
+    assert present.approved is True
+
+    absent = ContractCompiler().validate_patch(
+        contract,
+        patch,
+        _snapshot(repo, present_paths=[]),
+    )
+    assert "modify_outside_allowed_paths" in absent.violation_codes
+
+
+def test_file_scope_modify_resolves_unique_existing_package_alias(tmp_path: Path) -> None:
+    feature_root = tmp_path / "workspace" / ".iriai" / "features" / "slice-03" / "repos"
+    registry, feature_root = _registry(
+        tmp_path,
+        repos=[
+            _repo_identity(
+                feature_root,
+                name="iriai-studio-backend",
+                repo_id="backend",
+            )
+        ],
+    )
+    repo_root = feature_root / "iriai-studio-backend"
+    package = repo_root / "iriai_studio_backend"
+    (package / "api").mkdir(parents=True)
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "api" / "approvals.py").write_text("# approvals\n", encoding="utf-8")
+    task = _task(
+        repo_path="iriai-studio-backend",
+        file_scope=[_scope("api/approvals.py", "modify")],
+    )
+
+    contract = ContractCompiler().compile_task(_request(registry, task))
+
+    assert [rule.path for rule in contract.allowed_paths] == [
+        "iriai_studio_backend/api/approvals.py"
+    ]
+    assert any(
+        "api/approvals.py -> iriai_studio_backend/api/approvals.py" in warning
+        for warning in contract.compile_warnings
+    )
+
+
+def test_legacy_files_aliases_for_file_scope_subset_comparison(tmp_path: Path) -> None:
+    feature_root = tmp_path / "workspace" / ".iriai" / "features" / "slice-03" / "repos"
+    registry, feature_root = _registry(
+        tmp_path,
+        repos=[
+            _repo_identity(
+                feature_root,
+                name="iriai-studio-backend",
+                repo_id="backend",
+            )
+        ],
+    )
+    repo_root = feature_root / "iriai-studio-backend"
+    package = repo_root / "iriai_studio_backend"
+    (package / "api" / "schemas").mkdir(parents=True)
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "api" / "approvals.py").write_text("# approvals\n", encoding="utf-8")
+    (package / "api" / "schemas" / "approvals.py").write_text("# schemas\n", encoding="utf-8")
+    task = _task(
+        task_id="T-sf6-s17-005",
+        repo_path="iriai-studio-backend",
+        file_scope=[
+            _scope("api/approvals.py", "modify"),
+            _scope("api/schemas/approvals.py", "modify"),
+        ],
+        files=["api/approvals.py", "api/schemas/approvals.py"],
+    )
+
+    contract = ContractCompiler().compile_task(_request(registry, task))
+
+    assert [rule.path for rule in contract.allowed_paths] == [
+        "iriai_studio_backend/api/approvals.py",
+        "iriai_studio_backend/api/schemas/approvals.py",
+    ]
+    assert not any("legacy files" in warning for warning in contract.compile_warnings)
+
+
+def test_legacy_files_ambiguous_existing_package_alias_fails_closed(tmp_path: Path) -> None:
+    feature_root = tmp_path / "workspace" / ".iriai" / "features" / "slice-03" / "repos"
+    registry, feature_root = _registry(
+        tmp_path,
+        repos=[
+            _repo_identity(
+                feature_root,
+                name="iriai-studio-backend",
+                repo_id="backend",
+            )
+        ],
+    )
+    repo_root = feature_root / "iriai-studio-backend"
+    canonical_package = repo_root / "iriai_studio_backend"
+    (canonical_package / "api").mkdir(parents=True)
+    (canonical_package / "__init__.py").write_text("", encoding="utf-8")
+    (canonical_package / "api" / "known.py").write_text("# known\n", encoding="utf-8")
+    for package_name in ("iriai_studio_backend", "other_pkg"):
+        package = repo_root / package_name
+        (package / "api").mkdir(parents=True, exist_ok=True)
+        (package / "__init__.py").write_text("", encoding="utf-8")
+        (package / "api" / "approvals.py").write_text("# approvals\n", encoding="utf-8")
+    task = _task(
+        repo_path="iriai-studio-backend",
+        file_scope=[_scope("iriai_studio_backend/api/known.py", "modify")],
+        files=["api/approvals.py"],
+    )
+
+    with pytest.raises(ContractCompileError) as exc:
+        ContractCompiler().compile_task(_request(registry, task))
+
+    assert exc.value.failure_type == "contract_invalid_path"
+    assert "ambiguous existing path aliases" in str(exc.value)
+
+
+def test_file_scope_modify_ambiguous_existing_package_alias_fails_closed(tmp_path: Path) -> None:
+    feature_root = tmp_path / "workspace" / ".iriai" / "features" / "slice-03" / "repos"
+    registry, feature_root = _registry(
+        tmp_path,
+        repos=[
+            _repo_identity(
+                feature_root,
+                name="iriai-studio-backend",
+                repo_id="backend",
+            )
+        ],
+    )
+    repo_root = feature_root / "iriai-studio-backend"
+    for package_name in ("iriai_studio_backend", "other_pkg"):
+        package = repo_root / package_name
+        (package / "api").mkdir(parents=True)
+        (package / "__init__.py").write_text("", encoding="utf-8")
+        (package / "api" / "approvals.py").write_text("# approvals\n", encoding="utf-8")
+    task = _task(
+        repo_path="iriai-studio-backend",
+        file_scope=[_scope("api/approvals.py", "modify")],
+    )
+
+    with pytest.raises(ContractCompileError) as exc:
+        ContractCompiler().compile_task(_request(registry, task))
+
+    assert exc.value.failure_type == "contract_invalid_path"
+    assert "ambiguous existing path aliases" in str(exc.value)
+
+
 def test_patch_presence_generated_output_and_digest_mismatch_validation(tmp_path: Path) -> None:
     registry, _feature_root = _registry(tmp_path)
     repo = registry.repos[0]
