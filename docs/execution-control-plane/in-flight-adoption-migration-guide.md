@@ -112,3 +112,74 @@ the root DAG id/hash, the `dag-group:77` artifact id/hash, commit hash,
 the four group task ids, their completed statuses, and active regroup metadata.
 After this marker exists, strict resume
 must not rescan or contract-recompile groups `0..77`; it starts at group `78`.
+
+## Post-Adoption Metadata Repair
+
+If the first strict group exposes legacy task metadata, repair it append-only.
+Do not update historical DAG rows in place and do not restore runtime registry
+inference.
+
+For repo identity repair:
+
+- Run `build_post_adoption_repo_identity_repair_plan(...)`.
+- Require the marker `execution-control-adoption:{feature_id}` to match the
+  sealed range and first strict group.
+- Require the active regroup marker, canonical regroup artifact, rollback
+  projection, root `dag`, and current group's `workspace-authority-registry:gN`.
+- Resolve a missing `repo_id` / `repo_path` only when exactly one registry repo
+  claims the task through `writable_task_ids`, `read_only_task_ids`, or legacy
+  `task_ids`.
+- Append a new root `dag`, canonical regroup projection, rollback projection,
+  active regroup marker, and
+  `execution-control-post-adoption-metadata-repair:{feature_id}:g{N}` audit
+  artifact.
+- Record old and new artifact ids, changed task ids, registry evidence, and the
+  full post-boundary missing-identity scan.
+
+For `8ac124d6` group `78`, the approved repair source is
+`workspace-authority-registry:g78`. The expected change is setting
+`TASK-9-3.repo_path` to `iriai-studio`; already-explicit group `78` tasks remain
+unchanged.
+
+## Bulk Post-Adoption Repo-Identity Repair
+
+If one repaired strict group reveals the same legacy metadata debt in later
+groups, do a single append-only bulk repair instead of pausing one group at a
+time.
+
+- Run `build_post_adoption_repo_identity_bulk_repair_plan(...)`.
+- Scan from `next_effective_group_idx` through the active regroup's final
+  effective group.
+- Build WorkspaceAuthority registry projections for affected groups.
+- Let deterministic single-repo WorkspaceAuthority claims repair tasks without a
+  human choice.
+- Require reviewed records for zero-claim tasks, ambiguous tasks, active-regroup
+  group moves, and cross-repo splits.
+- Reject cross-repo file scopes unless the reviewed record supplies repo-scoped
+  split tasks with full original path coverage.
+- Normalize legacy `files` only when a task already has structured `file_scope`;
+  this prevents old broad file lists from widening strict contracts.
+- Compile every post-boundary group before writing.
+
+The review artifact key is:
+
+```text
+execution-control-post-adoption-repo-identity-review:{feature_id}:g{start}-g{end}
+```
+
+Each reviewed record must include:
+
+- `task_id`
+- `group_idx` when known
+- `repo_path` or `split_tasks`
+- `evidence_type`
+- `evidence_paths`
+- `reviewer_id`
+- `confidence`
+- `blocker` if unresolved
+
+For `8ac124d6`, the bulk repair used the existing `[0, 77] -> 78` adoption
+marker and seed registry `workspace-authority-registry:g78`, then repaired
+future groups `79..145` while compiling the full strict range `78..145`. The
+known cross-repo task `checkpoint-resume-slice-5-TASK-CR5-6` was split into
+backend and frontend repo-scoped tasks instead of being assigned to one repo.

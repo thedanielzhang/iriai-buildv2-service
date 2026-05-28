@@ -53,12 +53,12 @@ def _write_sandbox_manifest(
     return manifest_path
 
 
-def test_budget_tiers_use_opus_4_7_native_1m_context():
-    assert BUDGET_TIERS["opus"] == "claude-opus-4-7"
-    assert BUDGET_TIERS["opus_1m"] == "claude-opus-4-7"
+def test_budget_tiers_use_opus_4_8_native_1m_context():
+    assert BUDGET_TIERS["opus"] == "claude-opus-4-8"
+    assert BUDGET_TIERS["opus_1m"] == "claude-opus-4-8"
 
 
-def test_build_options_default_to_opus_4_7(monkeypatch):
+def test_build_options_default_to_opus_4_8_xhigh(monkeypatch):
     monkeypatch.setitem(
         sys.modules,
         "claude_agent_sdk",
@@ -70,7 +70,24 @@ def test_build_options_default_to_opus_4_7(monkeypatch):
 
     options = runtime._build_options(role, workspace=None)
 
-    assert options.model == "claude-opus-4-7"
+    assert options.model == "claude-opus-4-8"
+    assert options.effort == "xhigh"
+
+
+def test_build_options_preserves_explicit_effort(monkeypatch):
+    monkeypatch.setitem(
+        sys.modules,
+        "claude_agent_sdk",
+        SimpleNamespace(ClaudeAgentOptions=_FakeClaudeAgentOptions),
+    )
+
+    runtime = object.__new__(ClaudeAgentRuntime)
+    role = Role(name="summarizer", prompt="Summarize", tools=["Read"], effort="high")
+
+    options = runtime._build_options(role, workspace=None)
+
+    assert options.model == "claude-opus-4-8"
+    assert options.effort == "high"
 
 
 @pytest.mark.asyncio

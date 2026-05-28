@@ -37,6 +37,21 @@ _PATH_PARAMS: dict[str, str] = {
     "NotebookEdit": "file_path",
 }
 _RUNTIME_WORKSPACE_BINDING_KEY = "runtime_workspace_binding"
+_DEFAULT_CLAUDE_MODEL = "claude-opus-4-8"
+_DEFAULT_CLAUDE_EFFORT = "high"
+_OPUS_4_8_EFFORT = "xhigh"
+
+
+def _default_effort_for_model(model: Any) -> str:
+    if str(model or "").strip() == _DEFAULT_CLAUDE_MODEL:
+        return _OPUS_4_8_EFFORT
+    return _DEFAULT_CLAUDE_EFFORT
+
+
+def _resolve_model_and_effort(role: Any) -> tuple[str, str]:
+    model = str(getattr(role, "model", None) or "").strip() or _DEFAULT_CLAUDE_MODEL
+    effort = getattr(role, "effort", None)
+    return model, str(effort) if effort is not None else _default_effort_for_model(model)
 
 
 def _as_string_list(value: Any) -> list[str]:
@@ -949,13 +964,14 @@ class ClaudeAgentRuntime(AgentRuntime):
                 "enabled": True,
             }
 
+        model, effort = _resolve_model_and_effort(role)
         options = ClaudeAgentOptions(
             system_prompt=role.prompt,
             allowed_tools=role.tools,
-            model=role.model or "claude-opus-4-7",
+            model=model,
             cwd=cwd,
             permission_mode="bypassPermissions",
-            effort=role.effort if role.effort is not None else "high",
+            effort=effort,
             max_buffer_size=50 * 1024 * 1024,  # 50MB — agents may glob large dirs
             sandbox=sandbox,
             can_use_tool=write_guard,

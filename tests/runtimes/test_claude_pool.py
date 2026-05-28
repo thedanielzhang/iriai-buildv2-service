@@ -473,6 +473,8 @@ async def test_bound_pool_manifest_includes_runtime_binding_fields(tmp_path: Pat
         raise AssertionError("bound job was not queued")
 
     manifest = json.loads(queued[0].read_text(encoding="utf-8"))
+    assert manifest["role"]["model"] == "claude-opus-4-8"
+    assert manifest["role"]["effort"] == "xhigh"
     assert manifest["runtime_workspace_binding"]["sandbox_id"] == "sandbox-04"
     assert manifest["sandbox_id"] == "sandbox-04"
     assert manifest["repo_roots"] == [str(cwd / "repo")]

@@ -696,8 +696,137 @@ def test_unknown_write_set_is_isolated_and_group_read_write_conflicts_fail(tmp_p
                 all_task_ids=["TASK-reader", "TASK-writer"],
                 workspace_registry=registry,
             )
-        )
+    )
     assert exc_info.value.failure_type == "contract_scope_conflict"
+
+
+def test_multi_repo_group_compile_requires_explicit_repo_identity(tmp_path: Path) -> None:
+    feature_root = tmp_path / "workspace" / ".iriai" / "features" / "slice-03" / "repos"
+    repos = [
+        _repo_identity(feature_root, name="iriai-studio", repo_id="repo-studio"),
+        _repo_identity(feature_root, name="docs", repo_id="repo-docs"),
+    ]
+    registry, _feature_root = _registry(tmp_path, repos=repos)
+    task = _task(
+        task_id="TASK-9-3",
+        repo_path="",
+        file_scope=[_scope("src/view.ts", "modify")],
+        acceptance_criteria=[SimpleNamespace(description="Update the view.")],
+    )
+
+    with pytest.raises(ContractCompileError) as exc_info:
+        ContractCompiler().compile_group(
+            ContractGroupCompileRequest(
+                feature_id=FEATURE_ID,
+                dag_sha256=DAG_SHA,
+                source_dag_artifact_id=42,
+                source_dag_sha256=SOURCE_DAG_SHA,
+                group_idx=78,
+                tasks=[task],
+                all_task_ids=["TASK-9-3"],
+                workspace_registry=registry,
+            )
+        )
+
+    assert exc_info.value.failure_type == "contract_invalid_path"
+    assert "repo_id or repo_path is required" in str(exc_info.value)
+
+
+def test_multi_repo_group_compile_accepts_repaired_repo_path(tmp_path: Path) -> None:
+    feature_root = tmp_path / "workspace" / ".iriai" / "features" / "slice-03" / "repos"
+    repos = [
+        _repo_identity(feature_root, name="iriai-studio", repo_id="repo-studio"),
+        _repo_identity(feature_root, name="docs", repo_id="repo-docs"),
+    ]
+    registry, _feature_root = _registry(tmp_path, repos=repos)
+    task = _task(
+        task_id="TASK-9-3",
+        repo_path="iriai-studio",
+        file_scope=[_scope("src/view.ts", "modify")],
+        acceptance_criteria=[SimpleNamespace(description="Update the view.")],
+    )
+
+    [contract] = ContractCompiler().compile_group(
+        ContractGroupCompileRequest(
+            feature_id=FEATURE_ID,
+            dag_sha256=DAG_SHA,
+            source_dag_artifact_id=42,
+            source_dag_sha256=SOURCE_DAG_SHA,
+            group_idx=78,
+            tasks=[task],
+            all_task_ids=["TASK-9-3"],
+            workspace_registry=registry,
+        )
+    )
+
+    assert contract.task_id == "TASK-9-3"
+    assert contract.repo_id == "repo-studio"
+    assert contract.repo_path == "iriai-studio"
+
+
+def test_cross_repo_task_fails_unsplit_and_passes_after_split(tmp_path: Path) -> None:
+    feature_root = tmp_path / "workspace" / ".iriai" / "features" / "slice-03" / "repos"
+    repos = [
+        _repo_identity(feature_root, name="iriai-studio", repo_id="repo-studio"),
+        _repo_identity(feature_root, name="docs", repo_id="repo-docs"),
+    ]
+    registry, _feature_root = _registry(tmp_path, repos=repos)
+    unsplit = _task(
+        task_id="TASK-cross",
+        repo_path="iriai-studio",
+        file_scope=[
+            _scope("src/ui.ts", "modify"),
+            _scope("docs/reference.md", "modify"),
+        ],
+        acceptance_criteria=[SimpleNamespace(description="Update UI and docs.")],
+    )
+
+    with pytest.raises(ContractCompileError) as exc_info:
+        ContractCompiler().compile_group(
+            ContractGroupCompileRequest(
+                feature_id=FEATURE_ID,
+                dag_sha256=DAG_SHA,
+                source_dag_artifact_id=42,
+                source_dag_sha256=SOURCE_DAG_SHA,
+                group_idx=131,
+                tasks=[unsplit],
+                all_task_ids=["TASK-cross"],
+                workspace_registry=registry,
+            )
+        )
+
+    assert exc_info.value.failure_type == "contract_invalid_path"
+    assert "points at repo" in str(exc_info.value)
+
+    studio = _task(
+        task_id="TASK-cross-studio",
+        repo_path="iriai-studio",
+        file_scope=[_scope("src/ui.ts", "modify")],
+        acceptance_criteria=[SimpleNamespace(description="Update UI.")],
+    )
+    docs = _task(
+        task_id="TASK-cross-docs",
+        repo_path="docs",
+        file_scope=[_scope("reference.md", "modify")],
+        acceptance_criteria=[SimpleNamespace(description="Update docs.")],
+    )
+    contracts = ContractCompiler().compile_group(
+        ContractGroupCompileRequest(
+            feature_id=FEATURE_ID,
+            dag_sha256=DAG_SHA,
+            source_dag_artifact_id=42,
+            source_dag_sha256=SOURCE_DAG_SHA,
+            group_idx=131,
+            tasks=[studio, docs],
+            all_task_ids=["TASK-cross-studio", "TASK-cross-docs"],
+            workspace_registry=registry,
+        )
+    )
+
+    assert {contract.task_id: contract.repo_id for contract in contracts} == {
+        "TASK-cross-studio": "repo-studio",
+        "TASK-cross-docs": "repo-docs",
+    }
 
 
 def test_contract_digest_is_stable_under_path_rule_ordering(tmp_path: Path) -> None:

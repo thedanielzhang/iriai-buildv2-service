@@ -28,7 +28,7 @@ from pydantic import BaseModel
 from iriai_compose.runner import AgentRuntime
 from iriai_compose.storage import AgentSession, SessionStore
 
-from .claude import _inline_defs, _validate_runtime_workspace_binding
+from .claude import _inline_defs, _resolve_model_and_effort, _validate_runtime_workspace_binding
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -1264,6 +1264,7 @@ class ClaudePoolRuntime(AgentRuntime):
             schema = _inline_defs(output_type.model_json_schema())
             schema_path.write_text(json.dumps(schema, indent=2, sort_keys=True), encoding="utf-8")
 
+        model, effort = _resolve_model_and_effort(role)
         manifest = {
             "id": job_id,
             "kind": "claude",
@@ -1276,8 +1277,8 @@ class ClaudePoolRuntime(AgentRuntime):
             "cwd": manifest_cwd,
             "role": {
                 "name": role.name,
-                "model": str(role.model or "claude-opus-4-7"),
-                "effort": str(role.effort) if role.effort is not None else "high",
+                "model": model,
+                "effort": effort,
                 "tools": [str(tool) for tool in (role.tools or [])],
                 "metadata": {str(k): _jsonable(v) for k, v in (role.metadata or {}).items()},
             },
