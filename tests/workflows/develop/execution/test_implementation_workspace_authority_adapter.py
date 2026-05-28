@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import json
 import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+from iriai_build_v2.execution_control.atomic_landing import InFlightAdoptionRecord
 from iriai_build_v2.models.outputs import ImplementationTask, TaskFileScope
 from iriai_build_v2.workflows.develop.phases import implementation as implementation_module
 from iriai_build_v2.workflows.develop.phases.implementation import (
@@ -910,6 +912,26 @@ def _legacy_completed_group_checkpoint(
     )
 
 
+def _strict_adoption_marker(
+    feature,
+    *,
+    completed_range: tuple[int, int],
+    next_group: int,
+) -> str:
+    return InFlightAdoptionRecord(
+        feature_id=str(feature.id),
+        candidate_commit="candidate-commit",
+        deploy_artifact_id="deploy-artifact",
+        legacy_root_dag_artifact_id=42,
+        legacy_root_dag_sha256="f" * 64,
+        completed_checkpoint_range=completed_range,
+        next_effective_group_idx=next_group,
+        projection_digest="p" * 64,
+        adopted_at=datetime(2026, 5, 28, 12, 0, tzinfo=timezone.utc),
+        pre_adoption_baseline={"test": "sealed"},
+    ).model_dump_json()
+
+
 async def _noop_worktrees(*_args, **_kwargs) -> None:
     return None
 
@@ -919,7 +941,7 @@ async def _alias_guard_ok(*_args, **_kwargs):
 
 
 @pytest.mark.asyncio
-async def test_legacy_completed_checkpoint_skips_before_contract_compile(
+async def test_existing_checkpoint_without_adoption_marker_blocks_before_contract_compile(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     artifacts = _Artifacts()
@@ -962,13 +984,102 @@ async def test_legacy_completed_checkpoint_skips_before_contract_compile(
 
     outcome = await _implement_dag(runner, feature, dag)
 
-    assert compiled_groups == [1]
-    assert "stop at g1" in outcome.failure
-    assert "legacy completed TASK-old" in outcome.implementation_text
+    assert compiled_groups == []
+    assert outcome.terminal_state == "workflow_blocked"
+    assert "execution-control adoption marker" in outcome.failure
+    assert "in-flight-adoption-migration-guide.md" in outcome.failure
 
 
 @pytest.mark.asyncio
-async def test_legacy_approved_checkpoint_skips_partial_result_status(
+async def test_corrupt_adoption_marker_blocks_before_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artifacts = _Artifacts()
+    feature = _feature()
+    artifacts.store["dag-group:0"] = _legacy_completed_group_checkpoint(
+        group_idx=0,
+        task_id="TASK-old",
+    )
+    artifacts.store[f"execution-control-adoption:{feature.id}"] = "{not-json"
+    compiled_groups: list[int] = []
+    dag = implementation_module.ImplementationDAG(
+        tasks=[ImplementationTask(id="TASK-old", name="old", description="old")],
+        execution_order=[["TASK-old"]],
+        complete=True,
+    )
+
+    async def _compile_contracts(*args, **_kwargs):
+        compiled_groups.append(args[3])
+        return implementation_module.TaskContractCompileOutcome(approved=True)
+
+    monkeypatch.setattr(implementation_module, "_ensure_task_worktrees", _noop_worktrees)
+    monkeypatch.setattr(
+        implementation_module,
+        "_run_worktree_alias_pre_dispatch_guard",
+        _alias_guard_ok,
+    )
+    monkeypatch.setattr(
+        implementation_module,
+        "_compile_task_contracts_for_group",
+        _compile_contracts,
+    )
+    runner = SimpleNamespace(artifacts=artifacts, services={})
+
+    outcome = await _implement_dag(runner, feature, dag)
+
+    assert compiled_groups == []
+    assert outcome.terminal_state == "workflow_blocked"
+    assert "corrupt adoption marker" in outcome.failure
+
+
+@pytest.mark.asyncio
+async def test_mismatched_adoption_marker_blocks_before_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artifacts = _Artifacts()
+    feature = _feature()
+    artifacts.store["dag-group:0"] = _legacy_completed_group_checkpoint(
+        group_idx=0,
+        task_id="TASK-old",
+    )
+    artifacts.store[f"execution-control-adoption:{feature.id}"] = _strict_adoption_marker(
+        SimpleNamespace(id="other-feature"),
+        completed_range=(0, 0),
+        next_group=1,
+    )
+    compiled_groups: list[int] = []
+    dag = implementation_module.ImplementationDAG(
+        tasks=[ImplementationTask(id="TASK-old", name="old", description="old")],
+        execution_order=[["TASK-old"]],
+        complete=True,
+    )
+
+    async def _compile_contracts(*args, **_kwargs):
+        compiled_groups.append(args[3])
+        return implementation_module.TaskContractCompileOutcome(approved=True)
+
+    monkeypatch.setattr(implementation_module, "_ensure_task_worktrees", _noop_worktrees)
+    monkeypatch.setattr(
+        implementation_module,
+        "_run_worktree_alias_pre_dispatch_guard",
+        _alias_guard_ok,
+    )
+    monkeypatch.setattr(
+        implementation_module,
+        "_compile_task_contracts_for_group",
+        _compile_contracts,
+    )
+    runner = SimpleNamespace(artifacts=artifacts, services={})
+
+    outcome = await _implement_dag(runner, feature, dag)
+
+    assert compiled_groups == []
+    assert outcome.terminal_state == "workflow_blocked"
+    assert "does not match resumed feature" in outcome.failure
+
+
+@pytest.mark.asyncio
+async def test_existing_partial_checkpoint_without_adoption_marker_blocks(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     artifacts = _Artifacts()
@@ -1015,13 +1126,13 @@ async def test_legacy_approved_checkpoint_skips_partial_result_status(
 
     outcome = await _implement_dag(runner, _feature(), dag)
 
-    assert compiled_groups == [1]
-    assert "stop at g1" in outcome.failure
-    assert "legacy completed TASK-partial-old" in outcome.implementation_text
+    assert compiled_groups == []
+    assert outcome.terminal_state == "workflow_blocked"
+    assert "execution-control adoption marker" in outcome.failure
 
 
 @pytest.mark.asyncio
-async def test_legacy_completed_checkpoint_reruns_after_execution_control_adoption(
+async def test_adoption_marker_skips_sealed_checkpoint_range(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     artifacts = _Artifacts()
@@ -1030,14 +1141,18 @@ async def test_legacy_completed_checkpoint_reruns_after_execution_control_adopti
         group_idx=0,
         task_id="TASK-old",
     )
-    artifacts.store[f"execution-control-adoption:{feature.id}"] = json.dumps(
-        {"status": "adopted", "feature_id": feature.id},
-        sort_keys=True,
+    artifacts.store[f"execution-control-adoption:{feature.id}"] = _strict_adoption_marker(
+        feature,
+        completed_range=(0, 0),
+        next_group=1,
     )
     compiled_groups: list[int] = []
     dag = implementation_module.ImplementationDAG(
-        tasks=[ImplementationTask(id="TASK-old", name="old", description="old")],
-        execution_order=[["TASK-old"]],
+        tasks=[
+            ImplementationTask(id="TASK-old", name="old", description="old"),
+            ImplementationTask(id="TASK-next", name="next", description="next"),
+        ],
+        execution_order=[["TASK-old"], ["TASK-next"]],
         complete=True,
     )
 
@@ -1045,7 +1160,7 @@ async def test_legacy_completed_checkpoint_reruns_after_execution_control_adopti
         compiled_groups.append(args[3])
         return implementation_module.TaskContractCompileOutcome(
             approved=False,
-            failure="adopted group must revalidate",
+            failure="strict resume reached next group",
             failure_class="contract_compile",
             failure_type="contract_invalid_path",
         )
@@ -1065,8 +1180,8 @@ async def test_legacy_completed_checkpoint_reruns_after_execution_control_adopti
 
     outcome = await _implement_dag(runner, feature, dag)
 
-    assert compiled_groups == [0]
-    assert "adopted group must revalidate" in outcome.failure
+    assert compiled_groups == [1]
+    assert "strict resume reached next group" in outcome.failure
     assert "legacy completed TASK-old" not in outcome.implementation_text
 
 
@@ -1113,8 +1228,9 @@ async def test_incomplete_legacy_checkpoint_does_not_skip_contract_compile(
 
     outcome = await _implement_dag(runner, _feature(), dag)
 
-    assert compiled_groups == [0]
-    assert "incomplete group must rerun" in outcome.failure
+    assert compiled_groups == []
+    assert outcome.terminal_state == "workflow_blocked"
+    assert "execution-control adoption marker" in outcome.failure
     assert "legacy completed TASK-missing" not in outcome.implementation_text
 
 
@@ -1167,22 +1283,29 @@ async def test_mismatched_legacy_checkpoint_does_not_skip_contract_compile(
 
     outcome = await _implement_dag(runner, _feature(), dag)
 
-    assert compiled_groups == [0]
-    assert "mismatched group must rerun" in outcome.failure
+    assert compiled_groups == []
+    assert outcome.terminal_state == "workflow_blocked"
+    assert "execution-control adoption marker" in outcome.failure
     assert "legacy completed OTHER" not in outcome.implementation_text
 
 
 @pytest.mark.asyncio
-async def test_legacy_completed_checkpoints_resume_at_group_77(
+async def test_adopted_completed_checkpoints_resume_at_group_78(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     artifacts = _Artifacts()
-    task_ids = [f"TASK-{idx}" for idx in range(78)]
-    for group_idx, task_id in enumerate(task_ids[:77]):
+    feature = _feature()
+    task_ids = [f"TASK-{idx}" for idx in range(79)]
+    for group_idx, task_id in enumerate(task_ids[:78]):
         artifacts.store[f"dag-group:{group_idx}"] = _legacy_completed_group_checkpoint(
             group_idx=group_idx,
             task_id=task_id,
         )
+    artifacts.store[f"execution-control-adoption:{feature.id}"] = _strict_adoption_marker(
+        feature,
+        completed_range=(0, 77),
+        next_group=78,
+    )
     compiled_groups: list[int] = []
     dag = implementation_module.ImplementationDAG(
         tasks=[
@@ -1215,15 +1338,15 @@ async def test_legacy_completed_checkpoints_resume_at_group_77(
     )
     runner = SimpleNamespace(artifacts=artifacts, services={})
 
-    outcome = await _implement_dag(runner, _feature(), dag)
+    outcome = await _implement_dag(runner, feature, dag)
 
-    assert compiled_groups == [77]
-    assert "reached g77" in outcome.failure
-    assert "legacy completed TASK-76" in outcome.implementation_text
+    assert compiled_groups == [78]
+    assert "reached g78" in outcome.failure
+    assert "legacy completed TASK-77" not in outcome.implementation_text
 
 
 @pytest.mark.asyncio
-async def test_contract_compile_resolves_missing_task_repo_from_writable_registry(
+async def test_contract_compile_requires_explicit_task_repo_despite_writable_registry(
     tmp_path: Path,
 ) -> None:
     workspace_root, feature_root = _workspace(tmp_path)
@@ -1255,14 +1378,15 @@ async def test_contract_compile_resolves_missing_task_repo_from_writable_registr
         task,
     )
 
-    assert outcome.approved is True
-    projection = json.loads(artifacts.store["dag-task-contract:TASK-registry"])
-    assert projection["repo_id"] == "repo-app"
-    assert projection["path_counts"]["allowed_paths"] == 1
+    assert outcome.approved is False
+    assert outcome.failure_class == "contract_compile"
+    assert outcome.failure_type == "contract_invalid_path"
+    failure = json.loads(artifacts.store["dag-task-contract:compile-failure:g0"])
+    assert "repo_id or repo_path is required" in failure["error"]
 
 
 @pytest.mark.asyncio
-async def test_contract_compile_resolves_missing_task_repo_from_read_only_registry(
+async def test_contract_compile_requires_explicit_task_repo_despite_read_only_registry(
     tmp_path: Path,
 ) -> None:
     workspace_root, feature_root = _workspace(tmp_path)
@@ -1294,10 +1418,11 @@ async def test_contract_compile_resolves_missing_task_repo_from_read_only_regist
         task,
     )
 
-    assert outcome.approved is True
-    projection = json.loads(artifacts.store["dag-task-contract:TASK-read"])
-    assert projection["repo_id"] == "repo-docs"
-    assert projection["path_counts"]["read_only_paths"] == 1
+    assert outcome.approved is False
+    assert outcome.failure_class == "contract_compile"
+    assert outcome.failure_type == "contract_invalid_path"
+    failure = json.loads(artifacts.store["dag-task-contract:compile-failure:g0"])
+    assert "repo_id or repo_path is required" in failure["error"]
 
 
 @pytest.mark.asyncio
@@ -1337,7 +1462,7 @@ async def test_contract_compile_missing_registry_mapping_keeps_invalid_path_bloc
 
 
 @pytest.mark.asyncio
-async def test_contract_compile_ambiguous_registry_mapping_blocks_without_guessing(
+async def test_contract_compile_does_not_use_ambiguous_registry_mapping(
     tmp_path: Path,
 ) -> None:
     workspace_root, feature_root = _workspace(tmp_path)
@@ -1378,10 +1503,8 @@ async def test_contract_compile_ambiguous_registry_mapping_blocks_without_guessi
     assert outcome.failure_class == "contract_compile"
     assert outcome.failure_type == "contract_invalid_path"
     failure = json.loads(artifacts.store["dag-task-contract:compile-failure:g0"])
-    assert failure["ambiguous_repo_ids_by_task"] == {
-        "TASK-ambiguous": ["repo-app", "repo-lib"]
-    }
-    assert "ambiguous" in failure["error"]
+    assert "ambiguous_repo_ids_by_task" not in failure
+    assert "repo_id or repo_path is required" in failure["error"]
 
 
 @pytest.mark.asyncio
@@ -3248,16 +3371,21 @@ async def test_stale_group_checkpoint_marker_reruns_group(
     dag_sha256 = implementation_module.hashlib.sha256(
         dag.model_dump_json().encode("utf-8")
     ).hexdigest()
+    artifacts.store[f"execution-control-adoption:{feature.id}"] = _strict_adoption_marker(
+        feature,
+        completed_range=(0, 0),
+        next_group=1,
+    )
     stale_result = implementation_module.ImplementationResult(
-        task_id="TASK-0",
+        task_id="TASK-1",
         summary="stale checkpoint result",
         status="completed",
-        files_modified=["app/src/zero.py"],
+        files_modified=["app/src/one.py"],
     )
-    artifacts.store["dag-group:0"] = json.dumps(
+    artifacts.store["dag-group:1"] = json.dumps(
         {
-            "group_idx": 0,
-            "task_ids": ["TASK-0"],
+            "group_idx": 1,
+            "task_ids": ["TASK-1"],
             "results": [stale_result.model_dump()],
             "verdict": "approved",
             "commit_hash": "stale-head",
@@ -3265,11 +3393,11 @@ async def test_stale_group_checkpoint_marker_reruns_group(
         },
         sort_keys=True,
     )
-    artifacts.store["dag-group-commit-proof:0"] = json.dumps(
+    artifacts.store["dag-group-commit-proof:1"] = json.dumps(
         {
             "artifact_schema": "dag-group-commit-proof-v1",
-            "group_idx": 0,
-            "task_ids": ["TASK-0"],
+            "group_idx": 1,
+            "task_ids": ["TASK-1"],
             "dag_sha256": dag_sha256,
             "stage": "checkpoint",
             "commit_hash": "stale-head",
@@ -3318,7 +3446,7 @@ async def test_stale_group_checkpoint_marker_reruns_group(
     outcome = await _implement_dag(_runner(workspace_root, artifacts), feature, dag)
 
     assert "stale checkpoint rerun" in outcome.failure
-    assert ("TASK-0", 0) in recorded
+    assert ("TASK-1", 0) in recorded
     assert "stale checkpoint result" not in outcome.implementation_text
 
 
@@ -3340,9 +3468,16 @@ async def test_dirty_group_checkpoint_marker_reruns_group(
                 description="zero",
                 repo_path="app",
                 file_scope=[TaskFileScope(path="app/src/zero.py", action="modify")],
-            )
+            ),
+            ImplementationTask(
+                id="TASK-1",
+                name="one",
+                description="one",
+                repo_path="app",
+                file_scope=[TaskFileScope(path="app/src/one.py", action="create")],
+            ),
         ],
-        execution_order=[["TASK-0"]],
+        execution_order=[["TASK-0"], ["TASK-1"]],
         complete=True,
     )
     dag_sha256 = implementation_module.hashlib.sha256(
@@ -3350,16 +3485,21 @@ async def test_dirty_group_checkpoint_marker_reruns_group(
     ).hexdigest()
     runner = _runner(workspace_root, artifacts)
     repo_heads = implementation_module._current_feature_repo_heads(runner, feature)
+    artifacts.store[f"execution-control-adoption:{feature.id}"] = _strict_adoption_marker(
+        feature,
+        completed_range=(0, 0),
+        next_group=1,
+    )
     stale_result = implementation_module.ImplementationResult(
-        task_id="TASK-0",
+        task_id="TASK-1",
         summary="checkpoint result before dirty workspace",
         status="completed",
-        files_modified=["app/src/zero.py"],
+        files_modified=["app/src/one.py"],
     )
-    artifacts.store["dag-group:0"] = json.dumps(
+    artifacts.store["dag-group:1"] = json.dumps(
         {
-            "group_idx": 0,
-            "task_ids": ["TASK-0"],
+            "group_idx": 1,
+            "task_ids": ["TASK-1"],
             "results": [stale_result.model_dump()],
             "verdict": "approved",
             "commit_hash": repo_heads,
@@ -3367,11 +3507,11 @@ async def test_dirty_group_checkpoint_marker_reruns_group(
         },
         sort_keys=True,
     )
-    artifacts.store["dag-group-commit-proof:0"] = json.dumps(
+    artifacts.store["dag-group-commit-proof:1"] = json.dumps(
         {
             "artifact_schema": "dag-group-commit-proof-v1",
-            "group_idx": 0,
-            "task_ids": ["TASK-0"],
+            "group_idx": 1,
+            "task_ids": ["TASK-1"],
             "dag_sha256": dag_sha256,
             "stage": "checkpoint",
             "commit_hash": repo_heads,

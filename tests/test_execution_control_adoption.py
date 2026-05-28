@@ -212,6 +212,7 @@ async def test_adopt_in_flight_feature_happy_path() -> None:
 
     # Returned record carries the inputs.
     assert isinstance(record, InFlightAdoptionRecord)
+    assert record.status == "adopted"
     assert record.feature_id == "feat0001"
     assert record.candidate_commit == landing.candidate_commit
     assert record.deploy_artifact_id == landing.deploy_artifact_id
@@ -249,6 +250,7 @@ async def test_adopt_in_flight_feature_marker_body_is_serializable() -> None:
     body = store.put_calls[0][2]
     parsed = json.loads(body)
     assert isinstance(parsed, dict)
+    assert parsed["status"] == "adopted"
     # The legacy reader matches on ``feature_id`` (see
     # _execution_control_marker_is_valid at implementation.py:2488); the
     # marker MUST carry the feature_id field as a top-level key.

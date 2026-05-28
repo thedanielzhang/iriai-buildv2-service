@@ -7576,7 +7576,7 @@ async def test_unmarked_legacy_checkpoint_resume_without_slice06_proofs_is_stale
         '{"status": "legacy-in-flight", "feature_id": "feat-legacy-resume"}',
         feature=feature,
     )
-    assert await implementation_module._dag_group_checkpoint_is_fresh(
+    assert not await implementation_module._dag_group_checkpoint_is_fresh(
         runner,
         feature,
         group_idx=0,
@@ -7586,7 +7586,7 @@ async def test_unmarked_legacy_checkpoint_resume_without_slice06_proofs_is_stale
     )
 
     runner.services["execution_control_store"] = _DurableGraphStore()
-    assert await implementation_module._dag_group_checkpoint_is_fresh(
+    assert not await implementation_module._dag_group_checkpoint_is_fresh(
         runner,
         feature,
         group_idx=0,

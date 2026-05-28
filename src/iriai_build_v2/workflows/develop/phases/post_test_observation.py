@@ -42,7 +42,6 @@ from .implementation import (
     _commit_repos,
     _commit_repos_in_root,
     _dag_group_checkpoint_is_fresh,
-    _feature_has_execution_control_legacy_marker,
     _feature_requires_execution_control_proofs,
     _generate_and_publish_implementation_report,
     _get_feature_root,
@@ -60,10 +59,6 @@ from .implementation import (
     _record_post_dag_gate_proof,
     _record_source_push_workflow_blocker,
     _resolve_active_regroup_before_group_dispatch,
-    _source_push_proof_key,
-    _source_push_proof_payload,
-    _source_push_durable_proof_is_fresh,
-    _source_push_proof_records_are_self_consistent,
 )
 
 logger = logging.getLogger(__name__)
@@ -85,13 +80,6 @@ _POST_DAG_REQUIRED_GATE_KEYS = (
 )
 _POST_TEST_REPUBLISH_PENDING_KEY = "post-test-republish-pending"
 
-_LEGACY_POST_DAG_DERIVED_GATES = frozenset({
-    "source-push",
-    "implementation-report",
-    "notify",
-})
-
-
 async def _current_post_test_tree_digest(
     runner: WorkflowRunner,
     feature: Feature,
@@ -110,59 +98,6 @@ async def _current_post_test_tree_digest(
         authorized_repos=set(authorized_sources),
         authorized_source_roots=authorized_sources,
     )
-
-
-async def _legacy_source_push_gate_status(
-    runner: WorkflowRunner,
-    feature: Feature,
-    current_tree_digest: str,
-) -> str:
-    proof = _source_push_proof_payload(
-        await runner.artifacts.get(_source_push_proof_key(), feature=feature)
-    )
-    if not proof:
-        return "missing"
-    if _get_feature_root(runner, feature) is not None:
-        if await _source_push_durable_proof_is_fresh(
-            runner,
-            feature,
-            current_tree_digest,
-        ):
-            return "satisfied"
-        return "stale"
-    if _source_push_proof_records_are_self_consistent(proof, current_tree_digest):
-        return "satisfied"
-    return "stale"
-
-
-async def _legacy_post_dag_gate_is_satisfied(
-    runner: WorkflowRunner,
-    feature: Feature,
-    gate_name: str,
-    current_tree_digest: str | None = None,
-) -> bool:
-    if gate_name == "source-push":
-        if not current_tree_digest:
-            current_tree_digest = await _current_post_test_tree_digest(runner, feature)
-        return (
-            await _legacy_source_push_gate_status(
-                runner,
-                feature,
-                current_tree_digest,
-            )
-            == "satisfied"
-        )
-    if gate_name == "implementation-report":
-        return bool(
-            await runner.artifacts.get("implementation-report", feature=feature)
-            and await runner.artifacts.get(
-                "implementation-report-metadata",
-                feature=feature,
-            )
-        )
-    if gate_name == "notify":
-        return bool(await runner.artifacts.get("dag-notify-delivery", feature=feature))
-    return False
 
 
 async def _quiesce_post_test_workflow_blocker(
@@ -288,25 +223,12 @@ async def _raise_if_dag_incomplete_before_post_test(
 
     current_tree_digest = await _current_post_test_tree_digest(runner, feature)
     observed_control_plane_proofs = 0
-    control_plane_required = await _post_test_requires_control_plane_proofs(
-        runner,
-        feature,
-    )
-    legacy_marker_present = await _feature_has_execution_control_legacy_marker(
-        runner,
-        feature,
-    )
     for gate_key in _POST_DAG_REQUIRED_GATE_KEYS:
         gate_name = gate_key.removeprefix("dag-gate:")
         proof_key = f"dag-gate-proof:{gate_name}"
         if await runner.artifacts.get(proof_key, feature=feature):
             observed_control_plane_proofs += 1
-    legacy_artifact_only_gates = (
-        observed_control_plane_proofs == 0
-        and not control_plane_required
-        and legacy_marker_present
-    )
-    if observed_control_plane_proofs == 0 and not legacy_artifact_only_gates:
+    if observed_control_plane_proofs == 0:
         await _quiesce_post_test_workflow_blocker(
             runner,
             feature,
@@ -326,34 +248,10 @@ async def _raise_if_dag_incomplete_before_post_test(
     for gate_key in _POST_DAG_REQUIRED_GATE_KEYS:
         gate_name = gate_key.removeprefix("dag-gate:")
         gate_value = await runner.artifacts.get(gate_key, feature=feature)
-        if legacy_artifact_only_gates and gate_name == "source-push":
-            source_push_status = await _legacy_source_push_gate_status(
-                runner,
-                feature,
-                current_tree_digest,
-            )
-            if source_push_status == "missing":
-                missing_gates.append(gate_key)
-                continue
-            if source_push_status == "stale":
-                stale_gates.append(gate_key)
-                continue
-            if not gate_value:
-                continue
         if not gate_value:
-            if (
-                legacy_artifact_only_gates
-                and gate_name in _LEGACY_POST_DAG_DERIVED_GATES
-                and await _legacy_post_dag_gate_is_satisfied(
-                    runner,
-                    feature,
-                    gate_name,
-                )
-            ):
-                continue
             missing_gates.append(gate_key)
             continue
-        if not legacy_artifact_only_gates and not await _post_dag_gate_is_fresh(
+        if not await _post_dag_gate_is_fresh(
             runner,
             feature,
             gate_name,

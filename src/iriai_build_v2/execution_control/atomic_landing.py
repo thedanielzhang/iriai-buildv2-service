@@ -770,6 +770,7 @@ class InFlightAdoptionRecord(BaseModel):
     back into this contract via ``model_validate_json``.
     """
 
+    status: Literal["adopted"] = "adopted"
     feature_id: str
     candidate_commit: str
     deploy_artifact_id: str

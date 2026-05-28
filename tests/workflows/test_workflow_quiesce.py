@@ -1615,7 +1615,7 @@ async def test_post_test_observation_rejects_unmarked_artifact_only_legacy_gates
 
 
 @pytest.mark.asyncio
-async def test_post_test_observation_allows_marked_artifact_only_legacy_gates_without_slice06_proofs(
+async def test_post_test_observation_rejects_marked_artifact_only_legacy_gates_without_slice06_proofs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     dag = ImplementationDAG(
@@ -1639,6 +1639,9 @@ async def test_post_test_observation_allows_marked_artifact_only_legacy_gates_wi
         collected.append(1)
         return ObservationReport(observations=[])
 
+    async def _fresh_post_dag_gate(*_args, **_kwargs):
+        return True
+
     monkeypatch.setattr(
         implementation_module,
         "_feature_repos_clean_for_checkpoint_resume",
@@ -1651,13 +1654,16 @@ async def test_post_test_observation_allows_marked_artifact_only_legacy_gates_wi
     )
     monkeypatch.setattr(PostTestObservationPhase, "_collect_observations", _collect)
 
-    await PostTestObservationPhase().execute(runner, _feature(), BuildState())
+    with pytest.raises(WorkflowQuiesced) as exc_info:
+        await PostTestObservationPhase().execute(runner, _feature(), BuildState())
 
-    assert collected == [1]
+    assert collected == []
+    assert exc_info.value.reason == "post_test_blocked_post_dag_gates_incomplete"
+    assert exc_info.value.metadata["observed_control_plane_proofs"] == 0
 
 
 @pytest.mark.asyncio
-async def test_post_test_observation_derives_legacy_downstream_gates_from_artifacts(
+async def test_post_test_observation_rejects_legacy_downstream_gates_without_proofs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     dag = ImplementationDAG(
@@ -1728,9 +1734,12 @@ async def test_post_test_observation_derives_legacy_downstream_gates_from_artifa
     )
     monkeypatch.setattr(PostTestObservationPhase, "_collect_observations", _collect)
 
-    await PostTestObservationPhase().execute(runner, _feature(), BuildState())
+    with pytest.raises(WorkflowQuiesced) as exc_info:
+        await PostTestObservationPhase().execute(runner, _feature(), BuildState())
 
-    assert collected == [1]
+    assert collected == []
+    assert exc_info.value.reason == "post_test_blocked_post_dag_gates_incomplete"
+    assert exc_info.value.metadata["observed_control_plane_proofs"] == 0
 
 
 @pytest.mark.asyncio
@@ -1805,7 +1814,7 @@ async def test_post_test_observation_rejects_marked_legacy_missing_source_push_e
         await PostTestObservationPhase().execute(runner, _feature(), BuildState())
 
     assert exc_info.value.reason == "post_test_blocked_post_dag_gates_incomplete"
-    assert exc_info.value.metadata["first_missing_gate"] == "dag-gate:source-push"
+    assert exc_info.value.metadata["observed_control_plane_proofs"] == 0
 
 
 @pytest.mark.asyncio
@@ -1840,8 +1849,8 @@ async def test_post_test_observation_rejects_marked_legacy_empty_source_push_pro
     with pytest.raises(WorkflowQuiesced) as exc_info:
         await PostTestObservationPhase().execute(runner, _feature(), BuildState())
 
-    assert exc_info.value.reason == "post_test_blocked_post_dag_gates_stale"
-    assert exc_info.value.metadata["first_stale_gate"] == "dag-gate:source-push"
+    assert exc_info.value.reason == "post_test_blocked_post_dag_gates_incomplete"
+    assert exc_info.value.metadata["observed_control_plane_proofs"] == 0
 
 
 @pytest.mark.asyncio
@@ -1875,8 +1884,8 @@ async def test_post_test_observation_rejects_marked_legacy_stale_source_push_pro
     with pytest.raises(WorkflowQuiesced) as exc_info:
         await PostTestObservationPhase().execute(runner, _feature(), BuildState())
 
-    assert exc_info.value.reason == "post_test_blocked_post_dag_gates_stale"
-    assert exc_info.value.metadata["first_stale_gate"] == "dag-gate:source-push"
+    assert exc_info.value.reason == "post_test_blocked_post_dag_gates_incomplete"
+    assert exc_info.value.metadata["observed_control_plane_proofs"] == 0
 
 
 @pytest.mark.asyncio
@@ -1915,7 +1924,7 @@ async def test_post_test_observation_rejects_marked_legacy_malformed_source_push
         await PostTestObservationPhase().execute(runner, _feature(), BuildState())
 
     assert exc_info.value.reason == "post_test_blocked_post_dag_gates_incomplete"
-    assert exc_info.value.metadata["first_missing_gate"] == "dag-gate:source-push"
+    assert exc_info.value.metadata["observed_control_plane_proofs"] == 0
 
 
 @pytest.mark.asyncio
@@ -1960,46 +1969,13 @@ async def test_post_test_observation_rejects_marked_legacy_weak_unchanged_source
     with pytest.raises(WorkflowQuiesced) as exc_info:
         await PostTestObservationPhase().execute(runner, _feature(), BuildState())
 
-    assert exc_info.value.reason == "post_test_blocked_post_dag_gates_stale"
-    assert exc_info.value.metadata["first_stale_gate"] == "dag-gate:source-push"
+    assert exc_info.value.reason == "post_test_blocked_post_dag_gates_incomplete"
+    assert exc_info.value.metadata["observed_control_plane_proofs"] == 0
 
 
 @pytest.mark.asyncio
-async def test_legacy_source_push_status_uses_durable_freshness_with_feature_root(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    current_tree = _empty_workspace_tree_digest()
-    artifacts = _Artifacts({
-        implementation_module._source_push_proof_key(): _source_push_proof_for_digest(
-            current_tree
-        )
-    })
-    runner = _runner(_FeatureStore(), artifacts)
-    calls: list[str] = []
-
-    async def _not_fresh(_runner, _feature, tree_digest):
-        calls.append(tree_digest)
-        return False
-
-    monkeypatch.setattr(
-        post_test_module,
-        "_get_feature_root",
-        lambda *_args, **_kwargs: Path("/tmp/feature-root"),
-    )
-    monkeypatch.setattr(
-        post_test_module,
-        "_source_push_durable_proof_is_fresh",
-        _not_fresh,
-    )
-
-    status = await post_test_module._legacy_source_push_gate_status(
-        runner,
-        _feature(),
-        current_tree,
-    )
-
-    assert status == "stale"
-    assert calls == [current_tree]
+async def test_legacy_source_push_status_helper_is_removed() -> None:
+    assert not hasattr(post_test_module, "_legacy_source_push_gate_status")
 
 
 @pytest.mark.asyncio
@@ -2014,14 +1990,17 @@ async def test_post_test_observation_rejects_marked_legacy_gates_with_stale_chec
     artifacts = _Artifacts({
         "dag": dag.model_dump_json(),
         "dag-group:0": '{"group_idx": 0, "results": []}',
-        "execution-control-legacy:feat-quiesce": '{"status": "legacy-in-flight"}',
-        **_legacy_post_dag_gate_artifacts(),
+        **_post_dag_gate_artifacts(),
     })
     runner = _runner(_FeatureStore(), artifacts)
 
     async def _must_not_collect(*_args, **_kwargs):
         raise AssertionError("post-test observation must validate legacy checkpoint bodies")
 
+    async def _fresh_post_dag_gate(*_args, **_kwargs):
+        return True
+
+    monkeypatch.setattr(post_test_module, "_post_dag_gate_is_fresh", _fresh_post_dag_gate)
     monkeypatch.setattr(PostTestObservationPhase, "_collect_observations", _must_not_collect)
 
     with pytest.raises(WorkflowQuiesced) as exc_info:
@@ -2127,8 +2106,7 @@ async def test_post_test_observation_does_not_accept_base_hash_for_regroup_bound
             {"status": "active", "base_dag_sha256": base_sha},
             sort_keys=True,
         ),
-        "execution-control-legacy:feat-quiesce": '{"status": "legacy-in-flight"}',
-        **_legacy_post_dag_gate_artifacts(),
+        **_post_dag_gate_artifacts(),
     }
     for idx, task in enumerate(tasks):
         artifacts_payload[f"dag-group:{idx}"] = implementation_module.json.dumps(
@@ -2166,6 +2144,9 @@ async def test_post_test_observation_does_not_accept_base_hash_for_regroup_bound
         collected.append(1)
         return ObservationReport(observations=[])
 
+    async def _fresh_post_dag_gate(*_args, **_kwargs):
+        return True
+
     monkeypatch.setattr(
         post_test_module,
         "_resolve_active_regroup_before_group_dispatch",
@@ -2175,6 +2156,11 @@ async def test_post_test_observation_does_not_accept_base_hash_for_regroup_bound
         post_test_module,
         "_dag_group_checkpoint_is_fresh",
         _checkpoint_fresh,
+    )
+    monkeypatch.setattr(
+        post_test_module,
+        "_post_dag_gate_is_fresh",
+        _fresh_post_dag_gate,
     )
     monkeypatch.setattr(PostTestObservationPhase, "_collect_observations", _collect)
 

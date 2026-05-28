@@ -18,6 +18,7 @@ contract)."
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -1443,6 +1444,7 @@ def test_in_flight_adoption_record_happy_path() -> None:
     default rollback disposition (the conservative option)."""
 
     record = InFlightAdoptionRecord(**_adoption_record_kwargs())
+    assert record.status == "adopted"
     assert record.feature_id == "feat0001"
     assert record.candidate_commit == "abc123deadbeef"
     assert record.deploy_artifact_id == "artifact-2026-05-23"
@@ -1476,6 +1478,7 @@ def test_in_flight_adoption_record_serializable_round_trip() -> None:
     raw = record.model_dump_json()
     rebuilt = InFlightAdoptionRecord.model_validate_json(raw)
     assert rebuilt == record
+    assert json.loads(raw)["status"] == "adopted"
     assert rebuilt.adopted_by == "operator-alice"
     assert rebuilt.landing_gate_result_id == "alg-result-42"
     assert rebuilt.pre_adoption_baseline == {

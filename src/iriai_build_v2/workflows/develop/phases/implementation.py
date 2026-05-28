@@ -222,6 +222,11 @@ except ImportError:  # pragma: no cover - Slice 08 modules may be absent in old 
     merge_queue_git_service = None  # type: ignore[assignment]
 
 try:
+    from ....execution_control.atomic_landing import InFlightAdoptionRecord
+except ImportError:  # pragma: no cover - adoption model may be absent in old installs.
+    InFlightAdoptionRecord = None  # type: ignore[assignment]
+
+try:
     from iriai_build_v2.execution_control import (
         ContractVerdict as StoredContractVerdict,
         DispatchAttemptRequest as StoredDispatchAttemptRequest,
@@ -2462,35 +2467,108 @@ async def _feature_requires_execution_control_proofs(
     )
 
 
-async def _feature_has_execution_control_legacy_marker(
+_ADOPTION_MIGRATION_GUIDE_PATH = (
+    "docs/execution-control-plane/in-flight-adoption-migration-guide.md"
+)
+
+
+def _coerce_adoption_marker_body(raw: Any) -> str:
+    if isinstance(raw, str):
+        return raw
+    if isinstance(raw, (bytes, bytearray)):
+        return bytes(raw).decode("utf-8", "surrogateescape")
+    if isinstance(raw, (dict, list)):
+        return json.dumps(raw)
+    return str(raw)
+
+
+async def _execution_control_adoption_record_for_resume(
     runner: WorkflowRunner,
     feature: Feature,
-) -> bool:
-    if await _feature_requires_execution_control_proofs(runner, feature):
-        return False
+) -> tuple[Any | None, str]:
     feature_id = str(getattr(feature, "id", "") or "")
     if not feature_id:
-        return False
-    marker = await _execution_control_marker_payload(
-        runner,
-        feature,
-        (
-            f"execution-control-legacy:{feature_id}",
-            f"execution-control-legacy-inflight:{feature_id}",
-        ),
+        return None, "feature id is missing; cannot locate adoption marker"
+    if InFlightAdoptionRecord is None:
+        return None, "InFlightAdoptionRecord model is unavailable"
+    marker_key = f"execution-control-adoption:{feature_id}"
+    try:
+        raw = await runner.artifacts.get(marker_key, feature=feature)
+    except Exception as exc:  # noqa: BLE001
+        return None, f"failed to read {marker_key}: {type(exc).__name__}: {exc}"
+    if raw is None or raw == "":
+        return None, f"missing required adoption marker {marker_key}"
+    try:
+        record = InFlightAdoptionRecord.model_validate_json(
+            _coerce_adoption_marker_body(raw)
+        )
+    except Exception as exc:  # noqa: BLE001
+        return None, (
+            f"corrupt adoption marker {marker_key}: "
+            f"{type(exc).__name__}: {exc}"
+        )
+    if str(getattr(record, "feature_id", "") or "") != feature_id:
+        return None, (
+            f"adoption marker feature_id {getattr(record, 'feature_id', '')!r} "
+            f"does not match resumed feature {feature_id!r}"
+        )
+    if str(getattr(record, "status", "") or "").strip().lower() != "adopted":
+        return None, (
+            f"adoption marker {marker_key} status must be 'adopted', got "
+            f"{getattr(record, 'status', '')!r}"
+        )
+    return record, ""
+
+
+def _execution_control_adoption_resume_blocker(reason: str) -> str:
+    return _workflow_blocker_text(
+        "Strict execution-control resume requires a valid execution-control "
+        "adoption marker before dispatching any feature with existing "
+        f"dag-group state. {reason}. "
+        f"Run the in-flight adoption migration playbook at "
+        f"{_ADOPTION_MIGRATION_GUIDE_PATH}; do not edit root DAG artifacts or "
+        "delete pause/failure artifacts manually."
     )
-    return _execution_control_marker_is_valid(
-        marker,
-        feature_id=feature_id,
-        valid_statuses={
-            "active",
-            "in-flight",
-            "in_flight",
-            "legacy",
-            "legacy-in-flight",
-            "legacy_in_flight",
-        },
-    )
+
+
+def _validate_adoption_resume_boundary(
+    record: Any,
+    *,
+    group_count: int,
+) -> str:
+    try:
+        start, end = tuple(getattr(record, "completed_checkpoint_range"))
+        next_group = int(getattr(record, "next_effective_group_idx"))
+    except Exception as exc:  # noqa: BLE001
+        return f"adoption marker boundary fields are invalid: {exc}"
+    if start != 0:
+        return (
+            "adoption marker completed_checkpoint_range must start at 0 for "
+            f"strict resume, got ({start}, {end})"
+        )
+    if next_group != end + 1:
+        return (
+            "adoption marker next_effective_group_idx must equal the first "
+            f"post-baseline group ({end + 1}), got {next_group}"
+        )
+    if next_group > group_count:
+        return (
+            "adoption marker next_effective_group_idx is beyond the effective "
+            f"DAG group count ({next_group} > {group_count})"
+        )
+    return ""
+
+
+async def _first_existing_dag_group_idx(
+    runner: WorkflowRunner,
+    feature: Feature,
+    *,
+    group_count: int,
+) -> int | None:
+    for group_idx in range(group_count):
+        if await runner.artifacts.get(f"dag-group:{group_idx}", feature=feature):
+            return group_idx
+    return None
 
 
 async def _execution_control_marker_payload(
@@ -2834,66 +2912,6 @@ def _task_contract_prompt_block(contract: Any | None) -> str:
     return "\n".join(sections)
 
 
-def _value_attr(value: Any, key: str, default: Any = "") -> Any:
-    if isinstance(value, dict):
-        return value.get(key, default)
-    return getattr(value, key, default)
-
-
-def _repo_ids_by_task_from_registry(
-    registry: Any,
-    group_tasks: list[ImplementationTask],
-) -> tuple[dict[str, str], dict[str, list[str]]]:
-    task_ids_needing_registry: set[str] = set()
-    for task in group_tasks:
-        task_id = str(_value_attr(task, "id", "") or "")
-        if not task_id:
-            continue
-        explicit_repo_id = str(_value_attr(task, "repo_id", "") or "").strip()
-        explicit_repo_path = str(_value_attr(task, "repo_path", "") or "").strip()
-        if explicit_repo_id or explicit_repo_path:
-            continue
-        task_ids_needing_registry.add(task_id)
-    if not task_ids_needing_registry:
-        return {}, {}
-
-    candidate_repo_ids: dict[str, set[str]] = {
-        task_id: set() for task_id in task_ids_needing_registry
-    }
-    for repo in list(_value_attr(registry, "repos", []) or []):
-        repo_id = str(_value_attr(repo, "repo_id", "") or "").strip()
-        if not repo_id:
-            continue
-        repo_task_ids: list[str] = []
-        for attr in ("writable_task_ids", "read_only_task_ids", "task_ids"):
-            raw_ids = _value_attr(repo, attr, []) or []
-            if isinstance(raw_ids, str):
-                raw_iterable = [raw_ids]
-            else:
-                try:
-                    raw_iterable = list(raw_ids)
-                except TypeError:
-                    raw_iterable = []
-            repo_task_ids.extend(
-                str(raw_task_id) for raw_task_id in raw_iterable if str(raw_task_id)
-            )
-        for task_id in set(repo_task_ids):
-            if task_id in candidate_repo_ids:
-                candidate_repo_ids[task_id].add(repo_id)
-
-    repo_ids_by_task = {
-        task_id: next(iter(repo_ids))
-        for task_id, repo_ids in candidate_repo_ids.items()
-        if len(repo_ids) == 1
-    }
-    ambiguous = {
-        task_id: sorted(repo_ids)
-        for task_id, repo_ids in candidate_repo_ids.items()
-        if len(repo_ids) > 1
-    }
-    return repo_ids_by_task, ambiguous
-
-
 async def _compile_task_contracts_for_group(
     runner: WorkflowRunner,
     feature: Feature,
@@ -2920,45 +2938,6 @@ async def _compile_task_contracts_for_group(
             failure_class="contract_compile",
             failure_type="contract_missing_workspace_registry",
             route="quiesce",
-        )
-    repo_ids_by_task, ambiguous_repo_ids_by_task = _repo_ids_by_task_from_registry(
-        registry,
-        group_tasks,
-    )
-    if ambiguous_repo_ids_by_task:
-        artifact_key = f"dag-task-contract:compile-failure:g{group_idx}"
-        error = (
-            "task repo identity is ambiguous in the canonical registry: "
-            + ", ".join(
-                f"{task_id} -> {repo_ids}"
-                for task_id, repo_ids in sorted(ambiguous_repo_ids_by_task.items())
-            )
-        )
-        await runner.artifacts.put(
-            artifact_key,
-            _workspace_authority_json({
-                "artifact_schema": "dag-task-contract-compile-failure-v1",
-                "group_idx": group_idx,
-                "approved": False,
-                "failure_class": "contract_compile",
-                "failure_type": "contract_invalid_path",
-                "route": "run_contract_repair",
-                "error": error,
-                "task_ids": [task.id for task in group_tasks],
-                "ambiguous_repo_ids_by_task": ambiguous_repo_ids_by_task,
-            }),
-            feature=feature,
-        )
-        return TaskContractCompileOutcome(
-            approved=False,
-            failure=(
-                "Task deliverable contract compilation failed before dispatch. "
-                f"contract_compile/contract_invalid_path: {error}"
-            ),
-            failure_class="contract_compile",
-            failure_type="contract_invalid_path",
-            route="run_contract_repair",
-            artifact_key=artifact_key,
         )
     preexisting_digests: dict[str, str] = {}
     for task in group_tasks:
@@ -2999,7 +2978,6 @@ async def _compile_task_contracts_for_group(
                 tasks=group_tasks,
                 all_task_ids=[task.id for task in dag.tasks],
                 workspace_registry=registry,
-                repo_ids_by_task=repo_ids_by_task,
                 manifest_expected_files=manifest_entries.get("expected_files", []),
                 manifest_forbidden_files=manifest_entries.get("forbidden_files", []),
                 external_acceptance_criteria=external_acceptance_criteria,
@@ -3045,6 +3023,12 @@ async def _compile_task_contracts_for_group(
         contracts_by_task_id=persisted,
         preexisting_contract_digests=preexisting_digests,
     )
+
+
+def _value_attr(value: Any, key: str, default: Any = "") -> Any:
+    if isinstance(value, dict):
+        return value.get(key, default)
+    return getattr(value, key, default)
 
 
 def _contract_repo_id(contract: Any) -> str:
@@ -17931,7 +17915,43 @@ async def _implement_dag(
 
     # ── Resume: reconstruct state from checkpointed groups ──────────
     start_group = 0
-    for g_idx in range(len(dag.execution_order)):
+    first_existing_group = await _first_existing_dag_group_idx(
+        runner,
+        feature,
+        group_count=len(dag.execution_order),
+    )
+    if first_existing_group is not None:
+        adoption_record, adoption_error = (
+            await _execution_control_adoption_record_for_resume(runner, feature)
+        )
+        if adoption_error:
+            return DagExecutionOutcome(
+                implementation_text="",
+                failure=_execution_control_adoption_resume_blocker(adoption_error),
+                handover=handover,
+                terminal_state="workflow_blocked",
+            )
+        boundary_error = _validate_adoption_resume_boundary(
+            adoption_record,
+            group_count=len(dag.execution_order),
+        )
+        if boundary_error:
+            return DagExecutionOutcome(
+                implementation_text="",
+                failure=_execution_control_adoption_resume_blocker(boundary_error),
+                handover=handover,
+                terminal_state="workflow_blocked",
+            )
+        start_group = int(getattr(adoption_record, "next_effective_group_idx"))
+        logger.info(
+            "Feature %s adopted into strict execution-control resume: "
+            "skipping sealed checkpoint range %s and starting at group %d",
+            getattr(feature, "id", ""),
+            getattr(adoption_record, "completed_checkpoint_range", None),
+            start_group,
+        )
+
+    for g_idx in range(start_group, len(dag.execution_order)):
         group_task_ids = list(dag.execution_order[g_idx])
         accepted_dag_sha256s = []
         if regroup_overlay_applied and g_idx < regroup_offset:
@@ -17964,16 +17984,7 @@ async def _implement_dag(
             checkpoint=data,
             accepted_dag_sha256s=accepted_dag_sha256s,
         )
-        legacy_completed_skip = False
         if not checkpoint_fresh:
-            legacy_completed_skip = await _legacy_completed_checkpoint_can_skip_without_proofs(
-                runner,
-                feature,
-                group_idx=g_idx,
-                group_task_ids=group_task_ids,
-                checkpoint=data,
-            )
-        if not checkpoint_fresh and not legacy_completed_skip:
             logger.warning(
                 "Group %d checkpoint marker is stale or lacks durable proof — re-running",
                 g_idx,
@@ -18001,12 +18012,6 @@ async def _implement_dag(
                     handover=handover,
                     terminal_state="workflow_blocked",
                 )
-        else:
-            logger.info(
-                "Group %d legacy completed checkpoint lacks durable proof but "
-                "is pre-adoption — skipping contract recompile",
-                g_idx,
-            )
         for r_data in data.get("results", []):
             try:
                 result = ImplementationResult.model_validate(r_data)
@@ -20619,37 +20624,6 @@ def _checkpoint_results_match_tasks(
     return sorted(result_task_ids) == sorted(group_task_ids) and len(set(result_task_ids)) == len(result_task_ids)
 
 
-async def _legacy_completed_checkpoint_can_skip_without_proofs(
-    runner: WorkflowRunner,
-    feature: Feature,
-    *,
-    group_idx: int,
-    group_task_ids: list[str],
-    checkpoint: dict[str, Any],
-) -> bool:
-    if await _feature_requires_execution_control_proofs(runner, feature):
-        return False
-    if not isinstance(checkpoint, dict):
-        return False
-    if checkpoint.get("group_idx") != group_idx:
-        return False
-    if checkpoint.get("verdict") != "approved":
-        return False
-    if list(checkpoint.get("task_ids") or []) != list(group_task_ids):
-        return False
-    if await _artifact_exists(runner, feature, f"dag-group-commit-proof:{group_idx}"):
-        return False
-    if await _artifact_exists(runner, feature, f"dag-checkpoint-gate-proof:{group_idx}"):
-        return False
-    # Pre-control-plane legacy checkpoints sometimes preserved per-task
-    # statuses such as "partial" even after the aggregate group verdict was
-    # approved. For this pre-adoption skip path, exact result coverage plus the
-    # approved checkpoint verdict is the compatibility contract.
-    if not _checkpoint_results_match_tasks(checkpoint, group_task_ids):
-        return False
-    return True
-
-
 async def _record_dag_checkpoint_gate_proof(
     runner: WorkflowRunner,
     feature: Feature,
@@ -21278,8 +21252,8 @@ async def _dag_group_checkpoint_is_fresh(
         # `checkpoint_gate_evidence_id` / `checkpoint_evidence_id` /
         # `checkpoint_projection_id`, schema-enforced for `done`). When the
         # durable queue's typed evidence backs this `dag-group:*` body, the
-        # checkpoint is fresh. This is a NEW code path; if the queue evidence
-        # does NOT back it, fall through to the unchanged legacy-marker logic.
+        # checkpoint is fresh. If the queue evidence does NOT back it, fail
+        # closed; legacy marker compatibility was removed at strict cutover.
         if await _dag_group_queue_checkpoint_is_fresh(
             runner,
             feature,
@@ -21291,10 +21265,7 @@ async def _dag_group_checkpoint_is_fresh(
             accepted_dag_sha256s=accepted_dag_sha256s,
         ):
             return True
-        return (
-            await _feature_has_execution_control_legacy_marker(runner, feature)
-            and _checkpoint_commit_matches_current_heads(commit_hash, current_heads)
-        )
+        return False
     proof = _json_object_from_text(proof_raw)
     if str(proof.get("artifact_schema") or "") != "dag-group-commit-proof-v1":
         return False
