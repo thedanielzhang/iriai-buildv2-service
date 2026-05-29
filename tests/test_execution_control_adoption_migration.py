@@ -729,6 +729,99 @@ async def test_bulk_repo_identity_repair_moves_task_in_active_regroup_order() ->
 
 
 @pytest.mark.asyncio
+async def test_bulk_repo_identity_repair_rejects_group_move_that_mixes_hard_barriers() -> None:
+    store = _post_adoption_store()
+    regroup = json.loads(store.records["dag-regroup:test"]["value"])
+    regroup["barriers"] = [
+        {"id": "studio", "hard": True, "task_ids": ["TASK-9-3", "TASK-explicit"]},
+        {"id": "future", "hard": True, "task_ids": ["TASK-future"]},
+    ]
+    store.add("dag-regroup:test", regroup, artifact_id=33)
+
+    plan = await build_post_adoption_repo_identity_bulk_repair_plan(
+        feature=_feature(),
+        artifact_store=store,
+        boundary_group_idx=1,
+        first_group_idx=2,
+        last_group_idx=3,
+        regroup_active_key="dag-regroup-active:test",
+        reviewed_records=[
+            {
+                "task_id": "TASK-9-3",
+                "target_group_idx": 3,
+                "evidence_type": "same_wave_read_write_conflict_break",
+                "evidence_paths": ["iriai-studio/src/app.ts"],
+                "reviewer_id": "unit-test",
+                "confidence": 1.0,
+            }
+        ],
+        registry_builder=_prefix_registry_builder,
+    )
+
+    assert plan.ready is False
+    blocker_codes = {blocker.code for blocker in plan.blockers}
+    assert "dag_regroup_barrier_violation" in blocker_codes
+    [barrier_blocker] = [
+        blocker for blocker in plan.blockers
+        if blocker.code == "dag_regroup_barrier_violation"
+    ]
+    assert barrier_blocker.details["violations"][0]["new_group"] == 3
+    assert barrier_blocker.details["violations"][0]["barriers"] == ["future", "studio"]
+
+
+@pytest.mark.asyncio
+async def test_bulk_repo_identity_repair_recomputes_original_to_new_mapping_after_move() -> None:
+    store = _post_adoption_store()
+    adoption = json.loads(store.records["execution-control-adoption:8ac124d6"]["value"])
+    adoption["completed_checkpoint_range"] = [0, 0]
+    adoption["next_effective_group_idx"] = 1
+    store.add("execution-control-adoption:8ac124d6", adoption, artifact_id=21)
+    regroup = json.loads(store.records["dag-regroup:test"]["value"])
+    regroup["group_idx_offset"] = 1
+    regroup["dag"]["execution_order"].append([])
+    store.add("dag-regroup:test", regroup, artifact_id=33)
+    rollback = json.loads(store.records["dag-regroup-rollback:test"]["value"])
+    rollback["group_idx_offset"] = 1
+    store.add("dag-regroup-rollback:test", rollback, artifact_id=34)
+    active = json.loads(store.records["dag-regroup-active:test"]["value"])
+    active["group_idx_offset"] = 1
+    store.add("dag-regroup-active:test", active, artifact_id=35)
+    seed = json.loads(store.records["workspace-authority-registry:g2"]["value"])
+    store.add("workspace-authority-registry:g1", seed, artifact_id=41)
+
+    plan = await build_post_adoption_repo_identity_bulk_repair_plan(
+        feature=_feature(),
+        artifact_store=store,
+        boundary_group_idx=0,
+        first_group_idx=1,
+        last_group_idx=3,
+        regroup_active_key="dag-regroup-active:test",
+        reviewed_records=[
+            {
+                "task_id": "TASK-9-3",
+                "target_group_idx": 3,
+                "evidence_type": "same_wave_read_write_conflict_break",
+                "evidence_paths": ["iriai-studio/src/app.ts"],
+                "reviewer_id": "unit-test",
+                "confidence": 1.0,
+            }
+        ],
+        registry_builder=_prefix_registry_builder,
+    )
+
+    assert plan.ready is True
+    assert plan.regroup_projection["original_execution_order"] == [
+        ["TASK-9-3", "TASK-explicit"],
+        ["TASK-future"],
+    ]
+    assert plan.regroup_projection["original_to_new_group_mapping"] == {
+        "1": [1, 3],
+        "2": [2],
+    }
+    assert plan.regroup_validation["approved"] is True
+
+
+@pytest.mark.asyncio
 async def test_bulk_repo_identity_repair_normalizes_legacy_files_for_structured_scope() -> None:
     store = _post_adoption_store()
     root = json.loads(store.records["dag"]["value"])
@@ -802,3 +895,4 @@ async def test_bulk_repo_identity_repair_materializes_append_only_values() -> No
     audit = json.loads(audit_value)
     assert audit["repair_kind"] == "post_adoption_repo_identity_bulk"
     assert audit["new_artifacts"]["registries_by_group"] == {"2": 1005, "3": 1006}
+    assert audit["regroup_validation"]["approved"] is True

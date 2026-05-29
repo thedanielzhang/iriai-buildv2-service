@@ -2531,6 +2531,31 @@ class ExecutionControlStore:
             if record is None:
                 return None
             failure = self._evidence_node_from_record(record)
+            failure_payload = _json_dict(failure.payload)
+            evidence_ids = _typed_int_list(
+                failure_payload.get("evidence_ids"),
+                cap=50,
+            )
+            patch_summaries: list[dict[str, Any]] = []
+            for evidence_id in evidence_ids:
+                patch = await self._fetch_evidence_node_by_id(conn, int(evidence_id))
+                if (
+                    patch is None
+                    or patch.kind != "sandbox_patch_summary"
+                    or patch.feature_id != feature_id
+                ):
+                    continue
+                patch_payload = _json_dict(patch.payload)
+                patch_summaries.append({
+                    "id": patch.id,
+                    "attempt_id": patch.attempt_id,
+                    "sandbox_id": str(patch_payload.get("sandbox_id") or ""),
+                    "diff_sha256": str(patch_payload.get("diff_sha256") or ""),
+                    "changed_paths": [
+                        str(item)
+                        for item in _json_list(patch_payload.get("changed_paths"))[:50]
+                    ],
+                })
         payload = _json_dict(failure.payload)
         details = _json_dict(payload.get("details"))
         bounded_details = {
@@ -2552,6 +2577,8 @@ class ExecutionControlStore:
             "terminal_reason": _bounded_runtime_failure_context_text(
                 payload.get("terminal_reason")
             ),
+            "evidence_ids": evidence_ids,
+            "sandbox_patch_summaries": patch_summaries,
             "message": _bounded_runtime_failure_context_text(payload.get("message")),
             "details": bounded_details,
         }
@@ -3301,6 +3328,236 @@ class ExecutionControlStore:
                 )
                 return terminal_outcome
 
+    async def recover_late_runtime_completion(
+        self,
+        *,
+        attempt_id: int,
+        runtime_invocation: RuntimeInvocationEvidence,
+        structured_output: StructuredOutputEvidence,
+        raw_output: RawOutputEvidence | None = None,
+        patch_summary_ids: list[int] | None = None,
+        recovery_metadata: dict[str, Any] | None = None,
+    ) -> DispatchOutcome:
+        """Convert a terminal timeout into success after strict late-result validation."""
+
+        async with self._connection() as conn:
+            async with self._transaction(conn):
+                row = await self._fetch_dispatch_attempt_by_id(conn, int(attempt_id))
+                existing_outcome = _json_dict(row.payload.get("dispatch_outcome"))
+                if row.status == "succeeded" and existing_outcome:
+                    return DispatchOutcome(**existing_outcome)
+                if row.status != "failed" or row.dispatcher_state != "failed":
+                    raise ExecutionControlError(
+                        "late runtime completion recovery requires a failed terminal dispatch attempt"
+                    )
+                if existing_outcome.get("status") != "failed" or existing_outcome.get(
+                    "runtime_terminal_reason"
+                ) not in {"timeout", "watchdog_stall"}:
+                    raise ExecutionControlError(
+                        "late runtime completion recovery requires a timeout terminal outcome"
+                    )
+                failure_id = row.payload.get("typed_failure_id") or row.payload.get(
+                    "runtime_failure_id"
+                )
+                if failure_id is None:
+                    raise ExecutionControlError(
+                        "late runtime completion recovery requires timeout failure evidence"
+                    )
+                failure = await self._fetch_evidence_node_by_id(conn, int(failure_id))
+                if failure is None or failure.kind != "runtime_failure_context":
+                    raise ExecutionControlError("timeout failure evidence not found")
+                failure_payload = _json_dict(failure.payload)
+                if (
+                    failure_payload.get("failure_class") != "runtime_timeout"
+                    or failure_payload.get("failure_type") != "watchdog_timeout"
+                ):
+                    raise ExecutionControlError(
+                        "late runtime completion recovery requires runtime_timeout/watchdog_timeout"
+                    )
+                if runtime_invocation.attempt_id != row.id or structured_output.attempt_id != row.id:
+                    raise ExecutionControlError(
+                        "late runtime completion evidence belongs to a different attempt"
+                    )
+                if str(runtime_invocation.runtime or "") != str(row.runtime or ""):
+                    raise ExecutionControlError(
+                        "late runtime completion runtime does not match dispatch attempt"
+                    )
+
+                resolved_patch_ids = sorted(set(
+                    int(item)
+                    for item in (
+                        patch_summary_ids
+                        if patch_summary_ids is not None
+                        else _json_list(failure_payload.get("evidence_ids"))
+                    )
+                ))
+                if not resolved_patch_ids:
+                    raise ExecutionControlError(
+                        "late runtime completion recovery requires captured patch evidence"
+                    )
+                for patch_id in resolved_patch_ids:
+                    patch = await self._fetch_evidence_node_by_id(conn, int(patch_id))
+                    if (
+                        patch is None
+                        or patch.kind != "sandbox_patch_summary"
+                        or patch.feature_id != row.feature_id
+                        or (
+                            patch.attempt_id is not None
+                            and int(patch.attempt_id) != int(row.id)
+                        )
+                    ):
+                        raise ExecutionControlError(
+                            "late runtime completion patch evidence does not match attempt"
+                        )
+
+                invocation_fields = _runtime_invocation_fields(runtime_invocation, row)
+                invocation_evidence, _ = await self._insert_or_reuse_evidence_node(
+                    conn,
+                    invocation_fields,
+                    execution_row=row,
+                    kind="runtime_invocation",
+                )
+
+                raw_evidence_id: int | None = None
+                if raw_output is not None:
+                    if raw_output.attempt_id != row.id:
+                        raise ExecutionControlError(
+                            "late raw output evidence belongs to a different attempt"
+                        )
+                    raw_fields = _raw_output_fields(raw_output, row)
+                    raw_evidence, _ = await self._insert_or_reuse_evidence_node(
+                        conn,
+                        raw_fields,
+                        execution_row=row,
+                        kind="raw_output",
+                    )
+                    raw_evidence_id = raw_evidence.id
+                    if structured_output.raw_text_ref is None:
+                        structured_output = replace(
+                            structured_output,
+                            raw_text_ref=raw_evidence_id,
+                        )
+
+                structured_fields = _structured_output_fields(structured_output, row)
+                structured_evidence, _ = await self._insert_or_reuse_evidence_node(
+                    conn,
+                    structured_fields,
+                    execution_row=row,
+                    kind="structured_result",
+                )
+
+                provisional_payload = dict(row.payload)
+                provisional_payload.update({
+                    "dispatcher_state": "evidence_recording",
+                    "runtime_terminal_reason": "completed",
+                    "last_runtime_invocation_evidence_id": invocation_evidence.id,
+                    "structured_result_evidence_id": structured_evidence.id,
+                })
+                provisional_row = replace(
+                    row,
+                    status="succeeded",
+                    dispatcher_state="succeeded",
+                    payload=provisional_payload,
+                )
+                outcome = DispatchOutcome(
+                    attempt_id=row.id,
+                    state="succeeded",
+                    status="succeeded",
+                    runtime_terminal_reason="completed",
+                    structured_result_evidence_id=structured_evidence.id,
+                    raw_text_ref=raw_evidence_id,
+                    patch_summary_ids=resolved_patch_ids,
+                    compatibility_artifact_ids=[],
+                    runtime_failure_id=None,
+                    typed_failure_id=None,
+                    idempotency_key=row.idempotency_key,
+                    metadata={
+                        "late_runtime_completion_recovery": True,
+                        **_json_dict(recovery_metadata),
+                    },
+                )
+                await self._validate_dispatch_outcome(conn, provisional_row, outcome)
+                projection_result = await self._project_task_result_from_attempt_in_txn(
+                    conn,
+                    provisional_row,
+                    structured_result_evidence_id=structured_evidence.id,
+                    idempotency_key=None,
+                )
+                projection_ids = sorted({
+                    link.artifact_id
+                    for link in projection_result.projection_links
+                    if link.projection_key.startswith("dag-task:")
+                })
+                terminal_outcome = replace(
+                    outcome,
+                    compatibility_artifact_ids=sorted(projection_ids),
+                )
+
+                payload = dict(row.payload)
+                payload.pop("runtime_failure_id", None)
+                payload.pop("typed_failure_id", None)
+                payload.pop("runtime_failure_signature_hash", None)
+                payload.update({
+                    "dispatcher_state": "succeeded",
+                    "runtime_terminal_reason": "completed",
+                    "last_runtime_invocation_evidence_id": invocation_evidence.id,
+                    "runtime_invocation_evidence_ids": _append_unique(
+                        _json_list(row.payload.get("runtime_invocation_evidence_ids")),
+                        invocation_evidence.id,
+                    ),
+                    "structured_result_evidence_id": structured_evidence.id,
+                    "last_structured_result_evidence_id": structured_evidence.id,
+                    "patch_summary_ids": resolved_patch_ids,
+                    "compatibility_artifact_ids": list(
+                        terminal_outcome.compatibility_artifact_ids
+                    ),
+                    "dispatch_outcome": terminal_outcome.normalized_outcome(),
+                    "dispatch_outcome_digest": terminal_outcome.digest,
+                    "late_runtime_completion_recovery": {
+                        "recovered_from_runtime_failure_id": row.payload.get(
+                            "runtime_failure_id"
+                        ),
+                        "recovered_from_typed_failure_id": row.payload.get("typed_failure_id"),
+                        "runtime_invocation_evidence_id": invocation_evidence.id,
+                        "raw_output_evidence_id": raw_evidence_id,
+                        "structured_result_evidence_id": structured_evidence.id,
+                        "patch_summary_ids": resolved_patch_ids,
+                        **_json_dict(recovery_metadata),
+                    },
+                })
+                if raw_evidence_id is not None:
+                    payload.update({
+                        "last_raw_output_evidence_id": raw_evidence_id,
+                        "raw_output_evidence_ids": _append_unique(
+                            _json_list(row.payload.get("raw_output_evidence_ids")),
+                            raw_evidence_id,
+                        ),
+                    })
+                updated = await conn.fetchrow(
+                    """
+                    UPDATE execution_journal_rows
+                    SET
+                        status = $1,
+                        dispatcher_state = $2,
+                        payload = $3::jsonb,
+                        updated_at = NOW()
+                    WHERE id = $4
+                      AND entry_type = 'dispatch_attempt'
+                      AND status = 'failed'
+                      AND dispatcher_state = 'failed'
+                    RETURNING *
+                    """,
+                    terminal_outcome.status,
+                    terminal_outcome.state,
+                    stable_json(payload),
+                    row.id,
+                )
+                if updated is None:
+                    raise ExecutionControlError(
+                        "dispatch attempt changed before late completion recovery"
+                    )
+                return terminal_outcome
+
     async def project_task_result_from_attempt(
         self,
         projection: TaskResultProjectionFromAttempt | int,
@@ -4045,6 +4302,28 @@ class ExecutionControlStore:
                 *args,
             )
         return [self._sandbox_lease_from_record(row) for row in rows]
+
+    async def get_sandbox_lease_by_attempt_no(
+        self,
+        *,
+        feature_id: str,
+        attempt_no: int,
+    ) -> SandboxLease | None:
+        async with self._connection() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT *
+                FROM sandbox_leases
+                WHERE feature_id = $1 AND attempt_no = $2
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                str(feature_id),
+                int(attempt_no),
+            )
+        if row is None:
+            return None
+        return self._sandbox_lease_from_record(row)
 
     # ── Slice 10a — typed control-plane snapshot reads ─────────────────────
 

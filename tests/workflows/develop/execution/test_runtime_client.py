@@ -80,10 +80,34 @@ async def test_provider_exception_converts_to_failed_response() -> None:
 
 
 @pytest.mark.asyncio
-async def test_timeout_maps_to_timeout_response() -> None:
+async def test_runtime_client_does_not_hard_timeout_long_running_runner() -> None:
     class Runner:
         async def run(self, ask):
-            await asyncio.sleep(10)
+            await asyncio.sleep(0.03)
+            return {"task_id": "TASK-7", "summary": "finished", "status": "completed"}
+
+    client = RuntimeClient(
+        runner=Runner(),
+        actor_factory=lambda request: SimpleNamespace(name=request.actor_name),
+        ask_factory=_ask_factory,
+    )
+
+    response = await client.invoke(_request(timeout_seconds=0.01))
+
+    assert response.status == "completed"
+    assert response.terminal_reason == "completed"
+    assert response.structured_output == {
+        "task_id": "TASK-7",
+        "summary": "finished",
+        "status": "completed",
+    }
+
+
+@pytest.mark.asyncio
+async def test_runner_timeout_exception_maps_to_timeout_response() -> None:
+    class Runner:
+        async def run(self, ask):
+            raise TimeoutError("runtime stale")
 
     client = RuntimeClient(
         runner=Runner(),
@@ -95,7 +119,7 @@ async def test_timeout_maps_to_timeout_response() -> None:
 
     assert response.status == "failed"
     assert response.terminal_reason == "timeout"
-    assert response.raw_text == "TimeoutError"
+    assert response.raw_text == "runtime stale"
 
 
 @pytest.mark.asyncio

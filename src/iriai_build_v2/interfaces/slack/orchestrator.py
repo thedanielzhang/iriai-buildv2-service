@@ -874,6 +874,7 @@ class SlackWorkflowOrchestrator:
                 "workspace_path": workspace_path,
                 "mode": mode,
                 "phase": phase,
+                "channel_id": channel_id,
                 "agent_runtime": agent_runtime,
                 "runtime_policy": runtime_policy,
                 "concurrency_max": self._concurrency_max,
@@ -922,6 +923,62 @@ class SlackWorkflowOrchestrator:
 
         if recovered:
             logger.info("Recovered %d feature channel mappings", recovered)
+
+    async def trigger_recoverable_resumes(
+        self,
+        *,
+        trigger: str = "manual",
+        feature_id: str | None = None,
+    ) -> dict[str, object]:
+        """Resume recoverable workflows without requiring a Slack user message."""
+        assert self._env is not None
+        candidates: list[tuple[str, str]] = []
+        skipped: dict[str, str] = {}
+        for candidate_id, recovery_info in list(self._recoverable_features.items()):
+            if feature_id is not None and candidate_id != feature_id:
+                continue
+            if candidate_id in self._active_workflows:
+                skipped[candidate_id] = "active_workflow"
+                continue
+            channel_id = str(recovery_info.get("channel_id") or "").strip()
+            if not channel_id:
+                channel_id = next(
+                    (
+                        channel
+                        for channel, mapped_feature_id in self._channel_features.items()
+                        if mapped_feature_id == candidate_id
+                    ),
+                    "",
+                )
+            if not channel_id:
+                feature = await self._env.feature_store.get_feature(candidate_id)
+                metadata = dict(getattr(feature, "metadata", {}) or {}) if feature else {}
+                channel_id = str(metadata.get("channel_id") or "").strip()
+            if not channel_id:
+                skipped[candidate_id] = "missing_channel"
+                continue
+            candidates.append((candidate_id, channel_id))
+
+        resumed: list[str] = []
+        for candidate_id, channel_id in candidates:
+            logger.info(
+                "Triggering recoverable workflow resume feature=%s channel=%s trigger=%s",
+                candidate_id,
+                channel_id,
+                trigger,
+            )
+            await self._resume_workflow(candidate_id, channel_id)
+            resumed.append(candidate_id)
+
+        if not candidates and not skipped:
+            logger.info("Recoverable workflow resume trigger=%s found no candidates", trigger)
+        return {
+            "trigger": trigger,
+            "requested_feature_id": feature_id,
+            "resumed": resumed,
+            "skipped": skipped,
+            "remaining_recoverable": list(self._recoverable_features),
+        }
 
     async def _resume_workflow(self, feature_id: str, channel_id: str) -> None:
         """Resume an interrupted workflow from its last known phase."""
@@ -1160,6 +1217,7 @@ class SlackWorkflowOrchestrator:
             "workspace_path": str(current_meta.get("workspace_path", "") or ""),
             "mode": str(current_meta.get("mode", "singleplayer") or "singleplayer"),
             "phase": phase,
+            "channel_id": channel_id,
             "agent_runtime": str(
                 current_meta.get("agent_runtime", self._agent_runtime_name)
                 or self._agent_runtime_name

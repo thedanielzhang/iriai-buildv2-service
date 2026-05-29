@@ -463,6 +463,17 @@ class DispatchJournalPort(Protocol):
         outcome: DispatchOutcome,
     ) -> DispatchOutcome: ...
 
+    async def recover_late_runtime_completion(
+        self,
+        attempt: DispatchAttemptRecord,
+        request: DispatchRequest,
+        *,
+        invocation_id: str,
+        output_schema: dict[str, Any],
+        output_schema_digest: str,
+        output_type_name: str,
+    ) -> DispatchOutcome | None: ...
+
 
 class ExecutionControlStore(DispatchJournalPort, Protocol):
     """Alias protocol for the dispatch-only execution-control store facade."""
@@ -844,6 +855,9 @@ class RuntimeDispatcher:
         except DispatchIdempotencyConflict as exc:
             return await self._finish_start_idempotency_conflict(request, exc)
         if attempt.terminal_outcome is not None:
+            recovered = await self._recover_late_terminal_completion(attempt, request)
+            if recovered is not None:
+                return recovered
             if attempt.terminal_outcome_needs_finish:
                 return await self._store.finish_dispatch_attempt(attempt.terminal_outcome)
             return attempt.terminal_outcome
@@ -1441,6 +1455,28 @@ class RuntimeDispatcher:
             idempotency_key=request.idempotency_key,
         )
         return await self._store.finish_dispatch_attempt(outcome)
+
+    async def _recover_late_terminal_completion(
+        self,
+        attempt: DispatchAttemptRecord,
+        request: DispatchRequest,
+    ) -> DispatchOutcome | None:
+        outcome = attempt.terminal_outcome
+        if outcome is None or outcome.status != "failed":
+            return None
+        if outcome.runtime_terminal_reason not in {"timeout", "watchdog_stall"}:
+            return None
+        recover = getattr(self._store, "recover_late_runtime_completion", None)
+        if not callable(recover):
+            return None
+        return await recover(
+            attempt,
+            request,
+            invocation_id=self._key_factory.invocation_id(request, attempt.attempt_id),
+            output_schema=self._output_schema,
+            output_schema_digest=self._output_schema_digest,
+            output_type_name=self._output_type_name,
+        )
 
     async def _finish_start_idempotency_conflict(
         self,

@@ -133,6 +133,21 @@ async def run_slack_bridge(
 
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, stop.set)
+    resume_signal = getattr(signal, "SIGUSR1", None)
+    if resume_signal is not None:
+        def _request_recoverable_resume() -> None:
+            async def _resume() -> None:
+                try:
+                    result = await orchestrator.trigger_recoverable_resumes(
+                        trigger="signal:SIGUSR1",
+                    )
+                    logger.info("Recoverable resume signal handled: %s", result)
+                except Exception:
+                    logger.exception("Recoverable resume signal failed")
+
+            asyncio.create_task(_resume())
+
+        loop.add_signal_handler(resume_signal, _request_recoverable_resume)
 
     try:
         await stop.wait()

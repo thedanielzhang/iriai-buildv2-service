@@ -16,7 +16,7 @@ import shutil
 import sys
 import time
 import uuid
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -38,21 +38,27 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 _RUNTIME_WORKSPACE_BINDING_KEY = "runtime_workspace_binding"
+_RUNTIME_SCRATCH_ROOTS_KEY = "runtime_scratch_roots"
 _BOUND_WRITE_AUTHORIZED_KEY = "runtime_workspace_write_authorized"
 _BOUND_WRITE_AUTHORIZATION_KEY = "runtime_workspace_write_authorization"
 _BOUND_WRITE_AUTH_SECRET_FILE = "runtime-write-auth.secret"
+_BOUND_WRITE_AUTH_SECRET_MODE = 0o640
 _BOUND_WRITE_GUARD_KEY = "runtime_workspace_write_guard"
 _BOUND_WRITE_GUARD_SANDBOX_EXEC = "sandbox_exec"
+_AUTHORITY_GRANT_SCHEMA_VERSION = "runtime-workspace-authority-grant-v1"
 _WRITE_PRODUCING_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit", "Bash"}
 
 DEFAULT_POOL_ROOT = Path(
     os.environ.get("IRIAI_CLAUDE_POOL_ROOT", "/Users/Shared/iriai/claude-pool")
 )
-DEFAULT_PROFILE_NAMES = ("iriai-claude-1", "iriai-claude-2")
+DEFAULT_PROFILE_NAMES = ("iriai-claude-1",)
 DEFAULT_PROFILE_WEIGHTS = {
     "iriai-claude-1": 1.0,
-    "iriai-claude-2": 9.0,
 }
+DEPRECATED_DEFAULT_PROFILE_NAMES = ("iriai-claude-1", "iriai-claude-2")
+DEPRECATED_DEFAULT_PROFILE_WEIGHT_SETS = (
+    {"iriai-claude-1": 1.0, "iriai-claude-2": 9.0},
+)
 LEGACY_DEFAULT_PROFILE_NAMES = ("iriai-claude-1", "iriai-claude-2", "iriai-claude-3")
 LEGACY_DEFAULT_PROFILE_WEIGHT_SETS = (
     {"iriai-claude-1": 5.0, "iriai-claude-2": 1.0, "iriai-claude-3": 12.0},
@@ -67,6 +73,17 @@ DEFAULT_HEARTBEAT_SECONDS = float(
 )
 DEFAULT_HEARTBEAT_TIMEOUT_SECONDS = float(
     os.environ.get("IRIAI_CLAUDE_POOL_HEARTBEAT_TIMEOUT_SECONDS", "180") or "180"
+)
+DEFAULT_JOB_STALE_TIMEOUT_SECONDS = float(
+    os.environ.get(
+        "IRIAI_CLAUDE_POOL_JOB_STALE_TIMEOUT_SECONDS",
+        str(DEFAULT_HEARTBEAT_TIMEOUT_SECONDS),
+    )
+    or str(DEFAULT_HEARTBEAT_TIMEOUT_SECONDS)
+)
+DEFAULT_JOB_ABSOLUTE_TIMEOUT_SECONDS = float(
+    os.environ.get("IRIAI_CLAUDE_POOL_JOB_ABSOLUTE_TIMEOUT_SECONDS", "21600")
+    or "21600"
 )
 DEFAULT_HEALTH_TIMEOUT_SECONDS = float(
     os.environ.get("IRIAI_CLAUDE_POOL_HEALTH_TIMEOUT_SECONDS", "60") or "60"
@@ -128,6 +145,36 @@ class ResultMessage:
     structured_output: Any = None
 
 
+@dataclass(frozen=True)
+class ClaudePoolLateCompletion:
+    job_id: str
+    profile: str
+    done_path: str
+    result_path: str
+    stdout_path: str | None
+    stderr_path: str | None
+    manifest: dict[str, Any]
+    result: dict[str, Any]
+    result_text: str
+    structured_output: dict[str, Any]
+    raw: Any
+    schema_digest_validation: str
+
+    def recovery_metadata(self) -> dict[str, Any]:
+        return {
+            "job_id": self.job_id,
+            "profile": self.profile,
+            "done_path": self.done_path,
+            "result_path": self.result_path,
+            "stdout_path": self.stdout_path,
+            "stderr_path": self.stderr_path,
+            "schema_digest_validation": self.schema_digest_validation,
+            "job_created_at": self.manifest.get("created_at"),
+            "job_claimed_at": self.manifest.get("claimed_at"),
+            "job_finished_at": self.manifest.get("finished_at"),
+        }
+
+
 def _utc_now_iso() -> str:
     return datetime.now(UTC).isoformat()
 
@@ -139,6 +186,14 @@ def _parse_iso(value: str | None) -> datetime | None:
         return datetime.fromisoformat(value)
     except ValueError:
         return None
+
+
+def _stable_json_digest(value: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(value, sort_keys=True, separators=(",", ":"), default=str).encode(
+            "utf-8"
+        )
+    ).hexdigest()
 
 
 def _jsonable(value: Any) -> Any:
@@ -174,6 +229,14 @@ def _runtime_workspace_binding(role: Any) -> dict[str, Any] | None:
     return dict(raw)
 
 
+def _profile_runtime_scratch_roots(profile: ClaudePoolProfile) -> list[Path]:
+    try:
+        home = Path(pwd.getpwnam(profile.user).pw_dir)
+    except KeyError:
+        home = Path("/Users") / profile.user
+    return [home / ".claude" / "session-env"]
+
+
 def _role_is_write_producing(role: Any) -> bool:
     tools = {str(tool) for tool in (getattr(role, "tools", None) or [])}
     return bool(
@@ -202,16 +265,24 @@ def _pool_write_auth_secret(root: Path) -> str:
             fd = os.open(
                 secret_path,
                 os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-                0o600,
+                _BOUND_WRITE_AUTH_SECRET_MODE,
             )
             try:
                 os.write(fd, secrets.token_hex(32).encode("utf-8"))
             finally:
                 os.close(fd)
         try:
-            secret_path.chmod(0o600)
+            stat_result = secret_path.stat()
         except OSError:
-            logger.warning("Unable to chmod Claude pool write auth secret %s", secret_path)
+            stat_result = None
+        if stat_result is None or stat_result.st_uid == os.geteuid():
+            try:
+                secret_path.chmod(_BOUND_WRITE_AUTH_SECRET_MODE)
+            except OSError:
+                logger.warning(
+                    "Unable to chmod Claude pool write auth secret %s",
+                    secret_path,
+                )
         secret = secret_path.read_text(encoding="utf-8").strip()
     except FileExistsError:
         secret = secret_path.read_text(encoding="utf-8").strip()
@@ -243,8 +314,26 @@ def _bound_write_authorization(manifest: Mapping[str, Any], secret: str) -> str:
         "write_guard": manifest.get(_BOUND_WRITE_GUARD_KEY),
         "repo_roots": binding_map.get("repo_roots") or manifest.get("repo_roots") or {},
         "writable_roots": binding_map.get("writable_roots") or manifest.get("writable_roots") or [],
+        "write_guard_roots": binding_map.get("write_guard_roots") or manifest.get("write_guard_roots") or [],
+        "write_guard_scope": binding_map.get("write_guard_scope") or manifest.get("write_guard_scope"),
+        "authority_schema_version": (
+            binding_map.get("authority_schema_version")
+            or manifest.get("authority_schema_version")
+        ),
+        "runtime_workspace_authority_grants": (
+            binding_map.get("runtime_workspace_authority_grants")
+            or manifest.get("runtime_workspace_authority_grants")
+            or []
+        ),
+        "runtime_workspace_authority_grant_digest": (
+            binding_map.get("runtime_workspace_authority_grant_digest")
+            or manifest.get("runtime_workspace_authority_grant_digest")
+            or ""
+        ),
+        "promotable": binding_map.get("promotable", manifest.get("promotable")),
         "blocked_roots": binding_map.get("blocked_roots") or manifest.get("blocked_roots") or [],
         "contract_ids": binding_map.get("contract_ids") or manifest.get("contract_ids") or [],
+        "runtime_scratch_roots": manifest.get(_RUNTIME_SCRATCH_ROOTS_KEY) or [],
     }
     return hmac.new(
         secret.encode("utf-8"),
@@ -262,9 +351,19 @@ def _write_guard_roots(manifest: Mapping[str, Any]) -> list[Path]:
     binding_map = dict(binding) if isinstance(binding, Mapping) else {}
     paths = manifest.get("paths")
     paths_map = dict(paths) if isinstance(paths, Mapping) else {}
+    write_guard_scope = str(
+        binding_map.get("write_guard_scope")
+        or manifest.get("write_guard_scope")
+        or "contract"
+    )
+    manifest_write_guard_roots = (
+        binding_map.get("write_guard_roots")
+        or manifest.get("write_guard_roots")
+        or []
+    )
+    binding_writable_roots = binding_map.get("writable_roots") or []
     roots: list[Path] = []
-    for raw in [
-        manifest.get("cwd"),
+    raw_roots: list[Any] = [
         paths_map.get("prompt"),
         paths_map.get("system_prompt"),
         paths_map.get("schema"),
@@ -272,8 +371,15 @@ def _write_guard_roots(manifest: Mapping[str, Any]) -> list[Path]:
         paths_map.get("stdout"),
         paths_map.get("stderr"),
         paths_map.get("sandbox_profile"),
-        *(binding_map.get("writable_roots") or []),
-    ]:
+        *(manifest.get(_RUNTIME_SCRATCH_ROOTS_KEY) or []),
+        *manifest_write_guard_roots,
+    ]
+    if write_guard_scope == "diagnostic":
+        raw_roots.append(manifest.get("cwd"))
+        raw_roots.extend(binding_writable_roots)
+    elif not manifest_write_guard_roots:
+        raw_roots.extend(binding_writable_roots)
+    for raw in raw_roots:
         if not str(raw or "").strip():
             continue
         path = Path(str(raw)).expanduser()
@@ -295,6 +401,138 @@ def _write_guard_roots(manifest: Mapping[str, Any]) -> list[Path]:
         seen.add(key)
         unique.append(resolved)
     return unique
+
+
+def _authority_grants_from_manifest(manifest: Mapping[str, Any]) -> list[dict[str, Any]]:
+    binding = manifest.get(_RUNTIME_WORKSPACE_BINDING_KEY)
+    binding_map = dict(binding) if isinstance(binding, Mapping) else {}
+    raw_grants = (
+        binding_map.get("runtime_workspace_authority_grants")
+        or manifest.get("runtime_workspace_authority_grants")
+        or []
+    )
+    if not isinstance(raw_grants, list):
+        return []
+    return [dict(item) for item in raw_grants if isinstance(item, Mapping)]
+
+
+def _authority_schema_version(manifest: Mapping[str, Any]) -> str:
+    binding = manifest.get(_RUNTIME_WORKSPACE_BINDING_KEY)
+    binding_map = dict(binding) if isinstance(binding, Mapping) else {}
+    return str(
+        binding_map.get("authority_schema_version")
+        or manifest.get("authority_schema_version")
+        or ""
+    )
+
+
+def _authority_grant_digest(manifest: Mapping[str, Any]) -> str:
+    binding = manifest.get(_RUNTIME_WORKSPACE_BINDING_KEY)
+    binding_map = dict(binding) if isinstance(binding, Mapping) else {}
+    return str(
+        binding_map.get("runtime_workspace_authority_grant_digest")
+        or manifest.get("runtime_workspace_authority_grant_digest")
+        or ""
+    )
+
+
+def _grant_payload_digest(grant: Mapping[str, Any]) -> str:
+    payload = dict(grant)
+    payload.pop("grant_digest", None)
+    return _stable_json_digest(payload)
+
+
+def _validate_workspace_authority_grants(
+    manifest: Mapping[str, Any],
+    binding: Mapping[str, Any],
+    *,
+    role_name: str,
+    cwd: Path,
+) -> None:
+    if _authority_schema_version(manifest) != _AUTHORITY_GRANT_SCHEMA_VERSION:
+        raise RuntimeError(
+            f"Bound Claude write role {role_name} is missing runtime workspace authority grant"
+        )
+    grants = _authority_grants_from_manifest(manifest)
+    if not grants:
+        raise RuntimeError(
+            f"Bound Claude write role {role_name} is missing runtime workspace authority grant"
+        )
+    expected_digest = _authority_grant_digest(manifest)
+    actual_digest = _stable_json_digest(grants)
+    if expected_digest and expected_digest != actual_digest:
+        raise RuntimeError(
+            f"Bound Claude write role {role_name} has invalid runtime workspace authority grant digest"
+        )
+    binding_write_guard_roots = {
+        str(Path(str(path)).expanduser().resolve(strict=False))
+        for path in binding.get("write_guard_roots", [])
+        if str(path).strip()
+    }
+    grant_write_guard_roots: set[str] = set()
+    grant_repo_roots: set[str] = set()
+    grant_types: set[str] = set()
+    for grant in grants:
+        if str(grant.get("schema_version") or "") != _AUTHORITY_GRANT_SCHEMA_VERSION:
+            raise RuntimeError(
+                f"Bound Claude write role {role_name} has unsupported runtime workspace authority grant"
+            )
+        if str(grant.get("grant_digest") or "") != _grant_payload_digest(grant):
+            raise RuntimeError(
+                f"Bound Claude write role {role_name} has tampered runtime workspace authority grant"
+            )
+        grant_type = str(grant.get("grant_type") or "")
+        grant_types.add(grant_type)
+        promotable = bool(grant.get("promotable"))
+        if grant_type == "diagnostic" and promotable:
+            raise RuntimeError(
+                f"Bound Claude write role {role_name} diagnostic grant cannot be promotable"
+            )
+        if grant_type in {"product", "repair"} and not promotable:
+            raise RuntimeError(
+                f"Bound Claude write role {role_name} product grant must be promotable"
+            )
+        repo_root = Path(str(grant.get("repo_root") or "")).expanduser()
+        if not repo_root.is_absolute() or not repo_root.exists() or repo_root.is_symlink():
+            raise RuntimeError(
+                f"Bound Claude write role {role_name} has invalid authority repo root"
+            )
+        repo_root = repo_root.resolve(strict=True)
+        grant_repo_roots.add(str(repo_root))
+        if not _is_relative_to(cwd.resolve(strict=True), repo_root):
+            continue
+        for raw_root in grant.get("write_guard_roots", []) or []:
+            root = Path(str(raw_root)).expanduser().resolve(strict=False)
+            if not _is_relative_to(root, repo_root):
+                raise RuntimeError(
+                    f"Bound Claude write role {role_name} authority write root escapes repo"
+                )
+            grant_write_guard_roots.add(str(root))
+    if not any(
+        _is_relative_to(cwd.resolve(strict=True), Path(root))
+        for root in grant_repo_roots
+    ):
+        raise RuntimeError(
+            f"Bound Claude write role {role_name} cwd is outside authority repo roots"
+        )
+    if not grant_write_guard_roots:
+        raise RuntimeError(
+            f"Bound Claude write role {role_name} authority grant has no write roots"
+        )
+    if binding_write_guard_roots and binding_write_guard_roots != grant_write_guard_roots:
+        raise RuntimeError(
+            f"Bound Claude write role {role_name} write guard roots do not match authority grant"
+        )
+    scope = str(binding.get("write_guard_scope") or manifest.get("write_guard_scope") or "contract")
+    if scope == "diagnostic":
+        if grant_types != {"diagnostic"}:
+            raise RuntimeError(
+                f"Bound Claude write role {role_name} diagnostic scope requires diagnostic grant"
+            )
+    elif not (grant_types & {"product", "repair"}):
+        raise RuntimeError(
+            f"Bound Claude write role {role_name} product scope requires promotable grant"
+        )
 
 
 def _write_sandbox_exec_profile(manifest: Mapping[str, Any]) -> Path:
@@ -445,7 +683,7 @@ def _profile_entry_weight(entry: Any) -> float | None:
 
 
 def _migrate_legacy_default_profile_weights(entries: Any) -> tuple[Any, bool]:
-    """Move generated three-profile configs to the current two-profile default.
+    """Move generated old default configs to the current active-profile set.
 
     Existing pool installs have explicit entries in profiles.json, so changing
     only DEFAULT_PROFILE_NAMES / DEFAULT_PROFILE_WEIGHTS would not affect them.
@@ -456,11 +694,23 @@ def _migrate_legacy_default_profile_weights(entries: Any) -> tuple[Any, bool]:
         return entries, False
 
     names = [_profile_entry_name(entry) for entry in entries]
-    if names != list(LEGACY_DEFAULT_PROFILE_NAMES):
+    generated_defaults = (
+        (DEPRECATED_DEFAULT_PROFILE_NAMES, DEPRECATED_DEFAULT_PROFILE_WEIGHT_SETS),
+        (LEGACY_DEFAULT_PROFILE_NAMES, LEGACY_DEFAULT_PROFILE_WEIGHT_SETS),
+    )
+
+    matched_names: tuple[str, ...] | None = None
+    matched_weight_sets: tuple[dict[str, float], ...] = ()
+    for candidate_names, candidate_weight_sets in generated_defaults:
+        if names == list(candidate_names):
+            matched_names = candidate_names
+            matched_weight_sets = candidate_weight_sets
+            break
+    if matched_names is None:
         return entries, False
 
     by_name = dict(zip(names, entries, strict=False))
-    for name in LEGACY_DEFAULT_PROFILE_NAMES:
+    for name in matched_names:
         entry = by_name.get(name)
         if isinstance(entry, str):
             continue
@@ -473,10 +723,7 @@ def _migrate_legacy_default_profile_weights(entries: Any) -> tuple[Any, bool]:
         weight = _profile_entry_weight(entry)
         if weight is None:
             continue
-        if not any(
-            math.isclose(weight, legacy_weights[name])
-            for legacy_weights in LEGACY_DEFAULT_PROFILE_WEIGHT_SETS
-        ):
+        if not any(math.isclose(weight, weights[name]) for weights in matched_weight_sets):
             return entries, False
 
     migrated: list[Any] = []
@@ -528,6 +775,27 @@ def load_profiles(root: Path = DEFAULT_POOL_ROOT) -> list[ClaudePoolProfile]:
     return profiles
 
 
+def _prune_unconfigured_profile_state(
+    root: Path,
+    profiles: list[ClaudePoolProfile],
+) -> None:
+    state_path = _profile_state_path(root)
+    if not state_path.exists():
+        return
+    state = _read_json(state_path, {})
+    profile_state = state.get("profiles")
+    if not isinstance(profile_state, dict):
+        return
+    configured = {profile.name for profile in profiles}
+    removed = False
+    for profile_name in list(profile_state):
+        if profile_name not in configured:
+            profile_state.pop(profile_name, None)
+            removed = True
+    if removed:
+        _write_json_atomic(state_path, state)
+
+
 def ensure_pool_layout(
     root: Path = DEFAULT_POOL_ROOT,
     profiles: list[ClaudePoolProfile] | None = None,
@@ -555,6 +823,7 @@ def ensure_pool_layout(
                 ]
             },
         )
+    _prune_unconfigured_profile_state(root, profiles)
     return profiles
 
 
@@ -572,6 +841,183 @@ def _profile_state_path(root: Path) -> Path:
 
 def _payload_dir(root: Path, job_id: str) -> Path:
     return root / "payloads" / job_id[:2] / job_id
+
+
+def find_late_completed_claude_pool_job(
+    *,
+    root: Path | str = DEFAULT_POOL_ROOT,
+    feature_id: str,
+    group_idx: int,
+    task_id: str,
+    attempt_id: int,
+    sandbox_id: str = "",
+    sandbox_ids: Iterable[str] | None = None,
+    invocation_id: str | None = None,
+    idempotency_key: str | None = None,
+    output_schema_digest: str | None = None,
+    output_type_name: str | None = None,
+) -> ClaudePoolLateCompletion | None:
+    """Find one completed pool job that strictly matches a timed-out attempt."""
+
+    root_path = Path(root)
+    expected_sandbox_ids: list[str] = []
+    for raw in (sandbox_id, *(sandbox_ids or ())):
+        value = str(raw or "").strip()
+        if value and value not in expected_sandbox_ids:
+            expected_sandbox_ids.append(value)
+    if not expected_sandbox_ids:
+        return None
+    matches: list[ClaudePoolLateCompletion] = []
+    for done_path in sorted(
+        (root_path / "jobs" / "done").glob("*/*.json"),
+        key=lambda path: path.stat().st_mtime if path.exists() else 0.0,
+        reverse=True,
+    ):
+        manifest = _read_json(done_path, {})
+        candidate = _late_completion_from_manifest(
+            manifest,
+            done_path=done_path,
+            feature_id=feature_id,
+            group_idx=group_idx,
+            task_id=task_id,
+            attempt_id=attempt_id,
+            sandbox_ids=expected_sandbox_ids,
+            invocation_id=invocation_id,
+            idempotency_key=idempotency_key,
+            output_schema_digest=output_schema_digest,
+            output_type_name=output_type_name,
+        )
+        if candidate is not None:
+            matches.append(candidate)
+            if len(matches) > 1:
+                return None
+    return matches[0] if matches else None
+
+
+def _late_completion_from_manifest(
+    manifest: Mapping[str, Any],
+    *,
+    done_path: Path,
+    feature_id: str,
+    group_idx: int,
+    task_id: str,
+    attempt_id: int,
+    sandbox_ids: Iterable[str],
+    invocation_id: str | None,
+    idempotency_key: str | None,
+    output_schema_digest: str | None,
+    output_type_name: str | None,
+) -> ClaudePoolLateCompletion | None:
+    if manifest.get("kind") != "claude" or manifest.get("status") != "done":
+        return None
+    if str(manifest.get("feature_id") or "") != str(feature_id):
+        return None
+    binding = manifest.get(_RUNTIME_WORKSPACE_BINDING_KEY)
+    if not isinstance(binding, Mapping):
+        return None
+    if _optional_int(binding.get("attempt_id")) != int(attempt_id):
+        return None
+    actual_sandbox_id = str(binding.get("sandbox_id") or manifest.get("sandbox_id") or "")
+    if actual_sandbox_id not in {str(item) for item in sandbox_ids}:
+        return None
+    role_metadata = binding.get("role_metadata")
+    if not isinstance(role_metadata, Mapping):
+        return None
+    if _optional_int(role_metadata.get("group_idx")) != int(group_idx):
+        return None
+    task_ids = {str(item) for item in (role_metadata.get("task_ids") or [])}
+    if str(task_id) not in task_ids:
+        return None
+    if invocation_id and _manifest_value_present(manifest, "invocation_id"):
+        if str(manifest.get("invocation_id") or "") != str(invocation_id):
+            return None
+    if idempotency_key and _manifest_value_present(manifest, "dispatch_idempotency_key"):
+        if str(manifest.get("dispatch_idempotency_key") or "") != str(idempotency_key):
+            return None
+
+    schema_validation = _schema_digest_validation(
+        manifest,
+        expected_digest=output_schema_digest,
+        output_type_name=output_type_name,
+    )
+    if schema_validation is None:
+        return None
+
+    paths = manifest.get("paths")
+    if not isinstance(paths, Mapping):
+        return None
+    result_path_text = str(paths.get("result") or "")
+    if not result_path_text:
+        return None
+    result_path = Path(result_path_text)
+    result = _read_json(result_path, {})
+    if not bool(result.get("ok")):
+        return None
+    structured = result.get("structured_output")
+    if not isinstance(structured, Mapping):
+        return None
+    structured_output = dict(structured)
+    if str(structured_output.get("task_id") or "") != str(task_id):
+        return None
+    return ClaudePoolLateCompletion(
+        job_id=str(manifest.get("id") or done_path.stem),
+        profile=str(manifest.get("profile") or done_path.parent.name),
+        done_path=str(done_path),
+        result_path=str(result_path),
+        stdout_path=str(paths.get("stdout") or "") or None,
+        stderr_path=str(paths.get("stderr") or "") or None,
+        manifest=dict(manifest),
+        result=dict(result),
+        result_text=str(result.get("result_text") or ""),
+        structured_output=structured_output,
+        raw=result.get("raw"),
+        schema_digest_validation=schema_validation,
+    )
+
+
+def _manifest_value_present(manifest: Mapping[str, Any], key: str) -> bool:
+    value = manifest.get(key)
+    return value is not None and str(value) != ""
+
+
+def _schema_digest_validation(
+    manifest: Mapping[str, Any],
+    *,
+    expected_digest: str | None,
+    output_type_name: str | None,
+) -> str | None:
+    expected = str(expected_digest or "")
+    manifest_digest = str(manifest.get("output_schema_digest") or "")
+    if manifest_digest:
+        return "matched_manifest" if not expected or manifest_digest == expected else None
+    if not expected:
+        return "not_required"
+    paths = manifest.get("paths")
+    schema_path_text = str(paths.get("schema") or "") if isinstance(paths, Mapping) else ""
+    if not schema_path_text:
+        return None
+    schema_path = Path(schema_path_text)
+    try:
+        schema_text = schema_path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    digests = {hashlib.sha256(schema_text.encode("utf-8")).hexdigest()}
+    try:
+        digests.add(_stable_json_digest(json.loads(schema_text)))
+    except json.JSONDecodeError:
+        pass
+    if expected in digests:
+        return "matched_schema_file"
+    if output_type_name and expected == _stable_json_digest(str(output_type_name)):
+        return "matched_legacy_type_name"
+    return None
+
+
+def _optional_int(value: Any) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _classify_claude_pool_error(error: str) -> str | None:
@@ -740,6 +1186,8 @@ class ClaudePoolRuntime(AgentRuntime):
         profiles: list[ClaudePoolProfile] | None = None,
         poll_interval: float = DEFAULT_POLL_INTERVAL_SECONDS,
         heartbeat_timeout: float = DEFAULT_HEARTBEAT_TIMEOUT_SECONDS,
+        job_stale_timeout: float = DEFAULT_JOB_STALE_TIMEOUT_SECONDS,
+        job_absolute_timeout: float = DEFAULT_JOB_ABSOLUTE_TIMEOUT_SECONDS,
     ) -> None:
         self.root = Path(root) if root else DEFAULT_POOL_ROOT
         self.profiles = ensure_pool_layout(self.root, profiles)
@@ -748,6 +1196,8 @@ class ClaudePoolRuntime(AgentRuntime):
         self._interactive_roles = interactive_roles or set()
         self._poll_interval = poll_interval
         self._heartbeat_timeout = heartbeat_timeout
+        self._job_stale_timeout = job_stale_timeout
+        self._job_absolute_timeout = job_absolute_timeout
         self._affinity_lock = asyncio.Lock()
         self._invocation_jobs: dict[str, set[str]] = {}
         self._feature_sessions: dict[str, str] = {}
@@ -957,6 +1407,17 @@ class ClaudePoolRuntime(AgentRuntime):
         if affinity_data.get("profile_weights") != weights:
             affinity_data["profile_weights"] = weights
             affinity_data["profile_dispatch_counts"] = {}
+        else:
+            counts = affinity_data.get("profile_dispatch_counts")
+            if isinstance(counts, dict):
+                for profile_name in list(counts):
+                    if profile_name not in weights:
+                        counts.pop(profile_name, None)
+        session_profiles = affinity_data.get("session_profiles")
+        if isinstance(session_profiles, dict):
+            for session_key, profile_name in list(session_profiles.items()):
+                if profile_name not in weights:
+                    session_profiles.pop(session_key, None)
 
     def _record_profile_dispatch(
         self,
@@ -1265,6 +1726,7 @@ class ClaudePoolRuntime(AgentRuntime):
             schema_path.write_text(json.dumps(schema, indent=2, sort_keys=True), encoding="utf-8")
 
         model, effort = _resolve_model_and_effort(role)
+        role_metadata = getattr(role, "metadata", None) or {}
         manifest = {
             "id": job_id,
             "kind": "claude",
@@ -1274,7 +1736,21 @@ class ClaudePoolRuntime(AgentRuntime):
             "updated_at": _utc_now_iso(),
             "session_key": session_key,
             "feature_id": session_key.rsplit(":", 1)[-1] if session_key and ":" in session_key else None,
+            "invocation_id": role_metadata.get("runtime_invocation_id")
+            or role_metadata.get("invocation_id"),
+            "dispatch_attempt_id": role_metadata.get("dispatch_attempt_id")
+            or role_metadata.get("attempt_id"),
+            "dispatch_idempotency_key": role_metadata.get("dispatch_idempotency_key")
+            or role_metadata.get("idempotency_key"),
+            "dispatch_request_digest": role_metadata.get("dispatch_request_digest")
+            or role_metadata.get("request_digest"),
+            "output_schema_digest": role_metadata.get("output_schema_digest"),
+            "output_type_name": role_metadata.get("output_type_name"),
+            "timeout_seconds": role_metadata.get("timeout_seconds"),
             "cwd": manifest_cwd,
+            _RUNTIME_SCRATCH_ROOTS_KEY: [
+                str(path) for path in _profile_runtime_scratch_roots(profile)
+            ],
             "role": {
                 "name": role.name,
                 "model": model,
@@ -1304,6 +1780,12 @@ class ClaudePoolRuntime(AgentRuntime):
                 "repo_roots",
                 "contract_ids",
                 "writable_roots",
+                "write_guard_roots",
+                "write_guard_scope",
+                "authority_schema_version",
+                "runtime_workspace_authority_grants",
+                "runtime_workspace_authority_grant_digest",
+                "promotable",
                 "blocked_roots",
                 "manifest_path",
                 "expires_at",
@@ -1311,6 +1793,12 @@ class ClaudePoolRuntime(AgentRuntime):
                 if key in binding:
                     manifest[key] = _jsonable_deep(binding.get(key))
             if _role_is_write_producing(role):
+                _validate_workspace_authority_grants(
+                    manifest,
+                    binding,
+                    role_name=role.name,
+                    cwd=Path(str(manifest_cwd or "")),
+                )
                 manifest[_BOUND_WRITE_AUTHORIZED_KEY] = True
                 manifest[_BOUND_WRITE_GUARD_KEY] = _BOUND_WRITE_GUARD_SANDBOX_EXEC
                 manifest[_BOUND_WRITE_AUTHORIZATION_KEY] = _bound_write_authorization(
@@ -1323,6 +1811,8 @@ class ClaudePoolRuntime(AgentRuntime):
 
         done_path = _job_state_path(self.root, "done", profile.name, job_id)
         failed_path = _job_state_path(self.root, "failed", profile.name, job_id)
+        running_path = _job_state_path(self.root, "running", profile.name, job_id)
+        wait_started = time.monotonic()
         while True:
             if done_path.exists():
                 result = _read_json(result_path, {})
@@ -1338,7 +1828,67 @@ class ClaudePoolRuntime(AgentRuntime):
                 result = _read_json(result_path, {})
                 error = result.get("error") or _read_json(failed_path, {}).get("error")
                 raise RuntimeError(error or f"Claude pool job {job_id} failed")
+            self._raise_if_job_not_progressing(
+                job_id=job_id,
+                profile=profile.name,
+                queued_path=queued_path,
+                running_path=running_path,
+                wait_started=wait_started,
+            )
             await asyncio.sleep(self._poll_interval)
+
+    def _raise_if_job_not_progressing(
+        self,
+        *,
+        job_id: str,
+        profile: str,
+        queued_path: Path,
+        running_path: Path,
+        wait_started: float,
+    ) -> None:
+        elapsed = time.monotonic() - wait_started
+        if self._job_absolute_timeout > 0 and elapsed > self._job_absolute_timeout:
+            raise TimeoutError(
+                "Claude pool job exceeded absolute runtime cap "
+                f"(job_id={job_id}, profile={profile}, elapsed={elapsed:.1f}s, "
+                f"cap={self._job_absolute_timeout:.1f}s)"
+            )
+
+        if running_path.exists():
+            manifest = _read_json(running_path, {})
+            heartbeat = _parse_iso(manifest.get("heartbeat_at") or manifest.get("updated_at"))
+            if heartbeat is None:
+                return
+            heartbeat_age = (datetime.now(UTC) - heartbeat).total_seconds()
+            if self._job_stale_timeout > 0 and heartbeat_age > self._job_stale_timeout:
+                raise TimeoutError(
+                    "Claude pool job heartbeat is stale "
+                    f"(job_id={job_id}, profile={profile}, "
+                    f"heartbeat_age={heartbeat_age:.1f}s, "
+                    f"stale_timeout={self._job_stale_timeout:.1f}s, "
+                    f"running_path={running_path})"
+                )
+            return
+
+        if queued_path.exists():
+            manifest = _read_json(queued_path, {})
+            updated = _parse_iso(manifest.get("updated_at") or manifest.get("created_at"))
+            if updated is None:
+                return
+            queued_age = (datetime.now(UTC) - updated).total_seconds()
+            if self._job_stale_timeout > 0 and queued_age > self._job_stale_timeout:
+                raise TimeoutError(
+                    "Claude pool job remained queued without progress "
+                    f"(job_id={job_id}, profile={profile}, queued_age={queued_age:.1f}s, "
+                    f"stale_timeout={self._job_stale_timeout:.1f}s, "
+                    f"queued_path={queued_path})"
+                )
+            return
+
+        raise RuntimeError(
+            "Claude pool job disappeared before completion "
+            f"(job_id={job_id}, profile={profile})"
+        )
 
     async def _save_session_turn(
         self,
@@ -1439,6 +1989,12 @@ class ClaudePoolRunner:
             await asyncio.sleep(self.poll_interval)
 
     async def run_once(self, *, wait: bool = True) -> None:
+        if not self._profile_is_enabled():
+            logger.warning(
+                "Claude pool runner profile %s is disabled in profiles.json; refusing to claim work",
+                self.profile,
+            )
+            return
         for queued_path in sorted((self.root / "jobs" / "queued" / self.profile).glob("*.json")):
             claimed = self._claim(queued_path)
             if claimed is None:
@@ -1454,6 +2010,18 @@ class ClaudePoolRunner:
         for job_id, task in list(self._active.items()):
             if task.done():
                 self._active.pop(job_id, None)
+
+    def _profile_is_enabled(self) -> bool:
+        try:
+            configured = {profile.name for profile in load_profiles(self.root)}
+        except Exception:
+            logger.warning(
+                "Claude pool runner profile %s could not reload profiles.json",
+                self.profile,
+                exc_info=True,
+            )
+            return False
+        return self.profile in configured
 
     def _write_profile_heartbeat(self) -> None:
         _write_json_atomic(
@@ -1557,6 +2125,13 @@ class ClaudePoolRunner:
             for root in writable_roots
         ):
             raise RuntimeError("Bound Claude pool job cwd is outside writable roots")
+        if _manifest_role_is_write_producing(manifest.get("role")):
+            _validate_workspace_authority_grants(
+                manifest,
+                binding,
+                role_name=role_name or "unknown",
+                cwd=cwd,
+            )
 
         expires_at = _coerce_aware_datetime(binding.get("expires_at") or manifest.get("expires_at"))
         if expires_at is None:

@@ -58,7 +58,7 @@ def test_budget_tiers_use_opus_4_8_native_1m_context():
     assert BUDGET_TIERS["opus_1m"] == "claude-opus-4-8"
 
 
-def test_build_options_default_to_opus_4_8_xhigh(monkeypatch):
+def test_build_options_default_to_opus_4_8_high_effort(monkeypatch):
     monkeypatch.setitem(
         sys.modules,
         "claude_agent_sdk",
@@ -71,7 +71,7 @@ def test_build_options_default_to_opus_4_8_xhigh(monkeypatch):
     options = runtime._build_options(role, workspace=None)
 
     assert options.model == "claude-opus-4-8"
-    assert options.effort == "xhigh"
+    assert options.effort == "high"
 
 
 def test_build_options_preserves_explicit_effort(monkeypatch):
@@ -87,6 +87,28 @@ def test_build_options_preserves_explicit_effort(monkeypatch):
     options = runtime._build_options(role, workspace=None)
 
     assert options.model == "claude-opus-4-8"
+    assert options.effort == "high"
+
+
+def test_build_options_normalizes_legacy_xhigh_effort_to_high(monkeypatch):
+    monkeypatch.setitem(
+        sys.modules,
+        "claude_agent_sdk",
+        SimpleNamespace(ClaudeAgentOptions=_FakeClaudeAgentOptions),
+    )
+
+    runtime = object.__new__(ClaudeAgentRuntime)
+    role = SimpleNamespace(
+        name="implementer",
+        prompt="Build",
+        tools=["Read"],
+        model="claude-opus-4-8",
+        effort="xhigh",
+        metadata={},
+    )
+
+    options = runtime._build_options(role, workspace=None)
+
     assert options.effort == "high"
 
 

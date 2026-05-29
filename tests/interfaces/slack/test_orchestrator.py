@@ -357,6 +357,55 @@ async def test_recovery_uses_bridge_runtime_when_explicitly_overridden():
     ]
 
 
+@pytest.mark.asyncio
+async def test_trigger_recoverable_resumes_without_slack_message():
+    feature = SimpleNamespace(
+        id="feat-1",
+        name="Feature One",
+        metadata={
+            "channel_id": "C123",
+            "workspace_path": "/tmp/workspace",
+            "mode": "singleplayer",
+            "agent_runtime": "claude",
+            "_db_phase": "implementation",
+        },
+    )
+    adapter = _RecoveringAdapter()
+    interaction = _RecoveringInteraction()
+    orchestrator = SlackWorkflowOrchestrator(
+        adapter=adapter,
+        interaction_runtime=interaction,
+        agent_runtime_name="codex",
+    )
+    orchestrator._env = SimpleNamespace(
+        feature_store=_FakeFeatureStore({"feat-1": feature})
+    )
+    orchestrator._recoverable_features = {
+        "feat-1": {
+            "workspace_path": "/tmp/workspace",
+            "mode": "singleplayer",
+            "phase": "implementation",
+            "channel_id": "C123",
+            "agent_runtime": "claude",
+        }
+    }
+    resumed: list[tuple[str, str]] = []
+
+    async def _resume(feature_id: str, channel_id: str) -> None:
+        resumed.append((feature_id, channel_id))
+        orchestrator._recoverable_features.pop(feature_id, None)
+
+    orchestrator._resume_workflow = _resume  # type: ignore[method-assign]
+
+    result = await orchestrator.trigger_recoverable_resumes(trigger="dashboard")
+
+    assert resumed == [("feat-1", "C123")]
+    assert result["trigger"] == "dashboard"
+    assert result["resumed"] == ["feat-1"]
+    assert result["skipped"] == {}
+    assert result["remaining_recoverable"] == []
+
+
 class _FakeArtifacts:
     def __init__(self) -> None:
         self.values: dict[tuple[str, str], str] = {}

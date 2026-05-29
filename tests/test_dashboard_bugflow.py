@@ -46,6 +46,22 @@ def test_bridge_manager_forwards_runtime_policy_to_slack_bridge():
     assert cmd[cmd.index("--concurrency-max") + 1] == "2"
 
 
+@pytest.mark.asyncio
+async def test_bridge_manager_resume_endpoint_sends_signal(monkeypatch: pytest.MonkeyPatch):
+    manager = BridgeManager({"channel": "C123"})
+    manager.process = SimpleNamespace(pid=4242, returncode=None)
+    sent: list[tuple[int, int]] = []
+
+    monkeypatch.setattr(dashboard.os, "kill", lambda pid, sig: sent.append((pid, sig)))
+
+    status = await manager.request_resume()
+
+    assert sent == [(4242, dashboard.signal.SIGUSR1)]
+    assert status["resume_requested"] is True
+    assert status["running"] is True
+    assert manager.lines[-1].endswith("--- REQUESTED BRIDGE RESUME ---")
+
+
 def test_bridge_manager_caps_huge_log_lines(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(dashboard, "BRIDGE_LOG_LINE_CHARS", 20)
     manager = BridgeManager({"channel": "C123"})

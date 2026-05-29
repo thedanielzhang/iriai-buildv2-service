@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import shutil
+import stat
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
@@ -12,6 +13,7 @@ from types import SimpleNamespace
 import pytest
 
 from iriai_build_v2.execution_control.models import SandboxLease as StoredSandboxLease
+from iriai_build_v2.workflows.develop.execution import sandbox as sandbox_module
 from iriai_build_v2.workflows.develop.execution.sandbox import (
     SandboxAllocationError,
     SandboxIsolationError,
@@ -149,6 +151,17 @@ class DurableFakeStore:
         return None
 
 
+class DurableAllocationFailsStore(DurableFakeStore):
+    async def allocate_sandbox_lease(
+        self,
+        lease: object,
+        *,
+        repo_bindings: tuple[object, ...] = (),
+    ) -> object:
+        del lease, repo_bindings
+        raise TimeoutError()
+
+
 class RuntimeBindingFailsOnceStore(DurableFakeStore):
     def __init__(self) -> None:
         super().__init__()
@@ -274,6 +287,166 @@ def test_allocation_pins_head_writes_manifest_and_binds_runtime(tmp_path: Path) 
     assert str(source.resolve()) in binding.blocked_roots
     assert binding.env["IRIAI_SANDBOX_MANIFEST"] == str(manifest_path)
     assert binding.role_metadata["sandbox"] is True
+    assert binding.authority_schema_version == "runtime-workspace-authority-grant-v1"
+    assert binding.runtime_workspace_authority_grant_digest
+    assert binding.runtime_workspace_authority_grants[0]["grant_type"] == "product"
+    assert binding.runtime_workspace_authority_grants[0]["promotable"] is True
+
+
+def test_allocate_materializes_create_parent_and_preserves_leaf_contract_root(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "canonical" / "app"
+    base = init_repo(source)
+    spec = spec_for(base).model_copy(update={
+        "writable_roots": [
+            "app:src/vs/workbench/contrib/workflowTab/views/implementation/index.ts",
+        ],
+        "writable_root_specs": [
+            {
+                "repo_id": "app",
+                "path": "src/vs/workbench/contrib/workflowTab/views/implementation/index.ts",
+                "match_kind": "file",
+                "allow_create": True,
+            }
+        ],
+    })
+
+    lease = run(runner_for(tmp_path, source).allocate(spec))
+    repo_root = Path(lease.repo_roots["app"])
+    leaf = repo_root / "src/vs/workbench/contrib/workflowTab/views/implementation/index.ts"
+    manifest = json.loads((Path(lease.root) / "sandbox-manifest.json").read_text())
+
+    assert leaf.parent.is_dir()
+    assert not leaf.exists()
+    assert not (source / "src").exists()
+    assert manifest["writable_roots"] == [str(leaf)]
+    assert manifest["write_guard_roots"] == [str(leaf.parent)]
+    assert manifest["materialized_create_parents"][0]["target"] == str(leaf.parent)
+    assert manifest["authority_schema_version"] == "runtime-workspace-authority-grant-v1"
+    grant = manifest["runtime_workspace_authority_grants"][0]
+    assert grant["schema_version"] == "runtime-workspace-authority-grant-v1"
+    assert grant["grant_type"] == "product"
+    assert grant["contract_roots"] == [str(leaf)]
+    assert grant["create_parent_roots"] == [str(leaf.parent)]
+    assert grant["write_guard_roots"] == [str(leaf.parent)]
+    assert grant["grant_digest"]
+    assert git(repo_root, "status", "--porcelain=v1") == ""
+
+
+def test_allocate_rejects_pre_grant_manifest_for_fresh_dispatch(tmp_path: Path) -> None:
+    source = tmp_path / "canonical" / "app"
+    base = init_repo(source)
+    spec = spec_for(base)
+    runner = runner_for(tmp_path, source)
+    lease = run(runner.allocate(spec))
+    manifest_path = Path(lease.root) / "sandbox-manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    for key in (
+        "authority_schema_version",
+        "runtime_workspace_authority_grants",
+        "runtime_workspace_authority_grant_digest",
+        "promotable",
+    ):
+        manifest.pop(key, None)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(SandboxAllocationError, match="authority grant"):
+        run(runner_for(tmp_path, source).allocate(spec))
+
+
+def test_allocation_normalizes_clone_permissions_for_agent_group(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        sandbox_module,
+        "_agent_shared_group",
+        lambda: ("test-agents", os.getgid()),
+    )
+    source = tmp_path / "canonical" / "app"
+    init_repo(source)
+    (source / "src" / "nested").mkdir(parents=True)
+    (source / "src" / "nested" / "created.py").write_text("value = 1\n", encoding="utf-8")
+    (source / "script.sh").chmod(0o755)
+    git(source, "add", ".")
+    git(source, "commit", "-qm", "add nested executable")
+    base = git(source, "rev-parse", "HEAD")
+    runner = runner_for(tmp_path, source)
+
+    lease = run(runner.allocate(spec_for(base)))
+
+    repo = Path(lease.repo_roots["app"])
+    manifest = json.loads((Path(lease.root) / "sandbox-manifest.json").read_text())
+    for directory in [repo, repo / ".git", repo / "src", repo / "src" / "nested"]:
+        mode = directory.stat().st_mode
+        assert mode & stat.S_IWGRP
+        assert mode & stat.S_IXGRP
+        assert mode & stat.S_ISGID
+        assert directory.stat().st_gid == os.getgid()
+    for regular_file in [repo / "tracked.txt", repo / "src" / "nested" / "created.py"]:
+        assert regular_file.stat().st_mode & stat.S_IWGRP
+        assert regular_file.stat().st_gid == os.getgid()
+    assert repo.joinpath("script.sh").stat().st_mode & stat.S_IXUSR
+    assert git(repo, "status", "--porcelain=v1") == ""
+    assert manifest["permission_normalization"]["scope"] == "sandbox_repo_roots"
+    assert manifest["permission_normalization"]["repos"]["app"]["paths_changed"] > 0
+
+
+def test_allocation_permission_normalization_skips_symlink_targets(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        sandbox_module,
+        "_agent_shared_group",
+        lambda: ("test-agents", os.getgid()),
+    )
+    source = tmp_path / "canonical" / "app"
+    init_repo(source)
+    outside = tmp_path / "outside-target.txt"
+    outside.write_text("outside\n", encoding="utf-8")
+    outside.chmod(0o600)
+    try:
+        os.symlink(outside, source / "outside-link")
+    except OSError as exc:
+        pytest.skip(f"symlinks unavailable: {exc}")
+    git(source, "add", "outside-link")
+    git(source, "commit", "-qm", "add symlink")
+    base = git(source, "rev-parse", "HEAD")
+    outside_mode_before = stat.S_IMODE(outside.stat().st_mode)
+
+    lease = run(runner_for(tmp_path, source).allocate(spec_for(base)))
+
+    repo = Path(lease.repo_roots["app"])
+    manifest = json.loads((Path(lease.root) / "sandbox-manifest.json").read_text())
+    assert (repo / "outside-link").is_symlink()
+    assert stat.S_IMODE(outside.stat().st_mode) == outside_mode_before
+    assert manifest["permission_normalization"]["repos"]["app"]["symlinks_skipped"] >= 1
+
+
+def test_allocation_blocks_when_permission_normalization_cannot_chmod(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        sandbox_module,
+        "_agent_shared_group",
+        lambda: ("test-agents", os.getgid()),
+    )
+    source = tmp_path / "canonical" / "app"
+    base = init_repo(source)
+    real_chmod = sandbox_module.os.chmod
+
+    def _deny_repo_chmod(path: os.PathLike[str] | str, mode: int) -> None:
+        if ".iriai" in str(path):
+            raise PermissionError("permission denied")
+        real_chmod(path, mode)
+
+    monkeypatch.setattr(sandbox_module.os, "chmod", _deny_repo_chmod)
+
+    with pytest.raises(SandboxAllocationError, match="permission normalization failed"):
+        run(runner_for(tmp_path, source).allocate(spec_for(base)))
 
 
 def test_durable_store_bridge_persists_lease_id_and_runtime_binding(
@@ -309,6 +482,31 @@ def test_durable_store_bridge_persists_lease_id_and_runtime_binding(
     assert store.updated_leases[-1].status == "running"
     manifest = json.loads((Path(lease.root) / "sandbox-manifest.json").read_text(encoding="utf-8"))
     assert manifest["sandbox_lease_id"] == 321
+
+
+def test_durable_store_allocation_failure_records_diagnostic_context(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "canonical" / "app"
+    base = init_repo(source)
+    store = DurableAllocationFailsStore()
+    runner = runner_for(tmp_path, source, store=store)
+
+    with pytest.raises(SandboxAllocationError) as exc_info:
+        run(runner.allocate(spec_for(base)))
+
+    message = str(exc_info.value)
+    assert "durable sandbox lease allocation failed" in message
+    assert "phase=store.allocate_sandbox_lease" in message
+    assert "exception_type=TimeoutError" in message
+    assert "exception_repr=TimeoutError()" in message
+    assert "feature_id=Feature/One" in message
+    assert "group_idx=4" in message
+    assert "attempt_no=2" in message
+    assert "task_ids=task-a" in message
+    assert "idempotency_key=" in message
+    assert store.allocated_leases == []
+    assert not list((tmp_path / ".iriai").glob("features/*/sandboxes/g4/attempt-2"))
 
 
 def test_runtime_binding_failure_does_not_cache_non_durable_binding(

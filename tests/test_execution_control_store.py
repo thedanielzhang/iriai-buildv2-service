@@ -1518,10 +1518,50 @@ async def test_runtime_failure_context_reader_scopes_and_bounds_details() -> Non
                     "failure_class": "sandbox_binding",
                     "failure_type": "runtime_workspace_binding_failed",
                     "terminal_reason": "sandbox_binding_failed",
+                    "evidence_ids": [777],
                     "details": {
                         "message": collision_message,
                         "large": long_detail,
                     },
+                }
+            ),
+            "started_at": None,
+            "finished_at": None,
+            "created_at": datetime(2026, 5, 27, tzinfo=timezone.utc),
+            "updated_at": datetime(2026, 5, 27, tzinfo=timezone.utc),
+        }
+    )
+    conn.evidence_nodes.append(
+        {
+            "id": 777,
+            "feature_id": FEATURE_ID,
+            "idempotency_key": "idem:patch:777",
+            "execution_journal_row_id": 301,
+            "attempt_id": None,
+            "contract_id": None,
+            "snapshot_id": None,
+            "group_idx": 77,
+            "stage": "implementation",
+            "kind": "sandbox_patch_summary",
+            "name": "patch summary",
+            "status": "approved",
+            "deterministic": True,
+            "source_ref": "sandbox-physical-777",
+            "artifact_id": None,
+            "artifact_key": "",
+            "event_id": None,
+            "input_refs": "[]",
+            "output_refs": "[]",
+            "failure_id": None,
+            "verdict_id": None,
+            "content_hash": "patch-hash",
+            "summary": "",
+            "metadata": "{}",
+            "payload": json.dumps(
+                {
+                    "sandbox_id": "sandbox-physical-777",
+                    "diff_sha256": "d" * 64,
+                    "changed_paths": ["src/app.py"],
                 }
             ),
             "started_at": None,
@@ -1539,6 +1579,16 @@ async def test_runtime_failure_context_reader_scopes_and_bounds_details() -> Non
     assert context is not None
     assert context["id"] == 501
     assert context["feature_id"] == FEATURE_ID
+    assert context["evidence_ids"] == [777]
+    assert context["sandbox_patch_summaries"] == [
+        {
+            "id": 777,
+            "attempt_id": None,
+            "sandbox_id": "sandbox-physical-777",
+            "diff_sha256": "d" * 64,
+            "changed_paths": ["src/app.py"],
+        }
+    ]
     assert "sandbox path already belongs" in context["details"]["message"]
     assert context["details"]["large"].endswith("...[truncated 500 chars]")
     assert await store.get_runtime_failure_context(
@@ -5874,6 +5924,114 @@ async def test_dispatch_runtime_failure_is_typed_resumable_evidence() -> None:
     # snapshot.changed outbox row; the doc-10-correct SUMMARY-only
     # projection at the projection seam is covered by the dedicated
     # test_project_control_plane_snapshot_changed_* suite below.
+
+
+@pytest.mark.asyncio
+async def test_late_runtime_completion_recovery_converts_timeout_attempt_to_success() -> None:
+    module = _execution_control_module()
+    conn = _FakeConnection()
+    store = _store(_FakePool(conn))
+    base_request = _dispatch_request(module)
+    request = _dispatch_request(
+        module,
+        actor_metadata={**base_request.actor_metadata, "runtime": "claude_pool"},
+    )
+    attempt = await store.start_dispatch_attempt(request)
+    patch = await store.record_patch_summary(
+        module.PatchSummary(
+            feature_id=FEATURE_ID,
+            dag_sha256=DAG_SHA256,
+            group_idx=7,
+            attempt_no=attempt.attempt_id,
+            sandbox_id="sandbox-123",
+            task_id="TASK-typed-1",
+            repo_id="app",
+            base_commit="abc123",
+            changed_paths=["src/app.py"],
+            modified_paths=["src/app.py"],
+            diff_sha256="b" * 64,
+            diff_artifact_id=1010,
+            summary_artifact_id=1011,
+            idempotency_key="idem:patch:g7:attempt-late:app",
+        )
+    )
+    runtime = await store.record_runtime_invocation(
+        module.RuntimeInvocationEvidence(
+            attempt_id=attempt.attempt_id,
+            invocation_id="invoke-late",
+            runtime="claude_pool",
+            phase="response",
+            status="failed",
+            terminal_reason="timeout",
+            process_started=True,
+        )
+    )
+    failure = await store.record_runtime_failure(
+        module.RuntimeFailureEvidence(
+            attempt_id=attempt.attempt_id,
+            failure_class="runtime_timeout",
+            failure_type="watchdog_timeout",
+            retryable=True,
+            deterministic=False,
+            evidence_ids=[patch.evidence.id],
+            runtime="claude_pool",
+            terminal_reason="timeout",
+            signature_hash="late-timeout-signature",
+        )
+    )
+    await store.finish_dispatch_attempt(
+        module.DispatchOutcome(
+            attempt_id=attempt.attempt_id,
+            state="failed",
+            status="failed",
+            runtime_terminal_reason="timeout",
+            runtime_failure_id=failure.failure_id,
+            typed_failure_id=failure.typed_failure_id,
+            idempotency_key=request.stable_idempotency_key,
+        )
+    )
+
+    recovered = await store.recover_late_runtime_completion(
+        attempt_id=attempt.attempt_id,
+        runtime_invocation=module.RuntimeInvocationEvidence(
+            attempt_id=attempt.attempt_id,
+            invocation_id="invoke-late",
+            runtime="claude_pool",
+            phase="response",
+            status="completed",
+            terminal_reason="completed",
+            process_started=True,
+            elapsed_ms=2_155_416,
+            idempotency_key="idem:late-runtime-invocation",
+        ),
+        raw_output=module.RawOutputEvidence(
+            attempt_id=attempt.attempt_id,
+            invocation_id="invoke-late",
+            runtime="claude_pool",
+            status="completed",
+            terminal_reason="completed",
+            raw_text='{"task_id":"TASK-typed-1","status":"completed"}',
+            idempotency_key="idem:late-raw-output",
+        ),
+        structured_output=_structured_output(
+            module,
+            attempt.attempt_id,
+            idempotency_key="idem:late-structured-output",
+        ),
+        recovery_metadata={"job_id": "job-late"},
+    )
+
+    assert runtime.evidence.id
+    assert recovered.status == "succeeded"
+    assert recovered.runtime_terminal_reason == "completed"
+    assert recovered.patch_summary_ids == [patch.evidence.id]
+    row_payload = json.loads(conn.typed_rows[0]["payload"])
+    assert conn.typed_rows[0]["status"] == "succeeded"
+    assert row_payload["dispatch_outcome"]["status"] == "succeeded"
+    assert row_payload["late_runtime_completion_recovery"]["job_id"] == "job-late"
+    assert row_payload["late_runtime_completion_recovery"]["recovered_from_typed_failure_id"] == failure.typed_failure_id
+    assert "typed_failure_id" not in row_payload
+    assert conn.artifacts[-1]["key"] == "dag-task:TASK-typed-1"
 
 
 @pytest.mark.asyncio

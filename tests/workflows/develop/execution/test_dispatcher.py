@@ -152,6 +152,7 @@ class FakeStore:
         *,
         terminal_outcome: DispatchOutcome | None = None,
         terminal_outcome_needs_finish: bool = False,
+        late_recovery_outcome: DispatchOutcome | None = None,
         conflict: bool = False,
         duplicate_state: dispatcher_module.DispatcherState | None = None,
         duplicate_request_digest: str | None = None,
@@ -160,6 +161,7 @@ class FakeStore:
         self.log = log
         self.terminal_outcome = terminal_outcome
         self.terminal_outcome_needs_finish = terminal_outcome_needs_finish
+        self.late_recovery_outcome = late_recovery_outcome
         self.conflict = conflict
         self.duplicate_state = duplicate_state
         self.duplicate_request_digest = duplicate_request_digest
@@ -279,6 +281,20 @@ class FakeStore:
         self.log.append(f"finish:{outcome.status}")
         self.finished.append(outcome)
         return outcome
+
+    async def recover_late_runtime_completion(
+        self,
+        attempt: DispatchAttemptRecord,
+        request: DispatchRequest,
+        *,
+        invocation_id: str,
+        output_schema: dict[str, object],
+        output_schema_digest: str,
+        output_type_name: str,
+    ) -> DispatchOutcome | None:
+        del attempt, request, invocation_id, output_schema, output_schema_digest, output_type_name
+        self.log.append("recover_late_runtime_completion")
+        return self.late_recovery_outcome
 
     async def reserve_route_budget(self, *_args: object, **_kwargs: object) -> None:
         raise AssertionError("dispatcher must not reserve route budget")
@@ -743,6 +759,57 @@ async def test_duplicate_terminal_dispatch_needing_finish_uses_finish_path() -> 
     assert outcome.compatibility_artifact_ids == [401]
     assert store.finished == [outcome]
     assert log == ["start", "project_task", "finish:succeeded"]
+    assert runtime.calls == 0
+    assert prompt_builder.calls == 0
+    assert sandbox.bind_calls == 0
+    assert sandbox.capture_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_terminal_timeout_attempt_can_recover_late_runtime_completion() -> None:
+    log: list[str] = []
+    request = _request()
+    terminal = DispatchOutcome(
+        attempt_id=55,
+        state="failed",
+        status="failed",
+        runtime_terminal_reason="timeout",
+        structured_result_evidence_id=None,
+        raw_text_ref=None,
+        patch_summary_ids=[],
+        compatibility_artifact_ids=[],
+        runtime_failure_id=501,
+        typed_failure_id=501,
+        idempotency_key=request.idempotency_key,
+    )
+    recovered = DispatchOutcome(
+        attempt_id=55,
+        state="succeeded",
+        status="succeeded",
+        runtime_terminal_reason="completed",
+        structured_result_evidence_id=301,
+        raw_text_ref=203,
+        patch_summary_ids=[701],
+        compatibility_artifact_ids=[401],
+        runtime_failure_id=None,
+        typed_failure_id=None,
+        idempotency_key=request.idempotency_key,
+    )
+    runtime = FakeRuntime(log)
+    prompt_builder = FakePromptBuilder(log)
+    sandbox = FakeSandbox(log)
+    store = FakeStore(log, terminal_outcome=terminal, late_recovery_outcome=recovered)
+
+    outcome = await _dispatcher(
+        log,
+        store=store,
+        runtime=runtime,
+        prompt_builder=prompt_builder,
+        sandbox=sandbox,
+    ).dispatch(request)
+
+    assert outcome == recovered
+    assert log == ["start", "recover_late_runtime_completion"]
     assert runtime.calls == 0
     assert prompt_builder.calls == 0
     assert sandbox.bind_calls == 0

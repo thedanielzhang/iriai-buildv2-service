@@ -230,6 +230,7 @@ class PostAdoptionRepoIdentityBulkRepairPlan:
     created_split_task_ids: tuple[str, ...]
     moved_task_ids: tuple[str, ...]
     normalized_legacy_files_task_ids: tuple[str, ...]
+    regroup_validation: dict[str, Any]
     resolved_repo_paths_by_task: dict[str, str]
     affected_group_indices: tuple[int, ...]
     group_registry_projections: dict[int, dict[str, Any]]
@@ -327,6 +328,7 @@ class PostAdoptionRepoIdentityBulkRepairPlan:
             "created_split_task_ids": list(self.created_split_task_ids),
             "moved_task_ids": list(self.moved_task_ids),
             "normalized_legacy_files_task_ids": list(self.normalized_legacy_files_task_ids),
+            "regroup_validation": self.regroup_validation,
             "resolved_repo_paths_by_task": dict(sorted(self.resolved_repo_paths_by_task.items())),
             "affected_group_indices": list(self.affected_group_indices),
             "old_artifacts": {
@@ -1218,6 +1220,19 @@ async def build_post_adoption_repo_identity_bulk_repair_plan(
         ):
             affected_groups.add(group_idx)
 
+    _sync_regroup_original_order(updated_regroup, updated_root, group_offset)
+    _recompute_regroup_original_to_new_mapping(updated_regroup, group_offset)
+    regroup_validation = _validate_regroup_hard_barriers(
+        updated_regroup,
+        group_offset=group_offset,
+    )
+    if not regroup_validation["approved"]:
+        blockers.append(_blocker(
+            "dag_regroup_barrier_violation",
+            "reviewed group moves create derived waves with mixed hard barriers",
+            violations=regroup_validation["violations"],
+        ))
+
     if blockers:
         return _blocked_bulk_post_adoption_plan(
             feature_id=feature_id,
@@ -1232,7 +1247,6 @@ async def build_post_adoption_repo_identity_bulk_repair_plan(
             blockers=blockers,
         )
 
-    _sync_regroup_original_order(updated_regroup, updated_root, group_offset)
     refreshed_root_tasks = _tasks_by_id(updated_root)
     refreshed_order = list(updated_regroup_dag.get("execution_order") or [])
     group_registry_projections: dict[int, dict[str, Any]] = {}
@@ -1328,6 +1342,7 @@ async def build_post_adoption_repo_identity_bulk_repair_plan(
         created_split_task_ids=tuple(dict.fromkeys(created_split_task_ids)),
         moved_task_ids=tuple(dict.fromkeys(moved_task_ids)),
         normalized_legacy_files_task_ids=tuple(dict.fromkeys(normalized_legacy_files_task_ids)),
+        regroup_validation=regroup_validation,
         resolved_repo_paths_by_task=dict(sorted(resolved_repo_paths_by_task.items())),
         affected_group_indices=tuple(sorted(affected_groups)),
         group_registry_projections=group_registry_projections,
@@ -1730,6 +1745,7 @@ def _blocked_bulk_post_adoption_plan(
         created_split_task_ids=(),
         moved_task_ids=(),
         normalized_legacy_files_task_ids=(),
+        regroup_validation={},
         resolved_repo_paths_by_task={},
         affected_group_indices=(),
         group_registry_projections={},
@@ -2061,6 +2077,115 @@ def _move_task_in_order(
     if task_id not in {str(item) for item in target}:
         target.append(task_id)
     order[target_group_idx] = target
+
+
+def _recompute_regroup_original_to_new_mapping(
+    regroup_payload: dict[str, Any],
+    group_offset: int,
+) -> None:
+    original_order = list(regroup_payload.get("original_execution_order") or [])
+    regroup_dag = (
+        regroup_payload.get("dag")
+        if isinstance(regroup_payload.get("dag"), dict)
+        else {}
+    )
+    derived_order = list(regroup_dag.get("execution_order") or [])
+    original_group_by_task: dict[str, int] = {}
+    for local_original_idx, raw_group in enumerate(original_order):
+        if not isinstance(raw_group, list):
+            continue
+        original_group_idx = group_offset + local_original_idx
+        for raw_task_id in raw_group:
+            task_id = str(raw_task_id)
+            if task_id:
+                original_group_by_task[task_id] = original_group_idx
+
+    mapping: dict[str, list[int]] = {
+        str(group_offset + local_original_idx): []
+        for local_original_idx, raw_group in enumerate(original_order)
+        if isinstance(raw_group, list)
+    }
+    for local_derived_idx, raw_group in enumerate(derived_order):
+        if not isinstance(raw_group, list):
+            continue
+        derived_group_idx = group_offset + local_derived_idx
+        for raw_task_id in raw_group:
+            original_group_idx = original_group_by_task.get(str(raw_task_id))
+            if original_group_idx is None:
+                continue
+            bucket = mapping.setdefault(str(original_group_idx), [])
+            if derived_group_idx not in bucket:
+                bucket.append(derived_group_idx)
+
+    regroup_payload["original_to_new_group_mapping"] = {
+        original_group: sorted(new_groups)
+        for original_group, new_groups in sorted(
+            mapping.items(),
+            key=lambda item: int(item[0]) if str(item[0]).lstrip("-").isdigit() else item[0],
+        )
+    }
+
+
+def _validate_regroup_hard_barriers(
+    regroup_payload: Mapping[str, Any],
+    *,
+    group_offset: int,
+) -> dict[str, Any]:
+    regroup_dag = _mapping_for(regroup_payload.get("dag"))
+    execution_order = list(regroup_dag.get("execution_order") or [])
+    barrier_by_task = _regroup_hard_barrier_by_task_from_projection(regroup_payload)
+    violations: list[dict[str, Any]] = []
+    for local_group_idx, raw_group in enumerate(execution_order):
+        if not isinstance(raw_group, list):
+            continue
+        hard_barriers = sorted({
+            barrier_by_task[str(task_id)]
+            for task_id in raw_group
+            if str(task_id) in barrier_by_task
+        })
+        if len(hard_barriers) > 1:
+            violations.append({
+                "new_group": group_offset + local_group_idx,
+                "barriers": hard_barriers,
+                "task_ids": [str(task_id) for task_id in raw_group],
+            })
+    return {
+        "approved": not violations,
+        "reason": "" if not violations else "dag_regroup_barrier_violation",
+        "violations": violations[:20],
+    }
+
+
+def _regroup_hard_barrier_by_task_from_projection(
+    regroup_payload: Mapping[str, Any],
+) -> dict[str, str]:
+    barrier_by_task: dict[str, str] = {}
+    for idx, raw_barrier in enumerate(list(regroup_payload.get("barriers") or [])):
+        barrier = _mapping_for(raw_barrier)
+        hard = barrier.get("hard", True)
+        if hard is False or str(hard).lower() in {"false", "0", "no", "off"}:
+            continue
+        barrier_id = str(
+            barrier.get("id")
+            or barrier.get("barrier_id")
+            or barrier.get("name")
+            or barrier.get("kind")
+            or f"barrier-{idx}"
+        ).strip()
+        if not barrier_id:
+            continue
+        for raw_task_id in list(barrier.get("task_ids") or []):
+            task_id = str(raw_task_id).strip()
+            if task_id:
+                barrier_by_task.setdefault(task_id, barrier_id)
+
+    speed_tasks = _mapping_for(_mapping_for(regroup_payload.get("speed_index")).get("tasks"))
+    for task_id, raw_metadata in speed_tasks.items():
+        metadata = _mapping_for(raw_metadata)
+        barrier_id = str(metadata.get("barrier") or "").strip()
+        if barrier_id:
+            barrier_by_task.setdefault(str(task_id), barrier_id)
+    return barrier_by_task
 
 
 def _normalize_legacy_files_for_group_range(

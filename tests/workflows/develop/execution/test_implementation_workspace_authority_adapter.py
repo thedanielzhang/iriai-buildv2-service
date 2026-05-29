@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import stat
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
@@ -23,6 +25,11 @@ from iriai_build_v2.workflows.develop.execution.workspace_authority import (
     CanonicalRepoRegistry,
     RepoIdentity,
 )
+
+try:
+    import grp
+except ImportError:  # pragma: no cover - non-Unix fallback.
+    grp = None  # type: ignore[assignment]
 
 
 class _Artifacts:
@@ -70,6 +77,8 @@ class _BridgeExecutionControlStore:
         self.pending_merge_patch_requests = []
         self.runtime_failure_contexts = {}
         self.runtime_failure_context_requests = []
+        self.sandbox_leases_by_attempt_no = {}
+        self.sandbox_lease_attempt_requests = []
         self._next_contract_id = 100
         self._next_attempt_id = 0
         self._next_evidence_id = 1000
@@ -152,6 +161,11 @@ class _BridgeExecutionControlStore:
         self.runtime_failure_context_requests.append(kwargs)
         failure_id = int(kwargs.get("failure_id") or 0)
         return self.runtime_failure_contexts.get(failure_id)
+
+    async def get_sandbox_lease_by_attempt_no(self, **kwargs):
+        self.sandbox_lease_attempt_requests.append(kwargs)
+        attempt_no = int(kwargs.get("attempt_no") or 0)
+        return self.sandbox_leases_by_attempt_no.get(attempt_no)
 
     async def finish_dispatch_attempt(self, outcome):
         self.finished.append(outcome)
@@ -241,11 +255,130 @@ def _write_sandbox_file(ask, path: str, content: str) -> None:
     target.write_text(content, encoding="utf-8")
 
 
+def _write_retry_sandbox_manifest(
+    workspace_root: Path,
+    *,
+    feature_id: str,
+    attempt_id: int,
+    retained: bool = True,
+    normalized: bool = False,
+    repo_mode: int = 0o755,
+) -> Path:
+    repo = (
+        workspace_root
+        / ".iriai"
+        / "features"
+        / feature_id
+        / "sandboxes"
+        / "g78"
+        / f"attempt-{attempt_id}"
+        / "repos"
+        / "app"
+    )
+    (repo / "src").mkdir(parents=True)
+    repo.chmod(repo_mode)
+    (repo / "src").chmod(repo_mode)
+    manifest = {
+        "sandbox_id": f"sandbox-{attempt_id}",
+        "status": "retained" if retained else "captured",
+        "repo_roots": {"app": str(repo)},
+    }
+    if normalized:
+        manifest["permission_normalization"] = {
+            "scope": "sandbox_repo_roots",
+            "repos": {"app": {"paths_changed": 1}},
+        }
+    manifest_path = repo.parent.parent / "sandbox-manifest.json"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    return manifest_path
+
+
+def _shared_group_name_or_skip() -> str:
+    if grp is None:
+        pytest.skip("grp module is unavailable")
+    try:
+        return grp.getgrgid(os.getgid()).gr_name
+    except KeyError:
+        pytest.skip("current gid is not present in the group database")
+
+
 def _workspace(tmp_path: Path) -> tuple[Path, Path]:
     workspace_root = tmp_path / "workspace"
     feature_root = workspace_root / ".iriai" / "features" / "slice-02" / "repos"
     feature_root.mkdir(parents=True)
     return workspace_root, feature_root
+
+
+def _write_rca_pool_job(
+    pool_root: Path,
+    *,
+    job_id: str,
+    bug_id: str = "VERIFY-FAIL-158",
+    binding: dict[str, object] | None = None,
+    cwd: Path | None = None,
+    status: str = "failed",
+    profile: str = "iriai-claude-1",
+) -> Path:
+    prompt_dir = pool_root / "payloads" / job_id[:2] / job_id
+    prompt_dir.mkdir(parents=True)
+    prompt_path = prompt_dir / "prompt.md"
+    prompt_path.write_text(
+        f"## Bug Report: {bug_id}\n\nFailure Source: verify\n",
+        encoding="utf-8",
+    )
+    job_path = pool_root / "jobs" / status / profile / f"{job_id}.json"
+    job_path.parent.mkdir(parents=True)
+    role_metadata: dict[str, object] = {"runtime": "primary"}
+    if binding is not None:
+        role_metadata["runtime_workspace_binding"] = binding
+    payload = {
+        "id": job_id,
+        "profile": profile,
+        "status": status,
+        "created_at": "2026-05-29T07:04:24.434198+00:00",
+        "cwd": str(cwd or (pool_root / "canonical-feature-repos")),
+        "role": {
+            "name": "root-cause-analyst",
+            "tools": ["Read", "Bash", "Glob", "Grep"],
+            "metadata": role_metadata,
+        },
+        "paths": {
+            "prompt": str(prompt_path),
+            "result": str(prompt_dir / "result.json"),
+        },
+    }
+    job_path.write_text(json.dumps(payload), encoding="utf-8")
+    return job_path
+
+
+def _rca_blocker_attempt(
+    *,
+    bug_id: str = "VERIFY-FAIL-158",
+    source: str = "verify",
+    description: str | None = None,
+    fix_applied: str | None = None,
+    result: str = "FAIL",
+    attempt_number: int = 158,
+):
+    blocker = (
+        "SANDBOX_WORKFLOW_BLOCKER: RCA runtime failed before product repair "
+        f"dispatch; runtime=primary source={source} bug_id={bug_id} "
+        "context=bug-rca: Task Ask failed"
+    )
+    return implementation_module.BugFixAttempt(
+        bug_id=bug_id,
+        source_verdict=source,
+        description=description
+        or (
+            "BLOCKED on a sandbox-permissions issue: manifest writable_roots "
+            "lists only leaf files and EACCES prevents mkdir"
+        ),
+        root_cause="RCA runtime failed before root cause analysis completed.",
+        fix_applied=fix_applied or blocker,
+        files_modified=[],
+        re_verify_result=result,
+        attempt_number=attempt_number,
+    )
 
 
 @pytest.mark.parametrize(
@@ -300,6 +433,1367 @@ def test_retryable_dispatch_terminal_reason_stops_at_budget() -> None:
         attempt=5,
         max_retries=5,
     )
+
+
+def test_product_retry_budget_does_not_reset_from_existing_attempt_index() -> None:
+    outcome = SimpleNamespace(
+        status="failed",
+        runtime_terminal_reason="provider_error",
+    )
+
+    assert not implementation_module._should_retry_implementation_dispatch_outcome(
+        outcome,
+        attempt=3,
+        max_retries=3,
+    )
+
+
+def test_incomplete_process_failure_with_recorded_failure_retries() -> None:
+    outcome = SimpleNamespace(
+        status="incomplete",
+        runtime_terminal_reason="process_failed",
+        runtime_failure_id=901,
+        typed_failure_id=901,
+    )
+
+    assert implementation_module._should_retry_implementation_dispatch_outcome(
+        outcome,
+        attempt=3,
+        max_retries=5,
+    )
+
+
+def test_incomplete_process_failure_without_recorded_failure_blocks() -> None:
+    outcome = SimpleNamespace(
+        status="incomplete",
+        runtime_terminal_reason="process_failed",
+        runtime_failure_id=None,
+        typed_failure_id=None,
+    )
+
+    assert not implementation_module._should_retry_implementation_dispatch_outcome(
+        outcome,
+        attempt=3,
+        max_retries=5,
+    )
+
+
+@pytest.mark.asyncio
+async def test_permission_marked_patch_capture_failure_retries() -> None:
+    runner = SimpleNamespace(services={})
+    feature = SimpleNamespace(id="feature-1")
+    result = implementation_module.ImplementationResult(
+        task_id="TASK-permission-retry",
+        summary="Bash failed with EACCES permission denied creating .claude/session-env",
+        status="blocked",
+    )
+    outcome = SimpleNamespace(
+        status="failed",
+        runtime_terminal_reason="patch_capture_failed",
+        runtime_failure_id=146,
+        typed_failure_id=146,
+    )
+
+    assert await implementation_module._should_retry_implementation_dispatch_result(
+        runner,
+        feature,
+        result,
+        outcome,
+        attempt=4,
+        max_retries=3,
+        infra_max_retries=5,
+    )
+    assert not await implementation_module._should_retry_implementation_dispatch_result(
+        runner,
+        feature,
+        result,
+        outcome,
+        attempt=5,
+        max_retries=3,
+        infra_max_retries=5,
+    )
+
+
+@pytest.mark.asyncio
+async def test_permission_marked_patch_capture_failure_retries_from_context() -> None:
+    store = _BridgeExecutionControlStore()
+    store.runtime_failure_contexts[146] = {
+        "summary": "Task contract validation failed before sandbox promotion",
+        "details": {"stderr": "EPERM: session-env is not writable"},
+    }
+    runner = SimpleNamespace(services={"execution_control_store": store})
+    feature = SimpleNamespace(id="feature-1")
+    result = implementation_module.ImplementationResult(
+        task_id="TASK-permission-context-retry",
+        summary="patch capture failed",
+        status="blocked",
+    )
+    outcome = SimpleNamespace(
+        status="failed",
+        runtime_terminal_reason="patch_capture_failed",
+        runtime_failure_id=146,
+        typed_failure_id=146,
+    )
+
+    assert await implementation_module._should_retry_implementation_dispatch_result(
+        runner,
+        feature,
+        result,
+        outcome,
+        attempt=4,
+        max_retries=3,
+        infra_max_retries=5,
+    )
+    assert store.runtime_failure_context_requests == [
+        {"feature_id": "feature-1", "failure_id": 146}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_generic_patch_capture_failure_stays_non_retryable() -> None:
+    runner = SimpleNamespace(services={})
+    feature = SimpleNamespace(id="feature-1")
+    result = implementation_module.ImplementationResult(
+        task_id="TASK-empty-patch",
+        summary="empty_patch_requires_mutation, required_path_missing",
+        status="blocked",
+    )
+    outcome = SimpleNamespace(
+        status="failed",
+        runtime_terminal_reason="patch_capture_failed",
+        runtime_failure_id=150,
+        typed_failure_id=150,
+    )
+
+    assert not await implementation_module._should_retry_implementation_dispatch_result(
+        runner,
+        feature,
+        result,
+        outcome,
+        attempt=4,
+        max_retries=3,
+        infra_max_retries=5,
+    )
+    outcome_with_patch = SimpleNamespace(
+        status="failed",
+        runtime_terminal_reason="patch_capture_failed",
+        runtime_failure_id=150,
+        typed_failure_id=150,
+        patch_summary_ids=[701],
+    )
+    assert not await implementation_module._should_retry_implementation_dispatch_result(
+        runner,
+        feature,
+        result.model_copy(update={"summary": "permission denied"}),
+        outcome_with_patch,
+        attempt=5,
+        max_retries=3,
+        infra_max_retries=5,
+    )
+
+
+def _dispatch_replay_request() -> SimpleNamespace:
+    return SimpleNamespace(
+        feature_id="8ac124d6",
+        dag_sha256="dag-sha",
+        group_idx=78,
+        task_id="TASK-9-3",
+        task_name="Replay task",
+        retry=3,
+        retry_identity={},
+        contract_ids=[],
+        sandbox_id="dispatch-sandbox:8ac124d6:g78:TASK-9-3:r3",
+        workspace_snapshot_ids=[],
+        base_commit_by_repo={},
+        runtime_policy="claude_pool",
+        runtime_policy_digest="policy-digest",
+        actor_role="implementation",
+        actor_metadata={},
+        prior_evidence_ids=[],
+        cancellation_token=None,
+        idempotency_key="idem:dispatch:existing",
+        request_digest="new-request-digest",
+    )
+
+
+def _dispatch_replay_row(
+    *,
+    status: str,
+    dispatcher_state: str,
+    payload: dict[str, object],
+    attempt_id: int = 117,
+    request_digest: str = "old-request-digest",
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        id=attempt_id,
+        status=status,
+        dispatcher_state=dispatcher_state,
+        request_digest=request_digest,
+        payload=payload,
+    )
+
+
+class _IdempotencyConflictReplayStore:
+    def __init__(self, row: SimpleNamespace | None) -> None:
+        self.row = row
+        self.runtime_failures: list[object] = []
+
+    async def start_dispatch_attempt(self, _request: object) -> object:
+        raise implementation_module.StoredIdempotencyConflict("digest drift")
+
+    async def get_by_idempotency_key(
+        self,
+        _feature_id: str,
+        _idempotency_key: str,
+    ) -> SimpleNamespace | None:
+        if self.row is None:
+            return None
+        return SimpleNamespace(row=self.row)
+
+    async def record_runtime_failure(self, failure: object) -> SimpleNamespace:
+        self.runtime_failures.append(failure)
+        return SimpleNamespace(failure_id=999)
+
+
+@pytest.mark.asyncio
+async def test_dispatch_port_replays_terminal_success_despite_digest_drift() -> None:
+    row = _dispatch_replay_row(
+        status="succeeded",
+        dispatcher_state="succeeded",
+        payload={
+            "dispatch_outcome": {
+                "attempt_id": 117,
+                "state": "succeeded",
+                "status": "succeeded",
+                "runtime_terminal_reason": "completed",
+                "structured_result_evidence_id": 194,
+                "raw_text_ref": 193,
+                "patch_summary_ids": [157],
+                "compatibility_artifact_ids": [1983453],
+                "runtime_failure_id": None,
+                "typed_failure_id": None,
+                "idempotency_key": "idem:dispatch:existing",
+            }
+        },
+    )
+    store = _IdempotencyConflictReplayStore(row)
+    port = implementation_module._ExecutionControlDispatchJournalPort(store)
+
+    attempt = await port.start_dispatch_attempt(_dispatch_replay_request())
+
+    assert attempt.created is False
+    assert attempt.attempt_id == 117
+    assert attempt.terminal_outcome is not None
+    assert attempt.terminal_outcome.status == "succeeded"
+    assert attempt.terminal_outcome.patch_summary_ids == [157]
+    assert store.runtime_failures == []
+
+
+@pytest.mark.asyncio
+async def test_dispatch_port_replays_terminal_failure_despite_digest_drift() -> None:
+    row = _dispatch_replay_row(
+        status="failed",
+        dispatcher_state="failed",
+        payload={
+            "dispatch_outcome": {
+                "attempt_id": 105,
+                "state": "failed",
+                "status": "failed",
+                "runtime_terminal_reason": "sandbox_binding_failed",
+                "structured_result_evidence_id": None,
+                "raw_text_ref": None,
+                "patch_summary_ids": [],
+                "compatibility_artifact_ids": [],
+                "runtime_failure_id": 122,
+                "typed_failure_id": 122,
+                "idempotency_key": "idem:dispatch:existing",
+            }
+        },
+        attempt_id=105,
+    )
+    store = _IdempotencyConflictReplayStore(row)
+    port = implementation_module._ExecutionControlDispatchJournalPort(store)
+
+    attempt = await port.start_dispatch_attempt(_dispatch_replay_request())
+
+    assert attempt.created is False
+    assert attempt.attempt_id == 105
+    assert attempt.terminal_outcome is not None
+    assert attempt.terminal_outcome.status == "failed"
+    assert attempt.terminal_outcome.typed_failure_id == 122
+    assert store.runtime_failures == []
+
+
+@pytest.mark.asyncio
+async def test_dispatch_port_replays_recoverable_evidence_recording_digest_drift() -> None:
+    row = _dispatch_replay_row(
+        status="started",
+        dispatcher_state="evidence_recording",
+        payload={
+            "structured_result_evidence_id": 179,
+            "runtime_terminal_reason": "completed",
+            "raw_text_ref": 178,
+            "patch_summary_ids": [177],
+            "compatibility_artifact_ids": [],
+        },
+        attempt_id=135,
+    )
+    store = _IdempotencyConflictReplayStore(row)
+    port = implementation_module._ExecutionControlDispatchJournalPort(store)
+
+    attempt = await port.start_dispatch_attempt(_dispatch_replay_request())
+
+    assert attempt.created is False
+    assert attempt.terminal_outcome_needs_finish is True
+    assert attempt.terminal_outcome is not None
+    assert attempt.terminal_outcome.status == "succeeded"
+    assert attempt.terminal_outcome.patch_summary_ids == [177]
+    assert store.runtime_failures == []
+
+
+@pytest.mark.asyncio
+async def test_dispatch_port_preserves_strict_conflict_for_active_nonterminal() -> None:
+    row = _dispatch_replay_row(
+        status="started",
+        dispatcher_state="runtime_invoking",
+        payload={},
+        request_digest="actual-existing-digest",
+    )
+    store = _IdempotencyConflictReplayStore(row)
+    port = implementation_module._ExecutionControlDispatchJournalPort(store)
+
+    with pytest.raises(implementation_module.DispatcherDispatchIdempotencyConflict) as exc_info:
+        await port.start_dispatch_attempt(_dispatch_replay_request())
+
+    assert exc_info.value.existing_digest == "actual-existing-digest"
+    assert exc_info.value.requested_digest == "new-request-digest"
+    assert store.runtime_failures == []
+
+
+def test_runtime_provider_route_uses_route_retry_not_outer_attempt() -> None:
+    payload = implementation_module._typed_runtime_provider_route_payload(
+        group_idx=-1,
+        outer_attempt=158,
+        route_retry=0,
+        lane_id="bug-rca:verify:VERIFY-FAIL-158:bug-rca",
+        runtime="primary",
+        error=RuntimeError("provider unavailable"),
+        context="bug-rca",
+        source="verify",
+    )
+
+    assert payload["retry"] == 158
+    assert payload["outer_attempt"] == 158
+    assert payload["route_retry"] == 0
+    assert payload["lane_id"] == "bug-rca:verify:VERIFY-FAIL-158:bug-rca"
+    assert payload["route"] == "retry_dispatch"
+    assert not payload["retry_budget"].get("budget_exhausted", False)
+
+
+@pytest.mark.asyncio
+async def test_store_attempts_waives_historical_pre_grant_rca_blocker(
+    tmp_path: Path,
+) -> None:
+    artifacts = _Artifacts()
+    runner = _runner(tmp_path / "workspace", artifacts)
+    artifacts.store["bug-rca-runtime-failure:verify:VERIFY-FAIL-158"] = json.dumps({
+        "runtime_workspace_evidence": {
+            "classification": "pre_grant",
+            "matched_jobs": [{"classification": "pre_grant"}],
+        },
+        "error": "EACCES: permission denied; writable_roots lists only leaf files",
+    })
+
+    await implementation_module._store_attempts_or_quiesce_on_workflow_blocker(
+        runner,
+        _feature(),
+        [_rca_blocker_attempt()],
+        phase_name="implementation",
+        source="verify",
+    )
+
+    assert "workflow-blocker-waiver:bug-rca:verify:VERIFY-FAIL-158" in artifacts.store
+
+
+@pytest.mark.asyncio
+async def test_store_attempts_keeps_unproven_workflow_blocker_terminal(
+    tmp_path: Path,
+) -> None:
+    artifacts = _Artifacts()
+    runner = _runner(tmp_path / "workspace", artifacts)
+
+    with pytest.raises(implementation_module.WorkflowQuiesced):
+        await implementation_module._store_attempts_or_quiesce_on_workflow_blocker(
+            runner,
+            _feature(),
+            [_rca_blocker_attempt()],
+            phase_name="implementation",
+            source="verify",
+        )
+
+    assert not any(key.startswith("workflow-blocker-waiver:") for key in artifacts.store)
+
+
+@pytest.mark.asyncio
+async def test_store_attempts_ignores_description_only_blocker_for_infra_retry(
+    tmp_path: Path,
+) -> None:
+    artifacts = _Artifacts()
+    runner = _runner(tmp_path / "workspace", artifacts)
+    attempt = _rca_blocker_attempt(
+        fix_applied="Infrastructure retry scheduled for the RCA runtime lane.",
+        result="INFRA_RETRY",
+    )
+
+    await implementation_module._store_attempts_or_quiesce_on_workflow_blocker(
+        runner,
+        _feature(),
+        [attempt],
+        phase_name="implementation",
+        source="verify",
+    )
+
+    assert not any(key.startswith("workflow-blocker-waiver:") for key in artifacts.store)
+
+
+@pytest.mark.asyncio
+async def test_store_attempts_waives_diagnostic_scratch_repo_discovery_failure(
+    tmp_path: Path,
+) -> None:
+    artifacts = _Artifacts()
+    runner = _runner(tmp_path / "workspace", artifacts)
+    artifacts.store["bug-rca-runtime-failure:verify:VERIFY-FAIL-159"] = json.dumps({
+        "error": (
+            "git rev-parse HEAD failed in /tmp/repos/.iriai-test-tmp/pytest-0/"
+            "sources/A: fatal: not a git repository"
+        ),
+    })
+
+    await implementation_module._store_attempts_or_quiesce_on_workflow_blocker(
+        runner,
+        _feature(),
+        [
+            _rca_blocker_attempt(
+                bug_id="VERIFY-FAIL-159",
+                fix_applied=(
+                    "SANDBOX_WORKFLOW_BLOCKER: RCA runtime failed before product "
+                    "repair dispatch; runtime=primary source=verify "
+                    "bug_id=VERIFY-FAIL-159 context=bug-rca: git rev-parse HEAD "
+                    "failed in /tmp/repos/.iriai-test-tmp/pytest-0/sources/A: "
+                    "fatal: not a git repository"
+                ),
+                attempt_number=159,
+            )
+        ],
+        phase_name="implementation",
+        source="verify",
+    )
+
+    assert "workflow-blocker-waiver:bug-rca:verify:VERIFY-FAIL-159" in artifacts.store
+
+
+@pytest.mark.asyncio
+async def test_rca_pre_grant_job_schedules_one_infra_retry(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    pool_root = tmp_path / "claude-pool"
+    _write_rca_pool_job(
+        pool_root,
+        job_id="9ec7799fb6a74440ad9c52dfaeaa6459",
+    )
+    monkeypatch.setenv("IRIAI_CLAUDE_POOL_ROOT", str(pool_root))
+    artifacts = _Artifacts()
+    runner = _runner(tmp_path / "workspace", artifacts)
+
+    attempt = await implementation_module._record_bug_rca_runtime_blocker_attempt(
+        runner,
+        _feature(),
+        source="verify",
+        bug_id="VERIFY-FAIL-158",
+        attempt_number=158,
+        phase_name="implementation",
+        rca_runtime="primary",
+        exc=RuntimeError(
+            "BLOCKED on a sandbox-permissions issue: the contract files cannot "
+            "be written; manifest writable_roots lists only leaf files"
+        ),
+        context="bug-rca",
+        verdict_text="verify failed",
+    )
+
+    assert attempt.re_verify_result == "INFRA_RETRY"
+    assert "SANDBOX_WORKFLOW_BLOCKER" not in attempt.fix_applied
+    assert "workflow-blocker:bug-rca:verify:VERIFY-FAIL-158" not in artifacts.store
+    marker_key = "bug-rca-pre-grant-infra-retry:verify:bug-rca"
+    assert marker_key in artifacts.store
+    payload = json.loads(
+        artifacts.store["bug-rca-runtime-failure:verify:VERIFY-FAIL-158"]
+    )
+    assert payload["pre_grant_infra_retryable"] is True
+    evidence = payload["runtime_workspace_evidence"]
+    assert evidence["classification"] == "pre_grant"
+    assert evidence["matched_jobs"][0]["binding_present"] is False
+
+    second = await implementation_module._record_bug_rca_runtime_blocker_attempt(
+        runner,
+        _feature(),
+        source="verify",
+        bug_id="VERIFY-FAIL-159",
+        attempt_number=159,
+        phase_name="implementation",
+        rca_runtime="primary",
+        exc=RuntimeError(
+            "BLOCKED on a sandbox-permissions issue: the contract files cannot "
+            "be written; manifest writable_roots lists only leaf files"
+        ),
+        context="bug-rca",
+        verdict_text="verify failed",
+    )
+
+    assert second.re_verify_result == "INFRA_RETRY"
+    assert "SANDBOX_WORKFLOW_BLOCKER" not in second.fix_applied
+    second_payload = json.loads(
+        artifacts.store["bug-rca-runtime-failure:verify:VERIFY-FAIL-159"]
+    )
+    assert second_payload["pre_grant_infra_retryable"] is False
+    assert second_payload["pre_grant_infra_retry_consumed"] is True
+
+
+@pytest.mark.asyncio
+async def test_rca_pre_grant_leaf_only_manifest_schedules_infra_retry(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    pool_root = tmp_path / "claude-pool"
+    sandbox_root = tmp_path / "sandbox"
+    repo = sandbox_root / "repo"
+    leaf = repo / "src/vs/workbench/contrib/workflowTab/views/implementation/index.ts"
+    manifest_path = sandbox_root / "sandbox-manifest.json"
+    manifest_path.parent.mkdir(parents=True)
+    manifest_path.write_text(
+        json.dumps({
+            "sandbox_id": "sandbox-old",
+            "root": str(sandbox_root),
+            "repo_roots": {"app": str(repo)},
+            "writable_roots": [str(leaf)],
+        }),
+        encoding="utf-8",
+    )
+    _write_rca_pool_job(
+        pool_root,
+        job_id="leafonlypregrant0000000000000001",
+        binding={
+            "sandbox_id": "sandbox-old",
+            "cwd": str(repo),
+            "workspace_override": str(repo),
+            "manifest_path": str(manifest_path),
+            "writable_roots": [str(leaf)],
+        },
+        cwd=repo,
+    )
+    monkeypatch.setenv("IRIAI_CLAUDE_POOL_ROOT", str(pool_root))
+    artifacts = _Artifacts()
+    runner = _runner(tmp_path / "workspace", artifacts)
+
+    attempt = await implementation_module._record_bug_rca_runtime_blocker_attempt(
+        runner,
+        _feature(),
+        source="verify",
+        bug_id="VERIFY-FAIL-158",
+        attempt_number=158,
+        phase_name="implementation",
+        rca_runtime="primary",
+        exc=RuntimeError("EACCES: permission denied, mkdir contrib/workflowTab"),
+        context="bug-rca",
+        verdict_text="verify failed",
+    )
+
+    assert attempt.re_verify_result == "INFRA_RETRY"
+    payload = json.loads(
+        artifacts.store["bug-rca-runtime-failure:verify:VERIFY-FAIL-158"]
+    )
+    job = payload["runtime_workspace_evidence"]["matched_jobs"][0]
+    assert job["classification"] == "pre_grant"
+    assert job["leaf_only_writable_roots"] is True
+    assert job["write_guard_roots"] == []
+
+
+@pytest.mark.asyncio
+async def test_grant_backed_rca_failure_is_not_pre_grant_retryable(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    pool_root = tmp_path / "claude-pool"
+    repo = tmp_path / "sandbox" / "repo"
+    repo.mkdir(parents=True)
+    _write_rca_pool_job(
+        pool_root,
+        job_id="grantbacked00000000000000000001",
+        binding={
+            "sandbox_id": "sandbox-new",
+            "cwd": str(repo),
+            "workspace_override": str(repo),
+            "authority_schema_version": "runtime-workspace-authority-grant-v1",
+            "runtime_workspace_authority_grant_digest": "digest",
+            "write_guard_scope": "diagnostic",
+            "write_guard_roots": [str(repo)],
+            "writable_roots": [str(repo)],
+            "promotable": False,
+        },
+        cwd=repo,
+    )
+    monkeypatch.setenv("IRIAI_CLAUDE_POOL_ROOT", str(pool_root))
+    artifacts = _Artifacts()
+    runner = _runner(tmp_path / "workspace", artifacts)
+
+    attempt = await implementation_module._record_bug_rca_runtime_blocker_attempt(
+        runner,
+        _feature(),
+        source="verify",
+        bug_id="VERIFY-FAIL-158",
+        attempt_number=158,
+        phase_name="implementation",
+        rca_runtime="primary",
+        exc=RuntimeError("EACCES: permission denied"),
+        context="bug-rca",
+        verdict_text="verify failed",
+    )
+
+    assert attempt.re_verify_result == "INFRA_RETRY"
+    assert "SANDBOX_WORKFLOW_BLOCKER" not in attempt.fix_applied
+    payload = json.loads(
+        artifacts.store["bug-rca-runtime-failure:verify:VERIFY-FAIL-158"]
+    )
+    assert payload["pre_grant_infra_retryable"] is False
+    assert payload["runtime_workspace_evidence"]["classification"] == "grant_backed"
+    assert "workflow-blocker:bug-rca:verify:VERIFY-FAIL-158" not in artifacts.store
+
+
+@pytest.mark.asyncio
+async def test_generic_rca_failure_uses_runtime_route_retry(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    pool_root = tmp_path / "claude-pool"
+    _write_rca_pool_job(
+        pool_root,
+        job_id="genericfailure000000000000000001",
+    )
+    monkeypatch.setenv("IRIAI_CLAUDE_POOL_ROOT", str(pool_root))
+    artifacts = _Artifacts()
+    runner = _runner(tmp_path / "workspace", artifacts)
+
+    attempt = await implementation_module._record_bug_rca_runtime_blocker_attempt(
+        runner,
+        _feature(),
+        source="verify",
+        bug_id="VERIFY-FAIL-158",
+        attempt_number=158,
+        phase_name="implementation",
+        rca_runtime="primary",
+        exc=RuntimeError("structured output was malformed"),
+        context="bug-rca",
+        verdict_text="verify failed",
+    )
+
+    assert attempt.re_verify_result == "INFRA_RETRY"
+    assert "SANDBOX_WORKFLOW_BLOCKER" not in attempt.fix_applied
+    payload = json.loads(
+        artifacts.store["bug-rca-runtime-failure:verify:VERIFY-FAIL-158"]
+    )
+    assert payload["runtime_workspace_evidence"]["classification"] == "pre_grant"
+    assert payload["runtime_workspace_evidence"]["failure_mentions_sandbox_authority"] is False
+    assert payload["pre_grant_infra_retryable"] is False
+    assert payload["route"] == "retry_dispatch"
+    assert "workflow-blocker:bug-rca:verify:VERIFY-FAIL-158" not in artifacts.store
+
+
+@pytest.mark.asyncio
+async def test_rca_runtime_route_exhaustion_records_terminal_blocker(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    pool_root = tmp_path / "claude-pool"
+    _write_rca_pool_job(
+        pool_root,
+        job_id="genericfailure000000000000000001",
+    )
+    monkeypatch.setenv("IRIAI_CLAUDE_POOL_ROOT", str(pool_root))
+    artifacts = _Artifacts()
+    runner = _runner(tmp_path / "workspace", artifacts)
+    lane_id = implementation_module._rca_runtime_lane_id(
+        source="verify",
+        context="bug-rca",
+        verdict_text="verify failed",
+    )
+    for retry in (0, 1):
+        artifacts.store[f"bug-rca-runtime-failure:verify:PRIOR-{retry}"] = json.dumps({
+            "lane_id": lane_id,
+            "route_retry": retry,
+            "route": "retry_dispatch",
+            "error": "structured output was malformed",
+        })
+
+    attempt = await implementation_module._record_bug_rca_runtime_blocker_attempt(
+        runner,
+        _feature(),
+        source="verify",
+        bug_id="VERIFY-FAIL-200",
+        attempt_number=200,
+        phase_name="implementation",
+        rca_runtime="primary",
+        exc=RuntimeError("structured output was malformed"),
+        context="bug-rca",
+        verdict_text="verify failed",
+    )
+
+    assert attempt.re_verify_result == "FAIL"
+    assert "SANDBOX_WORKFLOW_BLOCKER" in attempt.fix_applied
+    payload = json.loads(
+        artifacts.store["bug-rca-runtime-failure:verify:VERIFY-FAIL-200"]
+    )
+    assert payload["route_retry"] == 2
+    assert payload["route"] == "quiesce"
+    assert "workflow-blocker:bug-rca:verify:VERIFY-FAIL-200" in artifacts.store
+
+
+@pytest.mark.asyncio
+async def test_diagnostic_claude_pool_actor_gets_disposable_runtime_binding(
+    tmp_path: Path,
+) -> None:
+    workspace_root, feature_root = _workspace(tmp_path)
+    _repo(feature_root, "app")
+    runner = _runner(workspace_root, _Artifacts())
+
+    async with implementation_module._diagnostic_actor_context(
+        runner,
+        _feature(),
+        base_actor=implementation_module.root_cause_analyst,
+        suffix="rca-test",
+        runtime="claude_pool",
+        workspace_path=str(feature_root),
+        feature_root=feature_root,
+        lane_id="test-diagnostic-rca",
+    ) as actor:
+        metadata = actor.role.metadata
+        binding = metadata["runtime_workspace_binding"]
+        cwd = Path(binding["cwd"])
+
+        assert metadata["workspace_override"] == binding["cwd"]
+        assert binding["runtime"] == "claude_pool"
+        assert binding["write_guard_scope"] == "diagnostic"
+        assert binding["write_guard_roots"] == binding["writable_roots"]
+        assert binding["authority_schema_version"] == "runtime-workspace-authority-grant-v1"
+        assert binding["runtime_workspace_authority_grant_digest"]
+        assert binding["promotable"] is False
+        assert binding["runtime_workspace_authority_grants"][0]["grant_type"] == "diagnostic"
+        assert binding["runtime_workspace_authority_grants"][0]["promotable"] is False
+        assert cwd.exists()
+        assert str(cwd).startswith(str(workspace_root / ".iriai"))
+
+
+def test_diagnostic_repo_roots_prefer_registry_and_exclude_scratch_repos(
+    tmp_path: Path,
+) -> None:
+    _workspace_root, feature_root = _workspace(tmp_path)
+    app = _repo(feature_root, "iriai-studio")
+    scratch = feature_root / ".iriai-test-tmp" / "pytest-0" / "sources" / "A"
+    scratch.mkdir(parents=True)
+    subprocess.run(["git", "init", "-q"], cwd=scratch, check=True)
+    registry = {
+        "repos": [
+            {
+                "canonical_path": str(app),
+                "workspace_relative_path": "iriai-studio",
+                "role": "execution",
+                "safety_status": "ok",
+            }
+        ]
+    }
+
+    roots = implementation_module._diagnostic_repo_roots(
+        feature_root=feature_root,
+        workspace_path=str(feature_root),
+        registry=registry,
+    )
+
+    assert roots == [app.resolve(strict=False)]
+
+
+def test_diagnostic_repo_roots_fallback_uses_only_direct_child_repos(
+    tmp_path: Path,
+) -> None:
+    _workspace_root, feature_root = _workspace(tmp_path)
+    app = _repo(feature_root, "iriai-studio")
+    scratch = feature_root / ".iriai-test-tmp" / "pytest-0" / "sources" / "A"
+    scratch.mkdir(parents=True)
+    subprocess.run(["git", "init", "-q"], cwd=scratch, check=True)
+
+    roots = implementation_module._diagnostic_repo_roots(
+        feature_root=feature_root,
+        workspace_path=str(feature_root),
+        registry=None,
+    )
+
+    assert roots == [app.resolve(strict=False)]
+
+
+@pytest.mark.asyncio
+async def test_diagnostic_binding_blocks_bad_registry_canonical_repo(
+    tmp_path: Path,
+) -> None:
+    workspace_root, feature_root = _workspace(tmp_path)
+    bad_repo = feature_root / "bad-repo"
+    (bad_repo / ".git").mkdir(parents=True)
+    artifacts = _Artifacts()
+    artifacts.store["workspace-authority-registry:g0"] = json.dumps({
+        "registry": {
+            "repos": [
+                {
+                    "canonical_path": str(bad_repo),
+                    "workspace_relative_path": "bad-repo",
+                    "role": "execution",
+                    "safety_status": "ok",
+                }
+            ]
+        }
+    })
+    runner = _runner(workspace_root, artifacts)
+
+    with pytest.raises(implementation_module.SandboxWorkflowBlocker) as exc_info:
+        await implementation_module._bind_diagnostic_sandbox_if_needed(
+            runner,
+            _feature(),
+            base_actor=implementation_module.root_cause_analyst,
+            suffix="rca-test",
+            runtime="claude_pool",
+            workspace_path=str(feature_root),
+            feature_root=feature_root,
+            lane_id="test-diagnostic-rca",
+        )
+
+    assert "could not read canonical workspace repo HEAD" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_late_recovery_uses_physical_sandbox_alias_from_failure_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict[str, object]] = []
+
+    def fake_find_late_completed_claude_pool_job(**kwargs):
+        calls.append(dict(kwargs))
+        if "sandbox-physical" not in list(kwargs.get("sandbox_ids") or []):
+            return None
+        return SimpleNamespace(
+            job_id="job-late",
+            result={"duration_ms": 42},
+            result_text='{"task_id":"TASK-late","status":"completed"}',
+            raw={"ok": True},
+            structured_output={"task_id": "TASK-late", "status": "completed"},
+            recovery_metadata=lambda: {
+                "job_id": "job-late",
+                "profile": "iriai-claude-1",
+            },
+        )
+
+    monkeypatch.setattr(
+        "iriai_build_v2.runtimes.claude_pool.find_late_completed_claude_pool_job",
+        fake_find_late_completed_claude_pool_job,
+    )
+
+    class ActorMetadata(SimpleNamespace):
+        def model_dump(self, *args, **kwargs):
+            del args, kwargs
+            return dict(vars(self))
+
+    class LateRecoveryStore(_BridgeExecutionControlStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.recovery_calls: list[dict[str, object]] = []
+
+        async def recover_late_runtime_completion(self, **kwargs):
+            self.recovery_calls.append(kwargs)
+            return SimpleNamespace(
+                attempt_id=144,
+                state="succeeded",
+                status="succeeded",
+                runtime_terminal_reason="completed",
+                structured_result_evidence_id=301,
+                raw_text_ref=302,
+                patch_summary_ids=[190],
+                compatibility_artifact_ids=[401],
+                runtime_failure_id=None,
+                typed_failure_id=None,
+                idempotency_key="idem-late",
+            )
+
+    store = LateRecoveryStore()
+    store.runtime_failure_contexts[191] = {
+        "id": 191,
+        "failure_class": "runtime_timeout",
+        "failure_type": "watchdog_timeout",
+        "sandbox_patch_summaries": [
+            {"id": 190, "sandbox_id": "sandbox-physical"},
+        ],
+    }
+    port = implementation_module._ExecutionControlDispatchJournalPort(store)
+    request = SimpleNamespace(
+        feature_id="feature-1",
+        group_idx=78,
+        task_id="TASK-late",
+        sandbox_id="dispatch-sandbox:feature-1:g78:t0:a6:implementation",
+        idempotency_key="idem-late",
+        actor_name="implementer",
+        actor_role="implementer",
+        actor_metadata=ActorMetadata(runtime="claude_pool"),
+    )
+    attempt = SimpleNamespace(
+        attempt_id=144,
+        terminal_outcome=SimpleNamespace(
+            status="failed",
+            runtime_terminal_reason="timeout",
+            runtime_failure_id=191,
+            typed_failure_id=191,
+        ),
+    )
+
+    outcome = await port.recover_late_runtime_completion(
+        attempt,
+        request,
+        invocation_id="invoke-late",
+        output_schema={},
+        output_schema_digest="digest",
+        output_type_name="ImplementationResult",
+    )
+
+    assert outcome.status == "succeeded"
+    assert calls[0]["sandbox_ids"] == [
+        "dispatch-sandbox:feature-1:g78:t0:a6:implementation",
+        "sandbox-physical",
+    ]
+    assert store.recovery_calls
+    recovery_metadata = store.recovery_calls[0]["recovery_metadata"]
+    assert recovery_metadata["sandbox_id_aliases"] == calls[0]["sandbox_ids"]
+
+
+@pytest.mark.asyncio
+async def test_timeout_infra_retry_uses_separate_headroom_without_patch_evidence() -> None:
+    store = _BridgeExecutionControlStore()
+    store.runtime_failure_contexts[191] = {
+        "id": 191,
+        "failure_class": "runtime_timeout",
+        "failure_type": "watchdog_timeout",
+        "sandbox_patch_summaries": [],
+    }
+    runner = SimpleNamespace(services={"execution_control_store": store})
+    feature = SimpleNamespace(id="feature-1")
+    result = implementation_module.ImplementationResult(
+        task_id="TASK-timeout",
+        summary="Runtime dispatch failed (timeout)",
+        status="blocked",
+    )
+    outcome = SimpleNamespace(
+        status="failed",
+        runtime_terminal_reason="timeout",
+        runtime_failure_id=191,
+        typed_failure_id=191,
+        patch_summary_ids=[],
+    )
+
+    assert await implementation_module._should_retry_implementation_dispatch_result(
+        runner,
+        feature,
+        result,
+        outcome,
+        attempt=4,
+        max_retries=3,
+        infra_max_retries=5,
+    )
+    assert not await implementation_module._should_retry_implementation_dispatch_result(
+        runner,
+        feature,
+        result,
+        outcome,
+        attempt=5,
+        max_retries=3,
+        infra_max_retries=5,
+    )
+
+
+@pytest.mark.asyncio
+async def test_timeout_infra_retry_rejects_existing_patch_evidence() -> None:
+    store = _BridgeExecutionControlStore()
+    store.runtime_failure_contexts[191] = {
+        "id": 191,
+        "failure_class": "runtime_timeout",
+        "failure_type": "watchdog_timeout",
+        "sandbox_patch_summaries": [
+            {"id": 190, "sandbox_id": "sandbox-physical"},
+        ],
+    }
+    runner = SimpleNamespace(services={"execution_control_store": store})
+    feature = SimpleNamespace(id="feature-1")
+    result = implementation_module.ImplementationResult(
+        task_id="TASK-timeout",
+        summary="Runtime dispatch failed (timeout)",
+        status="blocked",
+    )
+    outcome = SimpleNamespace(
+        status="failed",
+        runtime_terminal_reason="timeout",
+        runtime_failure_id=191,
+        typed_failure_id=191,
+        patch_summary_ids=[],
+    )
+
+    assert not await implementation_module._should_retry_implementation_dispatch_result(
+        runner,
+        feature,
+        result,
+        outcome,
+        attempt=4,
+        max_retries=3,
+        infra_max_retries=5,
+    )
+
+
+@pytest.mark.asyncio
+async def test_pre_fix_sandbox_empty_patch_capture_retries(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv(
+        "IRIAI_AGENT_SHARED_GROUP",
+        _shared_group_name_or_skip(),
+    )
+    workspace_root = tmp_path / "workspace"
+    _write_retry_sandbox_manifest(
+        workspace_root,
+        feature_id="feature-1",
+        attempt_id=110,
+        repo_mode=0o755,
+    )
+    store = _BridgeExecutionControlStore()
+    store.runtime_failure_contexts[146] = {
+        "summary": (
+            "SANDBOX_WORKFLOW_BLOCKER: Task contract validation failed before "
+            "sandbox promotion for TASK-9-3: empty_patch_requires_mutation, "
+            "required_path_missing"
+        ),
+        "details": {
+            "message": "empty_patch_requires_mutation, required_path_missing",
+            "runtime_terminal_reason": "completed",
+        },
+    }
+    runner = SimpleNamespace(
+        services={
+            "execution_control_store": store,
+            "workspace_manager": SimpleNamespace(_base=workspace_root),
+        }
+    )
+    feature = SimpleNamespace(id="feature-1", slug="feature-1")
+    result = implementation_module.ImplementationResult(
+        task_id="TASK-9-3",
+        summary="empty_patch_requires_mutation, required_path_missing",
+        status="blocked",
+    )
+    outcome = SimpleNamespace(
+        status="incomplete",
+        runtime_terminal_reason="patch_capture_failed",
+        runtime_failure_id=146,
+        typed_failure_id=146,
+        attempt_id=110,
+        patch_summary_ids=[],
+    )
+
+    assert await implementation_module._should_retry_implementation_dispatch_result(
+        runner,
+        feature,
+        result,
+        outcome,
+        attempt=4,
+        max_retries=3,
+        infra_max_retries=5,
+    )
+    assert not await implementation_module._should_retry_implementation_dispatch_result(
+        runner,
+        feature,
+        result,
+        outcome,
+        attempt=5,
+        max_retries=3,
+        infra_max_retries=5,
+    )
+
+
+@pytest.mark.asyncio
+async def test_pre_fix_sandbox_empty_patch_capture_requires_unnormalized_manifest(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv(
+        "IRIAI_AGENT_SHARED_GROUP",
+        _shared_group_name_or_skip(),
+    )
+    workspace_root = tmp_path / "workspace"
+    _write_retry_sandbox_manifest(
+        workspace_root,
+        feature_id="feature-1",
+        attempt_id=126,
+        normalized=True,
+        repo_mode=stat.S_ISGID | 0o775,
+    )
+    store = _BridgeExecutionControlStore()
+    store.runtime_failure_contexts[164] = {
+        "details": {
+            "message": "empty_patch_requires_mutation, required_path_missing",
+            "runtime_terminal_reason": "completed",
+        }
+    }
+    runner = SimpleNamespace(
+        services={
+            "execution_control_store": store,
+            "workspace_manager": SimpleNamespace(_base=workspace_root),
+        }
+    )
+    feature = SimpleNamespace(id="feature-1", slug="feature-1")
+    result = implementation_module.ImplementationResult(
+        task_id="implementation-phase-view-slice-14-T-sf13-s14-001",
+        summary="empty_patch_requires_mutation, required_path_missing",
+        status="blocked",
+    )
+    outcome = SimpleNamespace(
+        status="incomplete",
+        runtime_terminal_reason="patch_capture_failed",
+        runtime_failure_id=164,
+        typed_failure_id=164,
+        attempt_id=126,
+        patch_summary_ids=[],
+    )
+
+    assert not await implementation_module._should_retry_implementation_dispatch_result(
+        runner,
+        feature,
+        result,
+        outcome,
+        attempt=4,
+        max_retries=3,
+        infra_max_retries=5,
+    )
+
+
+@pytest.mark.asyncio
+async def test_pre_fix_sandbox_empty_patch_capture_requires_manifest(
+    tmp_path: Path,
+) -> None:
+    store = _BridgeExecutionControlStore()
+    store.runtime_failure_contexts[150] = {
+        "details": {
+            "message": "empty_patch_requires_mutation, required_path_missing",
+            "runtime_terminal_reason": "completed",
+        }
+    }
+    runner = SimpleNamespace(
+        services={
+            "execution_control_store": store,
+            "workspace_manager": SimpleNamespace(_base=tmp_path / "workspace"),
+        }
+    )
+    feature = SimpleNamespace(id="feature-1", slug="feature-1")
+    result = implementation_module.ImplementationResult(
+        task_id="implementation-phase-view-slice-2-T-sf13-s2-001",
+        summary="empty_patch_requires_mutation, required_path_missing",
+        status="blocked",
+    )
+    outcome = SimpleNamespace(
+        status="incomplete",
+        runtime_terminal_reason="patch_capture_failed",
+        runtime_failure_id=150,
+        typed_failure_id=150,
+        attempt_id=107,
+        patch_summary_ids=[],
+    )
+
+    assert not await implementation_module._should_retry_implementation_dispatch_result(
+        runner,
+        feature,
+        result,
+        outcome,
+        attempt=4,
+        max_retries=3,
+        infra_max_retries=5,
+    )
+
+
+def test_duplicate_replay_recovery_evidence_uses_durable_raw_output_id() -> None:
+    evidence = implementation_module._dispatch_attempt_duplicate_replay_recovery_evidence(
+        {
+            "last_raw_output_evidence_id": 112,
+            "raw_output_evidence_ids": [111, 112],
+        }
+    )
+
+    assert evidence == {
+        "durable": True,
+        "evidence_id": 112,
+        "raw_output_evidence_id": 112,
+        "runtime_crashed": True,
+        "signal": "workflow_crash_after_runtime_raw_output",
+        "recovery_reason": (
+            "durable raw output evidence was recorded before the dispatch "
+            "attempt reached a terminal state"
+        ),
+    }
+
+
+@pytest.mark.asyncio
+async def test_sandbox_binding_durable_allocation_failure_retries_from_context() -> None:
+    store = _BridgeExecutionControlStore()
+    store.runtime_failure_contexts[81] = {
+        "details": {
+            "message": (
+                "Sandbox binding failed: durable sandbox lease allocation failed: "
+                "no available sandbox lease"
+            )
+        }
+    }
+    runner = SimpleNamespace(services={"execution_control_store": store})
+    feature = SimpleNamespace(id="feature-1")
+    result = implementation_module.ImplementationResult(
+        task_id="TASK-durable-allocation",
+        summary="sandbox failed",
+        status="blocked",
+    )
+    outcome = SimpleNamespace(
+        status="failed",
+        runtime_terminal_reason="sandbox_binding_failed",
+        runtime_failure_id=81,
+        typed_failure_id=81,
+    )
+
+    assert await implementation_module._should_retry_implementation_dispatch_result(
+        runner,
+        feature,
+        result,
+        outcome,
+        attempt=0,
+        max_retries=5,
+    )
+    assert store.runtime_failure_context_requests == [
+        {"feature_id": "feature-1", "failure_id": 81}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_retry_exhausted_durable_allocation_failure_gets_infra_retry_when_no_lease() -> None:
+    store = _BridgeExecutionControlStore()
+    store.runtime_failure_contexts[166] = {
+        "details": {
+            "message": (
+                "SANDBOX_WORKFLOW_BLOCKER: Sandbox binding failed: "
+                "durable sandbox lease allocation failed: "
+                "phase=store.allocate_sandbox_lease exception_type=TimeoutError"
+            )
+        }
+    }
+    runner = SimpleNamespace(services={"execution_control_store": store})
+    feature = SimpleNamespace(id="feature-1")
+    result = implementation_module.ImplementationResult(
+        task_id="implementation-phase-view-slice-14-T-sf13-s14-001",
+        summary="sandbox failed",
+        status="blocked",
+    )
+    outcome = SimpleNamespace(
+        status="failed",
+        runtime_terminal_reason="sandbox_binding_failed",
+        runtime_failure_id=166,
+        typed_failure_id=166,
+        attempt_id=132,
+        patch_summary_ids=[],
+    )
+
+    assert await implementation_module._should_retry_implementation_dispatch_result(
+        runner,
+        feature,
+        result,
+        outcome,
+        attempt=5,
+        max_retries=5,
+        infra_max_retries=7,
+    )
+    assert store.sandbox_lease_attempt_requests == [
+        {"feature_id": "feature-1", "attempt_no": 132}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_retry_exhausted_durable_allocation_failure_requires_absent_lease() -> None:
+    store = _BridgeExecutionControlStore()
+    store.runtime_failure_contexts[167] = {
+        "details": {"message": "durable sandbox lease allocation failed: TimeoutError()"}
+    }
+    store.sandbox_leases_by_attempt_no[134] = SimpleNamespace(id=34)
+    runner = SimpleNamespace(services={"execution_control_store": store})
+    feature = SimpleNamespace(id="feature-1")
+    result = implementation_module.ImplementationResult(
+        task_id="implementation-phase-view-slice-2-T-sf13-s2-001",
+        summary="sandbox failed",
+        status="blocked",
+    )
+    outcome = SimpleNamespace(
+        status="failed",
+        runtime_terminal_reason="sandbox_binding_failed",
+        runtime_failure_id=167,
+        typed_failure_id=167,
+        attempt_id=134,
+        patch_summary_ids=[],
+    )
+
+    assert not await implementation_module._should_retry_implementation_dispatch_result(
+        runner,
+        feature,
+        result,
+        outcome,
+        attempt=5,
+        max_retries=5,
+        infra_max_retries=7,
+    )
+
+
+@pytest.mark.asyncio
+async def test_retry_exhausted_durable_allocation_failure_stops_at_infra_budget() -> None:
+    store = _BridgeExecutionControlStore()
+    store.runtime_failure_contexts[166] = {
+        "details": {"message": "durable sandbox lease allocation failed: TimeoutError()"}
+    }
+    runner = SimpleNamespace(services={"execution_control_store": store})
+    feature = SimpleNamespace(id="feature-1")
+    result = implementation_module.ImplementationResult(
+        task_id="implementation-phase-view-slice-14-T-sf13-s14-001",
+        summary="sandbox failed",
+        status="blocked",
+    )
+    outcome = SimpleNamespace(
+        status="failed",
+        runtime_terminal_reason="sandbox_binding_failed",
+        runtime_failure_id=166,
+        typed_failure_id=166,
+        attempt_id=132,
+        patch_summary_ids=[],
+    )
+
+    assert not await implementation_module._should_retry_implementation_dispatch_result(
+        runner,
+        feature,
+        result,
+        outcome,
+        attempt=7,
+        max_retries=5,
+        infra_max_retries=7,
+    )
+    assert store.sandbox_lease_attempt_requests == []
 
 
 def test_contract_workspace_snapshot_includes_tracked_required_paths(tmp_path: Path) -> None:
@@ -2820,10 +4314,10 @@ async def test_live_dag_dispatch_retryable_terminal_outcome_exhausts_budget(
     outcome = await _implement_dag(runner, feature, dag)
 
     assert outcome.terminal_state == "workflow_blocked"
-    assert [request.retry for request in dispatch_requests] == [0, 1, 2, 3, 4, 5]
-    assert "typed_failure_id=205" in outcome.failure
-    assert "runtime_failure_id=205" in outcome.failure
-    assert "dispatcher_attempt_id=105" in outcome.failure
+    assert [request.retry for request in dispatch_requests] == [0, 1, 2, 3]
+    assert "typed_failure_id=203" in outcome.failure
+    assert "runtime_failure_id=203" in outcome.failure
+    assert "dispatcher_attempt_id=103" in outcome.failure
 
 
 @pytest.mark.asyncio

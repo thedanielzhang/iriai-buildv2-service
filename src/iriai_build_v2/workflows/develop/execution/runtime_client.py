@@ -169,11 +169,11 @@ class RuntimeClient:
         return await self._run_with_timeout(runner, ask, request)
 
     async def _run_with_timeout(self, runner: Any, ask: Any, request: Any) -> Any:
-        timeout_seconds = _positive_float(_field(request, "timeout_seconds", None))
-        call = self._call_runner(runner, ask, request)
-        if timeout_seconds is None:
-            return await call
-        return await asyncio.wait_for(call, timeout=timeout_seconds)
+        # Runtime jobs are durable work from the workflow's point of view. The
+        # per-runtime adapter owns process/stale detection because it can tell a
+        # healthy long-running job from a wedged one; this generic bridge layer
+        # must not turn an arbitrary soft timeout into a terminal failure.
+        return await self._call_runner(runner, ask, request)
 
     async def _call_runner(self, runner: Any, ask: Any, request: Any) -> Any:
         run = getattr(runner, "run", None)
@@ -317,6 +317,19 @@ def _default_actor_from_request(request: Any) -> Any:
     metadata.update(_plain_dict(binding.get("role_metadata")))
     metadata.update(_plain_dict(_metadata(request).get("role_metadata")))
     metadata.setdefault("runtime", _text(_field(request, "runtime", actor_metadata.get("runtime", ""))))
+    invocation_fields = {
+        "runtime_invocation_id": "invocation_id",
+        "dispatch_attempt_id": "attempt_id",
+        "dispatch_idempotency_key": "idempotency_key",
+        "dispatch_request_digest": "request_digest",
+        "output_schema_digest": "output_schema_digest",
+        "output_type_name": "output_type_name",
+        "timeout_seconds": "timeout_seconds",
+    }
+    for metadata_key, request_key in invocation_fields.items():
+        value = _field(request, request_key, _MISSING)
+        if value is not _MISSING and value is not None and str(value) != "":
+            metadata.setdefault(metadata_key, value)
     if binding:
         metadata.setdefault("runtime_workspace_binding", binding)
 

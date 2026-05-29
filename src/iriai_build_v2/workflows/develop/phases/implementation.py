@@ -14,7 +14,8 @@ import stat
 import subprocess
 import tempfile
 import time
-from contextlib import asynccontextmanager
+from collections.abc import Mapping
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
@@ -5221,6 +5222,24 @@ def _contract_runtime_roots(contract: Any | None, *, repo_id: str) -> tuple[list
     return (writable or [repo_id], readonly, contract_ids)
 
 
+def _contract_runtime_root_specs(contract: Any | None, *, repo_id: str) -> list[dict[str, Any]]:
+    if contract is None:
+        return []
+    specs: list[dict[str, Any]] = []
+    for rule in getattr(contract, "allowed_paths", []) or []:
+        path = str(getattr(rule, "path", "") or "").strip()
+        if not path:
+            continue
+        specs.append({
+            "repo_id": str(getattr(rule, "repo_id", repo_id) or repo_id),
+            "path": path,
+            "match_kind": str(getattr(rule, "match_kind", "file") or "file"),
+            "allow_create": bool(getattr(rule, "allow_create", False)),
+            "source": "task_contract",
+        })
+    return specs
+
+
 # `_workflow_blocker_text` and `_is_workflow_blocker_text` are shimmed from
 # `..execution.control_plane` (Slice 12a-1 — see the shim re-export block
 # at `:798-845` above). They remain accessible under the legacy
@@ -8116,8 +8135,13 @@ async def _bind_task_sandbox(
         base_commits={repo_id: base_commit},
         mode=sandbox_mode,  # type: ignore[arg-type]
         writable_roots=writable_roots,
+        writable_root_specs=_contract_runtime_root_specs(
+            task_contract,
+            repo_id=repo_id,
+        ),
         readonly_roots=readonly_roots,
         contract_ids=contract_ids,
+        write_guard_scope="contract",
     )
     sandbox_runner = SandboxRunner(
         workspace_root=workspace_root,
@@ -8156,6 +8180,372 @@ async def _bind_task_sandbox(
         stage=sandbox_mode,
         snapshots=list(snapshots),
     )
+
+
+_DIAGNOSTIC_WRITE_TOOLS = {"Bash", "Edit", "Write", "MultiEdit", "NotebookEdit"}
+
+
+def _actor_has_write_capable_tools(actor: AgentActor) -> bool:
+    tools = getattr(getattr(actor, "role", None), "tools", None) or []
+    return any(str(tool) in _DIAGNOSTIC_WRITE_TOOLS for tool in tools)
+
+
+_DIAGNOSTIC_EXCLUDED_REPO_ROOT_NAMES = {
+    ".benchmarks",
+    ".iriai-context",
+    ".iriai-quarantine",
+    ".iriai-test-tmp",
+    ".playwright-mcp",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".tmp-smoke",
+    ".workflow-artifacts",
+    ".workflow-artifacts-staging",
+    "outputs",
+}
+
+
+def _diagnostic_direct_child_repo_roots(
+    feature_root: Path | None,
+    workspace_path: str | None,
+) -> list[Path]:
+    roots: list[Path] = []
+    if feature_root is not None:
+        if (feature_root / ".git").exists():
+            roots.append(feature_root)
+        elif feature_root.exists():
+            for child in feature_root.iterdir():
+                if child.name.startswith(".") or child.name in _DIAGNOSTIC_EXCLUDED_REPO_ROOT_NAMES:
+                    continue
+                if (child / ".git").exists():
+                    roots.append(child)
+    if not roots and workspace_path:
+        candidate = Path(workspace_path).expanduser()
+        if (
+            (candidate / ".git").exists()
+            and not candidate.name.startswith(".")
+            and candidate.name not in _DIAGNOSTIC_EXCLUDED_REPO_ROOT_NAMES
+        ):
+            roots.append(candidate)
+    return sorted({path.resolve(strict=False) for path in roots})
+
+
+def _diagnostic_registry_payload(value: Any) -> Any | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except Exception:
+            return None
+    if isinstance(value, Mapping):
+        registry = value.get("registry")
+        return registry if registry is not None else value
+    return value
+
+
+async def _latest_workspace_authority_registry_for_diagnostics(
+    runner: WorkflowRunner,
+    feature: Feature,
+    *,
+    group_idx: int | None,
+) -> Any | None:
+    artifacts = getattr(runner, "artifacts", None)
+    getter = getattr(artifacts, "get", None)
+    if callable(getter) and group_idx is not None:
+        try:
+            raw = await getter(
+                _workspace_authority_artifact_key("registry", group_idx),
+                feature=feature,
+            )
+            payload = _diagnostic_registry_payload(raw)
+            if payload is not None:
+                return payload
+        except Exception:
+            logger.debug("Failed to load diagnostic group workspace authority registry", exc_info=True)
+
+    list_records = getattr(artifacts, "list_records", None)
+    if callable(list_records):
+        try:
+            records = await list_records(
+                feature_id=feature.id,
+                prefixes=("workspace-authority-registry:",),
+                order="desc",
+                limit=50,
+                max_total_value_bytes=16 * 1024 * 1024,
+            )
+            for record in records:
+                payload = _diagnostic_registry_payload(record.get("value"))
+                if payload is not None:
+                    return payload
+        except Exception:
+            logger.debug("Failed to list diagnostic workspace authority registries", exc_info=True)
+
+    store = getattr(artifacts, "store", None)
+    if isinstance(store, Mapping):
+        for key in sorted(
+            (str(key) for key in store if str(key).startswith("workspace-authority-registry:")),
+            reverse=True,
+        ):
+            payload = _diagnostic_registry_payload(store.get(key))
+            if payload is not None:
+                return payload
+    return None
+
+
+def _diagnostic_registry_repo_roots(
+    registry: Any | None,
+    feature_root: Path | None,
+) -> list[Path]:
+    if registry is None:
+        return []
+    roots: list[Path] = []
+    feature_root_resolved = feature_root.resolve(strict=False) if feature_root is not None else None
+    for repo in _registry_repos(registry):
+        safety_status = str(_value_attr(repo, "safety_status", "ok") or "ok")
+        role = str(_value_attr(repo, "role", "execution") or "execution")
+        if safety_status != "ok" or role not in ("", "execution"):
+            continue
+        raw = str(
+            _value_attr(repo, "canonical_path", "")
+            or _value_attr(repo, "destination_path", "")
+            or ""
+        ).strip()
+        if not raw:
+            rel = _registry_repo_relative_path(repo, feature_root)
+            if rel and feature_root is not None:
+                raw = str(feature_root / rel)
+        if not raw:
+            continue
+        candidate = Path(raw).expanduser()
+        if not candidate.is_absolute() and feature_root is not None:
+            candidate = feature_root / candidate
+        candidate = candidate.resolve(strict=False)
+        if candidate.name.startswith(".") or candidate.name in _DIAGNOSTIC_EXCLUDED_REPO_ROOT_NAMES:
+            continue
+        if feature_root_resolved is not None:
+            try:
+                candidate.relative_to(feature_root_resolved)
+            except ValueError:
+                continue
+        if (candidate / ".git").exists():
+            roots.append(candidate)
+    return sorted({path.resolve(strict=False) for path in roots})
+
+
+def _diagnostic_repo_roots(
+    *,
+    feature_root: Path | None,
+    workspace_path: str | None,
+    registry: Any | None = None,
+) -> list[Path]:
+    roots = _diagnostic_registry_repo_roots(registry, feature_root)
+    if roots:
+        return roots
+    return _diagnostic_direct_child_repo_roots(feature_root, workspace_path)
+
+
+def _diagnostic_repo_id(repo_root: Path, feature_root: Path | None) -> str:
+    if feature_root is not None:
+        try:
+            rel = repo_root.resolve(strict=False).relative_to(
+                feature_root.resolve(strict=False)
+            )
+            text = rel.as_posix().strip()
+            if text and text != ".":
+                return text
+        except ValueError:
+            pass
+    return repo_root.name or "repo"
+
+
+async def _bind_diagnostic_sandbox_if_needed(
+    runner: WorkflowRunner,
+    feature: Feature,
+    *,
+    base_actor: AgentActor,
+    suffix: str,
+    runtime: str | None,
+    workspace_path: str | None,
+    feature_root: Path | None,
+    lane_id: str,
+    group_idx: int = 0,
+) -> RuntimeSandboxTaskBinding | None:
+    if _sandbox_runtime_name(runtime, runner) != "claude_pool":
+        return None
+    if not _actor_has_write_capable_tools(base_actor):
+        return None
+    if SandboxRunner is None or SandboxSpec is None:
+        raise SandboxWorkflowBlocker(
+            "Diagnostic runtime requires SandboxRunner for Claude pool write-capable actor.",
+            task_id=lane_id,
+        )
+    registry = await _latest_workspace_authority_registry_for_diagnostics(
+        runner,
+        feature,
+        group_idx=group_idx,
+    )
+    repo_roots = _diagnostic_repo_roots(
+        feature_root=feature_root,
+        workspace_path=workspace_path,
+        registry=registry,
+    )
+    if not repo_roots:
+        raise SandboxWorkflowBlocker(
+            "Diagnostic runtime could not find a Git worktree to sandbox.",
+            task_id=lane_id,
+        )
+    repo_sources: dict[str, Path] = {
+        _diagnostic_repo_id(repo_root, feature_root): repo_root
+        for repo_root in repo_roots
+    }
+    repo_ids = sorted(repo_sources)
+    base_commits: dict[str, str] = {}
+    for repo_id, source in repo_sources.items():
+        try:
+            base_commits[repo_id] = _git_text(["rev-parse", "HEAD"], cwd=source)
+        except Exception as exc:
+            raise SandboxWorkflowBlocker(
+                "Diagnostic runtime could not read canonical workspace repo HEAD "
+                f"for {repo_id} at {source}: {exc}",
+                task_id=lane_id,
+            ) from exc
+    workspace_root = _workspace_root_for_feature_root(runner, feature_root)
+    if workspace_root is None:
+        workspace_root = feature_root.parent if feature_root is not None else repo_roots[0].parent
+    lane_digest = hashlib.sha256(lane_id.encode("utf-8")).hexdigest()
+    spec = SandboxSpec(
+        feature_id=feature.id,
+        dag_sha256=f"diagnostic:{lane_digest[:24]}",
+        group_idx=max(0, int(group_idx)),
+        attempt_no=int(lane_digest[:8], 16),
+        task_ids=[lane_id],
+        repo_ids=repo_ids,
+        base_snapshot_ids=[0 for _ in repo_ids],
+        base_commits=base_commits,
+        mode="diagnostic",  # type: ignore[arg-type]
+        writable_roots=repo_ids,
+        readonly_roots=[],
+        contract_ids=[],
+        write_guard_scope="diagnostic",
+    )
+    sandbox_runner = SandboxRunner(
+        workspace_root=workspace_root,
+        repo_sources=repo_sources,
+        store=None,
+        artifact_writer=getattr(runner, "artifacts", None),
+        owner=f"workflow:{feature.id}:diagnostic:{suffix}:{lane_digest[:12]}",
+        allowed_source_roots=[feature_root] if feature_root is not None else repo_roots,
+        blocked_roots=[feature_root] if feature_root is not None else repo_roots,
+    )
+    lease = await sandbox_runner.allocate(spec)
+    binding = await sandbox_runner.bind_runtime(
+        lease,
+        _sandbox_runtime_name(runtime, runner),
+    )
+    return RuntimeSandboxTaskBinding(
+        runner=sandbox_runner,
+        lease=lease,
+        binding=binding,
+        workflow_runner=runner,
+        feature=feature,
+        feature_root=feature_root,
+        dag_sha256=spec.dag_sha256,
+        group_idx=group_idx,
+        stage="diagnostic",
+        snapshots=[],
+    )
+
+
+@asynccontextmanager
+async def _diagnostic_actor_context(
+    runner: WorkflowRunner,
+    feature: Feature,
+    *,
+    base_actor: AgentActor,
+    suffix: str,
+    runtime: str | None,
+    workspace_path: str | None,
+    feature_root: Path | None,
+    lane_id: str,
+    group_idx: int = 0,
+):
+    sandbox_binding = await _bind_diagnostic_sandbox_if_needed(
+        runner,
+        feature,
+        base_actor=base_actor,
+        suffix=suffix,
+        runtime=runtime,
+        workspace_path=workspace_path,
+        feature_root=feature_root,
+        lane_id=lane_id,
+        group_idx=group_idx,
+    )
+    actor = _make_parallel_actor(
+        base_actor,
+        suffix,
+        runtime=runtime,
+        workspace_path=workspace_path,
+        runtime_workspace_binding=(
+            sandbox_binding.binding if sandbox_binding is not None else None
+        ),
+        sandbox_required=sandbox_binding is not None,
+    )
+    try:
+        yield actor
+    except Exception:
+        if sandbox_binding is not None:
+            try:
+                await sandbox_binding.runner.release(sandbox_binding.lease, "retain")
+            except Exception:
+                logger.warning(
+                    "Failed to retain diagnostic sandbox %s",
+                    getattr(sandbox_binding.lease, "sandbox_id", ""),
+                    exc_info=True,
+                )
+        raise
+    else:
+        if sandbox_binding is not None:
+            try:
+                await sandbox_binding.runner.release(sandbox_binding.lease, "release")
+            except Exception:
+                logger.warning(
+                    "Failed to release diagnostic sandbox %s",
+                    getattr(sandbox_binding.lease, "sandbox_id", ""),
+                    exc_info=True,
+                )
+
+
+async def _run_bound_diagnostic_ask(
+    runner: WorkflowRunner,
+    feature: Feature,
+    *,
+    base_actor: AgentActor,
+    suffix: str,
+    runtime: str | None,
+    prompt: str,
+    output_type: type[BaseModel],
+    phase_name: str,
+    feature_root: Path | None,
+    lane_id: str,
+    group_idx: int = 0,
+) -> Any:
+    async with _diagnostic_actor_context(
+        runner,
+        feature,
+        base_actor=base_actor,
+        suffix=suffix,
+        runtime=runtime,
+        workspace_path=str(feature_root) if feature_root else None,
+        feature_root=feature_root,
+        lane_id=lane_id,
+        group_idx=group_idx,
+    ) as actor:
+        return await runner.run(
+            Ask(actor=actor, prompt=prompt, output_type=output_type),
+            feature,
+            phase_name=phase_name,
+        )
 
 
 def _sha256_text(value: str) -> str:
@@ -8342,15 +8732,41 @@ def _should_retry_implementation_dispatch_outcome(
 ) -> bool:
     if attempt >= max_retries:
         return False
-    if str(getattr(outcome, "status", "") or "") != "failed":
+    status = str(getattr(outcome, "status", "") or "")
+    if status not in {"failed", "incomplete"}:
         return False
     terminal_reason = str(
         getattr(outcome, "runtime_terminal_reason", "") or ""
     )
+    if status == "incomplete" and (
+        terminal_reason != "process_failed"
+        or not (
+            getattr(outcome, "runtime_failure_id", None)
+            or getattr(outcome, "typed_failure_id", None)
+        )
+    ):
+        return False
     return terminal_reason in _RETRYABLE_IMPLEMENTATION_DISPATCH_TERMINAL_REASONS
 
 
 _LEGACY_SANDBOX_LEASE_COLLISION_MARKER = "sandbox path already belongs to a different lease"
+_SANDBOX_DURABLE_LEASE_ALLOCATION_FAILED_MARKER = "durable sandbox lease allocation failed"
+_AGENT_SHARED_GROUP_ENV = "IRIAI_AGENT_SHARED_GROUP"
+_DEFAULT_AGENT_SHARED_GROUP = "iriai-agents"
+_PERMISSION_PATCH_CAPTURE_MARKERS = frozenset(
+    {
+        "eacces",
+        "eperm",
+        "permission denied",
+        "operation not permitted",
+        "not writable",
+        "session-env",
+    }
+)
+_EMPTY_PATCH_REQUIRED_PATH_MARKERS = frozenset(
+    {"empty_patch_requires_mutation", "required_path_missing"}
+)
+_SANDBOX_INFRA_RETRY_HEADROOM = 2
 
 
 def _contains_legacy_sandbox_lease_collision(*values: Any) -> bool:
@@ -8363,34 +8779,17 @@ def _contains_legacy_sandbox_lease_collision(*values: Any) -> bool:
     return False
 
 
-async def _should_retry_implementation_dispatch_result(
-    runner: WorkflowRunner,
-    feature: Feature,
-    result: ImplementationResult,
-    outcome: Any,
-    *,
-    attempt: int,
-    max_retries: int,
-) -> bool:
-    if _should_retry_implementation_dispatch_outcome(
-        outcome,
-        attempt=attempt,
-        max_retries=max_retries,
-    ):
-        return True
-    if attempt >= max_retries:
-        return False
-    if str(getattr(outcome, "status", "") or "") != "failed":
-        return False
-    terminal_reason = str(getattr(outcome, "runtime_terminal_reason", "") or "")
-    if terminal_reason != "sandbox_binding_failed":
-        return False
-    if _contains_legacy_sandbox_lease_collision(result.summary, result.notes, outcome):
-        return True
-    store = _execution_control_store_for_runner(runner)
-    reader = getattr(store, "get_runtime_failure_context", None)
-    if not callable(reader):
-        return False
+def _contains_retryable_sandbox_allocation_failure(*values: Any) -> bool:
+    marker = _SANDBOX_DURABLE_LEASE_ALLOCATION_FAILED_MARKER
+    for value in values:
+        if value is None:
+            continue
+        if marker in str(value).lower():
+            return True
+    return False
+
+
+def _dispatch_outcome_failure_ids(outcome: Any) -> list[int]:
     failure_ids: list[int] = []
     for raw in (
         getattr(outcome, "runtime_failure_id", None),
@@ -8402,21 +8801,351 @@ async def _should_retry_implementation_dispatch_result(
             continue
         if failure_id > 0 and failure_id not in failure_ids:
             failure_ids.append(failure_id)
-    for failure_id in failure_ids:
+    return failure_ids
+
+
+def _bounded_retry_marker_text(value: Any, *, depth: int = 0) -> str:
+    if value is None or depth > 6:
+        return ""
+    model_dump = getattr(value, "model_dump", None)
+    if callable(model_dump):
         try:
-            context = await _maybe_await_workspace_authority(
-                reader(feature_id=feature.id, failure_id=failure_id)
-            )
-        except Exception:
-            logger.warning(
-                "Unable to inspect runtime failure %s for sandbox-binding retry",
-                failure_id,
-                exc_info=True,
-            )
+            value = model_dump(mode="json")
+        except TypeError:
+            value = model_dump()
+    if isinstance(value, SimpleNamespace):
+        value = vars(value)
+    if dataclasses.is_dataclass(value):
+        value = dataclasses.asdict(value)
+    if isinstance(value, Mapping):
+        return " ".join(
+            _bounded_retry_marker_text(item, depth=depth + 1)
+            for item in value.values()
+        )
+    if isinstance(value, (list, tuple, set)):
+        return " ".join(
+            _bounded_retry_marker_text(item, depth=depth + 1)
+            for item in value
+        )
+    return str(value)
+
+
+def _contains_permission_patch_capture_failure(*values: Any) -> bool:
+    text = " ".join(_bounded_retry_marker_text(value) for value in values).lower()
+    if not text:
+        return False
+    return any(marker in text for marker in _PERMISSION_PATCH_CAPTURE_MARKERS)
+
+
+def _contains_empty_patch_required_path_failure(*values: Any) -> bool:
+    text = " ".join(_bounded_retry_marker_text(value) for value in values).lower()
+    if not text:
+        return False
+    return all(marker in text for marker in _EMPTY_PATCH_REQUIRED_PATH_MARKERS)
+
+
+def _mentions_completed_runtime(*values: Any) -> bool:
+    text = " ".join(_bounded_retry_marker_text(value) for value in values).lower()
+    return "completed" in text
+
+
+def _agent_shared_group_for_retry() -> tuple[str, int | None]:
+    group_name = os.environ.get(_AGENT_SHARED_GROUP_ENV, _DEFAULT_AGENT_SHARED_GROUP)
+    group_name = str(group_name or "").strip() or _DEFAULT_AGENT_SHARED_GROUP
+    if grp is None:
+        return group_name, None
+    try:
+        return group_name, grp.getgrnam(group_name).gr_gid
+    except KeyError:
+        return group_name, None
+
+
+def _positive_int(value: Any) -> int | None:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _append_unique_text(values: list[str], value: Any) -> None:
+    text = str(value or "").strip()
+    if text and text not in values:
+        values.append(text)
+
+
+def _runtime_failure_context_patch_summaries(context: Any) -> list[dict[str, Any]]:
+    data = _model_json_dict(context)
+    raw_summaries = data.get("sandbox_patch_summaries")
+    if not isinstance(raw_summaries, list):
+        return []
+    summaries: list[dict[str, Any]] = []
+    for raw in raw_summaries:
+        if isinstance(raw, Mapping):
+            summaries.append(dict(raw))
+    return summaries
+
+
+def _runtime_failure_context_sandbox_ids(context: Any) -> list[str]:
+    sandbox_ids: list[str] = []
+    data = _model_json_dict(context)
+    for key in ("sandbox_id", "actual_sandbox_id", "physical_sandbox_id"):
+        _append_unique_text(sandbox_ids, data.get(key))
+    details = data.get("details")
+    if isinstance(details, Mapping):
+        for key in ("sandbox_id", "actual_sandbox_id", "physical_sandbox_id"):
+            _append_unique_text(sandbox_ids, details.get(key))
+    for summary in _runtime_failure_context_patch_summaries(data):
+        _append_unique_text(sandbox_ids, summary.get("sandbox_id"))
+    return sandbox_ids
+
+
+def _runtime_failure_context_has_patch_summary(context: Any) -> bool:
+    return bool(_runtime_failure_context_patch_summaries(context))
+
+
+def _runtime_failure_context_is_watchdog_timeout(context: Any) -> bool:
+    data = _model_json_dict(context)
+    return (
+        str(data.get("failure_class") or "") == "runtime_timeout"
+        and str(data.get("failure_type") or "") == "watchdog_timeout"
+    )
+
+
+def _manifest_proves_pre_fix_sandbox_permissions(manifest: Mapping[str, Any]) -> bool:
+    if str(manifest.get("status") or "") != "retained":
+        return False
+    if manifest.get("permission_normalization"):
+        return False
+    repo_roots = manifest.get("repo_roots")
+    if not isinstance(repo_roots, Mapping) or not repo_roots:
+        return False
+    _, shared_gid = _agent_shared_group_for_retry()
+    if shared_gid is None:
+        return False
+    for raw in repo_roots.values():
+        try:
+            repo_root = Path(str(raw))
+            st = repo_root.lstat()
+        except OSError:
             continue
-        if _contains_legacy_sandbox_lease_collision(context):
+        if not stat.S_ISDIR(st.st_mode) or stat.S_ISLNK(st.st_mode):
+            continue
+        mode = stat.S_IMODE(st.st_mode)
+        if st.st_gid == shared_gid and not (
+            mode & stat.S_IWGRP and mode & stat.S_ISGID
+        ):
             return True
     return False
+
+
+def _pre_fix_sandbox_permission_retry_manifest_exists(
+    runner: WorkflowRunner,
+    feature: Feature,
+    outcome: Any,
+) -> bool:
+    attempt_id = _positive_int(getattr(outcome, "attempt_id", None))
+    if attempt_id is None:
+        return False
+    workspace_root = _workspace_root_for_feature_root(runner, None)
+    if workspace_root is None:
+        return False
+    feature_ids = [str(getattr(feature, "id", "") or "").strip()]
+    feature_slug = str(getattr(feature, "slug", "") or "").strip()
+    if feature_slug and feature_slug not in feature_ids:
+        feature_ids.append(feature_slug)
+    for feature_id in [item for item in feature_ids if item]:
+        sandboxes_root = (
+            workspace_root / ".iriai" / "features" / feature_id / "sandboxes"
+        )
+        if not sandboxes_root.is_dir():
+            continue
+        for manifest_path in sorted(
+            sandboxes_root.glob(f"g*/attempt-{attempt_id}/sandbox-manifest.json")
+        ):
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if (
+                isinstance(manifest, Mapping)
+                and _manifest_proves_pre_fix_sandbox_permissions(manifest)
+            ):
+                return True
+    return False
+
+
+def _patch_capture_outcome_has_no_patch(outcome: Any) -> bool:
+    return not list(getattr(outcome, "patch_summary_ids", []) or [])
+
+
+async def _sandbox_lease_absent_for_dispatch_outcome(
+    runner: WorkflowRunner,
+    feature: Feature,
+    outcome: Any,
+) -> bool:
+    attempt_no = _positive_int(getattr(outcome, "attempt_id", None))
+    if attempt_no is None:
+        return False
+    store = _execution_control_store_for_runner(runner)
+    reader = getattr(store, "get_sandbox_lease_by_attempt_no", None)
+    if not callable(reader):
+        return False
+    try:
+        lease = await _maybe_await_workspace_authority(
+            reader(feature_id=feature.id, attempt_no=attempt_no)
+        )
+    except Exception:
+        logger.warning(
+            "Unable to inspect sandbox lease for dispatch attempt %s",
+            attempt_no,
+            exc_info=True,
+        )
+        return False
+    return lease is None
+
+
+async def _should_retry_implementation_dispatch_result(
+    runner: WorkflowRunner,
+    feature: Feature,
+    result: ImplementationResult,
+    outcome: Any,
+    *,
+    attempt: int,
+    max_retries: int,
+    infra_max_retries: int | None = None,
+) -> bool:
+    status = str(getattr(outcome, "status", "") or "")
+    if status in {"failed", "incomplete"} and list(
+        getattr(outcome, "patch_summary_ids", []) or []
+    ):
+        return False
+    if _should_retry_implementation_dispatch_outcome(
+        outcome,
+        attempt=attempt,
+        max_retries=max_retries,
+    ):
+        return True
+    if status not in {"failed", "incomplete"}:
+        return False
+    terminal_reason = str(getattr(outcome, "runtime_terminal_reason", "") or "")
+    if terminal_reason == "patch_capture_failed":
+        if not _patch_capture_outcome_has_no_patch(outcome):
+            return False
+        infra_budget = max_retries + _SANDBOX_INFRA_RETRY_HEADROOM
+        if infra_max_retries is not None:
+            infra_budget = max(infra_budget, infra_max_retries)
+        infra_budget_available = attempt < infra_budget
+        if _contains_permission_patch_capture_failure(result, outcome):
+            return infra_budget_available
+        store = _execution_control_store_for_runner(runner)
+        reader = getattr(store, "get_runtime_failure_context", None)
+        if not callable(reader):
+            return False
+        contexts: list[Any] = []
+        for failure_id in _dispatch_outcome_failure_ids(outcome):
+            try:
+                context = await _maybe_await_workspace_authority(
+                    reader(feature_id=feature.id, failure_id=failure_id)
+                )
+            except Exception:
+                logger.warning(
+                    "Unable to inspect runtime failure %s for patch-capture retry",
+                    failure_id,
+                    exc_info=True,
+                )
+                continue
+            if context is None:
+                continue
+            contexts.append(context)
+            if _contains_permission_patch_capture_failure(context):
+                return infra_budget_available
+        if (
+            _contains_empty_patch_required_path_failure(result, outcome, *contexts)
+            and _mentions_completed_runtime(*contexts)
+            and _pre_fix_sandbox_permission_retry_manifest_exists(
+                runner,
+                feature,
+                outcome,
+            )
+            ):
+                return infra_budget_available
+        return False
+    if terminal_reason in {"timeout", "watchdog_stall"}:
+        if not _patch_capture_outcome_has_no_patch(outcome):
+            return False
+        infra_budget = max_retries + _SANDBOX_INFRA_RETRY_HEADROOM
+        if infra_max_retries is not None:
+            infra_budget = max(infra_budget, infra_max_retries)
+        if attempt >= infra_budget:
+            return False
+        store = _execution_control_store_for_runner(runner)
+        reader = getattr(store, "get_runtime_failure_context", None)
+        if not callable(reader):
+            return False
+        contexts: list[Any] = []
+        for failure_id in _dispatch_outcome_failure_ids(outcome):
+            try:
+                context = await _maybe_await_workspace_authority(
+                    reader(feature_id=feature.id, failure_id=failure_id)
+                )
+            except Exception:
+                logger.warning(
+                    "Unable to inspect runtime failure %s for timeout retry",
+                    failure_id,
+                    exc_info=True,
+                )
+                continue
+            if context is not None:
+                contexts.append(context)
+        if not contexts:
+            return False
+        if any(_runtime_failure_context_has_patch_summary(context) for context in contexts):
+            return False
+        return any(
+            _runtime_failure_context_is_watchdog_timeout(context)
+            for context in contexts
+        )
+    if terminal_reason != "sandbox_binding_failed":
+        return False
+    if _contains_legacy_sandbox_lease_collision(result.summary, result.notes, outcome):
+        return attempt < max_retries
+    allocation_failure = _contains_retryable_sandbox_allocation_failure(
+        result.summary,
+        result.notes,
+        outcome,
+    )
+    store = _execution_control_store_for_runner(runner)
+    reader = getattr(store, "get_runtime_failure_context", None)
+    if callable(reader):
+        for failure_id in _dispatch_outcome_failure_ids(outcome):
+            try:
+                context = await _maybe_await_workspace_authority(
+                    reader(feature_id=feature.id, failure_id=failure_id)
+                )
+            except Exception:
+                logger.warning(
+                    "Unable to inspect runtime failure %s for sandbox-binding retry",
+                    failure_id,
+                    exc_info=True,
+                )
+                continue
+            if _contains_legacy_sandbox_lease_collision(context):
+                return attempt < max_retries
+            if _contains_retryable_sandbox_allocation_failure(context):
+                allocation_failure = True
+    if not allocation_failure:
+        return False
+    if not _patch_capture_outcome_has_no_patch(outcome):
+        return False
+    if attempt < max_retries:
+        return True
+    infra_budget = max_retries + _SANDBOX_INFRA_RETRY_HEADROOM
+    if infra_max_retries is not None:
+        infra_budget = max(infra_budget, infra_max_retries)
+    if attempt >= infra_budget:
+        return False
+    return await _sandbox_lease_absent_for_dispatch_outcome(runner, feature, outcome)
 
 
 async def _recover_pre_promotion_contract_revalidation(
@@ -9254,7 +9983,7 @@ class _ImplementationRuntimeClient:
     async def _actor_for_invocation(self, invocation: Any) -> AgentActor:
         binding = getattr(invocation, "workspace_binding", None)
         cwd = str(getattr(binding, "cwd", "") or getattr(binding, "workspace_override", "") or "")
-        return _make_parallel_actor(
+        actor = _make_parallel_actor(
             implementer,
             self._actor_suffix,
             runtime=self._runtime_hint,
@@ -9262,6 +9991,27 @@ class _ImplementationRuntimeClient:
             runtime_workspace_binding=binding,
             sandbox_required=True,
         )
+        try:
+            metadata = dict(getattr(actor.role, "metadata", {}) or {})
+            metadata.update({
+                "runtime_invocation_id": str(getattr(invocation, "invocation_id", "") or ""),
+                "dispatch_attempt_id": getattr(invocation, "attempt_id", None),
+                "dispatch_idempotency_key": str(
+                    _model_json_dict(getattr(invocation, "metadata", {})).get("idempotency_key")
+                    or ""
+                ),
+                "dispatch_request_digest": str(
+                    _model_json_dict(getattr(invocation, "metadata", {})).get("request_digest")
+                    or ""
+                ),
+                "output_schema_digest": str(getattr(invocation, "output_schema_digest", "") or ""),
+                "output_type_name": str(getattr(invocation, "output_type_name", "") or ""),
+                "timeout_seconds": getattr(invocation, "timeout_seconds", None),
+            })
+            actor.role.metadata = metadata
+        except Exception:
+            logger.debug("Unable to attach dispatch identity to runtime actor metadata", exc_info=True)
+        return actor
 
     async def _ask_for_invocation(self, invocation: Any, actor: AgentActor) -> Ask:
         return Ask(
@@ -9524,15 +10274,56 @@ class _ExecutionControlDispatchJournalPort:
                 and DispatcherDispatchIdempotencyConflict is not None
                 and isinstance(exc, StoredIdempotencyConflict)
             ):
+                get_existing = getattr(self._store, "get_by_idempotency_key", None)
+                existing_result = (
+                    await get_existing(request.feature_id, request.idempotency_key)
+                    if get_existing is not None
+                    else None
+                )
+                if existing_result is not None:
+                    replay = self._attempt_record_from_row(
+                        existing_result.row,
+                        request,
+                        created=False,
+                        fallback_attempt_id=getattr(existing_result, "attempt_id", None),
+                    )
+                    if self._can_replay_digest_drift(replay):
+                        return replay
+                    existing_digest = str(
+                        getattr(existing_result.row, "request_digest", "") or ""
+                    )
+                else:
+                    existing_digest = "missing-existing-dispatch-attempt"
                 raise DispatcherDispatchIdempotencyConflict(
                     request.idempotency_key,
-                    "stored-dispatch-digest",
+                    existing_digest,
                     request.request_digest,
                 ) from exc
             raise
         row = result.attempt
+        return self._attempt_record_from_row(
+            row,
+            request,
+            created=result.created,
+            fallback_attempt_id=getattr(result, "attempt_id", None),
+        )
+
+    def _attempt_record_from_row(
+        self,
+        row: Any,
+        request: Any,
+        *,
+        created: bool,
+        fallback_attempt_id: Any = None,
+    ) -> Any:
         terminal = None
         terminal_needs_finish = False
+        row_attempt_id = getattr(row, "id", None)
+        if row_attempt_id is None:
+            row_attempt_id = getattr(row, "attempt_id", None)
+        if row_attempt_id is None:
+            row_attempt_id = fallback_attempt_id
+        attempt_id = int(row_attempt_id)
         if row.status in {"succeeded", "failed", "cancelled", "incomplete"}:
             outcome_payload = _model_json_dict(row.payload.get("dispatch_outcome"))
             if outcome_payload:
@@ -9542,7 +10333,7 @@ class _ExecutionControlDispatchJournalPort:
             failure_id = row.payload.get("runtime_failure_id") or row.payload.get("typed_failure_id")
             if structured_id is not None:
                 terminal = DispatcherOutcome(
-                    attempt_id=result.attempt_id,
+                    attempt_id=attempt_id,
                     state="succeeded",
                     status="succeeded",
                     runtime_terminal_reason=row.payload.get("runtime_terminal_reason") or "completed",
@@ -9568,7 +10359,7 @@ class _ExecutionControlDispatchJournalPort:
                 terminal_needs_finish = True
             elif failure_id is not None:
                 terminal = DispatcherOutcome(
-                    attempt_id=result.attempt_id,
+                    attempt_id=attempt_id,
                     state="failed",
                     status="failed",
                     runtime_terminal_reason=row.payload.get("runtime_terminal_reason") or "process_failed",
@@ -9585,16 +10376,22 @@ class _ExecutionControlDispatchJournalPort:
                 )
                 terminal_needs_finish = True
         return DispatcherAttemptRecord(
-            attempt_id=result.attempt_id,
+            attempt_id=attempt_id,
             state=str(row.dispatcher_state or "attempt_started"),
             request_digest=row.request_digest,
-            created=result.created,
+            created=created,
             terminal_outcome=terminal,
             terminal_outcome_needs_finish=terminal_needs_finish,
             duplicate_replay_recovery_evidence=(
                 _dispatch_attempt_duplicate_replay_recovery_evidence(row.payload)
             ),
         )
+
+    @staticmethod
+    def _can_replay_digest_drift(attempt: Any) -> bool:
+        if getattr(attempt, "terminal_outcome", None) is not None:
+            return True
+        return bool(getattr(attempt, "terminal_outcome_needs_finish", False))
 
     async def record_start_idempotency_conflict(self, request: Any, failure: Any) -> tuple[int, Any]:
         existing = await self._store.get_by_idempotency_key(
@@ -9855,6 +10652,194 @@ class _ExecutionControlDispatchJournalPort:
             }
         )
 
+    async def recover_late_runtime_completion(
+        self,
+        attempt: Any,
+        request: Any,
+        *,
+        invocation_id: str,
+        output_schema: dict[str, Any],
+        output_schema_digest: str,
+        output_type_name: str,
+    ) -> Any | None:
+        del output_schema
+        if (
+            StoredRuntimeInvocationEvidence is None
+            or StoredRawOutputEvidence is None
+            or StoredStructuredOutputEvidence is None
+            or not hasattr(self._store, "recover_late_runtime_completion")
+        ):
+            return None
+        runtime_name = str(getattr(getattr(request, "actor_metadata", None), "runtime", "") or "")
+        if runtime_name != "claude_pool":
+            return None
+        try:
+            from iriai_build_v2.runtimes.claude_pool import (
+                find_late_completed_claude_pool_job,
+            )
+        except Exception:
+            logger.warning("Unable to import Claude pool late completion recovery helper", exc_info=True)
+            return None
+
+        sandbox_ids = [str(getattr(request, "sandbox_id", "") or "")]
+        runtime_failure_contexts: list[Any] = []
+        outcome = getattr(attempt, "terminal_outcome", None)
+        reader = getattr(self._store, "get_runtime_failure_context", None)
+        if callable(reader) and outcome is not None:
+            for failure_id in _dispatch_outcome_failure_ids(outcome):
+                try:
+                    context = await _maybe_await_workspace_authority(
+                        reader(
+                            feature_id=str(getattr(request, "feature_id", "") or ""),
+                            failure_id=failure_id,
+                        )
+                    )
+                except Exception:
+                    logger.warning(
+                        "Unable to inspect runtime failure %s for late completion recovery",
+                        failure_id,
+                        exc_info=True,
+                    )
+                    continue
+                if context is None:
+                    continue
+                runtime_failure_contexts.append(context)
+                for sandbox_id in _runtime_failure_context_sandbox_ids(context):
+                    _append_unique_text(sandbox_ids, sandbox_id)
+
+        candidate = find_late_completed_claude_pool_job(
+            feature_id=str(getattr(request, "feature_id", "") or ""),
+            group_idx=int(getattr(request, "group_idx", 0) or 0),
+            task_id=str(getattr(request, "task_id", "") or ""),
+            attempt_id=int(getattr(attempt, "attempt_id", 0) or 0),
+            sandbox_ids=sandbox_ids,
+            invocation_id=invocation_id,
+            idempotency_key=str(getattr(request, "idempotency_key", "") or ""),
+            output_schema_digest=output_schema_digest,
+            output_type_name=output_type_name,
+        )
+        if candidate is None:
+            return None
+
+        actor_metadata = _model_json_dict(getattr(request, "actor_metadata", {}))
+        structured_payload = dict(candidate.structured_output)
+        recovery_metadata = {
+            "late_runtime_completion_recovery": True,
+            "runtime": "claude_pool",
+            "sandbox_id_aliases": sandbox_ids,
+            "runtime_failure_context_ids": [
+                _model_json_dict(context).get("id")
+                for context in runtime_failure_contexts
+                if _model_json_dict(context).get("id") is not None
+            ],
+            **candidate.recovery_metadata(),
+        }
+        elapsed_ms = 0
+        try:
+            elapsed_ms = int(candidate.result.get("duration_ms") or 0)
+        except (TypeError, ValueError):
+            elapsed_ms = 0
+
+        raw_output = StoredRawOutputEvidence(
+            attempt_id=int(getattr(attempt, "attempt_id", 0) or 0),
+            invocation_id=invocation_id,
+            runtime="claude_pool",
+            status="completed",
+            terminal_reason="completed",
+            raw_text=(
+                candidate.result_text
+                or json.dumps(candidate.raw, sort_keys=True, default=str)
+            ),
+            metadata=recovery_metadata,
+            payload={
+                "claude_pool_job": candidate.recovery_metadata(),
+            },
+        )
+        invocation = StoredRuntimeInvocationEvidence(
+            attempt_id=int(getattr(attempt, "attempt_id", 0) or 0),
+            invocation_id=invocation_id,
+            runtime="claude_pool",
+            phase="response",
+            actor_name=str(getattr(request, "actor_name", "") or ""),
+            actor_role=str(getattr(request, "actor_role", "") or ""),
+            actor_metadata=actor_metadata,
+            output_schema_digest=output_schema_digest,
+            output_type_name=output_type_name,
+            status="completed",
+            terminal_reason="completed",
+            process_started=True,
+            usage={
+                "claude_pool": candidate.recovery_metadata(),
+            },
+            elapsed_ms=elapsed_ms,
+            metadata=recovery_metadata,
+            payload={
+                "claude_pool_job": candidate.recovery_metadata(),
+            },
+            idempotency_key=(
+                "idem:dispatch-runtime-invocation-late-completion:"
+                f"{getattr(attempt, 'attempt_id', 0)}:{candidate.job_id}"
+            ),
+        )
+        structured = StoredStructuredOutputEvidence(
+            attempt_id=int(getattr(attempt, "attempt_id", 0) or 0),
+            schema_name=output_type_name,
+            schema_digest=output_schema_digest,
+            valid=True,
+            original_payload=structured_payload,
+            normalized_payload=structured_payload,
+            validation_errors=[],
+            corrected_fields={},
+            task_id_matches_request=(
+                str(structured_payload.get("task_id") or "")
+                == str(getattr(request, "task_id", "") or "")
+            ),
+            projection_body=json.dumps(structured_payload, sort_keys=True, default=str),
+            metadata=recovery_metadata,
+            payload={
+                "claude_pool_job": candidate.recovery_metadata(),
+            },
+            idempotency_key=(
+                "idem:dispatch-structured-output-late-completion:"
+                f"{getattr(attempt, 'attempt_id', 0)}:{candidate.job_id}:"
+                f"{output_schema_digest}"
+            ),
+        )
+        try:
+            result = await self._store.recover_late_runtime_completion(
+                attempt_id=int(getattr(attempt, "attempt_id", 0) or 0),
+                runtime_invocation=invocation,
+                raw_output=raw_output,
+                structured_output=structured,
+                recovery_metadata=recovery_metadata,
+            )
+        except Exception:
+            logger.warning(
+                "Late Claude pool completion for dispatch attempt %s did not pass "
+                "strict recovery validation; leaving original timeout in place",
+                getattr(attempt, "attempt_id", None),
+                exc_info=True,
+            )
+            return None
+        logger.info(
+            "Recovered late Claude pool completion for dispatch attempt %s via job %s",
+            getattr(attempt, "attempt_id", None),
+            candidate.job_id,
+        )
+        return DispatcherOutcome(
+            attempt_id=result.attempt_id,
+            state=result.state,
+            status=result.status,
+            runtime_terminal_reason=result.runtime_terminal_reason,
+            structured_result_evidence_id=result.structured_result_evidence_id,
+            raw_text_ref=result.raw_text_ref,
+            patch_summary_ids=list(result.patch_summary_ids),
+            compatibility_artifact_ids=list(result.compatibility_artifact_ids),
+            runtime_failure_id=result.runtime_failure_id,
+            typed_failure_id=result.typed_failure_id,
+            idempotency_key=result.idempotency_key,
+        )
+
 
 DISPATCH_ATTEMPT_RECOVERY_EVIDENCE_FIELDS = (
     "duplicate_replay_recovery_evidence",
@@ -9862,6 +10847,40 @@ DISPATCH_ATTEMPT_RECOVERY_EVIDENCE_FIELDS = (
     "stale_recovery_evidence",
     "recovery_evidence",
 )
+
+
+def _positive_dispatch_evidence_id(value: Any) -> int | None:
+    try:
+        evidence_id = int(value)
+    except (TypeError, ValueError):
+        return None
+    return evidence_id if evidence_id > 0 else None
+
+
+def _dispatch_attempt_raw_output_recovery_evidence(
+    payload: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    evidence_id = _positive_dispatch_evidence_id(
+        payload.get("last_raw_output_evidence_id")
+    )
+    if evidence_id is None:
+        for raw in list(payload.get("raw_output_evidence_ids") or []):
+            evidence_id = _positive_dispatch_evidence_id(raw)
+            if evidence_id is not None:
+                break
+    if evidence_id is None:
+        return None
+    return {
+        "durable": True,
+        "evidence_id": evidence_id,
+        "raw_output_evidence_id": evidence_id,
+        "runtime_crashed": True,
+        "signal": "workflow_crash_after_runtime_raw_output",
+        "recovery_reason": (
+            "durable raw output evidence was recorded before the dispatch "
+            "attempt reached a terminal state"
+        ),
+    }
 
 
 def _dispatch_attempt_duplicate_replay_recovery_evidence(
@@ -9885,7 +10904,7 @@ def _dispatch_attempt_duplicate_replay_recovery_evidence(
             if container.get(field) is not None
         )
     if not candidates:
-        return None
+        return _dispatch_attempt_raw_output_recovery_evidence(data)
     return candidates[0] if len(candidates) == 1 else candidates
 
 
@@ -10355,6 +11374,205 @@ def _workflow_blocker_from_attempts(attempts: list[BugFixAttempt]) -> str:
     return ""
 
 
+def _bug_fix_attempt_workflow_blocker_text(attempt: BugFixAttempt) -> str:
+    text = "\n".join([
+        str(getattr(attempt, "fix_applied", "") or ""),
+        str(getattr(attempt, "root_cause", "") or ""),
+        str(getattr(attempt, "description", "") or ""),
+    ])
+    return text if _is_workflow_blocker_text(text) else ""
+
+
+def _attempt_text_mentions_pre_grant_sandbox_authority(text: str) -> bool:
+    lowered = text.lower()
+    return (
+        (
+            "sandbox-permissions" in lowered
+            or "sandbox permission" in lowered
+            or "eacces" in lowered
+            or "eperm" in lowered
+            or "permission denied" in lowered
+        )
+        and (
+            "writable_roots" in lowered
+            or "leaf files" in lowered
+            or "leaf-only" in lowered
+            or "session-env" in lowered
+            or "pre-grant" in lowered
+        )
+    )
+
+
+def _attempt_text_mentions_diagnostic_scratch_repo_failure(text: str) -> bool:
+    lowered = text.lower()
+    return (
+        ".iriai-test-tmp" in lowered
+        and "git rev-parse head failed" in lowered
+        and "not a git repository" in lowered
+    )
+
+
+def _json_mapping(value: Any) -> dict[str, Any]:
+    if isinstance(value, Mapping):
+        return dict(value)
+    if not isinstance(value, str) or not value.strip():
+        return {}
+    try:
+        parsed = json.loads(value)
+    except Exception:
+        return {}
+    return dict(parsed) if isinstance(parsed, Mapping) else {}
+
+
+async def _artifact_json_mapping(
+    runner: WorkflowRunner,
+    feature: Feature,
+    key: str,
+) -> dict[str, Any]:
+    getter = getattr(getattr(runner, "artifacts", None), "get", None)
+    if not callable(getter):
+        return {}
+    try:
+        return _json_mapping(await getter(key, feature=feature))
+    except Exception:
+        return {}
+
+
+def _rca_runtime_failure_payload_is_grant_backed(payload: Mapping[str, Any]) -> bool:
+    evidence = payload.get("runtime_workspace_evidence")
+    if not isinstance(evidence, Mapping):
+        return False
+    if str(evidence.get("classification") or "") == "grant_backed":
+        return True
+    for job in list(evidence.get("matched_jobs") or []):
+        if isinstance(job, Mapping) and str(job.get("classification") or "") == "grant_backed":
+            return True
+    return False
+
+
+def _rca_runtime_failure_payload_proves_repaired_infra(
+    payload: Mapping[str, Any],
+    *,
+    attempt_text: str,
+) -> str:
+    if not payload:
+        return ""
+    if _rca_runtime_failure_payload_is_grant_backed(payload):
+        return ""
+    evidence = payload.get("runtime_workspace_evidence")
+    if isinstance(evidence, Mapping):
+        classification = str(evidence.get("classification") or "")
+        if classification == "pre_grant":
+            return "pre_grant_runtime_workspace_evidence"
+    payload_text = json.dumps(payload, sort_keys=True, default=str)
+    combined = f"{attempt_text}\n{payload_text}"
+    if _attempt_text_mentions_diagnostic_scratch_repo_failure(combined):
+        return "diagnostic_scratch_repo_discovery_failure"
+    if _attempt_text_mentions_pre_grant_sandbox_authority(combined):
+        return "pre_grant_sandbox_authority_text"
+    return ""
+
+
+async def _workflow_blocker_waiver_for_attempt(
+    runner: WorkflowRunner,
+    feature: Feature,
+    attempt: BugFixAttempt,
+    blocker_text: str,
+) -> dict[str, Any] | None:
+    result = str(getattr(attempt, "re_verify_result", "") or "").upper()
+    fix_text = str(getattr(attempt, "fix_applied", "") or "")
+    description = str(getattr(attempt, "description", "") or "")
+    bug_id = str(getattr(attempt, "bug_id", "") or "")
+    source = str(getattr(attempt, "source_verdict", "") or "")
+    is_rca_runtime_blocker = (
+        "RCA runtime failed before product repair dispatch" in blocker_text
+        and "context=bug-rca" in blocker_text
+    )
+    if result == "INFRA_RETRY" and not _is_workflow_blocker_text(fix_text):
+        return {
+            "reason": "infra_retry_attempt_description_only",
+            "bug_id": bug_id,
+            "source": source,
+        }
+    if not is_rca_runtime_blocker or not bug_id or not source:
+        return None
+
+    runtime_payload = await _artifact_json_mapping(
+        runner,
+        feature,
+        f"bug-rca-runtime-failure:{source}:{bug_id}",
+    )
+    if not runtime_payload:
+        runtime_payload = await _artifact_json_mapping(
+            runner,
+            feature,
+            f"workflow-blocker:bug-rca:{source}:{bug_id}",
+        )
+    reason = _rca_runtime_failure_payload_proves_repaired_infra(
+        runtime_payload,
+        attempt_text=blocker_text,
+    )
+    if not reason:
+        return None
+    return {
+        "reason": reason,
+        "bug_id": bug_id,
+        "source": source,
+        "attempt_number": getattr(attempt, "attempt_number", None),
+        "runtime_failure_key": f"bug-rca-runtime-failure:{source}:{bug_id}",
+        "description_only_inherited_blocker": (
+            not _attempt_text_mentions_pre_grant_sandbox_authority(fix_text)
+            and _attempt_text_mentions_pre_grant_sandbox_authority(description)
+        ),
+    }
+
+
+async def _record_workflow_blocker_waiver(
+    runner: WorkflowRunner,
+    feature: Feature,
+    waiver: Mapping[str, Any],
+    blocker_text: str,
+) -> None:
+    put = getattr(getattr(runner, "artifacts", None), "put", None)
+    if not callable(put):
+        return
+    source = str(waiver.get("source") or "unknown")
+    bug_id = str(waiver.get("bug_id") or "unknown")
+    payload = {
+        "artifact_schema": "workflow-blocker-waiver-v1",
+        "status": "waived_repaired_infra",
+        "waiver": dict(waiver),
+        "blocker_excerpt": blocker_text[:2000],
+    }
+    await put(
+        f"workflow-blocker-waiver:bug-rca:{source}:{bug_id}",
+        json.dumps(payload, sort_keys=True),
+        feature=feature,
+    )
+
+
+async def _workflow_blocker_from_attempts_classified(
+    runner: WorkflowRunner,
+    feature: Feature,
+    attempts: list[BugFixAttempt],
+) -> str:
+    for attempt in attempts:
+        blocker = _bug_fix_attempt_workflow_blocker_text(attempt)
+        if not blocker:
+            continue
+        waiver = await _workflow_blocker_waiver_for_attempt(
+            runner,
+            feature,
+            attempt,
+            blocker,
+        )
+        if waiver is not None:
+            await _record_workflow_blocker_waiver(runner, feature, waiver, blocker)
+            continue
+        return blocker
+    return ""
+
+
 def _workflow_blocker_from_verdict(verdict: object) -> str:
     if isinstance(verdict, Verdict):
         text_parts = [
@@ -10416,7 +11634,11 @@ async def _store_attempts_or_quiesce_on_workflow_blocker(
     source: str,
 ) -> None:
     await _store_attempts(runner, feature, attempts)
-    blocker = _workflow_blocker_from_attempts(attempts)
+    blocker = await _workflow_blocker_from_attempts_classified(
+        runner,
+        feature,
+        attempts,
+    )
     if blocker:
         raise WorkflowQuiesced(
             phase_name=phase_name,
@@ -12288,22 +13510,23 @@ class ImplementationPhase(Phase):
                 logger.info("Code review gate already passed — skipping")
                 review_verdict = Verdict(approved=True, summary="Previously approved")
             else:
-                review_verdict = await runner.run(
-                    Ask(
-                        actor=_make_parallel_actor(
-                            reviewer, "gate", runtime=gate_runtime,
-                        ),
-                        prompt=(
-                            _context_package_prompt(post_dag_context)
-                            +
-                            "Review the implementation for code quality, adherence to "
-                            "the technical plan, design decisions, and system design. "
-                            "Cross-check against the full upstream artifacts in your context."
-                        ),
-                        output_type=Verdict,
-                    ),
+                review_verdict = await _run_bound_diagnostic_ask(
+                    runner,
                     feature,
+                    base_actor=reviewer,
+                    suffix="gate",
+                    runtime=gate_runtime,
+                    prompt=(
+                        _context_package_prompt(post_dag_context)
+                        +
+                        "Review the implementation for code quality, adherence to "
+                        "the technical plan, design decisions, and system design. "
+                        "Cross-check against the full upstream artifacts in your context."
+                    ),
+                    output_type=Verdict,
                     phase_name=self.name,
+                    feature_root=feature_root,
+                    lane_id="post-dag:code-review",
                 )
                 await runner.artifacts.put(
                     "review-verdict", to_str(review_verdict), feature=feature
@@ -12368,23 +13591,24 @@ class ImplementationPhase(Phase):
                 logger.info("Security gate already passed — skipping")
                 security_verdict = Verdict(approved=True, summary="Previously approved")
             else:
-                security_verdict = await runner.run(
-                    Ask(
-                        actor=_make_parallel_actor(
-                            security_auditor, "gate", runtime=gate_runtime,
-                        ),
-                        prompt=(
-                            _context_package_prompt(post_dag_context)
-                            +
-                            "Audit the implementation for security vulnerabilities. "
-                            "Check OWASP Top 10, auth on every endpoint, secrets in "
-                            "code, input validation, and data exposure. Cross-check "
-                            "against the security profile in the PRD."
-                        ),
-                        output_type=Verdict,
-                    ),
+                security_verdict = await _run_bound_diagnostic_ask(
+                    runner,
                     feature,
+                    base_actor=security_auditor,
+                    suffix="gate",
+                    runtime=gate_runtime,
+                    prompt=(
+                        _context_package_prompt(post_dag_context)
+                        +
+                        "Audit the implementation for security vulnerabilities. "
+                        "Check OWASP Top 10, auth on every endpoint, secrets in "
+                        "code, input validation, and data exposure. Cross-check "
+                        "against the security profile in the PRD."
+                    ),
+                    output_type=Verdict,
                     phase_name=self.name,
+                    feature_root=feature_root,
+                    lane_id="post-dag:security",
                 )
                 await runner.artifacts.put(
                     "security-verdict", to_str(security_verdict), feature=feature
@@ -12457,6 +13681,24 @@ class ImplementationPhase(Phase):
                 test_result = ImplementationResult.model_validate_json(test_checkpoint)
             else:
                 test_authoring_tree_digest_before = post_dag_gate_tree_digest
+                if (
+                    _sandbox_runtime_name(gate_runtime, runner) == "claude_pool"
+                    and _actor_has_write_capable_tools(test_author)
+                ):
+                    blocker = _workflow_blocker_text(
+                        "Post-DAG test_author is product-producing and cannot run on "
+                        "claude_pool without an explicit product sandbox promotion lane."
+                    )
+                    raise WorkflowQuiesced(
+                        phase_name=self.name,
+                        reason=blocker,
+                        metadata={
+                            "terminal_state": "workflow_blocked",
+                            "deterministic_workflow_blocker": True,
+                            "operator_required": False,
+                            "source": "test-authoring",
+                        },
+                    )
                 test_result = await runner.run(
                     Ask(
                         actor=_make_parallel_actor(
@@ -12521,26 +13763,27 @@ class ImplementationPhase(Phase):
                 logger.info("QA gate already passed — skipping")
                 qa_verdict = Verdict(approved=True, summary="Previously approved")
             else:
-                qa_verdict = await runner.run(
-                    Ask(
-                        actor=_make_parallel_actor(
-                            qa_engineer, "gate", runtime=gate_runtime,
-                        ),
-                        prompt=(
-                            _context_package_prompt(post_dag_context)
-                            +
-                            "Test the full implementation. Run the test suite, check "
-                            "for runtime errors, and verify the acceptance criteria "
-                            "from the PRD and design specs are met. When a Test Plan "
-                            "section is provided above, march its verification_checklist "
-                            "top-to-bottom and cite AC-ids in any failures you report. "
-                            "Cross-check implementation against the full upstream "
-                            "artifacts in your context."
-                        ),
-                        output_type=Verdict,
-                    ),
+                qa_verdict = await _run_bound_diagnostic_ask(
+                    runner,
                     feature,
+                    base_actor=qa_engineer,
+                    suffix="gate",
+                    runtime=gate_runtime,
+                    prompt=(
+                        _context_package_prompt(post_dag_context)
+                        +
+                        "Test the full implementation. Run the test suite, check "
+                        "for runtime errors, and verify the acceptance criteria "
+                        "from the PRD and design specs are met. When a Test Plan "
+                        "section is provided above, march its verification_checklist "
+                        "top-to-bottom and cite AC-ids in any failures you report. "
+                        "Cross-check implementation against the full upstream "
+                        "artifacts in your context."
+                    ),
+                    output_type=Verdict,
                     phase_name=self.name,
+                    feature_root=feature_root,
+                    lane_id="post-dag:qa",
                 )
                 await runner.artifacts.put("qa-verdict", to_str(qa_verdict), feature=feature)
 
@@ -12601,26 +13844,27 @@ class ImplementationPhase(Phase):
                 logger.info("Integration gate already passed — skipping")
                 integration_verdict = Verdict(approved=True, summary="Previously approved")
             else:
-                integration_verdict = await runner.run(
-                    Ask(
-                        actor=_make_parallel_actor(
-                            integration_tester, "gate", runtime=gate_runtime,
-                        ),
-                        prompt=(
-                            _context_package_prompt(post_dag_context)
-                            +
-                            "Execute ALL user journeys from the PRD against the "
-                            "implementation. Use Playwright for UI journeys, Bash "
-                            "for API/CLI journeys. Every journey step must produce "
-                            "evidence. Check happy paths, error cases, and boundary "
-                            "conditions. When a Test Plan section is provided above, "
-                            "run through its test_scenarios and edge_cases lists; for "
-                            "any failure, cite the AC-id in your verdict."
-                        ),
-                        output_type=Verdict,
-                    ),
+                integration_verdict = await _run_bound_diagnostic_ask(
+                    runner,
                     feature,
+                    base_actor=integration_tester,
+                    suffix="gate",
+                    runtime=gate_runtime,
+                    prompt=(
+                        _context_package_prompt(post_dag_context)
+                        +
+                        "Execute ALL user journeys from the PRD against the "
+                        "implementation. Use Playwright for UI journeys, Bash "
+                        "for API/CLI journeys. Every journey step must produce "
+                        "evidence. Check happy paths, error cases, and boundary "
+                        "conditions. When a Test Plan section is provided above, "
+                        "run through its test_scenarios and edge_cases lists; for "
+                        "any failure, cite the AC-id in your verdict."
+                    ),
+                    output_type=Verdict,
                     phase_name=self.name,
+                    feature_root=feature_root,
+                    lane_id="post-dag:integration",
                 )
                 await runner.artifacts.put(
                     "integration-verdict", to_str(integration_verdict), feature=feature
@@ -12685,37 +13929,38 @@ class ImplementationPhase(Phase):
                 logger.info("Verifier gate already passed — skipping")
                 verifier_verdict = Verdict(approved=True, summary="Previously approved")
             else:
-                verifier_verdict = await runner.run(
-                    Ask(
-                        actor=_make_parallel_actor(
-                            verifier, "gate", runtime=gate_runtime,
-                        ),
-                        prompt=(
-                            _context_package_prompt(post_dag_context)
-                            +
-                            "Verify that ALL user journeys from the PRD work end-to-end. "
-                            "When a Test Plan section is provided above, its "
-                            "verification_checklist and acceptance_criteria are the "
-                            "authoritative source of truth — cite AC-ids for any failures.\n\n"
-                            "**For projects with a frontend/UI:**\n"
-                            "- Interact with the UI via real Playwright clicks and form fills "
-                            "— do not substitute API calls.\n"
-                            "- You MUST capture Playwright screenshots for every journey step. "
-                            "Save screenshots to a `screenshots/` directory in the project root "
-                            "using descriptive names: `{journey_id}_{step}.png` "
-                            "(e.g., `J1_create_workflow.png`, `J2_add_node.png`).\n"
-                            "- Use `page.screenshot(path='screenshots/...')` after each step.\n"
-                            "- A UI journey without screenshot evidence is NOT verified.\n\n"
-                            "**For pure backend/library projects:**\n"
-                            "- Run the test suite and verify all tests pass.\n"
-                            "- Execute API endpoints or CLI commands and verify responses.\n"
-                            "- Capture terminal output as evidence where appropriate.\n\n"
-                            "Every journey must produce evidence of working correctly."
-                        ),
-                        output_type=Verdict,
-                    ),
+                verifier_verdict = await _run_bound_diagnostic_ask(
+                    runner,
                     feature,
+                    base_actor=verifier,
+                    suffix="gate",
+                    runtime=gate_runtime,
+                    prompt=(
+                        _context_package_prompt(post_dag_context)
+                        +
+                        "Verify that ALL user journeys from the PRD work end-to-end. "
+                        "When a Test Plan section is provided above, its "
+                        "verification_checklist and acceptance_criteria are the "
+                        "authoritative source of truth — cite AC-ids for any failures.\n\n"
+                        "**For projects with a frontend/UI:**\n"
+                        "- Interact with the UI via real Playwright clicks and form fills "
+                        "— do not substitute API calls.\n"
+                        "- You MUST capture Playwright screenshots for every journey step. "
+                        "Save screenshots to a `screenshots/` directory in the project root "
+                        "using descriptive names: `{journey_id}_{step}.png` "
+                        "(e.g., `J1_create_workflow.png`, `J2_add_node.png`).\n"
+                        "- Use `page.screenshot(path='screenshots/...')` after each step.\n"
+                        "- A UI journey without screenshot evidence is NOT verified.\n\n"
+                        "**For pure backend/library projects:**\n"
+                        "- Run the test suite and verify all tests pass.\n"
+                        "- Execute API endpoints or CLI commands and verify responses.\n"
+                        "- Capture terminal output as evidence where appropriate.\n\n"
+                        "Every journey must produce evidence of working correctly."
+                    ),
+                    output_type=Verdict,
                     phase_name=self.name,
+                    feature_root=feature_root,
+                    lane_id="post-dag:verifier",
                 )
                 await runner.artifacts.put(
                     "verifier-verdict", to_str(verifier_verdict), feature=feature
@@ -14966,18 +16211,30 @@ async def _record_dag_verifier_runtime_failure(
 def _typed_runtime_provider_route_payload(
     *,
     group_idx: int,
-    retry: int | str,
+    retry: int | str | None = None,
+    outer_attempt: int | str | None = None,
+    route_retry: int | None = None,
+    lane_id: str | None = None,
     runtime: str | None,
     error: Exception,
     context: str,
     source: str = "",
 ) -> dict[str, Any]:
-    retry_key = str(retry)
+    outer_attempt_value = retry if outer_attempt is None else outer_attempt
+    route_retry_index = (
+        int(route_retry)
+        if route_retry is not None
+        else int(retry) if isinstance(retry, int) else 0
+    )
+    retry_key = str(outer_attempt_value if outer_attempt_value is not None else route_retry_index)
+    route_retry_key = str(route_retry_index)
+    lane_key = str(lane_id or f"{context}:g{group_idx}")
     stable_signature = _dag_verify_graph_digest({
         "context": context,
         "error_type": type(error).__name__,
         "group_idx": group_idx,
-        "retry": retry_key,
+        "lane_id": lane_key,
+        "route_retry": route_retry_key,
         "runtime": runtime or "",
         "source": source,
     })
@@ -14999,11 +16256,14 @@ def _typed_runtime_provider_route_payload(
             payload={
                 "idempotency_key": (
                     f"failure:dag-runtime-provider:g{group_idx}:"
-                    f"{context}:{retry_key}:{stable_signature}"
+                    f"{lane_key}:{route_retry_key}:{stable_signature}"
                 ),
                 "context": context,
                 "error_type": type(error).__name__,
                 "legacy_failure_type": legacy_failure_type,
+                "lane_id": lane_key,
+                "outer_attempt": outer_attempt_value,
+                "route_retry": route_retry_index,
                 "runtime": runtime or "",
                 "source": source,
             },
@@ -15020,7 +16280,7 @@ def _typed_runtime_provider_route_payload(
             + int(getattr(decision, "reservation_ordinal", 0) or 0),
             0,
         )
-        retry_index = int(retry) if isinstance(retry, int) else 0
+        retry_index = route_retry_index
         remaining = max(0, max_attempts - retry_index - 1)
         if retry_index >= max_attempts:
             decision = decision.model_copy(update={
@@ -15032,7 +16292,7 @@ def _typed_runtime_provider_route_payload(
                 "route_decision_id": None,
                 "idempotency_key": (
                     f"route:dag-runtime-provider:g{group_idx}:"
-                    f"{context}:{stable_signature}:quiesce:n{retry_index}"
+                    f"{lane_key}:{stable_signature}:quiesce:n{retry_index}"
                 ),
             })
         elif remaining <= 0 and retry_index + 1 >= max_attempts:
@@ -15043,7 +16303,7 @@ def _typed_runtime_provider_route_payload(
                 "route_decision_id": None if retry_index else decision.route_decision_id,
                 "idempotency_key": (
                     f"route:dag-runtime-provider:g{group_idx}:"
-                    f"{context}:{stable_signature}:retry_dispatch:n{retry_index + 1}"
+                    f"{lane_key}:{stable_signature}:retry_dispatch:n{retry_index + 1}"
                 ),
             })
         else:
@@ -15053,7 +16313,7 @@ def _typed_runtime_provider_route_payload(
                 "route_decision_id": None if retry_index else decision.route_decision_id,
                 "idempotency_key": (
                     f"route:dag-runtime-provider:g{group_idx}:"
-                    f"{context}:{stable_signature}:retry_dispatch:n{retry_index + 1}"
+                    f"{lane_key}:{stable_signature}:retry_dispatch:n{retry_index + 1}"
                 ),
             })
         route_decision = _route_decision_compat_payload(
@@ -15071,17 +16331,20 @@ def _typed_runtime_provider_route_payload(
             "operator_required": False,
             "route": "retry_dispatch",
             "retry_budget": {
-                "budget_key": f"runtime_provider:{context}:g{group_idx}:r{retry_key}",
+                "budget_key": f"runtime_provider:{lane_key}:g{group_idx}",
                 "max_retries": VERIFY_RETRIES,
                 "max_attempts": VERIFY_RETRIES,
-                "remaining_attempts": max(0, VERIFY_RETRIES - int(retry if isinstance(retry, int) else 0) - 1),
+                "remaining_attempts": max(0, VERIFY_RETRIES - route_retry_index - 1),
             },
             "stable_signature_hash": stable_signature,
         }
     return {
         "artifact_schema": "dag-runtime-failure-v2",
         "group_idx": group_idx,
-        "retry": retry,
+        "retry": outer_attempt_value,
+        "outer_attempt": outer_attempt_value,
+        "route_retry": route_retry_index,
+        "lane_id": lane_key,
         "runtime": runtime,
         "failure_class": "runtime_provider",
         "failure_type": failure_type,
@@ -16221,19 +17484,26 @@ async def _verify_and_fix_group(
                 "Check if the issue is a spec contradiction (task reference_material says X but a D-GR decision says Y)."
             )
             try:
-                rca_result = await runner.run(
-                    Ask(
-                        actor=_make_parallel_actor(
-                            root_cause_analyst, f"dag-rca-g{group_idx}-r{retry}",
-                            runtime=dag_rca_runtime,
-                            workspace_path=str(feature_root) if feature_root else None,
-                        ),
-                        prompt=rca_prompt,
-                        output_type=RootCauseAnalysis,
-                    ),
+                async with _diagnostic_actor_context(
+                    runner,
                     feature,
-                    phase_name="implementation",
-                )
+                    base_actor=root_cause_analyst,
+                    suffix=f"dag-rca-g{group_idx}-r{retry}",
+                    runtime=dag_rca_runtime,
+                    workspace_path=str(feature_root) if feature_root else None,
+                    feature_root=feature_root,
+                    lane_id=f"dag-rca:g{group_idx}:r{retry}",
+                    group_idx=group_idx,
+                ) as dag_rca_actor:
+                    rca_result = await runner.run(
+                        Ask(
+                            actor=dag_rca_actor,
+                            prompt=rca_prompt,
+                            output_type=RootCauseAnalysis,
+                        ),
+                        feature,
+                        phase_name="implementation",
+                    )
             except Exception as rca_err:
                 logger.warning("DAG verify RCA failed: %s", rca_err)
                 failure = _workflow_blocker_text(
@@ -18521,7 +19791,7 @@ async def _implement_dag(
                 )
 
         # ── Dispatch pending tasks with retry on crash ──────────────
-        TASK_MAX_RETRIES = 5
+        TASK_MAX_RETRIES = 3
         TASK_WARN_AT = 3  # Send Slack notification at this attempt
         new_results: list[object] = []
         results: list[object] = list(completed_results)
@@ -18542,6 +19812,8 @@ async def _implement_dag(
                     "dispatch_kind": "implementation",
                 },
             )
+
+            TASK_INFRA_MAX_RETRIES = TASK_MAX_RETRIES + _SANDBOX_INFRA_RETRY_HEADROOM
 
             async def _run_task(task_idx: int, t: ImplementationTask) -> ImplementationResult:
                 """Run a single implementation task with retry on crash."""
@@ -18569,7 +19841,7 @@ async def _implement_dag(
                     + handover_context
                 )
 
-                for attempt in range(TASK_MAX_RETRIES + 1):
+                for attempt in range(TASK_INFRA_MAX_RETRIES + 1):
                     sandbox_task_binding: RuntimeSandboxTaskBinding | None = None
                     try:
                         await _log_feature_event(
@@ -18621,6 +19893,7 @@ async def _implement_dag(
                                 dispatch_outcome,
                                 attempt=attempt,
                                 max_retries=TASK_MAX_RETRIES,
+                                infra_max_retries=TASK_INFRA_MAX_RETRIES,
                             )
                         ):
                             await _log_feature_event(
@@ -19677,7 +20950,7 @@ async def _run_enhancement_group(
         pending_tasks.append(enh_tasks_by_id[tid])
 
     # ── Dispatch pending tasks with retry on crash ────────────────
-    TASK_MAX_RETRIES = 5
+    TASK_MAX_RETRIES = 3
     TASK_WARN_AT = 3
     new_results: list[object] = []
 
@@ -21517,7 +22790,7 @@ async def _verify(
     if contradiction_decisions:
         known_issues += "\n\n" + contradiction_decisions
 
-    verifier = _make_parallel_actor(qa_engineer, "verify", runtime=runtime)
+    feature_root = _get_feature_root(runner, feature)
 
     verify_context = await _build_prompt_context_package(
         runner,
@@ -21546,15 +22819,25 @@ async def _verify(
         "This is a per-group verification, not a full QA pass."
     )
 
-    return await runner.run(
-        Ask(
-            actor=verifier,
-            prompt=verify_prompt,
-            output_type=Verdict,
-        ),
+    async with _diagnostic_actor_context(
+        runner,
         feature,
-        phase_name="implementation",
-    )
+        base_actor=qa_engineer,
+        suffix="verify",
+        runtime=runtime,
+        workspace_path=str(feature_root) if feature_root else None,
+        feature_root=feature_root,
+        lane_id="group-verify",
+    ) as verifier:
+        return await runner.run(
+            Ask(
+                actor=verifier,
+                prompt=verify_prompt,
+                output_type=Verdict,
+            ),
+            feature,
+            phase_name="implementation",
+        )
 
 
 async def _verify_enhancements(
@@ -21608,36 +22891,44 @@ async def _verify_enhancements(
         ],
     )
 
-    verifier = _make_parallel_actor(qa_engineer, "verify-enh", runtime=runtime)
-
-    return await runner.run(
-        Ask(
-            actor=verifier,
-            prompt=(
-                f"## Enhancement Group Verification\n\n"
-                f"{_context_package_prompt(verify_context)}"
-                f"An implementer was tasked with fixing {len(enhancement_items)} "
-                f"deferred non-blocking issues. Verify their work.\n\n"
-                f"### Verification Checklist\n\n"
-                f"For each file in [{file_list}]:\n"
-                f"1. The file exists and the changes compile/import correctly\n"
-                f"2. Changes address the specific enhancement items listed above\n"
-                f"3. **Regression check:** Existing tests still pass. Run any "
-                f"test suites that cover modified files. If no tests exist, "
-                f"verify the changes don't break imports or existing behavior\n"
-                f"4. Items marked as 'already resolved' by the implementer are "
-                f"actually resolved — spot-check a sample\n"
-                f"5. Fixes are minimal and targeted — no unnecessary rewrites\n\n"
-                f"**Do NOT approve if:**\n"
-                f"- Any existing test fails after the changes\n"
-                f"- A fix introduces a new bug or breaks an import\n"
-                f"- The implementer skipped items that are clearly still broken"
-            ),
-            output_type=Verdict,
-        ),
+    async with _diagnostic_actor_context(
+        runner,
         feature,
-        phase_name="implementation",
-    )
+        base_actor=qa_engineer,
+        suffix="verify-enh",
+        runtime=runtime,
+        workspace_path=str(feature_root) if feature_root else None,
+        feature_root=feature_root,
+        lane_id="enhancement-verify",
+    ) as verifier:
+        return await runner.run(
+            Ask(
+                actor=verifier,
+                prompt=(
+                    f"## Enhancement Group Verification\n\n"
+                    f"{_context_package_prompt(verify_context)}"
+                    f"An implementer was tasked with fixing {len(enhancement_items)} "
+                    f"deferred non-blocking issues. Verify their work.\n\n"
+                    f"### Verification Checklist\n\n"
+                    f"For each file in [{file_list}]:\n"
+                    f"1. The file exists and the changes compile/import correctly\n"
+                    f"2. Changes address the specific enhancement items listed above\n"
+                    f"3. **Regression check:** Existing tests still pass. Run any "
+                    f"test suites that cover modified files. If no tests exist, "
+                    f"verify the changes don't break imports or existing behavior\n"
+                    f"4. Items marked as 'already resolved' by the implementer are "
+                    f"actually resolved — spot-check a sample\n"
+                    f"5. Fixes are minimal and targeted — no unnecessary rewrites\n\n"
+                    f"**Do NOT approve if:**\n"
+                    f"- Any existing test fails after the changes\n"
+                    f"- A fix introduces a new bug or breaks an import\n"
+                    f"- The implementer skipped items that are clearly still broken"
+                ),
+                output_type=Verdict,
+            ),
+            feature,
+            phase_name="implementation",
+        )
 
 
 # ── RCA → Fix → Re-verify pipeline ──────────────────────────────────────────
@@ -25038,17 +26329,26 @@ async def _resolve_dag_contradiction(
         "10. authoritative_sources must cite concrete files/artifacts/decisions.\n"
         "11. Do not waive real implementation failures; only resolve conflicting expectations.\n"
     )
-    actor = _make_parallel_actor(
-        root_cause_analyst,
-        f"dag-g{group_idx}-r{retry}-contradiction-{safe_group}",
+    async with _diagnostic_actor_context(
+        runner,
+        feature,
+        base_actor=root_cause_analyst,
+        suffix=f"dag-g{group_idx}-r{retry}-contradiction-{safe_group}",
         runtime=runtime,
         workspace_path=str(feature_root) if feature_root else None,
-    )
-    result = await runner.run(
-        Ask(actor=actor, prompt=prompt, output_type=DagContradictionResolution),
-        feature,
-        phase_name="implementation",
-    )
+        feature_root=feature_root,
+        lane_id=f"dag-contradiction:g{group_idx}:r{retry}:{safe_group}",
+        group_idx=group_idx,
+    ) as contradiction_actor:
+        result = await runner.run(
+            Ask(
+                actor=contradiction_actor,
+                prompt=prompt,
+                output_type=DagContradictionResolution,
+            ),
+            feature,
+            phase_name="implementation",
+        )
     if isinstance(result, DagContradictionResolution):
         return result
     if isinstance(result, BaseModel):
@@ -30965,12 +32265,6 @@ async def _run_expanded_dag_verify_lenses(
     async def _run_lens(spec: DagVerifyLensSpec) -> tuple[DagVerifyLensSpec, Verdict | None, str | None]:
         artifact_key = f"dag-repair-lens:g{group_idx}:{spec.slug}:retry-{retry_label}"
         lens_runtime = _dag_repair_runtime_for(f"lens:{spec.slug}", runtime)
-        actor = _make_parallel_actor(
-            spec.actor,
-            f"dag-lens-g{group_idx}-r{retry_label}-{spec.slug}",
-            runtime=lens_runtime,
-            workspace_path=str(feature_root) if feature_root else None,
-        )
         prompt = (
             f"## Expanded DAG Verify Lens: {spec.label}\n\n"
             f"{context_prompt}"
@@ -30984,14 +32278,18 @@ async def _run_expanded_dag_verify_lenses(
             "group. Lens approval is advisory and cannot checkpoint the group."
         )
         try:
-            verdict = await runner.run(
-                Ask(
-                    actor=actor,
-                    prompt=prompt,
-                    output_type=Verdict,
-                ),
+            verdict = await _run_bound_diagnostic_ask(
+                runner,
                 feature,
+                base_actor=spec.actor,
+                suffix=f"dag-lens-g{group_idx}-r{retry_label}-{spec.slug}",
+                runtime=lens_runtime,
+                prompt=prompt,
+                output_type=Verdict,
                 phase_name="implementation",
+                feature_root=feature_root,
+                lane_id=f"dag-lens:g{group_idx}:r{retry_label}:{spec.slug}",
+                group_idx=group_idx,
             )
             if not isinstance(verdict, Verdict):
                 raise TypeError(f"lens returned {type(verdict).__name__}, expected Verdict")
@@ -31276,36 +32574,68 @@ async def _plan_bug_groups(
             similar_cluster_hints=list(strategy_context.similar_cluster_hints) if strategy_context else [],
         )
 
-    rca_tasks = [
-        Ask(
-            actor=(
-                actor_factory(root_cause_analyst, f"rca-{group.group_id}")
-                if actor_factory is not None
-                else _make_parallel_actor(
-                    root_cause_analyst,
-                    f"rca-{group.group_id}",
-                    runtime=rca_runtime,
-                )
-            ),
-            prompt=(
-                f"## Bug Group: {group.group_id}\n\n"
-                f"### Likely Root Cause (from triage)\n{group.likely_root_cause}\n\n"
-                f"### Issues in this group\n{_extract_group_issues(verdict, group)}\n\n"
-                f"### Full Verdict Summary\n{verdict.summary}\n\n"
-                "Investigate the root cause of these specific issues. Read the "
-                "relevant code, trace the data flow, and identify the exact "
-                "point of failure. Propose a conceptual fix approach — do NOT "
-                "implement anything."
-                f"{strategy_prompt}{prior_context}{workspace_hint}"
-            ),
-            output_type=RootCauseAnalysis,
+    rca_tasks: list[Ask] = []
+    rca_diagnostic_bindings: list[RuntimeSandboxTaskBinding] = []
+    for group in triage.groups:
+        suffix = f"rca-{group.group_id}"
+        if actor_factory is not None:
+            rca_actor = actor_factory(root_cause_analyst, suffix)
+        else:
+            diagnostic_binding = await _bind_diagnostic_sandbox_if_needed(
+                runner,
+                feature,
+                base_actor=root_cause_analyst,
+                suffix=suffix,
+                runtime=rca_runtime,
+                workspace_path=str(feature_root) if feature_root else None,
+                feature_root=feature_root,
+                lane_id=f"{source}:{group.group_id}:plan-rca:{attempt_number}",
+            )
+            if diagnostic_binding is not None:
+                rca_diagnostic_bindings.append(diagnostic_binding)
+            rca_actor = _make_parallel_actor(
+                root_cause_analyst,
+                suffix,
+                runtime=rca_runtime,
+                workspace_path=str(feature_root) if feature_root else None,
+                runtime_workspace_binding=(
+                    diagnostic_binding.binding
+                    if diagnostic_binding is not None
+                    else None
+                ),
+                sandbox_required=diagnostic_binding is not None,
+            )
+        rca_tasks.append(
+            Ask(
+                actor=rca_actor,
+                prompt=(
+                    f"## Bug Group: {group.group_id}\n\n"
+                    f"### Likely Root Cause (from triage)\n{group.likely_root_cause}\n\n"
+                    f"### Issues in this group\n{_extract_group_issues(verdict, group)}\n\n"
+                    f"### Full Verdict Summary\n{verdict.summary}\n\n"
+                    "Investigate the root cause of these specific issues. Read the "
+                    "relevant code, trace the data flow, and identify the exact "
+                    "point of failure. Propose a conceptual fix approach — do NOT "
+                    "implement anything."
+                    f"{strategy_prompt}{prior_context}{workspace_hint}"
+                ),
+                output_type=RootCauseAnalysis,
+            )
         )
-        for group in triage.groups
-    ]
-    if len(rca_tasks) == 1:
-        rca_results = [await runner.run(rca_tasks[0], feature, phase_name=phase_name)]
+    try:
+        if len(rca_tasks) == 1:
+            rca_results = [await runner.run(rca_tasks[0], feature, phase_name=phase_name)]
+        else:
+            rca_results = await runner.parallel(rca_tasks, feature)
+    except Exception:
+        for binding in rca_diagnostic_bindings:
+            with suppress(Exception):
+                await binding.runner.release(binding.lease, "retain")
+        raise
     else:
-        rca_results = await runner.parallel(rca_tasks, feature)
+        for binding in rca_diagnostic_bindings:
+            with suppress(Exception):
+                await binding.runner.release(binding.lease, "release")
 
     groups: list[PlannedBugGroup] = []
     fixable_groups: list[PlannedBugGroup] = []
@@ -32282,6 +33612,94 @@ async def _attempt_parallel_dag_repair(
     return decision_results + list(fix_results.values())
 
 
+def _rca_runtime_lane_id(
+    *,
+    source: str,
+    context: str,
+    verdict_text: str,
+) -> str:
+    digest = _dag_verify_graph_digest({
+        "context": context,
+        "source": source,
+        "verdict_text": verdict_text,
+    })
+    return f"bug-rca:{source}:{context}:{digest[:24]}"
+
+
+async def _rca_runtime_failure_records(
+    runner: WorkflowRunner,
+    feature: Feature,
+    *,
+    source: str,
+) -> list[dict[str, Any]]:
+    prefix = f"bug-rca-runtime-failure:{source}:"
+    artifacts = getattr(runner, "artifacts", None)
+    records: list[dict[str, Any]] = []
+    list_records = getattr(artifacts, "list_records", None)
+    if callable(list_records):
+        try:
+            raw_records = await list_records(
+                feature_id=feature.id,
+                prefixes=(prefix,),
+                order="asc",
+                limit=500,
+                max_total_value_bytes=16 * 1024 * 1024,
+            )
+            for record in raw_records:
+                payload = _json_mapping(record.get("value"))
+                if payload:
+                    records.append({
+                        "id": record.get("id"),
+                        "key": record.get("key"),
+                        "payload": payload,
+                    })
+        except Exception:
+            logger.debug("Failed to list RCA runtime failure records", exc_info=True)
+    store = getattr(artifacts, "store", None)
+    if isinstance(store, Mapping):
+        seen = {str(record.get("key") or "") for record in records}
+        for key in sorted(str(key) for key in store if str(key).startswith(prefix)):
+            if key in seen:
+                continue
+            payload = _json_mapping(store.get(key))
+            if payload:
+                records.append({"id": None, "key": key, "payload": payload})
+    return records
+
+
+def _rca_runtime_payload_is_waived_infra(payload: Mapping[str, Any]) -> bool:
+    if bool(payload.get("pre_grant_infra_retryable")):
+        return True
+    error = str(payload.get("error") or "")
+    return (
+        _attempt_text_mentions_pre_grant_sandbox_authority(error)
+        or _attempt_text_mentions_diagnostic_scratch_repo_failure(error)
+    )
+
+
+async def _rca_runtime_route_retry(
+    runner: WorkflowRunner,
+    feature: Feature,
+    *,
+    source: str,
+    lane_id: str,
+) -> int:
+    retry_values: list[int] = []
+    for record in await _rca_runtime_failure_records(runner, feature, source=source):
+        payload = record.get("payload")
+        if not isinstance(payload, Mapping):
+            continue
+        if str(payload.get("lane_id") or "") != lane_id:
+            continue
+        if _rca_runtime_payload_is_waived_infra(payload):
+            continue
+        try:
+            retry_values.append(int(payload.get("route_retry") or 0))
+        except (TypeError, ValueError):
+            retry_values.append(0)
+    return max(retry_values, default=-1) + 1
+
+
 async def _record_bug_rca_runtime_blocker_attempt(
     runner: WorkflowRunner,
     feature: Feature,
@@ -32295,15 +33713,49 @@ async def _record_bug_rca_runtime_blocker_attempt(
     context: str,
     verdict_text: str,
 ) -> BugFixAttempt:
+    runtime_workspace_evidence = _rca_runtime_workspace_failure_evidence(
+        bug_id=bug_id,
+        source=source,
+        context=context,
+        exc=exc,
+    )
+    pre_grant_retry_marker_key = (
+        "bug-rca-pre-grant-infra-retry:"
+        f"{source}:{_safe_context_stem(context)}"
+    )
+    pre_grant_retry_consumed = await _rca_pre_grant_retry_consumed(
+        runner,
+        feature,
+        pre_grant_retry_marker_key,
+    )
+    pre_grant_retryable = (
+        _rca_runtime_failure_is_pre_grant_sandbox_authority_failure(
+            runtime_workspace_evidence
+        )
+        and not pre_grant_retry_consumed
+    )
     failure = _workflow_blocker_text(
         "RCA runtime failed before product repair dispatch; "
         f"runtime={rca_runtime or '<default>'} source={source} "
         f"bug_id={bug_id} context={context}: {exc}"
     )
+    lane_id = _rca_runtime_lane_id(
+        source=source,
+        context=context,
+        verdict_text=verdict_text,
+    )
+    route_retry = await _rca_runtime_route_retry(
+        runner,
+        feature,
+        source=source,
+        lane_id=lane_id,
+    )
     blocker_payload = {
         **_typed_runtime_provider_route_payload(
             group_idx=-1,
-            retry=attempt_number,
+            outer_attempt=attempt_number,
+            route_retry=route_retry,
+            lane_id=lane_id,
             runtime=rca_runtime,
             error=exc,
             context=context,
@@ -32314,12 +33766,51 @@ async def _record_bug_rca_runtime_blocker_attempt(
         "phase": phase_name,
         "context": context,
         "blocked_before_product_repair": True,
+        "runtime_workspace_evidence": runtime_workspace_evidence,
+        "pre_grant_infra_retryable": pre_grant_retryable,
+        "pre_grant_infra_retry_consumed": pre_grant_retry_consumed,
+        "pre_grant_retry_marker_key": pre_grant_retry_marker_key,
     }
     await runner.artifacts.put(
         f"bug-rca-runtime-failure:{source}:{bug_id}",
         json.dumps(blocker_payload, sort_keys=True),
         feature=feature,
     )
+    should_retry_dispatch = str(blocker_payload.get("route") or "") == "retry_dispatch"
+    if pre_grant_retryable:
+        await runner.artifacts.put(
+            pre_grant_retry_marker_key,
+            json.dumps(
+                {
+                    "source": source,
+                    "context": context,
+                    "bug_id": bug_id,
+                    "attempt_number": attempt_number,
+                    "consumed": True,
+                    "reason": "pre-grant RCA sandbox authority failure",
+                    "runtime_workspace_evidence": runtime_workspace_evidence,
+                },
+                sort_keys=True,
+            ),
+            feature=feature,
+        )
+    if should_retry_dispatch:
+        return BugFixAttempt(
+            bug_id=bug_id,
+            source_verdict=source,
+            description=verdict_text,
+            root_cause=(
+                "RCA runtime failed before root cause analysis completed, and "
+                "typed runtime routing scheduled an infrastructure retry."
+            ),
+            fix_applied=(
+                "Infrastructure retry scheduled for the RCA runtime lane. No "
+                "product patch was promoted."
+            ),
+            files_modified=[],
+            re_verify_result="INFRA_RETRY",
+            attempt_number=attempt_number,
+        )
     await runner.artifacts.put(
         f"workflow-blocker:bug-rca:{source}:{bug_id}",
         json.dumps(blocker_payload, sort_keys=True),
@@ -32459,29 +33950,51 @@ async def _diagnose_and_fix(
         len(triage.groups), len(verdict.concerns) + len(verdict.gaps), source,
     )
 
-    # 2. Parallel RCA: one per group (read-only, always safe in parallel)
-    rca_tasks = [
-        Ask(
-            actor=_make_parallel_actor(
-                root_cause_analyst,
-                f"rca-{group.group_id}",
-                runtime=rca_runtime,
-            ),
-            prompt=(
-                f"## Bug Group: {group.group_id}\n\n"
-                f"### Likely Root Cause (from triage)\n{group.likely_root_cause}\n\n"
-                f"### Issues in this group\n{_extract_group_issues(verdict, group)}\n\n"
-                f"### Full Verdict Summary\n{verdict.summary}\n\n"
-                "Investigate the root cause of these specific issues. Read the "
-                "relevant code, trace the data flow, and identify the exact "
-                "point of failure. Propose a conceptual fix approach — do NOT "
-                "implement anything."
-                f"{prior_context}{workspace_hint}"
-            ),
-            output_type=RootCauseAnalysis,
+    # 2. Parallel RCA: one per group.
+    rca_tasks: list[Ask] = []
+    rca_diagnostic_bindings: list[RuntimeSandboxTaskBinding] = []
+    for group in triage.groups:
+        suffix = f"rca-{group.group_id}"
+        diagnostic_binding = await _bind_diagnostic_sandbox_if_needed(
+            runner,
+            feature,
+            base_actor=root_cause_analyst,
+            suffix=suffix,
+            runtime=rca_runtime,
+            workspace_path=str(feature_root) if feature_root else None,
+            feature_root=feature_root,
+            lane_id=f"{source}:{group.group_id}:diagnose-rca:{attempt_number}",
         )
-        for group in triage.groups
-    ]
+        if diagnostic_binding is not None:
+            rca_diagnostic_bindings.append(diagnostic_binding)
+        rca_tasks.append(
+            Ask(
+                actor=_make_parallel_actor(
+                    root_cause_analyst,
+                    suffix,
+                    runtime=rca_runtime,
+                    workspace_path=str(feature_root) if feature_root else None,
+                    runtime_workspace_binding=(
+                        diagnostic_binding.binding
+                        if diagnostic_binding is not None
+                        else None
+                    ),
+                    sandbox_required=diagnostic_binding is not None,
+                ),
+                prompt=(
+                    f"## Bug Group: {group.group_id}\n\n"
+                    f"### Likely Root Cause (from triage)\n{group.likely_root_cause}\n\n"
+                    f"### Issues in this group\n{_extract_group_issues(verdict, group)}\n\n"
+                    f"### Full Verdict Summary\n{verdict.summary}\n\n"
+                    "Investigate the root cause of these specific issues. Read the "
+                    "relevant code, trace the data flow, and identify the exact "
+                    "point of failure. Propose a conceptual fix approach — do NOT "
+                    "implement anything."
+                    f"{prior_context}{workspace_hint}"
+                ),
+                output_type=RootCauseAnalysis,
+            )
+        )
 
     try:
         if len(rca_tasks) == 1:
@@ -32489,6 +34002,9 @@ async def _diagnose_and_fix(
         else:
             rca_results = await runner.parallel(rca_tasks, feature)
     except Exception as exc:
+        for binding in rca_diagnostic_bindings:
+            with suppress(Exception):
+                await binding.runner.release(binding.lease, "retain")
         return [
             await _record_bug_rca_runtime_blocker_attempt(
                 runner,
@@ -32503,6 +34019,10 @@ async def _diagnose_and_fix(
                 verdict_text=verdict_text,
             )
         ]
+    else:
+        for binding in rca_diagnostic_bindings:
+            with suppress(Exception):
+                await binding.runner.release(binding.lease, "release")
 
     # Build group_id → RCA mapping
     group_rcas: list[tuple[str, RootCauseAnalysis]] = []
@@ -33023,6 +34543,280 @@ async def _diagnose_and_fix(
     )
 
 
+_RUNTIME_AUTHORITY_GRANT_SCHEMA_VERSION = "runtime-workspace-authority-grant-v1"
+_RCA_SANDBOX_AUTHORITY_FAILURE_MARKERS = (
+    "sandbox-permissions",
+    "sandbox permissions",
+    "permission denied",
+    "eacces",
+    "eperm",
+    "cannot be written",
+    "can't be written",
+    "read-only",
+    "read only",
+    "writable_roots",
+    "write roots",
+    "missing parent",
+    "materialized_create_parents",
+    "write_guard_roots",
+    "session-env",
+)
+
+
+def _rca_runtime_failure_mentions_sandbox_authority(exc: Exception) -> bool:
+    text = f"{type(exc).__name__}: {exc}".lower()
+    return any(marker in text for marker in _RCA_SANDBOX_AUTHORITY_FAILURE_MARKERS)
+
+
+def _rca_json_mapping(path: Path) -> dict[str, Any]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _rca_mapping_path(value: Any) -> Path | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    path = Path(text).expanduser()
+    return path if path.exists() and path.is_file() else None
+
+
+def _rca_job_role(job: Mapping[str, Any]) -> Mapping[str, Any]:
+    role = job.get("role")
+    return role if isinstance(role, Mapping) else {}
+
+
+def _rca_job_role_metadata(job: Mapping[str, Any]) -> Mapping[str, Any]:
+    metadata = _rca_job_role(job).get("metadata")
+    return metadata if isinstance(metadata, Mapping) else {}
+
+
+def _rca_job_binding(job: Mapping[str, Any]) -> dict[str, Any]:
+    for candidate in (
+        job.get("runtime_workspace_binding"),
+        _rca_job_role_metadata(job).get("runtime_workspace_binding"),
+    ):
+        if isinstance(candidate, Mapping):
+            return dict(candidate)
+    return {}
+
+
+def _rca_first_non_empty(*values: Any) -> Any:
+    for value in values:
+        if value not in (None, "", [], {}):
+            return value
+    return None
+
+
+def _rca_list(value: Any) -> list[Any]:
+    return list(value) if isinstance(value, list) else []
+
+
+def _rca_prompt_matches(
+    job: Mapping[str, Any],
+    *,
+    bug_id: str,
+    source: str,
+    context: str,
+    exc_text: str,
+) -> tuple[bool, str]:
+    role_name = str(_rca_job_role(job).get("name") or "")
+    role_is_rca = "root-cause" in role_name or "rca" in role_name.lower()
+    haystacks = [
+        json.dumps(job, sort_keys=True, default=str)[:80_000],
+        exc_text,
+    ]
+    prompt_path = _rca_mapping_path((job.get("paths") or {}).get("prompt") if isinstance(job.get("paths"), Mapping) else None)
+    if prompt_path is not None:
+        try:
+            haystacks.append(prompt_path.read_text(encoding="utf-8")[:200_000])
+        except Exception:
+            pass
+    combined = "\n".join(haystacks)
+    if bug_id and bug_id in combined:
+        return True, "bug_id"
+    if context and source and context in combined and source in combined and role_is_rca:
+        return True, "source_context_role"
+    if role_is_rca and "sandbox" in combined.lower() and "permission" in combined.lower():
+        return True, "rca_sandbox_permission"
+    return False, ""
+
+
+def _rca_workspace_authority_job_evidence(
+    path: Path,
+    job: Mapping[str, Any],
+) -> dict[str, Any]:
+    binding = _rca_job_binding(job)
+    manifest_path = _rca_mapping_path(
+        _rca_first_non_empty(
+            binding.get("manifest_path"),
+            job.get("manifest_path"),
+        )
+    )
+    manifest = _rca_json_mapping(manifest_path) if manifest_path is not None else {}
+    manifest_binding = _rca_job_binding(manifest)
+    effective_binding = {**manifest_binding, **binding}
+    authority_schema_version = str(
+        _rca_first_non_empty(
+            effective_binding.get("authority_schema_version"),
+            job.get("authority_schema_version"),
+            manifest.get("authority_schema_version"),
+        )
+        or ""
+    )
+    authority_grant_digest = str(
+        _rca_first_non_empty(
+            effective_binding.get("runtime_workspace_authority_grant_digest"),
+            job.get("runtime_workspace_authority_grant_digest"),
+            manifest.get("runtime_workspace_authority_grant_digest"),
+        )
+        or ""
+    )
+    writable_roots = _rca_list(
+        _rca_first_non_empty(
+            effective_binding.get("writable_roots"),
+            job.get("writable_roots"),
+            manifest.get("writable_roots"),
+        )
+    )
+    write_guard_roots = _rca_list(
+        _rca_first_non_empty(
+            effective_binding.get("write_guard_roots"),
+            job.get("write_guard_roots"),
+            manifest.get("write_guard_roots"),
+        )
+    )
+    materialized_create_parents = _rca_list(
+        _rca_first_non_empty(
+            job.get("materialized_create_parents"),
+            manifest.get("materialized_create_parents"),
+        )
+    )
+    binding_present = bool(effective_binding)
+    leaf_only = bool(writable_roots) and not write_guard_roots and not materialized_create_parents
+    if authority_schema_version == _RUNTIME_AUTHORITY_GRANT_SCHEMA_VERSION and write_guard_roots:
+        classification = "grant_backed"
+    elif not binding_present or not authority_schema_version or leaf_only:
+        classification = "pre_grant"
+    else:
+        classification = "ambiguous"
+    return {
+        "job_path": str(path),
+        "job_id": str(job.get("id") or path.stem),
+        "profile": str(job.get("profile") or path.parent.name),
+        "status": str(job.get("status") or path.parent.parent.name),
+        "created_at": str(job.get("created_at") or ""),
+        "cwd": str(job.get("cwd") or ""),
+        "role_name": str(_rca_job_role(job).get("name") or ""),
+        "binding_present": binding_present,
+        "manifest_path": str(manifest_path) if manifest_path is not None else "",
+        "manifest_present": bool(manifest),
+        "authority_schema_version": authority_schema_version,
+        "authority_grant_digest": authority_grant_digest,
+        "write_guard_roots": [str(item) for item in write_guard_roots],
+        "writable_roots": [str(item) for item in writable_roots],
+        "materialized_create_parents": materialized_create_parents,
+        "leaf_only_writable_roots": leaf_only,
+        "classification": classification,
+    }
+
+
+def _rca_claude_pool_root() -> Path:
+    return Path(os.environ.get("IRIAI_CLAUDE_POOL_ROOT", "/Users/Shared/iriai/claude-pool"))
+
+
+def _rca_runtime_workspace_failure_evidence(
+    *,
+    bug_id: str,
+    source: str,
+    context: str,
+    exc: Exception,
+) -> dict[str, Any]:
+    exc_text = f"{type(exc).__name__}: {exc}"
+    evidence: dict[str, Any] = {
+        "classification": "missing",
+        "failure_mentions_sandbox_authority": _rca_runtime_failure_mentions_sandbox_authority(exc),
+        "claude_pool_root": str(_rca_claude_pool_root()),
+        "matched_jobs": [],
+    }
+    root = _rca_claude_pool_root()
+    jobs_root = root / "jobs"
+    if not jobs_root.exists():
+        evidence["missing_reason"] = "claude_pool_jobs_root_missing"
+        return evidence
+    candidates = sorted(
+        jobs_root.glob("*/*/*.json"),
+        key=lambda path: path.stat().st_mtime if path.exists() else 0,
+        reverse=True,
+    )
+    for path in candidates[:750]:
+        job = _rca_json_mapping(path)
+        if not job:
+            continue
+        matched, reason = _rca_prompt_matches(
+            job,
+            bug_id=bug_id,
+            source=source,
+            context=context,
+            exc_text=exc_text,
+        )
+        if not matched:
+            continue
+        item = _rca_workspace_authority_job_evidence(path, job)
+        item["match_reason"] = reason
+        evidence["matched_jobs"].append(item)
+        if len(evidence["matched_jobs"]) >= 3:
+            break
+    matched_jobs = evidence["matched_jobs"]
+    if matched_jobs:
+        classifications = [
+            str(item.get("classification") or "")
+            for item in matched_jobs
+            if isinstance(item, Mapping)
+        ]
+        if "grant_backed" in classifications:
+            evidence["classification"] = "grant_backed"
+        elif "pre_grant" in classifications:
+            evidence["classification"] = "pre_grant"
+        else:
+            evidence["classification"] = "ambiguous"
+    return evidence
+
+
+def _rca_runtime_failure_is_pre_grant_sandbox_authority_failure(
+    evidence: Mapping[str, Any],
+) -> bool:
+    return (
+        bool(evidence.get("failure_mentions_sandbox_authority"))
+        and str(evidence.get("classification") or "") == "pre_grant"
+        and bool(evidence.get("matched_jobs"))
+    )
+
+
+async def _rca_pre_grant_retry_consumed(
+    runner: WorkflowRunner,
+    feature: Feature,
+    marker_key: str,
+) -> bool:
+    getter = getattr(getattr(runner, "artifacts", None), "get", None)
+    if not callable(getter):
+        return False
+    try:
+        raw = await getter(marker_key, feature=feature)
+    except Exception:
+        return False
+    if not raw:
+        return False
+    try:
+        payload = json.loads(str(raw))
+    except Exception:
+        return True
+    return bool(payload.get("consumed", True))
+
+
 async def _bind_post_dag_product_repair_sandbox(
     runner: WorkflowRunner,
     feature: Feature,
@@ -33279,28 +35073,57 @@ async def _single_rca_fix_verify(
 
     # 1. Root Cause Analysis
     try:
-        rca: RootCauseAnalysis = await runner.run(
-            Ask(
-                actor=actor_builder(
-                    root_cause_analyst,
-                    f"rca-{bug_id}",
-                    runtime=rca_runtime,
-                    workspace_path=str(feature_root) if feature_root else None,
+        if actor_factory is None:
+            async with _diagnostic_actor_context(
+                runner,
+                feature,
+                base_actor=root_cause_analyst,
+                suffix=f"rca-{bug_id}",
+                runtime=rca_runtime,
+                workspace_path=str(feature_root) if feature_root else None,
+                feature_root=feature_root,
+                lane_id=f"{source}:{bug_id}:bug-rca:{attempt_number}",
+            ) as rca_actor:
+                rca: RootCauseAnalysis = await runner.run(
+                    Ask(
+                        actor=rca_actor,
+                        prompt=(
+                            f"## Bug Report: {bug_id}\n\n"
+                            f"### Failure Source: {source}\n\n"
+                            f"### Verdict\n\n{verdict_text}\n\n"
+                            "Investigate the root cause of this failure. Read the relevant "
+                            "code, trace the data flow, and identify the exact point of failure. "
+                            "Propose a conceptual fix approach — do NOT implement anything."
+                            f"{prior_context}"
+                        ),
+                        output_type=RootCauseAnalysis,
+                    ),
+                    feature,
+                    phase_name=phase_name,
+                )
+        else:
+            rca = await runner.run(
+                Ask(
+                    actor=actor_builder(
+                        root_cause_analyst,
+                        f"rca-{bug_id}",
+                        runtime=rca_runtime,
+                        workspace_path=str(feature_root) if feature_root else None,
+                    ),
+                    prompt=(
+                        f"## Bug Report: {bug_id}\n\n"
+                        f"### Failure Source: {source}\n\n"
+                        f"### Verdict\n\n{verdict_text}\n\n"
+                        "Investigate the root cause of this failure. Read the relevant "
+                        "code, trace the data flow, and identify the exact point of failure. "
+                        "Propose a conceptual fix approach — do NOT implement anything."
+                        f"{prior_context}"
+                    ),
+                    output_type=RootCauseAnalysis,
                 ),
-                prompt=(
-                    f"## Bug Report: {bug_id}\n\n"
-                    f"### Failure Source: {source}\n\n"
-                    f"### Verdict\n\n{verdict_text}\n\n"
-                    "Investigate the root cause of this failure. Read the relevant "
-                    "code, trace the data flow, and identify the exact point of failure. "
-                    "Propose a conceptual fix approach — do NOT implement anything."
-                    f"{prior_context}"
-                ),
-                output_type=RootCauseAnalysis,
-            ),
-            feature,
-            phase_name=phase_name,
-        )
+                feature,
+                phase_name=phase_name,
+            )
     except Exception as exc:
         return await _record_bug_rca_runtime_blocker_attempt(
             runner,

@@ -39,7 +39,10 @@ _PATH_PARAMS: dict[str, str] = {
 _RUNTIME_WORKSPACE_BINDING_KEY = "runtime_workspace_binding"
 _DEFAULT_CLAUDE_MODEL = "claude-opus-4-8"
 _DEFAULT_CLAUDE_EFFORT = "high"
-_OPUS_4_8_EFFORT = "xhigh"
+_OPUS_4_8_EFFORT = "high"
+_CLAUDE_CLI_EFFORT_ALIASES = {
+    "xhigh": "high",
+}
 
 
 def _default_effort_for_model(model: Any) -> str:
@@ -51,7 +54,9 @@ def _default_effort_for_model(model: Any) -> str:
 def _resolve_model_and_effort(role: Any) -> tuple[str, str]:
     model = str(getattr(role, "model", None) or "").strip() or _DEFAULT_CLAUDE_MODEL
     effort = getattr(role, "effort", None)
-    return model, str(effort) if effort is not None else _default_effort_for_model(model)
+    raw_effort = str(effort) if effort is not None else _default_effort_for_model(model)
+    normalized_effort = raw_effort.strip().lower()
+    return model, _CLAUDE_CLI_EFFORT_ALIASES.get(normalized_effort, normalized_effort)
 
 
 def _as_string_list(value: Any) -> list[str]:

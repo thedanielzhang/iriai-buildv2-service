@@ -13,6 +13,7 @@ import logging
 import os
 from pathlib import Path
 import re
+import signal
 import sys
 import time
 from datetime import datetime, timezone
@@ -197,6 +198,16 @@ class BridgeManager:
         self._append_line(f"{time.strftime('%H:%M:%S')} --- RESTARTING BRIDGE ---")
         await self.stop()
         await self.start()
+
+    async def request_resume(self) -> dict:
+        if not self.process or self.process.returncode is not None:
+            raise RuntimeError("Bridge is not running; restart it before requesting resume")
+        sigusr1 = getattr(signal, "SIGUSR1", None)
+        if sigusr1 is None:
+            raise RuntimeError("Resume signal is not supported on this platform")
+        os.kill(self.process.pid, sigusr1)
+        self._append_line(f"{time.strftime('%H:%M:%S')} --- REQUESTED BRIDGE RESUME ---")
+        return {**self.status(), "resume_requested": True}
 
     async def _read_output(self) -> None:
         assert self.process and self.process.stdout
@@ -4273,6 +4284,16 @@ async def bridge_restart():
         raise HTTPException(404, "Bridge not configured (missing --bridge-channel)")
     await bridge.restart()
     return bridge.status()
+
+
+@app.post("/api/bridge/resume")
+async def bridge_resume():
+    if not bridge:
+        raise HTTPException(404, "Bridge not configured (missing --bridge-channel)")
+    try:
+        return await bridge.request_resume()
+    except RuntimeError as exc:
+        raise HTTPException(409, str(exc)) from exc
 
 
 @app.get("/api/bridge/logs")

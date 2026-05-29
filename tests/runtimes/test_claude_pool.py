@@ -25,8 +25,11 @@ from iriai_build_v2.runtimes.claude_pool import (
     _job_state_path,
     _pool_write_auth_secret,
     _payload_dir,
+    _profile_runtime_scratch_roots,
+    _stable_json_digest,
     _write_sandbox_exec_profile,
     _write_json_atomic,
+    find_late_completed_claude_pool_job,
     load_profiles,
 )
 
@@ -120,6 +123,121 @@ def _write_sandbox_manifest(
     return manifest_path
 
 
+def _authority_grant(
+    repo_root: Path,
+    *,
+    grant_type: str = "product",
+    write_guard_roots: list[Path] | None = None,
+    contract_roots: list[Path] | None = None,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "schema_version": "runtime-workspace-authority-grant-v1",
+        "feature_id": "feat-1",
+        "group_idx": 1,
+        "lane_id": "test-lane",
+        "grant_type": grant_type,
+        "repo_id": "app",
+        "repo_root": str(repo_root),
+        "contract_roots": [
+            str(path) for path in (contract_roots if contract_roots is not None else [repo_root])
+        ],
+        "create_parent_roots": [],
+        "write_guard_roots": [
+            str(path) for path in (write_guard_roots if write_guard_roots is not None else [repo_root])
+        ],
+        "promotable": grant_type != "diagnostic",
+        "contract_ids": [44],
+        "expires_at": (datetime.now(UTC) + timedelta(hours=1)).isoformat(),
+    }
+    payload["grant_digest"] = _stable_json_digest(payload)
+    return payload
+
+
+def _attach_authority(
+    manifest: dict[str, object],
+    repo_root: Path,
+    *,
+    grant_type: str = "product",
+    write_guard_roots: list[Path] | None = None,
+    contract_roots: list[Path] | None = None,
+) -> dict[str, object]:
+    grant = _authority_grant(
+        repo_root,
+        grant_type=grant_type,
+        write_guard_roots=write_guard_roots,
+        contract_roots=contract_roots,
+    )
+    grants = [grant]
+    binding = dict(manifest.get("runtime_workspace_binding") or {})
+    binding.update({
+        "authority_schema_version": "runtime-workspace-authority-grant-v1",
+        "runtime_workspace_authority_grants": grants,
+        "runtime_workspace_authority_grant_digest": _stable_json_digest(grants),
+        "promotable": grant_type != "diagnostic",
+    })
+    manifest.update({
+        "authority_schema_version": "runtime-workspace-authority-grant-v1",
+        "runtime_workspace_authority_grants": grants,
+        "runtime_workspace_authority_grant_digest": _stable_json_digest(grants),
+        "promotable": grant_type != "diagnostic",
+        "runtime_workspace_binding": binding,
+    })
+    return manifest
+
+
+def _authority_binding_fields(
+    repo_root: Path,
+    *,
+    grant_type: str = "product",
+    write_guard_roots: list[Path] | None = None,
+    contract_roots: list[Path] | None = None,
+) -> dict[str, object]:
+    grant = _authority_grant(
+        repo_root,
+        grant_type=grant_type,
+        write_guard_roots=write_guard_roots,
+        contract_roots=contract_roots,
+    )
+    grants = [grant]
+    return {
+        "write_guard_roots": [
+            str(path) for path in (
+                write_guard_roots if write_guard_roots is not None else [repo_root]
+            )
+        ],
+        "write_guard_scope": "diagnostic" if grant_type == "diagnostic" else "contract",
+        "authority_schema_version": "runtime-workspace-authority-grant-v1",
+        "runtime_workspace_authority_grants": grants,
+        "runtime_workspace_authority_grant_digest": _stable_json_digest(grants),
+        "promotable": grant_type != "diagnostic",
+    }
+
+
+def test_pool_write_auth_secret_is_group_readable(tmp_path: Path) -> None:
+    secret = _pool_write_auth_secret(tmp_path)
+
+    assert secret
+    mode = (tmp_path / "runtime-write-auth.secret").stat().st_mode & 0o777
+    assert mode == 0o640
+
+
+def test_pool_write_auth_secret_reads_existing_secret_when_chmod_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    secret_path = tmp_path / "runtime-write-auth.secret"
+    secret_path.write_text("existing-secret\n", encoding="utf-8")
+    secret_path.chmod(0o640)
+
+    def _deny_chmod(self: Path, mode: int) -> None:
+        del self, mode
+        raise PermissionError("permission denied")
+
+    monkeypatch.setattr(Path, "chmod", _deny_chmod)
+
+    assert _pool_write_auth_secret(tmp_path) == "existing-secret"
+
+
 @pytest.mark.asyncio
 async def test_round_robin_assigns_ephemeral_jobs_evenly(tmp_path: Path):
     runtime = ClaudePoolRuntime(root=tmp_path, profiles=_profiles())
@@ -154,8 +272,15 @@ async def test_weighted_selection_sends_most_work_to_profile_two(tmp_path: Path)
 
 def test_known_profiles_load_default_capacity_weights():
     assert _coerce_profile({"name": "iriai-claude-1"}).weight == 1
-    assert _coerce_profile({"name": "iriai-claude-2"}).weight == 9
+    assert _coerce_profile({"name": "iriai-claude-2"}).weight == 1
     assert _coerce_profile({"name": "iriai-claude-3"}).weight == 1
+
+
+def test_load_profiles_defaults_to_single_active_profile(tmp_path: Path):
+    profiles = load_profiles(tmp_path)
+
+    assert [profile.name for profile in profiles] == ["iriai-claude-1"]
+    assert [profile.weight for profile in profiles] == [1.0]
 
 
 def test_load_profiles_migrates_legacy_default_capacity_profile_set(tmp_path: Path):
@@ -175,7 +300,6 @@ def test_load_profiles_migrates_legacy_default_capacity_profile_set(tmp_path: Pa
 
     assert weights == {
         "iriai-claude-1": 1,
-        "iriai-claude-2": 9,
     }
     stored = json.loads((tmp_path / "profiles.json").read_text(encoding="utf-8"))
     stored_weights = {
@@ -184,8 +308,90 @@ def test_load_profiles_migrates_legacy_default_capacity_profile_set(tmp_path: Pa
     }
     assert stored_weights == {
         "iriai-claude-1": 1,
-        "iriai-claude-2": 9,
     }
+
+
+def test_load_profiles_migrates_deprecated_two_profile_default(tmp_path: Path):
+    _write_json_atomic(
+        tmp_path / "profiles.json",
+        {
+            "profiles": [
+                {"name": "iriai-claude-1", "user": "iriai-claude-1", "weight": 1},
+                {"name": "iriai-claude-2", "user": "iriai-claude-2", "weight": 9},
+            ]
+        },
+    )
+
+    profiles = load_profiles(tmp_path)
+
+    assert [profile.name for profile in profiles] == ["iriai-claude-1"]
+    stored = json.loads((tmp_path / "profiles.json").read_text(encoding="utf-8"))
+    assert [profile["name"] for profile in stored["profiles"]] == ["iriai-claude-1"]
+
+
+def test_load_profiles_preserves_custom_explicit_profile_set(tmp_path: Path):
+    _write_json_atomic(
+        tmp_path / "profiles.json",
+        {
+            "profiles": [
+                {"name": "iriai-claude-1", "user": "iriai-claude-1", "weight": 1},
+                {
+                    "name": "custom-claude",
+                    "user": "iriai-claude-2",
+                    "claude_command": "/bin/echo",
+                    "weight": 2,
+                },
+            ]
+        },
+    )
+
+    profiles = load_profiles(tmp_path)
+
+    assert [profile.name for profile in profiles] == ["iriai-claude-1", "custom-claude"]
+    assert profiles[1].claude_command == "/bin/echo"
+
+
+@pytest.mark.asyncio
+async def test_removed_profiles_are_pruned_from_state_and_affinity(tmp_path: Path):
+    _write_json_atomic(
+        tmp_path / "profile_state.json",
+        {
+            "profiles": {
+                "iriai-claude-1": {"status": "unavailable", "probe_after": "2000-01-01T00:00:00+00:00"},
+                "iriai-claude-2": {"status": "unavailable", "probe_after": "2999-01-01T00:00:00+00:00"},
+            }
+        },
+    )
+    _write_json_atomic(
+        tmp_path / "affinity.json",
+        {
+            "next_index": 1,
+            "profile_weights": {"iriai-claude-1": 1.0, "iriai-claude-2": 9.0},
+            "profile_dispatch_counts": {"iriai-claude-2": 15},
+            "session_profiles": {"lead:feature": "iriai-claude-2"},
+        },
+    )
+    runtime = ClaudePoolRuntime(
+        root=tmp_path,
+        profiles=[
+            ClaudePoolProfile(
+                name="iriai-claude-1",
+                user="iriai-claude-1",
+                claude_command="/bin/echo",
+            )
+        ],
+    )
+    runtime._clear_profile_unavailable("iriai-claude-1")
+
+    picked = await runtime._select_profile(session_key="lead:feature", persistent=True)
+
+    state = json.loads((tmp_path / "profile_state.json").read_text(encoding="utf-8"))
+    affinity = json.loads((tmp_path / "affinity.json").read_text(encoding="utf-8"))
+    assert picked.name == "iriai-claude-1"
+    assert "iriai-claude-2" not in state["profiles"]
+    assert affinity["profile_weights"] == {"iriai-claude-1": 1.0}
+    assert "iriai-claude-2" not in affinity["profile_dispatch_counts"]
+    assert affinity["session_profiles"] == {"lead:feature": "iriai-claude-1"}
 
 
 @pytest.mark.asyncio
@@ -474,7 +680,7 @@ async def test_bound_pool_manifest_includes_runtime_binding_fields(tmp_path: Pat
 
     manifest = json.loads(queued[0].read_text(encoding="utf-8"))
     assert manifest["role"]["model"] == "claude-opus-4-8"
-    assert manifest["role"]["effort"] == "xhigh"
+    assert manifest["role"]["effort"] == "high"
     assert manifest["runtime_workspace_binding"]["sandbox_id"] == "sandbox-04"
     assert manifest["sandbox_id"] == "sandbox-04"
     assert manifest["repo_roots"] == [str(cwd / "repo")]
@@ -529,6 +735,321 @@ def test_bound_pool_sandbox_profile_excludes_global_temp_roots(tmp_path: Path):
     assert str(result_path.parent) in profile
 
 
+def test_bound_pool_sandbox_profile_includes_profile_session_scratch_root(
+    tmp_path: Path,
+) -> None:
+    cwd = tmp_path / "sandbox"
+    cwd.mkdir()
+    profile_path = tmp_path / "payload" / "sandbox.sb"
+    scratch_root = tmp_path / "home" / ".claude" / "session-env"
+    manifest = {
+        "cwd": str(cwd),
+        "paths": {
+            "prompt": str(tmp_path / "payload" / "prompt.txt"),
+            "result": str(tmp_path / "payload" / "result.json"),
+            "sandbox_profile": str(profile_path),
+        },
+        "runtime_scratch_roots": [str(scratch_root)],
+        "runtime_workspace_binding": {
+            "writable_roots": [str(cwd)],
+        },
+    }
+
+    written = _write_sandbox_exec_profile(manifest)
+
+    profile = written.read_text(encoding="utf-8")
+    assert str(cwd) in profile
+    assert str(scratch_root) in profile
+
+
+def test_product_write_guard_uses_contract_roots_not_repo_cwd(tmp_path: Path) -> None:
+    cwd = tmp_path / "sandbox"
+    allowed_parent = cwd / "src/vs/workbench/contrib/workflowTab/views/implementation"
+    allowed_parent.mkdir(parents=True)
+    profile_path = tmp_path / "payload" / "sandbox.sb"
+    manifest = {
+        "cwd": str(cwd),
+        "paths": {
+            "prompt": str(tmp_path / "payload" / "prompt.txt"),
+            "result": str(tmp_path / "payload" / "result.json"),
+            "sandbox_profile": str(profile_path),
+        },
+        "runtime_workspace_binding": {
+            "writable_roots": [str(allowed_parent / "index.ts")],
+            "write_guard_roots": [str(allowed_parent)],
+            "write_guard_scope": "contract",
+        },
+    }
+
+    written = _write_sandbox_exec_profile(manifest)
+
+    profile = written.read_text(encoding="utf-8")
+    assert f'(subpath "{cwd}")' not in profile
+    assert f'(subpath "{allowed_parent}")' in profile
+
+
+def test_bound_write_authorization_covers_runtime_scratch_roots(
+    tmp_path: Path,
+) -> None:
+    manifest = {
+        "id": "job",
+        "created_at": datetime.now(UTC).isoformat(),
+        "cwd": str(tmp_path / "sandbox"),
+        "paths": {"prompt": str(tmp_path / "prompt.md")},
+        "runtime_scratch_roots": [str(tmp_path / "home" / ".claude" / "session-env")],
+        "runtime_workspace_binding": {
+            "sandbox_id": "sandbox-04",
+            "cwd": str(tmp_path / "sandbox"),
+            "workspace_override": str(tmp_path / "sandbox"),
+            "repo_roots": {"app": str(tmp_path / "sandbox")},
+            "writable_roots": [str(tmp_path / "sandbox")],
+            "blocked_roots": [],
+            "contract_ids": [44],
+            "manifest_path": str(tmp_path / "sandbox-manifest.json"),
+            "expires_at": (datetime.now(UTC) + timedelta(hours=1)).isoformat(),
+            "runtime": "claude_pool",
+        },
+    }
+    tampered = {
+        **manifest,
+        "runtime_scratch_roots": [str(tmp_path / "other-home" / ".claude" / "session-env")],
+    }
+
+    assert _bound_write_authorization(manifest, "secret") != _bound_write_authorization(
+        tampered,
+        "secret",
+    )
+
+
+def test_bound_write_authorization_covers_write_guard_scope(
+    tmp_path: Path,
+) -> None:
+    manifest = {
+        "id": "job",
+        "created_at": datetime.now(UTC).isoformat(),
+        "cwd": str(tmp_path / "sandbox"),
+        "paths": {"prompt": str(tmp_path / "prompt.md")},
+        "runtime_workspace_binding": {
+            "sandbox_id": "sandbox-04",
+            "cwd": str(tmp_path / "sandbox"),
+            "workspace_override": str(tmp_path / "sandbox"),
+            "repo_roots": {"app": str(tmp_path / "sandbox")},
+            "writable_roots": [str(tmp_path / "sandbox" / "src" / "index.ts")],
+            "write_guard_roots": [str(tmp_path / "sandbox" / "src")],
+            "write_guard_scope": "contract",
+            "blocked_roots": [],
+            "contract_ids": [44],
+            "manifest_path": str(tmp_path / "sandbox-manifest.json"),
+            "expires_at": (datetime.now(UTC) + timedelta(hours=1)).isoformat(),
+            "runtime": "claude_pool",
+        },
+    }
+    tampered = {
+        **manifest,
+        "runtime_workspace_binding": {
+            **manifest["runtime_workspace_binding"],
+            "write_guard_scope": "diagnostic",
+        },
+    }
+
+    assert _bound_write_authorization(manifest, "secret") != _bound_write_authorization(
+        tampered,
+        "secret",
+    )
+
+
+def test_bound_write_authorization_covers_authority_grant_digest(
+    tmp_path: Path,
+) -> None:
+    repo_root = tmp_path / "sandbox"
+    manifest = _attach_authority(
+        {
+            "id": "job",
+            "created_at": datetime.now(UTC).isoformat(),
+            "cwd": str(repo_root),
+            "paths": {"prompt": str(tmp_path / "prompt.md")},
+            "runtime_workspace_binding": {
+                "sandbox_id": "sandbox-04",
+                "cwd": str(repo_root),
+                "workspace_override": str(repo_root),
+                "repo_roots": {"app": str(repo_root)},
+                "writable_roots": [str(repo_root / "src" / "index.ts")],
+                "write_guard_roots": [str(repo_root / "src")],
+                "write_guard_scope": "contract",
+                "blocked_roots": [],
+                "contract_ids": [44],
+                "manifest_path": str(repo_root / "sandbox-manifest.json"),
+                "expires_at": (datetime.now(UTC) + timedelta(hours=1)).isoformat(),
+                "runtime": "claude_pool",
+            },
+        },
+        repo_root,
+        write_guard_roots=[repo_root / "src"],
+        contract_roots=[repo_root / "src" / "index.ts"],
+    )
+    tampered = {
+        **manifest,
+        "runtime_workspace_binding": {
+            **manifest["runtime_workspace_binding"],
+            "runtime_workspace_authority_grant_digest": "tampered",
+        },
+    }
+
+    assert _bound_write_authorization(manifest, "secret") != _bound_write_authorization(
+        tampered,
+        "secret",
+    )
+
+
+@pytest.mark.asyncio
+async def test_bound_pool_worker_requires_authority_grant_for_write_role(
+    tmp_path: Path,
+) -> None:
+    runner = ClaudePoolRunner(profile="iriai-claude-1", root=tmp_path)
+    cwd = tmp_path / "sandbox"
+    cwd.mkdir()
+    manifest_path = _write_sandbox_manifest(cwd, cwd)
+    manifest = {
+        "id": "job",
+        "kind": "claude",
+        "created_at": datetime.now(UTC).isoformat(),
+        "cwd": str(cwd),
+        "role": {"name": "fake", "tools": ["Read", "Write"]},
+        "runtime_workspace_binding": {
+            "sandbox_id": "sandbox-04",
+            "cwd": str(cwd),
+            "workspace_override": str(cwd),
+            "repo_roots": {"app": str(cwd)},
+            "writable_roots": [str(cwd)],
+            "write_guard_roots": [str(cwd)],
+            "write_guard_scope": "contract",
+            "blocked_roots": [],
+            "contract_ids": [44],
+            "manifest_path": str(manifest_path),
+            "expires_at": (datetime.now(UTC) + timedelta(hours=1)).isoformat(),
+            "runtime": "claude_pool",
+        },
+        "runtime_workspace_write_authorized": True,
+        "runtime_workspace_write_guard": "sandbox_exec",
+        "paths": {
+            "prompt": str(tmp_path / "prompt.md"),
+            "sandbox_profile": str(tmp_path / "sandbox-exec.sb"),
+        },
+    }
+    manifest["runtime_workspace_write_authorization"] = _bound_write_authorization(
+        manifest,
+        _pool_write_auth_secret(tmp_path),
+    )
+
+    with pytest.raises(RuntimeError, match="authority grant"):
+        await runner._execute_claude(manifest)
+
+
+@pytest.mark.asyncio
+async def test_bound_pool_worker_rejects_write_guard_grant_mismatch(
+    tmp_path: Path,
+) -> None:
+    runner = ClaudePoolRunner(profile="iriai-claude-1", root=tmp_path)
+    cwd = tmp_path / "sandbox"
+    (cwd / "src").mkdir(parents=True)
+    (cwd / "other").mkdir()
+    manifest_path = _write_sandbox_manifest(
+        cwd,
+        cwd,
+        writable_roots=[cwd / "src" / "index.ts"],
+    )
+    manifest = {
+        "id": "job",
+        "kind": "claude",
+        "created_at": datetime.now(UTC).isoformat(),
+        "cwd": str(cwd),
+        "role": {"name": "fake", "tools": ["Read", "Write"]},
+        "runtime_workspace_binding": {
+            "sandbox_id": "sandbox-04",
+            "cwd": str(cwd),
+            "workspace_override": str(cwd),
+            "repo_roots": {"app": str(cwd)},
+            "writable_roots": [str(cwd / "src" / "index.ts")],
+            "write_guard_roots": [str(cwd / "other")],
+            "write_guard_scope": "contract",
+            "blocked_roots": [],
+            "contract_ids": [44],
+            "manifest_path": str(manifest_path),
+            "expires_at": (datetime.now(UTC) + timedelta(hours=1)).isoformat(),
+            "runtime": "claude_pool",
+        },
+        "runtime_workspace_write_authorized": True,
+        "runtime_workspace_write_guard": "sandbox_exec",
+        "paths": {
+            "prompt": str(tmp_path / "prompt.md"),
+            "sandbox_profile": str(tmp_path / "sandbox-exec.sb"),
+        },
+    }
+    _attach_authority(
+        manifest,
+        cwd,
+        write_guard_roots=[cwd / "src"],
+        contract_roots=[cwd / "src" / "index.ts"],
+    )
+    manifest["runtime_workspace_write_authorization"] = _bound_write_authorization(
+        manifest,
+        _pool_write_auth_secret(tmp_path),
+    )
+
+    with pytest.raises(RuntimeError, match="write guard roots"):
+        await runner._execute_claude(manifest)
+
+
+@pytest.mark.asyncio
+async def test_disabled_runner_profile_refuses_to_claim_work(tmp_path: Path) -> None:
+    _write_json_atomic(
+        tmp_path / "profiles.json",
+        {
+            "profiles": [
+                {
+                    "name": "iriai-claude-1",
+                    "user": "iriai-claude-1",
+                    "claude_command": "/bin/echo",
+                },
+                {
+                    "name": "iriai-claude-2",
+                    "user": "iriai-claude-2",
+                    "claude_command": "/bin/echo",
+                },
+            ]
+        },
+    )
+    runner = _FakeClaudeRunner(profile="iriai-claude-2", root=tmp_path)
+    _write_json_atomic(
+        tmp_path / "profiles.json",
+        {
+            "profiles": [
+                {
+                    "name": "iriai-claude-1",
+                    "user": "iriai-claude-1",
+                    "claude_command": "/bin/echo",
+                }
+            ]
+        },
+    )
+    job_id = "disabled-job"
+    queued_path = _job_state_path(tmp_path, "queued", "iriai-claude-2", job_id)
+    _write_json_atomic(
+        queued_path,
+        {
+            "id": job_id,
+            "kind": "health",
+            "profile": "iriai-claude-2",
+            "status": "queued",
+        },
+    )
+
+    await runner.run_once()
+
+    assert queued_path.exists()
+    assert not _job_state_path(tmp_path, "running", "iriai-claude-2", job_id).exists()
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("tools", "metadata"),
@@ -564,6 +1085,7 @@ async def test_bound_pool_write_producing_role_submits_authorized_sandbox_job(
                 "manifest_path": str(manifest_path),
                 "expires_at": (datetime.now(UTC) + timedelta(hours=1)).isoformat(),
                 "runtime": "claude_pool",
+                **_authority_binding_fields(cwd),
             }
         },
     )
@@ -582,6 +1104,9 @@ async def test_bound_pool_write_producing_role_submits_authorized_sandbox_job(
     manifest = json.loads(queued[0].read_text(encoding="utf-8"))
     assert manifest["runtime_workspace_write_authorized"] is True
     assert manifest["runtime_workspace_write_guard"] == "sandbox_exec"
+    assert manifest["runtime_scratch_roots"] == [
+        str(path) for path in _profile_runtime_scratch_roots(profile)
+    ]
     assert manifest["runtime_workspace_write_authorization"] == _bound_write_authorization(
         manifest,
         _pool_write_auth_secret(tmp_path),
@@ -630,6 +1155,11 @@ async def test_bound_pool_write_role_accepts_file_level_writable_roots(
                 "manifest_path": str(manifest_path),
                 "expires_at": (datetime.now(UTC) + timedelta(hours=1)).isoformat(),
                 "runtime": "claude_pool",
+                **_authority_binding_fields(
+                    cwd,
+                    write_guard_roots=[writable_file.parent],
+                    contract_roots=[writable_file],
+                ),
             }
         },
     )
@@ -776,6 +1306,206 @@ def test_invocation_liveness_uses_running_job_heartbeat(tmp_path: Path):
     runtime._invocation_jobs["inv-1"] = {job_id}
 
     assert runtime.invocation_has_live_work("inv-1") is False
+
+
+@pytest.mark.asyncio
+async def test_pool_wait_allows_healthy_long_running_job_with_fresh_heartbeat(tmp_path: Path):
+    profile = _profiles()[0]
+    runtime = ClaudePoolRuntime(
+        root=tmp_path,
+        profiles=[profile],
+        poll_interval=0.005,
+        job_stale_timeout=0.5,
+        job_absolute_timeout=0,
+    )
+    role = Role(name="implementer", prompt="", metadata={})
+
+    async def complete_job() -> None:
+        queued_paths: list[Path] = []
+        while not queued_paths:
+            queued_paths = list((tmp_path / "jobs" / "queued" / profile.name).glob("*.json"))
+            await asyncio.sleep(0.005)
+        queued_path = queued_paths[0]
+        manifest = json.loads(queued_path.read_text(encoding="utf-8"))
+        running_path = _job_state_path(tmp_path, "running", profile.name, manifest["id"])
+        manifest.update({
+            "status": "running",
+            "claimed_at": "2000-01-01T00:00:00+00:00",
+            "heartbeat_at": datetime.now(UTC).isoformat(),
+            "updated_at": datetime.now(UTC).isoformat(),
+        })
+        _write_json_atomic(running_path, manifest)
+        queued_path.unlink()
+        await asyncio.sleep(0.03)
+        result_path = Path(manifest["paths"]["result"])
+        _write_json_atomic(
+            result_path,
+            {
+                "ok": True,
+                "result_text": "ok",
+                "structured_output": None,
+                "raw": {"result": "ok"},
+            },
+        )
+        done_path = _job_state_path(tmp_path, "done", profile.name, manifest["id"])
+        manifest.update({
+            "status": "done",
+            "finished_at": datetime.now(UTC).isoformat(),
+            "updated_at": datetime.now(UTC).isoformat(),
+        })
+        _write_json_atomic(running_path, manifest)
+        os.replace(running_path, done_path)
+
+    worker = asyncio.create_task(complete_job())
+    try:
+        final_text, structured, raw = await runtime._submit_and_wait(
+            role,
+            "Do work.",
+            output_type=None,
+            workspace=SimpleNamespace(path=tmp_path),
+            session_key="implementer:feat-1",
+            profile=profile,
+        )
+    finally:
+        await worker
+
+    assert final_text == "ok"
+    assert structured is None
+    assert raw == {"result": "ok"}
+
+
+@pytest.mark.asyncio
+async def test_pool_wait_fails_stale_running_job_heartbeat(tmp_path: Path):
+    profile = _profiles()[0]
+    runtime = ClaudePoolRuntime(
+        root=tmp_path,
+        profiles=[profile],
+        poll_interval=0.005,
+        job_stale_timeout=0.01,
+        job_absolute_timeout=0,
+    )
+    role = Role(name="implementer", prompt="", metadata={})
+
+    async def make_job_stale() -> None:
+        queued_paths: list[Path] = []
+        while not queued_paths:
+            queued_paths = list((tmp_path / "jobs" / "queued" / profile.name).glob("*.json"))
+            await asyncio.sleep(0.005)
+        queued_path = queued_paths[0]
+        manifest = json.loads(queued_path.read_text(encoding="utf-8"))
+        running_path = _job_state_path(tmp_path, "running", profile.name, manifest["id"])
+        manifest.update({
+            "status": "running",
+            "heartbeat_at": "2020-01-01T00:00:00+00:00",
+            "updated_at": "2020-01-01T00:00:00+00:00",
+        })
+        _write_json_atomic(running_path, manifest)
+        queued_path.unlink()
+
+    worker = asyncio.create_task(make_job_stale())
+    with pytest.raises(TimeoutError, match="heartbeat is stale"):
+        await runtime._submit_and_wait(
+            role,
+            "Do work.",
+            output_type=None,
+            workspace=SimpleNamespace(path=tmp_path),
+            session_key="implementer:feat-1",
+            profile=profile,
+        )
+    await worker
+
+
+def test_find_late_completed_pool_job_requires_matching_identity(tmp_path: Path):
+    profile = _profiles()[0]
+    runtime = ClaudePoolRuntime(root=tmp_path, profiles=[profile])
+    del runtime
+    job_id = "late123"
+    payload_dir = _payload_dir(tmp_path, job_id)
+    payload_dir.mkdir(parents=True)
+    schema = {"type": "object", "properties": {"task_id": {"type": "string"}}}
+    schema_digest = _stable_json_digest(schema)
+    schema_path = payload_dir / "schema.json"
+    schema_path.write_text(json.dumps(schema, sort_keys=True), encoding="utf-8")
+    result_path = payload_dir / "result.json"
+    _write_json_atomic(
+        result_path,
+        {
+            "ok": True,
+            "result_text": "{\"task_id\":\"TASK-late\",\"status\":\"completed\"}",
+            "structured_output": {"task_id": "TASK-late", "status": "completed"},
+            "raw": {"result": "ok"},
+        },
+    )
+    manifest = {
+        "id": job_id,
+        "kind": "claude",
+        "feature_id": "feat-late",
+        "status": "done",
+        "profile": profile.name,
+        "invocation_id": "invoke-late",
+        "dispatch_idempotency_key": "idem:late",
+        "runtime_workspace_binding": {
+            "attempt_id": 144,
+            "sandbox_id": "sandbox-late",
+            "role_metadata": {
+                "group_idx": 78,
+                "task_ids": ["TASK-late"],
+            },
+        },
+        "paths": {
+            "result": str(result_path),
+            "schema": str(schema_path),
+            "stdout": str(payload_dir / "stdout.json"),
+            "stderr": str(payload_dir / "stderr.log"),
+        },
+    }
+    _write_json_atomic(_job_state_path(tmp_path, "done", profile.name, job_id), manifest)
+
+    recovered = find_late_completed_claude_pool_job(
+        root=tmp_path,
+        feature_id="feat-late",
+        group_idx=78,
+        task_id="TASK-late",
+        attempt_id=144,
+        sandbox_id="sandbox-late",
+        invocation_id="invoke-late",
+        idempotency_key="idem:late",
+        output_schema_digest=schema_digest,
+    )
+
+    assert recovered is not None
+    assert recovered.job_id == job_id
+    assert recovered.structured_output["task_id"] == "TASK-late"
+    assert recovered.schema_digest_validation == "matched_schema_file"
+    recovered_by_alias = find_late_completed_claude_pool_job(
+        root=tmp_path,
+        feature_id="feat-late",
+        group_idx=78,
+        task_id="TASK-late",
+        attempt_id=144,
+        sandbox_id="dispatch-sandbox-late",
+        sandbox_ids=["dispatch-sandbox-late", "sandbox-late"],
+        invocation_id="invoke-late",
+        idempotency_key="idem:late",
+        output_schema_digest=schema_digest,
+    )
+
+    assert recovered_by_alias is not None
+    assert recovered_by_alias.job_id == job_id
+    assert (
+        find_late_completed_claude_pool_job(
+            root=tmp_path,
+            feature_id="feat-late",
+            group_idx=78,
+            task_id="TASK-other",
+            attempt_id=144,
+            sandbox_id="sandbox-late",
+            invocation_id="invoke-late",
+            idempotency_key="idem:late",
+            output_schema_digest=schema_digest,
+        )
+        is None
+    )
 
 
 def test_runner_builds_claude_cli_command_shape(tmp_path: Path):

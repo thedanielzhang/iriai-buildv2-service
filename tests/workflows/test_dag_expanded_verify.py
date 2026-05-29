@@ -5,12 +5,14 @@ import os
 import re
 import stat
 import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 from iriai_compose import Ask
 
+from iriai_build_v2.execution_control.atomic_landing import InFlightAdoptionRecord
 from iriai_build_v2.models.outputs import (
     ArtifactRepairResult,
     ArtifactRepairUpdate,
@@ -29,6 +31,26 @@ from iriai_build_v2.models.outputs import (
     Verdict,
 )
 from iriai_build_v2.workflows.develop.phases import implementation as implementation_module
+
+
+def _strict_adoption_marker(
+    feature,
+    *,
+    completed_range: tuple[int, int],
+    next_group: int,
+) -> str:
+    return InFlightAdoptionRecord(
+        feature_id=str(feature.id),
+        candidate_commit="candidate-commit",
+        deploy_artifact_id="deploy-artifact",
+        legacy_root_dag_artifact_id=42,
+        legacy_root_dag_sha256="f" * 64,
+        completed_checkpoint_range=completed_range,
+        next_effective_group_idx=next_group,
+        projection_digest="p" * 64,
+        adopted_at=datetime(2026, 5, 28, 12, 0, tzinfo=timezone.utc),
+        pre_adoption_baseline={"test": "sealed"},
+    ).model_dump_json()
 
 
 def test_dag_expanded_verify_env_defaults_on(monkeypatch):
@@ -5403,9 +5425,8 @@ async def test_single_rca_fix_verify_runtime_failure_records_typed_blocker():
         rca_runtime="primary",
     )
 
-    assert attempt.re_verify_result == "FAIL"
-    assert "SANDBOX_WORKFLOW_BLOCKER" in attempt.fix_applied
-    assert "RCA runtime failed before product repair dispatch" in attempt.fix_applied
+    assert attempt.re_verify_result == "INFRA_RETRY"
+    assert "SANDBOX_WORKFLOW_BLOCKER" not in attempt.fix_applied
     assert RootCauseAnalysis in runner.output_types
     assert ImplementationResult not in runner.output_types
     payload = json.loads(
@@ -5413,16 +5434,13 @@ async def test_single_rca_fix_verify_runtime_failure_records_typed_blocker():
     )
     assert payload["failure_type"] == "provider_internal_error"
     assert payload["legacy_failure_type"] == "provider_crash"
-    assert payload["route"] == "quiesce"
+    assert payload["route"] == "retry_dispatch"
     assert payload["route_decision"]["failure_type"] == "provider_internal_error"
-    assert payload["route_decision"]["route"] == "quiesce"
-    assert payload["route_decision"]["route_decision_id"] is None
-    assert payload["route_decision"]["idempotency_key"].endswith(":quiesce:n3")
+    assert payload["route_decision"]["route"] == "retry_dispatch"
+    assert payload["route_retry"] == 0
+    assert payload["lane_id"].startswith("bug-rca:verify:bug-rca:")
     assert payload["blocked_before_product_repair"] is True
-    workflow_payload = json.loads(
-        runner.artifacts.store["workflow-blocker:bug-rca:verify:VERIFY-RUNTIME"]
-    )
-    assert workflow_payload == payload
+    assert "workflow-blocker:bug-rca:verify:VERIFY-RUNTIME" not in runner.artifacts.store
 
 
 @pytest.mark.asyncio
@@ -5477,12 +5495,12 @@ async def test_multi_issue_diagnose_triage_runtime_failure_records_typed_blocker
     )
 
     assert len(attempts) == 1
-    assert attempts[0].re_verify_result == "FAIL"
-    assert "SANDBOX_WORKFLOW_BLOCKER" in attempts[0].fix_applied
+    assert attempts[0].re_verify_result == "INFRA_RETRY"
+    assert "SANDBOX_WORKFLOW_BLOCKER" not in attempts[0].fix_applied
     assert BugTriage in runner.output_types
     assert ImplementationResult not in runner.output_types
     payload = json.loads(
-        runner.artifacts.store["workflow-blocker:bug-rca:verify:VERIFY-TRIAGE-RUNTIME-1"]
+        runner.artifacts.store["bug-rca-runtime-failure:verify:VERIFY-TRIAGE-RUNTIME-1"]
     )
     assert payload["failure_type"] == "provider_internal_error"
     assert payload["legacy_failure_type"] == "provider_crash"
@@ -5491,6 +5509,7 @@ async def test_multi_issue_diagnose_triage_runtime_failure_records_typed_blocker
     assert payload["route_decision"]["route"] == "retry_dispatch"
     assert payload["blocked_before_product_repair"] is True
     assert payload["context"] == "bug-triage"
+    assert "workflow-blocker:bug-rca:verify:VERIFY-TRIAGE-RUNTIME-1" not in runner.artifacts.store
 
 
 @pytest.mark.asyncio
@@ -5562,12 +5581,12 @@ async def test_multi_issue_diagnose_parallel_rca_runtime_failure_records_typed_b
     )
 
     assert len(attempts) == 1
-    assert attempts[0].re_verify_result == "FAIL"
-    assert "SANDBOX_WORKFLOW_BLOCKER" in attempts[0].fix_applied
+    assert attempts[0].re_verify_result == "INFRA_RETRY"
+    assert "SANDBOX_WORKFLOW_BLOCKER" not in attempts[0].fix_applied
     assert BugTriage in runner.output_types
     assert ImplementationResult not in runner.output_types
     payload = json.loads(
-        runner.artifacts.store["workflow-blocker:bug-rca:verify:VERIFY-RCA-RUNTIME-1"]
+        runner.artifacts.store["bug-rca-runtime-failure:verify:VERIFY-RCA-RUNTIME-1"]
     )
     assert payload["failure_type"] == "provider_internal_error"
     assert payload["legacy_failure_type"] == "provider_crash"
@@ -5576,6 +5595,7 @@ async def test_multi_issue_diagnose_parallel_rca_runtime_failure_records_typed_b
     assert payload["route_decision"]["route"] == "retry_dispatch"
     assert payload["blocked_before_product_repair"] is True
     assert payload["context"] == "bug-rca-parallel"
+    assert "workflow-blocker:bug-rca:verify:VERIFY-RCA-RUNTIME-1" not in runner.artifacts.store
 
 
 def test_dag_expanded_verify_merges_and_dedupes_lens_findings():
@@ -6994,6 +7014,11 @@ async def test_checkpoint_resume_accepts_real_committed_repo_head_vector(
     monkeypatch.setattr(implementation_module, "_ensure_task_worktrees", _unexpected_group_work)
     monkeypatch.setattr(implementation_module, "_verify_and_fix_group", _unexpected_group_work)
     monkeypatch.setattr(implementation_module, "_commit_group", _unexpected_group_work)
+    runner.artifacts.store[f"execution-control-adoption:{feature.id}"] = _strict_adoption_marker(
+        feature,
+        completed_range=(0, 0),
+        next_group=1,
+    )
     store.projected_checkpoints.clear()
 
     head_before = subprocess.run(
@@ -7015,8 +7040,7 @@ async def test_checkpoint_resume_accepts_real_committed_repo_head_vector(
     assert outcome.failure == ""
     assert outcome.terminal_state == "complete"
     assert head_after == head_before
-    assert store.projected_checkpoints
-    assert getattr(store.projected_checkpoints[0], "projection_key") == "dag-group:0"
+    assert store.projected_checkpoints == []
 
 
 @pytest.mark.asyncio
@@ -7314,6 +7338,11 @@ async def test_active_regroup_resume_does_not_accept_base_hash_for_boundary_grou
             {"status": "active", "base_dag_sha256": base_sha},
             sort_keys=True,
         ),
+        f"execution-control-adoption:{feature.id}": _strict_adoption_marker(
+            feature,
+            completed_range=(0, 43),
+            next_group=44,
+        ),
     }
     for idx, task in enumerate(tasks):
         artifacts[f"dag-group:{idx}"] = json.dumps(
@@ -7444,6 +7473,16 @@ async def test_mid_group_resume_skips_completed_dag_task_markers(
     monkeypatch.setattr(implementation_module, "_record_precommit_contract_verdicts", _contract_verdict_ok)
     monkeypatch.setattr(implementation_module, "_commit_repos", _empty_string)
     monkeypatch.setattr(implementation_module, "_dispatch_task_attempt_via_runtime_dispatcher", _dispatch)
+    monkeypatch.setattr(
+        implementation_module,
+        "_resolve_task_dispatch_repo_binding",
+        lambda **_kwargs: implementation_module._TaskDispatchRepoBinding(
+            repo_id="",
+            repo_path="",
+            ws_path="",
+            source="test",
+        ),
+    )
     monkeypatch.setattr(implementation_module, "_verify_and_fix_group", _verify_group)
     monkeypatch.setattr(implementation_module, "_run_enhancement_group", _empty_string)
 
@@ -11193,6 +11232,13 @@ async def test_implement_dag_quiesce_returns_terminal_state_without_dispatch(mon
                 f"dag-group:{idx}": json.dumps({"group_idx": idx, "results": []})
                 for idx in range(45)
             }
+            self.store[f"execution-control-adoption:{feature.id}"] = (
+                _strict_adoption_marker(
+                    feature,
+                    completed_range=(0, 44),
+                    next_group=45,
+                )
+            )
 
         async def get(self, key: str, *, feature):
             del feature

@@ -14,6 +14,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import tempfile
 import threading
@@ -22,6 +23,11 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, Iterable, Literal, Mapping, Sequence
+
+try:
+    import grp
+except ImportError:  # pragma: no cover - non-Unix fallback.
+    grp = None  # type: ignore[assignment]
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -51,7 +57,7 @@ from ....models.outputs import ImplementationTask
 from ..._common._helpers import _write_context_text
 
 
-SandboxMode = Literal["wave", "task", "repair", "canonicalization"]
+SandboxMode = Literal["wave", "task", "repair", "canonicalization", "diagnostic"]
 SandboxStatus = Literal[
     "allocating",
     "allocated",
@@ -68,8 +74,11 @@ RuntimeName = Literal["claude", "codex", "claude_pool"]
 
 _MANIFEST_NAME = "sandbox-manifest.json"
 _MANIFEST_VERSION = "sandbox-runner-v1"
+_AUTHORITY_GRANT_SCHEMA_VERSION = "runtime-workspace-authority-grant-v1"
 _EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
 _TERMINAL_STATUSES = {"captured", "released", "retained", "failed", "poisoned"}
+_AGENT_SHARED_GROUP_ENV = "IRIAI_AGENT_SHARED_GROUP"
+_DEFAULT_AGENT_SHARED_GROUP = "iriai-agents"
 _RELEASE_DISPOSITIONS = {
     "release",
     "released",
@@ -78,6 +87,26 @@ _RELEASE_DISPOSITIONS = {
     "retention-expired",
     "retention_expired",
 }
+
+
+def _agent_shared_group() -> tuple[str, int | None]:
+    group_name = os.environ.get(_AGENT_SHARED_GROUP_ENV, _DEFAULT_AGENT_SHARED_GROUP)
+    group_name = str(group_name or "").strip() or _DEFAULT_AGENT_SHARED_GROUP
+    if grp is None:
+        return group_name, None
+    try:
+        return group_name, grp.getgrnam(group_name).gr_gid
+    except KeyError:
+        return group_name, None
+
+
+_ALLOCATION_LOCKS_GUARD = threading.Lock()
+_ALLOCATION_LOCKS: dict[str, threading.RLock] = {}
+
+
+def _allocation_lock_for_feature(feature_slug: str) -> threading.RLock:
+    with _ALLOCATION_LOCKS_GUARD:
+        return _ALLOCATION_LOCKS.setdefault(feature_slug, threading.RLock())
 
 
 class SandboxError(RuntimeError):
@@ -108,6 +137,66 @@ class _SandboxModel(BaseModel):
     model_config = ConfigDict(extra="allow", arbitrary_types_allowed=True)
 
 
+class SandboxWritableRootSpec(_SandboxModel):
+    repo_id: str = ""
+    path: str
+    match_kind: Literal["file", "directory"] = "file"
+    allow_create: bool = False
+    source: str = "contract"
+
+    @field_validator("path")
+    @classmethod
+    def _non_empty_path(cls, value: str) -> str:
+        text = str(value or "").strip()
+        if not text:
+            raise ValueError("path cannot be empty")
+        return text
+
+
+class RuntimeWorkspaceAuthorityGrant(_SandboxModel):
+    schema_version: str = _AUTHORITY_GRANT_SCHEMA_VERSION
+    feature_id: str
+    group_idx: int
+    lane_id: str
+    grant_type: Literal["product", "repair", "diagnostic"]
+    repo_id: str
+    repo_root: str
+    contract_roots: list[str] = Field(default_factory=list)
+    create_parent_roots: list[str] = Field(default_factory=list)
+    write_guard_roots: list[str] = Field(default_factory=list)
+    promotable: bool = True
+    contract_ids: list[int] = Field(default_factory=list)
+    expires_at: str
+
+    @model_validator(mode="after")
+    def _validate_grant(self) -> "RuntimeWorkspaceAuthorityGrant":
+        if self.schema_version != _AUTHORITY_GRANT_SCHEMA_VERSION:
+            raise ValueError("unsupported runtime workspace authority grant schema")
+        if not str(self.feature_id).strip():
+            raise ValueError("feature_id cannot be empty")
+        if self.group_idx < 0:
+            raise ValueError("group_idx cannot be negative")
+        if not str(self.lane_id).strip():
+            raise ValueError("lane_id cannot be empty")
+        if not str(self.repo_id).strip():
+            raise ValueError("repo_id cannot be empty")
+        if not str(self.repo_root).strip():
+            raise ValueError("repo_root cannot be empty")
+        if self.grant_type == "diagnostic" and self.promotable:
+            raise ValueError("diagnostic grants cannot be promotable")
+        if self.grant_type in {"product", "repair"} and not self.promotable:
+            raise ValueError("product and repair grants must be promotable")
+        if not self.write_guard_roots:
+            raise ValueError("write_guard_roots cannot be empty")
+        if len(set(self.contract_ids)) != len(self.contract_ids):
+            raise ValueError("contract_ids must be unique")
+        return self
+
+    @property
+    def grant_digest(self) -> str:
+        return _stable_digest(self.model_dump(mode="json", exclude={"grant_digest"}))
+
+
 class SandboxSpec(_SandboxModel):
     feature_id: str
     dag_sha256: str
@@ -119,8 +208,12 @@ class SandboxSpec(_SandboxModel):
     base_commits: dict[str, str]
     mode: SandboxMode
     writable_roots: list[str]
+    writable_root_specs: list[SandboxWritableRootSpec] = Field(default_factory=list)
     readonly_roots: list[str]
     contract_ids: list[int]
+    write_guard_scope: Literal["contract", "diagnostic"] = "contract"
+    authority_lane_id: str | None = None
+    authority_grant_type: Literal["product", "repair", "diagnostic"] | None = None
     ttl_seconds: int = 86_400
 
     @field_validator("feature_id", "dag_sha256", "mode")
@@ -204,6 +297,12 @@ class RuntimeWorkspaceBinding(_SandboxModel):
     workspace_override: str
     repo_roots: dict[str, str]
     writable_roots: list[str]
+    write_guard_roots: list[str] = Field(default_factory=list)
+    write_guard_scope: str = "contract"
+    authority_schema_version: str = ""
+    runtime_workspace_authority_grants: list[dict[str, Any]] = Field(default_factory=list)
+    runtime_workspace_authority_grant_digest: str = ""
+    promotable: bool = True
     readonly_roots: list[str]
     blocked_roots: list[str]
     expires_at: str
@@ -306,7 +405,7 @@ class SandboxRunner:
         feature_slug = _slugify(spec.feature_id)
         sandbox_id = self._sandbox_id(spec)
         sandbox_root = self._sandbox_root(spec)
-        lock = self._locks.setdefault(feature_slug, threading.RLock())
+        lock = _allocation_lock_for_feature(feature_slug)
 
         with lock:
             self._validate_sandbox_allocation_path(sandbox_root)
@@ -347,6 +446,7 @@ class SandboxRunner:
                 else:
                     lease = self._lease_from_manifest(manifest)
                     self._validate_manifest(manifest, lease, verify_heads=True)
+                    self._require_authority_grants_for_fresh_dispatch(manifest)
                     lease = await self._persist_allocated_lease(lease, spec, manifest)
                     self._leases_by_key[idempotency_key] = lease
                     self._specs_by_sandbox[lease.sandbox_id] = spec
@@ -358,6 +458,7 @@ class SandboxRunner:
             source_roots: dict[str, str] = {}
             base_commits: dict[str, str] = {}
             blocked_roots: list[str] = []
+            permission_normalization: dict[str, Any] = {}
 
             try:
                 for repo_id in spec.repo_ids:
@@ -388,6 +489,17 @@ class SandboxRunner:
                         sandbox_root=sandbox_root,
                         expected_commit=base_commit,
                     )
+                    permission_normalization[repo_id] = (
+                        self._normalize_sandbox_repo_permissions(
+                            repo_root,
+                            sandbox_root=sandbox_root,
+                        )
+                    )
+                    self._validate_repo_root(
+                        repo_root,
+                        sandbox_root=sandbox_root,
+                        expected_commit=base_commit,
+                    )
                     repo_roots[repo_id] = str(repo_root.resolve(strict=True))
             except Exception as exc:
                 if not manifest_path.exists():
@@ -409,6 +521,22 @@ class SandboxRunner:
                 default_roots=list(repo_roots.values()),
                 allow_external=False,
             )
+            mapped_writable_root_specs = self._mapped_writable_root_specs(
+                spec.writable_root_specs,
+                repo_roots=repo_roots,
+                source_roots=source_roots,
+                sandbox_root=sandbox_root,
+            )
+            materialized_create_parents = self._materialize_create_parents(
+                mapped_writable_root_specs,
+                repo_roots=repo_roots,
+                sandbox_root=sandbox_root,
+            )
+            write_guard_roots = self._write_guard_roots_for_manifest(
+                writable_roots=writable_roots,
+                writable_root_specs=mapped_writable_root_specs,
+                diagnostic=spec.write_guard_scope == "diagnostic",
+            )
             readonly_roots = self._runtime_roots_from_spec(
                 spec.readonly_roots,
                 repo_roots=repo_roots,
@@ -419,8 +547,27 @@ class SandboxRunner:
             )
             now = _utc_now(self._clock)
             expires_at = now + timedelta(seconds=spec.ttl_seconds)
+            authority_grants = self._runtime_workspace_authority_grants(
+                spec,
+                repo_roots=repo_roots,
+                writable_roots=writable_roots,
+                writable_root_specs=mapped_writable_root_specs,
+                materialized_create_parents=materialized_create_parents,
+                write_guard_roots=write_guard_roots,
+                expires_at=_isoformat(expires_at),
+            )
+            authority_grant_payloads = [
+                _authority_grant_payload(grant) for grant in authority_grants
+            ]
+            authority_grant_digest = _stable_digest(authority_grant_payloads)
+            write_guard_roots = _sorted_unique(
+                root
+                for grant in authority_grant_payloads
+                for root in list(grant.get("write_guard_roots") or [])
+            )
             manifest = {
                 "manifest_version": _MANIFEST_VERSION,
+                "authority_schema_version": _AUTHORITY_GRANT_SCHEMA_VERSION,
                 "sandbox_id": sandbox_id,
                 "idempotency_key": idempotency_key,
                 "root": str(sandbox_root.resolve(strict=True)),
@@ -436,7 +583,20 @@ class SandboxRunner:
                 "contract_ids": sorted(spec.contract_ids),
                 "blocked_roots": all_blocked,
                 "writable_roots": writable_roots,
+                "writable_root_specs": mapped_writable_root_specs,
+                "write_guard_roots": write_guard_roots,
+                "write_guard_scope": spec.write_guard_scope,
+                "runtime_workspace_authority_grants": authority_grant_payloads,
+                "runtime_workspace_authority_grant_digest": authority_grant_digest,
+                "promotable": any(
+                    bool(grant.get("promotable")) for grant in authority_grant_payloads
+                ),
+                "materialized_create_parents": materialized_create_parents,
                 "readonly_roots": readonly_roots,
+                "permission_normalization": {
+                    "scope": "sandbox_repo_roots",
+                    "repos": permission_normalization,
+                },
                 "expires_at": _isoformat(expires_at),
                 "owner": self.owner,
                 "status": "allocated",
@@ -471,6 +631,7 @@ class SandboxRunner:
             raise SandboxBindingError(f"unsupported runtime: {runtime}")
         manifest = self._load_manifest_for_lease(lease)
         self._validate_manifest(manifest, lease, verify_heads=True)
+        self._require_authority_grants_for_fresh_dispatch(manifest)
         if lease.status not in {"allocated", "binding"}:
             existing = self._runtime_bindings.get(lease.sandbox_id)
             if existing is not None and existing.runtime == runtime:
@@ -493,6 +654,18 @@ class SandboxRunner:
         blocked_roots = _sorted_unique(
             [*list(manifest.get("blocked_roots") or []), manifest_path]
         )
+        authority_grants = [
+            dict(item)
+            for item in list(manifest.get("runtime_workspace_authority_grants") or [])
+            if isinstance(item, Mapping)
+        ]
+        authority_grant_digest = str(
+            manifest.get("runtime_workspace_authority_grant_digest") or ""
+        )
+        authority_schema_version = str(
+            manifest.get("authority_schema_version") or ""
+        )
+        promotable = bool(manifest.get("promotable"))
         binding = RuntimeWorkspaceBinding(
             feature_id=str(manifest.get("feature_id") or ""),
             sandbox_lease_id=lease.sandbox_lease_id or lease.id,
@@ -503,6 +676,12 @@ class SandboxRunner:
             workspace_override=cwd,
             repo_roots=repo_roots,
             writable_roots=list(manifest.get("writable_roots") or repo_roots.values()),
+            write_guard_roots=list(manifest.get("write_guard_roots") or []),
+            write_guard_scope=str(manifest.get("write_guard_scope") or "contract"),
+            authority_schema_version=authority_schema_version,
+            runtime_workspace_authority_grants=authority_grants,
+            runtime_workspace_authority_grant_digest=authority_grant_digest,
+            promotable=promotable,
             readonly_roots=list(manifest.get("readonly_roots") or []),
             blocked_roots=blocked_roots,
             expires_at=effective_expires_at,
@@ -527,6 +706,10 @@ class SandboxRunner:
                 "mode": manifest.get("mode", ""),
                 "task_ids": list(manifest.get("task_ids") or []),
                 "contract_ids": list(manifest.get("contract_ids") or []),
+                "authority_schema_version": authority_schema_version,
+                "runtime_workspace_authority_grants": authority_grants,
+                "runtime_workspace_authority_grant_digest": authority_grant_digest,
+                "promotable": promotable,
                 "base_snapshot_ids": list(manifest.get("base_snapshot_ids") or []),
                 "base_snapshot_by_repo": dict(
                     manifest.get("base_snapshot_by_repo") or {}
@@ -901,12 +1084,29 @@ class SandboxRunner:
             return lease
         method = getattr(self.store, "allocate_sandbox_lease", None)
         if method is None or StoredSandboxLease is None or StoredSandboxRepoBinding is None:
-            await self._store_call(
-                ("record_sandbox_lease", "upsert_sandbox_lease", "save_sandbox_lease"),
-                lease,
-                spec,
-                manifest,
-            )
+            try:
+                await self._store_call(
+                    (
+                        "record_sandbox_lease",
+                        "upsert_sandbox_lease",
+                        "save_sandbox_lease",
+                    ),
+                    lease,
+                    spec,
+                    manifest,
+                )
+            except Exception as exc:
+                if isinstance(exc, SandboxError):
+                    raise
+                raise SandboxAllocationError(
+                    self._durable_allocation_failure_message(
+                        exc,
+                        lease=lease,
+                        spec=spec,
+                        manifest=manifest,
+                        phase="store.record_sandbox_lease",
+                    )
+                ) from exc
             return lease
 
         manifest_path = str(Path(str(manifest["root"])) / _MANIFEST_NAME)
@@ -998,7 +1198,13 @@ class SandboxRunner:
             if isinstance(exc, SandboxError):
                 raise
             raise SandboxAllocationError(
-                f"durable sandbox lease allocation failed: {exc}"
+                self._durable_allocation_failure_message(
+                    exc,
+                    lease=lease,
+                    spec=spec,
+                    manifest=manifest,
+                    phase="store.allocate_sandbox_lease",
+                )
             ) from exc
         stored_result_lease = getattr(result, "lease", None) if result is not None else None
         if stored_result_lease is not None:
@@ -1014,6 +1220,31 @@ class SandboxRunner:
             persisted_manifest["sandbox_lease_id"] = lease.sandbox_lease_id
             self._write_manifest(manifest_path, persisted_manifest)
         return lease
+
+    def _durable_allocation_failure_message(
+        self,
+        exc: BaseException,
+        *,
+        lease: SandboxLease,
+        spec: SandboxSpec,
+        manifest: Mapping[str, Any],
+        phase: str,
+    ) -> str:
+        task_ids = ",".join(str(task_id) for task_id in spec.task_ids)
+        return (
+            "durable sandbox lease allocation failed: "
+            f"phase={phase} "
+            f"exception_type={type(exc).__name__} "
+            f"exception_repr={exc!r} "
+            f"feature_id={spec.feature_id} "
+            f"group_idx={spec.group_idx} "
+            f"attempt_no={spec.attempt_no} "
+            f"mode={spec.mode} "
+            f"sandbox_id={lease.sandbox_id} "
+            f"sandbox_root={manifest.get('root')} "
+            f"task_ids={task_ids} "
+            f"idempotency_key={spec.idempotency_key}"
+        )
 
     async def _persist_runtime_binding(
         self,
@@ -1095,8 +1326,16 @@ class SandboxRunner:
             },
             mode=str(manifest.get("mode") or "task"),  # type: ignore[arg-type]
             writable_roots=[str(item) for item in manifest.get("writable_roots") or []],
+            writable_root_specs=[
+                SandboxWritableRootSpec.model_validate(item)
+                for item in manifest.get("writable_root_specs") or []
+                if isinstance(item, Mapping)
+            ],
             readonly_roots=[str(item) for item in manifest.get("readonly_roots") or []],
             contract_ids=[int(item) for item in manifest.get("contract_ids") or []],
+            write_guard_scope=str(
+                manifest.get("write_guard_scope") or "contract"
+            ),  # type: ignore[arg-type]
         )
 
     async def _persist_lease_status(
@@ -1586,6 +1825,309 @@ class SandboxRunner:
             roots.append(str(resolved))
         return roots
 
+    def _mapped_writable_root_specs(
+        self,
+        specs: Sequence[SandboxWritableRootSpec | Mapping[str, Any]],
+        *,
+        repo_roots: Mapping[str, str],
+        source_roots: Mapping[str, str],
+        sandbox_root: Path,
+    ) -> list[dict[str, Any]]:
+        mapped_specs: list[dict[str, Any]] = []
+        for raw_spec in specs:
+            spec = (
+                raw_spec
+                if isinstance(raw_spec, SandboxWritableRootSpec)
+                else SandboxWritableRootSpec.model_validate(raw_spec)
+            )
+            repo_id = str(spec.repo_id or "")
+            if not repo_id and len(repo_roots) == 1:
+                repo_id = next(iter(repo_roots))
+            entry = f"{repo_id}:{spec.path}" if repo_id else spec.path
+            runtime_roots = self._map_runtime_root(
+                entry,
+                repo_roots=repo_roots,
+                source_roots=source_roots,
+                sandbox_root=sandbox_root,
+                allow_external=False,
+            )
+            for runtime_root in runtime_roots:
+                mapped_specs.append({
+                    "repo_id": repo_id,
+                    "path": spec.path,
+                    "match_kind": spec.match_kind,
+                    "allow_create": bool(spec.allow_create),
+                    "source": spec.source,
+                    "runtime_root": runtime_root,
+                })
+        return mapped_specs
+
+    def _materialize_create_parents(
+        self,
+        writable_root_specs: Sequence[Mapping[str, Any]],
+        *,
+        repo_roots: Mapping[str, str],
+        sandbox_root: Path,
+    ) -> list[dict[str, Any]]:
+        materialized: list[dict[str, Any]] = []
+        for spec in writable_root_specs:
+            if not bool(spec.get("allow_create")):
+                continue
+            runtime_root = Path(str(spec.get("runtime_root") or "")).resolve(strict=False)
+            repo_id = str(spec.get("repo_id") or "")
+            repo_root_text = repo_roots.get(repo_id)
+            if not repo_root_text and len(repo_roots) == 1:
+                repo_root_text = next(iter(repo_roots.values()))
+            if not repo_root_text:
+                raise SandboxAllocationError(
+                    f"create root is missing repo identity: {spec.get('path')}"
+                )
+            repo_root = Path(repo_root_text).resolve(strict=True)
+            target = (
+                runtime_root
+                if str(spec.get("match_kind") or "file") == "directory"
+                else runtime_root.parent
+            )
+            target = target.resolve(strict=False)
+            if not _is_relative_to(target, repo_root):
+                raise SandboxAllocationError(
+                    f"create root escapes sandbox repo: {spec.get('path')}"
+                )
+            self._materialize_directory_chain(
+                target,
+                repo_root=repo_root,
+                sandbox_root=sandbox_root,
+            )
+            materialized.append({
+                "repo_id": repo_id,
+                "path": str(spec.get("path") or ""),
+                "match_kind": str(spec.get("match_kind") or "file"),
+                "target": str(target),
+            })
+        return materialized
+
+    def _materialize_directory_chain(
+        self,
+        target: Path,
+        *,
+        repo_root: Path,
+        sandbox_root: Path,
+    ) -> None:
+        repo_resolved = repo_root.resolve(strict=True)
+        sandbox_resolved = sandbox_root.resolve(strict=False)
+        target_resolved = target.resolve(strict=False)
+        if not _is_relative_to(target_resolved, repo_resolved):
+            raise SandboxAllocationError(f"create parent escapes sandbox repo: {target}")
+        if not _is_relative_to(repo_resolved, sandbox_resolved):
+            raise SandboxAllocationError(f"repo root escapes sandbox: {repo_root}")
+        relative = target_resolved.relative_to(repo_resolved)
+        current = repo_resolved
+        self._normalize_sandbox_directory_permissions(
+            current,
+            repo_root=repo_resolved,
+            sandbox_root=sandbox_resolved,
+        )
+        for part in relative.parts:
+            current = current / part
+            try:
+                st = current.lstat()
+            except FileNotFoundError:
+                current.mkdir()
+                self._normalize_sandbox_directory_permissions(
+                    current,
+                    repo_root=repo_resolved,
+                    sandbox_root=sandbox_resolved,
+                )
+                continue
+            except OSError as exc:
+                raise SandboxAllocationError(
+                    f"create parent stat failed for {current}: {exc}"
+                ) from exc
+            if stat.S_ISLNK(st.st_mode):
+                raise SandboxAllocationError(
+                    f"create parent contains symlink component: {current}"
+                )
+            if not stat.S_ISDIR(st.st_mode):
+                raise SandboxAllocationError(
+                    f"create parent contains non-directory component: {current}"
+                )
+            self._normalize_sandbox_directory_permissions(
+                current,
+                repo_root=repo_resolved,
+                sandbox_root=sandbox_resolved,
+            )
+
+    def _normalize_sandbox_directory_permissions(
+        self,
+        path: Path,
+        *,
+        repo_root: Path,
+        sandbox_root: Path,
+    ) -> None:
+        try:
+            st = path.lstat()
+        except OSError as exc:
+            raise SandboxAllocationError(
+                f"sandbox create-parent permission normalization failed to stat {path}: {exc}"
+            ) from exc
+        if stat.S_ISLNK(st.st_mode):
+            raise SandboxAllocationError(
+                f"sandbox create-parent permission normalization encountered symlink: {path}"
+            )
+        if not stat.S_ISDIR(st.st_mode):
+            raise SandboxAllocationError(
+                f"sandbox create-parent permission normalization requires directory: {path}"
+            )
+        resolved = path.resolve(strict=False)
+        if not _is_relative_to(resolved, repo_root) or not _is_relative_to(resolved, sandbox_root):
+            raise SandboxAllocationError(
+                f"sandbox create-parent permission normalization escapes sandbox: {path}"
+            )
+        group_name, shared_gid = _agent_shared_group()
+        if shared_gid is not None and st.st_gid != shared_gid:
+            try:
+                os.chown(path, -1, shared_gid)
+            except OSError as exc:
+                raise SandboxAllocationError(
+                    "sandbox create-parent permission normalization failed to chgrp "
+                    f"{path} to {group_name}: {exc}"
+                ) from exc
+        desired_mode = stat.S_IMODE(st.st_mode) | stat.S_IRGRP | stat.S_IWGRP | stat.S_IXGRP | stat.S_ISGID
+        try:
+            os.chmod(path, desired_mode)
+        except OSError as exc:
+            raise SandboxAllocationError(
+                "sandbox create-parent permission normalization failed to chmod "
+                f"{path} to {oct(desired_mode)}: {exc}"
+            ) from exc
+
+    def _write_guard_roots_for_manifest(
+        self,
+        *,
+        writable_roots: Sequence[str],
+        writable_root_specs: Sequence[Mapping[str, Any]],
+        diagnostic: bool,
+    ) -> list[str]:
+        if diagnostic:
+            return _sorted_unique(str(Path(path).resolve(strict=False)) for path in writable_roots)
+        if writable_root_specs:
+            roots: list[str] = []
+            for spec in writable_root_specs:
+                runtime_root = Path(str(spec.get("runtime_root") or "")).resolve(strict=False)
+                if str(spec.get("match_kind") or "file") == "directory":
+                    roots.append(str(runtime_root))
+                else:
+                    roots.append(str(runtime_root.parent))
+            return _sorted_unique(roots)
+        roots = []
+        for raw in writable_roots:
+            path = Path(str(raw)).resolve(strict=False)
+            roots.append(str(path if path.exists() and path.is_dir() else path.parent))
+        return _sorted_unique(roots)
+
+    def _runtime_workspace_authority_grants(
+        self,
+        spec: SandboxSpec,
+        *,
+        repo_roots: Mapping[str, str],
+        writable_roots: Sequence[str],
+        writable_root_specs: Sequence[Mapping[str, Any]],
+        materialized_create_parents: Sequence[Mapping[str, Any]],
+        write_guard_roots: Sequence[str],
+        expires_at: str,
+    ) -> list[RuntimeWorkspaceAuthorityGrant]:
+        grant_type = _authority_grant_type_for_spec(spec)
+        lane_id = (
+            str(spec.authority_lane_id or "").strip()
+            or f"{spec.mode}:g{spec.group_idx}:a{spec.attempt_no}:{','.join(spec.task_ids)}"
+        )
+        promotable = grant_type in {"product", "repair"}
+        grants: list[RuntimeWorkspaceAuthorityGrant] = []
+        for repo_id, repo_root_text in repo_roots.items():
+            repo_root = Path(repo_root_text).resolve(strict=True)
+            contract_roots = [
+                str(Path(root).resolve(strict=False))
+                for root in writable_roots
+                if _is_relative_to(Path(root).resolve(strict=False), repo_root)
+            ]
+            spec_guard_roots = [
+                str(Path(root).resolve(strict=False))
+                for root in write_guard_roots
+                if _is_relative_to(Path(root).resolve(strict=False), repo_root)
+            ]
+            create_parent_roots = [
+                str(Path(str(item.get("target"))).resolve(strict=False))
+                for item in materialized_create_parents
+                if str(item.get("repo_id") or repo_id) == repo_id
+            ]
+            if grant_type == "diagnostic" and not contract_roots:
+                contract_roots = [str(repo_root)]
+            if grant_type == "diagnostic" and not spec_guard_roots:
+                spec_guard_roots = [str(repo_root)]
+            if not spec_guard_roots and contract_roots:
+                spec_guard_roots = _sorted_unique(
+                    str(
+                        root
+                        if Path(root).exists() and Path(root).is_dir()
+                        else Path(root).parent
+                    )
+                    for root in contract_roots
+                )
+            grant = RuntimeWorkspaceAuthorityGrant(
+                feature_id=spec.feature_id,
+                group_idx=spec.group_idx,
+                lane_id=lane_id,
+                grant_type=grant_type,
+                repo_id=str(repo_id),
+                repo_root=str(repo_root),
+                contract_roots=_sorted_unique(contract_roots),
+                create_parent_roots=_sorted_unique(create_parent_roots),
+                write_guard_roots=_sorted_unique(spec_guard_roots),
+                promotable=promotable,
+                contract_ids=sorted(int(item) for item in spec.contract_ids),
+                expires_at=expires_at,
+            )
+            self._validate_authority_grant_paths(grant, repo_root=repo_root)
+            grants.append(grant)
+        if not grants:
+            raise SandboxAllocationError("runtime workspace authority grant requires repo roots")
+        return grants
+
+    def _validate_authority_grant_paths(
+        self,
+        grant: RuntimeWorkspaceAuthorityGrant,
+        *,
+        repo_root: Path,
+    ) -> None:
+        for label, paths in (
+            ("contract root", grant.contract_roots),
+            ("create parent root", grant.create_parent_roots),
+            ("write guard root", grant.write_guard_roots),
+        ):
+            for raw in paths:
+                path = Path(raw).resolve(strict=False)
+                if not _is_relative_to(path, repo_root):
+                    raise SandboxAllocationError(
+                        f"runtime workspace authority {label} escapes repo "
+                        f"{grant.repo_id}: {raw}"
+                    )
+
+    def _require_authority_grants_for_fresh_dispatch(
+        self,
+        manifest: Mapping[str, Any],
+    ) -> None:
+        if manifest.get("authority_schema_version") != _AUTHORITY_GRANT_SCHEMA_VERSION:
+            raise SandboxAllocationError(
+                "sandbox manifest lacks runtime workspace authority grant metadata; "
+                "fresh dispatch requires a new sandbox attempt"
+            )
+        grants = manifest.get("runtime_workspace_authority_grants")
+        if not isinstance(grants, list) or not grants:
+            raise SandboxAllocationError(
+                "sandbox manifest has no runtime workspace authority grants; "
+                "fresh dispatch requires a new sandbox attempt"
+            )
+
     def _runtime_cwd_from_manifest(
         self,
         manifest: Mapping[str, Any],
@@ -1812,6 +2354,145 @@ class SandboxRunner:
                 raise SandboxAllocationError(
                     f"sandbox repo {repo_root} at {head}, expected {expected_commit}"
                 )
+
+    def _normalize_sandbox_repo_permissions(
+        self,
+        repo_root: Path,
+        *,
+        sandbox_root: Path,
+    ) -> dict[str, Any]:
+        repo_resolved = repo_root.resolve(strict=True)
+        sandbox_resolved = sandbox_root.resolve(strict=False)
+        if not _is_relative_to(repo_resolved, sandbox_resolved):
+            raise SandboxAllocationError(
+                f"sandbox repo permission normalization escapes sandbox: {repo_root}"
+            )
+
+        group_name, shared_gid = _agent_shared_group()
+        summary: dict[str, Any] = {
+            "agent_shared_group": group_name,
+            "agent_shared_gid": shared_gid,
+            "paths_changed": 0,
+            "paths_already_ok": 0,
+            "directories_normalized": 0,
+            "files_normalized": 0,
+            "symlinks_skipped": 0,
+            "unsupported_skipped": 0,
+        }
+
+        def _normalize_path(path: Path) -> None:
+            try:
+                st = path.lstat()
+            except OSError as exc:
+                raise SandboxAllocationError(
+                    f"sandbox repo permission normalization failed to stat {path}: {exc}"
+                ) from exc
+
+            if stat.S_ISLNK(st.st_mode):
+                summary["symlinks_skipped"] += 1
+                return
+
+            path_resolved = path.resolve(strict=False)
+            if not _is_relative_to(path_resolved, repo_resolved):
+                raise SandboxAllocationError(
+                    f"sandbox repo permission normalization path escapes repo: {path}"
+                )
+
+            mode = stat.S_IMODE(st.st_mode)
+            if stat.S_ISDIR(st.st_mode):
+                desired_mode = (
+                    mode
+                    | stat.S_IRGRP
+                    | stat.S_IWGRP
+                    | stat.S_IXGRP
+                    | stat.S_ISGID
+                )
+                normalized_counter = "directories_normalized"
+            elif stat.S_ISREG(st.st_mode):
+                desired_mode = mode | stat.S_IRGRP | stat.S_IWGRP
+                normalized_counter = "files_normalized"
+            else:
+                summary["unsupported_skipped"] += 1
+                return
+
+            changed = False
+            if shared_gid is not None and st.st_gid != shared_gid:
+                try:
+                    os.chown(path, -1, shared_gid)
+                except OSError as exc:
+                    raise SandboxAllocationError(
+                        "sandbox repo permission normalization failed to chgrp "
+                        f"{path} to {group_name}: {exc}"
+                    ) from exc
+                changed = True
+
+            if mode != desired_mode:
+                try:
+                    os.chmod(path, desired_mode)
+                except OSError as exc:
+                    raise SandboxAllocationError(
+                        "sandbox repo permission normalization failed to chmod "
+                        f"{path} to {oct(desired_mode)}: {exc}"
+                    ) from exc
+                changed = True
+
+            try:
+                verified = path.lstat()
+            except OSError as exc:
+                raise SandboxAllocationError(
+                    f"sandbox repo permission normalization failed to verify {path}: {exc}"
+                ) from exc
+            if stat.S_ISLNK(verified.st_mode):
+                raise SandboxAllocationError(
+                    f"sandbox repo permission normalization encountered symlink race: {path}"
+                )
+            verified_mode = stat.S_IMODE(verified.st_mode)
+            if shared_gid is not None and verified.st_gid != shared_gid:
+                raise SandboxAllocationError(
+                    "sandbox repo permission normalization could not set group "
+                    f"{group_name} on {path}"
+                )
+            if not (verified_mode & stat.S_IWGRP):
+                raise SandboxAllocationError(
+                    f"sandbox repo permission normalization left {path} without group write"
+                )
+            if stat.S_ISDIR(verified.st_mode) and not (
+                verified_mode & stat.S_IXGRP and verified_mode & stat.S_ISGID
+            ):
+                raise SandboxAllocationError(
+                    "sandbox repo permission normalization left directory without "
+                    f"group execute/setgid: {path}"
+                )
+
+            if changed:
+                summary["paths_changed"] += 1
+                summary[normalized_counter] += 1
+            else:
+                summary["paths_already_ok"] += 1
+
+        _normalize_path(repo_root)
+        for current, dirnames, filenames in os.walk(repo_root, topdown=True, followlinks=False):
+            current_path = Path(current)
+            kept_dirs: list[str] = []
+            for dirname in dirnames:
+                child = current_path / dirname
+                try:
+                    child_stat = child.lstat()
+                except OSError as exc:
+                    raise SandboxAllocationError(
+                        "sandbox repo permission normalization failed to stat "
+                        f"directory {child}: {exc}"
+                    ) from exc
+                if stat.S_ISLNK(child_stat.st_mode):
+                    summary["symlinks_skipped"] += 1
+                    continue
+                kept_dirs.append(dirname)
+                _normalize_path(child)
+            dirnames[:] = kept_dirs
+            for filename in filenames:
+                _normalize_path(current_path / filename)
+
+        return summary
 
     def _git_dir_from_marker(self, repo_root: Path, git_marker: Path) -> Path:
         if git_marker.is_dir():
@@ -2240,6 +2921,16 @@ def _runtime_binding_metadata(binding: RuntimeWorkspaceBinding) -> dict[str, Any
         "workspace_override": binding.workspace_override,
         "repo_roots": dict(binding.repo_roots),
         "writable_roots": list(binding.writable_roots),
+        "write_guard_roots": list(binding.write_guard_roots),
+        "write_guard_scope": binding.write_guard_scope,
+        "authority_schema_version": binding.authority_schema_version,
+        "runtime_workspace_authority_grants": list(
+            binding.runtime_workspace_authority_grants
+        ),
+        "runtime_workspace_authority_grant_digest": (
+            binding.runtime_workspace_authority_grant_digest
+        ),
+        "promotable": bool(binding.promotable),
         "readonly_roots": list(binding.readonly_roots),
         "blocked_roots": list(binding.blocked_roots),
         "base_snapshot_ids": list(binding.role_metadata.get("base_snapshot_ids") or []),
@@ -2301,6 +2992,31 @@ def _stable_json(value: Any) -> str:
 
 def _stable_digest(value: Any) -> str:
     return hashlib.sha256(_stable_json(value).encode("utf-8")).hexdigest()
+
+
+def _authority_grant_type_for_spec(
+    spec: SandboxSpec,
+) -> Literal["product", "repair", "diagnostic"]:
+    if spec.authority_grant_type:
+        return spec.authority_grant_type
+    if spec.write_guard_scope == "diagnostic" or spec.mode == "diagnostic":
+        return "diagnostic"
+    if spec.mode in {"repair", "canonicalization"}:
+        return "repair"
+    return "product"
+
+
+def _authority_grant_payload(
+    grant: RuntimeWorkspaceAuthorityGrant | Mapping[str, Any],
+) -> dict[str, Any]:
+    payload = (
+        grant.model_dump(mode="json")
+        if isinstance(grant, RuntimeWorkspaceAuthorityGrant)
+        else dict(grant)
+    )
+    payload.pop("grant_digest", None)
+    payload["grant_digest"] = _stable_digest(payload)
+    return payload
 
 
 def _positive_int_or_none(value: Any) -> int | None:
@@ -2469,6 +3185,7 @@ __all__ = [
     "SandboxRunner",
     "SandboxSpec",
     "SandboxStatus",
+    "SandboxWritableRootSpec",
     "_exclude_sandbox_prompt_context_from_capture",
     "_is_terminal_sandbox_attempt_blocker",
     "_repair_repo_id_for_sandbox",

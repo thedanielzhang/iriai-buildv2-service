@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import sys
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -39,7 +40,7 @@ class PlaywrightService:
     async def ensure_browsers(self) -> None:
         """Run ``playwright install {browser}`` if not already installed."""
         proc = await asyncio.create_subprocess_exec(
-            "python", "-m", "playwright", "install", self._browser,
+            sys.executable, "-m", "playwright", "install", self._browser,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -65,7 +66,7 @@ class PlaywrightService:
             report_path = tmp.name
 
         cmd: list[str] = [
-            "python", "-m", "pytest",
+            sys.executable, "-m", "pytest",
             test_dir,
             f"--base-url={base_url}",
             f"--browser={self._browser}",
