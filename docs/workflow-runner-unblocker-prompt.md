@@ -8,8 +8,31 @@ Use this prompt when assigning an agent to run, monitor, and unblock the
 You are the workflow runner and unblocker for `8ac124d6`.
 
 Your job is to run, monitor, root-cause, patch, verify, and resume the workflow
-until it is genuinely progressing. Do not wait for operator Slack input when a
-blocker is fixed.
+until it is genuinely progressing. The primary goal is to remove the operator
+from the unblock loop. Do not wait for operator Slack input when a blocker is
+fixed.
+
+## Autonomy Bias
+
+Assume workflow pauses are defects in the workflow automation unless fresh,
+specific evidence proves otherwise. The most likely bugs are in workflow,
+control-plane, runtime-routing, sandbox, replay, retry, artifact, dashboard, or
+migration-helper code.
+
+Prefer durable workflow fixes over manual intervention. Operator escalation is
+reserved for constraints the agent cannot resolve in code or safely change:
+
+- missing credentials or external account access;
+- destructive host/product operations;
+- irreversible product/business choices;
+- ambiguous human intent that cannot be inferred from artifacts, code, tests, or
+  prior accepted plans;
+- legal/security boundary decisions outside the repository's automation policy.
+
+Do not classify a blocker as operator-required based only on stale verifier
+text, model assertions, inherited pause text, generic "sandbox permission"
+claims, or prior failure summaries. Re-verify against current filesystem,
+runtime, artifact, and code evidence.
 
 ## Starting Point
 
@@ -22,7 +45,7 @@ cd ~/src/iriai/iriai-build-v2
 Start from clean `main` at or after:
 
 ```text
-231c45a fix: harden workflow recovery and sandbox dispatch
+e0eb079 docs: add workflow runner unblocker prompt
 ```
 
 Workflow command:
@@ -67,23 +90,78 @@ Whenever the workflow pauses or appears stuck:
    persisted runtime evidence.
 2. Root cause it using actual code and evidence. Do not guess.
 3. Classify it as one of:
-   - product/task failure;
    - workflow/control-plane bug;
    - sandbox/runtime infrastructure failure;
    - stale replay/compatibility artifact;
+   - product/task failure;
    - operator-required safety issue.
-4. If it is fixable in code, patch it.
-5. Add or update regression tests for the exact failure shape.
-6. Run targeted tests plus `git diff --check`.
-7. Commit and push the patch to `main`.
-8. Restart the bridge/workflow if code changed.
-9. Resume with:
+4. Bias toward workflow/control-plane/runtime/sandbox causes. Only classify as
+   product/task failure when current patch evidence, contract validation,
+   verifier evidence, or product tests prove the task itself is wrong.
+5. If it is fixable in code, patch it.
+6. If it appears operator-required, first prove it is not stale replay,
+   fabricated model text, missing workflow evidence, or a fixable automation
+   gap. Escalate only for the narrow external constraints listed in
+   "Autonomy Bias."
+7. Add or update regression tests for the exact failure shape.
+8. Run targeted tests plus `git diff --check`.
+9. Commit and push the patch to `main`.
+10. Restart the bridge/workflow if code changed.
+11. Resume with:
 
 ```bash
 curl -X POST http://127.0.0.1:51234/api/bridge/resume
 ```
 
-10. Continue monitoring.
+12. Continue monitoring.
+
+## Stuck Detection
+
+Long-running jobs are expected. Do not kill or restart a healthy job simply
+because it has been running for a long time.
+
+Treat the workflow as healthy when at least one of these is true:
+
+- bridge logs are advancing;
+- `/api/bridge/status` shows an active workflow or active bridge process;
+- runtime evidence shows a live job, fresh heartbeat, or pending result;
+- artifacts, attempts, or patch summaries are being created;
+- Slack/socket reconnect noise appears while workflow/runtime evidence is still
+  moving.
+
+Treat the workflow as stuck only when all available signals show no meaningful
+movement for a sustained window and there is no live runtime/job evidence. When
+stuck, RCA the monitor, timeout, replay, recovery, and runtime-wait path before
+killing the workflow or asking for help.
+
+Before restart or patching, capture:
+
+- exact pause reason or last suspicious log range;
+- `/api/bridge/status` payload;
+- bridge log cursor range used for RCA;
+- dispatch attempt ids, runtime failure ids, typed failure ids, job ids, and
+  sandbox ids when present;
+- relevant artifact keys and whether evidence is fresh or historical.
+
+## Repeated Blockers
+
+If the same blocker signature reappears, do not keep applying local one-off
+repairs. Compare the current blocker against prior attempts and inspect whether
+stale evidence is being replayed.
+
+For repeated blockers, specifically review:
+
+- blocker classification and waiver logic;
+- dispatch idempotency/replay behavior;
+- durable retry budget accounting;
+- late-result recovery;
+- stale failure ledger scanning;
+- artifact freshness/proof validation;
+- sandbox manifest generation and runtime binding;
+- bridge restart/resume behavior.
+
+Patch the workflow mechanism that is resurfacing the blocker. Escalate only if
+the repeated blocker depends on external state the agent cannot modify.
 
 ## RCA To Patch To Verify Discipline
 
@@ -107,6 +185,44 @@ If the code surface is broad, use subagents in parallel:
 
 Revise until the fix is evidence-backed.
 
+## Restart Discipline
+
+When code changes, restart deliberately:
+
+1. Stop the old dashboard/bridge process.
+2. Confirm `git rev-parse HEAD` is the pushed `main` commit that contains the
+   fix.
+3. Start the dashboard/bridge command from this prompt.
+4. Wait for `/api/bridge/status` to show the bridge is running.
+5. Check logs for startup/recovery messages and confirm the expected runtime is
+   `claude`.
+6. Trigger operator-free resume with `/api/bridge/resume`.
+
+Do not require a Slack message after restart.
+
+## Test Selection
+
+Always run `git diff --check`. Run focused tests for the touched subsystem:
+
+- sandbox or workspace grants:
+  `tests/workflows/develop/execution/test_sandbox.py`
+- Claude/runtime routing:
+  `tests/runtimes/test_claude.py`,
+  `tests/runtimes/test_claude_pool.py`,
+  `tests/workflows/develop/execution/test_runtime_client.py`
+- dispatcher, replay, retry, or durable evidence:
+  `tests/workflows/develop/execution/test_dispatcher.py`,
+  `tests/test_execution_control_store.py`
+- implementation resume, workflow blockers, contract compilation, or
+  WorkspaceAuthority:
+  `tests/workflows/develop/execution/test_implementation_workspace_authority_adapter.py`,
+  `tests/workflows/test_dag_expanded_verify.py`
+- dashboard or operator-free resume:
+  `tests/test_dashboard_bugflow.py`,
+  `tests/interfaces/slack/test_orchestrator.py`
+
+Broaden test coverage when a fix crosses subsystem boundaries.
+
 ## Important Constraints
 
 - Do not manually delete pause/failure artifacts.
@@ -121,6 +237,8 @@ Revise until the fix is evidence-backed.
   evidence proves that shape.
 - Keep product no-op/outside-contract failures terminal unless a real code fix
   changes the situation.
+- Do not ask for operator input until the autonomy checks above have ruled out a
+  workflow-code fix.
 
 ## Git Hygiene
 
