@@ -34,6 +34,54 @@ text, model assertions, inherited pause text, generic "sandbox permission"
 claims, or prior failure summaries. Re-verify against current filesystem,
 runtime, artifact, and code evidence.
 
+## Claude Code Operating Model
+
+You are a Claude Code agent. Run this as one long, autonomous session and use
+Claude Code's orchestration features instead of doing everything inline. These
+are *your* operating tools and are separate from the iriai `8ac124d6` workflow
+you are unblocking.
+
+- **Track every blocker as a task.** Open a `TaskCreate` entry per distinct
+  blocker signature; mark it `in_progress` while you RCA and patch, and
+  `completed` only after the fix is committed, pushed, and the workflow has
+  resumed past it. This is your durable progress ledger for a multi-blocker
+  session.
+- **Run the bridge in the background.** Launch the dashboard/bridge command with
+  Bash `run_in_background: true` so it never blocks your turn; you are notified
+  if the process exits.
+- **Wait on a signal, don't busy-wait.** Use the `Monitor` tool to run the
+  watcher below in the background; it notifies you when the bridge exits or its
+  log cursor stalls, so you re-enter the Required Loop instead of polling every
+  turn. For coarse self-paced re-checks you may also drive this prompt with the
+  `/loop` skill.
+- **Delegate heavy reading to subagents to protect your context.** The journals,
+  decision logs, and bridge output here are multi-MB. Do not read them wholesale
+  into your own context. Spawn subagents to read, search, and summarize, then act
+  on their short reports. Brief each subagent cold: give it the exact files, ids,
+  and the question, and ask for a concise answer.
+
+`/api/bridge/status` has no "paused" flag — it reports process liveness
+(`running`) and a log cursor (`line_count`). Movement = `line_count` advancing;
+the pause reason itself is in the bridge log text (`/api/bridge/logs`). A
+background watcher that wakes you on exit or cursor-stall:
+
+```bash
+# A stall is a CANDIDATE pause only. On wake, confirm against "Stuck Detection"
+# before acting — healthy long-running jobs can be quiet for a while.
+prev=-1; stalls=0
+until [ "$stalls" -ge 4 ]; do
+  read -r run cur <<<"$(curl -s http://127.0.0.1:51234/api/bridge/status \
+    | python3 -c 'import sys,json;d=json.load(sys.stdin);print(d["running"],d["line_count"])')"
+  [ "$run" = "True" ] || { echo "BRIDGE EXITED"; break; }
+  if [ "$cur" = "$prev" ]; then stalls=$((stalls+1)); else stalls=0; prev="$cur"; fi
+  sleep 15
+done
+```
+
+On each wake, read the new log range with
+`curl 'http://127.0.0.1:51234/api/bridge/logs?after=<prev cursor>'` to recover
+the pause reason, then run the Required Loop.
+
 ## Starting Point
 
 Repo:
@@ -42,11 +90,10 @@ Repo:
 cd ~/src/iriai/iriai-build-v2
 ```
 
-Start from clean `main` at or after:
-
-```text
-e0eb079 docs: add workflow runner unblocker prompt
-```
+Start from a clean, up-to-date `main`. It must already contain this prompt,
+including the "Claude Code Operating Model" section above. Confirm with
+`git log --oneline -1 -- docs/workflow-runner-unblocker-prompt.md` and
+`git status --short` before doing anything else.
 
 Workflow command:
 
@@ -84,7 +131,8 @@ curl 'http://127.0.0.1:51234/api/bridge/logs?after=0'
 
 ## Required Loop
 
-Whenever the workflow pauses or appears stuck:
+Whenever the workflow pauses or appears stuck, open a `TaskCreate` entry for the
+blocker, then:
 
 1. Identify the exact blocker from bridge logs, pause reason, artifacts, and
    persisted runtime evidence.
@@ -113,7 +161,8 @@ Whenever the workflow pauses or appears stuck:
 curl -X POST http://127.0.0.1:51234/api/bridge/resume
 ```
 
-12. Continue monitoring.
+12. Mark the blocker's task `completed` and re-arm the background watcher
+    (Monitor) — do not idle-poll between checks.
 
 ## Stuck Detection
 
@@ -123,7 +172,7 @@ because it has been running for a long time.
 Treat the workflow as healthy when at least one of these is true:
 
 - bridge logs are advancing;
-- `/api/bridge/status` shows an active workflow or active bridge process;
+- `/api/bridge/status` shows `running: true` with an advancing `line_count`;
 - runtime evidence shows a live job, fresh heartbeat, or pending result;
 - artifacts, attempts, or patch summaries are being created;
 - Slack/socket reconnect noise appears while workflow/runtime evidence is still
@@ -175,13 +224,24 @@ For every blocker, produce a short internal RCA before patching:
 - Fix: minimal durable fix.
 - Verification: tests and operational checks.
 
-If the code surface is broad, use subagents in parallel:
+If the code surface is broad, fan work out to subagents — send one message with
+multiple `Agent` calls so they run in parallel:
 
-- RCA subagent: inspect persisted evidence and logs.
-- Code-path subagent: trace relevant implementation/runtime/sandbox path.
-- Test subagent: identify or add regression coverage.
-- Reviewer subagent: review the proposed fix for over-broad compatibility or
-  hidden retry masking.
+- **Evidence RCA** (`general-purpose`): read the relevant persisted evidence,
+  decision journal, and bridge log range; return the failure shape, the ids, and
+  the smoking-gun lines. Keeps multi-MB reads out of your context.
+- **Code-path trace** (`Explore`): locate the implementation/runtime/sandbox
+  functions on the failing path and report `file:line` references. Use this for
+  "where is X / what calls Y" lookups.
+- **Fix design** (`Plan`): for a cross-subsystem blocker, design the minimal
+  durable fix before you write code.
+- **Regression coverage** (`general-purpose`): identify the test that should
+  have caught this and draft the case for the exact failure shape.
+
+Then review your own diff before committing: run the `/code-review` skill to
+catch over-broad compatibility, hidden retry masking, or silently waived product
+failures, and `/verify` to confirm the fix changes real runtime behavior, not
+just tests.
 
 Revise until the fix is evidence-backed.
 
@@ -197,6 +257,12 @@ When code changes, restart deliberately:
 5. Check logs for startup/recovery messages and confirm the expected runtime is
    `claude`.
 6. Trigger operator-free resume with `/api/bridge/resume`.
+
+Scope the restart to what you changed: a fix in bridge/runtime/orchestrator code
+is picked up by relaunching the bridge subprocess (`POST /api/bridge/restart`,
+or the stop/start above, both spawn a fresh process), but a change to
+`dashboard.py` itself requires relaunching the dashboard process you started in
+the background.
 
 Do not require a Slack message after restart.
 
