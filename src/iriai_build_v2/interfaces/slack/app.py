@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import faulthandler
 import logging
 import os
 import signal
@@ -148,6 +149,28 @@ async def run_slack_bridge(
             asyncio.create_task(_resume())
 
         loop.add_signal_handler(resume_signal, _request_recoverable_resume)
+
+    # Hang diagnosis: SIGUSR2 dumps every thread's Python stack to a file. This
+    # is a C-level faulthandler (not an asyncio callback), so it fires even when
+    # the event loop is frozen in an uncancellable await — the one case where a
+    # native `sample` shows only `kevent` and py-spy needs root. `chain=False`
+    # keeps the default terminate action from running, so the process survives
+    # the dump. Trigger with `kill -USR2 <bridge_pid>`.
+    dump_signal = getattr(signal, "SIGUSR2", None)
+    if dump_signal is not None:
+        _fault_path = os.environ.get(
+            "IRIAI_FAULTHANDLER_PATH", "/tmp/iriai_bridge_faulthandler.log"
+        )
+        try:
+            _fault_file = open(_fault_path, "a", buffering=1)  # noqa: SIM115 - kept open for process lifetime
+            faulthandler.register(
+                dump_signal, file=_fault_file, all_threads=True, chain=False
+            )
+            logger.info(
+                "Stack-dump handler armed: kill -USR2 <pid> -> %s", _fault_path
+            )
+        except Exception:
+            logger.exception("Failed to arm SIGUSR2 stack-dump handler")
 
     try:
         await stop.wait()
