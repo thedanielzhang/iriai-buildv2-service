@@ -164,6 +164,38 @@ curl -X POST http://127.0.0.1:51234/api/bridge/resume
 12. Mark the blocker's task `completed` and re-arm the background watcher
     (Monitor) — do not idle-poll between checks.
 
+## Hang Diagnosis — Stack-Dump First
+
+A "hang" where the bridge log cursor (`line_count`) is frozen, no dispatch
+result is logged, AND the bridge process is low-CPU is usually the asyncio
+event loop blocked in a SYNCHRONOUS call — not an async timeout a watchdog can
+catch. A frozen loop cannot run ANY async timer, so adding watchdogs is futile
+until you prove the loop is free. Low CPU + quiet logs looks identical to
+"idle" — do NOT conclude "responsive / not stuck" from process state alone.
+
+The FIRST diagnostic for any suspected hang is a thread-stack dump of the
+bridge process, BEFORE writing any watchdog:
+
+- `sudo py-spy dump --pid <bridge_pid>` (needs root on macOS), or
+- faulthandler: register `faulthandler.register(signal.SIGUSR2,
+  all_threads=True, file=open(<path>))` early in the bridge entrypoint, then
+  `kill -USR2 <bridge_pid>` and read the dump (use a path only the bridge's
+  user can create), or
+- `sample <bridge_pid> 3` (no root) for native frames — enough to see whether
+  the main thread is in `kevent` (idle loop) vs `subprocess.run` / `read` / a
+  lock.
+
+If the main thread is inside `subprocess.run` / `_run_command` / a blocking
+read/wait, the loop is FROZEN by a synchronous call. Fix: run that call
+off-loop (`asyncio.to_thread` / `asyncio.create_subprocess_exec`) and bound it
+with a timeout — do NOT add another watchdog.
+
+Known hang class here: `SandboxRunner._run_command` (`sandbox.py`) runs git via
+synchronous `subprocess.run` directly on the loop — for clone (allocate) AND
+patch-capture (diff/add/read-tree). A slow/large/wedged git there freezes the
+entire bridge (and every watchdog with it). Off-load each at the async
+boundary.
+
 ## Stuck Detection
 
 Long-running jobs are expected. Do not kill or restart a healthy job simply
@@ -191,6 +223,12 @@ Before restart or patching, capture:
 - dispatch attempt ids, runtime failure ids, typed failure ids, job ids, and
   sandbox ids when present;
 - relevant artifact keys and whether evidence is fresh or historical.
+
+These signals are unreliable when the event loop is frozen: a synchronous
+blocking call (e.g. git on the loop) stops `line_count`, watchdogs, AND Slack
+heartbeats while consuming almost no CPU. When signals disagree or the bridge
+is quiet-but-not-progressing, a stack dump (see "Hang Diagnosis — Stack-Dump
+First") is the ground truth — not CPU%, not `line_count`.
 
 ## Repeated Blockers
 
