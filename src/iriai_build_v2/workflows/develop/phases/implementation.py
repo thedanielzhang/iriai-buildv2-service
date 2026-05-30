@@ -22987,21 +22987,35 @@ def _compute_fix_schedule(
     return schedule
 
 
+# Cap how much prior-attempt history is injected into a fix agent's context.
+# The history is unbounded and accumulates across every retry; for stuck tasks
+# it grew to ~7MB / 170+ attempts, which exceeds the model's context window when
+# the offloaded file is read — so the dispatch can never complete and the task
+# wedges. Keep a generous window of the MOST RECENT attempts (the ones an agent
+# must avoid repeating); the complete history remains in the artifact store, and
+# the omitted count is surfaced so nothing is silently dropped.
+_MAX_PRIOR_ATTEMPTS_SHOWN = 40
+_MAX_PRIOR_ATTEMPTS_CHARS = 1_000_000
+
+
 def _format_prior_attempts(
     prior_attempts: list[BugFixAttempt],
     context_base: Path | None = None,
 ) -> str:
     """Format prior attempts as context for RCA/fix agents.
 
-    When the formatted text exceeds *PROMPT_FILE_THRESHOLD* and a
-    *context_base* is available, the full content is written to a file
-    and a read-pointer is returned instead.
+    Only the most recent attempts are included (bounded by
+    *_MAX_PRIOR_ATTEMPTS_SHOWN* and *_MAX_PRIOR_ATTEMPTS_CHARS*) so the injected
+    context cannot overflow the model's window. When the formatted text still
+    exceeds *PROMPT_FILE_THRESHOLD* and a *context_base* is available, the full
+    content is written to a file and a read-pointer is returned instead.
     """
     if not prior_attempts:
         return ""
-    prior_lines = []
-    for a in prior_attempts:
-        prior_lines.append(
+    selected: list[str] = []
+    used = 0
+    for a in reversed(prior_attempts):
+        block = (
             f"### Attempt {a.attempt_number} ({a.bug_id})\n"
             f"- **Source:** {a.source_verdict}\n"
             f"- **Group:** {a.group_id or 'single'}\n"
@@ -23011,10 +23025,23 @@ def _format_prior_attempts(
             f"- **Files Modified:** {', '.join(a.files_modified)}\n"
             f"- **Result:** {a.re_verify_result}"
         )
-    text = (
-        "\n\n## Prior Fix Attempts (DO NOT REPEAT these approaches)\n\n"
-        + "\n\n".join(prior_lines)
-    )
+        if selected and (
+            len(selected) >= _MAX_PRIOR_ATTEMPTS_SHOWN
+            or used + len(block) > _MAX_PRIOR_ATTEMPTS_CHARS
+        ):
+            break
+        selected.append(block)
+        used += len(block)
+    selected.reverse()
+    omitted = len(prior_attempts) - len(selected)
+    header = "\n\n## Prior Fix Attempts (DO NOT REPEAT these approaches)\n\n"
+    if omitted > 0:
+        header += (
+            f"_(showing the {len(selected)} most recent of {len(prior_attempts)} "
+            f"attempts; {omitted} older omitted to fit the context window — the "
+            f"full history is preserved in the artifact store)_\n\n"
+        )
+    text = header + "\n\n".join(selected)
     return _offload_if_large(text, context_base, "prior-fix-attempts")
 
 
