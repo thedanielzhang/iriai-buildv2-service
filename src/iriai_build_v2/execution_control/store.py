@@ -2516,11 +2516,15 @@ class ExecutionControlStore:
         A task whose newest terminal attempt ``succeeded`` has its earlier
         infra-failures SUPERSEDED — they must not be replayed or counted against
         the durable retry budget (which would burn it instantly into a spurious
-        RootCauseAnalysis). Returns ``{status, idempotency_key,
+        RootCauseAnalysis). Returns ``{status, attempt, idempotency_key,
         dispatch_attempt_id}`` for the newest terminal row, or ``None`` when the
-        task has no terminal attempt yet. The ``updated_at DESC, id DESC`` tie-break
-        matches ``get_pending_durable_merge_patch_evidence`` so "latest" is
-        deterministic; a later FAILURE correctly outranks an earlier success.
+        task has no terminal attempt yet. ``attempt`` is the per-task loop retry
+        index (``payload['retry']``); a caller can re-dispatch exactly that index
+        to replay the persisted result (the durable idempotency key is a hash, so
+        the index — not the key — is the stable handle back into the loop). The
+        ``updated_at DESC, id DESC`` tie-break matches
+        ``get_pending_durable_merge_patch_evidence`` so "latest" is deterministic;
+        a later FAILURE correctly outranks an earlier success.
         """
 
         async with self._connection() as conn:
@@ -2549,6 +2553,7 @@ class ExecutionControlStore:
             outcome = _json_dict(attempt.payload.get("dispatch_outcome"))
             return {
                 "status": attempt.status or outcome.get("status"),
+                "attempt": attempt.payload.get("retry"),
                 "idempotency_key": (
                     outcome.get("idempotency_key") or attempt.idempotency_key
                 ),

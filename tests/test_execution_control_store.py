@@ -1771,6 +1771,7 @@ def _terminal_attempt_row(
     row_id: int,
     status: str,
     idempotency_key: str,
+    attempt: int,
     hour: int,
 ) -> dict[str, Any]:
     """A minimal dispatch_attempt journal row for get_latest_terminal_* tests."""
@@ -1788,6 +1789,7 @@ def _terminal_attempt_row(
         "task_id": "TASK-9-3",
         "request_digest": f"digest-{row_id}",
         "payload": json.dumps({
+            "retry": attempt,
             "dispatch_outcome": {"status": status, "idempotency_key": idempotency_key},
         }),
         "requires_legacy_visibility": False,
@@ -1805,14 +1807,14 @@ async def test_get_latest_terminal_dispatch_outcome_honors_superseding_success()
     conn = _FakeConnection()
     store = _store(_FakePool(conn))
     conn.typed_rows.append(_terminal_attempt_row(
-        row_id=66, status="failed",
-        idempotency_key="dispatch:feature-typed:g78:t0:TASK-9-3:a0:implementation", hour=1))
+        row_id=66, status="failed", attempt=0,
+        idempotency_key="idem:dispatch:hash-a0", hour=1))
     conn.typed_rows.append(_terminal_attempt_row(
-        row_id=110, status="incomplete",
-        idempotency_key="dispatch:feature-typed:g78:t0:TASK-9-3:a5:implementation", hour=2))
+        row_id=110, status="incomplete", attempt=5,
+        idempotency_key="idem:dispatch:hash-a5", hour=2))
     conn.typed_rows.append(_terminal_attempt_row(
-        row_id=135, status="succeeded",
-        idempotency_key="dispatch:feature-typed:g78:t0:TASK-9-3:a6:implementation", hour=3))
+        row_id=135, status="succeeded", attempt=6,
+        idempotency_key="idem:dispatch:hash-a6", hour=3))
 
     result = await store.get_latest_terminal_dispatch_outcome(
         feature_id=FEATURE_ID, dag_sha256="dag-sha-test", group_idx=78, task_id="TASK-9-3",
@@ -1820,7 +1822,7 @@ async def test_get_latest_terminal_dispatch_outcome_honors_superseding_success()
 
     assert result is not None
     assert result["status"] == "succeeded"
-    assert result["idempotency_key"].endswith(":a6:implementation")
+    assert result["attempt"] == 6  # the per-task loop retry index to re-dispatch
     assert result["dispatch_attempt_id"] == 135
 
 
@@ -1831,11 +1833,11 @@ async def test_get_latest_terminal_dispatch_outcome_returns_latest_failure_witho
     conn = _FakeConnection()
     store = _store(_FakePool(conn))
     conn.typed_rows.append(_terminal_attempt_row(
-        row_id=66, status="failed",
-        idempotency_key="dispatch:feature-typed:g78:t0:TASK-9-3:a0:implementation", hour=1))
+        row_id=66, status="failed", attempt=0,
+        idempotency_key="idem:dispatch:hash-a0", hour=1))
     conn.typed_rows.append(_terminal_attempt_row(
-        row_id=105, status="failed",
-        idempotency_key="dispatch:feature-typed:g78:t0:TASK-9-3:a4:implementation", hour=2))
+        row_id=105, status="failed", attempt=4,
+        idempotency_key="idem:dispatch:hash-a4", hour=2))
 
     result = await store.get_latest_terminal_dispatch_outcome(
         feature_id=FEATURE_ID, dag_sha256="dag-sha-test", group_idx=78, task_id="TASK-9-3",
@@ -1843,6 +1845,7 @@ async def test_get_latest_terminal_dispatch_outcome_returns_latest_failure_witho
 
     assert result is not None
     assert result["status"] == "failed"
+    assert result["attempt"] == 4
     assert result["dispatch_attempt_id"] == 105
 
 

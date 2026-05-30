@@ -19871,13 +19871,21 @@ async def _implement_dag(
                             t.id,
                             exc_info=True,
                         )
+                    logger.info(
+                        "L1 resume check: task=%s dag=%s latest_terminal_status=%s attempt=%s",
+                        t.id,
+                        (dag_sha256 or "unknown-dag")[:12],
+                        (_latest_terminal or {}).get("status"),
+                        (_latest_terminal or {}).get("attempt"),
+                    )
                     if _latest_terminal and _latest_terminal.get("status") == "succeeded":
-                        _succeeded_key = str(_latest_terminal.get("idempotency_key") or "")
-                        _key_match = re.search(
-                            rf":{re.escape(t.id)}:a(\d+):", _succeeded_key
-                        )
-                        if _key_match is not None:
-                            _succeeded_attempt = int(_key_match.group(1))
+                        # The durable idempotency key is a hash, so the per-task
+                        # loop retry index (payload['retry']) — not the key — is the
+                        # stable handle: re-dispatching exactly that index makes the
+                        # dispatcher replay the persisted (legitimately-partial)
+                        # success instead of the superseded failures.
+                        _succeeded_attempt = _latest_terminal.get("attempt")
+                        if isinstance(_succeeded_attempt, int) and _succeeded_attempt >= 0:
                             logger.info(
                                 "Task %s has a superseding successful dispatch in the "
                                 "journal (attempt %d) — honoring it instead of "
@@ -19886,6 +19894,13 @@ async def _implement_dag(
                                 _succeeded_attempt,
                             )
                             _attempt_range = (_succeeded_attempt,)
+                        else:
+                            logger.warning(
+                                "Task %s latest terminal dispatch succeeded but has no "
+                                "usable attempt index (%r) — using full infra-retry range",
+                                t.id,
+                                _succeeded_attempt,
+                            )
 
                 for attempt in _attempt_range:
                     sandbox_task_binding: RuntimeSandboxTaskBinding | None = None
