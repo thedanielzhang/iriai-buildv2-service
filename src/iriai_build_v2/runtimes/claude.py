@@ -6,7 +6,8 @@ import json
 import logging
 import math
 import os
-from contextlib import asynccontextmanager
+import signal
+from contextlib import asynccontextmanager, suppress
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -55,6 +56,14 @@ _DEFAULT_CLAUDE_STREAM_INACTIVITY_TIMEOUT_S = 600.0
 # anyio-shielded scope), asyncio.wait always returns on schedule, so the watchdog
 # can never be starved by a wedged dispatch.
 _WATCHDOG_POLL_SECONDS = 15.0
+# A dispatch's invocation counts as "live work" (which the workflow liveness
+# watchdog honors by extending its grace period) only while its CLI stream is
+# still producing output. If the stream wedges (e.g. the subprocess exited but
+# anyio process.wait() never resolves under the macOS ThreadedChildWatcher), the
+# per-invocation activity timestamp goes stale past this window, so
+# invocation_has_live_work() flips False and the outer watchdog stops extending
+# grace and can finally cancel/abandon the wedged dispatch.
+_LIVE_WORK_STALE_SECONDS = 120.0
 
 
 def _stream_inactivity_timeout_s() -> float:
@@ -650,7 +659,7 @@ class ClaudeAgentRuntime(AgentRuntime):
         self._session_context: dict[str, str] = {}  # session_key → compressed context after cycle
         self._retry_depth: int = 0  # prevent infinite retry loops
         self._invocation_activity: dict[str, Callable[[], None] | None] = {}
-        self._active_invocations: set[str] = set()
+        self._active_invocations: dict[str, float] = {}
 
     @asynccontextmanager
     async def bind_invocation(self, invocation_id: str, activity_sink: Callable[[], None] | None):
@@ -661,10 +670,13 @@ class ClaudeAgentRuntime(AgentRuntime):
         finally:
             _current_invocation_var.reset(token)
             self._invocation_activity.pop(invocation_id, None)
-            self._active_invocations.discard(invocation_id)
+            self._active_invocations.pop(invocation_id, None)
 
     def invocation_has_live_work(self, invocation_id: str) -> bool:
-        return invocation_id in self._active_invocations
+        ts = self._active_invocations.get(invocation_id)
+        if ts is None:
+            return False
+        return (asyncio.get_running_loop().time() - ts) < _LIVE_WORK_STALE_SECONDS
 
     async def invoke(
         self,
@@ -907,25 +919,30 @@ class ClaudeAgentRuntime(AgentRuntime):
         invocation_id = _current_invocation_var.get()
         loop = asyncio.get_running_loop()
         last_activity = loop.time()
+        connected_client: Any = None
 
         async def _run() -> Any:
-            nonlocal last_activity
+            nonlocal last_activity, connected_client
             result_msg = None
             async with make_client() as client:
+                connected_client = client
                 if invocation_id:
-                    self._active_invocations.add(invocation_id)
+                    self._active_invocations[invocation_id] = loop.time()
                 cleanup = on_connected(client) if on_connected is not None else None
                 try:
                     await client.query(prompt)
                     async for msg in client.receive_response():
                         last_activity = loop.time()
+                        if invocation_id:
+                            self._active_invocations[invocation_id] = last_activity
                         if emit:
                             self._emit_message(msg)
                         if isinstance(msg, ResultMessage):
                             result_msg = msg
                 finally:
                     if invocation_id:
-                        self._active_invocations.discard(invocation_id)
+                        self._active_invocations.pop(invocation_id, None)
+                    connected_client = None
                     if cleanup is not None:
                         cleanup()
             return result_msg
@@ -947,6 +964,20 @@ class ClaudeAgentRuntime(AgentRuntime):
                     )
         finally:
             if not task.done():
+                # Force-kill the live CLI subprocess BEFORE abandoning the task.
+                # The known wedge is anyio's process.wait() never resolving under
+                # the macOS ThreadedChildWatcher, so task.cancel() alone re-hangs
+                # on the SAME wait() during the SDK's teardown. SIGKILL makes the
+                # kernel re-deliver SIGCHLD so wait() resolves and the chain
+                # unwinds. No-op if the CLI already exited (the live-work flag
+                # then goes stale and the outer liveness watchdog cancels instead).
+                proc = getattr(
+                    getattr(connected_client, "_transport", None), "_process", None
+                )
+                pid = getattr(proc, "pid", None)
+                if pid:
+                    with suppress(ProcessLookupError, OSError, ValueError):
+                        os.kill(int(pid), signal.SIGKILL)
                 # Abandon: request cancellation but do not await it — the wedged
                 # await may be uncancellable, and we must not re-hang here.
                 task.cancel()

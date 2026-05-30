@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import signal
 import sys
 import time
 from pathlib import Path
@@ -16,6 +17,7 @@ from iriai_build_v2.runtimes.claude import (
     ClaudeAgentRuntime,
     ClaudeStreamWatchdogStall,
     StructuredOutputExhausted,
+    _LIVE_WORK_STALE_SECONDS,
     _resolve_stream_inactivity_timeout,
     _stream_inactivity_timeout_s,
 )
@@ -480,7 +482,7 @@ def _bare_runtime() -> ClaudeAgentRuntime:
     # _emit_message only touches _invocation_activity when an invocation id is
     # set on the contextvar; provide it so the test never passes by luck.
     runtime._invocation_activity = {}
-    runtime._active_invocations = set()
+    runtime._active_invocations = {}
     return runtime
 
 
@@ -539,6 +541,59 @@ async def test_dispatch_watchdog_returns_result_on_active_stream():
     )
 
     assert out is result
+
+
+class _WedgedSubprocessClient(_BaseFakeClient):
+    """Silent stream (so the inactivity watchdog fires) that exposes a live CLI
+    subprocess via client._transport._process.pid — models the wedge where the
+    subprocess won't reap, so the watchdog must SIGKILL the pid to unblock."""
+
+    def __init__(self, pid: int) -> None:
+        self._transport = SimpleNamespace(_process=SimpleNamespace(pid=pid))
+
+    def receive_response(self):
+        async def _gen():
+            await asyncio.sleep(3600)
+            yield None  # pragma: no cover - never reached
+
+        return _gen()
+
+
+@pytest.mark.asyncio
+async def test_dispatch_watchdog_sigkills_wedged_subprocess(monkeypatch):
+    # The wedge: the CLI subprocess won't reap, so anyio process.wait() never
+    # resolves and task.cancel() alone re-hangs on the SDK teardown's wait().
+    # The watchdog must SIGKILL the live pid first so wait() resolves.
+    runtime = _bare_runtime()
+    killed: list[tuple[int, int]] = []
+    monkeypatch.setattr(os, "kill", lambda pid, sig: killed.append((pid, sig)))
+
+    start = time.monotonic()
+    with pytest.raises(ClaudeStreamWatchdogStall):
+        await runtime._run_dispatch_bounded(
+            lambda: _WedgedSubprocessClient(424242), "p", _WatchdogResultMessage, 0.05
+        )
+
+    assert time.monotonic() - start < 5.0
+    assert killed == [(424242, signal.SIGKILL)]
+
+
+@pytest.mark.asyncio
+async def test_invocation_live_work_goes_stale_when_stream_wedges():
+    # The liveness watchdog (workflows/_runner.py) extends its grace period while
+    # an invocation reports live work. A wedged receive stops refreshing the
+    # activity timestamp, so it must go stale -> False, letting the watchdog
+    # cancel instead of extending grace forever (the 8ac124d6 freeze).
+    runtime = _bare_runtime()
+    loop = asyncio.get_running_loop()
+
+    runtime._active_invocations["inv"] = loop.time()
+    assert runtime.invocation_has_live_work("inv") is True
+
+    runtime._active_invocations["inv"] = loop.time() - (_LIVE_WORK_STALE_SECONDS + 5)
+    assert runtime.invocation_has_live_work("inv") is False
+
+    assert runtime.invocation_has_live_work("unknown") is False
 
 
 @pytest.mark.asyncio
