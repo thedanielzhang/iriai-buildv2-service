@@ -387,7 +387,32 @@ class _WatchdogResultMessage:
         self.result = result
 
 
-class _SilentClient:
+class _BaseFakeClient:
+    """Async-context-manager Claude client stub. Subclasses override the phase
+    (connect / query / receive) that should hang or stream."""
+
+    async def __aenter__(self):
+        await self._on_connect()
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def _on_connect(self):
+        return None
+
+    async def query(self, prompt):
+        return None
+
+    def receive_response(self):
+        async def _gen():
+            if False:  # pragma: no cover - empty async generator
+                yield None
+
+        return _gen()
+
+
+class _SilentClient(_BaseFakeClient):
     """receive_response() yields nothing and never ends — models a wedged CLI
     subprocess that stays alive but produces no output."""
 
@@ -399,7 +424,24 @@ class _SilentClient:
         return _gen()
 
 
-class _ActiveClient:
+class _ConnectHangClient(_BaseFakeClient):
+    """__aenter__ (connect) never returns — models a CLI that wedges during the
+    control-protocol init handshake before any message. The earlier
+    receive-only watchdog missed this entirely; the lifecycle watchdog must
+    still fire."""
+
+    async def _on_connect(self):
+        await asyncio.sleep(3600)
+
+
+class _QueryHangClient(_BaseFakeClient):
+    """query() never returns — models a wedge while sending the prompt."""
+
+    async def query(self, prompt):
+        await asyncio.sleep(3600)
+
+
+class _ActiveClient(_BaseFakeClient):
     """Streams `n_pre` non-result messages (each after `gap` seconds) then a
     ResultMessage — models a healthy job that keeps the stream active."""
 
@@ -419,7 +461,7 @@ class _ActiveClient:
         return _gen()
 
 
-class _InnerTimeoutClient:
+class _InnerTimeoutClient(_BaseFakeClient):
     """receive_response() raises a genuine TimeoutError from inside the stream
     (not the watchdog deadline)."""
 
@@ -437,16 +479,19 @@ def _bare_runtime() -> ClaudeAgentRuntime:
     # _emit_message only touches _invocation_activity when an invocation id is
     # set on the contextvar; provide it so the test never passes by luck.
     runtime._invocation_activity = {}
+    runtime._active_invocations = set()
     return runtime
 
 
 @pytest.mark.asyncio
-async def test_receive_with_watchdog_raises_on_silent_stream():
+async def test_dispatch_watchdog_raises_on_silent_stream():
     runtime = _bare_runtime()
 
     start = time.monotonic()
     with pytest.raises(ClaudeStreamWatchdogStall):
-        await runtime._receive_with_watchdog(_SilentClient(), _WatchdogResultMessage, 0.05)
+        await runtime._run_dispatch_bounded(
+            lambda: _SilentClient(), "p", _WatchdogResultMessage, 0.05
+        )
     elapsed = time.monotonic() - start
 
     # The whole point: it must NOT hang on a silent subprocess.
@@ -454,7 +499,33 @@ async def test_receive_with_watchdog_raises_on_silent_stream():
 
 
 @pytest.mark.asyncio
-async def test_receive_with_watchdog_returns_result_on_active_stream():
+async def test_dispatch_watchdog_raises_on_connect_hang():
+    # The phase the receive-only watchdog missed: a wedge during connect, before
+    # any message ever arrives. The lifecycle watchdog must still fire.
+    runtime = _bare_runtime()
+
+    start = time.monotonic()
+    with pytest.raises(ClaudeStreamWatchdogStall):
+        await runtime._run_dispatch_bounded(
+            lambda: _ConnectHangClient(), "p", _WatchdogResultMessage, 0.05
+        )
+    assert time.monotonic() - start < 5.0
+
+
+@pytest.mark.asyncio
+async def test_dispatch_watchdog_raises_on_query_hang():
+    runtime = _bare_runtime()
+
+    start = time.monotonic()
+    with pytest.raises(ClaudeStreamWatchdogStall):
+        await runtime._run_dispatch_bounded(
+            lambda: _QueryHangClient(), "p", _WatchdogResultMessage, 0.05
+        )
+    assert time.monotonic() - start < 5.0
+
+
+@pytest.mark.asyncio
+async def test_dispatch_watchdog_returns_result_on_active_stream():
     # Total stream duration (5 messages * 0.1s = 0.5s) exceeds the window (0.3s),
     # but each inter-message gap (0.1s) is well under it — so a working stream
     # that keeps emitting must reset the deadline and never trip the watchdog.
@@ -462,38 +533,64 @@ async def test_receive_with_watchdog_returns_result_on_active_stream():
     runtime = _bare_runtime()
     result = _WatchdogResultMessage("done")
 
-    out = await runtime._receive_with_watchdog(
-        _ActiveClient(result, n_pre=4, gap=0.1), _WatchdogResultMessage, 0.3
+    out = await runtime._run_dispatch_bounded(
+        lambda: _ActiveClient(result, n_pre=4, gap=0.1), "p", _WatchdogResultMessage, 0.3
     )
 
     assert out is result
 
 
 @pytest.mark.asyncio
-async def test_receive_with_watchdog_disabled_skips_watchdog():
+async def test_dispatch_watchdog_disabled_skips_watchdog():
     # inactivity_timeout=None (role opt-out) must drain without a watchdog.
     runtime = _bare_runtime()
     result = _WatchdogResultMessage("done")
 
-    out = await runtime._receive_with_watchdog(
-        _ActiveClient(result, n_pre=2, gap=0.0), _WatchdogResultMessage, None
+    out = await runtime._run_dispatch_bounded(
+        lambda: _ActiveClient(result, n_pre=2, gap=0.0), "p", _WatchdogResultMessage, None
     )
 
     assert out is result
 
 
 @pytest.mark.asyncio
-async def test_receive_with_watchdog_reraises_inner_timeout():
+async def test_dispatch_watchdog_reraises_inner_timeout():
     # A genuine TimeoutError from inside the stream must stay a TimeoutError
     # (classified "timeout"), not be relabeled a watchdog stall.
     runtime = _bare_runtime()
 
     with pytest.raises(TimeoutError) as excinfo:
         # Generous window so the watchdog deadline itself never fires.
-        await runtime._receive_with_watchdog(_InnerTimeoutClient(), _WatchdogResultMessage, 30.0)
+        await runtime._run_dispatch_bounded(
+            lambda: _InnerTimeoutClient(), "p", _WatchdogResultMessage, 30.0
+        )
 
     assert not isinstance(excinfo.value, ClaudeStreamWatchdogStall)
     assert _classify_exception(excinfo.value) == "timeout"
+
+
+@pytest.mark.asyncio
+async def test_dispatch_watchdog_runs_on_connected_and_cleanup():
+    # The interactive path registers the live client via on_connected and must
+    # run the returned cleanup when the dispatch ends.
+    runtime = _bare_runtime()
+    result = _WatchdogResultMessage("done")
+    events: list[str] = []
+
+    def on_connected(client):
+        events.append("connected")
+        return lambda: events.append("cleanup")
+
+    out = await runtime._run_dispatch_bounded(
+        lambda: _ActiveClient(result, n_pre=1, gap=0.0),
+        "p",
+        _WatchdogResultMessage,
+        1.0,
+        on_connected=on_connected,
+    )
+
+    assert out is result
+    assert events == ["connected", "cleanup"]
 
 
 def test_watchdog_stall_classifies_as_watchdog_stall():

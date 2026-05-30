@@ -849,44 +849,73 @@ class ClaudeAgentRuntime(AgentRuntime):
 
         return output_type.model_validate(result_msg.structured_output)
 
-    async def _receive_with_watchdog(
-        self, client: Any, ResultMessage: type, inactivity_timeout: float | None
+    async def _run_dispatch_bounded(
+        self,
+        make_client: Callable[[], Any],
+        prompt: str,
+        ResultMessage: type,
+        inactivity_timeout: float | None,
+        *,
+        emit: bool = True,
+        on_connected: Callable[[Any], Callable[[], None] | None] | None = None,
     ) -> Any:
-        """Drain client.receive_response() under an inactivity watchdog.
+        """Connect, query, and drain a Claude CLI client under an inactivity
+        watchdog covering the WHOLE lifecycle — connect (``__aenter__``), query,
+        and receive.
 
-        Without a bound this await blocks forever when the CLI subprocess wedges
-        or exits without emitting a terminal ResultMessage (observed: bridge
-        idle 33min mid-dispatch). The deadline resets on every streamed message,
-        so a healthy job that keeps streaming is never interrupted; sustained
-        silence raises a watchdog stall the dispatcher records as a typed
-        failure and retries. `inactivity_timeout` of None disables the watchdog
-        (per-role opt-out for long, deliberately-silent suites)."""
-        result_msg = None
-        if inactivity_timeout is None:
-            async for msg in client.receive_response():
-                self._emit_message(msg)
-                if isinstance(msg, ResultMessage):
-                    result_msg = msg
+        A wedge in ANY phase becomes a typed watchdog stall instead of an
+        infinite hang. Bounding only the receive loop is not enough: dispatches
+        whose options the SDK negotiates over the control protocol (structured
+        output, can_use_tool, sandbox, MCP servers) can wedge during connect
+        before the first message ever arrives — observed as the bridge sitting
+        idle for 18min+ with no further log line. The deadline resets on every
+        streamed message, so a healthy job that keeps streaming is never
+        interrupted. ``inactivity_timeout`` of None disables the watchdog
+        (per-role opt-out for long, deliberately-silent suites).
+
+        ``on_connected(client)`` runs after connect for callers that must
+        register the live client (interactive injection); it may return a
+        cleanup callable run when the dispatch ends.
+        """
+        invocation_id = _current_invocation_var.get()
+        loop = asyncio.get_running_loop()
+
+        async def _run(cm: Any) -> Any:
+            result_msg = None
+            async with make_client() as client:
+                if invocation_id:
+                    self._active_invocations.add(invocation_id)
+                cleanup = on_connected(client) if on_connected is not None else None
+                try:
+                    await client.query(prompt)
+                    async for msg in client.receive_response():
+                        if cm is not None:
+                            cm.reschedule(loop.time() + inactivity_timeout)
+                        if emit:
+                            self._emit_message(msg)
+                        if isinstance(msg, ResultMessage):
+                            result_msg = msg
+                finally:
+                    if invocation_id:
+                        self._active_invocations.discard(invocation_id)
+                    if cleanup is not None:
+                        cleanup()
             return result_msg
 
-        loop = asyncio.get_running_loop()
+        if inactivity_timeout is None:
+            return await _run(None)
         try:
             async with asyncio.timeout(inactivity_timeout) as cm:
-                async for msg in client.receive_response():
-                    cm.reschedule(loop.time() + inactivity_timeout)
-                    self._emit_message(msg)
-                    if isinstance(msg, ResultMessage):
-                        result_msg = msg
+                return await _run(cm)
         except TimeoutError as exc:
             # Only our inactivity deadline counts as a watchdog stall; a genuine
-            # TimeoutError raised from inside the stream stays a plain timeout.
+            # TimeoutError raised from inside the dispatch stays a plain timeout.
             if cm.expired():
                 raise ClaudeStreamWatchdogStall(
-                    f"Claude CLI stream watchdog stalled: produced no output for "
-                    f"{inactivity_timeout:.0f}s"
+                    f"Claude CLI dispatch watchdog stalled: produced no output for "
+                    f"{inactivity_timeout:.0f}s (connect/query/stream)"
                 ) from exc
             raise
-        return result_msg
 
     async def _invoke_default(
         self,
@@ -898,19 +927,12 @@ class ClaudeAgentRuntime(AgentRuntime):
         """Ephemeral client, receive_response(). Original code path."""
         from claude_agent_sdk import ClaudeSDKClient
 
-        invocation_id = _current_invocation_var.get()
-        async with ClaudeSDKClient(options=options) as client:
-                if invocation_id:
-                    self._active_invocations.add(invocation_id)
-                await client.query(prompt)
-                try:
-                    result_msg = await self._receive_with_watchdog(
-                        client, ResultMessage, inactivity_timeout
-                    )
-                finally:
-                    if invocation_id:
-                        self._active_invocations.discard(invocation_id)
-        return result_msg
+        return await self._run_dispatch_bounded(
+            lambda: ClaudeSDKClient(options=options),
+            prompt,
+            ResultMessage,
+            inactivity_timeout,
+        )
 
     async def _invoke_interactive(
         self,
@@ -924,32 +946,30 @@ class ClaudeAgentRuntime(AgentRuntime):
         from claude_agent_sdk import ClaudeSDKClient
 
         feature_id = session_key.rsplit(":", 1)[-1] if session_key else None
-        invocation_id = _current_invocation_var.get()
 
-        async with ClaudeSDKClient(options=options) as client:
-            if invocation_id:
-                self._active_invocations.add(invocation_id)
+        def on_connected(client: Any) -> Callable[[], None]:
             if session_key:
                 self._active_clients[session_key] = client
                 self._pending_counts[session_key] = 1
             if feature_id:
                 self._feature_sessions[feature_id] = session_key
 
-            try:
-                await client.query(prompt)
-                result_msg = await self._receive_with_watchdog(
-                    client, ResultMessage, inactivity_timeout
-                )
-            finally:
-                if invocation_id:
-                    self._active_invocations.discard(invocation_id)
+            def cleanup() -> None:
                 if session_key:
                     self._active_clients.pop(session_key, None)
                     self._pending_counts.pop(session_key, None)
                 if feature_id:
                     self._feature_sessions.pop(feature_id, None)
 
-        return result_msg
+            return cleanup
+
+        return await self._run_dispatch_bounded(
+            lambda: ClaudeSDKClient(options=options),
+            prompt,
+            ResultMessage,
+            inactivity_timeout,
+            on_connected=on_connected,
+        )
 
     def _emit_message(self, msg: Any) -> None:
         invocation_id = _current_invocation_var.get()
@@ -1045,13 +1065,14 @@ class ClaudeAgentRuntime(AgentRuntime):
             model="claude-haiku-4-5-20251001",
             system_prompt="You are a conversation summarizer. Output only the summary.",
         )
-        async with ClaudeSDKClient(options=options) as client:
-            await client.query(prompt)
-            result = None
-            async for msg in client.receive_response():
-                if isinstance(msg, ResultMessage):
-                    result = msg
-            return result.result if result else ""
+        result = await self._run_dispatch_bounded(
+            lambda: ClaudeSDKClient(options=options),
+            prompt,
+            ResultMessage,
+            _stream_inactivity_timeout_s(),
+            emit=False,
+        )
+        return result.result if result else ""
 
     def _build_options(
         self,
