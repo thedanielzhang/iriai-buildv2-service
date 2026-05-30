@@ -503,6 +503,27 @@ def _inline_defs(schema: dict[str, Any]) -> dict[str, Any]:
     return _resolve(schema)
 
 
+def _neutralize_nested_claude_session_env() -> bool:
+    """Strip the ``CLAUDECODE`` nested-session marker from this process's env.
+
+    The bundled Claude Code CLI that the SDK spawns aborts with "Claude Code
+    cannot be launched inside another Claude Code session" whenever it sees
+    ``CLAUDECODE == "1"``. The SDK builds every subprocess environment as
+    ``{**os.environ, **options.env, ...}``, so an inherited ``CLAUDECODE=1``
+    propagates to every spawned CLI and crashes all dispatches. That marker is
+    present whenever this runtime is launched from inside a Claude Code agent
+    session — the documented operating model for the workflow runner — so strip
+    it here at the single env chokepoint to cover every spawn site at once.
+    Nothing in this codebase reads ``CLAUDECODE``.
+
+    Returns ``True`` if a ``CLAUDECODE == "1"`` marker was cleared.
+    """
+    if os.environ.get("CLAUDECODE") == "1":
+        del os.environ["CLAUDECODE"]
+        return True
+    return False
+
+
 class ClaudeAgentRuntime(AgentRuntime):
     """Agent runtime using ClaudeSDKClient for reliable structured output.
 
@@ -530,6 +551,15 @@ class ClaudeAgentRuntime(AgentRuntime):
             raise ImportError(
                 "ClaudeAgentRuntime requires the 'claude-agent-sdk' package. "
                 "Install it with: pip install claude-agent-sdk"
+            )
+        # The SDK splays os.environ into every CLI subprocess it spawns; an
+        # inherited CLAUDECODE=1 (set when this runtime runs inside a Claude Code
+        # session) trips the CLI's nested-session guard and aborts every
+        # dispatch. Clear it once here so all spawn paths are covered.
+        if _neutralize_nested_claude_session_env():
+            logger.info(
+                "Cleared inherited CLAUDECODE=1 so Claude Code CLI subprocesses "
+                "can launch (nested-session guard would abort every dispatch)"
             )
         self.session_store = session_store
         self.on_message = on_message

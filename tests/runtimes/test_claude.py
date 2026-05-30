@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -110,6 +111,43 @@ def test_build_options_normalizes_legacy_xhigh_effort_to_high(monkeypatch):
     options = runtime._build_options(role, workspace=None)
 
     assert options.effort == "high"
+
+
+def test_neutralize_clears_nested_claudecode_marker(monkeypatch):
+    from iriai_build_v2.runtimes.claude import _neutralize_nested_claude_session_env
+
+    monkeypatch.setenv("CLAUDECODE", "1")
+
+    cleared = _neutralize_nested_claude_session_env()
+
+    assert cleared is True
+    assert "CLAUDECODE" not in os.environ
+
+
+def test_neutralize_leaves_non_marker_value(monkeypatch):
+    from iriai_build_v2.runtimes.claude import _neutralize_nested_claude_session_env
+
+    monkeypatch.setenv("CLAUDECODE", "0")
+
+    cleared = _neutralize_nested_claude_session_env()
+
+    assert cleared is False
+    assert os.environ.get("CLAUDECODE") == "0"
+
+
+def test_runtime_init_clears_nested_claudecode_marker(monkeypatch):
+    # The runtime is, by design, launched from inside a Claude Code session,
+    # where CLAUDECODE=1 would otherwise crash every spawned CLI subprocess.
+    monkeypatch.setitem(
+        sys.modules,
+        "claude_agent_sdk",
+        SimpleNamespace(ClaudeAgentOptions=_FakeClaudeAgentOptions),
+    )
+    monkeypatch.setenv("CLAUDECODE", "1")
+
+    ClaudeAgentRuntime()
+
+    assert os.environ.get("CLAUDECODE") != "1"
 
 
 @pytest.mark.asyncio
