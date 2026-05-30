@@ -15,6 +15,7 @@ from iriai_build_v2.config import BUDGET_TIERS
 from iriai_build_v2.runtimes.claude import (
     ClaudeAgentRuntime,
     ClaudeStreamWatchdogStall,
+    StructuredOutputExhausted,
     _resolve_stream_inactivity_timeout,
     _stream_inactivity_timeout_s,
 )
@@ -598,6 +599,16 @@ def test_watchdog_stall_classifies_as_watchdog_stall():
         ClaudeStreamWatchdogStall("Claude CLI stream watchdog stalled: produced no output for 600s")
     )
     assert reason == "watchdog_stall"
+
+
+def test_structured_output_exhausted_contract_for_lane_reaper():
+    # The bugfix lane reaper (queue._exc_is_structured_output_exhausted) detects
+    # this failure by isinstance AND by class name to classify it terminal, so
+    # the type must stay a RuntimeError subclass named exactly this. Reverting
+    # the raise sites to a bare RuntimeError would silently restore the
+    # respawn/dead-stall loop, so lock the contract here.
+    assert issubclass(StructuredOutputExhausted, RuntimeError)
+    assert StructuredOutputExhausted.__name__ == "StructuredOutputExhausted"
 
 
 def test_resolve_stream_inactivity_timeout_respects_role_metadata(monkeypatch):

@@ -108,6 +108,17 @@ class ClaudeStreamWatchdogStall(RuntimeError):
     subprocess block the dispatch await forever."""
 
 
+class StructuredOutputExhausted(RuntimeError):
+    """The agent exhausted its structured-output retries without producing a
+    valid result (CLI subtype ``error_max_structured_output_retries``, or a
+    ``structured_output is None`` that survived a session-cycle retry). This is
+    NOT an infrastructure failure: re-cloning and re-running the identical
+    dispatch on unchanged input fails identically, so callers must treat it as
+    terminal-and-surfaced rather than infinitely recoverable. The distinct type
+    lets the bugfix lane reaper (queue._reap_lane_tasks) classify it terminal
+    instead of stamping the generic 'infrastructure'/'recoverable' kind."""
+
+
 def _default_effort_for_model(model: Any) -> str:
     if str(model or "").strip() == _DEFAULT_CLAUDE_MODEL:
         return _OPUS_4_8_EFFORT
@@ -826,7 +837,7 @@ class ClaudeAgentRuntime(AgentRuntime):
                     )],
                 )
 
-            raise RuntimeError(
+            raise StructuredOutputExhausted(
                 f"Claude could not produce valid {output_type.__name__} "
                 f"after multiple attempts. Last result: {result_msg.result}"
             )
@@ -848,7 +859,7 @@ class ClaudeAgentRuntime(AgentRuntime):
                 self._retry_depth -= 1
 
         if result_msg.structured_output is None:
-            raise RuntimeError(
+            raise StructuredOutputExhausted(
                 f"structured_output is None for {output_type.__name__} "
                 f"(session {session_key}) after retry. "
                 f"Result text: {repr(result_msg.result) if result_msg.result else 'empty'}"

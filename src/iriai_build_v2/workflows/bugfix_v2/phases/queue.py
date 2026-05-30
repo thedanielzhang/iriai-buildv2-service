@@ -133,6 +133,12 @@ _GLOBAL_CLUSTER_HINT_LIMIT = 3
 _EXECUTION_STATES = frozenset({"running", "recovering", "stalled", "strategy_pending"})
 _STRATEGY_STATUSES = frozenset({"pending", "decided", "applied"})
 _RECOVERABLE_FAILURE_KINDS = frozenset({"infrastructure", "report-task", "planning-task", "promotion-task", "strategy-task"})
+# A structured-output exhaustion (agent could not emit a valid result after the
+# CLI's own retries) is deliberately absent from both the counted and
+# recoverable sets so _classify_execution_failure returns "terminal": respawning
+# re-runs the identical dispatch on unchanged input and fails identically, so it
+# must surface as a blocked lane instead of an invisible respawn/await loop.
+_STRUCTURED_OUTPUT_EXHAUSTED_KIND = "structured_output_exhausted"
 _EXECUTION_RECOVERY_GRACE_SECONDS = 60
 _SOURCE_PUSH_ALREADY_AT_LOCAL_HEAD_FAILURE_RE = re.compile(
     r"^failed to push cloned repos to source: "
@@ -1035,6 +1041,25 @@ class BugflowQueuePhase(Phase):
         report = await _load_report(runner, feature, report_id)
         if not report:
             return
+        summary = _summarize_exception(exc)
+        if _exc_is_structured_output_exhausted(exc):
+            # Same non-convergence as the planning/lane paths: re-running the
+            # identical intake/triage dispatch exhausts structured output again.
+            # Surface as blocked instead of retrying invisibly.
+            await _block_report_with_notice(
+                runner,
+                feature,
+                report,
+                current_step="Blocked: report task could not produce structured output",
+                summary=summary,
+                notice=(
+                    f"{report.report_id}: a report task could not produce structured output "
+                    f"after repeated attempts, so I marked it blocked instead of re-running the "
+                    f"identical dispatch.\n\nReason: {summary}"
+                ),
+                terminal_reason_kind=_STRUCTURED_OUTPUT_EXHAUSTED_KIND,
+            )
+            return
         report.current_step = "Recovering after report task failure"
         report.terminal_reason_kind = ""
         report.terminal_reason_summary = ""
@@ -1047,7 +1072,7 @@ class BugflowQueuePhase(Phase):
             notice_key=notice_key,
             text=(
                 f"{report.report_id}: a recoverable report-task failure occurred, so I'm retrying automatically.\n\n"
-                f"Reason: {_summarize_exception(exc)}"
+                f"Reason: {summary}"
             ),
         )
 
@@ -1061,9 +1086,33 @@ class BugflowQueuePhase(Phase):
         notice_key: str = "",
     ) -> None:
         summary = _summarize_exception(exc)
+        # A structured-output exhaustion in the shared RCA planning pass is
+        # non-convergent: leaving the report "queued" re-dispatches the identical
+        # RootCauseAnalysis on unchanged input and fails identically (the
+        # 8ac124d6 dead-stall). Block it terminally — mirroring the
+        # planning-no-rca path — so it surfaces instead of looping invisibly.
+        # The terminal_reason_kind matches _classify_execution_failure's
+        # "terminal" fallthrough, so the blocked-report resurrection sweep keeps
+        # it blocked rather than reviving it.
+        exhausted = _exc_is_structured_output_exhausted(exc)
         for report_id in report_ids:
             report = await _load_report(runner, feature, report_id)
             if not report or report.status != "queued" or report.lane_id:
+                continue
+            if exhausted:
+                await _block_report_with_notice(
+                    runner,
+                    feature,
+                    report,
+                    current_step="Blocked: shared RCA planning could not produce structured output",
+                    summary=summary,
+                    notice=(
+                        f"{report.report_id}: the shared RCA planning pass could not produce "
+                        f"structured output after repeated attempts, so I marked it blocked "
+                        f"instead of re-running the identical analysis.\n\nReason: {summary}"
+                    ),
+                    terminal_reason_kind=_STRUCTURED_OUTPUT_EXHAUSTED_KIND,
+                )
                 continue
             report.current_step = "Recovering after shared RCA planning failure"
             report.updated_at = utc_now()
@@ -1386,12 +1435,17 @@ class BugflowQueuePhase(Phase):
                     if await _respawn_intent_is_applied(runner, feature, lane_id):
                         continue
                     continue
+                failure_kind = (
+                    _STRUCTURED_OUTPUT_EXHAUSTED_KIND
+                    if _exc_is_structured_output_exhausted(exc)
+                    else "infrastructure"
+                )
                 await self._handle_lane_task_failure(
                     runner,
                     feature,
                     lane,
                     exc,
-                    failure_kind="infrastructure",
+                    failure_kind=failure_kind,
                     expected_nonce=state.nonce if state else None,
                     notice_key=f"lane-task:{lane_id}:{state.nonce}" if state else "",
                 )
@@ -3760,6 +3814,37 @@ async def _touch_promotion_execution(
     queue.last_progress_at = progress_at or utc_now()
     await _save_promotion_queue(runner, feature, queue)
     return queue
+
+
+def _exc_is_structured_output_exhausted(exc: BaseException | None) -> bool:
+    """True when *exc* (or anything it wraps) is a structured-output exhaustion.
+
+    The runtime raises ``StructuredOutputExhausted`` (a RuntimeError subclass),
+    but compose's ``runner.parallel`` re-wraps task failures in an
+    ``ExceptionGroup``, so the reaper sees a wrapper. We unwrap exception groups
+    and the ``__cause__``/``__context__`` chain, and fall back to matching the
+    class name so detection survives even if the typed class cannot be imported
+    in this process (the runtime module pulls the Claude CLI SDK)."""
+    try:
+        from ....runtimes.claude import StructuredOutputExhausted as _SOE
+    except Exception:  # pragma: no cover - SDK absent / import guard
+        _SOE = None  # type: ignore[assignment]
+    seen: set[int] = set()
+
+    def _match(e: BaseException | None) -> bool:
+        if e is None or id(e) in seen:
+            return False
+        seen.add(id(e))
+        if _SOE is not None and isinstance(e, _SOE):
+            return True
+        if type(e).__name__ == "StructuredOutputExhausted":
+            return True
+        if isinstance(e, BaseExceptionGroup):
+            if any(_match(sub) for sub in e.exceptions):
+                return True
+        return _match(e.__cause__) or _match(e.__context__)
+
+    return _match(exc)
 
 
 def _classify_execution_failure(

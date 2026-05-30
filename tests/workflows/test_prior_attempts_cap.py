@@ -48,3 +48,18 @@ def test_format_prior_attempts_caps_chars():
     assert out.count("### Attempt") < 59  # not all included
     # Stays within the char budget plus at most one extra block of headroom.
     assert len(out) <= _MAX_PRIOR_ATTEMPTS_CHARS + 200_000
+
+
+def test_format_prior_attempts_trims_608kb_class_payload_below_window():
+    # Regression: a 608KB-class prior-attempts payload (well under the old
+    # 1_000_000-char cap) overflowed the model window and wedged the RCA agent
+    # in error_max_structured_output_retries. Each attempt body is repeated
+    # across three fields, so 50_000-char bodies make ~150KB blocks; ten of them
+    # is ~1.5MB raw. The tightened cap must trim this to a single recent block
+    # (~150KB), well below the window-danger size — this assertion FAILS if the
+    # cap is loosened back toward the 1M value that shipped the dead-stall.
+    out = _format_prior_attempts([_attempt(n, body="z" * 50_000) for n in range(1, 11)])
+    assert "Attempt 10 (BUG-10)" in out  # newest always kept
+    assert "older omitted" in out  # nothing silently dropped
+    assert len(out) < 300_000
+    assert _MAX_PRIOR_ATTEMPTS_CHARS <= 250_000  # lock the intent, not just the effect

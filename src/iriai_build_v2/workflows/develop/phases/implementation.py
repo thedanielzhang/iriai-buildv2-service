@@ -22991,11 +22991,18 @@ def _compute_fix_schedule(
 # The history is unbounded and accumulates across every retry; for stuck tasks
 # it grew to ~7MB / 170+ attempts, which exceeds the model's context window when
 # the offloaded file is read — so the dispatch can never complete and the task
-# wedges. Keep a generous window of the MOST RECENT attempts (the ones an agent
-# must avoid repeating); the complete history remains in the artifact store, and
-# the omitted count is surfaced so nothing is silently dropped.
+# wedges. Keep a window of the MOST RECENT attempts (the ones an agent must
+# avoid repeating); the complete history remains in the artifact store, and the
+# omitted count is surfaced so nothing is silently dropped.
+#
+# The 1_000_000-char cap was still too loose: a 608KB prior-attempts payload
+# (well under the cap) overflowed the ~200K-token window once the RCA prompt,
+# task context, and the model's own output budget were added — the RCA agent
+# exhausted structured-output retries (error_max_structured_output_retries) and
+# the lane wedged. ~200K chars (~50K tokens) leaves ample room for the rest of
+# the prompt plus reasoning and the structured result.
 _MAX_PRIOR_ATTEMPTS_SHOWN = 40
-_MAX_PRIOR_ATTEMPTS_CHARS = 1_000_000
+_MAX_PRIOR_ATTEMPTS_CHARS = 200_000
 
 
 def _format_prior_attempts(

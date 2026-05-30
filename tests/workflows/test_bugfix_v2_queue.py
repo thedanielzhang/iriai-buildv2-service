@@ -5477,3 +5477,186 @@ async def test_remove_worktree_root_quarantines_directory_not_empty_cleanup_race
     assert not worktree_root.parent.exists()
     assert renamed_targets
     assert renamed_targets[0].name.startswith("L-race-stale-")
+
+
+def test_structured_output_exhaustion_classifies_terminal_not_recoverable():
+    # Regression: a RootCauseAnalysis (or any non-fallback agent) that exhausts
+    # its structured-output retries used to be reaped as failure_kind=
+    # "infrastructure" -> "recoverable" -> _respawn_lane_from_latest_main, which
+    # re-runs the identical dispatch on unchanged input and fails identically =
+    # a silent respawn/await loop (the 8ac124d6 dead-stall). It must classify as
+    # terminal so the lane surfaces as blocked instead.
+    assert (
+        queue_module._classify_execution_failure(
+            failure_kind=queue_module._STRUCTURED_OUTPUT_EXHAUSTED_KIND
+        )
+        == "terminal"
+    )
+    # Contrast: a genuine infrastructure failure must STILL recover (the fix
+    # must not turn ordinary transient failures terminal).
+    assert (
+        queue_module._classify_execution_failure(failure_kind="infrastructure")
+        == "recoverable"
+    )
+
+
+def test_exc_is_structured_output_exhausted_unwraps_wrappers():
+    from iriai_build_v2.runtimes.claude import StructuredOutputExhausted
+
+    detect = queue_module._exc_is_structured_output_exhausted
+
+    soe = StructuredOutputExhausted("RootCauseAnalysis exhausted")
+    assert detect(soe) is True
+    # compose's runner.parallel re-wraps task failures in an ExceptionGroup.
+    assert detect(ExceptionGroup("lane", [RuntimeError("other"), soe])) is True
+    # `raise ... from ...` chains the original onto __cause__.
+    chained = RuntimeError("outer")
+    chained.__cause__ = soe
+    assert detect(chained) is True
+    # Name-match fallback covers the path where the typed class can't be
+    # imported in this process (a distinct class sharing the name).
+    class StructuredOutputExhausted(RuntimeError):  # noqa: F811 - intentional shadow
+        pass
+
+    assert detect(StructuredOutputExhausted("x")) is True
+    # Negatives: ordinary failures (which should stay recoverable) and None.
+    assert detect(RuntimeError("sandbox_binding_failed")) is False
+    assert detect(None) is False
+
+
+@pytest.mark.asyncio
+async def test_planning_failure_blocks_terminal_on_structured_output_exhaustion(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    # Regression for the 8ac124d6 dead-stall: the shared RCA planning pass
+    # (_plan_bug_groups) is reaped by _handle_planning_task_failure. When the
+    # RootCauseAnalysis exhausts structured-output retries it must block the
+    # report terminally (kind=structured_output_exhausted), NOT leave it
+    # "queued" — which re-dispatches the identical RCA forever.
+    from iriai_build_v2.runtimes.claude import StructuredOutputExhausted
+
+    feature = _feature()
+    artifacts = _Artifacts()
+    report = _report("BR-RCA-1", status="queued", category="bug", summary="RCA exhausted")
+    await artifacts.put(
+        queue_module.report_key(report.report_id), report.model_dump_json(), feature=feature
+    )
+    runner = SimpleNamespace(
+        artifacts=artifacts,
+        services={"slack_adapter": _Adapter()},
+        interaction_runtimes={"terminal": _RootRuntime()},
+    )
+
+    blocked: list[tuple[str, str]] = []
+    recovered: list[str] = []
+
+    async def _fake_block(_runner, _feature, rpt, *, current_step, summary, notice, terminal_reason_kind="blocked"):
+        rpt.status = "blocked"
+        blocked.append((rpt.report_id, terminal_reason_kind))
+
+    async def _fake_recover(_runner, _feature, rpt, *, notice_key="", text=""):
+        recovered.append(rpt.report_id)
+
+    monkeypatch.setattr(queue_module, "_block_report_with_notice", _fake_block)
+    monkeypatch.setattr(queue_module, "_post_execution_recovery_notice", _fake_recover)
+
+    phase = queue_module.BugflowQueuePhase()
+    await phase._handle_planning_task_failure(
+        runner,
+        feature,
+        [report.report_id],
+        StructuredOutputExhausted(
+            "Claude could not produce valid RootCauseAnalysis after multiple attempts"
+        ),
+    )
+
+    assert blocked == [(report.report_id, queue_module._STRUCTURED_OUTPUT_EXHAUSTED_KIND)]
+    assert recovered == []  # must NOT take the re-queue/retry path
+
+
+@pytest.mark.asyncio
+async def test_planning_failure_recovers_on_ordinary_exception(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    # Contrast: a genuine transient planning failure must STILL take the
+    # recoverable retry path (the fix must not turn every planning failure
+    # terminal).
+    feature = _feature()
+    artifacts = _Artifacts()
+    report = _report("BR-RCA-2", status="queued", category="bug", summary="transient")
+    await artifacts.put(
+        queue_module.report_key(report.report_id), report.model_dump_json(), feature=feature
+    )
+    runner = SimpleNamespace(
+        artifacts=artifacts,
+        services={"slack_adapter": _Adapter()},
+        interaction_runtimes={"terminal": _RootRuntime()},
+    )
+
+    blocked: list[str] = []
+    recovered: list[str] = []
+
+    async def _fake_block(_runner, _feature, rpt, *, current_step, summary, notice, terminal_reason_kind="blocked"):
+        blocked.append(rpt.report_id)
+
+    async def _fake_recover(_runner, _feature, rpt, *, notice_key="", text=""):
+        recovered.append(rpt.report_id)
+
+    monkeypatch.setattr(queue_module, "_block_report_with_notice", _fake_block)
+    monkeypatch.setattr(queue_module, "_post_execution_recovery_notice", _fake_recover)
+
+    phase = queue_module.BugflowQueuePhase()
+    await phase._handle_planning_task_failure(
+        runner,
+        feature,
+        [report.report_id],
+        RuntimeError("transient sandbox glitch"),
+    )
+
+    assert recovered == [report.report_id]
+    assert blocked == []
+
+
+@pytest.mark.asyncio
+async def test_report_task_failure_blocks_terminal_on_structured_output_exhaustion(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    # The intake/triage report-task reaper (_handle_report_task_failure)
+    # dispatches structured-output agents too; an exhaustion there must block
+    # terminally rather than clear terminal_reason_kind and retry forever.
+    from iriai_build_v2.runtimes.claude import StructuredOutputExhausted
+
+    feature = _feature()
+    artifacts = _Artifacts()
+    report = _report("BR-INTAKE-1", status="intake_pending", category="bug", summary="intake exhausted")
+    await artifacts.put(
+        queue_module.report_key(report.report_id), report.model_dump_json(), feature=feature
+    )
+    runner = SimpleNamespace(
+        artifacts=artifacts,
+        services={"slack_adapter": _Adapter()},
+        interaction_runtimes={"terminal": _RootRuntime()},
+    )
+
+    blocked: list[tuple[str, str]] = []
+    recovered: list[str] = []
+
+    async def _fake_block(_runner, _feature, rpt, *, current_step, summary, notice, terminal_reason_kind="blocked"):
+        blocked.append((rpt.report_id, terminal_reason_kind))
+
+    async def _fake_recover(_runner, _feature, rpt, *, notice_key="", text=""):
+        recovered.append(rpt.report_id)
+
+    monkeypatch.setattr(queue_module, "_block_report_with_notice", _fake_block)
+    monkeypatch.setattr(queue_module, "_post_execution_recovery_notice", _fake_recover)
+
+    phase = queue_module.BugflowQueuePhase()
+    await phase._handle_report_task_failure(
+        runner,
+        feature,
+        report.report_id,
+        StructuredOutputExhausted("structured_output is None for Observation after retry"),
+    )
+
+    assert blocked == [(report.report_id, queue_module._STRUCTURED_OUTPUT_EXHAUSTED_KIND)]
+    assert recovered == []
