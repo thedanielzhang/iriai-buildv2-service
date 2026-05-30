@@ -41,6 +41,16 @@ Claude Code's orchestration features instead of doing everything inline. These
 are *your* operating tools and are separate from the iriai `8ac124d6` workflow
 you are unblocking.
 
+Your own context window is the scarcest resource in a long multi-blocker
+session — running it down forces a premature handoff mid-investigation (it has
+already happened). So the overriding rule is **offload by default**: keep your
+own context for orchestration and decisions, and push every context-heavy
+operation — stack-dump analysis, log/journal RCA, code tracing, repros — to a
+subagent (or a parallel fan-out of them) that returns a short verdict. Do not
+read multi-MB logs, raw stack dumps, or large source files into your own
+transcript; have a subagent read them and report `file:line` + the decisive
+lines.
+
 - **Track every blocker as a task.** Open a `TaskCreate` entry per distinct
   blocker signature; mark it `in_progress` while you RCA and patch, and
   `completed` only after the fix is committed, pushed, and the workflow has
@@ -54,11 +64,34 @@ you are unblocking.
   log cursor stalls, so you re-enter the Required Loop instead of polling every
   turn. For coarse self-paced re-checks you may also drive this prompt with the
   `/loop` skill.
-- **Delegate heavy reading to subagents to protect your context.** The journals,
-  decision logs, and bridge output here are multi-MB. Do not read them wholesale
-  into your own context. Spawn subagents to read, search, and summarize, then act
-  on their short reports. Brief each subagent cold: give it the exact files, ids,
-  and the question, and ask for a concise answer.
+- **Offload by default — never pull large output into your own context.** This
+  is the rule that keeps you alive long enough to finish a multi-blocker
+  session. Use the `Agent` tool and act only on the subagent's short written
+  report. Delegate, at minimum:
+  - **Stack-dump analysis** (see "Hang Diagnosis — Stack-Dump First"). `py-spy` /
+    `faulthandler` / `sample` output is thousands of frames — have the subagent
+    run the dump command, read it, and return ONLY the smoking-gun frame(s)
+    (e.g. "main thread in `subprocess.run` at `sandbox.py:2700`, under
+    `allocate`"). Never print a raw dump into your transcript.
+  - **Log / journal RCA.** Bridge and dashboard logs are multi-MB; a subagent
+    greps the range and returns the pause reason, the ids, and the few
+    smoking-gun lines.
+  - **Code tracing** ("where is X / what calls Y / is the dispatch in-process or
+    a spawned subprocess?"): an `Explore` or `general-purpose` subagent returns
+    `file:line` refs.
+  - **Repros and regression-test drafts.** A subagent writes and runs the repro
+    and returns pass/fail plus the one decisive line.
+  - **Whole RCA threads.** For a cross-subsystem blocker hand the entire
+    RCA → repro → fix-design to ONE `general-purpose` subagent and act on its
+    report; fan several out in parallel for independent blockers.
+  Brief each subagent cold: exact files, ids, pids, commands, and the precise
+  question; demand a concise answer ("under 200 words"). You keep only
+  orchestration, decisions, the small final diffs, and git/commit operations.
+- **Keep watchers to one-line signals.** A `Monitor`/`Bash` background watcher
+  must emit only the lines you would act on (a tight `grep` for terminal and
+  progress signatures), never raw logs — a chatty or duplicate-spamming watcher
+  floods your context as badly as reading inline. If one starts repeating,
+  `TaskStop` it and re-arm a tighter one.
 
 `/api/bridge/status` has no "paused" flag — it reports process liveness
 (`running`) and a log cursor (`line_count`). Movement = `line_count` advancing;
@@ -184,6 +217,10 @@ bridge process, BEFORE writing any watchdog:
 - `sample <bridge_pid> 3` (no root) for native frames — enough to see whether
   the main thread is in `kevent` (idle loop) vs `subprocess.run` / `read` / a
   lock.
+
+Run the dump from a subagent and have it report only the blocking frame — the
+raw output is thousands of lines, so do not read it into your own context
+(offload by default).
 
 If the main thread is inside `subprocess.run` / `_run_command` / a blocking
 read/wait, the loop is FROZEN by a synchronous call. Fix: run that call
