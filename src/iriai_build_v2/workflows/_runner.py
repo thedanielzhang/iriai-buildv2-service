@@ -58,6 +58,14 @@ LIVENESS_TIMEOUT = 10 * 60  # 10 min of silence → agent is stuck
 LIVENESS_POLL_INTERVAL = 30  # check every 30s
 RESOLVE_MAX_RETRIES = 2  # retry stuck invocations up to 2 times
 RESOLVE_RETRY_BACKOFF = 15  # seconds between retries
+# When the liveness watchdog cancels a stalled invocation, the task may be parked
+# in an UNCANCELLABLE await — e.g. the Claude SDK's anyio-shielded teardown or a
+# blocking process.wait() on an already-exited CLI swallows the cancellation.
+# Awaiting it unconditionally re-hangs the watchdog and starves the very liveness
+# check meant to break the stall. Join only for a bounded interval, then abandon
+# the orphaned task; asyncio.wait always returns on schedule. Mirrors the
+# poll-and-abandon dispatch watchdog in runtimes/claude.py.
+_WATCHDOG_ABANDON_JOIN_SECONDS = 15
 RUNTIME_WORKSPACE_BINDING_KEY = "runtime_workspace_binding"
 _WRITE_PRODUCING_TOOLS = {"Write", "Edit", "MultiEdit", "NotebookEdit", "Bash"}
 
@@ -1142,10 +1150,13 @@ class TrackedWorkflowRunner(DefaultWorkflowRunner):
                         actor_name, idle,
                     )
                     resolve_task.cancel()
-                    try:
-                        await resolve_task
-                    except asyncio.CancelledError:
-                        pass
+                    # Bounded join, not an unconditional await: if the cancelled
+                    # task is wedged in an uncancellable await it would re-hang
+                    # this watchdog forever (the 8ac124d6 line-728 freeze).
+                    # asyncio.wait returns on schedule; the orphan is abandoned.
+                    await asyncio.wait(
+                        {resolve_task}, timeout=_WATCHDOG_ABANDON_JOIN_SECONDS
+                    )
                     raise AgentStalled(
                         f"{actor_name} produced no output for {idle:.0f}s"
                     )
@@ -1154,7 +1165,9 @@ class TrackedWorkflowRunner(DefaultWorkflowRunner):
         except asyncio.CancelledError:
             resolve_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
-                await resolve_task
+                await asyncio.wait(
+                    {resolve_task}, timeout=_WATCHDOG_ABANDON_JOIN_SECONDS
+                )
             raise
 
     async def _resolve_with_runtime(

@@ -901,3 +901,69 @@ async def test_tracked_runner_uses_effective_role_timeout_in_prompt(
     assert result == "ok"
     assert "75 minutes" in captured["prompt"]
     assert "10 minutes" not in captured["prompt"]
+
+
+@pytest.mark.asyncio
+async def test_watchdog_not_starved_by_uncancellable_resolve(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    # Regression for the 8ac124d6 line-728 freeze: when the watchdog cancels a
+    # stalled invocation whose task is parked in an UNCANCELLABLE await (the
+    # Claude SDK's anyio-shielded teardown / process.wait() on an already-exited
+    # CLI swallows the cancellation), it used to `await resolve_task`
+    # unconditionally and hang forever — never raising AgentStalled, never
+    # retrying. The fix bounds the join so the watchdog cannot be starved.
+    from iriai_build_v2.workflows import _runner as runner_mod
+
+    monkeypatch.setattr(runner_mod, "LIVENESS_POLL_INTERVAL", 0.01)
+    monkeypatch.setattr(runner_mod, "_WATCHDOG_ABANDON_JOIN_SECONDS", 0.05)
+    # No invocation-local live work, so the watchdog does not extend grace.
+    monkeypatch.setattr(
+        runner_mod.TrackedWorkflowRunner,
+        "invocation_has_live_work",
+        lambda self, invocation_id: False,
+    )
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _uncancellable_resolve(self, target_runtime, task, **kwargs):
+        del self, target_runtime, task, kwargs
+        started.set()
+        # Swallow cancellation to model a teardown that cannot be cancelled:
+        # resolve_task never completes when the watchdog cancels it.
+        while not release.is_set():
+            try:
+                await asyncio.sleep(0.02)
+            except asyncio.CancelledError:
+                pass
+
+    monkeypatch.setattr(
+        runner_mod.TrackedWorkflowRunner,
+        "_resolve_with_runtime",
+        _uncancellable_resolve,
+    )
+
+    runner = _runner(_FakeRuntime())
+    tracker = _LivenessTracker(_FakeRuntime())
+    tracker.last_activity = time.monotonic() - (LIVENESS_TIMEOUT + 5)
+
+    try:
+        # Pre-fix this would hang; wait_for(3s) bounds the test. The fix makes
+        # AgentStalled raise within ~_WATCHDOG_ABANDON_JOIN_SECONDS.
+        with pytest.raises(AgentStalled):
+            await asyncio.wait_for(
+                runner._resolve_with_watchdog(
+                    _ask("stuck"),
+                    tracker,
+                    _FakeRuntime(),
+                    invocation_id="inv-stuck",
+                    runtime_kwargs={},
+                    actor_name="stuck",
+                    liveness_timeout=0,
+                ),
+                timeout=3.0,
+            )
+    finally:
+        release.set()
+        await asyncio.sleep(0.05)  # let the abandoned task unwind
