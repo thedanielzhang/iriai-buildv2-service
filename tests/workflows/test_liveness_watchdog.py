@@ -843,7 +843,7 @@ async def test_claude_default_invocation_reports_live_work(
 
     async def _invoke():
         async with runtime.bind_invocation("inv-default", None):
-            return await runtime._invoke_default(object(), "prompt", _FakeResultMessage)
+            return await runtime._invoke_default(object(), "prompt", _FakeResultMessage, 600.0)
 
     task = asyncio.create_task(_invoke())
     await started.wait()

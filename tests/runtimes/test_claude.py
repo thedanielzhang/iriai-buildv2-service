@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -10,7 +12,13 @@ import pytest
 from iriai_compose.actors import Role
 
 from iriai_build_v2.config import BUDGET_TIERS
-from iriai_build_v2.runtimes.claude import ClaudeAgentRuntime
+from iriai_build_v2.runtimes.claude import (
+    ClaudeAgentRuntime,
+    ClaudeStreamWatchdogStall,
+    _resolve_stream_inactivity_timeout,
+    _stream_inactivity_timeout_s,
+)
+from iriai_build_v2.workflows.develop.execution.runtime_client import _classify_exception
 
 
 class _FakeClaudeAgentOptions:
@@ -372,3 +380,164 @@ def test_bound_write_role_rejects_unproved_binding(
     runtime = object.__new__(ClaudeAgentRuntime)
     with pytest.raises(RuntimeError, match=message):
         runtime._build_options(role, workspace=SimpleNamespace(path=str(cwd)))
+
+
+class _WatchdogResultMessage:
+    def __init__(self, result: str = "ok"):
+        self.result = result
+
+
+class _SilentClient:
+    """receive_response() yields nothing and never ends — models a wedged CLI
+    subprocess that stays alive but produces no output."""
+
+    def receive_response(self):
+        async def _gen():
+            await asyncio.sleep(3600)
+            yield None  # pragma: no cover - never reached
+
+        return _gen()
+
+
+class _ActiveClient:
+    """Streams `n_pre` non-result messages (each after `gap` seconds) then a
+    ResultMessage — models a healthy job that keeps the stream active."""
+
+    def __init__(self, result_msg, *, n_pre: int = 4, gap: float = 0.1):
+        self._result_msg = result_msg
+        self._n_pre = n_pre
+        self._gap = gap
+
+    def receive_response(self):
+        async def _gen():
+            for _ in range(self._n_pre):
+                if self._gap:
+                    await asyncio.sleep(self._gap)
+                yield object()
+            yield self._result_msg
+
+        return _gen()
+
+
+class _InnerTimeoutClient:
+    """receive_response() raises a genuine TimeoutError from inside the stream
+    (not the watchdog deadline)."""
+
+    def receive_response(self):
+        async def _gen():
+            raise TimeoutError("provider timed out")
+            yield None  # pragma: no cover - unreachable, makes this a generator
+
+        return _gen()
+
+
+def _bare_runtime() -> ClaudeAgentRuntime:
+    runtime = object.__new__(ClaudeAgentRuntime)
+    runtime.on_message = None
+    # _emit_message only touches _invocation_activity when an invocation id is
+    # set on the contextvar; provide it so the test never passes by luck.
+    runtime._invocation_activity = {}
+    return runtime
+
+
+@pytest.mark.asyncio
+async def test_receive_with_watchdog_raises_on_silent_stream():
+    runtime = _bare_runtime()
+
+    start = time.monotonic()
+    with pytest.raises(ClaudeStreamWatchdogStall):
+        await runtime._receive_with_watchdog(_SilentClient(), _WatchdogResultMessage, 0.05)
+    elapsed = time.monotonic() - start
+
+    # The whole point: it must NOT hang on a silent subprocess.
+    assert elapsed < 5.0
+
+
+@pytest.mark.asyncio
+async def test_receive_with_watchdog_returns_result_on_active_stream():
+    # Total stream duration (5 messages * 0.1s = 0.5s) exceeds the window (0.3s),
+    # but each inter-message gap (0.1s) is well under it — so a working stream
+    # that keeps emitting must reset the deadline and never trip the watchdog.
+    # A naive total-runtime cap would fire at 0.3s and fail this test.
+    runtime = _bare_runtime()
+    result = _WatchdogResultMessage("done")
+
+    out = await runtime._receive_with_watchdog(
+        _ActiveClient(result, n_pre=4, gap=0.1), _WatchdogResultMessage, 0.3
+    )
+
+    assert out is result
+
+
+@pytest.mark.asyncio
+async def test_receive_with_watchdog_disabled_skips_watchdog():
+    # inactivity_timeout=None (role opt-out) must drain without a watchdog.
+    runtime = _bare_runtime()
+    result = _WatchdogResultMessage("done")
+
+    out = await runtime._receive_with_watchdog(
+        _ActiveClient(result, n_pre=2, gap=0.0), _WatchdogResultMessage, None
+    )
+
+    assert out is result
+
+
+@pytest.mark.asyncio
+async def test_receive_with_watchdog_reraises_inner_timeout():
+    # A genuine TimeoutError from inside the stream must stay a TimeoutError
+    # (classified "timeout"), not be relabeled a watchdog stall.
+    runtime = _bare_runtime()
+
+    with pytest.raises(TimeoutError) as excinfo:
+        # Generous window so the watchdog deadline itself never fires.
+        await runtime._receive_with_watchdog(_InnerTimeoutClient(), _WatchdogResultMessage, 30.0)
+
+    assert not isinstance(excinfo.value, ClaudeStreamWatchdogStall)
+    assert _classify_exception(excinfo.value) == "timeout"
+
+
+def test_watchdog_stall_classifies_as_watchdog_stall():
+    reason = _classify_exception(
+        ClaudeStreamWatchdogStall("Claude CLI stream watchdog stalled: produced no output for 600s")
+    )
+    assert reason == "watchdog_stall"
+
+
+def test_resolve_stream_inactivity_timeout_respects_role_metadata(monkeypatch):
+    monkeypatch.delenv("IRIAI_CLAUDE_STREAM_INACTIVITY_TIMEOUT_S", raising=False)
+
+    base = dict(name="impl", prompt="x", tools=["Read"])
+
+    # No metadata → env default (600s).
+    assert _resolve_stream_inactivity_timeout(Role(**base)) == 600.0
+    # liveness_timeout=0 → disabled (opt-out for long silent suites).
+    assert (
+        _resolve_stream_inactivity_timeout(Role(**base, metadata={"liveness_timeout": 0}))
+        is None
+    )
+    # Positive override is used verbatim.
+    assert (
+        _resolve_stream_inactivity_timeout(Role(**base, metadata={"liveness_timeout": 1800}))
+        == 1800.0
+    )
+    # Garbage / negative → env default.
+    assert (
+        _resolve_stream_inactivity_timeout(Role(**base, metadata={"liveness_timeout": "nope"}))
+        == 600.0
+    )
+    assert (
+        _resolve_stream_inactivity_timeout(Role(**base, metadata={"liveness_timeout": -5}))
+        == 600.0
+    )
+
+
+def test_stream_inactivity_timeout_rejects_non_finite_env(monkeypatch):
+    # A typo'd 'inf' must NOT silently disable the watchdog.
+    monkeypatch.setenv("IRIAI_CLAUDE_STREAM_INACTIVITY_TIMEOUT_S", "inf")
+    assert _stream_inactivity_timeout_s() == 600.0
+    monkeypatch.setenv("IRIAI_CLAUDE_STREAM_INACTIVITY_TIMEOUT_S", "0")
+    assert _stream_inactivity_timeout_s() == 600.0
+    monkeypatch.setenv("IRIAI_CLAUDE_STREAM_INACTIVITY_TIMEOUT_S", "abc")
+    assert _stream_inactivity_timeout_s() == 600.0
+    monkeypatch.setenv("IRIAI_CLAUDE_STREAM_INACTIVITY_TIMEOUT_S", "45")
+    assert _stream_inactivity_timeout_s() == 45.0

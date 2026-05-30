@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import contextvars
 import json
 import logging
+import math
 import os
 from contextlib import asynccontextmanager
 from collections.abc import Callable, Mapping
@@ -43,6 +45,60 @@ _OPUS_4_8_EFFORT = "high"
 _CLAUDE_CLI_EFFORT_ALIASES = {
     "xhigh": "high",
 }
+
+_CLAUDE_STREAM_INACTIVITY_TIMEOUT_ENV = "IRIAI_CLAUDE_STREAM_INACTIVITY_TIMEOUT_S"
+_DEFAULT_CLAUDE_STREAM_INACTIVITY_TIMEOUT_S = 600.0
+
+
+def _stream_inactivity_timeout_s() -> float:
+    """Default seconds the Claude CLI response stream may be silent before the
+    adapter treats the subprocess as wedged. The deadline resets on every
+    streamed message, so this bounds inactivity, not total runtime — a healthy
+    long-running job that keeps streaming is never interrupted. Env-overridable
+    for restart-free tuning. Non-finite/non-positive values fall back to the
+    default so a typo'd 'inf' can't silently disable the watchdog."""
+    raw = os.environ.get(_CLAUDE_STREAM_INACTIVITY_TIMEOUT_ENV)
+    if raw is None:
+        return _DEFAULT_CLAUDE_STREAM_INACTIVITY_TIMEOUT_S
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return _DEFAULT_CLAUDE_STREAM_INACTIVITY_TIMEOUT_S
+    if value > 0 and math.isfinite(value):
+        return value
+    return _DEFAULT_CLAUDE_STREAM_INACTIVITY_TIMEOUT_S
+
+
+def _resolve_stream_inactivity_timeout(role: Any) -> float | None:
+    """Effective inactivity-watchdog window for a role, or None to disable it.
+
+    Mirrors the per-role contract the liveness watchdog enforces in
+    workflows/_runner.py: role.metadata['liveness_timeout'] == 0 disables the
+    watchdog (roles running long, deliberately-silent suites opt out), a
+    positive value overrides, and absence falls back to the env default. Without
+    this, the adapter watchdog would kill the very roles that disabled the outer
+    one."""
+    metadata = getattr(role, "metadata", None) or {}
+    raw = metadata.get("liveness_timeout")
+    if raw is None:
+        return _stream_inactivity_timeout_s()
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return _stream_inactivity_timeout_s()
+    if value == 0:
+        return None
+    if value < 0 or not math.isfinite(value):
+        return _stream_inactivity_timeout_s()
+    return value
+
+
+class ClaudeStreamWatchdogStall(RuntimeError):
+    """Claude CLI response stream produced no output within the inactivity
+    window. The name and message carry 'watchdog'/'produced no output' so
+    runtime_client._classify_exception maps it to the 'watchdog_stall' terminal
+    reason (infra-retryable) rather than letting a wedged or silently-exited
+    subprocess block the dispatch await forever."""
 
 
 def _default_effort_for_model(model: Any) -> str:
@@ -669,12 +725,15 @@ class ClaudeAgentRuntime(AgentRuntime):
             self._interactive_roles and role.name in self._interactive_roles
         )
 
+        inactivity_timeout = _resolve_stream_inactivity_timeout(role)
         if use_interactive:
             result_msg = await self._invoke_interactive(
-                options, effective_prompt, session_key, ResultMessage
+                options, effective_prompt, session_key, ResultMessage, inactivity_timeout
             )
         else:
-            result_msg = await self._invoke_default(options, effective_prompt, ResultMessage)
+            result_msg = await self._invoke_default(
+                options, effective_prompt, ResultMessage, inactivity_timeout
+            )
 
         if result_msg is None:
             raise RuntimeError("Claude query completed without a result message")
@@ -790,7 +849,52 @@ class ClaudeAgentRuntime(AgentRuntime):
 
         return output_type.model_validate(result_msg.structured_output)
 
-    async def _invoke_default(self, options: Any, prompt: str, ResultMessage: type) -> Any:
+    async def _receive_with_watchdog(
+        self, client: Any, ResultMessage: type, inactivity_timeout: float | None
+    ) -> Any:
+        """Drain client.receive_response() under an inactivity watchdog.
+
+        Without a bound this await blocks forever when the CLI subprocess wedges
+        or exits without emitting a terminal ResultMessage (observed: bridge
+        idle 33min mid-dispatch). The deadline resets on every streamed message,
+        so a healthy job that keeps streaming is never interrupted; sustained
+        silence raises a watchdog stall the dispatcher records as a typed
+        failure and retries. `inactivity_timeout` of None disables the watchdog
+        (per-role opt-out for long, deliberately-silent suites)."""
+        result_msg = None
+        if inactivity_timeout is None:
+            async for msg in client.receive_response():
+                self._emit_message(msg)
+                if isinstance(msg, ResultMessage):
+                    result_msg = msg
+            return result_msg
+
+        loop = asyncio.get_running_loop()
+        try:
+            async with asyncio.timeout(inactivity_timeout) as cm:
+                async for msg in client.receive_response():
+                    cm.reschedule(loop.time() + inactivity_timeout)
+                    self._emit_message(msg)
+                    if isinstance(msg, ResultMessage):
+                        result_msg = msg
+        except TimeoutError as exc:
+            # Only our inactivity deadline counts as a watchdog stall; a genuine
+            # TimeoutError raised from inside the stream stays a plain timeout.
+            if cm.expired():
+                raise ClaudeStreamWatchdogStall(
+                    f"Claude CLI stream watchdog stalled: produced no output for "
+                    f"{inactivity_timeout:.0f}s"
+                ) from exc
+            raise
+        return result_msg
+
+    async def _invoke_default(
+        self,
+        options: Any,
+        prompt: str,
+        ResultMessage: type,
+        inactivity_timeout: float | None,
+    ) -> Any:
         """Ephemeral client, receive_response(). Original code path."""
         from claude_agent_sdk import ClaudeSDKClient
 
@@ -799,19 +903,22 @@ class ClaudeAgentRuntime(AgentRuntime):
                 if invocation_id:
                     self._active_invocations.add(invocation_id)
                 await client.query(prompt)
-                result_msg = None
                 try:
-                    async for msg in client.receive_response():
-                        self._emit_message(msg)
-                        if isinstance(msg, ResultMessage):
-                            result_msg = msg
+                    result_msg = await self._receive_with_watchdog(
+                        client, ResultMessage, inactivity_timeout
+                    )
                 finally:
                     if invocation_id:
                         self._active_invocations.discard(invocation_id)
         return result_msg
 
     async def _invoke_interactive(
-        self, options: Any, prompt: str, session_key: str | None, ResultMessage: type
+        self,
+        options: Any,
+        prompt: str,
+        session_key: str | None,
+        ResultMessage: type,
+        inactivity_timeout: float | None,
     ) -> Any:
         """Like default path but registers client for mid-stream injection."""
         from claude_agent_sdk import ClaudeSDKClient
@@ -830,11 +937,9 @@ class ClaudeAgentRuntime(AgentRuntime):
 
             try:
                 await client.query(prompt)
-                result_msg = None
-                async for msg in client.receive_response():
-                    self._emit_message(msg)
-                    if isinstance(msg, ResultMessage):
-                        result_msg = msg
+                result_msg = await self._receive_with_watchdog(
+                    client, ResultMessage, inactivity_timeout
+                )
             finally:
                 if invocation_id:
                     self._active_invocations.discard(invocation_id)
