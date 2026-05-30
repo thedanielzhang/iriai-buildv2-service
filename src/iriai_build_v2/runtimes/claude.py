@@ -48,6 +48,13 @@ _CLAUDE_CLI_EFFORT_ALIASES = {
 
 _CLAUDE_STREAM_INACTIVITY_TIMEOUT_ENV = "IRIAI_CLAUDE_STREAM_INACTIVITY_TIMEOUT_S"
 _DEFAULT_CLAUDE_STREAM_INACTIVITY_TIMEOUT_S = 600.0
+# How often the watchdog regains control to check for a stall. The dispatch runs
+# in a child task polled with asyncio.wait(timeout=...): unlike asyncio.timeout
+# (which fires by cancelling the task and therefore cannot interrupt an
+# uncancellable await — a blocking subprocess wait in an executor thread, or an
+# anyio-shielded scope), asyncio.wait always returns on schedule, so the watchdog
+# can never be starved by a wedged dispatch.
+_WATCHDOG_POLL_SECONDS = 15.0
 
 
 def _stream_inactivity_timeout_s() -> float:
@@ -868,8 +875,17 @@ class ClaudeAgentRuntime(AgentRuntime):
         whose options the SDK negotiates over the control protocol (structured
         output, can_use_tool, sandbox, MCP servers) can wedge during connect
         before the first message ever arrives — observed as the bridge sitting
-        idle for 18min+ with no further log line. The deadline resets on every
-        streamed message, so a healthy job that keeps streaming is never
+        idle for 18min+ with no further log line.
+
+        The dispatch runs in a CHILD task polled with asyncio.wait(timeout=...)
+        rather than under asyncio.timeout. asyncio.timeout fires by cancelling
+        the running task, which a wedged dispatch can swallow: the observed hang
+        sat in an uncancellable await (a blocking subprocess wait4 in an executor
+        thread / an anyio-shielded scope), so the cancellation never landed and
+        the watchdog never tripped. asyncio.wait always returns on schedule, so
+        on a genuine inactivity stall we abandon the child task (cancel without
+        awaiting) and raise — the watchdog can never be starved. The deadline
+        resets on every streamed message, so a healthy streaming job is never
         interrupted. ``inactivity_timeout`` of None disables the watchdog
         (per-role opt-out for long, deliberately-silent suites).
 
@@ -879,8 +895,10 @@ class ClaudeAgentRuntime(AgentRuntime):
         """
         invocation_id = _current_invocation_var.get()
         loop = asyncio.get_running_loop()
+        last_activity = loop.time()
 
-        async def _run(cm: Any) -> Any:
+        async def _run() -> Any:
+            nonlocal last_activity
             result_msg = None
             async with make_client() as client:
                 if invocation_id:
@@ -889,8 +907,7 @@ class ClaudeAgentRuntime(AgentRuntime):
                 try:
                     await client.query(prompt)
                     async for msg in client.receive_response():
-                        if cm is not None:
-                            cm.reschedule(loop.time() + inactivity_timeout)
+                        last_activity = loop.time()
                         if emit:
                             self._emit_message(msg)
                         if isinstance(msg, ResultMessage):
@@ -903,19 +920,25 @@ class ClaudeAgentRuntime(AgentRuntime):
             return result_msg
 
         if inactivity_timeout is None:
-            return await _run(None)
+            return await _run()
+
+        task = asyncio.create_task(_run())
+        poll = min(inactivity_timeout, _WATCHDOG_POLL_SECONDS)
         try:
-            async with asyncio.timeout(inactivity_timeout) as cm:
-                return await _run(cm)
-        except TimeoutError as exc:
-            # Only our inactivity deadline counts as a watchdog stall; a genuine
-            # TimeoutError raised from inside the dispatch stays a plain timeout.
-            if cm.expired():
-                raise ClaudeStreamWatchdogStall(
-                    f"Claude CLI dispatch watchdog stalled: produced no output for "
-                    f"{inactivity_timeout:.0f}s (connect/query/stream)"
-                ) from exc
-            raise
+            while True:
+                done, _ = await asyncio.wait({task}, timeout=poll)
+                if task in done:
+                    return task.result()
+                if loop.time() - last_activity >= inactivity_timeout:
+                    raise ClaudeStreamWatchdogStall(
+                        f"Claude CLI dispatch watchdog stalled: produced no output "
+                        f"for {inactivity_timeout:.0f}s (connect/query/stream)"
+                    )
+        finally:
+            if not task.done():
+                # Abandon: request cancellation but do not await it — the wedged
+                # await may be uncancellable, and we must not re-hang here.
+                task.cancel()
 
     async def _invoke_default(
         self,
