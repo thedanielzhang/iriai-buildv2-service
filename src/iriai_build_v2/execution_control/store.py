@@ -2501,6 +2501,60 @@ class ExecutionControlStore:
                 ),
             }
 
+    async def get_latest_terminal_dispatch_outcome(
+        self,
+        *,
+        feature_id: str,
+        dag_sha256: str,
+        group_idx: int,
+        task_id: str,
+    ) -> dict[str, Any] | None:
+        """Return the LATEST terminal dispatch attempt for a task (any terminal
+        status), so resume can derive infra-retry state from the most recent
+        outcome instead of replaying every historical failure.
+
+        A task whose newest terminal attempt ``succeeded`` has its earlier
+        infra-failures SUPERSEDED — they must not be replayed or counted against
+        the durable retry budget (which would burn it instantly into a spurious
+        RootCauseAnalysis). Returns ``{status, idempotency_key,
+        dispatch_attempt_id}`` for the newest terminal row, or ``None`` when the
+        task has no terminal attempt yet. The ``updated_at DESC, id DESC`` tie-break
+        matches ``get_pending_durable_merge_patch_evidence`` so "latest" is
+        deterministic; a later FAILURE correctly outranks an earlier success.
+        """
+
+        async with self._connection() as conn:
+            record = await conn.fetchrow(
+                """
+                SELECT *
+                FROM execution_journal_rows
+                WHERE feature_id = $1
+                  AND entry_type = 'dispatch_attempt'
+                  AND dag_sha256 = $2
+                  AND group_idx = $3
+                  AND task_id = $4
+                  AND status = ANY($5::text[])
+                ORDER BY updated_at DESC NULLS LAST, id DESC
+                LIMIT 1
+                """,
+                feature_id,
+                dag_sha256,
+                int(group_idx),
+                task_id,
+                list(DISPATCHER_TERMINAL_STATUSES),
+            )
+            if record is None:
+                return None
+            attempt = self._row_from_record(record)
+            outcome = _json_dict(attempt.payload.get("dispatch_outcome"))
+            return {
+                "status": attempt.status or outcome.get("status"),
+                "idempotency_key": (
+                    outcome.get("idempotency_key") or attempt.idempotency_key
+                ),
+                "dispatch_attempt_id": attempt.id,
+            }
+
     async def get_runtime_failure_context(
         self,
         *,

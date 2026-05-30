@@ -19841,7 +19841,53 @@ async def _implement_dag(
                     + handover_context
                 )
 
-                for attempt in range(TASK_INFRA_MAX_RETRIES + 1):
+                # ── L1: don't replay infra-failures superseded by a later success ──
+                # The per-attempt idempotency key is deterministic
+                # (...:{task.id}:a{attempt}:implementation), so on strict
+                # execution-control resume attempt 0 is permanently pinned to the
+                # FIRST historical failure record and re-dispatched as a replay.
+                # If the journal's NEWEST terminal dispatch for this task already
+                # SUCCEEDED, replaying the older failures would burn the infra-retry
+                # budget instantly and trigger a spurious RootCauseAnalysis. Honor
+                # that success directly by dispatching ONLY its attempt index — the
+                # dispatcher replays the persisted (possibly legitimately-partial)
+                # result via its idempotency key. A latest terminal FAILURE (no
+                # later success) leaves the full strict retry range untouched.
+                _attempt_range = range(TASK_INFRA_MAX_RETRIES + 1)
+                _ec_store = _execution_control_store_for_runner(runner)
+                if _ec_store is not None:
+                    try:
+                        _latest_terminal = await _ec_store.get_latest_terminal_dispatch_outcome(
+                            feature_id=feature.id,
+                            dag_sha256=dag_sha256 or "unknown-dag",
+                            group_idx=group_idx,
+                            task_id=t.id,
+                        )
+                    except Exception:
+                        _latest_terminal = None
+                        logger.debug(
+                            "get_latest_terminal_dispatch_outcome failed for %s; "
+                            "using full infra-retry range",
+                            t.id,
+                            exc_info=True,
+                        )
+                    if _latest_terminal and _latest_terminal.get("status") == "succeeded":
+                        _succeeded_key = str(_latest_terminal.get("idempotency_key") or "")
+                        _key_match = re.search(
+                            rf":{re.escape(t.id)}:a(\d+):", _succeeded_key
+                        )
+                        if _key_match is not None:
+                            _succeeded_attempt = int(_key_match.group(1))
+                            logger.info(
+                                "Task %s has a superseding successful dispatch in the "
+                                "journal (attempt %d) — honoring it instead of "
+                                "replaying stale infra-failures",
+                                t.id,
+                                _succeeded_attempt,
+                            )
+                            _attempt_range = (_succeeded_attempt,)
+
+                for attempt in _attempt_range:
                     sandbox_task_binding: RuntimeSandboxTaskBinding | None = None
                     try:
                         await _log_feature_event(

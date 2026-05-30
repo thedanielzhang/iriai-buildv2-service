@@ -1766,6 +1766,98 @@ async def test_pool_path_acquires_connection_and_transaction() -> None:
     assert any("pg_advisory_xact_lock" in call[0] for call in conn.calls)
 
 
+def _terminal_attempt_row(
+    *,
+    row_id: int,
+    status: str,
+    idempotency_key: str,
+    hour: int,
+) -> dict[str, Any]:
+    """A minimal dispatch_attempt journal row for get_latest_terminal_* tests."""
+    return {
+        "id": row_id,
+        "feature_id": FEATURE_ID,
+        "idempotency_key": idempotency_key,
+        "entry_type": "dispatch_attempt",
+        "status": status,
+        "dispatcher_state": status,
+        "actor": "dispatcher",
+        "runtime": "claude",
+        "dag_sha256": "dag-sha-test",
+        "group_idx": 78,
+        "task_id": "TASK-9-3",
+        "request_digest": f"digest-{row_id}",
+        "payload": json.dumps({
+            "dispatch_outcome": {"status": status, "idempotency_key": idempotency_key},
+        }),
+        "requires_legacy_visibility": False,
+        "projection_mode": "legacy_compatibility",
+        "created_at": datetime(2026, 5, 28, hour, tzinfo=timezone.utc),
+        "updated_at": datetime(2026, 5, 28, hour, tzinfo=timezone.utc),
+    }
+
+
+@pytest.mark.asyncio
+async def test_get_latest_terminal_dispatch_outcome_honors_superseding_success() -> None:
+    # The 8ac124d6 root cause: stale failures followed by a later SUCCESS. The
+    # newest terminal outcome must be the success, so resume stops replaying the
+    # superseded failures.
+    conn = _FakeConnection()
+    store = _store(_FakePool(conn))
+    conn.typed_rows.append(_terminal_attempt_row(
+        row_id=66, status="failed",
+        idempotency_key="dispatch:feature-typed:g78:t0:TASK-9-3:a0:implementation", hour=1))
+    conn.typed_rows.append(_terminal_attempt_row(
+        row_id=110, status="incomplete",
+        idempotency_key="dispatch:feature-typed:g78:t0:TASK-9-3:a5:implementation", hour=2))
+    conn.typed_rows.append(_terminal_attempt_row(
+        row_id=135, status="succeeded",
+        idempotency_key="dispatch:feature-typed:g78:t0:TASK-9-3:a6:implementation", hour=3))
+
+    result = await store.get_latest_terminal_dispatch_outcome(
+        feature_id=FEATURE_ID, dag_sha256="dag-sha-test", group_idx=78, task_id="TASK-9-3",
+    )
+
+    assert result is not None
+    assert result["status"] == "succeeded"
+    assert result["idempotency_key"].endswith(":a6:implementation")
+    assert result["dispatch_attempt_id"] == 135
+
+
+@pytest.mark.asyncio
+async def test_get_latest_terminal_dispatch_outcome_returns_latest_failure_without_success() -> None:
+    # A latest terminal FAILURE (no later success) must NOT look like a success,
+    # so strict retry/RCA behavior is preserved for genuinely-current failures.
+    conn = _FakeConnection()
+    store = _store(_FakePool(conn))
+    conn.typed_rows.append(_terminal_attempt_row(
+        row_id=66, status="failed",
+        idempotency_key="dispatch:feature-typed:g78:t0:TASK-9-3:a0:implementation", hour=1))
+    conn.typed_rows.append(_terminal_attempt_row(
+        row_id=105, status="failed",
+        idempotency_key="dispatch:feature-typed:g78:t0:TASK-9-3:a4:implementation", hour=2))
+
+    result = await store.get_latest_terminal_dispatch_outcome(
+        feature_id=FEATURE_ID, dag_sha256="dag-sha-test", group_idx=78, task_id="TASK-9-3",
+    )
+
+    assert result is not None
+    assert result["status"] == "failed"
+    assert result["dispatch_attempt_id"] == 105
+
+
+@pytest.mark.asyncio
+async def test_get_latest_terminal_dispatch_outcome_none_when_no_attempts() -> None:
+    conn = _FakeConnection()
+    store = _store(_FakePool(conn))
+
+    result = await store.get_latest_terminal_dispatch_outcome(
+        feature_id=FEATURE_ID, dag_sha256="dag-sha-test", group_idx=78, task_id="TASK-9-3",
+    )
+
+    assert result is None
+
+
 @pytest.mark.asyncio
 async def test_insert_race_revalidates_existing_typed_digest() -> None:
     module = _execution_control_module()
