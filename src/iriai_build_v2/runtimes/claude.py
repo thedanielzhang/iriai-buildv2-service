@@ -64,6 +64,16 @@ _WATCHDOG_POLL_SECONDS = 15.0
 # invocation_has_live_work() flips False and the outer watchdog stops extending
 # grace and can finally cancel/abandon the wedged dispatch.
 _LIVE_WORK_STALE_SECONDS = 120.0
+# The inactivity watchdog resets its deadline on EVERY streamed message, so a
+# dispatch that streams a message every few hundred ms can never trip it — even
+# when those messages are not progress but a repeated provider error (the
+# observed 8ac124d6 wedge: the bundled CLI's StructuredOutput Stop-hook fighting
+# an unmodifiable extended-thinking block, looping on 400 invalid_request_error
+# while re-uploading the whole prompt each time). We count consecutive
+# provider-error assistant messages with no intervening progress and abandon the
+# dispatch once the loop is unmistakable. Small enough to stop the cost bleed
+# fast; large enough to ride out a brief transient burst the model recovers from.
+_API_ERROR_STORM_THRESHOLD = 8
 
 
 def _stream_inactivity_timeout_s() -> float:
@@ -115,6 +125,41 @@ class ClaudeStreamWatchdogStall(RuntimeError):
     runtime_client._classify_exception maps it to the 'watchdog_stall' terminal
     reason (infra-retryable) rather than letting a wedged or silently-exited
     subprocess block the dispatch await forever."""
+
+
+class ClaudeApiErrorStorm(ClaudeStreamWatchdogStall):
+    """The CLI streamed a runaway loop of provider-error assistant messages with
+    no intervening progress (e.g. a StructuredOutput Stop-hook fighting an
+    unmodifiable extended-thinking block: repeated 400 ``invalid_request_error``).
+    Such a loop emits a message every few hundred ms, so it keeps resetting the
+    inactivity deadline and the time-based watchdog can never catch it. Subclassing
+    ClaudeStreamWatchdogStall — and carrying 'watchdog'/'produced no output' in the
+    message — reuses the 'watchdog_stall' terminal classification (infra-retryable)
+    and the force-kill/abandon teardown, so the dispatch self-recovers on retry."""
+
+
+def _is_provider_error_assistant_message(msg: Any) -> bool:
+    """True when an assistant message is a provider/API error rather than forward
+    progress. Detects both the SDK's structured ``error`` field
+    (AssistantMessageError, e.g. 'invalid_request'/'rate_limit'/'server_error')
+    and the text form the bundled CLI emits ('API Error: <code> {... _error ...}').
+    Used to break a fast error/retry loop that would otherwise reset the
+    inactivity watchdog on every streamed message."""
+    if getattr(msg, "error", None) is not None:
+        return True
+    content = getattr(msg, "content", None)
+    if isinstance(content, list):
+        for block in content:
+            text = getattr(block, "text", None)
+            # Match only the CLI's own error format (the whole text block IS the
+            # error, e.g. 'API Error: 400 {"type":"invalid_request_error",...}'),
+            # via startswith — never an agent that merely quotes an error string
+            # mid-investigation, which would falsely abort a healthy dispatch.
+            if isinstance(text, str):
+                low = text.strip().lower()
+                if low.startswith("api error:") and "_error" in low:
+                    return True
+    return False
 
 
 class StructuredOutputExhausted(RuntimeError):
@@ -916,6 +961,8 @@ class ClaudeAgentRuntime(AgentRuntime):
         register the live client (interactive injection); it may return a
         cleanup callable run when the dispatch ends.
         """
+        from claude_agent_sdk.types import AssistantMessage
+
         invocation_id = _current_invocation_var.get()
         loop = asyncio.get_running_loop()
         last_activity = loop.time()
@@ -924,6 +971,7 @@ class ClaudeAgentRuntime(AgentRuntime):
         async def _run() -> Any:
             nonlocal last_activity, connected_client
             result_msg = None
+            consecutive_provider_errors = 0
             async with make_client() as client:
                 connected_client = client
                 if invocation_id:
@@ -938,7 +986,26 @@ class ClaudeAgentRuntime(AgentRuntime):
                         if emit:
                             self._emit_message(msg)
                         if isinstance(msg, ResultMessage):
+                            consecutive_provider_errors = 0
                             result_msg = msg
+                        elif isinstance(msg, AssistantMessage):
+                            if _is_provider_error_assistant_message(msg):
+                                consecutive_provider_errors += 1
+                                if (
+                                    consecutive_provider_errors
+                                    >= _API_ERROR_STORM_THRESHOLD
+                                ):
+                                    raise ClaudeApiErrorStorm(
+                                        "Claude CLI dispatch watchdog: provider "
+                                        "error storm — "
+                                        f"{consecutive_provider_errors} consecutive "
+                                        "API errors with no progress; produced no "
+                                        "usable output. A fast error/retry loop kept "
+                                        "resetting the inactivity deadline, so "
+                                        "abandon the wedged dispatch."
+                                    )
+                            else:
+                                consecutive_provider_errors = 0
                 finally:
                     if invocation_id:
                         self._active_invocations.pop(invocation_id, None)
@@ -1217,5 +1284,15 @@ class ClaudeAgentRuntime(AgentRuntime):
                 "type": "json_schema",
                 "schema": _inline_defs(output_type.model_json_schema()),
             }
+            # The bundled CLI enforces structured output with a Stop hook that
+            # re-forces the turn until the model calls StructuredOutput. With
+            # extended/interleaved thinking on (effort=high), the model ends a turn
+            # on a thinking block; the forced continuation then mutates that block
+            # and the API rejects it (400 "thinking blocks in the latest assistant
+            # message cannot be modified"), looping forever. The CLI exposes no knob
+            # to disable that Stop hook, so disable thinking for structured-output
+            # dispatches (→ --max-thinking-tokens 0) to remove the thinking block
+            # the forced continuation cannot carry.
+            options.thinking = {"type": "disabled"}
 
         return options

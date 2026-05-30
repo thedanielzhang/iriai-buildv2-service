@@ -11,12 +11,15 @@ from types import SimpleNamespace
 
 import pytest
 from iriai_compose.actors import Role
+from pydantic import BaseModel
 
 from iriai_build_v2.config import BUDGET_TIERS
 from iriai_build_v2.runtimes.claude import (
     ClaudeAgentRuntime,
+    ClaudeApiErrorStorm,
     ClaudeStreamWatchdogStall,
     StructuredOutputExhausted,
+    _API_ERROR_STORM_THRESHOLD,
     _LIVE_WORK_STALE_SECONDS,
     _resolve_stream_inactivity_timeout,
     _stream_inactivity_timeout_s,
@@ -704,3 +707,153 @@ def test_stream_inactivity_timeout_rejects_non_finite_env(monkeypatch):
     assert _stream_inactivity_timeout_s() == 600.0
     monkeypatch.setenv("IRIAI_CLAUDE_STREAM_INACTIVITY_TIMEOUT_S", "45")
     assert _stream_inactivity_timeout_s() == 45.0
+
+
+# ── Structured-output dispatches must disable extended thinking ──
+# The bundled CLI's StructuredOutput Stop-hook fights an unmodifiable
+# extended-thinking block, looping forever on 400 invalid_request_error. Disabling
+# thinking (→ --max-thinking-tokens 0) for structured-output dispatches removes the
+# thinking block the forced continuation cannot carry.
+
+
+class _StructuredOut(BaseModel):
+    value: int
+
+
+def test_build_options_disables_thinking_for_structured_output(monkeypatch):
+    monkeypatch.setitem(
+        sys.modules,
+        "claude_agent_sdk",
+        SimpleNamespace(ClaudeAgentOptions=_FakeClaudeAgentOptions),
+    )
+    runtime = object.__new__(ClaudeAgentRuntime)
+    role = Role(name="rca", prompt="Find the bug", tools=["Read"])
+
+    options = runtime._build_options(role, workspace=None, output_type=_StructuredOut)
+
+    assert options.thinking == {"type": "disabled"}
+    assert options.output_format["type"] == "json_schema"
+    # Effort is a separate CLI flag and must be untouched.
+    assert options.effort == "high"
+
+
+def test_build_options_keeps_thinking_enabled_without_structured_output(monkeypatch):
+    monkeypatch.setitem(
+        sys.modules,
+        "claude_agent_sdk",
+        SimpleNamespace(ClaudeAgentOptions=_FakeClaudeAgentOptions),
+    )
+    runtime = object.__new__(ClaudeAgentRuntime)
+    role = Role(name="rca", prompt="Find the bug", tools=["Read"])
+
+    options = runtime._build_options(role, workspace=None)
+
+    # Free-form dispatches keep the default (thinking unset → CLI default on).
+    assert getattr(options, "thinking", None) is None
+
+
+# ── A fast provider-error/retry loop must be abandoned ──
+# It streams a message every few hundred ms, so it keeps resetting the inactivity
+# deadline and the time-based watchdog alone can never catch it.
+
+
+class _ProviderErrorStormClient(_BaseFakeClient):
+    """receive_response() yields provider-error assistant messages forever —
+    models the StructuredOutput Stop-hook vs unmodifiable-thinking-block 400 loop
+    that the time-based watchdog cannot catch because each message resets it."""
+
+    def receive_response(self):
+        from claude_agent_sdk.types import AssistantMessage
+
+        async def _gen():
+            while True:
+                yield AssistantMessage(content=[], model="m", error="invalid_request")
+
+        return _gen()
+
+
+class _TextProviderErrorStormClient(_BaseFakeClient):
+    """Same loop, but the error arrives as text the bundled CLI prints rather than
+    the SDK's structured ``error`` field."""
+
+    def receive_response(self):
+        from claude_agent_sdk.types import AssistantMessage, TextBlock
+
+        async def _gen():
+            while True:
+                yield AssistantMessage(
+                    content=[
+                        TextBlock(
+                            text='API Error: 400 {"type":"invalid_request_error",'
+                            '"message":"thinking blocks cannot be modified"}'
+                        )
+                    ],
+                    model="m",
+                )
+
+        return _gen()
+
+
+class _RecoveringErrorClient(_BaseFakeClient):
+    """A few provider errors, each followed by a genuine progress message that
+    resets the counter, then a ResultMessage — a transient blip the model recovers
+    from, which must NOT be abandoned."""
+
+    def __init__(self, result_msg):
+        self._result = result_msg
+
+    def receive_response(self):
+        from claude_agent_sdk.types import AssistantMessage, TextBlock
+
+        async def _gen():
+            for _ in range(_API_ERROR_STORM_THRESHOLD + 3):
+                yield AssistantMessage(content=[], model="m", error="invalid_request")
+                yield AssistantMessage(
+                    content=[TextBlock(text="continuing the investigation")],
+                    model="m",
+                )
+            yield self._result
+
+        return _gen()
+
+
+@pytest.mark.asyncio
+async def test_dispatch_aborts_on_provider_error_storm():
+    runtime = _bare_runtime()
+    start = time.monotonic()
+    # Large inactivity timeout so the TIME-based watchdog cannot be what fires —
+    # the storm detector must catch it on message content instead.
+    with pytest.raises(ClaudeApiErrorStorm):
+        await runtime._run_dispatch_bounded(
+            lambda: _ProviderErrorStormClient(), "p", _WatchdogResultMessage, 30.0
+        )
+    assert time.monotonic() - start < 5.0
+
+
+@pytest.mark.asyncio
+async def test_dispatch_aborts_on_text_provider_error_storm():
+    runtime = _bare_runtime()
+    with pytest.raises(ClaudeApiErrorStorm):
+        await runtime._run_dispatch_bounded(
+            lambda: _TextProviderErrorStormClient(), "p", _WatchdogResultMessage, 30.0
+        )
+
+
+@pytest.mark.asyncio
+async def test_dispatch_does_not_abort_when_errors_interleaved_with_progress():
+    runtime = _bare_runtime()
+    result = _WatchdogResultMessage("done")
+    out = await runtime._run_dispatch_bounded(
+        lambda: _RecoveringErrorClient(result), "p", _WatchdogResultMessage, 30.0
+    )
+    assert out is result
+
+
+def test_provider_error_storm_classifies_as_watchdog_stall():
+    exc = ClaudeApiErrorStorm(
+        "Claude CLI dispatch watchdog: provider error storm — produced no usable output"
+    )
+    # Subclass of the time-based stall, classified into the same infra-retryable
+    # terminal reason so the dispatch self-recovers on retry.
+    assert isinstance(exc, ClaudeStreamWatchdogStall)
+    assert _classify_exception(exc) == "watchdog_stall"
