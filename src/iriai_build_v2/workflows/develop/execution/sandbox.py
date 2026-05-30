@@ -101,12 +101,16 @@ def _agent_shared_group() -> tuple[str, int | None]:
 
 
 _ALLOCATION_LOCKS_GUARD = threading.Lock()
-_ALLOCATION_LOCKS: dict[str, threading.RLock] = {}
+# Per-feature allocation lock. asyncio.Lock (not threading.RLock) so it can be
+# held across an `await` (the off-loop clone) while still serializing concurrent
+# same-feature allocations: a reentrant RLock is owned per-thread, so a second
+# allocate on the same event-loop thread would slip straight through.
+_ALLOCATION_LOCKS: dict[str, asyncio.Lock] = {}
 
 
-def _allocation_lock_for_feature(feature_slug: str) -> threading.RLock:
+def _allocation_lock_for_feature(feature_slug: str) -> asyncio.Lock:
     with _ALLOCATION_LOCKS_GUARD:
-        return _ALLOCATION_LOCKS.setdefault(feature_slug, threading.RLock())
+        return _ALLOCATION_LOCKS.setdefault(feature_slug, asyncio.Lock())
 
 
 class SandboxError(RuntimeError):
@@ -127,6 +131,29 @@ class SandboxCaptureError(SandboxError):
 
 class SandboxIsolationError(SandboxCaptureError):
     """Sandbox contents attempted to escape the declared repo roots."""
+
+
+_SANDBOX_COMMAND_TIMEOUT_ENV = "IRIAI_SANDBOX_COMMAND_TIMEOUT_S"
+_DEFAULT_SANDBOX_COMMAND_TIMEOUT_S = 1200.0  # 20 min — generous for large --no-local clones
+
+
+def _sandbox_command_timeout_s() -> float:
+    """Hard timeout for a single sandbox subprocess (git) command.
+
+    Without it, subprocess.run blocks forever on a wedged git command. Because
+    allocate() runs the clone synchronously, a hung git froze the whole asyncio
+    event loop (no watchdog/Slack/other workflow could run). Env-overridable;
+    non-finite/non-positive values fall back to the default."""
+    raw = os.environ.get(_SANDBOX_COMMAND_TIMEOUT_ENV)
+    if raw is None:
+        return _DEFAULT_SANDBOX_COMMAND_TIMEOUT_S
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return _DEFAULT_SANDBOX_COMMAND_TIMEOUT_S
+    if 0 < value < 1e9:
+        return value
+    return _DEFAULT_SANDBOX_COMMAND_TIMEOUT_S
 
 
 class SandboxReleaseError(SandboxError):
@@ -407,7 +434,7 @@ class SandboxRunner:
         sandbox_root = self._sandbox_root(spec)
         lock = _allocation_lock_for_feature(feature_slug)
 
-        with lock:
+        async with lock:
             self._validate_sandbox_allocation_path(sandbox_root)
             manifest_path = sandbox_root / _MANIFEST_NAME
             if manifest_path.exists():
@@ -479,7 +506,13 @@ class SandboxRunner:
                             f"repo destination already exists before manifest: {repo_root}"
                         )
                     repo_root.parent.mkdir(parents=True, exist_ok=True)
-                    self._git_text(
+                    # Run the clone off the event loop. `git clone --no-local` of
+                    # a large repo takes minutes (or wedges); calling it inline
+                    # froze the entire asyncio loop (no watchdog/Slack/other
+                    # workflow could run) — the bridge "hang". to_thread keeps the
+                    # loop responsive; the per-command timeout bounds a wedged git.
+                    await asyncio.to_thread(
+                        self._git_text,
                         sandbox_root,
                         ["clone", "--no-local", str(source_resolved), str(repo_root)],
                     )
@@ -2697,14 +2730,21 @@ class SandboxRunner:
         if env:
             merged_env.update({str(key): str(value) for key, value in env.items()})
         if self.command_runner is None:
-            completed = subprocess.run(
-                list(argv),
-                cwd=str(cwd),
-                env=merged_env,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                check=False,
-            )
+            try:
+                completed = subprocess.run(
+                    list(argv),
+                    cwd=str(cwd),
+                    env=merged_env,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                    timeout=_sandbox_command_timeout_s(),
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise SandboxError(
+                    f"command timed out after {_sandbox_command_timeout_s():.0f}s: "
+                    f"{' '.join(map(str, argv))} in {cwd}"
+                ) from exc
             return CommandResult(
                 returncode=completed.returncode,
                 stdout=completed.stdout,

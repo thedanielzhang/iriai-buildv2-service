@@ -1451,3 +1451,31 @@ def test_empty_patch_persists_empty_capture_result(tmp_path: Path) -> None:
     assert artifact_writer.records[0][1] == b""
     assert len(store.patch_summaries) == 1
     assert lease.status == "captured"
+
+
+def test_sandbox_command_timeout_env_parsing(monkeypatch) -> None:
+    monkeypatch.delenv("IRIAI_SANDBOX_COMMAND_TIMEOUT_S", raising=False)
+    assert (
+        sandbox_module._sandbox_command_timeout_s()
+        == sandbox_module._DEFAULT_SANDBOX_COMMAND_TIMEOUT_S
+    )
+    monkeypatch.setenv("IRIAI_SANDBOX_COMMAND_TIMEOUT_S", "30")
+    assert sandbox_module._sandbox_command_timeout_s() == 30.0
+    for bad in ("inf", "0", "-5", "nope"):
+        monkeypatch.setenv("IRIAI_SANDBOX_COMMAND_TIMEOUT_S", bad)
+        assert (
+            sandbox_module._sandbox_command_timeout_s()
+            == sandbox_module._DEFAULT_SANDBOX_COMMAND_TIMEOUT_S
+        )
+
+
+def test_run_command_raises_sandbox_error_on_timeout(tmp_path: Path, monkeypatch) -> None:
+    # A wedged git command must not block forever (it ran on the event loop and
+    # froze the whole bridge). The per-command timeout converts it to a
+    # SandboxError -> sandbox_binding_failed -> the dispatcher advances.
+    source = tmp_path / "canonical" / "app"
+    init_repo(source)
+    runner = runner_for(tmp_path, source)
+    monkeypatch.setenv("IRIAI_SANDBOX_COMMAND_TIMEOUT_S", "0.5")
+    with pytest.raises(sandbox_module.SandboxError, match="timed out"):
+        runner._run_command(tmp_path, ["sleep", "5"])
