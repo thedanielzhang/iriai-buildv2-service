@@ -115,29 +115,36 @@ survives restarts (re-arm it yourself after every restart — see "Restart
 Discipline"):
 
 ```bash
-# STUCK = no workflow progress AND no live, streaming dispatch CLI for ~3 min.
-# Progress = a dispatch CLI is alive with a fresh transcript, OR a workflow
-# (not-noise) log line appeared. Continuous counter (NOT a one-shot `-eq N`,
-# which misses the wedge if the CLI was alive at that single tick). Does not
-# exit on a transient not-running — a blind gap is worse than a redundant line.
+# STALL = NO dispatch CLI alive AND no workflow progress for ~5 min.
+# TRUST an alive dispatch CLI as healthy. A thinking-heavy run writes its
+# transcript in BURSTS and can be quiet for minutes while genuinely streaming —
+# so a "fresh transcript / recent log" requirement FALSE-ALARMS on healthy work
+# (observed). Wedged/exited CLIs are recovered in-process now (the inactivity
+# watchdog at its deadline for a hung-alive CLI; the dead-pid fast-path in
+# seconds for an exited-but-orphaned one), so the EXTERNAL monitor only needs to
+# catch the genuine "no dispatch + not progressing" stall. Continuous counter
+# (NOT a one-shot `-eq N`). Does not exit on a transient not-running.
 B=http://127.0.0.1:51234
-sig='Group [0-9]|sealed|checkpoint|dispatch (result|completed|failed)|capture_patch|patch summary|provider error storm|retrying once with thinking|StructuredOutput'
-prev=0; quiet=0
+sig='Group [0-9]|sealed|checkpoint|dispatch (result|completed|failed)|capture_patch|patch summary|provider error storm|retrying once with thinking|StructuredOutput|watchdog: CLI subprocess|Abandoning'
+prev=0; quiet=0; down=0
 while true; do
   run=$(curl -s --max-time 8 $B/api/bridge/status | python3 -c 'import sys,json;print(json.load(sys.stdin).get("running"))' 2>/dev/null || echo "?")
-  if [ "$run" != "True" ]; then echo "BRIDGE_NOT_RUNNING — restart+resume+RE-ARM (do NOT assume healthy)"; sleep 30; continue; fi
+  if [ "$run" != "True" ]; then [ "$down" = 0 ] && echo "BRIDGE_NOT_RUNNING — restart+resume+RE-ARM (do NOT assume healthy)"; down=1; sleep 30; continue; fi
+  down=0
   cur=$(curl -s --max-time 8 $B/api/bridge/status | python3 -c 'import sys,json;print(json.load(sys.stdin)["line_count"])' 2>/dev/null || echo "$prev")
-  cli=$(pgrep -f "_bundled/claude --output-format" | head -1)
-  # live dispatch = a CLI alive AND a feature-repo transcript touched in <90s
-  fresh=$(find ~/.claude/projects -path '*-repos*' -name '*.jsonl' -newermt '-90 seconds' 2>/dev/null | head -1)
+  cli=$(pgrep -f "_bundled/claude --output-format" | head -1)   # alive dispatch = healthy
   work=$(curl -s --max-time 8 "$B/api/bridge/logs?after=$prev" | python3 -c "import sys,json,re;d=json.load(sys.stdin);print(sum(1 for x in (d.get('lines') or []) if re.search(r'''$sig''',str(x),re.I)))" 2>/dev/null || echo 0)
   prev=$cur
-  if { [ -n "$cli" ] && [ -n "$fresh" ]; } || [ "${work:-0}" != "0" ]; then quiet=0
-  else quiet=$((quiet+1)); fi
-  if [ "$quiet" -ge 6 ]; then echo "STUCK ~3min: no workflow progress, no live dispatch (lc=$cur cli=[${cli:-none}])"; quiet=0; fi
+  if [ -n "$cli" ] || [ "${work:-0}" != "0" ]; then quiet=0; else quiet=$((quiet+1)); fi
+  if [ "$quiet" -ge 10 ]; then echo "STALL ~5min: no dispatch CLI and no workflow progress (lc=$cur) — self-recovery may have failed; stack-dump + journal, do NOT trust line_count"; quiet=0; fi
   sleep 30
 done
 ```
+
+To confirm an ALIVE-but-suspect dispatch CLI is really working (vs wedged), check
+its API socket is moving bytes — `nettop -n -p <pid> -l 2 -s 15` — and/or its
+session transcript mtime is advancing; a low-CPU CLI with bytes flowing is a
+healthy long job (don't kill it).
 
 On a STUCK alert, do NOT trust `line_count` — stack-dump the bridge (see "Hang
 Diagnosis") and check the journal/transcript for the in-flight dispatch, then run
