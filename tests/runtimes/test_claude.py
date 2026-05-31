@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import signal
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -930,3 +931,43 @@ async def test_invoke_disables_thinking_only_after_a_storm(monkeypatch):
     # First attempt thinking ON; only the post-storm fallback turns it OFF.
     assert build_thinking_flags == [False, True]
     assert dispatches["n"] == 2
+
+
+class _DeadCliClient(_BaseFakeClient):
+    """receive_response() never ends (orphaned stream) while exposing a CLI
+    subprocess pid that has already exited and been reaped — models the macOS
+    ThreadedChildWatcher orphan: the loop sits idle awaiting a closed stream that
+    will never yield. The watchdog must abandon it fast on the dead pid, not wait
+    out the full inactivity deadline."""
+
+    def __init__(self, dead_pid: int):
+        self._transport = SimpleNamespace(_process=SimpleNamespace(pid=dead_pid))
+
+    def receive_response(self):
+        async def _gen():
+            await asyncio.sleep(3600)
+            yield None  # pragma: no cover - never reached
+
+        return _gen()
+
+
+@pytest.mark.asyncio
+async def test_dispatch_abandons_fast_when_cli_pid_already_exited(monkeypatch):
+    # The recurring bridge hang: the CLI exits but receive_response never ends.
+    # The dead-pid fast-path must abandon in ~seconds, NOT wait out the (here
+    # large) inactivity deadline.
+    monkeypatch.setattr("iriai_build_v2.runtimes.claude._WATCHDOG_POLL_SECONDS", 0.02)
+    monkeypatch.setattr("iriai_build_v2.runtimes.claude._CLI_EXIT_GRACE_SECONDS", 0.04)
+
+    proc = subprocess.Popen(["true"])
+    proc.wait()  # reaped → its pid is now dead (os.kill -> ProcessLookupError)
+    dead_pid = proc.pid
+
+    runtime = _bare_runtime()
+    start = time.monotonic()
+    with pytest.raises(ClaudeStreamWatchdogStall):
+        # 30s inactivity timeout: the inactivity path must NOT be what fires.
+        await runtime._run_dispatch_bounded(
+            lambda: _DeadCliClient(dead_pid), "p", _WatchdogResultMessage, 30.0
+        )
+    assert time.monotonic() - start < 5.0

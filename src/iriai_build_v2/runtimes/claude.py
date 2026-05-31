@@ -74,6 +74,15 @@ _LIVE_WORK_STALE_SECONDS = 120.0
 # dispatch once the loop is unmistakable. Small enough to stop the cost bleed
 # fast; large enough to ride out a brief transient burst the model recovers from.
 _API_ERROR_STORM_THRESHOLD = 8
+# When a dispatch's CLI subprocess has EXITED but its receive_response() stream
+# never ended (the macOS ThreadedChildWatcher orphan: the child is reaped, the
+# pid is gone, yet the SDK's stream/process.wait never surfaces the result or
+# closes), the task hangs awaiting a dead stream. A normal completion finishes
+# the task the instant the CLI exits, so a pid that stays dead this long while
+# the task is still running is orphaned — abandon it after this grace instead of
+# waiting out the full (600s) inactivity deadline. This is the recurring
+# "bridge hang": loop idle in the selector, no dispatch CLI, no terminal row.
+_CLI_EXIT_GRACE_SECONDS = 10.0
 
 
 def _stream_inactivity_timeout_s() -> float:
@@ -117,6 +126,25 @@ def _resolve_stream_inactivity_timeout(role: Any) -> float | None:
     if value < 0 or not math.isfinite(value):
         return _stream_inactivity_timeout_s()
     return value
+
+
+def _pid_has_exited(pid: int) -> bool:
+    """True when no process with ``pid`` exists — it exited AND was reaped.
+
+    ``os.kill(pid, 0)`` delivers no signal but raises ProcessLookupError for a
+    missing pid; a live process (or a not-yet-reaped zombie, which still occupies
+    the table) returns without error. Used by the dispatch watchdog to detect a
+    CLI that exited while its receive_response stream stayed open (the macOS
+    ThreadedChildWatcher orphan) so it can abandon fast instead of waiting out
+    the full inactivity deadline. EPERM/other OSError → treat as still alive
+    (don't abandon on uncertainty)."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except OSError:
+        return False
+    return False
 
 
 class ClaudeStreamWatchdogStall(RuntimeError):
@@ -1045,6 +1073,7 @@ class ClaudeAgentRuntime(AgentRuntime):
 
         task = asyncio.create_task(_run())
         poll = min(inactivity_timeout, _WATCHDOG_POLL_SECONDS)
+        cli_dead_since: float | None = None
         try:
             while True:
                 done, _ = await asyncio.wait({task}, timeout=poll)
@@ -1055,6 +1084,32 @@ class ClaudeAgentRuntime(AgentRuntime):
                         f"Claude CLI dispatch watchdog stalled: produced no output "
                         f"for {inactivity_timeout:.0f}s (connect/query/stream)"
                     )
+                # Fast-path the orphaned-dispatch wedge (the recurring bridge
+                # hang): the CLI subprocess has exited but receive_response()
+                # never ended, so the task hangs awaiting a closed stream. A
+                # normal completion finishes the task the instant the CLI exits
+                # (returned above), so a pid that stays dead for the grace window
+                # while the task is still running is orphaned — abandon it in
+                # seconds rather than waiting out the whole inactivity deadline.
+                pid = getattr(
+                    getattr(
+                        getattr(connected_client, "_transport", None), "_process", None
+                    ),
+                    "pid",
+                    None,
+                )
+                if pid and _pid_has_exited(int(pid)):
+                    if cli_dead_since is None:
+                        cli_dead_since = loop.time()
+                    elif loop.time() - cli_dead_since >= _CLI_EXIT_GRACE_SECONDS:
+                        raise ClaudeStreamWatchdogStall(
+                            f"Claude CLI dispatch watchdog: CLI subprocess (pid "
+                            f"{pid}) exited but the response stream never ended "
+                            f"(orphaned receive_response, {_CLI_EXIT_GRACE_SECONDS:.0f}s "
+                            f"grace) — produced no result. Abandoning."
+                        )
+                else:
+                    cli_dead_since = None
         finally:
             if not task.done():
                 # Force-kill the live CLI subprocess BEFORE abandoning the task.
