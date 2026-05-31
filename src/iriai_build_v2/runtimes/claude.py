@@ -1115,6 +1115,7 @@ class ClaudeAgentRuntime(AgentRuntime):
             else min(inactivity_timeout, _WATCHDOG_POLL_SECONDS)
         )
         cli_dead_since: float | None = None
+        last_diag: float = loop.time()
         try:
             while True:
                 done, _ = await asyncio.wait({task}, timeout=poll)
@@ -1126,6 +1127,21 @@ class ClaudeAgentRuntime(AgentRuntime):
                 # finally has already nulled connected_client.
                 if cli_pid is None and connected_client is not None:
                     cli_pid = _transport_pid(connected_client)
+                # Diagnostic: when a dispatch goes quiet, record WHY the orphan
+                # guard isn't recovering it (is cli_pid None? does the pid read as
+                # exited? is the inactivity watchdog disabled?). Rate-limited.
+                _idle = loop.time() - last_activity
+                if _idle >= 45 and (loop.time() - last_diag) >= 45:
+                    last_diag = loop.time()
+                    logger.warning(
+                        "dispatch watchdog diag: idle=%.0fs cli_pid=%s pid_exited=%s "
+                        "inactivity_timeout=%s connected=%s",
+                        _idle,
+                        cli_pid,
+                        (_pid_has_exited(cli_pid) if cli_pid else None),
+                        inactivity_timeout,
+                        connected_client is not None,
+                    )
                 if (
                     inactivity_timeout is not None
                     and loop.time() - last_activity >= inactivity_timeout
