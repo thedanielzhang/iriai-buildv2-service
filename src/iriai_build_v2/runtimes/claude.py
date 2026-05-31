@@ -147,6 +147,17 @@ def _pid_has_exited(pid: int) -> bool:
     return False
 
 
+def _transport_pid(client: Any) -> int | None:
+    """The OS pid of a connected SDK client's CLI subprocess, or None."""
+    pid = getattr(
+        getattr(getattr(client, "_transport", None), "_process", None), "pid", None
+    )
+    try:
+        return int(pid) if pid else None
+    except (TypeError, ValueError):
+        return None
+
+
 class ClaudeStreamWatchdogStall(RuntimeError):
     """Claude CLI response stream produced no output within the inactivity
     window. The name and message carry 'watchdog'/'produced no output' so
@@ -1036,13 +1047,19 @@ class ClaudeAgentRuntime(AgentRuntime):
         loop = asyncio.get_running_loop()
         last_activity = loop.time()
         connected_client: Any = None
+        # Captured once the CLI subprocess exists and RETAINED across _run's
+        # finally (which nulls connected_client before the SDK teardown). The
+        # dead-pid fast-path needs the pid during the teardown phase — the
+        # observed orphan wedges there, with connected_client already None.
+        cli_pid: int | None = None
 
         async def _run() -> Any:
-            nonlocal last_activity, connected_client
+            nonlocal last_activity, connected_client, cli_pid
             result_msg = None
             consecutive_provider_errors = 0
             async with make_client() as client:
                 connected_client = client
+                cli_pid = _transport_pid(client)
                 if invocation_id:
                     self._active_invocations[invocation_id] = loop.time()
                 cleanup = on_connected(client) if on_connected is not None else None
@@ -1100,27 +1117,23 @@ class ClaudeAgentRuntime(AgentRuntime):
                         f"for {inactivity_timeout:.0f}s (connect/query/stream)"
                     )
                 # Fast-path the orphaned-dispatch wedge (the recurring bridge
-                # hang): the CLI subprocess has exited but receive_response()
-                # never ended, so the task hangs awaiting a closed stream. A
-                # normal completion finishes the task the instant the CLI exits
-                # (returned above), so a pid that stays dead for the grace window
-                # while the task is still running is orphaned — abandon it in
-                # seconds rather than waiting out the whole inactivity deadline.
-                pid = getattr(
-                    getattr(
-                        getattr(connected_client, "_transport", None), "_process", None
-                    ),
-                    "pid",
-                    None,
-                )
-                if pid and _pid_has_exited(int(pid)):
+                # hang): the CLI subprocess has exited but the dispatch task is
+                # still running — either receive_response() never ended, or (the
+                # observed case) the receive loop ended and the SDK's `async with`
+                # teardown / process.wait wedged. A normal completion finishes the
+                # task the instant the CLI exits (returned above), so a CLI pid
+                # that stays dead for the grace window while the task runs is
+                # orphaned. Use the RETAINED cli_pid: _run's finally nulls
+                # connected_client before teardown, so reading the pid off the
+                # client would miss exactly the teardown-orphan case.
+                if cli_pid and _pid_has_exited(cli_pid):
                     if cli_dead_since is None:
                         cli_dead_since = loop.time()
                     elif loop.time() - cli_dead_since >= _CLI_EXIT_GRACE_SECONDS:
                         raise ClaudeStreamWatchdogStall(
                             f"Claude CLI dispatch watchdog: CLI subprocess (pid "
-                            f"{pid}) exited but the response stream never ended "
-                            f"(orphaned receive_response, {_CLI_EXIT_GRACE_SECONDS:.0f}s "
+                            f"{cli_pid}) exited but the dispatch never completed "
+                            f"(orphaned stream/teardown, {_CLI_EXIT_GRACE_SECONDS:.0f}s "
                             f"grace) — produced no result. Abandoning."
                         )
                 else:
@@ -1134,10 +1147,9 @@ class ClaudeAgentRuntime(AgentRuntime):
                 # kernel re-deliver SIGCHLD so wait() resolves and the chain
                 # unwinds. No-op if the CLI already exited (the live-work flag
                 # then goes stale and the outer liveness watchdog cancels instead).
-                proc = getattr(
-                    getattr(connected_client, "_transport", None), "_process", None
-                )
-                pid = getattr(proc, "pid", None)
+                # Prefer the live client's pid (receive-loop orphan); fall back to
+                # the retained cli_pid (teardown orphan, connected_client nulled).
+                pid = _transport_pid(connected_client) or cli_pid
                 if pid:
                     with suppress(ProcessLookupError, OSError, ValueError):
                         os.kill(int(pid), signal.SIGKILL)

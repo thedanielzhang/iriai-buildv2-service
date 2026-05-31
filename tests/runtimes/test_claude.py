@@ -1025,3 +1025,45 @@ async def test_dispatch_abandons_fast_when_cli_pid_already_exited(monkeypatch):
             lambda: _DeadCliClient(dead_pid), "p", _WatchdogResultMessage, 30.0
         )
     assert time.monotonic() - start < 5.0
+
+
+class _TeardownHangClient(_BaseFakeClient):
+    """receive_response() ends immediately — so _run's inner finally runs and
+    NULLS connected_client — then __aexit__ (SDK teardown) hangs while exposing an
+    already-exited pid. Models the observed teardown orphan: the dead-pid check
+    must fire off the RETAINED cli_pid, since connected_client is already None."""
+
+    def __init__(self, dead_pid: int):
+        self._transport = SimpleNamespace(_process=SimpleNamespace(pid=dead_pid))
+
+    def receive_response(self):
+        async def _gen():
+            if False:  # pragma: no cover - empty async generator (ends at once)
+                yield None
+
+        return _gen()
+
+    async def __aexit__(self, *exc):
+        await asyncio.sleep(3600)  # teardown wedge
+        return False
+
+
+@pytest.mark.asyncio
+async def test_dispatch_abandons_fast_on_teardown_orphan(monkeypatch):
+    # The wedge that slipped past the first fix: the receive loop ENDS (so
+    # connected_client is nulled) but the SDK's async-with teardown hangs. The
+    # dead-pid fast-path must still fire using the retained cli_pid.
+    monkeypatch.setattr("iriai_build_v2.runtimes.claude._WATCHDOG_POLL_SECONDS", 0.02)
+    monkeypatch.setattr("iriai_build_v2.runtimes.claude._CLI_EXIT_GRACE_SECONDS", 0.04)
+
+    proc = subprocess.Popen(["true"])
+    proc.wait()
+    dead_pid = proc.pid
+
+    runtime = _bare_runtime()
+    start = time.monotonic()
+    with pytest.raises(ClaudeStreamWatchdogStall):
+        await runtime._run_dispatch_bounded(
+            lambda: _TeardownHangClient(dead_pid), "p", _WatchdogResultMessage, 30.0
+        )
+    assert time.monotonic() - start < 5.0
