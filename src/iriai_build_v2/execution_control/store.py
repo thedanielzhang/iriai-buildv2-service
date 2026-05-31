@@ -4103,19 +4103,27 @@ class ExecutionControlStore:
                     snapshot_digest=snapshot_digest,
                     idempotency_key=idempotency_key,
                 )
-                await self._complete_missing_projections(
-                    conn,
-                    row,
-                    (projection,),
-                    source_table="workspace_snapshots",
-                    source_id=snapshot.id,
-                    projection_owner="workspace_authority",
-                    projection_kind="workspace_snapshot",
-                    projection_payload={
-                        "entry_type": "workspace_snapshot",
-                        "workspace_snapshot_id": snapshot.id,
-                    },
-                )
+                if snapshot_created:
+                    # Only a freshly inserted snapshot needs its projection created;
+                    # the snapshot + its projection are written in this one
+                    # transaction, so a REUSED snapshot already has its projection.
+                    # Re-running completion on reuse would re-validate that existing
+                    # projection against the freshly re-captured (volatile) snapshot
+                    # value and conflict on the authority overlay — the same drift the
+                    # identity digest deliberately ignores.
+                    await self._complete_missing_projections(
+                        conn,
+                        row,
+                        (projection,),
+                        source_table="workspace_snapshots",
+                        source_id=snapshot.id,
+                        projection_owner="workspace_authority",
+                        projection_kind="workspace_snapshot",
+                        projection_payload={
+                            "entry_type": "workspace_snapshot",
+                            "workspace_snapshot_id": snapshot.id,
+                        },
+                    )
                 links = await self._fetch_projection_links(conn, row.id)
                 execution = ExecutionJournalResult(
                     row=row,
@@ -9384,7 +9392,7 @@ def _payload_projection_value(value: Any) -> str:
 
 
 def _workspace_snapshot_digest(payload: dict[str, Any]) -> str:
-    return stable_digest(_workspace_snapshot_stable_payload(payload))
+    return stable_digest(_workspace_snapshot_identity_payload(payload))
 
 
 def _workspace_snapshot_differing_keys(
@@ -9392,8 +9400,8 @@ def _workspace_snapshot_differing_keys(
 ) -> str:
     if new is None:
         return "(unknown)"
-    a = _workspace_snapshot_stable_payload(stored)
-    b = _workspace_snapshot_stable_payload(new)
+    a = _workspace_snapshot_identity_payload(stored)
+    b = _workspace_snapshot_identity_payload(new)
     keys = sorted(k for k in (set(a) | set(b)) if a.get(k) != b.get(k))
     return ",".join(keys) or "(none)"
 
@@ -9403,22 +9411,45 @@ def _workspace_snapshot_projection_value(payload: dict[str, Any]) -> str:
 
 
 def _workspace_snapshot_stable_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    # Representation used for the PROJECTION/artifact body — strips only the
+    # internal artifact ids and capture timestamps. (The idempotency-gating
+    # IDENTITY digest uses the narrower _workspace_snapshot_identity_payload.)
     return {
         key: value
         for key, value in payload.items()
         if key not in {
             "acl_artifact_id",
-            # Per-attempt bookkeeping counter (retry*1000+repair_idx on the
-            # repair-dispatch path), NOT part of the workspace identity that the
-            # idempotency key encodes. Leaving it in the digest made a resume
-            # re-record the same snapshot under the same key with a different
-            # digest -> IdempotencyConflict that dead-locked resume.
-            "attempt_id",
             "captured_at",
             "compatibility_projection_artifact_ids",
             "registry_artifact_id",
             "validated_at",
         }
+    }
+
+
+# Fields excluded from the IDENTITY digest (beyond the stable-payload exclusions):
+# the per-attempt bookkeeping counter and the preflight-derived authority/ACL
+# overlay. None of these are part of the immutable git workspace identity that the
+# idempotency key already encodes (head_sha/index_digest/worktree_status_digest);
+# they are RE-DERIVED from the preflight on every resume attempt (observed:
+# agent_writable_paths flips []<->[<feature path>] for the same git state), so
+# gating idempotency on them dead-locked resume. They remain in the stored payload
+# and the projection — only the identity digest ignores them.
+_WORKSPACE_SNAPSHOT_NON_IDENTITY_KEYS = frozenset({
+    "attempt_id",
+    "agent_writable_paths",
+    "denied_paths",
+    "outside_root_targets",
+    "symlink_paths",
+    "warnings",
+})
+
+
+def _workspace_snapshot_identity_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: value
+        for key, value in _workspace_snapshot_stable_payload(payload).items()
+        if key not in _WORKSPACE_SNAPSHOT_NON_IDENTITY_KEYS
     }
 
 

@@ -4844,6 +4844,52 @@ async def test_workspace_snapshot_retry_ignores_volatile_attempt_id() -> None:
 
 
 @pytest.mark.asyncio
+async def test_workspace_snapshot_retry_ignores_volatile_agent_writable_paths() -> None:
+    # The exact Group-78 failure shape: the preflight-derived agent_writable_paths
+    # (and the rest of the authority overlay) is re-derived per attempt and flips for
+    # the same git state. It must NOT gate idempotency at the snapshot-digest OR the
+    # projection layer; re-recording the same git-identity snapshot must be idempotent.
+    module = _execution_control_module()
+    conn = _FakeConnection()
+    store = _store(_FakePool(conn))
+    first = module.WorkspaceSnapshotEvidence(
+        feature_id=FEATURE_ID,
+        payload=_workspace_snapshot_payload(agent_writable_paths=["/workspace/app/src"]),
+        dag_sha256=DAG_SHA256,
+        group_idx=45,
+        stage="retry-0",
+        repo_id="app",
+        canonical_path="/workspace/app",
+        registry_digest="registry-digest-1",
+        head_sha="abc123",
+        index_digest="index-digest-1",
+        worktree_status_digest="status-digest-1",
+    )
+    retry = module.WorkspaceSnapshotEvidence(
+        feature_id=FEATURE_ID,
+        payload=_workspace_snapshot_payload(agent_writable_paths=[]),
+        dag_sha256=DAG_SHA256,
+        group_idx=45,
+        stage="retry-0",
+        repo_id="app",
+        canonical_path="/workspace/app",
+        registry_digest="registry-digest-1",
+        head_sha="abc123",
+        index_digest="index-digest-1",
+        worktree_status_digest="status-digest-1",
+    )
+
+    assert first.stable_idempotency_key == retry.stable_idempotency_key
+    await store.record_workspace_snapshot(first)
+    await store.record_workspace_snapshot(retry)
+
+    assert len(conn.typed_rows) == 1
+    assert len(conn.workspace_snapshots) == 1
+    assert len(conn.artifacts) == 1
+    assert len(conn.projection_links) == 1
+
+
+@pytest.mark.asyncio
 async def test_workspace_snapshot_retry_self_heals_legacy_snapshot_digest() -> None:
     # A row persisted before attempt_id was excluded carries a stale snapshot_digest
     # (computed WITH attempt_id). On resume the digest no longer matches, but the
@@ -6928,6 +6974,7 @@ def _workspace_snapshot_payload(
     captured_at: str = "2026-05-19T12:00:00+00:00",
     dirty_paths: list[str] | None = None,
     attempt_id: int | None = None,
+    agent_writable_paths: list[str] | None = None,
 ) -> dict[str, Any]:
     dirty = [] if dirty_paths is None else dirty_paths
     payload: dict[str, Any] = {
@@ -6947,6 +6994,8 @@ def _workspace_snapshot_payload(
     }
     if attempt_id is not None:
         payload["attempt_id"] = attempt_id
+    if agent_writable_paths is not None:
+        payload["agent_writable_paths"] = agent_writable_paths
     return payload
 
 
@@ -6956,7 +7005,6 @@ def _workspace_snapshot_artifact_body(payload: dict[str, Any]) -> str:
         for key, value in payload.items()
         if key not in {
             "acl_artifact_id",
-            "attempt_id",
             "captured_at",
             "compatibility_projection_artifact_ids",
             "registry_artifact_id",
