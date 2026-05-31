@@ -5869,6 +5869,7 @@ class ExecutionControlStore:
                 execution_row_id=execution_row.id,
                 snapshot_digest=snapshot_digest,
                 registry_digest=registry_digest,
+                payload=payload,
             )
             return row, False
         row = await conn.fetchrow(
@@ -5911,6 +5912,7 @@ class ExecutionControlStore:
                 execution_row_id=execution_row.id,
                 snapshot_digest=snapshot_digest,
                 registry_digest=registry_digest,
+                payload=payload,
             )
             return snapshot, False
         return self._snapshot_from_record(row), True
@@ -6594,6 +6596,7 @@ class ExecutionControlStore:
         execution_row_id: int,
         snapshot_digest: str,
         registry_digest: str,
+        payload: dict[str, Any] | None = None,
     ) -> None:
         if row.execution_journal_row_id != execution_row_id:
             raise IdempotencyConflict(
@@ -6608,7 +6611,8 @@ class ExecutionControlStore:
             _workspace_snapshot_digest(row.payload) != snapshot_digest
         ):
             raise IdempotencyConflict(
-                "workspace snapshot idempotency key was reused with a different snapshot"
+                "workspace snapshot idempotency key was reused with a different snapshot "
+                f"(differing stable keys: {_workspace_snapshot_differing_keys(row.payload, payload)})"
             )
         if row.registry_digest != registry_digest:
             raise IdempotencyConflict(
@@ -9381,6 +9385,17 @@ def _payload_projection_value(value: Any) -> str:
 
 def _workspace_snapshot_digest(payload: dict[str, Any]) -> str:
     return stable_digest(_workspace_snapshot_stable_payload(payload))
+
+
+def _workspace_snapshot_differing_keys(
+    stored: dict[str, Any], new: dict[str, Any] | None
+) -> str:
+    if new is None:
+        return "(unknown)"
+    a = _workspace_snapshot_stable_payload(stored)
+    b = _workspace_snapshot_stable_payload(new)
+    keys = sorted(k for k in (set(a) | set(b)) if a.get(k) != b.get(k))
+    return ",".join(keys) or "(none)"
 
 
 def _workspace_snapshot_projection_value(payload: dict[str, Any]) -> str:
