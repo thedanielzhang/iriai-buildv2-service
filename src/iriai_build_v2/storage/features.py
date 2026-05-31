@@ -4,7 +4,8 @@ import asyncio
 import hashlib
 import json
 import os
-from contextlib import asynccontextmanager
+import time
+from contextlib import asynccontextmanager, suppress
 from typing import Any
 
 import asyncpg
@@ -15,6 +16,18 @@ from ..public_dashboard import PublicDashboardOutbox
 
 _MIRROR_TIMEOUT_ENV = "IRIAI_PUBLIC_DASHBOARD_MIRROR_TIMEOUT_SECONDS"
 _DEFAULT_MIRROR_TIMEOUT_SECONDS = 0.75
+
+_ADVISORY_LOCK_TIMEOUT_ENV = "IRIAI_ADVISORY_LOCK_TIMEOUT_SECONDS"
+_DEFAULT_ADVISORY_LOCK_TIMEOUT_SECONDS = 90.0
+_ADVISORY_LOCK_RETRY_ENV = "IRIAI_ADVISORY_LOCK_RETRY_SECONDS"
+_DEFAULT_ADVISORY_LOCK_RETRY_SECONDS = 0.25
+
+
+class AdvisoryLockTimeout(TimeoutError):
+    """Raised when an advisory lock cannot be acquired within the bounded window.
+
+    Failing fast and loud is intentional: the prior blocking acquisition parked the
+    caller (e.g. ``resume_workflow``) forever behind a contending/leaked holder."""
 
 
 class PostgresFeatureStore:
@@ -162,16 +175,43 @@ class PostgresFeatureStore:
 
     @asynccontextmanager
     async def advisory_lock(self, feature_id: str, name: str):
-        """Hold a transaction-scoped advisory lock for the duration of a block."""
+        """Hold a transaction-scoped advisory lock for the duration of a block.
+
+        Acquisition is NON-BLOCKING (``pg_try_advisory_xact_lock``) on a bounded
+        retry loop. The old blocking ``pg_advisory_xact_lock`` parked the coroutine
+        on a query future that never resolved when a contending/leaked holder kept
+        the lock — deadlocking ``resume_workflow`` forever. Now a still-contended
+        lock raises ``AdvisoryLockTimeout`` after a bounded window instead.
+
+        Cleanup ALWAYS releases the connection (in the outer ``finally``), even if
+        the body is cancelled mid-transaction: the bounded pool release runs the
+        connection reset (``ROLLBACK``), freeing the advisory lock, so a cancelled
+        holder can no longer leak an ``idle in transaction`` lock holder."""
+        lock_key = _advisory_lock_key(feature_id, name)
+        deadline = time.monotonic() + _advisory_lock_timeout_seconds()
+        interval = _advisory_lock_retry_seconds()
         conn = await self._pool.acquire()
-        tx = conn.transaction()
-        await tx.start()
         try:
-            lock_key = _advisory_lock_key(feature_id, name)
-            await conn.execute("SELECT pg_advisory_xact_lock($1)", lock_key)
-            yield conn
+            tx = conn.transaction()
+            await tx.start()
+            try:
+                while not await conn.fetchval(
+                    "SELECT pg_try_advisory_xact_lock($1)", lock_key
+                ):
+                    if time.monotonic() >= deadline:
+                        raise AdvisoryLockTimeout(
+                            f"advisory_lock({feature_id!r}, {name!r}) not acquired "
+                            f"within {_advisory_lock_timeout_seconds():.1f}s; "
+                            "another holder is contending"
+                        )
+                    await asyncio.sleep(interval)
+                yield conn
+            finally:
+                # Best-effort rollback, shielded so cancellation can't skip it; the
+                # outer finally guarantees release regardless.
+                with suppress(Exception):
+                    await asyncio.shield(tx.rollback())
         finally:
-            await tx.rollback()
             await self._pool.release(conn)
 
 
@@ -213,3 +253,21 @@ def _mirror_timeout_seconds() -> float:
     except (TypeError, ValueError):
         parsed = _DEFAULT_MIRROR_TIMEOUT_SECONDS
     return max(0.05, parsed)
+
+
+def _advisory_lock_timeout_seconds() -> float:
+    raw = os.environ.get(_ADVISORY_LOCK_TIMEOUT_ENV, "")
+    try:
+        parsed = float(raw)
+    except (TypeError, ValueError):
+        parsed = _DEFAULT_ADVISORY_LOCK_TIMEOUT_SECONDS
+    return max(0.1, parsed)
+
+
+def _advisory_lock_retry_seconds() -> float:
+    raw = os.environ.get(_ADVISORY_LOCK_RETRY_ENV, "")
+    try:
+        parsed = float(raw)
+    except (TypeError, ValueError):
+        parsed = _DEFAULT_ADVISORY_LOCK_RETRY_SECONDS
+    return max(0.01, parsed)

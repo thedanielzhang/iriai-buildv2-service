@@ -51,17 +51,19 @@ class _BoundedReleasePool(asyncpg.pool.Pool):
 async def _setup_session_guards(conn: asyncpg.Connection) -> None:
     """Applied on EVERY acquire (asyncpg's reset-on-release clears session GUCs).
 
-    A coroutine cancelled mid-transaction (e.g. by a dispatch watchdog) can leave
-    its connection ``idle in transaction`` holding an advisory/row lock, which
-    then blocks FOREVER anything that waits for that lock — observed:
-    ``resume_workflow`` parked on ``pg_advisory_lock`` behind a 12-minute
-    idle-in-transaction holder of ``pg_advisory_xact_lock``.
-    ``idle_in_transaction_session_timeout`` makes Postgres terminate such leaked
-    sessions so their locks release; ``lock_timeout`` bounds any remaining
-    blocking lock acquisition so it raises instead of hanging the event loop."""
-    idle_ms = max(1000, _int_env("IRIAI_DB_IDLE_IN_TXN_TIMEOUT_MS", 60000))
+    ``lock_timeout`` bounds any BLOCKING lock acquisition (row locks, the
+    remaining ``pg_advisory_xact_lock`` call sites) so it raises instead of
+    hanging the event loop.
+
+    NOTE: deliberately does NOT set ``idle_in_transaction_session_timeout``. That
+    guard (tried in 48a2735) terminates the connection of a LEGITIMATE
+    advisory-lock holder that is held across a long op, leaving the holder's
+    coroutine to fail on a dead connection (a dead-connection hang). The leaked /
+    contended-holder deadlock is instead fixed at the source: ``advisory_lock``
+    now acquires non-blocking (``pg_try_advisory_xact_lock`` + bounded retry) and
+    always releases its connection, so no waiter can park forever and a cancelled
+    holder no longer leaks its lock."""
     lock_ms = max(1000, _int_env("IRIAI_DB_LOCK_TIMEOUT_MS", 90000))
-    await conn.execute(f"SET idle_in_transaction_session_timeout = {idle_ms}")
     await conn.execute(f"SET lock_timeout = {lock_ms}")
 
 

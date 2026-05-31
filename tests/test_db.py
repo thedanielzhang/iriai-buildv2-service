@@ -58,13 +58,13 @@ async def test_create_pool_applies_env_overrides_and_clamps_max_to_min(
 
 
 @pytest.mark.asyncio
-async def test_setup_session_guards_sets_idle_txn_and_lock_timeouts(
+async def test_setup_session_guards_sets_lock_timeout_only(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # A leaked idle-in-transaction connection holding an advisory lock deadlocks
-    # any waiter forever; these GUCs make Postgres self-heal that. Re-applied on
-    # every acquire because asyncpg's reset-on-release clears session settings.
-    monkeypatch.delenv("IRIAI_DB_IDLE_IN_TXN_TIMEOUT_MS", raising=False)
+    # lock_timeout bounds any blocking lock acquisition. We deliberately do NOT set
+    # idle_in_transaction_session_timeout: it terminates the LEGITIMATE advisory-lock
+    # holder mid-op (dead-connection hang); the leaked-holder deadlock is fixed in
+    # advisory_lock itself (non-blocking pg_try_advisory_xact_lock + always-release).
     monkeypatch.delenv("IRIAI_DB_LOCK_TIMEOUT_MS", raising=False)
     executed: list[str] = []
 
@@ -74,14 +74,13 @@ async def test_setup_session_guards_sets_idle_txn_and_lock_timeouts(
 
     await db._setup_session_guards(_FakeConn())
 
-    assert any("idle_in_transaction_session_timeout = 60000" in s for s in executed)
+    assert not any("idle_in_transaction_session_timeout" in s for s in executed)
     assert any("lock_timeout = 90000" in s for s in executed)
 
-    monkeypatch.setenv("IRIAI_DB_IDLE_IN_TXN_TIMEOUT_MS", "5000")
     monkeypatch.setenv("IRIAI_DB_LOCK_TIMEOUT_MS", "7000")
     executed.clear()
     await db._setup_session_guards(_FakeConn())
-    assert any("idle_in_transaction_session_timeout = 5000" in s for s in executed)
+    assert not any("idle_in_transaction_session_timeout" in s for s in executed)
     assert any("lock_timeout = 7000" in s for s in executed)
 
 
