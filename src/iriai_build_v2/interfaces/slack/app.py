@@ -201,6 +201,39 @@ async def run_slack_bridge(
         except Exception:
             logger.exception("Failed to arm SIGUSR2 stack-dump handler")
 
+    # asyncio TASK-stack dump — shows SUSPENDED coroutines (the orphaned dispatch
+    # await), which faulthandler's thread-only dump cannot. kill -INFO <pid>.
+    task_dump_signal = getattr(signal, "SIGINFO", None)
+    if task_dump_signal is not None:
+        _tasks_path = os.environ.get("IRIAI_TASKDUMP_PATH", "/tmp/iriai_bridge_tasks.log")
+
+        def _dump_asyncio_tasks() -> None:
+            import io
+
+            buf = io.StringIO()
+            try:
+                tasks = asyncio.all_tasks(loop)
+                buf.write(f"\n===== asyncio task dump ({len(tasks)} tasks) =====\n")
+                for t in tasks:
+                    buf.write(f"\n--- Task {t.get_name()} done={t.done()} ---\n")
+                    try:
+                        t.print_stack(file=buf)
+                    except Exception as exc:  # pragma: no cover - best-effort diag
+                        buf.write(f"(print_stack failed: {exc})\n")
+            except Exception as exc:  # pragma: no cover - best-effort diag
+                buf.write(f"(all_tasks failed: {exc})\n")
+            try:
+                with open(_tasks_path, "a") as fh:
+                    fh.write(buf.getvalue())
+            except Exception:
+                logger.exception("Failed to write asyncio task dump")
+
+        try:
+            loop.add_signal_handler(task_dump_signal, _dump_asyncio_tasks)
+            logger.info("Task-dump handler armed: kill -INFO <pid> -> %s", _tasks_path)
+        except Exception:
+            logger.exception("Failed to arm SIGINFO task-dump handler")
+
     try:
         await stop.wait()
     finally:
