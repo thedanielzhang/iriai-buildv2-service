@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from iriai_build_v2 import db
@@ -106,6 +108,30 @@ async def test_bounded_release_defaults_finite_timeout(monkeypatch: pytest.Monke
     monkeypatch.setenv("IRIAI_DB_RELEASE_TIMEOUT_SECONDS", "7")
     await db._bounded_release(fake_release, "conn", None)
     assert recorded[-1] == ("conn", 7)  # env override
+
+
+@pytest.mark.asyncio
+async def test_bounded_release_hard_timeout_terminates_wedged_reset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # asyncpg's reset(timeout=...) has been observed to hang on a dead socket under
+    # asyncio.shield (its own timeout never fires, cancellation is swallowed). The
+    # outer wait_for must still unblock the caller within timeout+grace AND
+    # terminate the connection so the orphaned shielded reset unwinds.
+    monkeypatch.setenv("IRIAI_DB_RELEASE_GRACE_SECONDS", "0")
+    terminated: list[bool] = []
+
+    class _Conn:
+        def terminate(self) -> None:
+            terminated.append(True)
+
+    async def wedged_release(connection: object, *, timeout: object) -> None:
+        await asyncio.sleep(60)  # a reset that never honors its own timeout
+
+    with pytest.raises(asyncio.TimeoutError):
+        await db._bounded_release(wedged_release, _Conn(), 0.05)
+
+    assert terminated == [True]  # connection abandoned, not leaked or deadlocked
 
 
 def test_bounded_release_pool_is_a_pool_subclass_with_compatible_layout() -> None:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 from pathlib import Path
 
@@ -19,12 +20,41 @@ def _release_timeout_seconds() -> float:
     return float(max(1, _int_env("IRIAI_DB_RELEASE_TIMEOUT_SECONDS", 15)))
 
 
+def _release_grace_seconds() -> float:
+    return float(max(0, _int_env("IRIAI_DB_RELEASE_GRACE_SECONDS", 5)))
+
+
 async def _bounded_release(pool_release, connection, timeout):
-    """Default a connection release to a finite timeout. asyncpg's reset
-    (``command_timeout`` does NOT cover it) is otherwise unbounded."""
+    """Release a pooled connection under a HARD outer timeout.
+
+    Passing ``timeout`` to asyncpg's ``Pool.release`` is NOT sufficient: that
+    timeout is handed to ``Connection.reset``, and on a dead/half-open socket the
+    reset has been observed to hang inside ``Connection.reset`` *under
+    ``asyncio.shield``* — so asyncpg's own timeout never fires AND the cancellation
+    a caller/watchdog sends is swallowed. The owning coroutine (e.g.
+    ``resume_workflow``) then deadlocks forever awaiting the shielded release
+    (confirmed via an asyncio task dump: ``PoolConnectionHolder.release`` parked at
+    ``await self._con.reset(timeout=budget)``).
+
+    Wrap the whole release in ``asyncio.wait_for`` so a wedged reset can't outlast
+    ``timeout + grace``. On expiry, ``terminate()`` the connection so the orphaned
+    shielded reset unwinds (and the dead connection is dropped from the pool), then
+    surface ``TimeoutError`` instead of hanging the event loop."""
     if timeout is None:
         timeout = _release_timeout_seconds()
-    return await pool_release(connection, timeout=timeout)
+    try:
+        return await asyncio.wait_for(
+            pool_release(connection, timeout=timeout),
+            timeout=timeout + _release_grace_seconds(),
+        )
+    except asyncio.TimeoutError:
+        terminate = getattr(connection, "terminate", None)
+        if callable(terminate):
+            try:
+                terminate()
+            except Exception:
+                pass
+        raise
 
 
 class _BoundedReleasePool(asyncpg.pool.Pool):
