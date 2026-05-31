@@ -268,6 +268,59 @@ patch-capture (diff/add/read-tree). A slow/large/wedged git there freezes the
 entire bridge (and every watchdog with it). Off-load each at the async
 boundary.
 
+### Check host health FIRST (load / memory)
+
+Before assuming a code hang, run `uptime` and `vm_stat`. A THRASHING HOST — high
+load average, exhausted memory / heavy swapping — starves the event loop so
+timers, watchdogs, `command_timeout`, and socket I/O all fire late or never,
+making perfectly correct code LOOK like a code bug (DB sockets wedge,
+`command_timeout` "doesn't fire", dispatches crawl). In one session the host sat
+at load ~78 with memory exhausted because a *different application* (Codex.app)
+had leaked ~2400 processes over 12 days; clearing them (`pkill -f <leaked-path>`)
+dropped load to ~7 and most "hangs" vanished. Rule out the host before patching
+code: `ps -ax -o comm | sort | uniq -c | sort -rn | head` finds runaway process
+groups; check their parent (`ps -o ppid`) to see who's leaking.
+
+### Dump asyncio TASKS, not just threads
+
+Thread dumps (faulthandler / py-spy / `sample`) show only OS THREADS. A hung
+asyncio app's real wedge is almost always a SUSPENDED COROUTINE awaiting a future
+that never resolves — invisible to a thread dump, which just shows the main
+thread "idle in `selectors.select`" (looks identical to a healthy idle loop).
+That misled this session for a dozen commits. **For any asyncio hang, dump the
+tasks**: arm a SIGINFO handler in the bridge entrypoint that writes
+`asyncio.all_tasks()` stacks to a file, then `kill -INFO <bridge_pid>` and read
+it (a subagent reads it; offload):
+
+```python
+import asyncio, signal
+def _dump_tasks():
+    with open("/tmp/iriai_bridge_tasks.log", "a") as f:
+        for t in asyncio.all_tasks(loop):
+            f.write(f"\n--- {t.get_name()} done={t.done()} ---\n"); t.print_stack(file=f)
+loop.add_signal_handler(signal.SIGINFO, _dump_tasks)   # macOS: kill -INFO <pid>
+```
+
+The suspended coroutine's `wait_for=<Future ... cb=[...]>` names what it's parked
+on (e.g. `BaseProtocol._on_waiter_completed` = an asyncpg query on a dead
+connection; an `asyncio.shield` wrapper = an uncancellable await). This is what
+finally revealed the real blocker — a Postgres connection deadlock in
+`resume_workflow`, not the agent dispatch. Do it EARLY, not last.
+
+### DB / control-plane deadlock classes (resume path)
+
+When `resume_workflow` hangs, inspect `pg_stat_activity` (look for `idle in
+transaction`) and `pg_locks` (advisory locks). Two real classes seen here:
+asyncpg's `Pool.release` runs the connection reset under `asyncio.shield` with no
+timeout (uncancellable deadlock — bound the release timeout in `db.create_pool`);
+and `storage/features.py:advisory_lock` holds a transaction-scoped
+`pg_advisory_xact_lock` (connection `idle in transaction`) for the WHOLE duration
+of its `async with` block — held across a long op, it deadlocks any contending /
+re-entrant waiter forever. Do NOT "fix" the latter with
+`idle_in_transaction_session_timeout` (it terminates the *legitimate* holder,
+causing dead-connection hangs); fix it with non-blocking
+`pg_try_advisory_xact_lock` + bounded retry and a shorter critical section.
+
 ## Stuck Detection
 
 Long-running jobs are expected. Do not kill or restart a healthy job simply
