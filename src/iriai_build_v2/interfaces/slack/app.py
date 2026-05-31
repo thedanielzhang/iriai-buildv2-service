@@ -40,6 +40,28 @@ async def run_slack_bridge(
     selected per-feature via a scoping card in the workflow channel.
     Runs until SIGINT or SIGTERM.
     """
+    # Install an early SIGUSR1 guard BEFORE the multi-second startup
+    # (control-plane checks, orchestrator.start, adapter.connect / Slack auth).
+    # SIGUSR1 is the operator-free resume trigger (the dashboard sends it via
+    # os.kill); until the real async handler is installed at the bottom of this
+    # function, SIGUSR1's default disposition is 'terminate', so a resume that
+    # races startup would KILL the bridge before it ever serves work (observed:
+    # restart + immediate resume -> exit code -30). Record an early signal in a
+    # flag and honor it once the real handler is live, so a racing resume is
+    # queued rather than fatal.
+    _early_resume_pending = {"flag": False}
+    _early_resume_signal = getattr(signal, "SIGUSR1", None)
+    if _early_resume_signal is not None:
+        def _early_resume_guard(_signum, _frame) -> None:
+            _early_resume_pending["flag"] = True
+
+        try:
+            signal.signal(_early_resume_signal, _early_resume_guard)
+        except (ValueError, OSError):
+            # Not the main thread / unsupported platform — the real async handler
+            # installed below still covers the common (post-startup) case.
+            pass
+
     from ...execution_control.startup import (
         EnvFlagState,
         assert_control_plane_ready_for_workflow_launch,
@@ -149,6 +171,13 @@ async def run_slack_bridge(
             asyncio.create_task(_resume())
 
         loop.add_signal_handler(resume_signal, _request_recoverable_resume)
+        # Honor a resume SIGUSR1 that arrived during startup (caught by the early
+        # guard above, before this real handler existed) now that we can act on
+        # it — the operator-free resume must not be silently dropped just because
+        # it raced the bridge coming up.
+        if _early_resume_pending["flag"]:
+            logger.info("Honoring SIGUSR1 resume that arrived during startup")
+            _request_recoverable_resume()
 
     # Hang diagnosis: SIGUSR2 dumps every thread's Python stack to a file. This
     # is a C-level faulthandler (not an asyncio callback), so it fires even when
