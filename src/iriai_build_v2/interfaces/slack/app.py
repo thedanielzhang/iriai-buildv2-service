@@ -220,6 +220,39 @@ async def run_slack_bridge(
                         t.print_stack(file=buf)
                     except Exception as exc:  # pragma: no cover - best-effort diag
                         buf.write(f"(print_stack failed: {exc})\n")
+                    # print_stack collapses nested coroutine awaits (observed: it
+                    # shows only the OUTERMOST frame for a deeply-suspended
+                    # resume_workflow, hiding the exact orphaned await). Walk the
+                    # cr_await chain by hand to surface every frame down to the
+                    # bare Future the coroutine is parked on.
+                    try:
+                        buf.write("  [await chain]\n")
+                        node = t.get_coro()
+                        seen: set[int] = set()
+                        depth = 0
+                        while node is not None and id(node) not in seen and depth < 300:
+                            seen.add(id(node))
+                            depth += 1
+                            frame = getattr(node, "cr_frame", None) or getattr(
+                                node, "gi_frame", None
+                            )
+                            if frame is not None:
+                                code = frame.f_code
+                                buf.write(
+                                    f"    {code.co_filename}:{frame.f_lineno} "
+                                    f"in {code.co_name}\n"
+                                )
+                            nxt = getattr(node, "cr_await", None)
+                            if nxt is None:
+                                nxt = getattr(node, "gi_yieldfrom", None)
+                            if nxt is not None and not (
+                                hasattr(nxt, "cr_frame") or hasattr(nxt, "gi_frame")
+                            ):
+                                buf.write(f"    -> awaiting non-coro: {nxt!r}\n")
+                                nxt = None
+                            node = nxt
+                    except Exception as exc:  # pragma: no cover - best-effort diag
+                        buf.write(f"  (await-chain walk failed: {exc})\n")
             except Exception as exc:  # pragma: no cover - best-effort diag
                 buf.write(f"(all_tasks failed: {exc})\n")
             try:
