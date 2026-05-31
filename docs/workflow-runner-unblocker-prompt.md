@@ -94,26 +94,54 @@ lines.
   `TaskStop` it and re-arm a tighter one.
 
 `/api/bridge/status` has no "paused" flag — it reports process liveness
-(`running`) and a log cursor (`line_count`). Movement = `line_count` advancing;
-the pause reason itself is in the bridge log text (`/api/bridge/logs`). A
-background watcher that wakes you on exit or cursor-stall:
+(`running`) and a log cursor (`line_count`). **`line_count` is NOT a progress
+signal — never build stuck-detection on it.** It has repeatedly caused MISSED
+hangs because it fails in BOTH directions:
+
+- It **advances on noise** — Slack socket reconnects, sibling-feature resume
+  tracebacks (`phase 'architecture' not found`), heartbeats — while the workflow
+  is wedged. A creeping cursor has masked a dead workflow.
+- It **freezes during a healthy dispatch** — the bridge does not log per-token,
+  so a working multi-minute agent run looks identical to a hang on the cursor.
+
+So a cursor-stall watcher false-alarms on quiet healthy jobs AND silently misses
+a wedge whose cursor keeps creeping from noise. Key on real PROGRESS instead (see
+"Stuck Detection"): a live dispatch CLI whose session transcript is growing, the
+execution-control journal's latest dispatch-attempt advancing, group-index /
+sealed-checkpoint advance, or fresh artifacts.
+
+A watcher that keys on those, alerts FAST (~3 min), re-alerts on an interval, and
+survives restarts (re-arm it yourself after every restart — see "Restart
+Discipline"):
 
 ```bash
-# A stall is a CANDIDATE pause only. On wake, confirm against "Stuck Detection"
-# before acting — healthy long-running jobs can be quiet for a while.
-prev=-1; stalls=0
-until [ "$stalls" -ge 4 ]; do
-  read -r run cur <<<"$(curl -s http://127.0.0.1:51234/api/bridge/status \
-    | python3 -c 'import sys,json;d=json.load(sys.stdin);print(d["running"],d["line_count"])')"
-  [ "$run" = "True" ] || { echo "BRIDGE EXITED"; break; }
-  if [ "$cur" = "$prev" ]; then stalls=$((stalls+1)); else stalls=0; prev="$cur"; fi
-  sleep 15
+# STUCK = no workflow progress AND no live, streaming dispatch CLI for ~3 min.
+# Progress = a dispatch CLI is alive with a fresh transcript, OR a workflow
+# (not-noise) log line appeared. Continuous counter (NOT a one-shot `-eq N`,
+# which misses the wedge if the CLI was alive at that single tick). Does not
+# exit on a transient not-running — a blind gap is worse than a redundant line.
+B=http://127.0.0.1:51234
+sig='Group [0-9]|sealed|checkpoint|dispatch (result|completed|failed)|capture_patch|patch summary|provider error storm|retrying once with thinking|StructuredOutput'
+prev=0; quiet=0
+while true; do
+  run=$(curl -s --max-time 8 $B/api/bridge/status | python3 -c 'import sys,json;print(json.load(sys.stdin).get("running"))' 2>/dev/null || echo "?")
+  if [ "$run" != "True" ]; then echo "BRIDGE_NOT_RUNNING — restart+resume+RE-ARM (do NOT assume healthy)"; sleep 30; continue; fi
+  cur=$(curl -s --max-time 8 $B/api/bridge/status | python3 -c 'import sys,json;print(json.load(sys.stdin)["line_count"])' 2>/dev/null || echo "$prev")
+  cli=$(pgrep -f "_bundled/claude --output-format" | head -1)
+  # live dispatch = a CLI alive AND a feature-repo transcript touched in <90s
+  fresh=$(find ~/.claude/projects -path '*-repos*' -name '*.jsonl' -newermt '-90 seconds' 2>/dev/null | head -1)
+  work=$(curl -s --max-time 8 "$B/api/bridge/logs?after=$prev" | python3 -c "import sys,json,re;d=json.load(sys.stdin);print(sum(1 for x in (d.get('lines') or []) if re.search(r'''$sig''',str(x),re.I)))" 2>/dev/null || echo 0)
+  prev=$cur
+  if { [ -n "$cli" ] && [ -n "$fresh" ]; } || [ "${work:-0}" != "0" ]; then quiet=0
+  else quiet=$((quiet+1)); fi
+  if [ "$quiet" -ge 6 ]; then echo "STUCK ~3min: no workflow progress, no live dispatch (lc=$cur cli=[${cli:-none}])"; quiet=0; fi
+  sleep 30
 done
 ```
 
-On each wake, read the new log range with
-`curl 'http://127.0.0.1:51234/api/bridge/logs?after=<prev cursor>'` to recover
-the pause reason, then run the Required Loop.
+On a STUCK alert, do NOT trust `line_count` — stack-dump the bridge (see "Hang
+Diagnosis") and check the journal/transcript for the in-flight dispatch, then run
+the Required Loop.
 
 ## Starting Point
 
@@ -238,19 +266,47 @@ boundary.
 Long-running jobs are expected. Do not kill or restart a healthy job simply
 because it has been running for a long time.
 
-Treat the workflow as healthy when at least one of these is true:
+Treat the workflow as healthy ONLY on a real PROGRESS signal — never on
+log/cursor movement, which advances on noise while the workflow is wedged:
 
-- bridge logs are advancing;
-- `/api/bridge/status` shows `running: true` with an advancing `line_count`;
-- runtime evidence shows a live job, fresh heartbeat, or pending result;
-- artifacts, attempts, or patch summaries are being created;
-- Slack/socket reconnect noise appears while workflow/runtime evidence is still
-  moving.
+- a dispatch CLI is alive AND its session transcript
+  (`~/.claude/projects/.../<session>.jsonl`) mtime is advancing, or its API
+  socket is flowing (a live, streaming agent run — the expected long job);
+- the execution-control journal's latest dispatch-attempt is advancing (a new
+  `attempt_started`/terminal row, or its timestamp moving);
+- group index / sealed-checkpoint count advances, or fresh artifacts / patch
+  summaries are written.
 
-Treat the workflow as stuck only when all available signals show no meaningful
-movement for a sustained window and there is no live runtime/job evidence. When
-stuck, RCA the monitor, timeout, replay, recovery, and runtime-wait path before
-killing the workflow or asking for help.
+`line_count` / "bridge logs advancing" is explicitly NOT one of these. A
+`running: true` status with an advancing `line_count` is NOT evidence of health
+(noise inflates the cursor — see "Claude Code Operating Model").
+
+Treat the workflow as stuck when, for a SHORT window (~3 min is enough — do not
+wait 10+), none of the real progress signals above moved AND there is no live,
+streaming dispatch CLI. The recurring stuck signature here: event loop idle in
+the selector (NOT in a sync call), `line_count` frozen, NO dispatch CLI, and the
+journal showing an in-flight dispatch with no terminal row — a dispatch whose CLI
+exited but whose `await process.wait()` wedged (macOS ThreadedChildWatcher),
+orphaning the coroutine; the watchdogs do not recover it (the adapter SIGKILL is
+a no-op once the CLI exited, and the outer liveness watchdog only cancels, which
+cannot interrupt the wedged wait). When stuck, RCA the monitor, timeout, replay,
+recovery, and runtime-wait path before killing the workflow or asking for help.
+
+**Monitoring discipline (the ways the watcher has MISSED hangs — do not repeat):**
+
+- **`line_count` is not progress.** Build stuck-detection on the real progress
+  signals above, never on cursor/log movement.
+- **Silence is not health.** "The watcher didn't fire" never means healthy.
+  Actively probe progress (journal / transcript / group) on a cadence; do not
+  wait passively for an alert.
+- **Detect fast.** A frozen workflow with no live dispatch CLI for >~3 min is a
+  wedge — alert then, not at 10–12 min.
+- **Continuous counters, not one-shot `-eq N`.** A check that only fires at
+  exactly tick N silently misses the wedge if the CLI was alive at that single
+  tick (observed: a `[ "$frozen" -eq 10 ]` no-CLI check never re-fired).
+- **Monitors die on restart → blind windows.** Every bridge restart trips the
+  watcher's not-running branch; re-arm IMMEDIATELY after every restart and treat
+  the gap as unmonitored — verify state directly before assuming progress.
 
 Before restart or patching, capture:
 
