@@ -1341,6 +1341,40 @@ def test_capture_includes_worktree_changes_without_mutating_normal_index(
     assert git(source, "status", "--porcelain=v1") == ""
 
 
+def test_capture_patch_runs_git_off_event_loop(tmp_path: Path, monkeypatch) -> None:
+    # Regression: the patch-capture git plumbing (read-tree/add/diff + the index
+    # digests) must run OFF the event loop. Running it inline froze the entire
+    # asyncio loop and every watchdog while git churned a worktree, leaving an
+    # in-flight agent dispatch orphaned for ~1.5h (the bridge "hang").
+    source = tmp_path / "canonical" / "app"
+    base = init_repo(source)
+    runner = runner_for(
+        tmp_path,
+        source,
+        store=FakeStore(),
+        artifact_writer=FakeArtifactWriter(),
+    )
+    lease = run(runner.allocate(spec_for(base)))
+    repo = Path(lease.repo_roots["app"])
+    (repo / "tracked.txt").write_text("changed\n", encoding="utf-8")
+
+    offloaded: list[str] = []
+    real_to_thread = asyncio.to_thread
+
+    async def spy_to_thread(func, /, *args, **kwargs):
+        offloaded.append(getattr(func, "__name__", repr(func)))
+        return await real_to_thread(func, *args, **kwargs)
+
+    # Install the spy AFTER allocate so only the capture-phase offloads are seen.
+    monkeypatch.setattr(sandbox_module.asyncio, "to_thread", spy_to_thread)
+
+    run(runner.capture_patch(lease))
+
+    # The heavy git section AND the after-capture index digest both run in a thread.
+    assert "_capture_patch_git_section" in offloaded
+    assert "_normal_index_digest" in offloaded
+
+
 def test_capture_records_outside_contract_paths_by_contract_roots(
     tmp_path: Path,
 ) -> None:

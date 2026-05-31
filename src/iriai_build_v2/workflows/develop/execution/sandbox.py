@@ -1412,31 +1412,21 @@ class SandboxRunner:
                     return Path(str(result))
         raise SandboxAllocationError(f"no repo source registered for {repo_id}")
 
-    async def _capture_repo_patch(
+    def _capture_patch_git_section(
         self,
-        *,
-        repo_id: str,
         repo_root: Path,
         base_commit: str,
-        manifest: Mapping[str, Any],
-        lease: SandboxLease,
-    ) -> tuple[SandboxRepoPatch, bool, bytes]:
-        sandbox_root = Path(str(manifest["root"]))
-        self._validate_repo_root(
-            repo_root,
-            sandbox_root=sandbox_root,
-            expected_commit=None,
-        )
-        if not base_commit:
-            raise SandboxCaptureError(f"missing base commit for repo {repo_id}")
-        blocked_roots = [
-            Path(path).resolve(strict=False)
-            for path in manifest.get("blocked_roots", [])
-        ]
-        self._reject_symlink_escapes(repo_root, blocked_roots)
+    ) -> tuple[str, str | None, bytes, bytes, bytes, bytes]:
+        """Synchronous git plumbing for patch capture: index digest, rev-parse,
+        and the read-tree/add/diff sequence against a throwaway index. Every git
+        command shells out via subprocess.run, which BLOCKS the calling thread,
+        so the caller MUST run this off the event loop (asyncio.to_thread).
+        Running it inline froze the entire asyncio loop and every watchdog while
+        ``git add -A`` / ``git diff`` churned a large worktree — the same hang
+        class as the inline clone, already fixed at allocate. Returns
+        (before_index, head_commit, diff_bytes, name_status, raw_diff, numstat)."""
         before_index = self._normal_index_digest(repo_root)
         head_commit = self._git_text(repo_root, ["rev-parse", "HEAD"]).strip() or None
-
         with tempfile.TemporaryDirectory(prefix="iriai-sandbox-index-") as temp_dir:
             index_path = Path(temp_dir) / "index"
             env = {"GIT_INDEX_FILE": str(index_path)}
@@ -1494,6 +1484,45 @@ class SandboxRunner:
                 ],
                 env=env,
             )
+        return before_index, head_commit, diff_bytes, name_status, raw_diff, numstat
+
+    async def _capture_repo_patch(
+        self,
+        *,
+        repo_id: str,
+        repo_root: Path,
+        base_commit: str,
+        manifest: Mapping[str, Any],
+        lease: SandboxLease,
+    ) -> tuple[SandboxRepoPatch, bool, bytes]:
+        sandbox_root = Path(str(manifest["root"]))
+        self._validate_repo_root(
+            repo_root,
+            sandbox_root=sandbox_root,
+            expected_commit=None,
+        )
+        if not base_commit:
+            raise SandboxCaptureError(f"missing base commit for repo {repo_id}")
+        blocked_roots = [
+            Path(path).resolve(strict=False)
+            for path in manifest.get("blocked_roots", [])
+        ]
+        self._reject_symlink_escapes(repo_root, blocked_roots)
+        # Run the git plumbing off the event loop. read-tree/add/diff shell out
+        # via blocking subprocess.run; inline they froze the whole asyncio loop
+        # (and every watchdog) while `git add -A`/`git diff` churned a large
+        # worktree — the bridge "hang". to_thread keeps the loop responsive; the
+        # per-command timeout still bounds a wedged git.
+        (
+            before_index,
+            head_commit,
+            diff_bytes,
+            name_status,
+            raw_diff,
+            numstat,
+        ) = await asyncio.to_thread(
+            self._capture_patch_git_section, repo_root, base_commit
+        )
 
         created, modified, deleted, renamed = _parse_name_status(name_status)
         mode_changed, executable_changed = _parse_raw_modes(raw_diff)
@@ -1528,7 +1557,7 @@ class SandboxRunner:
             diff_bytes=diff_bytes,
             diff_sha256=diff_sha256,
         )
-        after_index = self._normal_index_digest(repo_root)
+        after_index = await asyncio.to_thread(self._normal_index_digest, repo_root)
         repo_patch = SandboxRepoPatch(
             repo_id=repo_id,
             base_commit=base_commit,
