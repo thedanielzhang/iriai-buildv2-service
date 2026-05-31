@@ -1100,18 +1100,36 @@ class ClaudeAgentRuntime(AgentRuntime):
                         cleanup()
             return result_msg
 
-        if inactivity_timeout is None:
-            return await _run()
-
+        # Always run the watchdog poll loop — even when inactivity_timeout is None
+        # (a role that opted out of the INACTIVITY watchdog: liveness_timeout=0 for
+        # long, deliberately-silent suites, e.g. the compiler). The inactivity
+        # check is gated on a set timeout, but the dead-pid orphan check runs for
+        # EVERY dispatch: a CLI subprocess that has exited is unambiguously
+        # orphaned regardless of the inactivity policy, and without this a
+        # liveness_timeout=0 dispatch hangs FOREVER on the macOS ThreadedChildWatcher
+        # orphan (no watchdog at all on the old `return await _run()` path).
         task = asyncio.create_task(_run())
-        poll = min(inactivity_timeout, _WATCHDOG_POLL_SECONDS)
+        poll = (
+            _WATCHDOG_POLL_SECONDS
+            if inactivity_timeout is None
+            else min(inactivity_timeout, _WATCHDOG_POLL_SECONDS)
+        )
         cli_dead_since: float | None = None
         try:
             while True:
                 done, _ = await asyncio.wait({task}, timeout=poll)
                 if task in done:
                     return task.result()
-                if loop.time() - last_activity >= inactivity_timeout:
+                # Capture the CLI pid lazily while the client is still live —
+                # connect may populate the process just after _run's initial
+                # capture — and retain it for the teardown phase, when _run's
+                # finally has already nulled connected_client.
+                if cli_pid is None and connected_client is not None:
+                    cli_pid = _transport_pid(connected_client)
+                if (
+                    inactivity_timeout is not None
+                    and loop.time() - last_activity >= inactivity_timeout
+                ):
                     raise ClaudeStreamWatchdogStall(
                         f"Claude CLI dispatch watchdog stalled: produced no output "
                         f"for {inactivity_timeout:.0f}s (connect/query/stream)"

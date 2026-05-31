@@ -1067,3 +1067,25 @@ async def test_dispatch_abandons_fast_on_teardown_orphan(monkeypatch):
             lambda: _TeardownHangClient(dead_pid), "p", _WatchdogResultMessage, 30.0
         )
     assert time.monotonic() - start < 5.0
+
+
+@pytest.mark.asyncio
+async def test_dispatch_abandons_orphan_even_when_inactivity_watchdog_disabled(monkeypatch):
+    # liveness_timeout=0 roles (e.g. the compiler) pass inactivity_timeout=None —
+    # no INACTIVITY watchdog. The dead-pid orphan check must STILL run, or such a
+    # dispatch hangs forever on the ThreadedChildWatcher orphan (the old
+    # `return await _run()` path had no watchdog at all).
+    monkeypatch.setattr("iriai_build_v2.runtimes.claude._WATCHDOG_POLL_SECONDS", 0.02)
+    monkeypatch.setattr("iriai_build_v2.runtimes.claude._CLI_EXIT_GRACE_SECONDS", 0.04)
+
+    proc = subprocess.Popen(["true"])
+    proc.wait()
+    dead_pid = proc.pid
+
+    runtime = _bare_runtime()
+    start = time.monotonic()
+    with pytest.raises(ClaudeStreamWatchdogStall):
+        await runtime._run_dispatch_bounded(
+            lambda: _DeadCliClient(dead_pid), "p", _WatchdogResultMessage, None
+        )
+    assert time.monotonic() - start < 5.0
