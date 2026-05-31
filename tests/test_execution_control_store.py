@@ -4799,6 +4799,83 @@ async def test_workspace_snapshot_retry_ignores_volatile_capture_times() -> None
 
 
 @pytest.mark.asyncio
+async def test_workspace_snapshot_retry_ignores_volatile_attempt_id() -> None:
+    # attempt_id (retry*1000+repair_idx on the repair-dispatch path) changes on
+    # every resume but is identity-irrelevant; re-recording the same snapshot under
+    # the same content-identity key must be idempotent, not an IdempotencyConflict.
+    module = _execution_control_module()
+    conn = _FakeConnection()
+    store = _store(_FakePool(conn))
+    first = module.WorkspaceSnapshotEvidence(
+        feature_id=FEATURE_ID,
+        payload=_workspace_snapshot_payload(attempt_id=195000),
+        dag_sha256=DAG_SHA256,
+        group_idx=45,
+        stage="retry-0",
+        repo_id="app",
+        canonical_path="/workspace/app",
+        registry_digest="registry-digest-1",
+        head_sha="abc123",
+        index_digest="index-digest-1",
+        worktree_status_digest="status-digest-1",
+    )
+    retry = module.WorkspaceSnapshotEvidence(
+        feature_id=FEATURE_ID,
+        payload=_workspace_snapshot_payload(attempt_id=196000),
+        dag_sha256=DAG_SHA256,
+        group_idx=45,
+        stage="retry-0",
+        repo_id="app",
+        canonical_path="/workspace/app",
+        registry_digest="registry-digest-1",
+        head_sha="abc123",
+        index_digest="index-digest-1",
+        worktree_status_digest="status-digest-1",
+    )
+
+    assert first.stable_idempotency_key == retry.stable_idempotency_key
+    await store.record_workspace_snapshot(first)
+    await store.record_workspace_snapshot(retry)
+
+    assert len(conn.typed_rows) == 1
+    assert len(conn.workspace_snapshots) == 1
+    assert len(conn.artifacts) == 1
+    assert len(conn.projection_links) == 1
+
+
+@pytest.mark.asyncio
+async def test_workspace_snapshot_retry_self_heals_legacy_snapshot_digest() -> None:
+    # A row persisted before attempt_id was excluded carries a stale snapshot_digest
+    # (computed WITH attempt_id). On resume the digest no longer matches, but the
+    # snapshot is the same workspace state: recomputing from the stored full payload
+    # must reconcile it idempotently instead of dead-locking resume forever.
+    module = _execution_control_module()
+    conn = _FakeConnection()
+    store = _store(_FakePool(conn))
+    evidence = module.WorkspaceSnapshotEvidence(
+        feature_id=FEATURE_ID,
+        payload=_workspace_snapshot_payload(attempt_id=195000),
+        dag_sha256=DAG_SHA256,
+        group_idx=45,
+        stage="retry-0",
+        repo_id="app",
+        canonical_path="/workspace/app",
+        registry_digest="registry-digest-1",
+        head_sha="abc123",
+        index_digest="index-digest-1",
+        worktree_status_digest="status-digest-1",
+    )
+    await store.record_workspace_snapshot(evidence)
+    # Simulate a legacy stored digest that predates the attempt_id exclusion.
+    conn.workspace_snapshots[0]["snapshot_digest"] = "legacy-digest-with-attempt-id"
+
+    await store.record_workspace_snapshot(evidence)
+
+    assert len(conn.typed_rows) == 1
+    assert len(conn.workspace_snapshots) == 1
+
+
+@pytest.mark.asyncio
 async def test_workspace_snapshot_idempotency_uses_payload_fallbacks_and_bounds_projection() -> None:
     module = _execution_control_module()
     conn = _FakeConnection()
@@ -6850,9 +6927,10 @@ def _workspace_snapshot_payload(
     *,
     captured_at: str = "2026-05-19T12:00:00+00:00",
     dirty_paths: list[str] | None = None,
+    attempt_id: int | None = None,
 ) -> dict[str, Any]:
     dirty = [] if dirty_paths is None else dirty_paths
-    return {
+    payload: dict[str, Any] = {
         "feature_id": FEATURE_ID,
         "dag_sha256": DAG_SHA256,
         "group_idx": 45,
@@ -6867,6 +6945,9 @@ def _workspace_snapshot_payload(
         "captured_at": captured_at,
         "validated_at": captured_at,
     }
+    if attempt_id is not None:
+        payload["attempt_id"] = attempt_id
+    return payload
 
 
 def _workspace_snapshot_artifact_body(payload: dict[str, Any]) -> str:
@@ -6875,6 +6956,7 @@ def _workspace_snapshot_artifact_body(payload: dict[str, Any]) -> str:
         for key, value in payload.items()
         if key not in {
             "acl_artifact_id",
+            "attempt_id",
             "captured_at",
             "compatibility_projection_artifact_ids",
             "registry_artifact_id",

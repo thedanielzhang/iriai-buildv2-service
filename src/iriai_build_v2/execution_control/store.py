@@ -4079,10 +4079,21 @@ class ExecutionControlStore:
                 existing = await self._fetch_existing(conn, write.feature_id, write.idempotency_key)
                 if existing is None:
                     row, journal_created = await self._insert_typed_row(conn, write)
+                    self._validate_row_digest(row, write)
                 else:
+                    # Reused journal row. The workspace-snapshot idempotency key is a
+                    # content identity (repo/stage/head/index/worktree-status), so a key
+                    # match IS the same snapshot. Defer the strict request-digest
+                    # equality to _validate_workspace_snapshot_record below, which
+                    # recomputes the digest from the stored full payload: that lets a
+                    # benign digest delta (e.g. a legacy row whose digest predates
+                    # excluding the volatile attempt_id) re-record idempotently instead
+                    # of dead-locking resume, while a genuinely different snapshot still
+                    # conflicts there. Everything the request digest adds over the key
+                    # (snapshot_digest, registry_digest, repo_id, stage) is re-checked
+                    # there or is already part of the key.
                     row = self._row_from_record(existing)
                     journal_created = False
-                self._validate_row_digest(row, write)
                 snapshot, snapshot_created = await self._insert_or_reuse_workspace_snapshot(
                     conn,
                     evidence,
@@ -6588,7 +6599,14 @@ class ExecutionControlStore:
             raise IdempotencyConflict(
                 "workspace snapshot idempotency key belongs to a different typed row"
             )
-        if row.snapshot_digest != snapshot_digest:
+        if row.snapshot_digest != snapshot_digest and (
+            # A stored snapshot whose digest differs ONLY because it was written
+            # before a volatile field (attempt_id) was excluded is the same
+            # workspace state. Recompute the stable digest from the stored full
+            # payload; accept if it now matches, otherwise the snapshot genuinely
+            # differs and the conflict is real.
+            _workspace_snapshot_digest(row.payload) != snapshot_digest
+        ):
             raise IdempotencyConflict(
                 "workspace snapshot idempotency key was reused with a different snapshot"
             )
@@ -9375,6 +9393,12 @@ def _workspace_snapshot_stable_payload(payload: dict[str, Any]) -> dict[str, Any
         for key, value in payload.items()
         if key not in {
             "acl_artifact_id",
+            # Per-attempt bookkeeping counter (retry*1000+repair_idx on the
+            # repair-dispatch path), NOT part of the workspace identity that the
+            # idempotency key encodes. Leaving it in the digest made a resume
+            # re-record the same snapshot under the same key with a different
+            # digest -> IdempotencyConflict that dead-locked resume.
+            "attempt_id",
             "captured_at",
             "compatibility_projection_artifact_ids",
             "registry_artifact_id",
