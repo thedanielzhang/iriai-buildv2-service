@@ -933,6 +933,60 @@ async def test_invoke_disables_thinking_only_after_a_storm(monkeypatch):
     assert dispatches["n"] == 2
 
 
+@pytest.mark.asyncio
+async def test_invoke_falls_back_to_no_thinking_on_structured_output_exhaustion(monkeypatch):
+    # Same scoped fallback, but triggered by a CLEAN exhaustion
+    # (subtype=error_max_structured_output_retries, no result) rather than a 400
+    # storm — thinking-on still could not emit structured output, so retry once
+    # with thinking disabled instead of failing the dispatch terminally.
+    runtime = object.__new__(ClaudeAgentRuntime)
+    runtime._interactive_roles = set()
+    runtime._session_messages = {}
+    runtime._session_sizes = {}
+    runtime._session_context = {}
+    runtime.session_store = None
+    runtime._active_invocations = {}
+    runtime._invocation_activity = {}
+
+    role = Role(name="rca", prompt="Find the bug", tools=["Read"], metadata={})
+
+    build_thinking_flags: list[bool] = []
+
+    def fake_build_options(_role, _workspace, output_type=None, *, disable_thinking=False):
+        build_thinking_flags.append(disable_thinking)
+        return _FakeClaudeAgentOptions(
+            output_format={"type": "json_schema"} if output_type else None
+        )
+
+    monkeypatch.setattr(runtime, "_build_options", fake_build_options)
+
+    class _Exhausted:
+        result = None
+        subtype = "error_max_structured_output_retries"
+        session_id = None
+        structured_output = None
+
+    class _Good:
+        result = "done"
+        subtype = "success"
+        session_id = None
+        structured_output = {"value": 9}
+
+    dispatches = {"n": 0}
+
+    async def fake_invoke_default(_opts, _prompt, _ResultMessage, _timeout):
+        dispatches["n"] += 1
+        return _Exhausted() if dispatches["n"] == 1 else _Good()
+
+    monkeypatch.setattr(runtime, "_invoke_default", fake_invoke_default)
+
+    out = await runtime.invoke(role, "diagnose", output_type=_StructuredOut)
+
+    assert isinstance(out, _StructuredOut) and out.value == 9
+    assert build_thinking_flags == [False, True]
+    assert dispatches["n"] == 2
+
+
 class _DeadCliClient(_BaseFakeClient):
     """receive_response() never ends (orphaned stream) while exposing a CLI
     subprocess pid that has already exited and been reaped — models the macOS

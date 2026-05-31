@@ -839,30 +839,45 @@ class ClaudeAgentRuntime(AgentRuntime):
                 opts, effective_prompt, ResultMessage, inactivity_timeout
             )
 
-        try:
-            result_msg = await _dispatch(options)
-        except ClaudeApiErrorStorm:
-            # A provider-error storm is the bundled CLI's StructuredOutput
-            # Stop-hook fighting an extended-thinking block (400 "thinking blocks
-            # ... cannot be modified", looping forever). Keep full extended
-            # thinking for every normal dispatch; ONLY here, on a CONFIRMED storm,
-            # retry THIS one dispatch once with thinking disabled (fresh session,
-            # so the poisoned thinking-block state is dropped) so it can still
-            # produce output instead of failing terminally. Scoped degradation of
-            # the single failing dispatch — never a global reasoning-quality cut.
-            if not output_type:
-                raise
+        async def _dispatch_with_thinking_fallback() -> Any:
+            # First attempt keeps full extended thinking.
+            try:
+                rm = await _dispatch(options)
+            except ClaudeApiErrorStorm:
+                if not output_type:
+                    raise
+                rm = None  # 400 storm -> force the thinking-disabled retry below
+
+            # Thinking + the bundled CLI's StructuredOutput Stop-hook can leave a
+            # structured-output dispatch unable to emit its result — either as a
+            # 400 storm (the CLI re-forces a turn whose extended-thinking block the
+            # API rejects "thinking blocks ... cannot be modified"; caught above as
+            # ClaudeApiErrorStorm) or as a clean exhaustion
+            # (subtype=error_max_structured_output_retries, no result). Both mean
+            # "thinking-on could not produce structured output here". Retry THIS
+            # one dispatch once with thinking disabled (which reliably emits it) so
+            # the workflow still gets a real result. Scoped to the single failing
+            # dispatch — every normal dispatch keeps full extended thinking; only
+            # one that actually fails to emit degrades, and only on its retry.
+            needs_fallback = bool(output_type) and (
+                rm is None
+                or getattr(rm, "subtype", None) == "error_max_structured_output_retries"
+            )
+            if not needs_fallback:
+                return rm
             logger.warning(
-                "Provider-error storm on %s — retrying once with thinking "
-                "disabled to break the StructuredOutput Stop-hook vs "
-                "thinking-block loop (scoped fallback; normal dispatches keep "
-                "extended thinking)",
+                "Structured output unproduced with thinking on for %s (%s) — "
+                "retrying once with thinking disabled (scoped fallback; normal "
+                "dispatches keep extended thinking)",
                 session_key or role.name,
+                "api error storm" if rm is None else "exhausted retries",
             )
             fallback_options = self._build_options(
                 role, workspace, output_type, disable_thinking=True
             )
-            result_msg = await _dispatch(fallback_options)
+            return await _dispatch(fallback_options)
+
+        result_msg = await _dispatch_with_thinking_fallback()
 
         if result_msg is None:
             raise RuntimeError("Claude query completed without a result message")
