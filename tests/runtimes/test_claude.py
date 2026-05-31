@@ -720,7 +720,10 @@ class _StructuredOut(BaseModel):
     value: int
 
 
-def test_build_options_disables_thinking_for_structured_output(monkeypatch):
+def test_build_options_keeps_thinking_for_structured_output_by_default(monkeypatch):
+    # Structured output must NOT disable extended thinking — doing so would
+    # compromise reasoning fidelity for every RCA/verdict dispatch. Structured
+    # output + thinking is the working path (it carried sealed groups 0..77).
     monkeypatch.setitem(
         sys.modules,
         "claude_agent_sdk",
@@ -731,9 +734,28 @@ def test_build_options_disables_thinking_for_structured_output(monkeypatch):
 
     options = runtime._build_options(role, workspace=None, output_type=_StructuredOut)
 
-    assert options.thinking == {"type": "disabled"}
+    assert getattr(options, "thinking", None) is None
     assert options.output_format["type"] == "json_schema"
-    # Effort is a separate CLI flag and must be untouched.
+    assert options.effort == "high"
+
+
+def test_build_options_disables_thinking_only_as_scoped_fallback(monkeypatch):
+    # The ONLY path that disables thinking is the explicit last-resort fallback
+    # after a confirmed provider-error storm (invoke passes disable_thinking=True).
+    monkeypatch.setitem(
+        sys.modules,
+        "claude_agent_sdk",
+        SimpleNamespace(ClaudeAgentOptions=_FakeClaudeAgentOptions),
+    )
+    runtime = object.__new__(ClaudeAgentRuntime)
+    role = Role(name="rca", prompt="Find the bug", tools=["Read"])
+
+    options = runtime._build_options(
+        role, workspace=None, output_type=_StructuredOut, disable_thinking=True
+    )
+
+    assert options.thinking == {"type": "disabled"}
+    # Effort is a separate CLI flag and must be untouched even in the fallback.
     assert options.effort == "high"
 
 
@@ -857,3 +879,54 @@ def test_provider_error_storm_classifies_as_watchdog_stall():
     # terminal reason so the dispatch self-recovers on retry.
     assert isinstance(exc, ClaudeStreamWatchdogStall)
     assert _classify_exception(exc) == "watchdog_stall"
+
+
+@pytest.mark.asyncio
+async def test_invoke_disables_thinking_only_after_a_storm(monkeypatch):
+    # Quality contract: extended thinking stays ON for the normal dispatch. Only
+    # when that dispatch hits a CONFIRMED provider-error storm does invoke retry
+    # THIS one dispatch with thinking disabled — a scoped fallback, never a
+    # global reasoning-quality cut.
+    runtime = object.__new__(ClaudeAgentRuntime)
+    runtime._interactive_roles = set()
+    runtime._session_messages = {}
+    runtime._session_sizes = {}
+    runtime._session_context = {}
+    runtime.session_store = None
+    runtime._active_invocations = {}
+    runtime._invocation_activity = {}
+
+    role = Role(name="rca", prompt="Find the bug", tools=["Read"], metadata={})
+
+    build_thinking_flags: list[bool] = []
+
+    def fake_build_options(_role, _workspace, output_type=None, *, disable_thinking=False):
+        build_thinking_flags.append(disable_thinking)
+        return _FakeClaudeAgentOptions(
+            output_format={"type": "json_schema"} if output_type else None
+        )
+
+    monkeypatch.setattr(runtime, "_build_options", fake_build_options)
+
+    class _Result:
+        result = "done"
+        subtype = "success"
+        session_id = None
+        structured_output = {"value": 7}
+
+    dispatches = {"n": 0}
+
+    async def fake_invoke_default(_opts, _prompt, _ResultMessage, _timeout):
+        dispatches["n"] += 1
+        if dispatches["n"] == 1:
+            raise ClaudeApiErrorStorm("provider error storm; produced no output; watchdog")
+        return _Result()
+
+    monkeypatch.setattr(runtime, "_invoke_default", fake_invoke_default)
+
+    out = await runtime.invoke(role, "diagnose", output_type=_StructuredOut)
+
+    assert isinstance(out, _StructuredOut) and out.value == 7
+    # First attempt thinking ON; only the post-storm fallback turns it OFF.
+    assert build_thinking_flags == [False, True]
+    assert dispatches["n"] == 2

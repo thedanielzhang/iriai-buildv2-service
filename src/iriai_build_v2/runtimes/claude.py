@@ -801,14 +801,40 @@ class ClaudeAgentRuntime(AgentRuntime):
         )
 
         inactivity_timeout = _resolve_stream_inactivity_timeout(role)
-        if use_interactive:
-            result_msg = await self._invoke_interactive(
-                options, effective_prompt, session_key, ResultMessage, inactivity_timeout
+
+        async def _dispatch(opts: Any) -> Any:
+            if use_interactive:
+                return await self._invoke_interactive(
+                    opts, effective_prompt, session_key, ResultMessage, inactivity_timeout
+                )
+            return await self._invoke_default(
+                opts, effective_prompt, ResultMessage, inactivity_timeout
             )
-        else:
-            result_msg = await self._invoke_default(
-                options, effective_prompt, ResultMessage, inactivity_timeout
+
+        try:
+            result_msg = await _dispatch(options)
+        except ClaudeApiErrorStorm:
+            # A provider-error storm is the bundled CLI's StructuredOutput
+            # Stop-hook fighting an extended-thinking block (400 "thinking blocks
+            # ... cannot be modified", looping forever). Keep full extended
+            # thinking for every normal dispatch; ONLY here, on a CONFIRMED storm,
+            # retry THIS one dispatch once with thinking disabled (fresh session,
+            # so the poisoned thinking-block state is dropped) so it can still
+            # produce output instead of failing terminally. Scoped degradation of
+            # the single failing dispatch — never a global reasoning-quality cut.
+            if not output_type:
+                raise
+            logger.warning(
+                "Provider-error storm on %s — retrying once with thinking "
+                "disabled to break the StructuredOutput Stop-hook vs "
+                "thinking-block loop (scoped fallback; normal dispatches keep "
+                "extended thinking)",
+                session_key or role.name,
             )
+            fallback_options = self._build_options(
+                role, workspace, output_type, disable_thinking=True
+            )
+            result_msg = await _dispatch(fallback_options)
 
         if result_msg is None:
             raise RuntimeError("Claude query completed without a result message")
@@ -1211,8 +1237,15 @@ class ClaudeAgentRuntime(AgentRuntime):
         role: Role,
         workspace: Workspace | None,
         output_type: type[BaseModel] | None = None,
+        *,
+        disable_thinking: bool = False,
     ) -> Any:
-        """Construct ClaudeAgentOptions from a role."""
+        """Construct ClaudeAgentOptions from a role.
+
+        ``disable_thinking`` is a scoped, last-resort fallback used ONLY when a
+        dispatch already hit a confirmed provider-error storm (see ``invoke``);
+        normal dispatches keep extended thinking on so reasoning fidelity is
+        never compromised."""
         from claude_agent_sdk import ClaudeAgentOptions
 
         binding = _runtime_workspace_binding(role)
@@ -1284,15 +1317,17 @@ class ClaudeAgentRuntime(AgentRuntime):
                 "type": "json_schema",
                 "schema": _inline_defs(output_type.model_json_schema()),
             }
-            # The bundled CLI enforces structured output with a Stop hook that
-            # re-forces the turn until the model calls StructuredOutput. With
-            # extended/interleaved thinking on (effort=high), the model ends a turn
-            # on a thinking block; the forced continuation then mutates that block
-            # and the API rejects it (400 "thinking blocks in the latest assistant
-            # message cannot be modified"), looping forever. The CLI exposes no knob
-            # to disable that Stop hook, so disable thinking for structured-output
-            # dispatches (→ --max-thinking-tokens 0) to remove the thinking block
-            # the forced continuation cannot carry.
+        if disable_thinking:
+            # Scoped, last-resort fallback ONLY (set by invoke after a confirmed
+            # provider-error storm). The storm is the bundled CLI's StructuredOutput
+            # Stop-hook re-forcing a turn that ended on an extended-thinking block,
+            # which the API then rejects (400 "thinking blocks in the latest
+            # assistant message cannot be modified") forever. Extended thinking is
+            # kept ON for every normal dispatch — structured output + thinking is
+            # the working path that carried groups 0..77 — and disabled here only
+            # to break the loop on the one dispatch that stormed (→
+            # --max-thinking-tokens 0), so it can still produce output rather than
+            # fail terminally.
             options.thinking = {"type": "disabled"}
 
         return options
