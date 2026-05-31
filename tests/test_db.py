@@ -53,3 +53,33 @@ async def test_create_pool_applies_env_overrides_and_clamps_max_to_min(
             {"min_size": 4, "max_size": 4, "command_timeout": 12},
         )
     ]
+
+
+@pytest.mark.asyncio
+async def test_bounded_release_defaults_finite_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    # asyncpg's Pool.release runs the connection reset under asyncio.shield with
+    # timeout=None — an unbounded, uncancellable hang on a dead socket. Every
+    # release must default to a finite timeout so the reset can't deadlock.
+    monkeypatch.delenv("IRIAI_DB_RELEASE_TIMEOUT_SECONDS", raising=False)
+    recorded: list[tuple[object, object]] = []
+
+    async def fake_release(connection: object, *, timeout: object) -> str:
+        recorded.append((connection, timeout))
+        return "released"
+
+    out = await db._bounded_release(fake_release, "conn", None)
+    assert out == "released"
+    assert recorded[-1] == ("conn", 15)  # None -> finite default
+
+    await db._bounded_release(fake_release, "conn", 3)
+    assert recorded[-1] == ("conn", 3)  # explicit timeout preserved
+
+    monkeypatch.setenv("IRIAI_DB_RELEASE_TIMEOUT_SECONDS", "7")
+    await db._bounded_release(fake_release, "conn", None)
+    assert recorded[-1] == ("conn", 7)  # env override
+
+
+def test_bounded_release_pool_is_a_pool_subclass_with_compatible_layout() -> None:
+    # __class__ swap in create_pool requires identical C layout (so __slots__=()).
+    assert issubclass(db._BoundedReleasePool, db.asyncpg.pool.Pool)
+    assert db._BoundedReleasePool.__basicsize__ == db.asyncpg.pool.Pool.__basicsize__
