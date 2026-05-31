@@ -48,6 +48,23 @@ class _BoundedReleasePool(asyncpg.pool.Pool):
         return await _bounded_release(super().release, connection, timeout)
 
 
+async def _setup_session_guards(conn: asyncpg.Connection) -> None:
+    """Applied on EVERY acquire (asyncpg's reset-on-release clears session GUCs).
+
+    A coroutine cancelled mid-transaction (e.g. by a dispatch watchdog) can leave
+    its connection ``idle in transaction`` holding an advisory/row lock, which
+    then blocks FOREVER anything that waits for that lock — observed:
+    ``resume_workflow`` parked on ``pg_advisory_lock`` behind a 12-minute
+    idle-in-transaction holder of ``pg_advisory_xact_lock``.
+    ``idle_in_transaction_session_timeout`` makes Postgres terminate such leaked
+    sessions so their locks release; ``lock_timeout`` bounds any remaining
+    blocking lock acquisition so it raises instead of hanging the event loop."""
+    idle_ms = max(1000, _int_env("IRIAI_DB_IDLE_IN_TXN_TIMEOUT_MS", 60000))
+    lock_ms = max(1000, _int_env("IRIAI_DB_LOCK_TIMEOUT_MS", 90000))
+    await conn.execute(f"SET idle_in_transaction_session_timeout = {idle_ms}")
+    await conn.execute(f"SET lock_timeout = {lock_ms}")
+
+
 async def create_pool(dsn: str) -> asyncpg.Pool:
     min_size = max(1, _int_env("IRIAI_DB_POOL_MIN_SIZE", 1))
     max_size = max(min_size, _int_env("IRIAI_DB_POOL_MAX_SIZE", 5))
@@ -57,6 +74,7 @@ async def create_pool(dsn: str) -> asyncpg.Pool:
         min_size=min_size,
         max_size=max_size,
         command_timeout=command_timeout,
+        setup=_setup_session_guards,
     )
     assert pool is not None
     # Bound every connection release so a wedged reset (dead socket / in-flight
