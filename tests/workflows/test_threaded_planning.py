@@ -1426,6 +1426,100 @@ async def test_task_planning_prompt_requires_requirement_ids_for_req_owning_slic
 
 
 @pytest.mark.asyncio
+async def test_task_planning_prompt_includes_path_discipline_and_repo_catalog(monkeypatch):
+    """AC4: the subfeature planner prompt surfaces the Path Discipline guidance
+    and the real workspace directory map (repo catalog)."""
+    feature = SimpleNamespace(id="feat-task-plan-path-discipline", metadata={})
+    decomposition = SubfeatureDecomposition(
+        subfeatures=[
+            Subfeature(
+                id="SF-1",
+                slug="studio-workflow-tab",
+                name="Studio Workflow Tab",
+                description="SWT",
+            ),
+        ],
+        complete=True,
+    )
+    workstream = Workstream(
+        id="WS-A",
+        name="Studio Workflow",
+        subfeature_slugs=["studio-workflow-tab"],
+        rationale="Studio workflow scope",
+        depends_on=[],
+    )
+    subfeature = decomposition.subfeatures[0]
+    slice_info = task_planning_module.TaskPlanningSlice(
+        slice_id="slice-14",
+        title="Workflow tab view",
+        step_ids=["STEP-14"],
+        requirement_ids=["REQ-1"],
+        acceptance_criterion_ids=["AC-studio-workflow-tab-1"],
+        owned_acceptance_criterion_ids=["AC-studio-workflow-tab-1"],
+        strict_acceptance_criteria=True,
+    )
+
+    directory_map = (
+        "# Directory Map\n\n## Repos\n\n"
+        "| Name | Path | Description | GitHub URL | Language |\n"
+        "|------|------|-------------|------------|----------|\n"
+        "| iriai-studio | iriai-studio | VS Code fork | https://example/x | TypeScript |\n"
+    )
+    project_ctx = ProjectContext(
+        feature_name="Studio Workflow Tab",
+        workspace_path="/tmp/ws",
+        directory_map=directory_map,
+    )
+
+    async def _get(key, *, feature=None):
+        del feature
+        if key == "project":
+            return project_ctx.model_dump_json()
+        return None
+
+    runner = SimpleNamespace(artifacts=SimpleNamespace(get=_get))
+
+    async def _fake_package(self, *args, **kwargs):
+        del self, args, kwargs
+        return None
+
+    async def _fake_context(self, *args, **kwargs):
+        del self, args, kwargs
+        return ""
+
+    monkeypatch.setattr(
+        TaskPlanningPhase,
+        "_build_subfeature_task_context_package",
+        _fake_package,
+    )
+    monkeypatch.setattr(
+        TaskPlanningPhase,
+        "_build_subfeature_task_context",
+        _fake_context,
+    )
+
+    prompt, package = await TaskPlanningPhase()._build_subfeature_task_prompt(
+        runner,
+        feature,
+        decomposition,
+        workstream,
+        subfeature,
+        {},
+        direct_peer_only=True,
+        mode_label="target-only",
+        slice_info=slice_info,
+    )
+
+    assert package is None
+    # (a) Path Discipline guidance is present
+    assert "Path Discipline" in prompt
+    assert "Repo Catalog" in prompt
+    # (b) the real directory-map / repo-layout content is rendered into the prompt
+    assert "iriai-studio | iriai-studio" in prompt
+    assert "VS Code fork" in prompt
+
+
+@pytest.mark.asyncio
 async def test_task_planning_allows_empty_task_requirement_ids_for_slices_without_direct_requirements():
     slice_info = task_planning_module.TaskPlanningSlice(
         slice_id="slice-1",

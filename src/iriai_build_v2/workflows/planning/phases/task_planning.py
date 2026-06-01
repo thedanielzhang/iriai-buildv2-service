@@ -24,6 +24,7 @@ from ....models.outputs import (
     DecisionRecord,
     ImplementationDAG,
     ImplementationTask,
+    ProjectContext,
     TaskAcceptanceCriterion,
     TaskReference,
     SharedPlanningIndex,
@@ -6830,6 +6831,29 @@ class TaskPlanningPhase(Phase):
             return None
         return await self._merge_slice_fragments(runner, feature, subfeature.slug, manifest)
 
+    @staticmethod
+    async def _load_directory_map(runner: WorkflowRunner, feature: Feature) -> str:
+        """Return the persisted workspace directory map (repo catalog), if any.
+
+        The directory map is carried on the persisted ``ProjectContext`` under the
+        ``project`` artifact key (built by ``WorkspaceManager.build_directory_map``).
+        Surfacing it into the planner prompt gives the Planning Lead the real repo
+        layout so it can ground every emitted path (see Path Discipline).
+        """
+        artifacts = getattr(runner, "artifacts", None)
+        if artifacts is None:
+            return ""
+        try:
+            raw = await artifacts.get("project", feature=feature)
+        except Exception:
+            return ""
+        if not raw:
+            return ""
+        try:
+            return ProjectContext.model_validate_json(raw).directory_map or ""
+        except Exception:
+            return ""
+
     async def _build_subfeature_task_prompt(
         self,
         runner: WorkflowRunner,
@@ -6867,6 +6891,17 @@ class TaskPlanningPhase(Phase):
                 direct_peer_only=direct_peer_only,
                 mode_label=mode_label,
                 slice_info=slice_info,
+            )
+        repo_catalog = await self._load_directory_map(runner, feature)
+        repo_catalog_section = ""
+        if repo_catalog:
+            repo_catalog_section = (
+                "## Repo Catalog (real workspace layout)\n"
+                "These are the actual repos available at planning time. Per Path "
+                "Discipline, ground every `file_scope[].path` and `files[]` entry "
+                "against this catalog and confirm the exact location with Glob/Grep "
+                "before emitting it.\n\n"
+                f"{repo_catalog.strip()}\n\n"
             )
         slice_note = ""
         if slice_info is not None:
@@ -6918,6 +6953,7 @@ class TaskPlanningPhase(Phase):
             f"Workstream rationale: {workstream.rationale}\n"
             f"Peer context mode: {mode_label}\n"
             f"Workstream depends on: {workstream.depends_on or ['none']}\n\n"
+            f"{repo_catalog_section}"
             f"{slice_note}"
             f"{repair_note}"
             "Create tasks ONLY for the target subfeature. Every task.subfeature_id MUST be the "

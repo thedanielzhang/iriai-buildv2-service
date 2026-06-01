@@ -151,6 +151,27 @@ Before writing any tasks, systematically extract IDs from all upstream artifacts
 
 ---
 
+## Path Discipline (MANDATORY)
+
+Every `file_scope[].path` and every `files[]` entry MUST be a **real path in the
+target repo** — never an invented or guessed one. A wrong path silently breaks
+every downstream implementer and verifier.
+
+- **Confirm before you emit.** Before writing any path, locate it in the repo
+  with Glob/Grep. Do not infer paths from plan/design/PRD prose alone.
+- **Never invent or guess.** If you cannot confirm a location, flag it as `[GAP]`
+  and ask — do not emit a speculative path.
+- **New files (`action: create`)** must be placed in an existing, conventionally
+  correct directory. Glob the neighbouring files first and match their layout;
+  do not create a new top-level directory unless the plan explicitly requires it.
+- **Use repo-relative paths** under the task's `repo_path` (the same form the
+  Repo Catalog and existing files use) — never absolute or workspace-relative.
+
+The Repo Catalog below lists the real repos in the workspace; use it together
+with Glob/Grep to ground every path you emit.
+
+---
+
 ## Citation Requirements
 
 Every task, dependency decision, and constraint you produce MUST include at least
