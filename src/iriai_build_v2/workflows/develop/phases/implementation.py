@@ -289,6 +289,7 @@ from ....models.outputs import (
     BugFixAttempt,
     BugGroup,
     BugTriage,
+    DagPathResolution,
     DerivedDAGArtifact,
     EnhancementBacklog,
     EnhancementDecomposition,
@@ -313,6 +314,7 @@ from ....models.outputs import (
 )
 from ....models.state import BuildState
 from ....roles import (
+    dag_path_resolver_role,
     implementer,
     integration_tester,
     lead_architect_gate_reviewer,
@@ -874,11 +876,15 @@ from ..execution.control_plane import (
     _workflow_blocker_text,
 )
 from ..._common._dag_paths import (
+    AmbiguousDagPath,
+    apply_path_resolution,
     canonicalize_dag_path,
     canonicalize_implementation_tasks,
+    dag_path_agentic_resolver_enabled,
     dag_path_canonicalization_enabled,
     dag_path_rewrites_to_records,
     find_retired_backend_path_references,
+    unresolved_dag_paths,
 )
 from ..._common._autonomy import autonomous_remainder_enabled, interaction_actor_for_phase
 from ...public_exhibit import enqueue_public_exhibit_refresh
@@ -13295,6 +13301,122 @@ async def _generate_and_publish_implementation_report(
     return report_url, backlog_url, backlog
 
 
+def _build_migration_resolver_prompt(
+    dag: ImplementationDAG, unresolved: list[dict[str, str]]
+) -> str:
+    """Resolver prompt for the execution-side DAG path migration.
+
+    Mirrors the planning-seam resolver prompt: the agent runs with cwd = workspace
+    root and confirms each candidate's real location via Glob/Grep."""
+    repo_by_task = {task.id: (task.repo_path or "") for task in dag.tasks}
+    candidates = [
+        {
+            "task_id": entry["task_id"],
+            "repo_path": repo_by_task.get(entry["task_id"], ""),
+            "field": entry["field"],
+            "path": entry["path"],
+            "action": entry.get("action", ""),
+        }
+        for entry in unresolved
+    ]
+    return (
+        "Resolve these implementation-DAG task paths against the real repository "
+        "checked out at your current working directory (each candidate lives at "
+        "`<cwd>/<repo_path>/<path>`).\n\n"
+        "UNRESOLVED candidate paths (JSON):\n"
+        f"```json\n{json.dumps(candidates, indent=2)}\n```\n\n"
+        "For EACH entry return exactly one DagPathDecision (copy task_id and field "
+        "verbatim): `correct` + `resolved` (the real repo-relative path) + "
+        "`evidence` (the Glob/Grep hit) when there is a UNIQUE real match; `keep` "
+        "when the path is already correct; `create_ok` for a legitimate NEW file in "
+        "a real directory; `ambiguous` when you cannot find a unique match — NEVER "
+        "guess. Set corrected_count and ambiguous_count accordingly."
+    )
+
+
+async def _migrate_persisted_dag_paths(
+    runner: WorkflowRunner, feature: Feature, dag: ImplementationDAG
+) -> ImplementationDAG:
+    """One-time, replay-safe correction of bad file paths in an ALREADY-persisted DAG.
+
+    Planning's agentic resolver fixes paths for new features, but a DAG persisted
+    before that landed (e.g. with a phantom path) is frozen. On resume, run the same
+    existence-prepass + agentic resolver against the live repo; if any path is
+    corrected, re-persist the ``dag`` artifact so the corrected paths flow into
+    ``dag_sha256`` and every downstream consumer.
+
+    Safe for sealed groups: resume adoption keys on group indices (not on
+    ``dag_sha256``) and the group loop starts at ``start_group``, so sealed groups
+    are skipped regardless of the sha change; the unsealed group's stale proofs
+    (old sha) correctly fail freshness and re-dispatch with the corrected paths.
+
+    Idempotent: once paths resolve on disk the existence prepass is empty and this
+    is a no-op. Replay-stable: the resolution is persisted and reused, so the agent
+    is dispatched at most once. Ambiguous resolutions are surfaced (logged) and left
+    uncorrected rather than guessed."""
+    if not dag_path_agentic_resolver_enabled():
+        return dag
+    get_workspace = getattr(runner, "get_workspace", None)
+    workspace = get_workspace(getattr(feature, "workspace_id", None)) if callable(get_workspace) else None
+    workspace_root = str(getattr(workspace, "path", "") or "")
+    if not workspace_root:
+        return dag
+    unresolved = unresolved_dag_paths(dag, workspace_root)
+    if not unresolved:
+        return dag
+
+    artifact_key = "dag-path-resolution:migration"
+    resolution: DagPathResolution | None = None
+    existing = await runner.artifacts.get(artifact_key, feature=feature)
+    if existing:
+        try:
+            resolution = DagPathResolution.model_validate_json(existing)
+        except Exception:
+            logger.warning(
+                "Persisted %s is not valid DagPathResolution JSON; re-dispatching",
+                artifact_key, exc_info=True,
+            )
+            resolution = None
+    if resolution is None:
+        actor = AgentActor(
+            name="dag-path-resolver-migration",
+            role=dag_path_resolver_role,
+            context_keys=[],
+        )
+        resolution = await runner.run(
+            Ask(
+                actor=actor,
+                prompt=_build_migration_resolver_prompt(dag, unresolved),
+                output_type=DagPathResolution,
+            ),
+            feature,
+            phase_name="implementation",
+        )
+        await runner.artifacts.put(
+            artifact_key, resolution.model_dump_json(indent=2), feature=feature
+        )
+
+    try:
+        corrected, rewrites = apply_path_resolution(dag, resolution)
+    except AmbiguousDagPath as exc:
+        logger.error(
+            "DAG path migration could not resolve %d path(s) unambiguously "
+            "(operator action needed; left uncorrected): %s",
+            len(unresolved), exc,
+        )
+        return dag
+    if not rewrites:
+        return dag
+    await runner.artifacts.put(
+        "dag", corrected.model_dump_json(indent=2), feature=feature
+    )
+    logger.info(
+        "DAG path migration corrected %d path(s) and re-persisted the dag artifact",
+        len(rewrites),
+    )
+    return corrected
+
+
 class ImplementationPhase(Phase):
     name = "implementation"
 
@@ -13303,6 +13425,9 @@ class ImplementationPhase(Phase):
     ) -> BuildState:
         dag_json = await runner.artifacts.get("dag", feature=feature)
         dag = ImplementationDAG.model_validate_json(dag_json)
+        # One-time, replay-safe correction of bad paths in an already-persisted DAG
+        # (e.g. a planner phantom path). No-op once paths resolve on disk.
+        dag = await _migrate_persisted_dag_paths(runner, feature, dag)
 
         # Loaded once per execute() call and spliced into 4 of 6 post-DAG gates
         # (test author, QA, integration tester, verifier) AND into the
