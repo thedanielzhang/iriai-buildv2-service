@@ -5615,6 +5615,7 @@ async def _enqueue_durable_merge_queue_for_results(
     contracts_by_task_id: dict[str, Any] | None,
     feature_root: Path | None,
     stage: str,
+    retry_source_by_task: dict[str, int] | None = None,
 ) -> list[int]:
     """Slice 08e-2: enqueue sandbox-captured lanes onto the durable merge queue.
 
@@ -5633,9 +5634,21 @@ async def _enqueue_durable_merge_queue_for_results(
     guard are preserved: this only records the integration *intent*; the
     queue worker runs the post-apply gates and the verifier still runs.
 
+    *retry_source_by_task* (Blocker #2 commit-hygiene recovery): an optional
+    ``task_id -> failed merge_queue_item id`` map. When a task is present, its
+    lane is enqueued as an authorized ``retry_of_queue_item_id`` REPLACEMENT of
+    the failed source lane (``MergeQueueStore._validate_retry_source`` requires
+    the source be terminal ``failed``, carry no ``result_commit``, have no
+    existing replacement, and the replacement carry a FRESH patch). The fresh
+    patch is signalled with a deterministic non-empty ``head_commit`` derived
+    from the new sandbox patch evidence ids so the retry lane's idempotency key +
+    ``head_commit`` differ from the (empty-head) failed source. Default ``None``
+    preserves the original first-time enqueue for every non-recovered task.
+
     Returns the enqueued ``merge_queue_items`` ids (one per covered task).
     """
 
+    retry_source_by_task = retry_source_by_task or {}
     if (
         MergeQueueStore is None
         or MergeQueueItemCreate is None
@@ -5748,6 +5761,29 @@ async def _enqueue_durable_merge_queue_for_results(
                 repo_id = lane["repo_id"]
                 base_commit = lane["base_commit"]
                 gate_id = lane["pre_queue_gate_evidence_id"]
+                # Blocker #2 commit-hygiene recovery: when this task's prior
+                # lane failed commit_hygiene, enqueue THIS fresh capture as an
+                # authorized `retry_of_queue_item_id` replacement of that failed
+                # source. The store's `_validate_retry_source` requires the
+                # replacement carry a FRESH patch (a `head_commit` differing from
+                # the source) — the original lane has an empty `head_commit`, so
+                # derive a deterministic non-empty head from the new patch
+                # evidence ids. This also makes the retry lane's idempotency key
+                # distinct from the failed source so the two never collide.
+                retry_of = retry_source_by_task.get(task_id)
+                head_commit = ""
+                if retry_of is not None:
+                    head_commit = "retry-" + _sha256_text(
+                        f"{task_id}:{sorted(lane['patch_evidence_ids'])}"
+                    )[:32]
+                payload = {
+                    "stage": stage,
+                    "task_ids": [task_id],
+                    "source": "implementation_worker",
+                }
+                if retry_of is not None:
+                    payload["retry_of_queue_item_id"] = int(retry_of)
+                    payload["source"] = "commit_hygiene_recovery"
                 # One queue item per task = one integration lane. A per-task
                 # lane is always isolation-safe (it never combines tasks);
                 # unknown_write_set contracts REQUIRE this and the store
@@ -5759,12 +5795,13 @@ async def _enqueue_durable_merge_queue_for_results(
                     base_commit=base_commit,
                     repo_id=repo_id,
                     repo_path=lane["repo_path"],
-                    head_commit="",
+                    head_commit=head_commit,
                     contract_ids=[contract_id],
                     patch_evidence_ids=lane["patch_evidence_ids"],
                     gate_evidence_ids=[gate_id],
                     pre_queue_gate_evidence_id=gate_id,
                     integration_lane=f"task:{task_id}",
+                    retry_of_queue_item_id=retry_of,
                     task_coverage=[
                         TaskCoverageCreate(
                             task_id=task_id, contract_id=contract_id
@@ -5777,11 +5814,7 @@ async def _enqueue_durable_merge_queue_for_results(
                             base_commit=base_commit,
                         )
                     ],
-                    payload={
-                        "stage": stage,
-                        "task_ids": [task_id],
-                        "source": "implementation_worker",
-                    },
+                    payload=payload,
                 )
                 try:
                     item = await queue_store.enqueue(create)
@@ -5826,6 +5859,150 @@ async def _enqueue_durable_merge_queue_for_results(
             },
         )
     return enqueued_ids
+
+
+@dataclass
+class _CommitHygieneRecoveryLane:
+    """A group's failed merge-queue lane recoverable via agent re-dispatch.
+
+    Built by :func:`_commit_hygiene_recovery_lanes_for_group` from the durable
+    merge-queue rows for ONE ``(feature, dag, group)`` — one entry per failed
+    ``commit_hygiene`` lane, keyed by the (single) task it covers. ``hook_detail``
+    is the persisted hook output (``commit_and_prove_clean`` now folds the
+    bounded pre-commit/husky stderr/stdout into the failure detail) that the
+    re-dispatch threads to the agent as concrete recovery feedback.
+    """
+
+    task_id: str
+    lane_id: int
+    failure_class: str
+    hook_detail: str
+
+
+def _parse_lane_failure(item: Any) -> tuple[str, str]:
+    """Recover ``(failure_class, detail)`` from a failed merge-queue lane.
+
+    The worker's ``_fail`` records ``payload["last_error"] =
+    f"{failure_class}: {detail}"`` (``merge_queue.py``). Split on the FIRST
+    ``": "`` so the multi-line ``detail`` (which now carries the bounded hook
+    stderr/stdout with its own ``stderr:``/``stdout:`` headers) is preserved
+    intact. Returns ``("", "")`` when no parseable ``last_error`` is present.
+    """
+
+    payload = getattr(item, "payload", None) or {}
+    last_error = str(payload.get("last_error", "") or "")
+    if not last_error:
+        return ("", "")
+    head, sep, tail = last_error.partition(": ")
+    if not sep:
+        return (head.strip(), "")
+    return (head.strip(), tail)
+
+
+async def _commit_hygiene_recovery_lanes_for_group(
+    runner: WorkflowRunner,
+    feature: Feature,
+    *,
+    dag_sha256: str,
+    group_idx: int,
+) -> dict[str, _CommitHygieneRecoveryLane]:
+    """Map ``task_id -> failed commit_hygiene lane`` for ONE DAG group.
+
+    Queries the durable queue's lanes for the group
+    (``MergeQueueStore.list_group_items``) and returns one entry per lane that
+    is terminal ``failed`` with ``failure_class == "commit_hygiene"``, keyed by
+    the (single) task id the lane covers. The recovery seam in ``_implement_dag``
+    consumes this to decide (via :func:`_commit_hygiene_recovery_plan`) whether
+    to re-dispatch the task with the persisted hook error as feedback.
+
+    Fails closed: any missing module, store, connection, or DB error returns an
+    EMPTY map, so the caller falls through to unchanged resume behavior — a
+    commit_hygiene recovery is never invented on incomplete evidence.
+    """
+
+    if MergeQueueStore is None:
+        return {}
+    store = _execution_control_store_for_runner(runner)
+    if store is None:
+        return {}
+    feature_id = str(getattr(feature, "id", "") or "")
+    if not feature_id or not str(dag_sha256 or ""):
+        return {}
+    try:
+        async with _merge_queue_connection(store) as conn:
+            queue_store = MergeQueueStore(conn)
+            items = await queue_store.list_group_items(
+                feature_id, str(dag_sha256), group_idx
+            )
+    except Exception:  # pragma: no cover - fail closed on any store/DB error.
+        logger.debug(
+            "commit_hygiene recovery probe failed for group %d",
+            group_idx,
+            exc_info=True,
+        )
+        return {}
+    recovery: dict[str, _CommitHygieneRecoveryLane] = {}
+    for item in items or []:
+        if str(getattr(item, "status", "") or "") != "failed":
+            continue
+        failure_class, detail = _parse_lane_failure(item)
+        if failure_class != "commit_hygiene":
+            continue
+        covered = [
+            str(c.task_id)
+            for c in getattr(item, "task_coverage", []) or []
+            if str(getattr(c, "task_id", ""))
+        ]
+        # A `task:{id}` lane covers exactly one task; a recovery is per-task.
+        if len(covered) != 1:
+            continue
+        task_id = covered[0]
+        # Keep the lowest-id (oldest) failed lane per task — a retry replacement
+        # of a recovered lane is itself a distinct lane, but only the original
+        # failed lane is a valid retry SOURCE (`_validate_retry_source` refuses a
+        # source that already has a non-cancelled replacement).
+        existing = recovery.get(task_id)
+        if existing is not None and existing.lane_id <= int(item.id):
+            continue
+        recovery[task_id] = _CommitHygieneRecoveryLane(
+            task_id=task_id,
+            lane_id=int(item.id),
+            failure_class=failure_class,
+            hook_detail=detail,
+        )
+    return recovery
+
+
+def _commit_hygiene_recovery_feedback(lane: _CommitHygieneRecoveryLane) -> str:
+    """Build the agent recovery feedback for a failed commit_hygiene lane.
+
+    Names the CONCRETE pre-commit/husky blocker from the persisted hook output
+    (e.g. the eslint rule id + the offending test file) so the re-dispatched
+    agent fixes the actual violation — never a generic "fix hygiene". Threaded
+    into the re-dispatch prompt as ``handover_context``.
+    """
+
+    detail = (lane.hook_detail or "").strip()
+    body = (
+        detail
+        if detail
+        else (
+            "The product pre-commit hook rejected this task's commit, but no "
+            "hook output was persisted."
+        )
+    )
+    return (
+        "\n\n## Commit-Hygiene Blocker — Fix Required\n"
+        "Your previously-captured patch for this task was applied to the "
+        "canonical repo but the product **pre-commit/husky hook rejected the "
+        "commit** when the durable merge queue tried to integrate it. The work "
+        "is NOT integrated. Re-do the task and FIX the concrete hook violation "
+        "below so the commit passes — do not bypass, disable, or suppress the "
+        "hook (no `--no-verify`, no eslint-disable, no test skips).\n\n"
+        f"**Failed merge-queue lane:** {lane.lane_id}\n"
+        "**Pre-commit hook output:**\n"
+        f"```\n{body}\n```\n"
+    )
 
 
 # ── Slice 08e-3a — durable merge queue DRAIN worker ─────────────────────────
@@ -8783,6 +8960,50 @@ _SANDBOX_INFRA_RETRY_HEADROOM = 2
 # required. Bounded so a task that never converges surfaces a clean terminal
 # blocker instead of looping forever at the merge-queue gate.
 _PARTIAL_RESUME_RERUN_HEADROOM = 2
+
+# Bound for the commit-hygiene drain-failure recovery (Blocker #2): a durable
+# merge-queue lane that `failed` with `failure_class == "commit_hygiene"` (the
+# product pre-commit/husky hook rejected the candidate) is recovered by
+# re-dispatching its task with the real hook error as feedback so the agent
+# fixes the violation, then re-capturing -> re-enqueueing the fresh patch as a
+# `retry_of_queue_item_id` lane. Bounded so a task that never converges surfaces
+# a clean terminal `workflow_blocked` instead of looping forever at the gate.
+_COMMIT_HYGIENE_RERUN_MAX = 2
+
+
+def _commit_hygiene_recovery_plan(
+    *,
+    lane_status: str,
+    failure_class: str,
+    prior_rerun_count: int,
+    max_reruns: int,
+) -> str:
+    """Decide how a resume should handle a task whose merge-queue lane failed.
+
+    The durable merge queue never re-claims a ``failed`` lane and the per-task
+    resume block short-circuits a ``completed`` ``dag-task:*`` marker — so a
+    lane that ``failed`` with ``commit_hygiene`` (the product pre-commit hook
+    rejected the candidate; e.g. a VS Code code-hygiene violation in an
+    agent-generated test file) is otherwise a dead-end. This decides, purely
+    from the lane's terminal state + the bounded per-task re-run budget, whether
+    the resume should:
+
+    - ``"rerun"`` — re-dispatch the task with the real hook error as feedback so
+      the agent fixes the violation, then re-capture + enqueue a retry lane.
+      Returned when the lane is ``failed`` + ``commit_hygiene`` and the per-task
+      re-run budget is not yet exhausted (``prior_rerun_count < max_reruns``).
+    - ``"escalate"`` — the same lane state but the re-run budget IS exhausted;
+      the caller leaves the lane ``failed`` and falls through to the existing
+      fail-closed ``workflow_blocked`` terminal path (no infinite loop).
+    - ``"none"`` — any other lane state (not failed, or not commit_hygiene);
+      unchanged behavior — the caller short-circuits the completed marker.
+    """
+
+    if lane_status == "failed" and failure_class == "commit_hygiene":
+        if prior_rerun_count < max_reruns:
+            return "rerun"
+        return "escalate"
+    return "none"
 
 
 def _resume_dispatch_plan_for_succeeded_terminal(
@@ -19774,7 +19995,127 @@ async def _implement_dag(
         completed_results: list[ImplementationResult] = []
         pending_merge_queue_resume_results: list[ImplementationResult] = []
         stable_task_indices = {tid: idx for idx, tid in enumerate(group)}
+
+        # ── Commit-hygiene drain-failure recovery (Blocker #2) ───────
+        # A task whose durable merge-queue lane `failed` with `commit_hygiene`
+        # (the product pre-commit/husky hook rejected its captured patch) leaves
+        # a `completed` `dag-task:*` marker that the block below would normally
+        # short-circuit — but the lane is `failed` and never re-claimed, so the
+        # work is a dead-end. Query the group's lanes ONCE, then for each such
+        # task decide (bounded) whether to re-dispatch it with the real hook
+        # error as feedback (`rerun`), surface a clean terminal blocker
+        # (`escalate`), or leave it unchanged (`none`). Re-dispatched tasks carry
+        # per-task feedback + a retry-source lane id so the fresh capture is
+        # enqueued as a `retry_of_queue_item_id` replacement of the failed lane.
+        commit_hygiene_recovery = (
+            await _commit_hygiene_recovery_lanes_for_group(
+                runner, feature, dag_sha256=dag_sha256, group_idx=group_idx,
+            )
+        )
+        commit_hygiene_feedback_by_task: dict[str, str] = {}
+        commit_hygiene_retry_source_by_task: dict[str, int] = {}
+
         for tid in group:
+            recovery_lane = commit_hygiene_recovery.get(tid)
+            if recovery_lane is not None:
+                rerun_marker_key = f"dag-commit-hygiene-rerun:{tid}"
+                prior_rerun_count = 0
+                try:
+                    raw_count = await runner.artifacts.get(
+                        rerun_marker_key, feature=feature,
+                    )
+                    if raw_count:
+                        prior_rerun_count = int(str(raw_count).strip())
+                except Exception:
+                    prior_rerun_count = 0
+                recovery_decision = _commit_hygiene_recovery_plan(
+                    lane_status="failed",
+                    failure_class=recovery_lane.failure_class,
+                    prior_rerun_count=prior_rerun_count,
+                    max_reruns=_COMMIT_HYGIENE_RERUN_MAX,
+                )
+                if recovery_decision == "escalate":
+                    # Budget exhausted: do not re-dispatch again. Fall through to
+                    # the EXISTING fail-closed terminal path with the persisted
+                    # hook error in the blocker message — never an infinite loop.
+                    await _log_feature_event(
+                        runner,
+                        feature.id,
+                        "dag_commit_hygiene_recovery_escalated",
+                        "implementation",
+                        content=tid,
+                        metadata={
+                            "group_idx": group_idx,
+                            "task_id": tid,
+                            "merge_queue_item_id": recovery_lane.lane_id,
+                            "prior_rerun_count": prior_rerun_count,
+                            "max_reruns": _COMMIT_HYGIENE_RERUN_MAX,
+                        },
+                    )
+                    return DagExecutionOutcome(
+                        implementation_text="\n\n".join(
+                            to_str(r) for r in all_results
+                        ),
+                        failure=_workflow_blocker_text(
+                            f"Task {tid} (group {group_idx}) could not pass the "
+                            "product commit-hygiene hook after "
+                            f"{_COMMIT_HYGIENE_RERUN_MAX} bounded agent "
+                            "re-dispatches; its merge-queue lane "
+                            f"{recovery_lane.lane_id} remains failed. The commit "
+                            "gate was not bypassed. Manual resolution is "
+                            "required.\n\nPre-commit hook output:\n"
+                            f"{recovery_lane.hook_detail or '(none persisted)'}"
+                        ),
+                        handover=handover,
+                        terminal_state="workflow_blocked",
+                    )
+                if recovery_decision == "rerun":
+                    # Do NOT short-circuit the `completed` marker — re-dispatch
+                    # the task with the concrete hook error as feedback, persist
+                    # the incremented rerun counter, and record the failed lane
+                    # as the retry source so the fresh capture is enqueued as a
+                    # `retry_of_queue_item_id` replacement.
+                    commit_hygiene_feedback_by_task[tid] = (
+                        _commit_hygiene_recovery_feedback(recovery_lane)
+                    )
+                    commit_hygiene_retry_source_by_task[tid] = (
+                        recovery_lane.lane_id
+                    )
+                    try:
+                        await runner.artifacts.put(
+                            rerun_marker_key,
+                            str(prior_rerun_count + 1),
+                            feature=feature,
+                        )
+                    except Exception:  # pragma: no cover - best effort.
+                        pass
+                    await _log_feature_event(
+                        runner,
+                        feature.id,
+                        "dag_commit_hygiene_recovery_rerun",
+                        "implementation",
+                        content=tid,
+                        metadata={
+                            "group_idx": group_idx,
+                            "task_id": tid,
+                            "merge_queue_item_id": recovery_lane.lane_id,
+                            "prior_rerun_count": prior_rerun_count,
+                            "max_reruns": _COMMIT_HYGIENE_RERUN_MAX,
+                        },
+                    )
+                    logger.warning(
+                        "Task %s merge-queue lane %d failed commit_hygiene; "
+                        "re-dispatching (rerun %d/%d) with the persisted hook "
+                        "error as feedback instead of short-circuiting the "
+                        "completed marker",
+                        tid,
+                        recovery_lane.lane_id,
+                        prior_rerun_count + 1,
+                        _COMMIT_HYGIENE_RERUN_MAX,
+                    )
+                    pending_tasks.append(group_tasks_by_id[tid])
+                    continue
+
             task_marker = await runner.artifacts.get(
                 f"dag-task:{tid}", feature=feature,
             )
@@ -19986,10 +20327,17 @@ async def _implement_dag(
                 ws_path = repo_binding.ws_path
 
                 # ── Build prompt, offloading to files if too large ──
+                # A task recovered from a `failed:commit_hygiene` merge-queue
+                # lane carries per-task feedback naming the CONCRETE pre-commit
+                # hook blocker; thread it through the same `handover_context`
+                # plumbing the dispatcher already files to disk when large.
+                task_handover_context = handover_context + (
+                    commit_hygiene_feedback_by_task.get(t.id, "")
+                )
                 prefix = f"{repo_prefix}/" if repo_prefix else ""
                 inline_prompt = (
                     _build_task_prompt(t, repo_prefix=prefix, contract=task_contract)
-                    + handover_context
+                    + task_handover_context
                 )
 
                 # ── L1: don't replay infra-failures superseded by a later success ──
@@ -20172,7 +20520,7 @@ async def _implement_dag(
                             repo_id=repo_binding.repo_id,
                             repo_prefix=repo_prefix or "",
                             inline_prompt=inline_prompt,
-                            handover_context=handover_context,
+                            handover_context=task_handover_context,
                             stage="implementation",
                             actor_suffix=f"g{group_idx}-t{task_idx}-a{attempt}",
                             log_label=f"Task {t.id}",
@@ -20461,6 +20809,12 @@ async def _implement_dag(
                             contracts_by_task_id=contracts_by_task_id,
                             feature_root=feature_root,
                             stage="implementation",
+                            # Blocker #2: a task re-dispatched out of a
+                            # `failed:commit_hygiene` lane is enqueued as a
+                            # `retry_of_queue_item_id` replacement of that lane.
+                            retry_source_by_task=(
+                                commit_hygiene_retry_source_by_task or None
+                            ),
                         )
                     )
                 except _MergeQueueEnqueueError as exc:

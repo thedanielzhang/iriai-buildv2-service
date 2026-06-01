@@ -32,6 +32,34 @@ from .journal import (
 )
 
 
+# Bound the persisted hook output so a verbose pre-commit/husky log stays within
+# the merge_queue_items payload + the routed RouterFailureObservation
+# (`_route_merge_queue_drain_failure` truncates `detail` to 1000 chars). The hook
+# output is already `_bounded` (4000 chars) at capture in `git_service.commit`;
+# this is a second, tighter head+tail clip so the most-diagnostic lines (the rule
+# id + target file are usually near the top; the summary near the bottom) survive
+# the route-table detail cap and become the agent's recovery feedback.
+_HOOK_OUTPUT_DETAIL_LIMIT = 2000
+
+
+def _clip_hook_output(text: str, *, limit: int = _HOOK_OUTPUT_DETAIL_LIMIT) -> str:
+    """Head+tail clip a hook output stream to *limit* chars.
+
+    Keeps the leading and trailing slices (the eslint rule id / target file is
+    typically near the top and the run summary near the bottom) and elides the
+    middle so the persisted failure detail names the concrete blocker instead of
+    a bare exit code.
+    """
+
+    text = (text or "").strip()
+    if len(text) <= limit:
+        return text
+    head = limit // 2
+    tail = limit - head
+    elided = len(text) - head - tail
+    return f"{text[:head]}\n... [clipped {elided} chars]\n{text[-tail:]}"
+
+
 class LeaseToken(BaseModel):
     """A worker's fencing token for a claimed queue item."""
 
@@ -601,10 +629,22 @@ class MergeQueue:
                     )
                     detail = "commit hook rejected the candidate"
                     if commit_result.hook_failure is not None:
-                        detail = (
-                            f"commit hook failed (exit "
-                            f"{commit_result.hook_failure.returncode})"
-                        )
+                        hook = commit_result.hook_failure
+                        # Persist the bounded hook stderr/stdout (not just the
+                        # exit code) so the failure is diagnosable AND so the
+                        # concrete blocker (e.g. the eslint rule id + target
+                        # file) flows into the routed RouterFailureObservation
+                        # and becomes the agent recovery feedback. The stream is
+                        # already `_bounded` at capture; this head+tail clip
+                        # keeps the detail within the route-table 1000-char cap
+                        # surface while preserving the most-diagnostic lines.
+                        stderr = _clip_hook_output(hook.stderr)
+                        stdout = _clip_hook_output(hook.stdout)
+                        detail = f"commit hook failed (exit {hook.returncode})"
+                        if stderr:
+                            detail += f"\nstderr:\n{stderr}"
+                        if stdout:
+                            detail += f"\nstdout:\n{stdout}"
                     await self._fail(item, token, "commit_hygiene", detail)
                     return MergeCommitResult(
                         item_id=item.id, committed=False, status="failed",

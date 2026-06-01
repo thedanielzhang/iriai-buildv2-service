@@ -1633,3 +1633,274 @@ async def test_pending_durable_merge_reader_recovers_latest_succeeded_patch_ids(
     assert recovered["dispatch_attempt_id"] == attempt.attempt_id
     assert recovered["structured_result_evidence_id"] == structured.evidence.id
     assert recovered["patch_summary_ids"] == [patch.evidence.id]
+
+
+# ── Blocker #2 — commit-hygiene drain-failure recovery ──────────────────────
+#
+# A durable merge-queue lane that `failed` with `commit_hygiene` (the product
+# pre-commit/husky hook rejected its captured patch) is recovered by
+# re-dispatching the task with the persisted hook error as feedback, then
+# enqueuing the fresh capture as a `retry_of_queue_item_id` replacement. These
+# exercise: (1) the bounded hook stderr is PERSISTED in the failed lane's detail
+# (the recovery feedback source), (2) `_commit_hygiene_recovery_lanes_for_group`
+# maps the task -> the failed lane + names the concrete hook blocker, (3) the
+# retry enqueue wires `retry_of_queue_item_id` and the store accepts it as an
+# authorized replacement, (4) the recovery plan is bounded and escalates.
+
+
+_HOOK_RULE_LINE = (
+    "activityBuffer.unit.test.ts:30 — Suites should include a call to "
+    "ensureNoDisposablesAreLeakedInTestSuite() "
+    "(local/code-ensure-no-disposables-leak-in-test)"
+)
+
+
+def _diff_for_appended_line(repo: Path, text: str) -> str:
+    """Stage no change; capture a diff that appends *text* to README.md."""
+    original = (repo / "README.md").read_text()
+    (repo / "README.md").write_text(original + text)
+    patch = _git(repo, "diff")
+    (repo / "README.md").write_text(original)
+    return patch
+
+
+def _install_rejecting_precommit_hook(repo: Path, *, stderr_line: str) -> None:
+    """Install a legacy `.git/hooks/pre-commit` that always rejects.
+
+    Mirrors the canonical `iriai-studio` repo (empty `core.hooksPath` -> the
+    legacy hook runs); the hook writes *stderr_line* to stderr and exits 1, so
+    `git_service.commit` returns `committed=False` with a `HookFailure` carrying
+    that stderr — the exact shape `commit_and_prove_clean` now persists.
+    """
+    hook = repo / ".git" / "hooks" / "pre-commit"
+    hook.write_text(f"#!/bin/sh\necho '{stderr_line}' >&2\nexit 1\n")
+    hook.chmod(0o755)
+
+
+def _recovery_runner(conn) -> SimpleNamespace:
+    return SimpleNamespace(
+        artifacts=None,
+        services={"execution_control_store": ExecutionControlStore(conn)},
+    )
+
+
+def _recovery_feature(feature_id: str) -> SimpleNamespace:
+    return SimpleNamespace(id=feature_id, slug=feature_id, metadata={})
+
+
+async def _enqueue_and_fail_commit_hygiene(
+    impl, conn, feature_id: str, tmp_path: Path, *, task_id: str = "TASK-1"
+):
+    """Enqueue a real lane, install a rejecting hook, drain -> failed lane.
+
+    Returns `(failed_item_id, repo, base_commit, contract_row)`.
+    """
+    repo = tmp_path / "app"
+    base = _init_repo(repo)
+    patch = _diff_for_appended_line(repo, "recovery line\n")
+    contract = await _insert_contract(
+        conn,
+        feature_id,
+        task_id,
+        allowed_paths=[
+            {"repo_id": "app", "path": "README.md", "match_kind": "file"}
+        ],
+    )
+    diff_artifact = await _insert_artifact(
+        conn, feature_id, f"dag-sandbox-diff:{task_id}", patch
+    )
+    patch_evidence = await _insert_sandbox_patch_evidence(
+        conn, feature_id, repo_id="app", base_commit=base,
+        diff_artifact_id=diff_artifact,
+    )
+    contract_row = SimpleNamespace(
+        id=contract, repo_id="app", repo_path="app", unknown_write_set=False,
+    )
+    runner = _recovery_runner(conn)
+    feature = _recovery_feature(feature_id)
+    enqueued = await impl._enqueue_durable_merge_queue_for_results(
+        runner, feature, [_impl_result(impl, task_id, [patch_evidence])],
+        dag_sha256=_DAG, group_idx=1,
+        contracts_by_task_id={task_id: contract_row},
+        feature_root=tmp_path, stage="implementation",
+    )
+    assert len(enqueued) == 1
+    failed_item_id = enqueued[0]
+
+    _install_rejecting_precommit_hook(repo, stderr_line=_HOOK_RULE_LINE)
+    drained = await impl._drain_durable_merge_queue_for_feature(
+        runner, feature, dag_sha256=_DAG, stage="implementation",
+    )
+    assert len(drained) == 1
+    assert drained[0].failure_class == "commit_hygiene"
+    return failed_item_id, repo, base, contract_row
+
+
+@pytest.mark.asyncio
+async def test_commit_hook_failure_persists_bounded_hook_stderr(
+    mq_conn, tmp_path: Path
+) -> None:
+    """The failed lane's persisted detail carries the bounded hook stderr.
+
+    Acceptance criterion 2: `commit_and_prove_clean` folds the bounded hook
+    `stderr`/`stdout` into the `commit_hygiene` failure detail (not just the
+    exit code), so the concrete blocker is persisted on the `merge_queue_items`
+    row — diagnosable AND usable as the agent recovery feedback.
+    """
+    impl = _enqueue_implementation_module()
+    feature_id = "feat-hygiene-persist"
+    await _insert_feature(mq_conn, feature_id)
+    failed_item_id, _repo, _base, _contract = (
+        await _enqueue_and_fail_commit_hygiene(impl, mq_conn, feature_id, tmp_path)
+    )
+
+    item = await MergeQueueStore(mq_conn).get(failed_item_id)
+    assert item is not None and item.status == "failed"
+    last_error = str(item.payload.get("last_error", ""))
+    # The typed class prefix + the exit code + the persisted hook stderr line.
+    assert last_error.startswith("commit_hygiene:")
+    assert "commit hook failed (exit 1)" in last_error
+    assert "stderr:" in last_error
+    assert "ensureNoDisposablesAreLeakedInTestSuite()" in last_error
+
+
+@pytest.mark.asyncio
+async def test_commit_hygiene_recovery_map_names_the_concrete_blocker(
+    mq_conn, tmp_path: Path
+) -> None:
+    """The recovery map keys the failed lane by task + carries the hook detail.
+
+    Acceptance criteria 3 + 4 (feedback content): the per-group recovery probe
+    maps the task -> its `failed:commit_hygiene` lane, and the re-dispatch
+    feedback names the CONCRETE pre-commit rule (not a generic "fix hygiene").
+    """
+    impl = _enqueue_implementation_module()
+    feature_id = "feat-hygiene-map"
+    await _insert_feature(mq_conn, feature_id)
+    failed_item_id, _repo, _base, _contract = (
+        await _enqueue_and_fail_commit_hygiene(impl, mq_conn, feature_id, tmp_path)
+    )
+
+    recovery = await impl._commit_hygiene_recovery_lanes_for_group(
+        _recovery_runner(mq_conn), _recovery_feature(feature_id),
+        dag_sha256=_DAG, group_idx=1,
+    )
+    assert set(recovery) == {"TASK-1"}
+    lane = recovery["TASK-1"]
+    assert lane.lane_id == failed_item_id
+    assert lane.failure_class == "commit_hygiene"
+    assert "ensureNoDisposablesAreLeakedInTestSuite()" in lane.hook_detail
+
+    feedback = impl._commit_hygiene_recovery_feedback(lane)
+    assert "Commit-Hygiene Blocker" in feedback
+    assert "ensureNoDisposablesAreLeakedInTestSuite()" in feedback
+    assert str(failed_item_id) in feedback
+    # Decision plan: a fresh failed lane (0 prior reruns) re-dispatches.
+    assert impl._commit_hygiene_recovery_plan(
+        lane_status="failed", failure_class=lane.failure_class,
+        prior_rerun_count=0, max_reruns=impl._COMMIT_HYGIENE_RERUN_MAX,
+    ) == "rerun"
+
+
+@pytest.mark.asyncio
+async def test_commit_hygiene_recovery_enqueues_a_retry_replacement_lane(
+    mq_conn, tmp_path: Path
+) -> None:
+    """A recovered task's fresh capture enqueues as a retry of the failed lane.
+
+    Acceptance criterion 3 (retry linkage): the fresh capture is enqueued via
+    `_enqueue_durable_merge_queue_for_results(retry_source_by_task=...)`, which
+    sets `retry_of_queue_item_id` to the failed source and a fresh `head_commit`
+    so the store's `_validate_retry_source` accepts it as the single authorized
+    replacement of the terminal-failed source.
+    """
+    impl = _enqueue_implementation_module()
+    feature_id = "feat-hygiene-retry"
+    await _insert_feature(mq_conn, feature_id)
+    failed_item_id, repo, base, contract_row = (
+        await _enqueue_and_fail_commit_hygiene(impl, mq_conn, feature_id, tmp_path)
+    )
+    # Remove the rejecting hook so the retry CAN commit (the agent "fixed" it).
+    (repo / ".git" / "hooks" / "pre-commit").unlink()
+
+    # A FRESH sandbox capture: a new diff artifact + a new patch evidence node
+    # (distinct ids), exactly as a re-dispatched task would produce.
+    fresh_patch = _diff_for_appended_line(repo, "recovered fixed line\n")
+    fresh_diff = await _insert_artifact(
+        mq_conn, feature_id, "dag-sandbox-diff:TASK-1:retry", fresh_patch
+    )
+    fresh_evidence = await _insert_sandbox_patch_evidence(
+        mq_conn, feature_id, repo_id="app", base_commit=base,
+        diff_artifact_id=fresh_diff,
+    )
+
+    enqueued = await impl._enqueue_durable_merge_queue_for_results(
+        _recovery_runner(mq_conn), _recovery_feature(feature_id),
+        [_impl_result(impl, "TASK-1", [fresh_evidence])],
+        dag_sha256=_DAG, group_idx=1,
+        contracts_by_task_id={"TASK-1": contract_row},
+        feature_root=tmp_path, stage="implementation",
+        retry_source_by_task={"TASK-1": failed_item_id},
+    )
+    assert len(enqueued) == 1
+    retry_item_id = enqueued[0]
+    assert retry_item_id != failed_item_id
+
+    store = MergeQueueStore(mq_conn)
+    retry_item = await store.get(retry_item_id)
+    assert retry_item is not None
+    # THE retry linkage: the new lane points at the failed source.
+    assert retry_item.retry_of_queue_item_id == failed_item_id
+    assert retry_item.status == "queued"
+    # A fresh head_commit (distinct from the failed source's empty head) so the
+    # store's freshness check + idempotency key do not collide with the source.
+    assert retry_item.head_commit and retry_item.head_commit != ""
+    assert retry_item.payload.get("source") == "commit_hygiene_recovery"
+
+    # The source lane is unchanged (still terminal failed) — its single
+    # authorized replacement now exists.
+    source = await store.get(failed_item_id)
+    assert source is not None and source.status == "failed"
+
+    # The retry now drains cleanly to `integrated` (the hook no longer rejects).
+    drained = await impl._drain_durable_merge_queue_for_feature(
+        _recovery_runner(mq_conn), _recovery_feature(feature_id),
+        dag_sha256=_DAG, stage="implementation",
+    )
+    assert len(drained) == 1
+    assert drained[0].item_id == retry_item_id
+    assert drained[0].terminal_status == "integrated"
+    assert drained[0].succeeded is True
+
+
+@pytest.mark.asyncio
+async def test_commit_hygiene_recovery_is_bounded_then_escalates(
+    mq_conn, tmp_path: Path
+) -> None:
+    """After the re-run budget the plan escalates (no infinite loop).
+
+    Acceptance criterion 4 (bound): with the per-task re-run counter at
+    `_COMMIT_HYGIENE_RERUN_MAX`, the recovery plan returns `escalate` for the
+    still-`failed:commit_hygiene` lane — the resume seam then falls through to a
+    clean terminal `workflow_blocked` carrying the persisted hook error rather
+    than re-dispatching forever.
+    """
+    impl = _enqueue_implementation_module()
+    feature_id = "feat-hygiene-bound"
+    await _insert_feature(mq_conn, feature_id)
+    _failed, _repo, _base, _contract = (
+        await _enqueue_and_fail_commit_hygiene(impl, mq_conn, feature_id, tmp_path)
+    )
+    recovery = await impl._commit_hygiene_recovery_lanes_for_group(
+        _recovery_runner(mq_conn), _recovery_feature(feature_id),
+        dag_sha256=_DAG, group_idx=1,
+    )
+    lane = recovery["TASK-1"]
+
+    # At budget -> escalate; the hook detail is still available for the blocker.
+    assert impl._commit_hygiene_recovery_plan(
+        lane_status="failed", failure_class=lane.failure_class,
+        prior_rerun_count=impl._COMMIT_HYGIENE_RERUN_MAX,
+        max_reruns=impl._COMMIT_HYGIENE_RERUN_MAX,
+    ) == "escalate"
+    assert "ensureNoDisposablesAreLeakedInTestSuite()" in lane.hook_detail
