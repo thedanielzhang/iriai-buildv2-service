@@ -45,9 +45,12 @@ def build_dag_path_resolver_prompt(
 ) -> str:
     """Shared resolver prompt (planning seam + execution migration).
 
-    The agent confirms each candidate at ``<repos_root>/<repo_path>/<path>`` via
-    Glob/Read/Grep and returns the path RELATIVE TO the repo root
-    (``<repos_root>/<repo_path>``) — the same repo-relative form the DAG uses."""
+    The DAG mixes path conventions: a candidate file lives at EITHER
+    ``<repos_root>/<path>`` (the path already embeds the repo-name prefix) OR
+    ``<repos_root>/<repo_path>/<path>`` (the path is repo-internal). ``repo_path``
+    is also unreliable, so the agent must Glob/Grep to find the real file. It
+    returns ``resolved`` in the SAME prefix-convention as the input ``path`` so
+    the deterministic apply step can match the value back."""
     repo_by_task = {task.id: (task.repo_path or "") for task in dag.tasks}
     candidates = [
         {
@@ -61,18 +64,27 @@ def build_dag_path_resolver_prompt(
     ]
     return (
         "Resolve these implementation-DAG task paths against the REAL repository "
-        f"checkouts under `{repos_root}`. Each candidate file is expected at "
-        "`<repos_root>/<repo_path>/<path>` (absolute, readable). Use Glob/Read/Grep "
-        "to find the real file and return the path RELATIVE TO the repo root "
-        "(`<repos_root>/<repo_path>`), i.e. the same repo-relative form as `path`.\n\n"
+        f"checkouts under `{repos_root}`.\n\n"
+        "PATH CONVENTION (MIXED — important): this DAG was authored with two "
+        "conventions and `repo_path` is unreliable. For each candidate the real "
+        "file is at EITHER `<repos_root>/<path>` (the `path` already includes the "
+        "repo-name prefix, e.g. `iriai-studio/src/vs/...`) OR "
+        "`<repos_root>/<repo_path>/<path>` (the `path` is repo-internal, e.g. "
+        "`src/vs/workbench/...`). Try BOTH joins, and use Glob/Read/Grep to locate "
+        "the actual file by name (a basename Glob like `**/<filename>` is the most "
+        "reliable way to find where it truly lives).\n\n"
         f"repos_root: {repos_root}\n\n"
         "UNRESOLVED candidate paths (JSON):\n"
         f"```json\n{json.dumps(candidates, indent=2)}\n```\n\n"
         "For EACH entry return exactly one DagPathDecision (copy task_id and field "
-        "verbatim): `correct` + `resolved` (the real repo-relative path) + `evidence` "
-        "(the Glob/Grep hit) when there is a UNIQUE real match; `keep` when the path "
-        "is already correct; `create_ok` for a legitimate NEW file in a real "
-        "directory; `ambiguous` when you cannot find a unique match — NEVER guess. "
+        "verbatim). When you find a UNIQUE real match, return `correct` with "
+        "`resolved` = the path in the SAME prefix-convention as the input `path` "
+        "(if the input embedded the repo-name prefix, keep that prefix in "
+        "`resolved`; if it was repo-internal, keep it repo-internal) plus "
+        "`evidence` (the Glob/Grep hit). Return `keep` when the path is already "
+        "correct (it resolves under one of the two joins); `create_ok` for a "
+        "legitimate NEW file whose target DIRECTORY is a real location; "
+        "`ambiguous` when you cannot find a unique match — NEVER guess. "
         "Set corrected_count and ambiguous_count accordingly."
     )
 
@@ -136,76 +148,119 @@ class AmbiguousDagPath(Exception):
         )
 
 
-def _task_path_fields(task: ImplementationTask) -> Iterable[tuple[str, str, str]]:
-    """Yield (field_key, path, action) for every addressable path on a task.
+def _file_scope_path_fields(
+    task: ImplementationTask,
+) -> Iterable[tuple[str, str, str]]:
+    """Yield (field_key, path, action) for every ``file_scope`` entry on a task.
 
     field_key matches the convention the resolver returns in DagPathDecision so
-    apply_path_resolution can match decisions back deterministically."""
+    apply_path_resolution can match decisions back deterministically. The legacy
+    ``files[]`` list is intentionally NOT flagged by the prepass — those entries
+    carry no action and are reference/aux paths; apply_path_resolution still
+    corrects any ``files[]`` value that matches a corrected ``file_scope`` path."""
     for idx, scope in enumerate(task.file_scope):
         yield f"file_scope[{idx}].path", scope.path, (scope.action or "").strip().lower()
-    for idx, path in enumerate(task.files):
-        yield f"files[{idx}]", path, ""  # legacy list carries no action
+
+
+def _path_resolves(
+    repos_root: str,
+    repo_path: str,
+    path: str,
+    *,
+    exists: Callable[[str], bool],
+) -> bool:
+    """True when ``path`` exists under EITHER prefix convention.
+
+    The DAG mixes conventions: some ``file_scope[].path`` values already embed
+    the repo-name prefix (``iriai-studio/src/vs/...``) while others are
+    repo-internal (``src/vs/workbench/...``); ``task.repo_path`` is unreliable
+    (one task records ``repo_path='iriai'`` for an ``iriai-studio-backend/...``
+    file). So a path RESOLVES if either ``<repos_root>/<path>`` or
+    ``<repos_root>/<repo_path>/<path>`` exists on disk."""
+    if exists(os.path.join(repos_root, path)):
+        return True
+    if repo_path and exists(os.path.join(repos_root, repo_path, path)):
+        return True
+    return False
 
 
 def unresolved_dag_paths(
     dag: ImplementationDAG,
-    workspace_root: str,
+    repos_root: str,
     *,
     exists: Callable[[str], bool] = os.path.exists,
     isdir: Callable[[str], bool] = os.path.isdir,
 ) -> list[dict[str, str]]:
-    """Cheap deterministic existence prepass. Returns the paths that do NOT
-    resolve against the real repo; an empty result means the agent can be SKIPPED.
+    """Cheap deterministic existence prepass. Returns the ``file_scope`` paths
+    that do NOT resolve against the real repo; an empty result means the agent
+    can be SKIPPED.
 
-    Conservative on purpose: ``modify``/``read_only`` (and legacy) entries must
-    point at an existing file; ``create`` entries only require their parent
-    directory to already exist (the file itself does not yet). The resolver is the
-    authority for anything this can't confirm. NOTE: a path whose stub file was
-    written by a prior failed attempt will look "resolved" here — callers that
-    must not trust on-disk stubs (the one-time migration) bypass this prepass and
-    invoke the resolver unconditionally."""
+    A path resolves when EITHER ``<repos_root>/<path>`` OR
+    ``<repos_root>/<task.repo_path>/<path>`` exists (the DAG mixes
+    repo-prefixed and repo-internal conventions, and ``task.repo_path`` is
+    unreliable — see :func:`_path_resolves`).
+
+    A ``file_scope`` entry is flagged when it does NOT resolve:
+      - for ``modify``/``read_only``/``read`` (a must-exist file is missing);
+      - for ``create`` the file is missing *by definition* — flag it and let the
+        resolver decide ``create_ok`` vs ``correct``. Callers bound the create
+        blast radius by SCOPING which tasks are passed (e.g. the one-time
+        migration restricts the DAG view to unsealed groups).
+
+    ``isdir`` is retained for signature compatibility / future use; the
+    both-convention existence check is the authority here. NOTE: a path whose
+    stub file was written by a prior failed attempt will look "resolved" — the
+    one-time migration scopes to unsealed groups (whose ``create`` files do not
+    yet exist) so it still surfaces the phantom for the resolver."""
+    del isdir  # signature-compatible; existence under either prefix is authoritative
     unresolved: list[dict[str, str]] = []
     for task in dag.tasks:
-        repo_root = (
-            os.path.join(workspace_root, task.repo_path)
-            if task.repo_path
-            else workspace_root
-        )
-        for field, path, action in _task_path_fields(task):
+        repo_path = task.repo_path or ""
+        for field, path, action in _file_scope_path_fields(task):
             if not path:
                 continue
-            abs_path = os.path.join(repo_root, path)
-            if action == "create":
-                ok = isdir(os.path.dirname(abs_path) or repo_root)
-            elif field.startswith("files["):
-                # legacy list may include to-be-created files: lenient
-                ok = exists(abs_path) or isdir(os.path.dirname(abs_path) or repo_root)
-            else:
-                ok = exists(abs_path)
-            if not ok:
-                unresolved.append(
-                    {"task_id": task.id, "field": field, "path": path, "action": action}
-                )
+            if _path_resolves(repos_root, repo_path, path, exists=exists):
+                continue
+            unresolved.append(
+                {"task_id": task.id, "field": field, "path": path, "action": action}
+            )
     return unresolved
 
 
 def apply_path_resolution(
     dag: ImplementationDAG,
     resolution: DagPathResolution,
+    *,
+    raise_on_ambiguous: bool = True,
 ) -> tuple[ImplementationDAG, list[DagPathRewrite]]:
     """Apply the resolver's ``correct`` decisions to the DAG (pure, deterministic).
 
-    ``keep``/``create_ok`` leave the path untouched; any ``ambiguous`` decision
-    raises AmbiguousDagPath so the caller fails-safe. Decisions are matched by
-    (task_id, field_key) and only applied when the recorded ``original`` still
-    matches the live path, so re-applying the same resolution is idempotent."""
+    ``keep``/``create_ok`` leave the path untouched. ``ambiguous`` decisions are
+    NEVER applied (we never guess a path — that is what produced the 199-attempt
+    loop):
+
+      - ``raise_on_ambiguous=True`` (default): any ``ambiguous`` decision raises
+        AmbiguousDagPath so the PLANNING seam fails-safe before persistence.
+      - ``raise_on_ambiguous=False``: ambiguous decisions are simply left
+        unchanged and ALL ``correct`` decisions are still applied — so a
+        confident phantom fix lands even when a sibling ``create`` is uncertain.
+        The one-time migration uses this so an unresolved sibling cannot block
+        re-persisting the corrected phantom.
+
+    Decisions are matched first by (task_id, field_key) for ``file_scope`` entries
+    and then by VALUE for ``files[]`` entries: any ``files[]`` value equal to a
+    corrected ``file_scope`` ``original`` is rewritten to the same ``resolved``
+    target, so a phantom that also appears in the ``files[]``/reference list is
+    fully corrected. Every rewrite is idempotent — only applied when the current
+    value still equals the recorded ``original``."""
     decisions = {(d.task_id, d.field): d for d in resolution.decisions}
-    ambiguous = [
-        d for d in resolution.decisions
-        if (d.decision or "").strip().lower() == "ambiguous"
-    ]
-    if ambiguous:
-        raise AmbiguousDagPath(ambiguous)
+    if raise_on_ambiguous:
+        ambiguous = [
+            d for d in resolution.decisions
+            if (d.decision or "").strip().lower() == "ambiguous"
+        ]
+        if ambiguous:
+            raise AmbiguousDagPath(ambiguous)
 
     rewrites: list[DagPathRewrite] = []
 
@@ -226,6 +281,9 @@ def apply_path_resolution(
         updated_scope = list(task.file_scope)
         updated_files = list(task.files)
         changed = False
+        # Build this task's {original -> resolved} map from its applied
+        # file_scope corrects so files[] entries with the same value follow.
+        value_map: dict[str, str] = {}
         for idx, scope in enumerate(task.file_scope):
             resolved = _corrected(f"file_scope[{idx}].path", scope.path, task.id)
             if resolved is not None:
@@ -236,11 +294,16 @@ def apply_path_resolution(
                     canonical=resolved,
                     rule="agentic-resolver",
                 ))
+                value_map[scope.path] = resolved
                 updated_scope[idx] = scope.model_copy(update={"path": resolved})
                 changed = True
         for idx, path in enumerate(task.files):
+            # Prefer an explicit files[idx] decision; otherwise follow a
+            # file_scope correction with the same value.
             resolved = _corrected(f"files[{idx}]", path, task.id)
-            if resolved is not None:
+            if resolved is None:
+                resolved = value_map.get(path) if path else None
+            if resolved is not None and resolved != path:
                 rewrites.append(DagPathRewrite(
                     task_id=task.id,
                     field=f"files[{idx}]",

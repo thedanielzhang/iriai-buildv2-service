@@ -876,7 +876,6 @@ from ..execution.control_plane import (
     _workflow_blocker_text,
 )
 from ..._common._dag_paths import (
-    AmbiguousDagPath,
     apply_path_resolution,
     build_dag_path_resolver_prompt,
     canonicalize_dag_path,
@@ -13303,37 +13302,44 @@ async def _generate_and_publish_implementation_report(
     return report_url, backlog_url, backlog
 
 
-async def _migrate_persisted_dag_paths(
-    runner: WorkflowRunner, feature: Feature, dag: ImplementationDAG
-) -> ImplementationDAG:
-    """One-time, replay-safe correction of bad file paths in an ALREADY-persisted DAG.
+async def _resolve_group_task_paths(
+    runner: WorkflowRunner,
+    feature: Feature,
+    group_tasks: list[ImplementationTask],
+    *,
+    group_idx: int,
+) -> list[ImplementationTask]:
+    """Just-in-time agentic correction of bad file paths for ONE group's tasks.
 
-    Planning's agentic resolver fixes paths for new features, but a DAG persisted
-    before that landed (e.g. with a phantom path) is frozen. On resume, run the same
-    existence-prepass + agentic resolver against the live repo; if any path is
-    corrected, re-persist the ``dag`` artifact so the corrected paths flow into
-    ``dag_sha256`` and every downstream consumer.
+    Runs at the per-group dispatch hook (mirrors the static canonicalize shim):
+    the corrected tasks are kept IN-MEMORY for this group's dispatch only — the
+    persisted ``dag`` artifact is NOT rewritten, so ``dag_sha256`` stays stable.
 
-    Safe for sealed groups: resume adoption keys on group indices (not on
-    ``dag_sha256``) and the group loop starts at ``start_group``, so sealed groups
-    are skipped regardless of the sha change; the unsealed group's stale proofs
-    (old sha) correctly fail freshness and re-dispatch with the corrected paths.
+    A cheap deterministic existence prepass (scoped to just this group's small
+    task set) gates a single read-only resolver Ask: the agent only runs when
+    this group actually has non-resolving ``file_scope`` paths. The resolution is
+    persisted under ``dag-path-resolution:g{group_idx}`` so resume reuses it
+    (replay stability — the agent is dispatched at most once per group).
 
-    Idempotent: once paths resolve on disk the existence prepass is empty and this
-    is a no-op. Replay-stable: the resolution is persisted and reused, so the agent
-    is dispatched at most once. Ambiguous resolutions are surfaced (logged) and left
-    uncorrected rather than guessed."""
-    if not dag_path_agentic_resolver_enabled():
-        return dag
+    Ambiguity-tolerant: confident ``correct`` decisions (the phantom fix) land
+    even when a sibling ``create`` is uncertain; ambiguous decisions are left
+    unchanged and logged — never guessed (that produced the 199-attempt loop)."""
     repos_root = feature_repos_root(runner, feature)
     if not repos_root:
         # No on-disk checkout to resolve against — skip rather than mis-resolve.
-        return dag
-    unresolved = unresolved_dag_paths(dag, repos_root)
-    if not unresolved:
-        return dag
+        return group_tasks
 
-    artifact_key = "dag-path-resolution:migration"
+    scoped = ImplementationDAG(
+        tasks=list(group_tasks),
+        num_teams=1,
+        execution_order=[[t.id for t in group_tasks]],
+    )
+    unresolved = unresolved_dag_paths(scoped, repos_root)
+    if not unresolved:
+        # Existence-prepass skip: every path in this group already resolves on disk.
+        return group_tasks
+
+    artifact_key = f"dag-path-resolution:g{group_idx}"
     resolution: DagPathResolution | None = None
     existing = await runner.artifacts.get(artifact_key, feature=feature)
     if existing:
@@ -13347,14 +13353,14 @@ async def _migrate_persisted_dag_paths(
             resolution = None
     if resolution is None:
         actor = AgentActor(
-            name="dag-path-resolver-migration",
+            name=f"dag-path-resolver-g{group_idx}",
             role=dag_path_resolver_role,
             context_keys=[],
         )
         resolution = await runner.run(
             Ask(
                 actor=actor,
-                prompt=build_dag_path_resolver_prompt(dag, unresolved, repos_root),
+                prompt=build_dag_path_resolver_prompt(scoped, unresolved, repos_root),
                 output_type=DagPathResolution,
             ),
             feature,
@@ -13364,25 +13370,25 @@ async def _migrate_persisted_dag_paths(
             artifact_key, resolution.model_dump_json(indent=2), feature=feature
         )
 
-    try:
-        corrected, rewrites = apply_path_resolution(dag, resolution)
-    except AmbiguousDagPath as exc:
-        logger.error(
-            "DAG path migration could not resolve %d path(s) unambiguously "
-            "(operator action needed; left uncorrected): %s",
-            len(unresolved), exc,
-        )
-        return dag
+    # Ambiguity-tolerant: apply all confident `correct` decisions (the phantom
+    # fix) even if some sibling `create` is uncertain. Ambiguous decisions are
+    # left unchanged and logged — never guessed (that produced the 199-loop).
+    corrected, rewrites = apply_path_resolution(
+        scoped, resolution, raise_on_ambiguous=False
+    )
     if not rewrites:
-        return dag
-    await runner.artifacts.put(
-        "dag", corrected.model_dump_json(indent=2), feature=feature
+        return group_tasks
+    ambiguous_count = getattr(resolution, "ambiguous_count", 0) or sum(
+        1
+        for d in getattr(resolution, "decisions", [])
+        if (getattr(d, "decision", "") or "").strip().lower() == "ambiguous"
     )
     logger.info(
-        "DAG path migration corrected %d path(s) and re-persisted the dag artifact",
-        len(rewrites),
+        "Group %d: agentic resolver corrected %d task path(s) in-memory "
+        "(%d ambiguous left uncorrected)",
+        group_idx, len(rewrites), ambiguous_count,
     )
-    return corrected
+    return list(corrected.tasks)
 
 
 class ImplementationPhase(Phase):
@@ -13393,10 +13399,6 @@ class ImplementationPhase(Phase):
     ) -> BuildState:
         dag_json = await runner.artifacts.get("dag", feature=feature)
         dag = ImplementationDAG.model_validate_json(dag_json)
-        # One-time, replay-safe correction of bad paths in an already-persisted DAG
-        # (e.g. a planner phantom path). No-op once paths resolve on disk.
-        dag = await _migrate_persisted_dag_paths(runner, feature, dag)
-
         # Loaded once per execute() call and spliced into 4 of 6 post-DAG gates
         # (test author, QA, integration tester, verifier) AND into the
         # post-fix integration regression re-run in _run_regression. Code
@@ -19477,6 +19479,15 @@ async def _implement_dag(
                 group_idx,
                 path_rewrites,
                 context_label="implementation-runtime",
+            )
+        # Just-in-time agentic correction of bad file paths for THIS group only.
+        # Kept in-memory for this group's dispatch (do NOT re-persist the dag;
+        # dag_sha256 must stay stable — same pattern as the static canonicalize).
+        # The corrected group_tasks flow into _ensure_task_worktrees and the
+        # workspace-authority pre-dispatch adapter below.
+        if dag_path_agentic_resolver_enabled():
+            group_tasks = await _resolve_group_task_paths(
+                runner, feature, group_tasks, group_idx=group_idx
             )
         group_tasks_by_id = {task.id: task for task in group_tasks}
 
