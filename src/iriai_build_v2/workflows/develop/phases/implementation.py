@@ -878,11 +878,13 @@ from ..execution.control_plane import (
 from ..._common._dag_paths import (
     AmbiguousDagPath,
     apply_path_resolution,
+    build_dag_path_resolver_prompt,
     canonicalize_dag_path,
     canonicalize_implementation_tasks,
     dag_path_agentic_resolver_enabled,
     dag_path_canonicalization_enabled,
     dag_path_rewrites_to_records,
+    feature_repos_root,
     find_retired_backend_path_references,
     unresolved_dag_paths,
 )
@@ -13301,39 +13303,6 @@ async def _generate_and_publish_implementation_report(
     return report_url, backlog_url, backlog
 
 
-def _build_migration_resolver_prompt(
-    dag: ImplementationDAG, unresolved: list[dict[str, str]]
-) -> str:
-    """Resolver prompt for the execution-side DAG path migration.
-
-    Mirrors the planning-seam resolver prompt: the agent runs with cwd = workspace
-    root and confirms each candidate's real location via Glob/Grep."""
-    repo_by_task = {task.id: (task.repo_path or "") for task in dag.tasks}
-    candidates = [
-        {
-            "task_id": entry["task_id"],
-            "repo_path": repo_by_task.get(entry["task_id"], ""),
-            "field": entry["field"],
-            "path": entry["path"],
-            "action": entry.get("action", ""),
-        }
-        for entry in unresolved
-    ]
-    return (
-        "Resolve these implementation-DAG task paths against the real repository "
-        "checked out at your current working directory (each candidate lives at "
-        "`<cwd>/<repo_path>/<path>`).\n\n"
-        "UNRESOLVED candidate paths (JSON):\n"
-        f"```json\n{json.dumps(candidates, indent=2)}\n```\n\n"
-        "For EACH entry return exactly one DagPathDecision (copy task_id and field "
-        "verbatim): `correct` + `resolved` (the real repo-relative path) + "
-        "`evidence` (the Glob/Grep hit) when there is a UNIQUE real match; `keep` "
-        "when the path is already correct; `create_ok` for a legitimate NEW file in "
-        "a real directory; `ambiguous` when you cannot find a unique match — NEVER "
-        "guess. Set corrected_count and ambiguous_count accordingly."
-    )
-
-
 async def _migrate_persisted_dag_paths(
     runner: WorkflowRunner, feature: Feature, dag: ImplementationDAG
 ) -> ImplementationDAG:
@@ -13356,12 +13325,11 @@ async def _migrate_persisted_dag_paths(
     uncorrected rather than guessed."""
     if not dag_path_agentic_resolver_enabled():
         return dag
-    get_workspace = getattr(runner, "get_workspace", None)
-    workspace = get_workspace(getattr(feature, "workspace_id", None)) if callable(get_workspace) else None
-    workspace_root = str(getattr(workspace, "path", "") or "")
-    if not workspace_root:
+    repos_root = feature_repos_root(runner, feature)
+    if not repos_root:
+        # No on-disk checkout to resolve against — skip rather than mis-resolve.
         return dag
-    unresolved = unresolved_dag_paths(dag, workspace_root)
+    unresolved = unresolved_dag_paths(dag, repos_root)
     if not unresolved:
         return dag
 
@@ -13386,7 +13354,7 @@ async def _migrate_persisted_dag_paths(
         resolution = await runner.run(
             Ask(
                 actor=actor,
-                prompt=_build_migration_resolver_prompt(dag, unresolved),
+                prompt=build_dag_path_resolver_prompt(dag, unresolved, repos_root),
                 output_type=DagPathResolution,
             ),
             feature,

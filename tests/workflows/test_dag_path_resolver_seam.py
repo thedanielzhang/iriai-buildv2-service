@@ -16,10 +16,19 @@ from iriai_build_v2.models.outputs import (
     TaskFileScope,
     TaskReference,
 )
+from iriai_build_v2.workflows.planning.phases import task_planning as _tp
 from iriai_build_v2.workflows.planning.phases.task_planning import TaskPlanningPhase
 
 
 # ── Fixtures / fakes ─────────────────────────────────────────────────────────
+
+
+@pytest.fixture(autouse=True)
+def _patch_repos_root(monkeypatch, tmp_path):
+    # The seam resolves paths under the feature's per-repo checkout root
+    # (feature_repos_root). In these tests the "checkout" is tmp_path, with files
+    # written at <tmp_path>/<repo_path>/<path>, so point the resolver there.
+    monkeypatch.setattr(_tp, "feature_repos_root", lambda runner, feature: str(tmp_path))
 
 
 class _Artifacts:

@@ -73,6 +73,7 @@ class _Runner:
 
 
 def _force_unresolved(monkeypatch):
+    monkeypatch.setattr(impl, "feature_repos_root", lambda runner, feature: "/ws/repos")
     monkeypatch.setattr(impl, "unresolved_dag_paths", lambda dag, root: [
         {"task_id": "T1", "field": "file_scope[0].path", "path": PHANTOM, "action": "modify"},
         {"task_id": "T1", "field": "files[0]", "path": PHANTOM, "action": ""},
@@ -99,6 +100,7 @@ async def test_migration_corrects_and_repersists_dag(monkeypatch):
 async def test_migration_is_noop_when_paths_resolve(monkeypatch):
     # AC9: idempotent — once paths resolve on disk the prepass is empty.
     monkeypatch.setenv("IRIAI_DAG_PATH_AGENTIC_RESOLVER", "1")
+    monkeypatch.setattr(impl, "feature_repos_root", lambda runner, feature: "/ws/repos")
     monkeypatch.setattr(impl, "unresolved_dag_paths", lambda dag, root: [])
     runner = _Runner(resolution=_correct_resolution())
     dag = _dag()

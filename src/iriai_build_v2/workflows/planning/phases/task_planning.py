@@ -86,10 +86,12 @@ from ..._common._helpers import (
 from ..._common._dag_paths import (
     AmbiguousDagPath,
     apply_path_resolution,
+    build_dag_path_resolver_prompt,
     canonicalize_implementation_dag,
     dag_path_agentic_resolver_enabled,
     dag_path_canonicalization_enabled,
     dag_path_rewrites_to_records,
+    feature_repos_root,
     find_retired_backend_path_references,
     unresolved_dag_paths,
 )
@@ -4738,22 +4740,14 @@ class TaskPlanningPhase(Phase):
         runner: WorkflowRunner,
         feature: Feature,
     ) -> str:
-        """Resolve the on-disk workspace root the planner agents run under.
+        """Resolve the feature's on-disk per-repo checkout root for path resolution.
 
-        This mirrors how the Claude runtime derives an agent's cwd
-        (``runtimes/claude.py`` ``_build_options`` ``cwd = str(workspace.path)``):
-        the runner maps ``feature.workspace_id`` to a ``Workspace`` whose
-        ``path`` is the checkout root. Returns ``""`` when no workspace is bound
-        (e.g. unit tests) — with no workspace there is nothing on disk to
-        existence-check, so the prepass simply reports everything unresolved."""
-        get_workspace = getattr(runner, "get_workspace", None)
-        if not callable(get_workspace):
-            return ""
-        workspace = get_workspace(getattr(feature, "workspace_id", None))
-        if workspace is None:
-            return ""
-        path = getattr(workspace, "path", None)
-        return str(path) if path else ""
+        A task path resolves to ``<repos_root>/<task.repo_path>/<file_scope path>``
+        (the feature checkout under ``.iriai/features/<slug>/repos``, NOT the bare
+        workspace). Returns ``""`` when the checkout isn't present (e.g. planning
+        before checkout, or unit tests), so the prepass skips rather than
+        mis-resolving against the wrong base."""
+        return feature_repos_root(runner, feature)
 
     @classmethod
     async def _resolve_dag_paths_for_persistence(
@@ -4779,8 +4773,12 @@ class TaskPlanningPhase(Phase):
         if not dag_path_agentic_resolver_enabled():
             return cls._canonicalize_dag_paths_for_persistence(dag, context=context)
 
-        workspace_root = cls._resolver_workspace_root(runner, feature)
-        unresolved = unresolved_dag_paths(dag, workspace_root)
+        repos_root = cls._resolver_workspace_root(runner, feature)
+        if not repos_root:
+            # No on-disk checkout to resolve against — skip rather than mis-resolve
+            # (e.g. planning before the feature's repos are checked out).
+            return dag, [], []
+        unresolved = unresolved_dag_paths(dag, repos_root)
         if not unresolved:
             # Existence-prepass skip: every path already resolves on disk.
             return dag, [], []
@@ -4792,6 +4790,7 @@ class TaskPlanningPhase(Phase):
             unresolved=unresolved,
             context=context,
             resolution_key=resolution_key,
+            repos_root=repos_root,
         )
 
         try:
@@ -4823,6 +4822,7 @@ class TaskPlanningPhase(Phase):
         unresolved: list[dict[str, str]],
         context: str,
         resolution_key: str,
+        repos_root: str,
     ) -> DagPathResolution:
         """Return the persisted resolution (replay-stable) or dispatch the agent once."""
         artifact_key = f"dag-path-resolution:{resolution_key}"
@@ -4843,7 +4843,7 @@ class TaskPlanningPhase(Phase):
             role=dag_path_resolver_role,
             context_keys=[],
         )
-        prompt = cls._build_dag_path_resolver_prompt(dag, unresolved)
+        prompt = build_dag_path_resolver_prompt(dag, unresolved, repos_root)
         await _clear_agent_session(runner, actor, feature)
         resolution: DagPathResolution = await runner.run(
             Ask(
@@ -4861,52 +4861,6 @@ class TaskPlanningPhase(Phase):
             resolution.model_dump_json(indent=2),
         )
         return resolution
-
-    @staticmethod
-    def _build_dag_path_resolver_prompt(
-        dag: ImplementationDAG,
-        unresolved: list[dict[str, str]],
-    ) -> str:
-        """Embed each unresolved path's repo_path + candidate JSON for the resolver.
-
-        The resolver runs with cwd = workspace root, so it resolves
-        ``{repo_path}/{path}`` against the live checkout via Glob/Grep."""
-        repo_by_task = {task.id: (task.repo_path or "") for task in dag.tasks}
-        candidates = [
-            {
-                "task_id": entry["task_id"],
-                "repo_path": repo_by_task.get(entry["task_id"], ""),
-                "field": entry["field"],
-                "path": entry["path"],
-                "action": entry.get("action", ""),
-            }
-            for entry in unresolved
-        ]
-        repo_paths = sorted({c["repo_path"] for c in candidates if c["repo_path"]})
-        repo_lines = (
-            "\n".join(f"- {rp}" for rp in repo_paths)
-            if repo_paths
-            else "- (workspace root)"
-        )
-        candidates_json = _json.dumps(candidates, indent=2)
-        return (
-            "Resolve the following implementation-DAG task paths against the real "
-            "repository checked out at your current working directory.\n\n"
-            "Repos (workspace-relative; each candidate path lives at "
-            "`<cwd>/<repo_path>/<path>`):\n"
-            f"{repo_lines}\n\n"
-            "UNRESOLVED candidate paths (JSON):\n"
-            f"```json\n{candidates_json}\n```\n\n"
-            "For EACH entry, use Glob/Grep to find the real file and return exactly "
-            "one DagPathDecision with `task_id` and `field` copied verbatim:\n"
-            "- `correct` + `resolved` (the real repo-relative path) + `evidence` "
-            "(the Glob/Grep hit) when there is a UNIQUE real match;\n"
-            "- `keep` when the given path already exists / is already correct;\n"
-            "- `create_ok` when it is a legitimate NEW file whose parent directory "
-            "is a real location;\n"
-            "- `ambiguous` when you cannot find a unique match — NEVER guess.\n"
-            "Set corrected_count and ambiguous_count accordingly."
-        )
 
     @classmethod
     async def _merge_slice_fragments(

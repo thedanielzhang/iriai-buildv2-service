@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import asdict, dataclass
-from typing import Callable, Iterable
+from pathlib import Path
+from typing import Any, Callable, Iterable
 
 from ...models.outputs import (
     DagPathResolution,
@@ -13,6 +15,66 @@ from ...models.outputs import (
 
 DAG_PATH_CANONICALIZATION_ENV = "IRIAI_DAG_PATH_CANONICALIZATION"
 DAG_PATH_AGENTIC_RESOLVER_ENV = "IRIAI_DAG_PATH_AGENTIC_RESOLVER"
+
+
+def feature_repos_root(runner: Any, feature: Any) -> str:
+    """Absolute directory containing the feature's per-repo checkouts, or "".
+
+    Layout (mirrors implementation._get_feature_root):
+    ``<workspace_base>/.iriai/features/<feature.slug>/repos/<repo_path>/<file>``.
+    A task path resolves to ``<repos_root>/<task.repo_path>/<file_scope path>``.
+
+    Returns "" when the workspace manager or the on-disk checkout is unavailable
+    (e.g. planning before checkout, or unit tests) so callers SKIP resolution
+    rather than mis-resolve against the wrong base."""
+    services = getattr(runner, "services", None)
+    getter = getattr(services, "get", None) if services is not None else None
+    wm = getter("workspace_manager") if callable(getter) else None
+    base = getattr(wm, "_base", None) if wm is not None else None
+    slug = getattr(feature, "slug", None)
+    if not base or not slug:
+        return ""
+    root = Path(base) / ".iriai" / "features" / slug / "repos"
+    return str(root) if root.exists() else ""
+
+
+def build_dag_path_resolver_prompt(
+    dag: ImplementationDAG,
+    unresolved: list[dict[str, str]],
+    repos_root: str,
+) -> str:
+    """Shared resolver prompt (planning seam + execution migration).
+
+    The agent confirms each candidate at ``<repos_root>/<repo_path>/<path>`` via
+    Glob/Read/Grep and returns the path RELATIVE TO the repo root
+    (``<repos_root>/<repo_path>``) — the same repo-relative form the DAG uses."""
+    repo_by_task = {task.id: (task.repo_path or "") for task in dag.tasks}
+    candidates = [
+        {
+            "task_id": entry["task_id"],
+            "repo_path": repo_by_task.get(entry["task_id"], ""),
+            "field": entry["field"],
+            "path": entry["path"],
+            "action": entry.get("action", ""),
+        }
+        for entry in unresolved
+    ]
+    return (
+        "Resolve these implementation-DAG task paths against the REAL repository "
+        f"checkouts under `{repos_root}`. Each candidate file is expected at "
+        "`<repos_root>/<repo_path>/<path>` (absolute, readable). Use Glob/Read/Grep "
+        "to find the real file and return the path RELATIVE TO the repo root "
+        "(`<repos_root>/<repo_path>`), i.e. the same repo-relative form as `path`.\n\n"
+        f"repos_root: {repos_root}\n\n"
+        "UNRESOLVED candidate paths (JSON):\n"
+        f"```json\n{json.dumps(candidates, indent=2)}\n```\n\n"
+        "For EACH entry return exactly one DagPathDecision (copy task_id and field "
+        "verbatim): `correct` + `resolved` (the real repo-relative path) + `evidence` "
+        "(the Glob/Grep hit) when there is a UNIQUE real match; `keep` when the path "
+        "is already correct; `create_ok` for a legitimate NEW file in a real "
+        "directory; `ambiguous` when you cannot find a unique match — NEVER guess. "
+        "Set corrected_count and ambiguous_count accordingly."
+    )
 
 _BACKEND_PATH_REWRITES: tuple[tuple[str, str, str], ...] = (
     (
