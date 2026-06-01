@@ -105,6 +105,7 @@ from .compiler import role as compiler_role
 from .summarizer import role as summarizer_role
 from .citation_reviewer import role as citation_reviewer_role
 from .observation_collector import role as observation_collector_role
+from .dag_path_resolver import role as dag_path_resolver_role
 
 # Backward compat aliases
 task_planner_role = planning_lead_role

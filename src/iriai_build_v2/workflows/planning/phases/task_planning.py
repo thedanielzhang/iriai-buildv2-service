@@ -18,6 +18,7 @@ from ....models.outputs import (
     ArtifactAuditReport,
     ArtifactBackfillStatus,
     ArtifactBackfillSubfeatureStatus,
+    DagPathResolution,
     DesignDecisions,
     DecisionLedger,
     DecisionRecord,
@@ -45,6 +46,7 @@ from ....services.markdown import to_markdown
 from ....roles import (
     InterviewActor,
     dag_compiler,
+    dag_path_resolver_role,
     planning_lead_role,
 )
 from .._decisions import GLOBAL_DECISIONS_KEY, _decision_sort_key, parse_decision_ledger
@@ -81,10 +83,14 @@ from ..._common._helpers import (
     targeted_revision,
 )
 from ..._common._dag_paths import (
+    AmbiguousDagPath,
+    apply_path_resolution,
     canonicalize_implementation_dag,
+    dag_path_agentic_resolver_enabled,
     dag_path_canonicalization_enabled,
     dag_path_rewrites_to_records,
     find_retired_backend_path_references,
+    unresolved_dag_paths,
 )
 
 logger = logging.getLogger(__name__)
@@ -4635,9 +4641,12 @@ class TaskPlanningPhase(Phase):
         traceability_errors = cls._slice_traceability_errors(slice_info, normalized.tasks)
         if traceability_errors:
             return None, "; ".join(traceability_errors), True
-        normalized, _path_rewrites, path_errors = cls._canonicalize_dag_paths_for_persistence(
+        normalized, _path_rewrites, path_errors = await cls._resolve_dag_paths_for_persistence(
+            runner,
+            feature,
             normalized,
             context=f"slice {slug}/{slice_info.slice_id}",
+            resolution_key=f"{slug}:{slice_info.slice_id}",
         )
         if path_errors:
             return None, "; ".join(path_errors), True
@@ -4699,6 +4708,10 @@ class TaskPlanningPhase(Phase):
         *,
         context: str,
     ) -> tuple[ImplementationDAG, list[dict[str, str]], list[str]]:
+        """Legacy static DAG-path shim (the flag-OFF fallback).
+
+        Preserved byte-for-byte from the pre-agentic seam: callable only when
+        ``dag_path_agentic_resolver_enabled()`` is false (emergency rollback)."""
         if not dag_path_canonicalization_enabled():
             return dag, [], []
         canonical, rewrites = canonicalize_implementation_dag(dag)
@@ -4718,6 +4731,181 @@ class TaskPlanningPhase(Phase):
             for ref in remaining
         ]
         return canonical, records, errors
+
+    @staticmethod
+    def _resolver_workspace_root(
+        runner: WorkflowRunner,
+        feature: Feature,
+    ) -> str:
+        """Resolve the on-disk workspace root the planner agents run under.
+
+        This mirrors how the Claude runtime derives an agent's cwd
+        (``runtimes/claude.py`` ``_build_options`` ``cwd = str(workspace.path)``):
+        the runner maps ``feature.workspace_id`` to a ``Workspace`` whose
+        ``path`` is the checkout root. Returns ``""`` when no workspace is bound
+        (e.g. unit tests) — with no workspace there is nothing on disk to
+        existence-check, so the prepass simply reports everything unresolved."""
+        get_workspace = getattr(runner, "get_workspace", None)
+        if not callable(get_workspace):
+            return ""
+        workspace = get_workspace(getattr(feature, "workspace_id", None))
+        if workspace is None:
+            return ""
+        path = getattr(workspace, "path", None)
+        return str(path) if path else ""
+
+    @classmethod
+    async def _resolve_dag_paths_for_persistence(
+        cls,
+        runner: WorkflowRunner,
+        feature: Feature,
+        dag: ImplementationDAG,
+        *,
+        context: str,
+        resolution_key: str,
+    ) -> tuple[ImplementationDAG, list[dict[str, str]], list[str]]:
+        """Validate/correct DAG task paths against the real repo before persistence.
+
+        Default (agentic) path: a cheap deterministic existence prepass gates a
+        single read-only resolver Ask. The resolution is persisted under
+        ``dag-path-resolution:{resolution_key}`` so resume reuses it (replay
+        stability — the agent is never re-dispatched). Ambiguous decisions
+        fail-safe (non-retryable) rather than guess.
+
+        Flag-OFF path: preserves the exact legacy static-shim behavior so the
+        flag is a true emergency rollback. Returns a 3-tuple
+        ``(dag, records, errors)`` so all call sites unpack unchanged."""
+        if not dag_path_agentic_resolver_enabled():
+            return cls._canonicalize_dag_paths_for_persistence(dag, context=context)
+
+        workspace_root = cls._resolver_workspace_root(runner, feature)
+        unresolved = unresolved_dag_paths(dag, workspace_root)
+        if not unresolved:
+            # Existence-prepass skip: every path already resolves on disk.
+            return dag, [], []
+
+        resolution = await cls._load_or_dispatch_path_resolution(
+            runner,
+            feature,
+            dag,
+            unresolved=unresolved,
+            context=context,
+            resolution_key=resolution_key,
+        )
+
+        try:
+            corrected, rewrites = apply_path_resolution(dag, resolution)
+        except AmbiguousDagPath as exc:
+            logger.warning(
+                "%s: agentic DAG path resolution is ambiguous (non-retryable): %s",
+                context,
+                exc,
+            )
+            return dag, [], [str(exc)]
+
+        records = dag_path_rewrites_to_records(rewrites)
+        if records:
+            logger.warning(
+                "%s: agentic resolver corrected %d DAG path(s) before persistence",
+                context,
+                len(records),
+            )
+        return corrected, records, []
+
+    @classmethod
+    async def _load_or_dispatch_path_resolution(
+        cls,
+        runner: WorkflowRunner,
+        feature: Feature,
+        dag: ImplementationDAG,
+        *,
+        unresolved: list[dict[str, str]],
+        context: str,
+        resolution_key: str,
+    ) -> DagPathResolution:
+        """Return the persisted resolution (replay-stable) or dispatch the agent once."""
+        artifact_key = f"dag-path-resolution:{resolution_key}"
+        existing = await get_existing_artifact(runner, feature, artifact_key)
+        if existing:
+            try:
+                return DagPathResolution.model_validate_json(existing)
+            except Exception:
+                logger.warning(
+                    "%s: persisted %s is not valid DagPathResolution JSON; re-dispatching",
+                    context,
+                    artifact_key,
+                    exc_info=True,
+                )
+
+        actor = AgentActor(
+            name=f"dag-path-resolver-{resolution_key}",
+            role=dag_path_resolver_role,
+            context_keys=[],
+        )
+        prompt = cls._build_dag_path_resolver_prompt(dag, unresolved)
+        await _clear_agent_session(runner, actor, feature)
+        resolution: DagPathResolution = await runner.run(
+            Ask(
+                actor=actor,
+                prompt=prompt,
+                output_type=DagPathResolution,
+            ),
+            feature,
+            phase_name=getattr(cls, "name", "task_planning"),
+        )
+        await cls._put_artifact(
+            runner,
+            feature,
+            artifact_key,
+            resolution.model_dump_json(indent=2),
+        )
+        return resolution
+
+    @staticmethod
+    def _build_dag_path_resolver_prompt(
+        dag: ImplementationDAG,
+        unresolved: list[dict[str, str]],
+    ) -> str:
+        """Embed each unresolved path's repo_path + candidate JSON for the resolver.
+
+        The resolver runs with cwd = workspace root, so it resolves
+        ``{repo_path}/{path}`` against the live checkout via Glob/Grep."""
+        repo_by_task = {task.id: (task.repo_path or "") for task in dag.tasks}
+        candidates = [
+            {
+                "task_id": entry["task_id"],
+                "repo_path": repo_by_task.get(entry["task_id"], ""),
+                "field": entry["field"],
+                "path": entry["path"],
+                "action": entry.get("action", ""),
+            }
+            for entry in unresolved
+        ]
+        repo_paths = sorted({c["repo_path"] for c in candidates if c["repo_path"]})
+        repo_lines = (
+            "\n".join(f"- {rp}" for rp in repo_paths)
+            if repo_paths
+            else "- (workspace root)"
+        )
+        candidates_json = _json.dumps(candidates, indent=2)
+        return (
+            "Resolve the following implementation-DAG task paths against the real "
+            "repository checked out at your current working directory.\n\n"
+            "Repos (workspace-relative; each candidate path lives at "
+            "`<cwd>/<repo_path>/<path>`):\n"
+            f"{repo_lines}\n\n"
+            "UNRESOLVED candidate paths (JSON):\n"
+            f"```json\n{candidates_json}\n```\n\n"
+            "For EACH entry, use Glob/Grep to find the real file and return exactly "
+            "one DagPathDecision with `task_id` and `field` copied verbatim:\n"
+            "- `correct` + `resolved` (the real repo-relative path) + `evidence` "
+            "(the Glob/Grep hit) when there is a UNIQUE real match;\n"
+            "- `keep` when the given path already exists / is already correct;\n"
+            "- `create_ok` when it is a legitimate NEW file whose parent directory "
+            "is a real location;\n"
+            "- `ambiguous` when you cannot find a unique match — NEVER guess.\n"
+            "Set corrected_count and ambiguous_count accordingly."
+        )
 
     @classmethod
     async def _merge_slice_fragments(
@@ -4757,13 +4945,16 @@ class TaskPlanningPhase(Phase):
             complete=True,
         )
         normalized, _normalized_flag = cls._normalize_subfeature_execution_order(merged)
-        normalized, _path_rewrites, path_errors = cls._canonicalize_dag_paths_for_persistence(
+        normalized, _path_rewrites, path_errors = await cls._resolve_dag_paths_for_persistence(
+            runner,
+            feature,
             normalized,
             context=f"subfeature DAG {slug}",
+            resolution_key=f"{slug}:merged",
         )
         if path_errors:
             raise RuntimeError(
-                "retired backend path references remain after canonicalization: "
+                "unresolved DAG path references remain after resolution: "
                 + "; ".join(path_errors)
             )
         return normalized
@@ -5256,14 +5447,17 @@ class TaskPlanningPhase(Phase):
             complete=True,
         )
         normalized, _normalized_flag = cls._normalize_subfeature_execution_order(merged)
-        normalized, _path_rewrites, path_errors = cls._canonicalize_dag_paths_for_persistence(
+        normalized, _path_rewrites, path_errors = await cls._resolve_dag_paths_for_persistence(
+            runner,
+            feature,
             normalized,
             context="approved root DAG",
+            resolution_key="root",
         )
         if path_errors:
             raise RuntimeError(
-                "Cannot persist approved root DAG JSON: retired backend path "
-                "references remain after canonicalization: " + "; ".join(path_errors)
+                "Cannot persist approved root DAG JSON: unresolved path "
+                "references remain after resolution: " + "; ".join(path_errors)
             )
         return normalized
 

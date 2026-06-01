@@ -1498,7 +1498,10 @@ async def test_task_planning_requires_task_requirement_ids_when_slice_has_direct
 
 
 @pytest.mark.asyncio
-async def test_task_planning_canonicalizes_retired_backend_paths_before_fragment_persistence():
+async def test_task_planning_canonicalizes_retired_backend_paths_before_fragment_persistence(monkeypatch):
+    # Legacy static backend-prefix shim is the flag-OFF fallback; exercise it
+    # explicitly (the default-on path is the agentic resolver, covered elsewhere).
+    monkeypatch.setenv("IRIAI_DAG_PATH_AGENTIC_RESOLVER", "0")
     slice_info = task_planning_module.TaskPlanningSlice(
         slice_id="slice-1",
         step_ids=["STEP-1"],
@@ -1556,7 +1559,9 @@ async def test_task_planning_canonicalizes_retired_backend_paths_before_fragment
 
 
 @pytest.mark.asyncio
-async def test_task_planning_root_dag_persistence_canonicalizes_subfeature_dags():
+async def test_task_planning_root_dag_persistence_canonicalizes_subfeature_dags(monkeypatch):
+    # Legacy static backend-prefix shim is the flag-OFF fallback.
+    monkeypatch.setenv("IRIAI_DAG_PATH_AGENTIC_RESOLVER", "0")
     stale_dag = ImplementationDAG(
         tasks=[
             _valid_task(
