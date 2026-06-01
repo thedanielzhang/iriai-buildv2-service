@@ -8774,6 +8774,53 @@ _EMPTY_PATCH_REQUIRED_PATH_MARKERS = frozenset(
     {"empty_patch_requires_mutation", "required_path_missing"}
 )
 _SANDBOX_INFRA_RETRY_HEADROOM = 2
+# Extra fresh dispatch attempts granted on strict-resume to a task whose newest
+# terminal dispatch SUCCEEDED at the process level but whose deliverable marker
+# is NOT `completed` (e.g. the agent self-reported `partial`, so capture-time
+# contract validation never ran). The durable merge queue refuses such a lane,
+# and the gate's contract is that a partial task "re-runs on the next resume" —
+# so a genuine fresh run (not an idempotency-key replay of the partial) is
+# required. Bounded so a task that never converges surfaces a clean terminal
+# blocker instead of looping forever at the merge-queue gate.
+_PARTIAL_RESUME_RERUN_HEADROOM = 2
+
+
+def _resume_dispatch_plan_for_succeeded_terminal(
+    *,
+    succeeded_attempt: int,
+    marker_status: str,
+    infra_max_retries: int,
+    partial_rerun_headroom: int,
+) -> tuple[str, tuple[int, ...] | range | None]:
+    """Decide how strict-resume should re-enter the dispatch loop for a task
+    whose newest terminal dispatch SUCCEEDED at the process level.
+
+    A process-level ``succeeded`` dispatch can still carry a deliverable marker
+    whose status is NOT ``completed`` (the agent self-reported ``partial``, so
+    capture-time contract validation — gated on the runtime turn
+    ``response.status == "completed"``, not on the deliverable status — never
+    ran). Replaying such an attempt by its idempotency key reproduces the
+    partial result, which the durable merge queue then refuses
+    (``_resolve_merge_queue_lane_inputs``) — an infinite resume→reject loop.
+
+    Returns one of:
+
+    - ``("replay", (attempt,))`` — the deliverable already ``completed``; replay
+      that attempt index (skips the superseded stale infra-failures).
+    - ``("rerun", range(...))`` — a non-``completed`` marker; force genuine fresh
+      dispatch(es) at attempt indices PAST the success (new idempotency keys, so
+      a real re-run, still skipping the stale infra-failures), bounded by the
+      partial re-run headroom.
+    - ``("blocked", None)`` — the partial re-run budget is exhausted; the caller
+      surfaces a clean terminal blocker instead of looping at the merge queue.
+    """
+
+    if marker_status == "completed":
+        return ("replay", (succeeded_attempt,))
+    max_attempt = infra_max_retries + partial_rerun_headroom
+    if succeeded_attempt < max_attempt:
+        return ("rerun", range(succeeded_attempt + 1, max_attempt + 1))
+    return ("blocked", None)
 
 
 def _contains_legacy_sandbox_lease_collision(*values: Any) -> bool:
@@ -19986,18 +20033,100 @@ async def _implement_dag(
                         # The durable idempotency key is a hash, so the per-task
                         # loop retry index (payload['retry']) — not the key — is the
                         # stable handle: re-dispatching exactly that index makes the
-                        # dispatcher replay the persisted (legitimately-partial)
-                        # success instead of the superseded failures.
+                        # dispatcher replay the persisted success instead of the
+                        # superseded failures (only when its deliverable completed —
+                        # see the marker check below).
                         _succeeded_attempt = _latest_terminal.get("attempt")
                         if isinstance(_succeeded_attempt, int) and _succeeded_attempt >= 0:
-                            logger.info(
-                                "Task %s has a superseding successful dispatch in the "
-                                "journal (attempt %d) — honoring it instead of "
-                                "replaying stale infra-failures",
-                                t.id,
-                                _succeeded_attempt,
+                            # A process-level `succeeded` dispatch can still carry
+                            # a deliverable marker whose status is NOT `completed`
+                            # (the agent self-reported `partial`, so capture-time
+                            # contract validation — gated on the runtime turn
+                            # `response.status == "completed"`, not on the
+                            # deliverable status — never ran). Replaying that
+                            # attempt by its idempotency key reproduces the partial
+                            # result, which the durable merge queue then refuses
+                            # (`_resolve_merge_queue_lane_inputs`) — an infinite
+                            # resume→reject loop. Honor a `completed` success with a
+                            # replay; force a GENUINE fresh dispatch (new attempt
+                            # index past the success, still skipping the stale
+                            # infra-failures) for a non-`completed` marker, bounded
+                            # so a task that never converges escalates with a clean
+                            # terminal blocker instead of looping.
+                            _marker_status = ""
+                            try:
+                                _marker_raw = await runner.artifacts.get(
+                                    f"dag-task:{t.id}", feature=feature,
+                                )
+                                if _marker_raw:
+                                    _marker_status = str(
+                                        getattr(
+                                            ImplementationResult.model_validate_json(
+                                                _marker_raw
+                                            ),
+                                            "status",
+                                            "",
+                                        )
+                                        or ""
+                                    )
+                            except Exception:
+                                _marker_status = ""
+                            _marker_label = _marker_status or "missing"
+                            _resume_plan, _resume_attempts = (
+                                _resume_dispatch_plan_for_succeeded_terminal(
+                                    succeeded_attempt=_succeeded_attempt,
+                                    marker_status=_marker_status,
+                                    infra_max_retries=TASK_INFRA_MAX_RETRIES,
+                                    partial_rerun_headroom=(
+                                        _PARTIAL_RESUME_RERUN_HEADROOM
+                                    ),
+                                )
                             )
-                            _attempt_range = (_succeeded_attempt,)
+                            if _resume_plan == "replay":
+                                logger.info(
+                                    "Task %s has a superseding successful dispatch in "
+                                    "the journal (attempt %d) — honoring it instead "
+                                    "of replaying stale infra-failures",
+                                    t.id,
+                                    _succeeded_attempt,
+                                )
+                                _attempt_range = _resume_attempts
+                            elif _resume_plan == "rerun":
+                                logger.info(
+                                    "Task %s newest terminal dispatch succeeded but "
+                                    "its deliverable marker is %r (not 'completed') — "
+                                    "re-running fresh from attempt %d instead of "
+                                    "replaying the partial result the merge queue "
+                                    "refuses",
+                                    t.id,
+                                    _marker_label,
+                                    _succeeded_attempt + 1,
+                                )
+                                _attempt_range = _resume_attempts
+                            else:
+                                logger.warning(
+                                    "Task %s deliverable marker is still %r after "
+                                    "exhausting its partial re-run budget (attempt "
+                                    "%d) — surfacing a terminal blocker for "
+                                    "resolution instead of looping",
+                                    t.id,
+                                    _marker_label,
+                                    _succeeded_attempt,
+                                )
+                                return ImplementationResult(
+                                    task_id=t.id,
+                                    summary=_workflow_blocker_text(
+                                        f"Task {t.id} converged on a non-'completed' "
+                                        f"deliverable ({_marker_label}) across its "
+                                        "bounded fresh re-runs after a successful "
+                                        "dispatch; its captured patch was never "
+                                        "contract-validated at sandbox capture, so "
+                                        "the durable merge queue cannot enqueue it "
+                                        "for canonical integration. Manual or "
+                                        "upstream resolution is required."
+                                    ),
+                                    status="blocked",
+                                )
                         else:
                             logger.warning(
                                 "Task %s latest terminal dispatch succeeded but has no "
