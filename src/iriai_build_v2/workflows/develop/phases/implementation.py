@@ -5973,6 +5973,61 @@ async def _commit_hygiene_recovery_lanes_for_group(
     return recovery
 
 
+async def _integrated_lane_task_ids_for_group(
+    runner: WorkflowRunner,
+    feature: Feature,
+    *,
+    dag_sha256: str,
+    group_idx: int,
+) -> set[str]:
+    """Return the task ids whose durable merge-queue lane is ``integrated``.
+
+    Queries the durable queue's lanes for ONE ``(feature, dag, group)``
+    (``MergeQueueStore.list_group_items``) and collects every task id covered
+    by a lane whose terminal status is ``integrated``. The per-task resume loop
+    in ``_implement_dag`` consults this in the pending-merge-marker branch: an
+    integrated lane that still carries a stale ``dag-task-pending-merge:{tid}``
+    marker (markers are only swept when the WHOLE group seals) must be treated
+    as a completed success, NOT as a durable-merge-queue blocker.
+
+    Mirrors :func:`_commit_hygiene_recovery_lanes_for_group`'s fail-closed
+    pattern: any missing module, store, connection, or DB error returns an EMPTY
+    set, so the caller falls through to the UNCHANGED blocker behavior — an
+    integrated-lane shortcut is never invented on incomplete evidence.
+    """
+
+    if MergeQueueStore is None:
+        return set()
+    store = _execution_control_store_for_runner(runner)
+    if store is None:
+        return set()
+    feature_id = str(getattr(feature, "id", "") or "")
+    if not feature_id or not str(dag_sha256 or ""):
+        return set()
+    try:
+        async with _merge_queue_connection(store) as conn:
+            queue_store = MergeQueueStore(conn)
+            items = await queue_store.list_group_items(
+                feature_id, str(dag_sha256), group_idx
+            )
+    except Exception:  # pragma: no cover - fail closed on any store/DB error.
+        logger.debug(
+            "integrated-lane probe failed for group %d",
+            group_idx,
+            exc_info=True,
+        )
+        return set()
+    integrated: set[str] = set()
+    for item in items or []:
+        if str(getattr(item, "status", "") or "") != "integrated":
+            continue
+        for c in getattr(item, "task_coverage", []) or []:
+            task_id = str(getattr(c, "task_id", "") or "")
+            if task_id:
+                integrated.add(task_id)
+    return integrated
+
+
 def _commit_hygiene_recovery_feedback(lane: _CommitHygieneRecoveryLane) -> str:
     """Build the agent recovery feedback for a failed commit_hygiene lane.
 
@@ -20012,6 +20067,15 @@ async def _implement_dag(
                 runner, feature, dag_sha256=dag_sha256, group_idx=group_idx,
             )
         )
+        # Task ids whose durable merge-queue lane is already `integrated`.
+        # Such tasks may still carry a stale `dag-task-pending-merge:{tid}`
+        # marker (markers are only swept when the WHOLE group seals), but the
+        # canonical mutation already merged — the pending-merge branch below
+        # must treat them as a completed success, never a terminal blocker.
+        # Fails closed (empty set on any store/DB error → unchanged blocker).
+        integrated_lane_task_ids = await _integrated_lane_task_ids_for_group(
+            runner, feature, dag_sha256=dag_sha256, group_idx=group_idx,
+        )
         commit_hygiene_feedback_by_task: dict[str, str] = {}
         commit_hygiene_retry_source_by_task: dict[str, int] = {}
 
@@ -20130,6 +20194,27 @@ async def _implement_dag(
                     status="completed",
                     notes=str(pending_merge_marker),
                 )
+                if tid in integrated_lane_task_ids:
+                    # The marker is STALE: this task's merge-queue lane already
+                    # `integrated` (the canonical mutation merged), but the
+                    # `dag-task-pending-merge:{tid}` marker is only swept when
+                    # the WHOLE group seals — which can't happen while sibling
+                    # lanes are recovering (chicken-and-egg). Treat it as the
+                    # completed success it is: do NOT enqueue it onto
+                    # `pending_merge_queue_resume_results` (re-enqueuing an
+                    # already-integrated lane would conflict) and do NOT block.
+                    completed_results.append(marker_result)
+                    all_results.append(marker_result)
+                    handover.record_success(marker_result)
+                    logger.info(
+                        "Task %s carries a stale pending-merge marker but its "
+                        "merge-queue lane is already integrated; treating it as "
+                        "a completed success instead of a durable-merge blocker",
+                        tid,
+                    )
+                    continue
+                # Lane is genuinely NOT integrated (truly pending, or captured
+                # but never enqueued): keep the existing fail-closed blocker.
                 return DagExecutionOutcome(
                     implementation_text="\n\n".join(to_str(r) for r in all_results),
                     failure=_durable_merge_queue_blocker_for_results([marker_result]),
