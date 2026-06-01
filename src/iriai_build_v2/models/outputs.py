@@ -991,6 +991,32 @@ class ImplementationDAG(BaseModel):
     complete: bool = False
 
 
+class DagPathDecision(BaseModel):
+    """One agentic path-resolution decision for a single DAG task path field.
+
+    ``field`` addresses the path within the task (``file_scope[0].path`` or
+    ``files[2]``) so the application step can match it back deterministically."""
+
+    task_id: str
+    field: str
+    original: str
+    resolved: str = ""  # the real repo path when decision == "correct"
+    decision: str = "keep"  # keep | correct | create_ok | ambiguous
+    evidence: str = ""  # how the resolver confirmed the real location (e.g. a Glob hit)
+
+
+class DagPathResolution(BaseModel):
+    """Structured output of the agentic DAG path resolver (the Ask ``output_type``).
+
+    ``decisions`` may be empty when the resolver wrote them to a file artifact
+    instead (``artifact_path``); the counts stay flat for quick signalling."""
+
+    decisions: list[DagPathDecision] = Field(default_factory=list)
+    corrected_count: int = 0
+    ambiguous_count: int = 0
+    artifact_path: str = ""
+
+
 class DerivedDAGArtifact(BaseModel):
     """A staged DAG candidate that is not yet the active implementation DAG."""
 
