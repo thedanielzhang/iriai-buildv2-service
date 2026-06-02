@@ -9271,7 +9271,16 @@ _PARTIAL_RESUME_RERUN_HEADROOM = 2
 # fixes the violation, then re-capturing -> re-enqueueing the fresh patch as a
 # `retry_of_queue_item_id` lane. Bounded so a task that never converges surfaces
 # a clean terminal `workflow_blocked` instead of looping forever at the gate.
-_COMMIT_HYGIENE_RERUN_MAX = 2
+#
+# Only ACTIONABLE-feedback re-failures count toward this budget (see
+# `_commit_hygiene_retry_refailure_counts_for_group`). A product hygiene gate
+# typically surfaces SEVERAL independent violations (e.g. multiple unicode-char
+# lines + an import-layering rule), and an agent fixes them incrementally —
+# often surfacing or re-introducing one while fixing another — so convergence
+# legitimately takes a handful of informed passes. 2 was too tight (it
+# escalated a task that was still making net progress); 4 gives a fair bounded
+# number of real attempts before declaring genuine non-convergence.
+_COMMIT_HYGIENE_RERUN_MAX = 4
 
 
 def _commit_hygiene_recovery_plan(

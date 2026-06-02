@@ -67,11 +67,12 @@ def test_non_failed_lane_is_unchanged():
 
 
 def test_bounded_progression_converges_to_escalation():
-    # Walk the across-resume progression for the items 5/7 shape
-    # (max_reruns=2): each resume that still sees a failed:commit_hygiene lane
-    # increments the per-task counter; after the budget the plan flips from
-    # rerun to escalate and stays there — it terminates rather than loops.
-    assert _plan("failed", "commit_hygiene", 0) == "rerun"
-    assert _plan("failed", "commit_hygiene", 1) == "rerun"
-    assert _plan("failed", "commit_hygiene", 2) == "escalate"
-    assert _plan("failed", "commit_hygiene", 3) == "escalate"
+    # Walk the across-resume progression: each genuine actionable-feedback
+    # re-failure increments the per-task counter; below the budget the plan
+    # returns rerun, at/after the budget it flips to escalate and stays there —
+    # it terminates rather than loops. Budget-relative so it tracks
+    # `_COMMIT_HYGIENE_RERUN_MAX` instead of hard-coding the value.
+    for n in range(_COMMIT_HYGIENE_RERUN_MAX):
+        assert _plan("failed", "commit_hygiene", n) == "rerun"
+    assert _plan("failed", "commit_hygiene", _COMMIT_HYGIENE_RERUN_MAX) == "escalate"
+    assert _plan("failed", "commit_hygiene", _COMMIT_HYGIENE_RERUN_MAX + 1) == "escalate"
