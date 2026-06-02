@@ -51,6 +51,13 @@ SlackVerbosity = Literal["normal", "quiet"]
 _SILENT_INVOCATION_NOTICE_DELAY = 8.0
 _SILENT_INVOCATION_UPDATE_INTERVAL = 15.0
 
+# Defense-in-depth backstop for the typed-recoverable auto-continue loop: halt
+# (surface as a genuine workflow_blocked) after this many consecutive recoverable
+# auto-continues whose progress_token did not change — a stuck auto-loop is itself
+# a defect, not a routine recovery. The bounded commit_hygiene rerun budget
+# already terminates a healthy recovery long before this trips.
+_AUTO_CONTINUE_NO_PROGRESS_CAP = 2
+
 # Roles that benefit from persistent client + mid-stream user message injection.
 # Short-lived reviewers use the fast ephemeral client path.
 _INTERACTIVE_ROLES = {
@@ -628,10 +635,11 @@ class SlackWorkflowOrchestrator:
             binder = getattr(runner, "bind_invocation_observer", None)
             with binder(observer) if observer is not None and callable(binder) else nullcontext():
                 await runner.execute_workflow(workflow, feature, state)
-            quiesce = self._runner_quiesce_result(runner)
-            if quiesce is not None:
-                await self._mark_workflow_quiesced(feature, channel_id, quiesce)
-                return
+            await self._consume_quiesce_or_auto_continue(
+                runner, workflow, feature, state, channel_id
+            )
+            if self._runner_quiesce_result(runner) is not None:
+                return  # halted (already marked quiesced by the helper)
             if self._slack_verbosity != "quiet":
                 await self._adapter.post_message(channel_id, "Workflow complete!")
             await self._adapter.add_reaction(
@@ -1154,15 +1162,16 @@ class SlackWorkflowOrchestrator:
                 await runner.resume_workflow(
                     workflow, feature, state, resume_from_phase=resume_phase
                 )
-            quiesce = self._runner_quiesce_result(runner)
-            if quiesce is not None:
-                await self._mark_workflow_quiesced(
-                    feature,
-                    channel_id,
-                    quiesce,
-                    runtime_policy=runtime_policy,
-                )
-                return
+            await self._consume_quiesce_or_auto_continue(
+                runner,
+                workflow,
+                feature,
+                state,
+                channel_id,
+                runtime_policy=runtime_policy,
+            )
+            if self._runner_quiesce_result(runner) is not None:
+                return  # halted (already marked quiesced by the helper)
             if self._slack_verbosity != "quiet":
                 await self._adapter.post_message(channel_id, "Workflow complete!")
         except Exception as e:
@@ -1192,6 +1201,133 @@ class SlackWorkflowOrchestrator:
             if feature.id not in self._recoverable_features:
                 self._feature_workflows.pop(feature.id, None)
                 self._interaction.unregister_channel(feature.id)
+
+    async def _consume_quiesce_or_auto_continue(
+        self,
+        runner: Any,
+        workflow: Any,
+        feature: Any,
+        state: Any,
+        channel_id: str,
+        *,
+        runtime_policy: str | None = None,
+    ) -> None:
+        """Handle a workflow quiesce, auto-continuing typed-recoverable terminals.
+
+        A manual ``POST /api/bridge/resume`` re-enters the durable-replay resume
+        path; a typed-recoverable terminal (a known self-healing checkpoint such
+        as a commit_hygiene rerun with budget remaining) needs the SAME re-entry,
+        just without the external poke. So on a recoverable quiesce we re-invoke
+        ``runner.resume_workflow(...)`` ourselves: each call fully unwinds and
+        releases its sandboxes/DB before the next, and ``_implement_dag``
+        re-derives all group/lane state from the journal, so this is equivalent
+        to an automated resume — not a long inline loop holding resources.
+
+        Genuine / unknown terminals (``recoverable`` is False, the default for
+        every blocker except the typed allowlist) still halt and wait for an
+        external resume — today's behavior. A stuck auto-loop (``progress_token``
+        unchanged for ``_AUTO_CONTINUE_NO_PROGRESS_CAP`` consecutive recoverable
+        quiesces) is surfaced as a genuine halt, never spun on.
+
+        On return, ``runner``'s ``last_workflow_quiesce`` is None iff the workflow
+        completed; otherwise it has been marked quiesced (the caller should just
+        return without posting "complete").
+        """
+        observer = self._make_invocation_observer(
+            feature.id, feature.workflow_name, channel_id
+        )
+        binder = getattr(runner, "bind_invocation_observer", None)
+        last_token: str | None = None
+        no_progress = 0
+        while True:
+            quiesce = self._runner_quiesce_result(runner)
+            if quiesce is None:
+                return
+            metadata = quiesce.metadata or {}
+            if not bool(metadata.get("recoverable")):
+                await self._mark_workflow_quiesced(
+                    feature, channel_id, quiesce, runtime_policy=runtime_policy
+                )
+                return
+            token = str(metadata.get("progress_token") or "")
+            if token and token == last_token:
+                no_progress += 1
+            else:
+                no_progress = 0
+                last_token = token
+            if no_progress >= _AUTO_CONTINUE_NO_PROGRESS_CAP:
+                logger.warning(
+                    "Auto-continue of a recoverable terminal made no progress "
+                    "(token=%s) for %d cycles for %s — surfacing as a halt",
+                    token,
+                    no_progress,
+                    feature.id,
+                )
+                stuck = WorkflowQuiesceResult(
+                    phase_name=quiesce.phase_name,
+                    reason=(
+                        "Auto-continue of a typed-recoverable terminal made no "
+                        f"progress for {no_progress} consecutive cycles "
+                        "(progress_token unchanged) — halting as a defect to "
+                        f"surface. Last reason: {quiesce.reason}"
+                    ),
+                    metadata={
+                        **metadata,
+                        "recoverable": False,
+                        "auto_continue_stuck": True,
+                    },
+                )
+                await self._mark_workflow_quiesced(
+                    feature, channel_id, stuck, runtime_policy=runtime_policy
+                )
+                return
+            await self._log_auto_continue(feature, quiesce)
+            with (
+                binder(observer)
+                if observer is not None and callable(binder)
+                else nullcontext()
+            ):
+                await runner.resume_workflow(
+                    workflow,
+                    feature,
+                    state,
+                    resume_from_phase=quiesce.phase_name,
+                )
+
+    async def _log_auto_continue(
+        self, feature: Any, quiesce: WorkflowQuiesceResult
+    ) -> None:
+        if self._env is None:
+            return
+        metadata = quiesce.metadata or {}
+        recovery_class = str(metadata.get("recovery_class") or "")
+        logger.info(
+            "Auto-continuing recoverable workflow terminal feature=%s "
+            "phase=%s recovery_class=%s progress_token=%s (no external resume)",
+            feature.id,
+            quiesce.phase_name,
+            recovery_class,
+            metadata.get("progress_token"),
+        )
+        try:
+            await self._env.feature_store.log_event(
+                feature.id,
+                "workflow_auto_continue",
+                "slack-orchestrator",
+                content=recovery_class,
+                metadata={
+                    "phase_name": quiesce.phase_name,
+                    "recovery_class": recovery_class,
+                    "progress_token": metadata.get("progress_token"),
+                    "reason": str(quiesce.reason)[:500],
+                },
+            )
+        except Exception:
+            logger.warning(
+                "Failed to log auto-continue event for %s",
+                feature.id,
+                exc_info=True,
+            )
 
     def _runner_quiesce_result(self, runner: Any) -> WorkflowQuiesceResult | None:
         quiesce = getattr(runner, "last_workflow_quiesce", None)

@@ -58,6 +58,15 @@ class DagExecutionOutcome:
     failure: str
     handover: HandoverDoc
     terminal_state: str = "complete"
+    # Typed-recoverable terminal signal. ``recoverable`` is True ONLY for a
+    # known self-healing checkpoint the orchestrator may auto-continue without
+    # an external resume (conservative allowlist — defaults False so every
+    # other ``workflow_blocked`` return is a genuine halt). ``recovery_class``
+    # names the recoverable condition and ``progress_token`` is a monotonic
+    # marker the orchestrator uses to detect a stuck auto-continue loop.
+    recoverable: bool = False
+    recovery_class: str = ""
+    progress_token: str = ""
 
     def __iter__(self):
         yield self.implementation_text

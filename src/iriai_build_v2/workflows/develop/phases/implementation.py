@@ -9318,6 +9318,59 @@ def _commit_hygiene_recovery_plan(
     return "none"
 
 
+async def _drain_failure_is_commit_hygiene_rerun(
+    *,
+    failed_lanes: list,
+    runner: Any,
+    feature: Feature,
+    refailure_counts: dict[str, int],
+    max_reruns: int,
+) -> bool:
+    """Typed-recoverable allowlist for a merge-queue drain failure.
+
+    Returns True iff EVERY failed lane is a ``commit_hygiene`` lane whose bounded
+    rerun budget is not yet exhausted — i.e. the next durable-replay re-entry
+    would re-dispatch it (``_commit_hygiene_recovery_plan`` == ``"rerun"``). That
+    is the self-healing checkpoint the orchestrator may auto-continue without an
+    external resume. Reuses the SAME budget accounting the dispatch loop uses
+    (genuine refailures + runtime-blocked reruns persisted as a block marker), so
+    this never diverges from the escalate decision. Any non-``commit_hygiene``
+    lane, an un-mappable lane, or an exhausted budget returns False so a genuine
+    defect still halts.
+    """
+    if not failed_lanes:
+        return False
+    for lane in failed_lanes:
+        if getattr(lane, "failure_class", "") != "commit_hygiene":
+            return False
+        task_ids = getattr(lane, "task_ids", None) or []
+        if not task_ids:
+            return False
+        for tid in task_ids:
+            block_count = 0
+            try:
+                raw_block = await runner.artifacts.get(
+                    _commit_hygiene_rerun_block_marker_key(tid),
+                    feature=feature,
+                )
+                if raw_block:
+                    block_count = int(str(raw_block).strip())
+            except Exception:
+                block_count = 0
+            prior_rerun_count = int(refailure_counts.get(tid, 0)) + block_count
+            if (
+                _commit_hygiene_recovery_plan(
+                    lane_status="failed",
+                    failure_class="commit_hygiene",
+                    prior_rerun_count=prior_rerun_count,
+                    max_reruns=max_reruns,
+                )
+                != "rerun"
+            ):
+                return False
+    return True
+
+
 def _resume_dispatch_plan_for_succeeded_terminal(
     *,
     succeeded_attempt: int,
@@ -14050,6 +14103,15 @@ class ImplementationPhase(Phase):
                         "dag_failure": dag_failure[:1000],
                         "deterministic_workflow_blocker": True,
                         "operator_required": False,
+                        # Typed-recoverable signal for the orchestrator's
+                        # auto-continue boundary. True ONLY for a known
+                        # self-healing checkpoint (commit_hygiene rerun with
+                        # budget remaining); the orchestrator re-enters the
+                        # durable-replay resume itself instead of waiting for an
+                        # external poke. progress_token guards a stuck loop.
+                        "recoverable": dag_outcome.recoverable,
+                        "recovery_class": dag_outcome.recovery_class,
+                        "progress_token": dag_outcome.progress_token,
                     },
                 )
 
@@ -21316,10 +21378,18 @@ async def _implement_dag(
                 # checkpoint fail closed (never the legacy commit) and route
                 # any failure through the Slice 07 failure router.
 
-                def _merge_queue_group_blocked(failure_text: str) -> DagExecutionOutcome:
+                def _merge_queue_group_blocked(
+                    failure_text: str,
+                    *,
+                    recoverable: bool = False,
+                    recovery_class: str = "",
+                    progress_token: str = "",
+                ) -> DagExecutionOutcome:
                     # Fail closed: persist the per-task pending markers so a
                     # resume re-drives the (idempotent) enqueue + drain +
                     # checkpoint, and stop the DAG on a typed workflow blocker.
+                    # ``recoverable`` defaults False so this stays a genuine halt
+                    # unless the caller proves a typed self-healing checkpoint.
                     failure = _workflow_blocker_text(failure_text)
                     if enqueued_item_ids:
                         failure = _append_note_once(
@@ -21334,6 +21404,9 @@ async def _implement_dag(
                         failure=failure,
                         handover=handover,
                         terminal_state="workflow_blocked",
+                        recoverable=recoverable,
+                        recovery_class=recovery_class,
+                        progress_token=progress_token,
                     )
 
                 for result in pending_merge_queue:
@@ -21390,11 +21463,36 @@ async def _implement_dag(
                         f"{r.failure_class or 'failed'}"
                         for r in failed_lanes[:10]
                     )
+                    # Typed-recoverable allowlist (conservative): a drain that
+                    # left ONLY `commit_hygiene` lanes whose bounded rerun budget
+                    # is not yet exhausted is the self-healing checkpoint the
+                    # recovery re-dispatches on the next re-entry, so the
+                    # orchestrator may auto-continue it WITHOUT an external
+                    # resume. Any non-commit_hygiene lane or an exhausted budget
+                    # keeps the default genuine halt so a real defect surfaces.
+                    recoverable = await _drain_failure_is_commit_hygiene_rerun(
+                        failed_lanes=failed_lanes,
+                        runner=runner,
+                        feature=feature,
+                        refailure_counts=commit_hygiene_refailure_counts,
+                        max_reruns=_COMMIT_HYGIENE_RERUN_MAX,
+                    )
+                    # Monotonic progress marker: a genuine rerun enqueues a new
+                    # retry lane (higher item id) each cycle, so an unchanged
+                    # token across cycles means the recovery made no progress.
+                    progress_token = (
+                        str(max(enqueued_item_ids)) if enqueued_item_ids else ""
+                    )
                     return _merge_queue_group_blocked(
                         "Durable merge queue drain could not integrate every "
                         f"lane of group {group_idx}: {detail}. The failures "
                         "were routed through the typed failure router; the "
-                        "legacy canonical commit is not a fallback."
+                        "legacy canonical commit is not a fallback.",
+                        recoverable=recoverable,
+                        recovery_class=(
+                            "commit_hygiene_rerun" if recoverable else ""
+                        ),
+                        progress_token=progress_token,
                     )
 
                 # ── Checkpoint: the coordinator projects `dag-group:*` from

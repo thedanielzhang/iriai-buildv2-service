@@ -284,6 +284,128 @@ async def test_resumed_workflow_quiesce_posts_paused_and_remains_recoverable():
 
 
 @pytest.mark.asyncio
+async def test_recoverable_quiesce_auto_continues_without_external_poke():
+    # A typed-recoverable quiesce (commit_hygiene rerun, budget remaining) is
+    # auto-continued internally: the orchestrator re-invokes resume_workflow
+    # itself — no external POST /api/bridge/resume — until the workflow completes.
+    from contextlib import nullcontext
+
+    class _Runner:
+        last_workflow_quiesce = None
+
+        def __init__(self):
+            self.resume_calls = 0
+
+        def bind_invocation_observer(self, _observer):
+            return nullcontext()
+
+        async def resume_workflow(self, _workflow, _feature, _state, *, resume_from_phase):
+            self.resume_calls += 1
+            if self.resume_calls < 3:
+                # Recoverable; progress_token advances each cycle (new retry lane).
+                self.last_workflow_quiesce = WorkflowQuiesceResult(
+                    phase_name=resume_from_phase,
+                    reason="drain could not integrate every lane (commit_hygiene)",
+                    metadata={
+                        "recoverable": True,
+                        "recovery_class": "commit_hygiene_rerun",
+                        "progress_token": str(200 + self.resume_calls),
+                    },
+                )
+            else:
+                self.last_workflow_quiesce = None  # integrated + sealed → done
+
+    feature = SimpleNamespace(
+        id="feat-1",
+        workflow_name="full-develop",
+        metadata={"_db_phase": "implementation"},
+    )
+    adapter = _RecoveringAdapter()
+    interaction = _RecoveringInteraction()
+    orchestrator = SlackWorkflowOrchestrator(
+        adapter=adapter,
+        interaction_runtime=interaction,
+        slack_verbosity="normal",
+        agent_runtime_name="claude",
+    )
+    orchestrator._env = SimpleNamespace(
+        feature_store=_FakeFeatureStore({"feat-1": feature})
+    )
+    runner = _Runner()
+
+    await orchestrator._run_workflow_resumed(
+        runner, object(), feature, object(), "C123", "implementation",
+        runtime_policy=PRIMARY_IMPL_SECONDARY_REVIEW_POLICY,
+    )
+
+    # 1 initial resume + 2 internal auto-continues, then completion.
+    assert runner.resume_calls == 3
+    # Did NOT halt for an operator: no paused message, not registered recoverable.
+    assert "feat-1" not in orchestrator._recoverable_features
+    assert all("paused" not in msg for _ch, msg in adapter.messages)
+    assert any("complete" in msg.lower() for _ch, msg in adapter.messages)
+
+
+@pytest.mark.asyncio
+async def test_auto_continue_no_progress_cap_halts_as_defect():
+    # A recoverable terminal whose progress_token never changes is a stuck
+    # auto-loop (misclassification) — the defense-in-depth cap surfaces it as a
+    # genuine halt instead of spinning forever.
+    from contextlib import nullcontext
+
+    class _Runner:
+        last_workflow_quiesce = None
+
+        def __init__(self):
+            self.resume_calls = 0
+
+        def bind_invocation_observer(self, _observer):
+            return nullcontext()
+
+        async def resume_workflow(self, _workflow, _feature, _state, *, resume_from_phase):
+            self.resume_calls += 1
+            # Recoverable but progress_token is FROZEN → no real progress.
+            self.last_workflow_quiesce = WorkflowQuiesceResult(
+                phase_name=resume_from_phase,
+                reason="drain could not integrate every lane (commit_hygiene)",
+                metadata={
+                    "recoverable": True,
+                    "recovery_class": "commit_hygiene_rerun",
+                    "progress_token": "201",
+                },
+            )
+
+    feature = SimpleNamespace(
+        id="feat-1",
+        workflow_name="full-develop",
+        metadata={"_db_phase": "implementation"},
+    )
+    adapter = _RecoveringAdapter()
+    interaction = _RecoveringInteraction()
+    orchestrator = SlackWorkflowOrchestrator(
+        adapter=adapter,
+        interaction_runtime=interaction,
+        slack_verbosity="normal",
+        agent_runtime_name="claude",
+    )
+    orchestrator._env = SimpleNamespace(
+        feature_store=_FakeFeatureStore({"feat-1": feature})
+    )
+    runner = _Runner()
+
+    await orchestrator._run_workflow_resumed(
+        runner, object(), feature, object(), "C123", "implementation",
+        runtime_policy=PRIMARY_IMPL_SECONDARY_REVIEW_POLICY,
+    )
+
+    # Bounded: 1 initial + _AUTO_CONTINUE_NO_PROGRESS_CAP (2) auto-continues, then halt.
+    assert runner.resume_calls == 3
+    # Surfaced as a genuine halt for a code fix (registered recoverable + paused).
+    assert "feat-1" in orchestrator._recoverable_features
+    assert any("paused" in msg for _ch, msg in adapter.messages)
+
+
+@pytest.mark.asyncio
 async def test_recovery_preserves_saved_runtime_without_explicit_override():
     async def _list_active():
         return [

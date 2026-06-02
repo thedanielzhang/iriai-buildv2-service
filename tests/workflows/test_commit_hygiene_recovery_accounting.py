@@ -499,3 +499,107 @@ async def test_sibling_isolation_enqueue_error_is_best_effort(monkeypatch):
     assert ids == []
     # No markers written when the enqueue itself failed.
     assert arts.puts == {}
+
+
+# ── Typed-recoverable drain-failure allowlist ────────────────────────────────
+#
+# `_drain_failure_is_commit_hygiene_rerun` decides whether a merge-queue drain
+# that left failed lanes is the self-healing checkpoint the orchestrator may
+# auto-continue (commit_hygiene + budget remaining) vs a genuine halt. It reuses
+# the SAME budget accounting (`_commit_hygiene_recovery_plan` + refailure counts
+# + the runtime-block marker) so it never diverges from the escalate decision.
+
+
+class _FakeRecoverableLane:
+    """The fields the typed-recoverable allowlist inspects on a drain result."""
+
+    def __init__(self, task_ids, failure_class="commit_hygiene"):
+        self.task_ids = task_ids
+        self.failure_class = failure_class
+
+
+class _FakeArtifactsGet:
+    def __init__(self, block_counts=None):
+        # {task_id: runtime-block-rerun count} → the block-marker artifact value.
+        self._block_counts = block_counts or {}
+
+    async def get(self, key, *, feature=None):
+        for tid, count in self._block_counts.items():
+            if key == _commit_hygiene_rerun_block_marker_key(tid):
+                return str(count)
+        return None
+
+
+def _drain_runner(block_counts=None):
+    return SimpleNamespace(services={}, artifacts=_FakeArtifactsGet(block_counts))
+
+
+@pytest.mark.asyncio
+async def test_drain_failure_recoverable_when_all_commit_hygiene_with_budget():
+    # All failed lanes are commit_hygiene with budget remaining (1 < 4) → the
+    # next re-entry would "rerun" → auto-continue allowed.
+    recoverable = await impl._drain_failure_is_commit_hygiene_rerun(
+        failed_lanes=[_FakeRecoverableLane(["slice-1-TASK-12"])],
+        runner=_drain_runner(),
+        feature=_feature(),
+        refailure_counts={"slice-1-TASK-12": 1},
+        max_reruns=4,
+    )
+    assert recoverable is True
+
+
+@pytest.mark.asyncio
+async def test_drain_failure_not_recoverable_with_a_non_hygiene_lane():
+    # A single non-commit_hygiene failed lane (e.g. an apply conflict) is NOT a
+    # known self-heal → genuine halt even though a sibling lane is hygiene.
+    recoverable = await impl._drain_failure_is_commit_hygiene_rerun(
+        failed_lanes=[
+            _FakeRecoverableLane(["slice-1-TASK-12"]),
+            _FakeRecoverableLane(["slice-2"], failure_class="apply_conflict"),
+        ],
+        runner=_drain_runner(),
+        feature=_feature(),
+        refailure_counts={},
+        max_reruns=4,
+    )
+    assert recoverable is False
+
+
+@pytest.mark.asyncio
+async def test_drain_failure_not_recoverable_when_budget_exhausted():
+    # refailures (3) + runtime-block reruns (1) == 4 == max → escalate, not rerun
+    # → genuine halt (mirrors the escalate terminal in the dispatch loop).
+    recoverable = await impl._drain_failure_is_commit_hygiene_rerun(
+        failed_lanes=[_FakeRecoverableLane(["slice-1-TASK-12"])],
+        runner=_drain_runner(block_counts={"slice-1-TASK-12": 1}),
+        feature=_feature(),
+        refailure_counts={"slice-1-TASK-12": 3},
+        max_reruns=4,
+    )
+    assert recoverable is False
+
+
+@pytest.mark.asyncio
+async def test_drain_failure_not_recoverable_for_empty_or_untracked_lane():
+    # No failed lanes → not a recoverable terminal.
+    assert (
+        await impl._drain_failure_is_commit_hygiene_rerun(
+            failed_lanes=[],
+            runner=_drain_runner(),
+            feature=_feature(),
+            refailure_counts={},
+            max_reruns=4,
+        )
+        is False
+    )
+    # A commit_hygiene lane with no task_ids can't be budget-checked → halt.
+    assert (
+        await impl._drain_failure_is_commit_hygiene_rerun(
+            failed_lanes=[_FakeRecoverableLane([])],
+            runner=_drain_runner(),
+            feature=_feature(),
+            refailure_counts={},
+            max_reruns=4,
+        )
+        is False
+    )
