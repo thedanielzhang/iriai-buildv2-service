@@ -23487,10 +23487,17 @@ async def _dag_group_queue_checkpoint_is_fresh(
         return False
     if not items:
         return False
-    # Every lane covering an expected task id must be terminal `done`. A lane in
-    # any other status (`queued`/`leased`/`applying`/.../`integrated`/`failed`/
-    # `poisoned`) covering an expected task means the group is NOT fully
-    # checkpointed — fail closed.
+    # Every expected task must be covered by exactly one terminal `done` lane. A
+    # lane still IN FLIGHT (`queued`/`leased`/`applying`/.../`integrated`)
+    # covering an expected task means the group is NOT fully checkpointed — fail
+    # closed. But a `failed`/`poisoned` lane is DEAD retry-chain history: a
+    # commit_hygiene recovery leaves a chain of failed lanes superseded by the
+    # `done` replacement that finally landed. Those must be ignored here — the
+    # exactly-one-`done`-per-task check below still proves completeness, so a
+    # genuinely unresolved failure (a task with NO `done` lane) still fails
+    # closed via the missing-task check. (Without this, a validly-sealed group
+    # whose tasks recovered through the retry chain is judged "stale" forever
+    # and re-run — but its `done`-replaced lanes can no longer be re-enqueued.)
     done_by_task: dict[str, list[Any]] = {}
     for item in items:
         covered = {
@@ -23499,6 +23506,8 @@ async def _dag_group_queue_checkpoint_is_fresh(
             if str(getattr(c, "task_id", ""))
         }
         if not covered & expected:
+            continue
+        if str(getattr(item, "status", "")) in ("failed", "poisoned"):
             continue
         if str(getattr(item, "status", "")) != "done":
             return False

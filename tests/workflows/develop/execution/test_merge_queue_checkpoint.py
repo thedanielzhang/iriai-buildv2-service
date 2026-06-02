@@ -157,6 +157,9 @@ async def _enqueue_drainable_lane(
     base_commit: str,
     patch_text: str,
     allowed_file: str = "README.md",
+    retry_of: int | None = None,
+    head_commit: str = "",
+    contract: int | None = None,
 ) -> int:
     """Enqueue one ``queued`` ``task:{id}`` lane the drain can claim.
 
@@ -165,14 +168,15 @@ async def _enqueue_drainable_lane(
     a diff artifact, an active contract scoped to *allowed_file*, a pre-queue
     aggregate_verdict gate node, one task-coverage row, and one repo target.
     """
-    contract = await _insert_contract(
-        conn,
-        feature_id,
-        task_id,
-        allowed_paths=[
-            {"repo_id": repo_id, "path": allowed_file, "match_kind": "file"}
-        ],
-    )
+    if contract is None:
+        contract = await _insert_contract(
+            conn,
+            feature_id,
+            task_id,
+            allowed_paths=[
+                {"repo_id": repo_id, "path": allowed_file, "match_kind": "file"}
+            ],
+        )
     diff_artifact = await _insert_artifact(
         conn, feature_id, f"dag-sandbox-diff:{task_id}", patch_text
     )
@@ -189,12 +193,13 @@ async def _enqueue_drainable_lane(
             base_commit=base_commit,
             repo_id=repo_id,
             repo_path=str(repo_path),
-            head_commit="",
+            head_commit=head_commit,
             integration_lane=f"task:{task_id}",
             pre_queue_gate_evidence_id=gate,
             contract_ids=[contract],
             patch_evidence_ids=[patch_evidence],
             gate_evidence_ids=[gate],
+            retry_of_queue_item_id=retry_of,
             task_coverage=[
                 TaskCoverageCreate(task_id=task_id, contract_id=contract)
             ],
@@ -878,6 +883,78 @@ async def test_queue_checkpoint_body_passes_the_legacy_resume_freshness_gate(
 
     # And the queue-evidence freshness branch itself confirms the typed rows.
     current_heads = impl._current_feature_repo_heads(runner, feature)
+    queue_fresh = await impl._dag_group_queue_checkpoint_is_fresh(
+        runner, feature, group_idx=_GROUP, group_task_ids=["TASK-1"],
+        dag_sha256=_DAG, commit_hash=str(body["commit_hash"]),
+        current_heads=current_heads,
+    )
+    assert queue_fresh is True
+
+
+@pytest.mark.asyncio
+async def test_queue_checkpoint_freshness_ignores_dead_failed_retry_lanes(
+    mq_conn, tmp_path: Path
+) -> None:
+    """A sealed group with DEAD `failed` retry-chain lanes is still fresh.
+
+    A commit_hygiene recovery leaves a chain of `failed` lanes superseded by the
+    `done` replacement that finally landed. The resume freshness gate
+    (`_dag_group_queue_checkpoint_is_fresh`) must IGNORE those dead lanes —
+    otherwise a validly-sealed group is judged "stale or lacks durable proof"
+    and re-run forever, but its `done`-replaced lanes can no longer be
+    re-enqueued (their retry sources already have a `done` replacement). Mirrors
+    feature 8ac124d6 group 78, where 7 failed retry lanes (5,7,9,10,11,13,14)
+    blocked the seal even though all four tasks were `done`.
+    """
+    feature_id = "feat-ckpt-dead-failed"
+    await _insert_feature(mq_conn, feature_id)
+    base, repo, base_commit = _build_feature_workspace(tmp_path, feature_id)
+    patch = _diff_for_appended_line(repo, "dead failed lane line\n")
+    # One contract shared by both lanes (a retry reuses its source's contract).
+    contract = await _insert_contract(
+        mq_conn, feature_id, "TASK-1",
+        allowed_paths=[{"repo_id": "app", "path": "README.md", "match_kind": "file"}],
+    )
+
+    # The original lane that FAILED commit_hygiene — the dead retry-chain root.
+    failed_lane = await _enqueue_drainable_lane(
+        mq_conn, feature_id, task_id="TASK-1", repo_id="app",
+        repo_path=repo, base_commit=base_commit, patch_text=patch,
+        head_commit="h-orig", contract=contract,
+    )
+    await mq_conn.execute(
+        "UPDATE merge_queue_items SET status='failed' WHERE id=$1", failed_lane,
+    )
+    # The recovery retry that lands: enqueued as a retry_of the failed lane,
+    # then drained + checkpointed to `done`.
+    await _enqueue_drainable_lane(
+        mq_conn, feature_id, task_id="TASK-1", repo_id="app",
+        repo_path=repo, base_commit=base_commit, patch_text=patch,
+        retry_of=failed_lane, contract=contract,
+    )
+    runner = _workspace_runner(mq_conn, base)
+    feature = _feature(feature_id)
+
+    drained = await impl._drain_durable_merge_queue_for_feature(
+        runner, feature, dag_sha256=_DAG
+    )
+    assert any(d.integrated for d in drained)
+
+    task_results = [
+        impl.ImplementationResult(
+            task_id="TASK-1", summary="recovered the work", status="completed"
+        )
+    ]
+    result = await impl._checkpoint_durable_merge_queue_group(
+        runner, feature, dag_sha256=_DAG, group_idx=_GROUP,
+        expected_task_ids=["TASK-1"], task_results=task_results,
+    )
+    assert result.checkpointed is True
+
+    body = json.loads(await runner.artifacts.get("dag-group:1", feature=feature))
+    current_heads = impl._current_feature_repo_heads(runner, feature)
+    # THE regression assertion: the dead `failed` lane does NOT make the
+    # otherwise fully-`done` group stale.
     queue_fresh = await impl._dag_group_queue_checkpoint_is_fresh(
         runner, feature, group_idx=_GROUP, group_task_ids=["TASK-1"],
         dag_sha256=_DAG, commit_hash=str(body["commit_hash"]),
