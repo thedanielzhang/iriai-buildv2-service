@@ -903,6 +903,24 @@ class ContractCompiler:
         ]
         if operation in {"create", "rename_to"}:
             permitted = any(rule.allow_create for rule in matching)
+            if not permitted and base_present_paths is not None:
+                # Symmetric to the modify-when-present tolerance below: the
+                # contract declared this exact file as a `modify` deliverable,
+                # but it is ABSENT at the base commit, so a `create` is the only
+                # way to deliver it (the upstream DAG mislabeled create-vs-modify
+                # intent). Permit it — this does NOT broaden writes beyond the
+                # already-declared deliverable path.
+                permitted = any(
+                    rule.allow_modify
+                    and rule.match_kind == "file"
+                    and _same_path(rule.path, path, case_sensitivity)
+                    and not _path_present_exact(
+                        base_present_paths,
+                        path,
+                        case_sensitivity=case_sensitivity,
+                    )
+                    for rule in matching
+                )
         elif operation in {"modify"}:
             permitted = any(rule.allow_modify for rule in matching)
             if not permitted and base_present_paths is not None:

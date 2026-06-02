@@ -979,6 +979,42 @@ def test_existing_create_deliverable_accepts_modify_during_resume(tmp_path: Path
     assert "modify_outside_allowed_paths" in absent.violation_codes
 
 
+def test_modify_deliverable_absent_at_base_accepts_create(tmp_path: Path) -> None:
+    # Symmetric to test_existing_create_deliverable_accepts_modify_during_resume:
+    # a task declared `modify` for a file that does NOT exist at the base commit
+    # (the upstream DAG mislabeled create-vs-modify intent). A create is the only
+    # way to deliver the declared file, so it must be permitted — but only when
+    # the file is genuinely absent at base; creating a file that already exists
+    # is still a violation (it should be a modify).
+    registry, _feature_root = _registry(tmp_path)
+    repo = registry.repos[0]
+    task = _task(
+        file_scope=[_scope("src/new.py", "modify")],
+        acceptance_criteria=[SimpleNamespace(description="New module is present.")],
+    )
+    contract = ContractCompiler().compile_task(_request(registry, task))
+    patch = PatchSummary(
+        sandbox_id="sandbox-modify-absent",
+        repo_id=repo.repo_id,
+        created_paths=["src/new.py"],
+        diff_sha256="digest",
+    )
+
+    absent = ContractCompiler().validate_patch(
+        contract,
+        patch,
+        _snapshot(repo, present_paths=[]),
+    )
+    assert absent.approved is True
+
+    present = ContractCompiler().validate_patch(
+        contract,
+        patch,
+        _snapshot(repo, present_paths=["src/new.py"]),
+    )
+    assert "create_outside_allowed_paths" in present.violation_codes
+
+
 def test_file_scope_modify_resolves_unique_existing_package_alias(tmp_path: Path) -> None:
     feature_root = tmp_path / "workspace" / ".iriai" / "features" / "slice-03" / "repos"
     registry, feature_root = _registry(
