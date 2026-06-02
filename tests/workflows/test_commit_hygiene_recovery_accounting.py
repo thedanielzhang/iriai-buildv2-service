@@ -30,6 +30,7 @@ requirement — the same reason two ``test_merge_queue_checkpoint`` tests are
 pre-existing failures).
 """
 
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -38,11 +39,26 @@ import iriai_build_v2.workflows.develop.phases.implementation as impl
 from iriai_build_v2.workflows.develop.phases.implementation import (
     _PENDING_DURABLE_MERGE_QUEUE_NOTE,
     ImplementationResult,
+    _commit_hygiene_augmented_contract,
+    _commit_hygiene_recovery_feedback,
     _commit_hygiene_recovery_lanes_for_group,
     _commit_hygiene_retry_refailure_counts_for_group,
     _commit_hygiene_rerun_block_marker_key,
+    _commit_hygiene_widening_grant,
+    _CommitHygieneRecoveryLane,
     _integrate_nonblocked_successes_before_block,
     _integrated_lane_task_ids_for_group,
+    _parse_commit_hygiene_hook_offenders,
+)
+from iriai_build_v2.workflows.develop.execution.task_contracts import (
+    ContractCompiler,
+    ContractExecutionPolicy,
+    ContractPathRule,
+    PatchSummary,
+    TaskDeliverableContract,
+)
+from iriai_build_v2.workflows.develop.execution.workspace_authority import (
+    WorkspaceSnapshot,
 )
 
 
@@ -603,3 +619,355 @@ async def test_drain_failure_not_recoverable_for_empty_or_untracked_lane():
         )
         is False
     )
+
+
+# ── Evidence-gated, allow-list-bounded write-set widening ────────────────────
+#
+# The commit-hygiene recovery loop can self-heal a blocker whose only fix is a
+# carve-out in a shared-config file OUTSIDE the task's write-set (e.g. a
+# `local/code-import-patterns` lint failure on the task's own new `impl/**`
+# files, fixed by editing `eslint.config.js`). Triggering is gated on the
+# product hook's OWN evidence — the rule fired on the task's OWN subtree — and
+# the widened set is bounded by a static allow-list of shared-config files,
+# `modify`-only, must pre-exist. Every other path still fails closed.
+
+
+_REPO = "repo-app"
+
+
+def _file_rule(path: str, *, modify: bool = False, create: bool = False) -> ContractPathRule:
+    return ContractPathRule(
+        repo_id=_REPO,
+        path=path,
+        match_kind="file",
+        intent="modify" if modify else "create",
+        required=False,
+        allow_modify=modify,
+        allow_create=create,
+        allow_delete=False,
+        source="test",
+    )
+
+
+def _dir_rule(path: str) -> ContractPathRule:
+    return ContractPathRule(
+        repo_id=_REPO,
+        path=path,
+        match_kind="directory",
+        intent="create",
+        required=False,
+        allow_modify=True,
+        allow_create=True,
+        allow_delete=False,
+        source="test",
+    )
+
+
+def _contract(allowed_paths: list[ContractPathRule]) -> TaskDeliverableContract:
+    normalized = {
+        "feature_id": "8ac124d6",
+        "dag_sha256": "dag-sha",
+        "group_idx": 79,
+        "task_id": "TASK-12",
+        "repo_id": _REPO,
+        "allowed_paths": [r.model_dump(mode="json") for r in allowed_paths],
+    }
+    return TaskDeliverableContract(
+        id=101,
+        feature_id="8ac124d6",
+        dag_sha256="dag-sha",
+        source_dag_artifact_id=1,
+        source_dag_sha256="src-dag-sha",
+        group_idx=79,
+        task_id="TASK-12",
+        repo_id=_REPO,
+        repo_path="app",
+        required_paths=[],
+        allowed_paths=allowed_paths,
+        read_only_paths=[],
+        forbidden_paths=[],
+        generated_outputs=[],
+        acceptance_criteria=[],
+        verification_gates=[],
+        execution_policy=ContractExecutionPolicy(
+            write_set_mode="declared",
+            sandbox_isolation="per_task",
+            merge_admission="single_task",
+            requires_contract_verdict=True,
+            repair_may_broaden_scope=False,
+            phased_rollout_allowed=False,
+        ),
+        non_goals=[],
+        dependency_task_ids=[],
+        unknown_write_set=False,
+        compile_warnings=[],
+        normalized_contract_json=normalized,
+        contract_digest="digest-original",
+        status="active",
+        idempotency_key="idem-original",
+    )
+
+
+def _hook_detail(*abs_paths: str, rule: str = "local/code-import-patterns") -> str:
+    lines = ["commit_hygiene: commit hook failed (exit 1)", "stderr:"]
+    for path in abs_paths:
+        lines.append(
+            f"{path}: line 3, col 1, Warning - disallowed import ({rule})"
+        )
+    return "\n".join(lines)
+
+
+# ── Parse helper ─────────────────────────────────────────────────────────────
+
+
+def test_parse_hook_offenders_extracts_paths_and_rules():
+    detail = _hook_detail(
+        "/repo/app/impl/selection/a.ts",
+        "/repo/app/impl/selection/b.ts",
+    )
+    paths, rules = _parse_commit_hygiene_hook_offenders(detail)
+    assert paths == [
+        "/repo/app/impl/selection/a.ts",
+        "/repo/app/impl/selection/b.ts",
+    ]
+    assert rules == ["local/code-import-patterns"]
+
+
+def test_parse_hook_offenders_ignores_unparseable_lines():
+    paths, rules = _parse_commit_hygiene_hook_offenders(
+        "commit_hygiene: commit hook failed (exit 1)\nstderr:\n(no offenders)"
+    )
+    assert paths == []
+    assert rules == []
+
+
+# ── Trigger / boundary (a)-(d) ───────────────────────────────────────────────
+
+
+def test_widen_grants_eslint_when_local_rule_and_offenders_in_contract(tmp_path: Path):
+    # (a) local/* rule + EVERY offender inside the task's contract → grant
+    # eslint.config.js (modify), but only because the config file exists.
+    repo = tmp_path / "app"
+    (repo / "impl" / "selection").mkdir(parents=True)
+    (repo / "eslint.config.js").write_text("module.exports = [];")
+    contract = _contract([_dir_rule("impl/selection")])
+    detail = _hook_detail(str(repo / "impl" / "selection" / "a.ts"))
+    granted = _commit_hygiene_widening_grant(
+        contract=contract, hook_detail=detail, repo_root=repo,
+    )
+    assert granted == ["eslint.config.js"]
+
+
+def test_no_widen_when_offender_outside_contract(tmp_path: Path):
+    # (b) an offender OUTSIDE the task's contract is a GENUINE violation → no grant.
+    repo = tmp_path / "app"
+    (repo / "impl" / "selection").mkdir(parents=True)
+    (repo / "src").mkdir(parents=True)
+    (repo / "eslint.config.js").write_text("module.exports = [];")
+    contract = _contract([_dir_rule("impl/selection")])
+    detail = _hook_detail(
+        str(repo / "impl" / "selection" / "a.ts"),   # in-contract
+        str(repo / "src" / "stray.ts"),               # OUTSIDE the contract
+    )
+    granted = _commit_hygiene_widening_grant(
+        contract=contract, hook_detail=detail, repo_root=repo,
+    )
+    assert granted == []
+
+
+def test_no_widen_when_no_local_rule(tmp_path: Path):
+    # (c) no `local/*` rule named → no grant (not an evidence-gated trigger).
+    repo = tmp_path / "app"
+    (repo / "impl" / "selection").mkdir(parents=True)
+    (repo / "eslint.config.js").write_text("module.exports = [];")
+    contract = _contract([_dir_rule("impl/selection")])
+    detail = _hook_detail(
+        str(repo / "impl" / "selection" / "a.ts"),
+        rule="prettier/prettier",   # not a local/* hygiene rule
+    )
+    granted = _commit_hygiene_widening_grant(
+        contract=contract, hook_detail=detail, repo_root=repo,
+    )
+    assert granted == []
+
+
+def test_no_widen_when_granted_config_absent(tmp_path: Path):
+    # (d) the granted config path must EXIST in the repo — it never does for a
+    # repo without the shared eslint config, so no grant.
+    repo = tmp_path / "app"
+    (repo / "impl" / "selection").mkdir(parents=True)
+    # NOTE: no eslint.config.js written.
+    contract = _contract([_dir_rule("impl/selection")])
+    detail = _hook_detail(str(repo / "impl" / "selection" / "a.ts"))
+    granted = _commit_hygiene_widening_grant(
+        contract=contract, hook_detail=detail, repo_root=repo,
+    )
+    assert granted == []
+
+
+def test_no_widen_when_config_already_permitted(tmp_path: Path):
+    # The augmented builder returns None when the only granted path is already
+    # in the contract (nothing to add).
+    repo = tmp_path / "app"
+    (repo / "impl" / "selection").mkdir(parents=True)
+    (repo / "eslint.config.js").write_text("module.exports = [];")
+    contract = _contract(
+        [_dir_rule("impl/selection"), _file_rule("eslint.config.js", modify=True)]
+    )
+    detail = _hook_detail(str(repo / "impl" / "selection" / "a.ts"))
+    granted = _commit_hygiene_widening_grant(
+        contract=contract, hook_detail=detail, repo_root=repo,
+    )
+    assert granted == ["eslint.config.js"]
+    # ...but augmenting yields None: the config is ALREADY permitted.
+    assert _commit_hygiene_augmented_contract(
+        contract=contract, granted_config_paths=granted,
+    ) is None
+
+
+def test_widening_grant_fails_closed_without_repo_root():
+    contract = _contract([_dir_rule("impl/selection")])
+    assert _commit_hygiene_widening_grant(
+        contract=contract,
+        hook_detail=_hook_detail("/x/impl/selection/a.ts"),
+        repo_root=None,
+    ) == []
+
+
+# ── Augmented contract: validates the widened path, original still rejects ───
+
+
+def _snapshot_for(contract: TaskDeliverableContract) -> WorkspaceSnapshot:
+    return WorkspaceSnapshot(
+        feature_id=contract.feature_id,
+        dag_sha256=contract.dag_sha256,
+        group_idx=contract.group_idx,
+        repo_id=contract.repo_id,
+        canonical_path="/tmp/app",
+        workspace_relative_path="app",
+        case_sensitivity="case_sensitive",
+        present_paths=["eslint.config.js", "impl/selection/a.ts"],
+    )
+
+
+def test_augmented_contract_permits_config_modify_original_rejects():
+    original = _contract([_dir_rule("impl/selection")])
+    augmented = _commit_hygiene_augmented_contract(
+        contract=original, granted_config_paths=["eslint.config.js"],
+    )
+    assert augmented is not None
+
+    # Augmented allowed_paths = the originals + the eslint.config.js modify rule.
+    paths = {(r.path, r.allow_modify) for r in augmented.allowed_paths}
+    assert ("impl/selection/", True) in paths
+    assert ("eslint.config.js", True) in paths
+    assert {r.path for r in original.allowed_paths} <= {
+        r.path for r in augmented.allowed_paths
+    }
+
+    # Distinct idempotency_key + distinct contract_digest (required so
+    # put_task_contract supersedes the narrow original instead of conflicting).
+    assert augmented.idempotency_key != original.idempotency_key
+    assert augmented.contract_digest != original.contract_digest
+    assert augmented.status == "active"
+    assert augmented.id is None  # a NEW row, not the original
+
+    compiler = ContractCompiler()
+
+    # A modify of eslint.config.js is REJECTED under the original (out of scope)...
+    original_violations: list[dict] = []
+    compiler._validate_patch_operation(
+        original,
+        "eslint.config.js",
+        "modify",
+        "case_sensitive",
+        original_violations,
+        base_present_paths={"eslint.config.js"},
+    )
+    assert any(
+        v["failure_type"] == "outside_allowed_paths" for v in original_violations
+    )
+
+    # ...and PERMITTED under the augmented contract.
+    augmented_violations: list[dict] = []
+    compiler._validate_patch_operation(
+        augmented,
+        "eslint.config.js",
+        "modify",
+        "case_sensitive",
+        augmented_violations,
+        base_present_paths={"eslint.config.js"},
+    )
+    assert augmented_violations == []
+
+    # The original deliverable subtree still validates under the augmented one.
+    subtree_violations: list[dict] = []
+    compiler._validate_patch_operation(
+        augmented,
+        "impl/selection/a.ts",
+        "create",
+        "case_sensitive",
+        subtree_violations,
+        base_present_paths=set(),
+    )
+    assert subtree_violations == []
+
+
+def test_augmented_contract_full_verdict_round_trip():
+    # End-to-end through validate_patch: a patch that creates the task's own file
+    # AND modifies eslint.config.js is APPROVED under the augmented contract but
+    # produces a contract_violation under the original.
+    original = _contract([_dir_rule("impl/selection")])
+    augmented = _commit_hygiene_augmented_contract(
+        contract=original, granted_config_paths=["eslint.config.js"],
+    )
+    assert augmented is not None
+    compiler = ContractCompiler()
+    snapshot = _snapshot_for(original)
+    patch = PatchSummary(
+        sandbox_id="sbx-1",
+        repo_id=_REPO,
+        created_paths=["impl/selection/a.ts"],
+        modified_paths=["eslint.config.js"],
+        changed_paths=["impl/selection/a.ts", "eslint.config.js"],
+    )
+
+    original_verdict = compiler.validate_patch(original, patch, snapshot)
+    assert not original_verdict.approved
+    assert "modify_outside_allowed_paths" in original_verdict.violation_codes
+
+    augmented_verdict = compiler.validate_patch(augmented, patch, snapshot)
+    assert augmented_verdict.approved, augmented_verdict.violations
+
+
+# ── Feedback steering ────────────────────────────────────────────────────────
+
+
+def test_feedback_mentions_granted_config_when_widened():
+    lane = _CommitHygieneRecoveryLane(
+        task_id="TASK-12",
+        lane_id=12,
+        failure_class="commit_hygiene",
+        hook_detail=_hook_detail("/repo/app/impl/selection/a.ts"),
+    )
+    text = _commit_hygiene_recovery_feedback(
+        lane, widened_config_paths=["eslint.config.js"],
+    )
+    assert "eslint.config.js" in text
+    assert "modify-only" in text
+    # The bans stay intact.
+    assert "--no-verify" in text
+    assert "eslint-disable" in text
+
+
+def test_feedback_omits_carveout_when_not_widened():
+    lane = _CommitHygieneRecoveryLane(
+        task_id="TASK-12",
+        lane_id=12,
+        failure_class="commit_hygiene",
+        hook_detail=_hook_detail("/repo/app/impl/selection/a.ts"),
+    )
+    text = _commit_hygiene_recovery_feedback(lane)
+    assert "Shared-config carve-out permitted" not in text
+    # The ban on bypassing the hook is still present.
+    assert "--no-verify" in text

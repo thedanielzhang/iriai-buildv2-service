@@ -70,17 +70,21 @@ try:
         ContractCompileError,
         ContractCompiler,
         ContractGroupCompileRequest,
+        ContractPathRule,
         ContractVerdict as CompiledContractVerdict,
         PatchSummary as CompiledPatchSummary,
         TaskDeliverableContract as CompiledTaskDeliverableContract,
+        _path_matches_any,
     )
 except ImportError:  # pragma: no cover - Slice 03 module may be absent in old installs.
     ContractCompileError = None  # type: ignore[assignment]
     ContractCompiler = None  # type: ignore[assignment]
     ContractGroupCompileRequest = None  # type: ignore[assignment]
+    ContractPathRule = None  # type: ignore[assignment]
     CompiledContractVerdict = None  # type: ignore[assignment]
     CompiledPatchSummary = None  # type: ignore[assignment]
     CompiledTaskDeliverableContract = None  # type: ignore[assignment]
+    _path_matches_any = None  # type: ignore[assignment]
 
 try:
     from ..execution.sandbox import (
@@ -6276,13 +6280,24 @@ async def _integrated_lane_task_ids_for_group(
     return integrated
 
 
-def _commit_hygiene_recovery_feedback(lane: _CommitHygieneRecoveryLane) -> str:
+def _commit_hygiene_recovery_feedback(
+    lane: _CommitHygieneRecoveryLane,
+    *,
+    widened_config_paths: Sequence[str] | None = None,
+) -> str:
     """Build the agent recovery feedback for a failed commit_hygiene lane.
 
     Names the CONCRETE pre-commit/husky blocker from the persisted hook output
     (e.g. the eslint rule id + the offending test file) so the re-dispatched
     agent fixes the actual violation — never a generic "fix hygiene". Threaded
     into the re-dispatch prompt as ``handover_context``.
+
+    When ``widened_config_paths`` is non-empty, the host has evidence-gated an
+    write-set widening: the re-dispatch contract permits ``modify``-only edits to
+    those shared-config file(s). Tell the agent it MAY edit them to add the
+    carve-out for its OWN subtree — while keeping the existing ``--no-verify`` /
+    ``eslint-disable`` / test-skip ban intact (suppressing the rule would refail
+    on "Unused eslint-disable directive").
     """
 
     detail = (lane.hook_detail or "").strip()
@@ -6294,6 +6309,24 @@ def _commit_hygiene_recovery_feedback(lane: _CommitHygieneRecoveryLane) -> str:
             "hook output was persisted."
         )
     )
+    widening_block = ""
+    granted = [str(p) for p in (widened_config_paths or []) if str(p)]
+    if granted:
+        files = ", ".join(f"`{p}`" for p in granted)
+        widening_block = (
+            "\n\n### Shared-config carve-out permitted\n"
+            "The hook violation above was triggered by THIS task's own new "
+            "files, and its only legitimate fix is a carve-out in a shared "
+            "config file. Your re-dispatch contract has been widened to permit "
+            f"**modify-only** edits to {files}. You MAY edit "
+            f"{'that file' if len(granted) == 1 else 'those files'} to add the "
+            "narrow carve-out for YOUR subtree so the rule passes for your new "
+            "code. Do NOT broaden the carve-out beyond your own paths, and do "
+            "NOT create or delete the config file — modify only. The ban on "
+            "`--no-verify`, eslint-disable comments, and test skips STILL "
+            "applies (suppressing the rule would refail on an "
+            "'Unused eslint-disable directive')."
+        )
     return (
         "\n\n## Commit-Hygiene Blocker — Fix Required\n"
         "Your previously-captured patch for this task was applied to the "
@@ -6305,6 +6338,7 @@ def _commit_hygiene_recovery_feedback(lane: _CommitHygieneRecoveryLane) -> str:
         f"**Failed merge-queue lane:** {lane.lane_id}\n"
         "**Pre-commit hook output:**\n"
         f"```\n{body}\n```\n"
+        f"{widening_block}"
     )
 
 
@@ -8051,6 +8085,127 @@ def _repair_contract_for_paths(
     )
 
 
+def _commit_hygiene_augmented_contract(
+    *,
+    contract: Any,
+    granted_config_paths: Sequence[str],
+) -> Any | None:
+    """Build an AUGMENTED contract = the task's existing contract + modify-only
+    config-file rule(s) for each granted, allow-listed, repo-existing path.
+
+    Mirrors the repair-contract builder's rule shape (a per-path
+    ``allow_modify``-only file rule) but keeps ``status="active"`` and computes a
+    DISTINCT ``idempotency_key`` from the NEW ``contract_digest`` (as
+    ``compile_task`` does) so ``put_task_contract`` inserts a NEW row (new id)
+    and SUPERSEDES the narrow original — copying the original's key would instead
+    raise ``IdempotencyConflict``. The new ``normalized_contract_json`` /
+    ``contract_digest`` carry the widened ``allowed_paths`` so the re-dispatch's
+    capture verdict and retry-lane ``contract_id`` both validate against it.
+
+    Returns ``None`` when nothing new can be added (no granted path is missing
+    from the contract) — the caller then proceeds with the original contract.
+    Only adds a rule for a granted path NOT already permitted by the contract.
+    """
+
+    if (
+        contract is None
+        or not granted_config_paths
+        or ContractPathRule is None
+        or _path_matches_any is None
+    ):
+        return None
+    repo_id = _contract_repo_id(contract)
+    existing_rules = list(getattr(contract, "allowed_paths", None) or [])
+    new_rules: list[Any] = []
+    for config_path in granted_config_paths:
+        already_permitted = _path_matches_any(
+            config_path, existing_rules, case_sensitivity="case_sensitive"
+        )
+        if already_permitted:
+            continue
+        new_rules.append(
+            ContractPathRule(
+                repo_id=repo_id,
+                path=config_path,
+                match_kind="file",
+                intent="modify",
+                required=False,
+                allow_modify=True,
+                allow_create=False,
+                allow_delete=False,
+                source="commit_hygiene_widening",
+            )
+        )
+    if not new_rules:
+        return None
+    augmented_allowed = existing_rules + new_rules
+
+    # Recompute the normalized projection + digest from the WIDENED contract so
+    # the augmented row carries a differing `contract_digest` (required for the
+    # supersede), then derive a distinct idempotency_key from it.
+    base_payload = _model_json_dict(contract)
+    augmented_allowed_json = [
+        rule.model_dump(mode="json") if hasattr(rule, "model_dump") else dict(rule)
+        for rule in augmented_allowed
+    ]
+    normalized = dict(base_payload.get("normalized_contract_json") or {})
+    normalized["allowed_paths"] = [
+        {
+            "repo_id": rule.repo_id,
+            "path": rule.path,
+            "match_kind": rule.match_kind,
+            "intent": rule.intent,
+            "required": rule.required,
+            "allow_modify": rule.allow_modify,
+            "allow_create": rule.allow_create,
+            "allow_delete": rule.allow_delete,
+            "source": rule.source,
+        }
+        for rule in augmented_allowed
+    ]
+    contract_digest = hashlib.sha256(
+        json.dumps(normalized, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    feature_id = str(base_payload.get("feature_id", ""))
+    if dispatcher_stable_digest is not None:
+        idempotency_key = dispatcher_stable_digest(
+            {
+                "kind": "task-deliverable-contract:commit-hygiene-widened",
+                "feature_id": feature_id,
+                "dag_sha256": base_payload.get("dag_sha256", ""),
+                "group_idx": base_payload.get("group_idx", 0),
+                "task_id": base_payload.get("task_id", ""),
+                "repo_id": repo_id,
+                "contract_digest": contract_digest,
+            }
+        )
+    else:  # pragma: no cover - canonical digest module is always present.
+        idempotency_key = f"idem:commit-hygiene-widened:{feature_id}:{contract_digest}"
+
+    update = {
+        "id": None,
+        "allowed_paths": augmented_allowed,
+        "normalized_contract_json": normalized,
+        "contract_digest": contract_digest,
+        "status": "active",
+        "idempotency_key": idempotency_key,
+    }
+    if hasattr(contract, "model_copy"):
+        return contract.model_copy(update=update)
+    augmented = dict(base_payload)
+    augmented["allowed_paths"] = augmented_allowed_json
+    augmented.update(
+        {
+            "id": None,
+            "normalized_contract_json": normalized,
+            "contract_digest": contract_digest,
+            "status": "active",
+            "idempotency_key": idempotency_key,
+        }
+    )
+    return augmented
+
+
 async def _bind_repair_sandbox(
     runner: WorkflowRunner,
     feature: Feature,
@@ -9306,6 +9461,194 @@ _PARTIAL_RESUME_RERUN_HEADROOM = 2
 # escalated a task that was still making net progress); 4 gives a fair bounded
 # number of real attempts before declaring genuine non-convergence.
 _COMMIT_HYGIENE_RERUN_MAX = 4
+
+
+# ── Evidence-gated, allow-list-bounded commit-hygiene write-set widening ─────
+#
+# A task can fail the product pre-commit hook for a reason whose ONLY legitimate
+# fix is editing a shared-config file that lies OUTSIDE the task's declared
+# write-set — e.g. new files under the task's own `impl/<subtree>/**` trip the
+# VS Code fork's `local/code-import-patterns` lint rule, which is only fixable by
+# adding a carve-out block to the shared `eslint.config.js`. The merge-queue
+# apply gate rejects the out-of-write-set patch with `contract_violation` before
+# the commit hook even runs, so the recovery loop re-dispatches forever and
+# escalates — a permanent hard block. This widening lets such a blocker self-heal
+# by narrowly granting the task a `modify`-only rule on the shared-config file on
+# the re-dispatch — but ONLY when the product hook's OWN evidence proves the
+# rule fired on the task's OWN subtree (every offending file is inside the task's
+# existing contract). Every other path still fails closed.
+#
+# `_COMMIT_HYGIENE_HOOK_RULE_GRANTS` maps a hook-rule FAMILY (matched as the
+# `local/<rule>` prefix in the persisted hook stderr) to the shared-config files
+# recovery MAY grant. Concrete filenames only — NO globs: capture-time
+# `_validate_patch_operation` matches `match_kind="file"` rules by EXACT path, so
+# a glob rule would not authorize the touch at capture. This is a module constant
+# (the trigger is product-specific — a VS Code fork's `eslint.config.js`) that
+# could later be sourced from execution-policy / a per-product setting.
+_COMMIT_HYGIENE_HOOK_RULE_GRANTS: dict[str, tuple[str, ...]] = {
+    # The VS Code lint family `local/*` (code-import-patterns, etc.) is fixed by
+    # a carve-out in the shared eslint flat config.
+    "local": ("eslint.config.js",),
+}
+
+# Hard bound: recovery may NEVER grant a config file outside this allow-list,
+# regardless of what `_COMMIT_HYGIENE_HOOK_RULE_GRANTS` maps. Every granted file
+# must (a) be in this set, (b) already exist in the repo, (c) not already be
+# permitted by the task's contract. Never create/delete; `modify`-only.
+_COMMIT_HYGIENE_SHARED_CONFIG_ALLOWLIST: frozenset[str] = frozenset(
+    {"eslint.config.js", "tsconfig.json", "package.json"}
+)
+
+# Stable hook-stderr line form the parse helper recognizes:
+#   `<abs-path>: line L, col C, Warning - <msg> (local/<rule>)`
+# Captures the offending absolute path and the `local/<rule>` rule id.
+_COMMIT_HYGIENE_HOOK_LINE_RE = re.compile(
+    r"^(?P<path>\S.*?):\s*line\s+\d+,\s*col\s+\d+,\s*\w+\s*-\s*.*?\((?P<rule>local/[^)]+)\)\s*$"
+)
+
+
+def _parse_commit_hygiene_hook_offenders(
+    hook_detail: str,
+) -> tuple[list[str], list[str]]:
+    """Parse a failed lane's persisted hook stderr into (abs_paths, rule_ids).
+
+    Recognizes lines of the stable form
+    ``<abs-path>: line L, col C, Warning - <msg> (local/<rule>)`` (the bounded
+    pre-commit/husky stderr ``commit_and_prove_clean`` folds into the failure
+    detail). Returns the de-duplicated list of offending ABSOLUTE paths and the
+    de-duplicated list of ``local/<rule>`` rule ids. Order-preserving. Any line
+    that does not match is ignored — a non-actionable / unparseable detail
+    yields empty lists, so the caller never widens on absent evidence.
+    """
+
+    paths: list[str] = []
+    rules: list[str] = []
+    for raw_line in (hook_detail or "").splitlines():
+        match = _COMMIT_HYGIENE_HOOK_LINE_RE.match(raw_line.strip())
+        if match is None:
+            continue
+        offending = match.group("path").strip()
+        rule_id = match.group("rule").strip()
+        if offending and offending not in paths:
+            paths.append(offending)
+        if rule_id and rule_id not in rules:
+            rules.append(rule_id)
+    return paths, rules
+
+
+def _commit_hygiene_rule_grant_config_paths(rule_ids: Sequence[str]) -> list[str]:
+    """Config files the rule ids may grant, intersected with the allow-list.
+
+    A rule id is ``local/<rule>``; its FAMILY is the prefix before the first
+    ``/`` (``local``). Returns the de-duplicated, allow-listed config basenames
+    mapped from every present rule family. Never returns a path outside
+    :data:`_COMMIT_HYGIENE_SHARED_CONFIG_ALLOWLIST` (the hard bound).
+    """
+
+    granted: list[str] = []
+    for rule_id in rule_ids:
+        family = str(rule_id or "").split("/", 1)[0].strip()
+        for config_path in _COMMIT_HYGIENE_HOOK_RULE_GRANTS.get(family, ()):
+            if (
+                config_path in _COMMIT_HYGIENE_SHARED_CONFIG_ALLOWLIST
+                and config_path not in granted
+            ):
+                granted.append(config_path)
+    return granted
+
+
+def _commit_hygiene_widening_grant(
+    *,
+    contract: Any,
+    hook_detail: str,
+    repo_root: Path | None,
+) -> list[str]:
+    """Decide the config files a commit-hygiene rerun MAY widen to (evidence-gated).
+
+    Returns the de-duplicated, allow-listed, repo-existing config files (e.g.
+    ``["eslint.config.js"]``) the re-dispatch contract may grant ``modify``-only,
+    or an EMPTY list (no widening) when ANY gate is not met:
+
+    * the hook stderr names NO ``local/*`` rule, OR
+    * the parsed rule ids map to NO allow-listed config file, OR
+    * ANY offending file (normalized abs→repo-relative) is OUTSIDE the task's
+      existing contract ``allowed_paths`` — a genuine out-of-scope violation, OR
+    * no granted config file actually exists in the repo.
+
+    Triggering is purely by the product hook's OWN evidence on the task's OWN
+    subtree; the widened set is bounded by the static allow-list — never a path
+    trusted out of the message. Pure / fail-safe: any exception yields [].
+    """
+
+    if contract is None or repo_root is None or _path_matches_any is None:
+        return []
+    abs_paths, rule_ids = _parse_commit_hygiene_hook_offenders(hook_detail)
+    if not rule_ids or not abs_paths:
+        return []
+    grant_candidates = _commit_hygiene_rule_grant_config_paths(rule_ids)
+    if not grant_candidates:
+        return []
+    allowed_rules = list(getattr(contract, "allowed_paths", None) or [])
+    if not allowed_rules:
+        return []
+    repo_resolved = repo_root.resolve(strict=False)
+    for offending in abs_paths:
+        rel = _commit_hygiene_offender_repo_relative(offending, repo_resolved)
+        if rel is None:
+            # Could not normalize to repo-relative (outside the repo / parse
+            # failure) → cannot prove it is the task's own subtree → fail closed.
+            return []
+        if not _path_matches_any(
+            rel, allowed_rules, case_sensitivity="case_sensitive"
+        ):
+            # An offending file outside the task's contract is a genuine
+            # violation — do NOT widen.
+            return []
+    # Every offending file is inside the contract: grant the allow-listed config
+    # file(s) that actually exist in the repo.
+    granted: list[str] = []
+    for config_path in grant_candidates:
+        candidate = repo_root / config_path
+        try:
+            exists = candidate.is_file()
+        except OSError:
+            exists = False
+        if exists and config_path not in granted:
+            granted.append(config_path)
+    return granted
+
+
+def _commit_hygiene_offender_repo_relative(
+    offending: str,
+    repo_resolved: Path,
+) -> str | None:
+    """Normalize a hook-stderr offending path to a repo-relative POSIX path.
+
+    Mirrors the abs→repo-relative stripping pattern at
+    ``_contract_snapshot_path_list`` (relative_to(repo_resolved)). Returns the
+    repo-relative POSIX path, or ``None`` when the path is outside the repo or
+    cannot be normalized (so the caller fails closed). A relative offending path
+    is normalized as-is (the hook usually emits absolute paths, but tolerate
+    both).
+    """
+
+    text = str(offending or "").strip().replace("\\", "/")
+    if not text:
+        return None
+    if text.startswith("/") or re.match(r"^[A-Za-z]:[/\\]", text):
+        try:
+            text = (
+                Path(text)
+                .resolve(strict=False)
+                .relative_to(repo_resolved)
+                .as_posix()
+            )
+        except (OSError, ValueError):
+            return None
+    parts = [part for part in text.strip("/").split("/") if part not in {"", "."}]
+    if not parts or any(part == ".." for part in parts):
+        return None
+    return "/".join(parts)
 
 
 def _commit_hygiene_recovery_plan(
@@ -20462,6 +20805,10 @@ async def _implement_dag(
         )
         commit_hygiene_feedback_by_task: dict[str, str] = {}
         commit_hygiene_retry_source_by_task: dict[str, int] = {}
+        # Config files an evidence-gated write-set widening granted a re-dispatch
+        # (modify-only). Threaded into the recovery feedback so the agent knows
+        # it MAY edit them to add the carve-out for its own subtree.
+        commit_hygiene_widened_paths_by_task: dict[str, list[str]] = {}
 
         for tid in group:
             recovery_lane = commit_hygiene_recovery.get(tid)
@@ -20543,8 +20890,95 @@ async def _implement_dag(
                     # durable evidence above — a confirmed hygiene re-failure
                     # adds a failed retry lane, and a runtime-blocked re-run
                     # increments the block counter AFTER the dispatch returns.
+
+                    # ── Evidence-gated write-set widening ────────────────────
+                    # When the failed lane's hook stderr proves the hygiene rule
+                    # (`local/*`) fired on the task's OWN subtree (every offending
+                    # file is inside its existing contract), narrowly grant the
+                    # task a `modify`-only rule on the shared-config file(s) the
+                    # rule family permits (allow-list-bounded; must pre-exist).
+                    # The augmented contract is persisted as a NEW active row that
+                    # supersedes the narrow original, and `contracts_by_task_id`
+                    # is repointed so BOTH the re-dispatch sandbox patch-capture
+                    # verdict and the retry-lane contract_id validate against the
+                    # widened write-set. Fail SAFE: any parse/persist/registry
+                    # error catches, logs, and proceeds with the ORIGINAL contract
+                    # — the widening attempt never blocks the rerun.
+                    widened_paths: list[str] = []
+                    try:
+                        original_contract = contracts_by_task_id.get(tid)
+                        widening_repo_root: Path | None = None
+                        if original_contract is not None and feature_root is not None:
+                            contract_repo_id = _contract_repo_id(original_contract)
+                            widening_repo = _registry_repo_for_selection(
+                                authority_guard.registry,
+                                task_id=tid,
+                                repo_id=contract_repo_id,
+                                repo_path=_contract_repo_path(original_contract),
+                                feature_root=feature_root,
+                            )
+                            widening_repo_root = _registry_repo_canonical_path(
+                                widening_repo,
+                                feature_root=feature_root,
+                                repo_path=_contract_repo_path(original_contract),
+                            )
+                        granted_config_paths = _commit_hygiene_widening_grant(
+                            contract=original_contract,
+                            hook_detail=recovery_lane.hook_detail,
+                            repo_root=widening_repo_root,
+                        )
+                        if granted_config_paths:
+                            augmented_contract = _commit_hygiene_augmented_contract(
+                                contract=original_contract,
+                                granted_config_paths=granted_config_paths,
+                            )
+                            if augmented_contract is not None:
+                                persisted = await _persist_task_contracts(
+                                    runner, feature, [augmented_contract]
+                                )
+                                stored = persisted.get(tid, augmented_contract)
+                                contracts_by_task_id[tid] = stored
+                                widened_paths = list(granted_config_paths)
+                                commit_hygiene_widened_paths_by_task[tid] = (
+                                    widened_paths
+                                )
+                                await _log_feature_event(
+                                    runner,
+                                    feature.id,
+                                    "dag_commit_hygiene_recovery_widened",
+                                    "implementation",
+                                    content=tid,
+                                    metadata={
+                                        "group_idx": group_idx,
+                                        "task_id": tid,
+                                        "merge_queue_item_id": recovery_lane.lane_id,
+                                        "granted_paths": widened_paths,
+                                        "augmented_contract_id": _task_contract_id(
+                                            stored
+                                        ),
+                                    },
+                                )
+                                logger.warning(
+                                    "Task %s commit_hygiene recovery: evidence-gated "
+                                    "write-set widening granted modify on %s; "
+                                    "re-dispatching against the augmented contract",
+                                    tid,
+                                    widened_paths,
+                                )
+                    except Exception:  # noqa: BLE001 - fail safe to original contract.
+                        logger.warning(
+                            "Task %s commit_hygiene write-set widening attempt "
+                            "failed; proceeding with the original contract",
+                            tid,
+                            exc_info=True,
+                        )
+                        widened_paths = []
+                        commit_hygiene_widened_paths_by_task.pop(tid, None)
+
                     commit_hygiene_feedback_by_task[tid] = (
-                        _commit_hygiene_recovery_feedback(recovery_lane)
+                        _commit_hygiene_recovery_feedback(
+                            recovery_lane, widened_config_paths=widened_paths
+                        )
                     )
                     commit_hygiene_retry_source_by_task[tid] = (
                         recovery_lane.lane_id
