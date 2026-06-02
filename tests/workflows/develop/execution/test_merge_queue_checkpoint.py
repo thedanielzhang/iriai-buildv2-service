@@ -1657,6 +1657,57 @@ async def test_resume_recovery_redrives_a_drained_uncheckpointed_group(
 
 
 @pytest.mark.asyncio
+async def test_resume_recovery_refuses_to_over_seal_an_incomplete_group(
+    mq_conn, tmp_path: Path
+) -> None:
+    """Resume recovery must NOT checkpoint a group with a non-`completed` task.
+
+    Regression for the group-79 over-seal: when one task's `dag-task:*` marker is
+    `partial` (its deliverable was never validated + committed), deriving the
+    checkpoint coverage from the `completed`-only markers silently dropped it and
+    sealed a 3-of-4 group. The resume freshness gate then correctly rejected that
+    seal on every resume, and the group could never re-seal (its `done` lanes
+    refuse re-enqueue) — a permanent hard block. The re-drive now fails closed.
+    """
+    feature_id = "feat-ckpt-resume-incomplete"
+    await _insert_feature(mq_conn, feature_id)
+    base, _repo, _base_commit = _build_feature_workspace(tmp_path, feature_id)
+    runner = _workspace_runner(mq_conn, base)
+    feature = _feature(feature_id)
+
+    # TASK-1 completed (a real queue deliverable); TASK-2 only `partial` (no
+    # committed lane) — the group is 1-of-2 and must NOT be sealed.
+    await runner.artifacts.put(
+        "dag-task:TASK-1",
+        impl.ImplementationResult(
+            task_id="TASK-1", summary="implemented task one", status="completed",
+            notes="canonical_mutation=pending_durable_merge_queue",
+        ).model_dump_json(),
+        feature=feature,
+    )
+    await runner.artifacts.put(
+        "dag-task:TASK-2",
+        impl.ImplementationResult(
+            task_id="TASK-2", summary="partial — contract not validated",
+            status="partial",
+        ).model_dump_json(),
+        feature=feature,
+    )
+
+    recovery = await impl._resume_recover_durable_merge_queue_group(
+        runner, feature, dag_sha256=_DAG, group_idx=_GROUP,
+        group_task_ids=["TASK-1", "TASK-2"],
+    )
+
+    assert recovery.recovered is False
+    assert "TASK-2" in recovery.detail
+    assert "incomplete group" in recovery.detail
+    # No `dag-group:*` checkpoint was written — the group was NOT over-sealed.
+    assert await _dag_group_projection(mq_conn, feature_id, _GROUP) is None
+    assert await runner.artifacts.get(f"dag-group:{_GROUP}", feature=feature) is None
+
+
+@pytest.mark.asyncio
 async def test_resume_recovery_is_idempotent_on_an_already_checkpointed_group(
     mq_conn, tmp_path: Path
 ) -> None:

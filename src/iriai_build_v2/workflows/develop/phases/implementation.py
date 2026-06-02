@@ -7723,19 +7723,44 @@ async def _resume_recover_durable_merge_queue_group(
     # note are queue lanes (and they are exactly the tasks the 08e-2 enqueue
     # produced a `task:{id}` lane + a pending marker for).
     task_results: list[ImplementationResult] = []
+    incomplete_task_ids: list[str] = []
     for tid in group_task_ids:
         marker = await runner.artifacts.get(f"dag-task:{tid}", feature=feature)
         if not marker:
+            incomplete_task_ids.append(str(tid))
             continue
         try:
             result = ImplementationResult.model_validate_json(marker)
         except Exception:
+            incomplete_task_ids.append(str(tid))
             continue
-        if (
-            result.status == "completed"
-            and _result_requires_durable_merge_queue(result)
-        ):
+        if result.status != "completed":
+            # A `partial`/`blocked` task was dispatched but its deliverable was
+            # never validated + committed (e.g. the patch failed contract
+            # validation or the commit-hygiene hook). It has no `done` lane.
+            incomplete_task_ids.append(str(tid))
+            continue
+        if _result_requires_durable_merge_queue(result):
             task_results.append(result)
+    # Fail closed: NEVER checkpoint a group unless EVERY DAG task carries a
+    # `completed` (committed) lane. Deriving `expected_task_ids` from the
+    # `completed`-only markers and sealing on those alone over-seals a partially
+    # integrated group — e.g. a 3-of-4 `dag-group:*` body when one task is
+    # `partial`. That over-broad checkpoint is then CORRECTLY rejected by the
+    # resume freshness gate on every later resume (its done-lane coverage check
+    # finds the missing task), and the group can never re-seal because its
+    # already-`done` lanes refuse re-enqueue — a permanent hard block. Blocking
+    # here instead lets the incomplete task re-run and land its commit.
+    if incomplete_task_ids:
+        return _MergeQueueResumeRecovery(
+            recovered=False,
+            detail=(
+                f"durable merge queue resume for group {group_idx} refused to "
+                "checkpoint an incomplete group: task(s) "
+                f"{', '.join(incomplete_task_ids)} lack a completed+committed "
+                "lane (dag-task marker missing or status != 'completed')"
+            ),
+        )
     expected_task_ids = [r.task_id for r in task_results if r.task_id]
     if not expected_task_ids:
         # No reconstructable queue lanes — let the caller block as before.
