@@ -23789,14 +23789,6 @@ async def _dag_group_checkpoint_is_fresh(
         feature_root,
         group_idx=group_idx,
     )
-    if not _feature_repos_clean_for_checkpoint_resume(
-        runner,
-        feature,
-        feature_root=feature_root,
-        authorized_repos=authorized_repos,
-        authorized_source_roots=authorized_sources,
-    ):
-        return False
     current_heads = _current_feature_repo_heads(
         runner,
         feature,
@@ -23837,6 +23829,22 @@ async def _dag_group_checkpoint_is_fresh(
             accepted_dag_sha256s=accepted_dag_sha256s,
         ):
             return True
+        return False
+    # Legacy commit-proof path: a group sealed via the legacy
+    # `dag-group-commit-proof:*` / `dag-checkpoint-gate-proof:*` artifacts proves
+    # freshness by an EXACT head + no-dirty match, so it still requires the
+    # authorized repos to be clean at resume. The queue-only path above
+    # intentionally skips this check: its proof is the typed `done`-lane commits
+    # remaining REACHABLE from current heads, which already confirms the seal is
+    # intact — so a LATER group's in-progress dirt on a repo this sealed group
+    # also owns must NOT re-stale it (the fix #10 scope gap).
+    if not _feature_repos_clean_for_checkpoint_resume(
+        runner,
+        feature,
+        feature_root=feature_root,
+        authorized_repos=authorized_repos,
+        authorized_source_roots=authorized_sources,
+    ):
         return False
     proof = _json_object_from_text(proof_raw)
     if str(proof.get("artifact_schema") or "") != "dag-group-commit-proof-v1":
