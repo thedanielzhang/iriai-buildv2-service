@@ -20343,7 +20343,15 @@ async def _implement_dag(
 
         for tid in group:
             recovery_lane = commit_hygiene_recovery.get(tid)
-            if recovery_lane is not None:
+            # A task whose lane already `integrated` (via some retry) must NOT be
+            # re-dispatched even though older FAILED lanes for it still exist:
+            # the recovery would source the retry from its newest FAILED lane,
+            # but that lane already has the integrated replacement, so
+            # `_validate_retry_source` would refuse the enqueue and roll back the
+            # WHOLE batch — taking a healthy sibling's good patch down with it.
+            # Skip recovery and let the integrated-lane stale-marker branch below
+            # record it as the completed success it is.
+            if recovery_lane is not None and tid not in integrated_lane_task_ids:
                 # Budget = confirmed hygiene re-failures (failed retry lanes)
                 # + re-runs that terminated in a runtime block (overflow) and so
                 # never produced a retry lane to count. Both are real, dispatched

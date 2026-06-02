@@ -42,6 +42,7 @@ from iriai_build_v2.workflows.develop.phases.implementation import (
     _commit_hygiene_retry_refailure_counts_for_group,
     _commit_hygiene_rerun_block_marker_key,
     _integrate_nonblocked_successes_before_block,
+    _integrated_lane_task_ids_for_group,
 )
 
 
@@ -323,6 +324,33 @@ async def test_recovery_newest_selection_is_order_independent():
             _runner_with_store(), _feature(), dag_sha256="dag-sha", group_idx=78,
         )
         assert recovery["t"].lane_id == 9
+
+
+@pytest.mark.asyncio
+async def test_integrated_task_with_stale_failed_lanes_is_skipped_by_seam():
+    # slice-2-002 shape after self-heal: failed lanes 7 + 10 AND integrated lane
+    # 12. The recovery-lanes helper still returns it (it has failed lanes) AND
+    # the integrated-lanes helper returns it. The seam combines them
+    # (`recovery_lane is not None and tid not in integrated`) to SKIP recovery —
+    # never re-dispatching an already-integrated task, which would source the
+    # retry from lane 10 (now replaced by 12), get refused by
+    # `_validate_retry_source`, and roll back the whole enqueue batch.
+    _FakeQueueStore.items = [
+        _FakeItem("failed", ["slice-2-002"], id=7,
+                  last_error="commit_hygiene: commit hook failed (exit 1)"),
+        _FakeItem("failed", ["slice-2-002"], id=10, last_error=_HYG,
+                  retry_of_queue_item_id=7),
+        _FakeItem("integrated", ["slice-2-002"], id=12,
+                  retry_of_queue_item_id=10),
+    ]
+    recovery = await _commit_hygiene_recovery_lanes_for_group(
+        _runner_with_store(), _feature(), dag_sha256="dag-sha", group_idx=78,
+    )
+    integrated = await _integrated_lane_task_ids_for_group(
+        _runner_with_store(), _feature(), dag_sha256="dag-sha", group_idx=78,
+    )
+    assert "slice-2-002" in recovery     # has failed lanes -> recovery candidate
+    assert "slice-2-002" in integrated   # but already integrated -> seam skips it
 
 
 @pytest.mark.asyncio
