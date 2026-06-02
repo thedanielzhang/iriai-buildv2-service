@@ -3493,6 +3493,33 @@ async def test_external_git_worktree_metadata_requires_matching_source_authority
     assert "README.md" in status
 
 
+def test_direct_source_push_repos_ignores_iriai_test_tmp_scratch(tmp_path):
+    """A `.iriai-test-tmp/` scratch repo must not trip the workspace-authority
+    guard.
+
+    A concurrent test run (pytest basetemp rooted under a real feature root)
+    transiently leaves unregistered git repos under `.iriai-test-tmp/`. The
+    discovery must IGNORE them — otherwise `_feature_repos_clean_for_checkpoint_
+    resume` reports a discovery failure, the resume freshness gate fails, and a
+    validly-sealed group is judged "stale" and re-run forever (its `done`-
+    replaced lanes can no longer re-enqueue). Observed on feature 8ac124d6
+    group 78. Test scratch is never a canonical-mutation target, so ignoring it
+    does not weaken the guard's protection of authorized canonical repos.
+    """
+    repos_root = tmp_path / "feature-root"
+    app = repos_root / "app"
+    _init_git_repo(app)
+    # Transient scratch repo a concurrent backend pytest run left behind.
+    scratch = repos_root / ".iriai-test-tmp" / "backend-pytest" / "sources" / "A"
+    _init_git_repo(scratch)
+
+    repo_dirs, failures = implementation_module._direct_source_push_repos(
+        repos_root, authorized_repos={"app"},
+    )
+    assert failures == []
+    assert repo_dirs == [app]
+
+
 @pytest.mark.asyncio
 async def test_external_git_worktree_metadata_is_scoped_to_repo_rel(tmp_path):
     app_source = tmp_path / "source" / "app"

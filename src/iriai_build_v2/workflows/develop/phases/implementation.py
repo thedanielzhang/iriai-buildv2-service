@@ -15063,6 +15063,16 @@ def _direct_source_push_repos(
             rel_git = git_dir.relative_to(repos_root).as_posix()
         except ValueError:
             rel_git = str(git_dir)
+        # `.iriai-test-tmp/` is a test-scratch directory (e.g. a pytest basetemp
+        # rooted under a real feature root). Transient unregistered git repos a
+        # concurrent test run leaves there are NOT feature workspace repos and
+        # must never trip the workspace-authority guard — otherwise they make
+        # `_feature_repos_clean_for_checkpoint_resume` fail and a validly-sealed
+        # group is judged "stale" and re-run forever on resume. Test scratch is
+        # never a canonical-mutation target, so skipping it does not weaken the
+        # guard's protection of authorized canonical repos.
+        if ".iriai-test-tmp" in Path(rel_git).parts:
+            continue
         if git_dir.is_symlink():
             failures.append(f"{rel_git}: .git must not be a symlink for source push")
             continue
