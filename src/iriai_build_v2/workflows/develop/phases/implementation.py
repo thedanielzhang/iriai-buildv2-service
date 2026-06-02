@@ -5861,6 +5861,120 @@ async def _enqueue_durable_merge_queue_for_results(
     return enqueued_ids
 
 
+async def _integrate_nonblocked_successes_before_block(
+    runner: WorkflowRunner,
+    feature: Feature,
+    results: list[Any],
+    *,
+    dag_sha256: str,
+    group_idx: int,
+    contracts_by_task_id: dict[str, Any] | None,
+    feature_root: Path | None,
+    retry_source_by_task: dict[str, int] | None,
+) -> list[int]:
+    """Sibling isolation: integrate a group's good lanes before bailing blocked.
+
+    The group dispatch returns ``workflow_blocked`` as soon as ANY task comes
+    back ``blocked``. Without this, a sibling that produced a clean,
+    enqueueable success is discarded along with the blocked task — its patch is
+    never enqueued, so it can never integrate while the blocked sibling keeps
+    re-running (observed: a commit_hygiene re-run that SUCCEEDED was thrown away
+    because a different task in the group overflowed first).
+
+    This enqueues + drains ONLY the non-blocked successes (a ``blocked`` result
+    never satisfies ``_result_requires_durable_merge_queue``) so they reach
+    ``integrated`` NOW. On the next resume the already-integrated lane is
+    treated as a completed success by the integrated-lane stale-marker branch,
+    letting the blocked sibling retry independently. It does NOT checkpoint —
+    the group is incomplete — and is best-effort: any enqueue/drain error is
+    logged and swallowed so the caller still surfaces the blocked terminal and
+    the (idempotent) enqueue + drain is re-driven on the next resume.
+    """
+
+    pending = [
+        r
+        for r in results
+        if isinstance(r, ImplementationResult)
+        and _result_requires_durable_merge_queue(r)
+    ]
+    if not pending:
+        return []
+    try:
+        enqueued_item_ids = await _enqueue_durable_merge_queue_for_results(
+            runner,
+            feature,
+            pending,
+            dag_sha256=dag_sha256,
+            group_idx=group_idx,
+            contracts_by_task_id=contracts_by_task_id,
+            feature_root=feature_root,
+            stage="implementation",
+            retry_source_by_task=retry_source_by_task,
+        )
+    except _MergeQueueEnqueueError as exc:
+        logger.warning(
+            "Sibling-isolation enqueue failed for group %d (will retry on "
+            "resume): %s",
+            group_idx,
+            exc,
+        )
+        return []
+    # Persist per-task pending markers so the resume recognizes the lane (the
+    # integrated-lane branch keys on this marker + an `integrated` lane status).
+    for result in pending:
+        if result.task_id:
+            await runner.artifacts.put(
+                _pending_merge_queue_marker_key(result.task_id),
+                str(result.notes),
+                feature=feature,
+            )
+    try:
+        drain_results = await _drain_durable_merge_queue_for_feature(
+            runner,
+            feature,
+            dag_sha256=dag_sha256,
+            stage="implementation",
+        )
+    except _MergeQueueEnqueueError as exc:
+        logger.warning(
+            "Sibling-isolation drain failed for group %d (will retry on "
+            "resume): %s",
+            group_idx,
+            exc,
+        )
+        return enqueued_item_ids
+    integrated = sum(1 for r in drain_results if r.succeeded)
+    refailed = [r for r in drain_results if not r.succeeded]
+    await _log_feature_event(
+        runner,
+        feature.id,
+        "dag_sibling_isolation_integrated",
+        "implementation",
+        content=f"g{group_idx}:implementation",
+        metadata={
+            "group_idx": group_idx,
+            "stage": "implementation",
+            "task_ids": [r.task_id for r in pending if r.task_id],
+            "enqueued_merge_queue_item_ids": enqueued_item_ids,
+            "integrated_lane_count": integrated,
+            "refailed_lane_detail": [
+                f"item {r.item_id} ({r.terminal_status}): "
+                f"{r.failure_class or 'failed'}"
+                for r in refailed[:10]
+            ],
+        },
+    )
+    logger.info(
+        "Sibling isolation: group %d integrated %d non-blocked lane(s) before "
+        "the blocked terminal; %d re-failed at the drain (kept failed for the "
+        "next recovery pass)",
+        group_idx,
+        integrated,
+        len(refailed),
+    )
+    return enqueued_item_ids
+
+
 @dataclass
 class _CommitHygieneRecoveryLane:
     """A group's failed merge-queue lane recoverable via agent re-dispatch.
@@ -5971,6 +6085,88 @@ async def _commit_hygiene_recovery_lanes_for_group(
             hook_detail=detail,
         )
     return recovery
+
+
+def _commit_hygiene_rerun_block_marker_key(task_id: str) -> str:
+    """Durable counter of recovery re-runs that terminated in a runtime block.
+
+    A commit_hygiene recovery re-run that never reaches the drain (e.g. the
+    agent overflows the model context window — ``structured_output is None`` /
+    ``Prompt is too long``) leaves NO failed retry-lane, so the lane-derived
+    genuine-refailure count (:func:`_commit_hygiene_retry_refailure_counts_for_group`)
+    cannot see it. This separate, durably-persisted counter bounds those
+    runtime-blocked re-runs so a re-run that cannot even produce a patch
+    escalates to a clean terminal instead of being retried by every resume
+    forever. It is incremented ONLY after a dispatched re-run returns a blocked
+    result — never at the rerun DECISION, never on a sibling's block.
+    """
+
+    return f"dag-commit-hygiene-rerun-block:{task_id}"
+
+
+async def _commit_hygiene_retry_refailure_counts_for_group(
+    runner: WorkflowRunner,
+    feature: Feature,
+    *,
+    dag_sha256: str,
+    group_idx: int,
+) -> dict[str, int]:
+    """Map ``task_id -> count of FAILED commit_hygiene retry lanes`` for a group.
+
+    A genuine hygiene re-failure is a recovery RETRY lane (``retry_of_queue_
+    item_id`` set, ``source == "commit_hygiene_recovery"``) that the durable
+    drain re-ran the product pre-commit hook against and re-rejected. Counting
+    those — rather than incrementing a budget at the rerun DECISION — is the
+    accurate per-task hygiene-refailure count: a resume that is blocked
+    downstream, or a re-run that fails on a runtime overflow before it can
+    enqueue a retry lane, contributes ZERO here (no failed retry lane exists),
+    so it never burns the bounded budget for a failure that was not a real
+    hygiene non-convergence.
+
+    Fails closed (empty map) on any missing module / store / DB error.
+    """
+
+    if MergeQueueStore is None:
+        return {}
+    store = _execution_control_store_for_runner(runner)
+    if store is None:
+        return {}
+    feature_id = str(getattr(feature, "id", "") or "")
+    if not feature_id or not str(dag_sha256 or ""):
+        return {}
+    try:
+        async with _merge_queue_connection(store) as conn:
+            queue_store = MergeQueueStore(conn)
+            items = await queue_store.list_group_items(
+                feature_id, str(dag_sha256), group_idx
+            )
+    except Exception:  # pragma: no cover - fail closed on any store/DB error.
+        logger.debug(
+            "commit_hygiene retry-refailure probe failed for group %d",
+            group_idx,
+            exc_info=True,
+        )
+        return {}
+    counts: dict[str, int] = {}
+    for item in items or []:
+        if str(getattr(item, "status", "") or "") != "failed":
+            continue
+        payload = getattr(item, "payload", None) or {}
+        retry_of = getattr(item, "retry_of_queue_item_id", None)
+        if retry_of is None:
+            retry_of = payload.get("retry_of_queue_item_id")
+        if retry_of is None:
+            # Not a retry replacement — this is the ORIGINAL failed lane, which
+            # is the recovery SOURCE, not a re-failure of a recovered patch.
+            continue
+        failure_class, _detail = _parse_lane_failure(item)
+        if failure_class != "commit_hygiene":
+            continue
+        for c in getattr(item, "task_coverage", []) or []:
+            task_id = str(getattr(c, "task_id", "") or "")
+            if task_id:
+                counts[task_id] = counts.get(task_id, 0) + 1
+    return counts
 
 
 async def _integrated_lane_task_ids_for_group(
@@ -20076,22 +20272,44 @@ async def _implement_dag(
         integrated_lane_task_ids = await _integrated_lane_task_ids_for_group(
             runner, feature, dag_sha256=dag_sha256, group_idx=group_idx,
         )
+        # Genuine per-task hygiene-refailure count, derived from the durable
+        # queue (failed RETRY lanes), NOT a budget incremented at the rerun
+        # decision. The old decision-time counter over-counted: a resume that
+        # was blocked downstream (a sibling's terminal) AND a re-run that failed
+        # on a runtime overflow before it could enqueue a retry lane each burned
+        # a budget unit without a real hygiene non-convergence, so a task could
+        # false-escalate to a terminal `workflow_blocked` while its effective
+        # genuine-refailure count was still 0. The budget is now
+        # genuine-refailures + runtime-blocked re-runs (see below).
+        commit_hygiene_refailure_counts = (
+            await _commit_hygiene_retry_refailure_counts_for_group(
+                runner, feature, dag_sha256=dag_sha256, group_idx=group_idx,
+            )
+        )
         commit_hygiene_feedback_by_task: dict[str, str] = {}
         commit_hygiene_retry_source_by_task: dict[str, int] = {}
 
         for tid in group:
             recovery_lane = commit_hygiene_recovery.get(tid)
             if recovery_lane is not None:
-                rerun_marker_key = f"dag-commit-hygiene-rerun:{tid}"
-                prior_rerun_count = 0
+                # Budget = confirmed hygiene re-failures (failed retry lanes)
+                # + re-runs that terminated in a runtime block (overflow) and so
+                # never produced a retry lane to count. Both are real, dispatched
+                # failures; a mere decision or a sibling's block contributes 0.
+                refailure_count = int(
+                    commit_hygiene_refailure_counts.get(tid, 0)
+                )
+                block_count = 0
                 try:
-                    raw_count = await runner.artifacts.get(
-                        rerun_marker_key, feature=feature,
+                    raw_block = await runner.artifacts.get(
+                        _commit_hygiene_rerun_block_marker_key(tid),
+                        feature=feature,
                     )
-                    if raw_count:
-                        prior_rerun_count = int(str(raw_count).strip())
+                    if raw_block:
+                        block_count = int(str(raw_block).strip())
                 except Exception:
-                    prior_rerun_count = 0
+                    block_count = 0
+                prior_rerun_count = refailure_count + block_count
                 recovery_decision = _commit_hygiene_recovery_plan(
                     lane_status="failed",
                     failure_class=recovery_lane.failure_class,
@@ -20135,24 +20353,20 @@ async def _implement_dag(
                     )
                 if recovery_decision == "rerun":
                     # Do NOT short-circuit the `completed` marker — re-dispatch
-                    # the task with the concrete hook error as feedback, persist
-                    # the incremented rerun counter, and record the failed lane
-                    # as the retry source so the fresh capture is enqueued as a
-                    # `retry_of_queue_item_id` replacement.
+                    # the task with the concrete hook error as feedback and
+                    # record the failed lane as the retry source so the fresh
+                    # capture is enqueued as a `retry_of_queue_item_id`
+                    # replacement. The budget is NOT incremented here at the
+                    # decision (the over-count bug); it is derived from the
+                    # durable evidence above — a confirmed hygiene re-failure
+                    # adds a failed retry lane, and a runtime-blocked re-run
+                    # increments the block counter AFTER the dispatch returns.
                     commit_hygiene_feedback_by_task[tid] = (
                         _commit_hygiene_recovery_feedback(recovery_lane)
                     )
                     commit_hygiene_retry_source_by_task[tid] = (
                         recovery_lane.lane_id
                     )
-                    try:
-                        await runner.artifacts.put(
-                            rerun_marker_key,
-                            str(prior_rerun_count + 1),
-                            feature=feature,
-                        )
-                    except Exception:  # pragma: no cover - best effort.
-                        pass
                     await _log_feature_event(
                         runner,
                         feature.id,
@@ -20838,6 +21052,69 @@ async def _implement_dag(
 
             results = list(completed_results) + list(new_results)
             all_results.extend(new_results)  # Don't double-count resumed results
+            # Blocker #2 refinement: account a commit_hygiene recovery re-run
+            # that was actually dispatched and came back BLOCKED (e.g. a runtime
+            # context-window overflow that never reached the drain, so it left no
+            # failed retry lane to count). Incremented HERE — after the dispatch,
+            # only for the task that itself blocked — so a sibling's block never
+            # burns this task's budget and a mere decision never counts. This
+            # bounds an unfixable re-run to a clean escalation instead of letting
+            # every resume retry the same overflow forever.
+            for r in new_results:
+                if (
+                    isinstance(r, ImplementationResult)
+                    and r.status == "blocked"
+                    and r.task_id in commit_hygiene_feedback_by_task
+                ):
+                    block_key = _commit_hygiene_rerun_block_marker_key(r.task_id)
+                    prior_block = 0
+                    try:
+                        raw_prior = await runner.artifacts.get(
+                            block_key, feature=feature,
+                        )
+                        if raw_prior:
+                            prior_block = int(str(raw_prior).strip())
+                    except Exception:
+                        prior_block = 0
+                    try:
+                        await runner.artifacts.put(
+                            block_key, str(prior_block + 1), feature=feature,
+                        )
+                    except Exception:  # pragma: no cover - best effort.
+                        pass
+                    await _log_feature_event(
+                        runner,
+                        feature.id,
+                        "dag_commit_hygiene_recovery_rerun_blocked",
+                        "implementation",
+                        content=r.task_id,
+                        metadata={
+                            "group_idx": group_idx,
+                            "task_id": r.task_id,
+                            "prior_block_count": prior_block,
+                            "max_reruns": _COMMIT_HYGIENE_RERUN_MAX,
+                        },
+                    )
+            # Sibling isolation: integrate this group's non-blocked successes
+            # before bailing to the blocked terminal below, so a good sibling
+            # lands (reaches `integrated`) instead of being discarded with the
+            # blocked task — letting the blocked sibling retry independently.
+            if any(
+                isinstance(r, ImplementationResult) and r.status == "blocked"
+                for r in new_results
+            ):
+                await _integrate_nonblocked_successes_before_block(
+                    runner,
+                    feature,
+                    [*pending_merge_queue_resume_results, *new_results],
+                    dag_sha256=dag_sha256,
+                    group_idx=group_idx,
+                    contracts_by_task_id=contracts_by_task_id,
+                    feature_root=feature_root,
+                    retry_source_by_task=(
+                        commit_hygiene_retry_source_by_task or None
+                    ),
+                )
             sandbox_blocked = [
                 r
                 for r in new_results
