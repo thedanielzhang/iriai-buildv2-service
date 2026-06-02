@@ -6112,6 +6112,21 @@ def _commit_hygiene_rerun_block_marker_key(task_id: str) -> str:
     return f"dag-commit-hygiene-rerun-block:{task_id}"
 
 
+def _hook_detail_is_actionable(detail: str) -> bool:
+    """True when a failed-lane hook detail carries the concrete violation.
+
+    ``commit_and_prove_clean`` folds the bounded pre-commit hook stderr/stdout
+    into the failure detail under ``stderr:`` / ``stdout:`` headers (post-8e2e344
+    HEAD code). A stale, pre-fix lane records only ``commit hook failed
+    (exit N)`` with no hook output — non-actionable: the re-dispatched agent
+    cannot know what to fix. Used to decide whether a re-failure produced FROM
+    that detail counts against the bounded recovery budget.
+    """
+
+    text = (detail or "").lower()
+    return "stderr:" in text or "stdout:" in text
+
+
 async def _commit_hygiene_retry_refailure_counts_for_group(
     runner: WorkflowRunner,
     feature: Feature,
@@ -6123,13 +6138,23 @@ async def _commit_hygiene_retry_refailure_counts_for_group(
 
     A genuine hygiene re-failure is a recovery RETRY lane (``retry_of_queue_
     item_id`` set, ``source == "commit_hygiene_recovery"``) that the durable
-    drain re-ran the product pre-commit hook against and re-rejected. Counting
-    those — rather than incrementing a budget at the rerun DECISION — is the
-    accurate per-task hygiene-refailure count: a resume that is blocked
-    downstream, or a re-run that fails on a runtime overflow before it can
-    enqueue a retry lane, contributes ZERO here (no failed retry lane exists),
-    so it never burns the bounded budget for a failure that was not a real
-    hygiene non-convergence.
+    drain re-ran the product pre-commit hook against and re-rejected AND whose
+    re-dispatch had ACTIONABLE feedback (its retry-source lane carried the real
+    bounded hook stderr, not the stale pre-8e2e344 "commit hook failed (exit N)"
+    string). Counting those — rather than incrementing a budget at the rerun
+    DECISION — is the accurate per-task hygiene-refailure count:
+
+    - a resume blocked downstream, or a re-run that fails on a runtime overflow
+      before it can enqueue a retry lane, contributes ZERO (no failed retry lane
+      exists), so it never burns the bounded budget;
+    - a re-failure whose source lane carried only the stale non-actionable
+      detail was a DOOMED attempt — the agent never saw the concrete violation —
+      so it ALSO contributes ZERO, instead of false-escalating a task that is
+      actually converging once it finally gets the real hook output. (Observed:
+      slice-14's first retry lane was sourced from the stale lane 5; it fixed
+      nothing it could not see. Its later retry — sourced from a lane carrying
+      the real eslint output — fixed the unicode violations and left only one
+      import-layering error, i.e. genuine convergence.)
 
     Fails closed (empty map) on any missing module / store / DB error.
     """
@@ -6155,6 +6180,13 @@ async def _commit_hygiene_retry_refailure_counts_for_group(
             exc_info=True,
         )
         return {}
+    # Index lanes by id so a retry lane can consult its SOURCE lane's detail.
+    by_id: dict[int, Any] = {}
+    for item in items or []:
+        try:
+            by_id[int(getattr(item, "id", 0) or 0)] = item
+        except (TypeError, ValueError):
+            continue
     counts: dict[str, int] = {}
     for item in items or []:
         if str(getattr(item, "status", "") or "") != "failed":
@@ -6170,6 +6202,18 @@ async def _commit_hygiene_retry_refailure_counts_for_group(
         failure_class, _detail = _parse_lane_failure(item)
         if failure_class != "commit_hygiene":
             continue
+        # Only count a re-failure the agent produced WITH actionable feedback:
+        # the rerun is fed its retry-SOURCE lane's hook detail, so a re-failure
+        # whose source carried only the stale "commit hook failed (exit N)"
+        # string (no stderr) was a doomed attempt that must NOT burn the budget.
+        try:
+            source = by_id.get(int(retry_of))
+        except (TypeError, ValueError):
+            source = None
+        if source is not None:
+            _src_class, src_detail = _parse_lane_failure(source)
+            if not _hook_detail_is_actionable(src_detail):
+                continue
         for c in getattr(item, "task_coverage", []) or []:
             task_id = str(getattr(c, "task_id", "") or "")
             if task_id:

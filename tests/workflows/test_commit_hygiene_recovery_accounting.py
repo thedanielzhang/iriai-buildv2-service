@@ -237,6 +237,43 @@ async def test_refailure_counts_fail_closed():
     )
 
 
+@pytest.mark.asyncio
+async def test_refailure_on_stale_vague_source_does_not_count():
+    # slice-14 shape: lane 5 (stale, vague "exit 1") -> lane 9 (retry_of=5,
+    # actionable detail) -> lane 11 (retry_of=9, actionable). Lane 9's
+    # re-failure was produced on the VAGUE lane-5 feedback (the agent never saw
+    # the violation) so it must NOT count; lane 11's was produced on lane 9's
+    # ACTIONABLE feedback so it counts. Net = 1, so the task gets a convergence
+    # attempt instead of false-escalating at 2.
+    vague = "commit_hygiene: commit hook failed (exit 1)"
+    _FakeQueueStore.items = [
+        _FakeItem("failed", ["slice-14"], id=5, last_error=vague),
+        _FakeItem("failed", ["slice-14"], id=9, last_error=_HYG,
+                  retry_of_queue_item_id=5),
+        _FakeItem("failed", ["slice-14"], id=11, last_error=_HYG,
+                  retry_of_queue_item_id=9),
+    ]
+    counts = await _commit_hygiene_retry_refailure_counts_for_group(
+        _runner_with_store(), _feature(), dag_sha256="dag-sha", group_idx=78,
+    )
+    assert counts == {"slice-14": 1}
+
+
+@pytest.mark.asyncio
+async def test_refailure_on_actionable_source_counts():
+    # An original lane with actionable detail (HEAD code captures stderr) whose
+    # retry re-fails: the agent HAD the concrete error and still failed → counts.
+    _FakeQueueStore.items = [
+        _FakeItem("failed", ["t"], id=1, last_error=_HYG),
+        _FakeItem("failed", ["t"], id=2, last_error=_HYG,
+                  retry_of_queue_item_id=1),
+    ]
+    counts = await _commit_hygiene_retry_refailure_counts_for_group(
+        _runner_with_store(), _feature(), dag_sha256="dag-sha", group_idx=78,
+    )
+    assert counts == {"t": 1}
+
+
 # ── Recovery-lane selection: newest failed lane (source + actionable detail) ─
 
 
