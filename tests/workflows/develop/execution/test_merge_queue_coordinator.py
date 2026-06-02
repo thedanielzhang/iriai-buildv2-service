@@ -233,6 +233,46 @@ async def test_coverage_failed_lane_superseded_by_retry_is_approved(
 
 
 @pytest.mark.asyncio
+async def test_coverage_failed_chain_superseded_by_transitive_retry_is_approved(
+    mq_conn,
+) -> None:
+    # A commit_hygiene recovery can re-fail several times before its patch
+    # finally integrates: original FAILED -> retry-1 FAILED -> retry-2
+    # INTEGRATED. Every failed lane in that chain is transitively superseded by
+    # the integrated head, so coverage must APPROVE the group — checking only
+    # the DIRECT replacement (which is itself `failed`) would wrongly block the
+    # checkpoint forever even though the task is integrated. (Mirrors feature
+    # 8ac124d6 group 78 slice-14: lanes 5->9->11->13->14 all failed, 15
+    # integrated.)
+    await _insert_feature(mq_conn, "feat-c")
+    store = MergeQueueStore(mq_conn)
+    contract = await _insert_contract(mq_conn, "feat-c", "T1")
+    source = await _enqueue_lane(
+        mq_conn, store, "feat-c", task_id="T1", contract_id=contract,
+        lane="group", head="h1",
+    )
+    await _force_status(mq_conn, "feat-c", source, "failed")
+    # Each retry is enqueued while its source is `failed` with no live
+    # replacement (the retry-source rule), then itself forced terminal.
+    retry1 = await _enqueue_lane(
+        mq_conn, store, "feat-c", task_id="T1", contract_id=contract,
+        lane="group", head="h-r1", retry_of=source,
+    )
+    await _force_status(mq_conn, "feat-c", retry1, "failed")
+    retry2 = await _enqueue_lane(
+        mq_conn, store, "feat-c", task_id="T1", contract_id=contract,
+        lane="group", head="h-r2", retry_of=retry1,
+    )
+    await _force_status(mq_conn, "feat-c", retry2, "integrated")
+
+    cov = await _coordinator(store, ["T1"]).coverage("feat-c", _DAG, 1)
+    assert cov.approved is True
+    assert source in cov.failed_queue_item_ids
+    assert retry1 in cov.failed_queue_item_ids
+    assert cov.integrated_queue_item_ids == [retry2]
+
+
+@pytest.mark.asyncio
 async def test_coverage_blocked_by_an_unsuperseded_failed_lane(mq_conn) -> None:
     await _insert_feature(mq_conn, "feat-c")
     store = MergeQueueStore(mq_conn)

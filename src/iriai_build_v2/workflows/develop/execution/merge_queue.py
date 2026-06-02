@@ -946,15 +946,36 @@ class GroupMergeCoordinator:
                 replacements[item.retry_of_queue_item_id] = item
 
         def _superseded(failed_item: MergeQueueItem) -> bool:
+            # Follow the retry chain forward: a failed lane is superseded when
+            # the chain rooted at it eventually reaches a CANDIDATE
+            # (integrated/checkpointing/done) lane covering the same task set.
+            # The chain can be longer than one hop — a commit_hygiene recovery
+            # often re-fails several times before its patch finally integrates
+            # (e.g. 5 -> 9 -> 11 -> 13 -> 14 -> integrated 15), and each
+            # intermediate retry is itself a `failed` lane whose DIRECT
+            # replacement is also `failed`. Checking only the direct replacement
+            # would wrongly treat those resolved intermediates as unresolved
+            # blockers and refuse the group checkpoint even though every task is
+            # integrated. (The `uniq_merge_queue_retry_source_active` index
+            # guarantees at most one non-cancelled replacement per source, so the
+            # chain is linear; the `seen` guard is defensive against a cycle.)
+            failed_tasks = {c.task_id for c in failed_item.task_coverage}
+            seen: set[int] = {failed_item.id}
             replacement = replacements.get(failed_item.id)
-            if (
-                replacement is None
-                or replacement.status not in _CANDIDATE_STATUSES
-            ):
-                return False
-            return {c.task_id for c in replacement.task_coverage} == {
-                c.task_id for c in failed_item.task_coverage
-            }
+            while replacement is not None and replacement.id not in seen:
+                seen.add(replacement.id)
+                if {c.task_id for c in replacement.task_coverage} != failed_tasks:
+                    return False
+                if replacement.status in _CANDIDATE_STATUSES:
+                    return True
+                if replacement.status != "failed":
+                    # A non-candidate, non-failed replacement (cancelled lanes
+                    # are already excluded from `replacements`; an in-flight
+                    # `queued`/`leased` retry has not integrated yet) is not a
+                    # clean supersession — the group is not ready to checkpoint.
+                    return False
+                replacement = replacements.get(replacement.id)
+            return False
 
         candidate_by_task: dict[str, list[int]] = defaultdict(list)
         for item in items:
