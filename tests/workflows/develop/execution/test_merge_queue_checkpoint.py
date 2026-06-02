@@ -1030,6 +1030,69 @@ async def test_queue_checkpoint_freshness_accepts_head_advanced_past_seal(
 
 
 @pytest.mark.asyncio
+async def test_queue_checkpoint_freshness_ignores_extra_unregistered_repo(
+    mq_conn, tmp_path: Path
+) -> None:
+    """A sealed group stays fresh when an extra UNREGISTERED repo is present.
+
+    A group's authorized repo set is task-derived and narrow (only the repos its
+    tasks write to). Other repos legitimately present under the feature root —
+    planning reference repos, or a sibling feature repo this group never touched
+    — must NOT fail the resume freshness gate. Pre-fix, an extra repo made
+    `_current_feature_repo_heads` / `_feature_repos_clean_for_checkpoint_resume`
+    report a discovery failure (heads "" / not clean) → freshness False → the
+    validly-sealed group was re-run forever (feature 8ac124d6 group 78). The
+    seal-time no-dirty proof is already group-scoped, so scoping resume to the
+    group's authorized repos is safe.
+    """
+    feature_id = "feat-ckpt-extra-repo"
+    await _insert_feature(mq_conn, feature_id)
+    base, repo, base_commit = _build_feature_workspace(tmp_path, feature_id)
+    patch = _diff_for_appended_line(repo, "sealed group work\n")
+    await _enqueue_drainable_lane(
+        mq_conn, feature_id, task_id="TASK-1", repo_id="app",
+        repo_path=repo, base_commit=base_commit, patch_text=patch,
+    )
+    runner = _workspace_runner(mq_conn, base)
+    feature = _feature(feature_id)
+    drained = await impl._drain_durable_merge_queue_for_feature(
+        runner, feature, dag_sha256=_DAG
+    )
+    assert len(drained) == 1 and drained[0].integrated is True
+    task_results = [
+        impl.ImplementationResult(
+            task_id="TASK-1", summary="did the work", status="completed"
+        )
+    ]
+    result = await impl._checkpoint_durable_merge_queue_group(
+        runner, feature, dag_sha256=_DAG, group_idx=_GROUP,
+        expected_task_ids=["TASK-1"], task_results=task_results,
+    )
+    assert result.checkpointed is True
+    body = json.loads(await runner.artifacts.get("dag-group:1", feature=feature))
+
+    # An extra UNREGISTERED repo legitimately present under the feature root.
+    _init_repo(repo.parent / "iriai-studio-backend")
+
+    # The two resume-path helpers, scoped to the group's authorized repo, IGNORE
+    # the extra repo (pre-fix: a discovery failure → ""/False → stale).
+    heads = impl._current_feature_repo_heads(
+        runner, feature, authorized_repos={"app"},
+    )
+    assert heads.startswith("app:") and "iriai-studio-backend" not in heads
+    assert impl._feature_repos_clean_for_checkpoint_resume(
+        runner, feature, authorized_repos={"app"},
+    ) is True
+
+    # End-to-end: the sealed group is still fresh with the extra repo present.
+    fresh = await impl._dag_group_checkpoint_is_fresh(
+        runner, feature, group_idx=_GROUP, group_task_ids=["TASK-1"],
+        dag_sha256=_DAG, checkpoint=body,
+    )
+    assert fresh is True
+
+
+@pytest.mark.asyncio
 async def test_pre_p1_fix_empty_results_body_is_rejected_by_the_freshness_gate(
     mq_conn, tmp_path: Path
 ) -> None:

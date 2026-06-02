@@ -3520,6 +3520,46 @@ def test_direct_source_push_repos_ignores_iriai_test_tmp_scratch(tmp_path):
     assert repo_dirs == [app]
 
 
+def test_direct_source_push_ignore_unauthorized_skips_extra_repos(tmp_path):
+    """ignore_unauthorized=True scopes discovery to the group's authorized repos.
+
+    The resume freshness gate only cares whether THIS group's repos are clean.
+    Other repos legitimately present under the feature root — planning reference
+    repos, or a sibling feature repo (e.g. iriai-studio-backend) a frontend-only
+    group never touched — must be SKIPPED, not turned into discovery failures
+    that wrongly mark a validly-sealed group stale and re-run it forever.
+    """
+    repos_root = tmp_path / "repos"
+    app = repos_root / "app"
+    _init_git_repo(app)
+    _init_git_repo(repos_root / "iriai-studio-backend")
+    _init_git_repo(repos_root / "iriai-compose")
+
+    repo_dirs, failures = implementation_module._direct_source_push_repos(
+        repos_root, authorized_repos={"app"}, ignore_unauthorized=True,
+    )
+    assert failures == []
+    assert repo_dirs == [app]
+
+
+def test_direct_source_push_default_still_rejects_unregistered_repo(tmp_path):
+    """Default (ignore_unauthorized=False) keeps source-push/commit strictness:
+    an unregistered repo under the feature root is still a discovery failure.
+    """
+    repos_root = tmp_path / "repos"
+    app = repos_root / "app"
+    _init_git_repo(app)
+    _init_git_repo(repos_root / "iriai-compose")
+
+    repo_dirs, failures = implementation_module._direct_source_push_repos(
+        repos_root, authorized_repos={"app"},
+    )
+    assert app in repo_dirs
+    assert any(
+        "not registered in canonical workspace authority" in f for f in failures
+    )
+
+
 @pytest.mark.asyncio
 async def test_external_git_worktree_metadata_is_scoped_to_repo_rel(tmp_path):
     app_source = tmp_path / "source" / "app"

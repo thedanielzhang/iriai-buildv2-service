@@ -15039,6 +15039,7 @@ def _direct_source_push_repos(
     *,
     authorized_repos: set[str] | None = None,
     authorized_source_roots: dict[str, str] | None = None,
+    ignore_unauthorized: bool = False,
 ) -> tuple[list[Path], list[str]]:
     failures: list[str] = []
     repo_dirs: list[Path] = []
@@ -15087,6 +15088,21 @@ def _direct_source_push_repos(
             rel = repo_dir.relative_to(repos_root).as_posix()
         except ValueError:
             rel = str(repo_dir)
+        # Resume-freshness callers (ignore_unauthorized=True) scope validation to
+        # the GROUP's authorized repos. Reference/sibling repos legitimately
+        # present under the feature root — the other repos planning pulls in, or
+        # an `iriai-studio-backend` a frontend-only group never touches — are not
+        # this group's mutation targets, so an unregistered one is SKIPPED rather
+        # than turned into a discovery failure that wrongly marks a validly-sealed
+        # group "stale" and re-runs it forever. Authorized repos still fall
+        # through to the full symlink/worktree validation below; the strict
+        # source-push/commit callers leave ignore_unauthorized False.
+        if (
+            ignore_unauthorized
+            and authorized_repos is not None
+            and rel not in authorized_repos
+        ):
+            continue
         if authorized_repos is None and "/" in rel:
             failures.append(
                 f"{rel}/.git: nested or stray git repository is not authorized "
@@ -22772,6 +22788,10 @@ def _current_feature_repo_heads(
             feature_root,
             authorized_repos=authorized_repos,
             authorized_source_roots=authorized_source_roots,
+            # Resume-path read: only the group's authorized repos' HEADs matter;
+            # other repos legitimately present under the feature root must not
+            # zero out the heads (which would fail the freshness gate).
+            ignore_unauthorized=True,
         )
         if discovery_failures:
             return ""
@@ -22909,6 +22929,14 @@ def _feature_repos_clean_for_checkpoint_resume(
             feature_root,
             authorized_repos=authorized_repos,
             authorized_source_roots=authorized_source_roots,
+            # Resume-path cleanliness check: verify ONLY the group's authorized
+            # repos' working trees are clean. Other repos legitimately present
+            # under the feature root (planning reference repos, or a sibling
+            # feature repo this group never touched) are not this group's
+            # mutation targets and must not fail the checkpoint freshness gate —
+            # seal-time no-dirty proof is already group-scoped (see
+            # `_checkpoint_no_dirty_proof` call with group-scoped authorized_repos).
+            ignore_unauthorized=True,
         )
         if discovery_failures:
             return False
