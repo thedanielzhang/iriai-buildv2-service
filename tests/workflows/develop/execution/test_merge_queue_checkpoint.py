@@ -964,6 +964,72 @@ async def test_queue_checkpoint_freshness_ignores_dead_failed_retry_lanes(
 
 
 @pytest.mark.asyncio
+async def test_queue_checkpoint_freshness_accepts_head_advanced_past_seal(
+    mq_conn, tmp_path: Path
+) -> None:
+    """A sealed group stays fresh after a LATER group advances the repo head.
+
+    The strict equality head-match only holds the instant a group seals. Once a
+    later group commits on top, the repo head advances PAST the checkpoint's
+    commit, so the checkpoint commit becomes an ANCESTOR of the current head,
+    not equal — and a multi-task single-repo group records several per-task
+    commits behind the single head anyway. The freshness gate must accept the
+    seal by reachability; otherwise the first post-adoption multi-task group to
+    be re-validated on resume (8ac124d6 group 78) is judged "stale" and re-run
+    forever (its `done`-replaced lanes can no longer be re-enqueued).
+    """
+    feature_id = "feat-ckpt-head-advanced"
+    await _insert_feature(mq_conn, feature_id)
+    base, repo, base_commit = _build_feature_workspace(tmp_path, feature_id)
+    patch = _diff_for_appended_line(repo, "sealed group work\n")
+    await _enqueue_drainable_lane(
+        mq_conn, feature_id, task_id="TASK-1", repo_id="app",
+        repo_path=repo, base_commit=base_commit, patch_text=patch,
+    )
+    runner = _workspace_runner(mq_conn, base)
+    feature = _feature(feature_id)
+    drained = await impl._drain_durable_merge_queue_for_feature(
+        runner, feature, dag_sha256=_DAG
+    )
+    assert len(drained) == 1 and drained[0].integrated is True
+    task_results = [
+        impl.ImplementationResult(
+            task_id="TASK-1", summary="did the work", status="completed"
+        )
+    ]
+    result = await impl._checkpoint_durable_merge_queue_group(
+        runner, feature, dag_sha256=_DAG, group_idx=_GROUP,
+        expected_task_ids=["TASK-1"], task_results=task_results,
+    )
+    assert result.checkpointed is True
+    body = json.loads(await runner.artifacts.get("dag-group:1", feature=feature))
+
+    # Right after the seal: the repo head EQUALS the checkpoint commit.
+    heads0 = impl._current_feature_repo_heads(runner, feature)
+    assert await impl._dag_group_queue_checkpoint_is_fresh(
+        runner, feature, group_idx=_GROUP, group_task_ids=["TASK-1"],
+        dag_sha256=_DAG, commit_hash=str(body["commit_hash"]),
+        current_heads=heads0,
+    ) is True
+
+    # A LATER group commits on top — the repo head advances PAST the seal.
+    (repo / "later.txt").write_text("later group work\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "later group work")
+    heads1 = impl._current_feature_repo_heads(runner, feature)
+    assert heads1 != heads0  # the head moved forward
+
+    # THE regression: the seal is STILL fresh — its commit is now an ANCESTOR
+    # of the advanced head, accepted by reachability rather than equality.
+    queue_fresh = await impl._dag_group_queue_checkpoint_is_fresh(
+        runner, feature, group_idx=_GROUP, group_task_ids=["TASK-1"],
+        dag_sha256=_DAG, commit_hash=str(body["commit_hash"]),
+        current_heads=heads1,
+    )
+    assert queue_fresh is True
+
+
+@pytest.mark.asyncio
 async def test_pre_p1_fix_empty_results_body_is_rejected_by_the_freshness_gate(
     mq_conn, tmp_path: Path
 ) -> None:

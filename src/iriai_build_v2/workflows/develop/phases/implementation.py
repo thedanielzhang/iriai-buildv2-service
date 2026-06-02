@@ -22809,6 +22809,71 @@ def _checkpoint_commit_matches_current_heads(commit_hash: str, current_heads: st
     )
 
 
+def _git_commit_is_ancestor_or_equal(commit: str, head: str, repo_dir: Path) -> bool:
+    """True when *commit* is reachable from *head* in *repo_dir* (or equal)."""
+    if commit == head:
+        return True
+    if not commit or not head:
+        return False
+    try:
+        result = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", commit, head],
+            cwd=repo_dir,
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        )
+    except Exception:
+        return False
+    return result.returncode == 0
+
+
+def _checkpoint_commits_reachable_from_current_heads(
+    commit_hash: str, current_heads: str, feature_root: Path | None,
+) -> bool:
+    """True when every recorded checkpoint commit is still in repo history.
+
+    The strict equality match (:func:`_checkpoint_commit_matches_current_heads`)
+    breaks for a VALIDLY-sealed group two ways: (1) a LATER group commits on top,
+    advancing the repo head past the checkpoint's commits; (2) a multi-task
+    single-repo group records one ``result_commit`` PER TASK — several commits
+    behind the single repo head — so the head/commit COUNTS never line up. In
+    both cases the checkpoint commits are still reachable from the current head
+    (ancestors). A repo that was reset/diverged after the checkpoint (its work
+    lost) leaves the commits UNREACHABLE, so this still fails closed and the
+    group is correctly re-run.
+
+    (Without this, the first post-adoption MULTI-TASK group to be freshness-
+    re-validated on resume — e.g. 8ac124d6 group 78 — is judged "stale", re-run,
+    and cannot re-seal because its `done`-replaced lanes can no longer enqueue;
+    a hard stuck loop. Groups skipped via the adoption marker never hit it.)
+    """
+
+    commit_hash = str(commit_hash or "").strip()
+    current_heads = str(current_heads or "").strip()
+    if not commit_hash or not current_heads or feature_root is None:
+        return False
+    bare_commits = [c.strip() for c in commit_hash.split(",") if c.strip()]
+    if not bare_commits:
+        return False
+    repo_heads: list[tuple[Path, str]] = []
+    for item in current_heads.split(","):
+        rel, sep, head = item.partition(":")
+        if not sep or not head.strip():
+            return False
+        repo_heads.append((feature_root / rel.strip(), head.strip()))
+    if not repo_heads:
+        return False
+    return all(
+        any(
+            _git_commit_is_ancestor_or_equal(commit, head, repo_dir)
+            for repo_dir, head in repo_heads
+        )
+        for commit in bare_commits
+    )
+
+
 def _feature_repos_clean_for_checkpoint_resume(
     runner: WorkflowRunner,
     feature: Feature,
@@ -23539,7 +23604,17 @@ async def _dag_group_queue_checkpoint_is_fresh(
         return False
     if ",".join(result_commits) != str(commit_hash or ""):
         return False
-    return _checkpoint_commit_matches_current_heads(commit_hash, current_heads)
+    if _checkpoint_commit_matches_current_heads(commit_hash, current_heads):
+        return True
+    # The strict equality match fails once a LATER group commits on top of this
+    # sealed group (the repo head advances past these commits) and for a
+    # multi-task single-repo group (one result_commit per task, several commits
+    # behind the single head). Accept when every recorded commit is still
+    # reachable from a current repo head — the durable `done`-lane commit proofs
+    # already proved the work landed; this only confirms it was not reset away.
+    return _checkpoint_commits_reachable_from_current_heads(
+        commit_hash, current_heads, _get_feature_root(runner, feature),
+    )
 
 
 async def _dag_group_checkpoint_is_fresh(
