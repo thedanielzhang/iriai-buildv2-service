@@ -47,7 +47,10 @@ class ProjectProfile(BaseModel):
     ready_probe_kind: str = ""  # one of READY_PROBE_KINDS
     ready_probe_target: str = ""  # url path, log substring, or file path
     base_url_template: str = ""  # e.g. "http://127.0.0.1:{port}"
-    native_test_cmd: str = ""  # e.g. "npx playwright test --config=..."
+    native_test_cmd: str = ""  # base, e.g. "npx playwright test"
+    # Discovered native test configs (e.g. playwright.config.{badge,chat,lifecycle}.ts);
+    # the browser adapter runs `{native_test_cmd} --config=<cfg>` per entry.
+    native_test_configs: list[str] = Field(default_factory=list)
     # Names ONLY — never secret values.
     env_keys: list[str] = Field(default_factory=list)
     seed_cmd: str = ""  # deterministic fixtures/DB seed; "" = no-op
