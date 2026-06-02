@@ -6071,12 +6071,20 @@ async def _commit_hygiene_recovery_lanes_for_group(
         if len(covered) != 1:
             continue
         task_id = covered[0]
-        # Keep the lowest-id (oldest) failed lane per task — a retry replacement
-        # of a recovered lane is itself a distinct lane, but only the original
-        # failed lane is a valid retry SOURCE (`_validate_retry_source` refuses a
-        # source that already has a non-cancelled replacement).
+        # Keep the HIGHEST-id (newest) failed lane per task — the head of the
+        # retry chain. The earlier "keep oldest" logic inverted the retry-source
+        # rule: `_validate_retry_source` REFUSES a source that already has a
+        # non-cancelled replacement, so once the original lane (e.g. 5) has a
+        # failed retry replacement (e.g. 9), the original is NO LONGER a valid
+        # retry source — the next retry must source from the unreplaced head
+        # (9), or the enqueue fails closed. Keeping the newest ALSO threads the
+        # LATEST hook detail as the recovery feedback: a stale pre-fix original
+        # lane carries only "commit hook failed (exit 1)" (no stderr), while the
+        # newest retry lane carries the actual bounded pre-commit hook stderr —
+        # the concrete hygiene violation the agent must fix. Both the valid
+        # retry source and the actionable feedback live on the newest lane.
         existing = recovery.get(task_id)
-        if existing is not None and existing.lane_id <= int(item.id):
+        if existing is not None and existing.lane_id >= int(item.id):
             continue
         recovery[task_id] = _CommitHygieneRecoveryLane(
             task_id=task_id,

@@ -38,6 +38,7 @@ import iriai_build_v2.workflows.develop.phases.implementation as impl
 from iriai_build_v2.workflows.develop.phases.implementation import (
     _PENDING_DURABLE_MERGE_QUEUE_NOTE,
     ImplementationResult,
+    _commit_hygiene_recovery_lanes_for_group,
     _commit_hygiene_retry_refailure_counts_for_group,
     _commit_hygiene_rerun_block_marker_key,
     _integrate_nonblocked_successes_before_block,
@@ -58,10 +59,12 @@ class _FakeItem:
         status: str,
         task_ids: list[str],
         *,
+        id: int = 0,
         last_error: str = "",
         retry_of_queue_item_id: int | None = None,
         retry_of_in_payload: bool = False,
     ) -> None:
+        self.id = id
         self.status = status
         self.task_coverage = [_FakeCoverage(t) for t in task_ids]
         self.retry_of_queue_item_id = retry_of_queue_item_id
@@ -232,6 +235,68 @@ async def test_refailure_counts_fail_closed():
         )
         == {}
     )
+
+
+# ── Recovery-lane selection: newest failed lane (source + actionable detail) ─
+
+
+_ACTIONABLE = (
+    "commit_hygiene: commit hook failed (exit 1)\nstderr:\n"
+    "TaskRow.test.tsx(146,82): Unexpected unicode character"
+)
+
+
+@pytest.mark.asyncio
+async def test_recovery_uses_newest_failed_lane_not_oldest():
+    # The items-5/9 shape after the first recovery retry: lane 5 is the STALE
+    # original ("exit 1", no stderr) and lane 9 is its failed retry replacement
+    # carrying the ACTUAL hook stderr. The recovery must select lane 9 (the
+    # unreplaced chain head) — both because `_validate_retry_source` would refuse
+    # lane 5 (already replaced by 9) AND because lane 9 carries the actionable
+    # feedback the agent needs to fix the concrete hygiene violation.
+    _FakeQueueStore.items = [
+        _FakeItem(
+            "failed", ["slice-14"], id=5,
+            last_error="commit_hygiene: commit hook failed (exit 1)",
+        ),
+        _FakeItem(
+            "failed", ["slice-14"], id=9,
+            last_error=_ACTIONABLE, retry_of_queue_item_id=5,
+        ),
+    ]
+    recovery = await _commit_hygiene_recovery_lanes_for_group(
+        _runner_with_store(), _feature(), dag_sha256="dag-sha", group_idx=78,
+    )
+    assert recovery["slice-14"].lane_id == 9  # newest = valid retry source
+    assert "Unexpected unicode character" in recovery["slice-14"].hook_detail
+
+
+@pytest.mark.asyncio
+async def test_recovery_newest_selection_is_order_independent():
+    # The newest lane wins regardless of the order items arrive from the store.
+    items_low_first = [
+        _FakeItem("failed", ["t"], id=5, last_error="commit_hygiene: a"),
+        _FakeItem("failed", ["t"], id=9, last_error="commit_hygiene: b",
+                  retry_of_queue_item_id=5),
+    ]
+    items_high_first = list(reversed(items_low_first))
+    for items in (items_low_first, items_high_first):
+        _FakeQueueStore.items = items
+        recovery = await _commit_hygiene_recovery_lanes_for_group(
+            _runner_with_store(), _feature(), dag_sha256="dag-sha", group_idx=78,
+        )
+        assert recovery["t"].lane_id == 9
+
+
+@pytest.mark.asyncio
+async def test_recovery_single_failed_lane_is_selected():
+    _FakeQueueStore.items = [
+        _FakeItem("failed", ["t"], id=5, last_error=_ACTIONABLE),
+    ]
+    recovery = await _commit_hygiene_recovery_lanes_for_group(
+        _runner_with_store(), _feature(), dag_sha256="dag-sha", group_idx=78,
+    )
+    assert recovery["t"].lane_id == 5
 
 
 # ── Sibling isolation: integrate non-blocked successes before the block ──────
