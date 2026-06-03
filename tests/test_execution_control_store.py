@@ -204,6 +204,13 @@ class _FakeConnection:
             return "INSERT 0 1"
         if "update" in normalized and "task_deliverable_contracts" in normalized:
             return self._update_task_contract(sql, args)
+        if "update" in normalized and "artifacts" in normalized:
+            return self._update_artifact(sql, args)
+        if (
+            "update" in normalized
+            and "execution_artifact_projections" in normalized
+        ):
+            return self._update_projection_link(sql, args)
         if "insert into" in normalized and "task_deliverable_contracts" in normalized:
             self._insert_task_contract(sql, args)
             return "INSERT 0 1"
@@ -259,6 +266,9 @@ class _FakeConnection:
             return _FakeRow(row) if row is not None else None
         if "select" in normalized and "from task_deliverable_contracts" in normalized:
             row = self._select_task_contract(sql, args)
+            return _FakeRow(row) if row is not None else None
+        if "update" in normalized and "evidence_nodes" in normalized:
+            row = self._update_evidence_node(sql, args)
             return _FakeRow(row) if row is not None else None
         if "select" in normalized and "from evidence_nodes" in normalized:
             row = self._select_evidence_node(args)
@@ -1010,6 +1020,73 @@ class _FakeConnection:
             count += 1
         return f"UPDATE {count}"
 
+    def _update_artifact(self, sql: str, args: tuple[object, ...]) -> str:
+        # Supersede shape: UPDATE artifacts SET value = $1 WHERE id = $2
+        value = args[0]
+        artifact_id = int(args[1])
+        count = 0
+        for row in self.artifacts:
+            if row["id"] != artifact_id:
+                continue
+            row["value"] = value
+            row["sha256"] = _sha256(str(value))
+            count += 1
+        return f"UPDATE {count}"
+
+    def _update_projection_link(self, sql: str, args: tuple[object, ...]) -> str:
+        # Supersede shape: UPDATE execution_artifact_projections
+        #   SET payload = $1, projection_sha256 = $2, source_id = $3
+        #   WHERE id = $4
+        payload = args[0]
+        projection_sha256 = args[1]
+        source_id = args[2]
+        link_id = int(args[3])
+        count = 0
+        for row in self.projection_links:
+            if row["id"] != link_id:
+                continue
+            row["payload"] = payload
+            row["projection_sha256"] = projection_sha256
+            row["source_id"] = source_id
+            count += 1
+        return f"UPDATE {count}"
+
+    def _update_evidence_node(
+        self,
+        sql: str,
+        args: tuple[object, ...],
+    ) -> dict[str, Any] | None:
+        # Supersede shape: UPDATE evidence_nodes SET status, name, summary,
+        #   source_ref, input_refs, output_refs, content_hash, metadata,
+        #   payload, updated_at = NOW() WHERE id = $10
+        (
+            status,
+            name,
+            summary,
+            source_ref,
+            input_refs,
+            output_refs,
+            content_hash,
+            metadata,
+            payload,
+            evidence_id,
+        ) = args[:10]
+        for row in self.evidence_nodes:
+            if row["id"] != int(evidence_id):
+                continue
+            row["status"] = status
+            row["name"] = name
+            row["summary"] = summary
+            row["source_ref"] = source_ref
+            row["input_refs"] = input_refs
+            row["output_refs"] = output_refs
+            row["content_hash"] = content_hash
+            row["metadata"] = metadata
+            row["payload"] = payload
+            row["updated_at"] = datetime(2026, 5, 19, 3, tzinfo=timezone.utc)
+            return row
+        return None
+
     def _insert_evidence_node(self, sql: str, args: tuple[object, ...]) -> dict[str, Any] | None:
         feature_id = str(args[0])
         idempotency_key = str(args[1])
@@ -1177,6 +1254,28 @@ class _FakeConnection:
         args: tuple[object, ...],
     ) -> dict[str, Any] | None:
         normalized = " ".join(sql.lower().split())
+        # Strict-superset supersede shape (group_checkpoint / graph node):
+        #   SET request_digest = $1, payload = $2, updated_at = NOW()
+        #   WHERE id = $3 AND entry_type = '...'
+        if "set request_digest = $1" in normalized:
+            request_digest = str(args[0])
+            payload = args[1]
+            row_id = int(args[2])
+            entry_type = None
+            if "entry_type = 'group_checkpoint'" in normalized:
+                entry_type = "group_checkpoint"
+            elif "entry_type = 'verification_graph_node'" in normalized:
+                entry_type = "verification_graph_node"
+            for row in self.typed_rows:
+                if row["id"] != row_id:
+                    continue
+                if entry_type is not None and row["entry_type"] != entry_type:
+                    return None
+                row["request_digest"] = request_digest
+                row["payload"] = payload
+                row["updated_at"] = datetime(2026, 5, 19, 3, tzinfo=timezone.utc)
+                return row
+            return None
         status = str(args[0])
         dispatcher_state = str(args[1])
         payload = args[2]
@@ -2555,6 +2654,263 @@ async def test_group_checkpoint_projection_requires_approved_gate_source_cases(
         await _call_projection(store, "project_group_checkpoint", projection)
 
     assert conn.projection_links == []
+
+
+# ── group_checkpoint strict-superset supersede ────────────────────────────────
+#
+# Recovers an invalid partial-coverage ``group_checkpoint`` (e.g. DAG group 79's
+# 3-of-4 checkpoint) IN PLACE once its missing lane integrates: a new body whose
+# ``task_ids`` STRICTLY supersede the stored ones replaces the existing
+# ``:projection`` row + ``dag-group:N`` artifact + projection link, preserving
+# the typed row id (and thus the sibling lanes' ``checkpoint_projection_id`` FK).
+# Equal / smaller / disjoint bodies are UNCHANGED (idempotent no-op or
+# IdempotencyConflict). Reachable only via the authorized strict-superset gate.
+
+
+def _checkpoint_projection(
+    conn: _FakeConnection,
+    *,
+    group_idx: int,
+    task_ids: list[str],
+    idempotency_key: str,
+    supersede: bool = False,
+    commit_hash: str = "abc123",
+    gate_id: int | None = None,
+) -> tuple[Any, int]:
+    """Build a ``GroupCheckpointProjection`` carrying a ``task_ids`` body.
+
+    Returns ``(projection, gate_id)``. Pass ``gate_id`` to reuse the SAME
+    approved checkpoint_gate evidence node across calls — the production
+    projector keys the gate on the checkpoint key, so a recovery / idempotent
+    re-run reuses the same gate id (and thus the same write digest when the body
+    is unchanged).
+    """
+
+    if gate_id is None:
+        gate_id = _append_checkpoint_gate_evidence(conn, group_idx=group_idx)["id"]
+    checkpoint = {
+        "group_idx": group_idx,
+        "task_ids": list(task_ids),
+        "results": [],
+        "verdict": "approved",
+        "commit_hash": commit_hash,
+    }
+    projection = _projection(
+        "GroupCheckpointProjection",
+        projection_key=f"dag-group:{group_idx}",
+        artifact_key=f"dag-group:{group_idx}",
+        projection_body=None,
+        artifact_body=None,
+        body=None,
+        value=None,
+        checkpoint=checkpoint,
+        group_idx=group_idx,
+        status="done",
+        source_table="evidence_nodes",
+        source_id=gate_id,
+        idempotency_key=idempotency_key,
+        supersede=supersede,
+    )
+    return projection, gate_id
+
+
+@pytest.mark.asyncio
+async def test_group_checkpoint_strict_superset_supersedes_in_place() -> None:
+    conn = _FakeConnection()
+    store = _store(_FakePool(conn))
+
+    # A stored 3-task checkpoint for g79.
+    first, gate_id = _checkpoint_projection(
+        conn,
+        group_idx=79,
+        task_ids=["T1", "T2", "T3"],
+        idempotency_key="idem:checkpoint:g79:projection",
+    )
+    first_result = await _call_projection(store, "project_group_checkpoint", first)
+    stored_row_id = first_result.row.id
+    stored_link_id = first_result.projection_links[0].id
+    stored_artifact_id = first_result.projection_links[0].artifact_id
+    assert json.loads(
+        next(a for a in conn.artifacts if a["id"] == stored_artifact_id)["value"]
+    )["task_ids"] == ["T1", "T2", "T3"]
+
+    # A new 4-task body whose ids STRICTLY superset the stored ids, with
+    # supersede authorized. Reuse the keyed gate (production reuses it).
+    second, _gate_id = _checkpoint_projection(
+        conn,
+        group_idx=79,
+        task_ids=["T1", "T2", "T3", "T4"],
+        idempotency_key="idem:checkpoint:g79:projection",
+        supersede=True,
+        gate_id=gate_id,
+    )
+    second_result = await _call_projection(store, "project_group_checkpoint", second)
+
+    # Same typed row id (in-place UPDATE — no new journal row inserted), so the
+    # sibling lanes' checkpoint_projection_id FK is preserved by construction.
+    assert second_result.row.id == stored_row_id
+    assert second_result.projection_links[0].id == stored_link_id
+    assert second_result.projection_links[0].artifact_id == stored_artifact_id
+    assert (
+        len([r for r in conn.typed_rows if r["entry_type"] == "group_checkpoint"])
+        == 1
+    )
+    assert len(conn.projection_links) == 1
+    # The artifact body now carries all 4 task ids.
+    assert json.loads(
+        next(a for a in conn.artifacts if a["id"] == stored_artifact_id)["value"]
+    )["task_ids"] == ["T1", "T2", "T3", "T4"]
+
+
+@pytest.mark.asyncio
+async def test_group_checkpoint_equal_body_is_idempotent_no_op() -> None:
+    conn = _FakeConnection()
+    store = _store(_FakePool(conn))
+
+    first, gate_id = _checkpoint_projection(
+        conn,
+        group_idx=79,
+        task_ids=["T1", "T2", "T3"],
+        idempotency_key="idem:checkpoint:g79:projection",
+    )
+    first_result = await _call_projection(store, "project_group_checkpoint", first)
+
+    # An identical body with supersede authorized is a plain idempotent no-op:
+    # the digest matches (same keyed gate), so the supersede branch is never
+    # entered.
+    second, _gate_id = _checkpoint_projection(
+        conn,
+        group_idx=79,
+        task_ids=["T1", "T2", "T3"],
+        idempotency_key="idem:checkpoint:g79:projection",
+        supersede=True,
+        gate_id=gate_id,
+    )
+    second_result = await _call_projection(store, "project_group_checkpoint", second)
+
+    assert second_result.row.id == first_result.row.id
+    assert second_result.row.request_digest == first_result.row.request_digest
+    assert len(conn.projection_links) == 1
+    assert json.loads(
+        next(
+            a
+            for a in conn.artifacts
+            if a["id"] == first_result.projection_links[0].artifact_id
+        )["value"]
+    )["task_ids"] == ["T1", "T2", "T3"]
+
+
+@pytest.mark.parametrize(
+    "new_task_ids",
+    [
+        ["T1", "T2"],            # strict subset (smaller) — NOT a superset
+        ["T1", "T2", "T3"],      # equal set but a different body digest
+        ["X1", "X2", "X3", "X4"],  # disjoint
+    ],
+)
+@pytest.mark.asyncio
+async def test_group_checkpoint_non_superset_still_conflicts(
+    new_task_ids: list[str],
+) -> None:
+    module = _execution_control_module()
+    conn = _FakeConnection()
+    store = _store(_FakePool(conn))
+
+    first, gate_id = _checkpoint_projection(
+        conn,
+        group_idx=79,
+        task_ids=["T1", "T2", "T3"],
+        idempotency_key="idem:checkpoint:g79:projection",
+    )
+    await _call_projection(store, "project_group_checkpoint", first)
+
+    # A non-strict-superset body (smaller / equal-set-different-digest /
+    # disjoint) under the SAME idempotency key must NOT supersede — it raises
+    # IdempotencyConflict exactly as before. The differing ``commit_hash``
+    # guarantees a divergent digest even for the equal-set case.
+    second, _gate_id = _checkpoint_projection(
+        conn,
+        group_idx=79,
+        task_ids=new_task_ids,
+        idempotency_key="idem:checkpoint:g79:projection",
+        supersede=True,
+        commit_hash="different-commit",
+        gate_id=gate_id,
+    )
+    with pytest.raises(module.IdempotencyConflict):
+        await _call_projection(store, "project_group_checkpoint", second)
+
+    # The stored checkpoint is untouched.
+    assert (
+        len([r for r in conn.typed_rows if r["entry_type"] == "group_checkpoint"])
+        == 1
+    )
+    assert len(conn.projection_links) == 1
+    assert json.loads(conn.artifacts[-1]["value"])["task_ids"] == ["T1", "T2", "T3"]
+
+
+@pytest.mark.asyncio
+async def test_group_checkpoint_supersede_does_not_replace_without_flag() -> None:
+    module = _execution_control_module()
+    conn = _FakeConnection()
+    store = _store(_FakePool(conn))
+
+    first, gate_id = _checkpoint_projection(
+        conn,
+        group_idx=79,
+        task_ids=["T1", "T2", "T3"],
+        idempotency_key="idem:checkpoint:g79:projection",
+    )
+    await _call_projection(store, "project_group_checkpoint", first)
+
+    # Even a STRICT superset must NOT supersede when supersede is not
+    # authorized — the airtight guard requires the flag.
+    second, _gate_id = _checkpoint_projection(
+        conn,
+        group_idx=79,
+        task_ids=["T1", "T2", "T3", "T4"],
+        idempotency_key="idem:checkpoint:g79:projection",
+        supersede=False,
+        gate_id=gate_id,
+    )
+    with pytest.raises(module.IdempotencyConflict):
+        await _call_projection(store, "project_group_checkpoint", second)
+
+    assert json.loads(conn.artifacts[-1]["value"])["task_ids"] == ["T1", "T2", "T3"]
+
+
+@pytest.mark.asyncio
+async def test_group_checkpoint_supersede_isolated_from_other_group() -> None:
+    conn = _FakeConnection()
+    store = _store(_FakePool(conn))
+
+    # An UNRELATED group's checkpoint with a digest match is a plain idempotent
+    # no-op — the supersede path never touches it.
+    other, gate_id = _checkpoint_projection(
+        conn,
+        group_idx=80,
+        task_ids=["U1", "U2"],
+        idempotency_key="idem:checkpoint:g80:projection",
+    )
+    other_result = await _call_projection(store, "project_group_checkpoint", other)
+
+    again, _gate_id = _checkpoint_projection(
+        conn,
+        group_idx=80,
+        task_ids=["U1", "U2"],
+        idempotency_key="idem:checkpoint:g80:projection",
+        supersede=True,
+        gate_id=gate_id,
+    )
+    again_result = await _call_projection(store, "project_group_checkpoint", again)
+
+    assert again_result.row.id == other_result.row.id
+    assert again_result.row.request_digest == other_result.row.request_digest
+    assert (
+        len([r for r in conn.typed_rows if r["entry_type"] == "group_checkpoint"])
+        == 1
+    )
+    assert json.loads(conn.artifacts[-1]["value"])["task_ids"] == ["U1", "U2"]
 
 
 # ── Slice 10g-1 — doc-10-correct control_plane.snapshot_changed outbox ────

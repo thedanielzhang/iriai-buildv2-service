@@ -507,7 +507,7 @@ _TOKEN = LeaseToken(item_id=0, lease_owner="coordinator", lease_version=0)
 
 
 def _projector(conn, feature_id: str, calls: list):
-    async def project(coverage, body):
+    async def project(coverage, body, *, supersede: bool = False):
         calls.append(body)
         gate = await _insert_evidence(conn, feature_id)
         body_ev = await _insert_evidence(conn, feature_id)
@@ -624,7 +624,7 @@ async def test_checkpoint_group_recovers_with_an_idempotent_projector(
     body_ev = await _insert_evidence(mq_conn, "feat-c")
     calls: list = []
 
-    async def projector(coverage, body):
+    async def projector(coverage, body, *, supersede: bool = False):
         calls.append(body)
         return CheckpointProjection(
             checkpoint_projection_id=555,

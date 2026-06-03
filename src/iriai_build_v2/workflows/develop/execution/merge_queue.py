@@ -1161,7 +1161,20 @@ class GroupMergeCoordinator:
             body = _reconstruct_checkpoint_body(
                 current, results=task_results, task_ids=body_task_ids
             )
-            projection = await self._checkpoint_projector(current, body)
+            # Strict-superset supersede authorization: a group whose
+            # ``group_checkpoint`` was projected with PARTIAL coverage (an
+            # invalid N-of-M checkpoint) must be recoverable in place once its
+            # missing lane(s) integrate and coverage becomes complete. We
+            # authorize the projector/store to SUPERSEDE the stored checkpoint
+            # body iff the new body's ``task_ids`` are a STRICT superset of the
+            # stored ones — that invariant is enforced atomically in the store
+            # (``_group_checkpoint_supersedes``) under the feature advisory lock,
+            # so authorizing here is safe: equal/smaller/disjoint bodies remain
+            # an idempotent no-op (matching digest) or ``IdempotencyConflict``
+            # (divergent digest) exactly as before.
+            projection = await self._checkpoint_projector(
+                current, body, supersede=True
+            )
             coverage_digest = _checkpoint_coverage_digest(current)
             # 08g P2-A: a lane already in `checkpointing` (a crash entered
             # `checkpointing` then died before `complete_checkpoint`) is a

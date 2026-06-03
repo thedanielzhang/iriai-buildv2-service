@@ -857,6 +857,122 @@ async def test_checkpoint_projector_direct_idempotency(mq_conn) -> None:
     assert first.body_sha256 == second.body_sha256
 
 
+@pytest.mark.asyncio
+async def test_checkpoint_projector_strict_superset_supersedes_in_place(
+    mq_conn,
+) -> None:
+    """A strict-superset body supersedes the gate/body/projection IN PLACE.
+
+    Recovers an invalid partial-coverage checkpoint (the DAG group 79 / 3-of-4
+    scenario): a first body carries 3 task ids; a second body whose ids strictly
+    superset them, with supersede authorized, UPDATEs the existing
+    checkpoint_gate + checkpoint_body evidence nodes, the dag-group:* artifact,
+    and the projection row IN PLACE — no new evidence/journal/artifact rows, no
+    IdempotencyConflict, and the projection id is preserved.
+    """
+    feature_id = "feat-ckpt-supersede"
+    await _insert_feature(mq_conn, feature_id)
+    store = MergeQueueStore(mq_conn)
+    contract = await _insert_contract(mq_conn, feature_id, "T1")
+    lane = await _enqueue_lane(
+        mq_conn, store, feature_id, task_id="T1", contract_id=contract
+    )
+    await _force_status(mq_conn, feature_id, lane, "integrated")
+
+    control = ExecutionControlStore(mq_conn)
+    projector = build_checkpoint_projector(
+        control, _checkpoint_gate_provider(GateDecision(approved=True))
+    )
+    coord = GroupMergeCoordinator(store, _expected_provider(["T1"]), projector)
+    coverage = await coord.coverage(feature_id, _DAG, 1)
+
+    three = {"group_idx": 1, "task_ids": ["T1", "T2", "T3"], "verdict": "approved"}
+    first = await projector(coverage, three)
+
+    four = {
+        "group_idx": 1,
+        "task_ids": ["T1", "T2", "T3", "T4"],
+        "verdict": "approved",
+    }
+    second = await projector(coverage, four, supersede=True)
+
+    # Same projection + evidence ids (in-place UPDATE — nothing re-inserted).
+    assert second.checkpoint_projection_id == first.checkpoint_projection_id
+    assert second.checkpoint_gate_evidence_id == first.checkpoint_gate_evidence_id
+    assert second.checkpoint_evidence_id == first.checkpoint_evidence_id
+    assert second.body_sha256 != first.body_sha256
+
+    # Exactly one of each row — superseded in place, never duplicated.
+    gate_count = await mq_conn.fetchval(
+        "SELECT count(*) FROM evidence_nodes "
+        "WHERE feature_id = $1 AND kind = 'checkpoint_gate'",
+        feature_id,
+    )
+    assert gate_count == 1
+    body_count = await mq_conn.fetchval(
+        "SELECT count(*) FROM evidence_nodes "
+        "WHERE feature_id = $1 AND kind = 'aggregate_verdict'",
+        feature_id,
+    )
+    assert body_count == 1
+    journal_count = await mq_conn.fetchval(
+        "SELECT count(*) FROM execution_journal_rows "
+        "WHERE feature_id = $1 AND entry_type = 'group_checkpoint'",
+        feature_id,
+    )
+    assert journal_count == 1
+
+    # The dag-group:* artifact body now carries all 4 task ids.
+    artifact_value = await mq_conn.fetchval(
+        "SELECT value FROM artifacts "
+        "WHERE feature_id = $1 AND key = 'dag-group:1' ORDER BY id DESC LIMIT 1",
+        feature_id,
+    )
+    assert json.loads(artifact_value)["task_ids"] == ["T1", "T2", "T3", "T4"]
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_projector_non_superset_still_conflicts(mq_conn) -> None:
+    """A non-strict-superset body still raises IdempotencyConflict.
+
+    Even with supersede authorized, a smaller / disjoint body must NOT replace
+    the stored checkpoint — the strict-superset gate is airtight.
+    """
+    from iriai_build_v2.execution_control import IdempotencyConflict
+
+    feature_id = "feat-ckpt-noconflict"
+    await _insert_feature(mq_conn, feature_id)
+    store = MergeQueueStore(mq_conn)
+    contract = await _insert_contract(mq_conn, feature_id, "T1")
+    lane = await _enqueue_lane(
+        mq_conn, store, feature_id, task_id="T1", contract_id=contract
+    )
+    await _force_status(mq_conn, feature_id, lane, "integrated")
+
+    control = ExecutionControlStore(mq_conn)
+    projector = build_checkpoint_projector(
+        control, _checkpoint_gate_provider(GateDecision(approved=True))
+    )
+    coord = GroupMergeCoordinator(store, _expected_provider(["T1"]), projector)
+    coverage = await coord.coverage(feature_id, _DAG, 1)
+
+    three = {"group_idx": 1, "task_ids": ["T1", "T2", "T3"], "verdict": "approved"}
+    await projector(coverage, three)
+
+    # Disjoint ids — never a superset; supersede must not replace.
+    disjoint = {"group_idx": 1, "task_ids": ["X1", "X2"], "verdict": "approved"}
+    with pytest.raises(IdempotencyConflict):
+        await projector(coverage, disjoint, supersede=True)
+
+    # The stored checkpoint body is untouched.
+    artifact_value = await mq_conn.fetchval(
+        "SELECT value FROM artifacts "
+        "WHERE feature_id = $1 AND key = 'dag-group:1' ORDER BY id DESC LIMIT 1",
+        feature_id,
+    )
+    assert json.loads(artifact_value)["task_ids"] == ["T1", "T2", "T3"]
+
+
 # ── Slice 08e-2 — implementation-worker enqueue splice ──────────────────────
 #
 # These exercise `_enqueue_durable_merge_queue_for_results` — the splice that

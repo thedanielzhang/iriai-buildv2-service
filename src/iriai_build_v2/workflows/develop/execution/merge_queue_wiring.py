@@ -598,7 +598,7 @@ def build_checkpoint_projector(
     """
 
     async def project(
-        coverage: GroupMergeCoverage, body: dict
+        coverage: GroupMergeCoverage, body: dict, *, supersede: bool = False
     ) -> CheckpointProjection:
         checkpoint_key = _checkpoint_key(coverage)
         decision = await gate_decision_provider(coverage)
@@ -634,7 +634,9 @@ def build_checkpoint_projector(
             deterministic=True,
             input_refs=sorted(decision.input_evidence_ids),
         )
-        gate_result = await store.record_verification_graph_node(gate_evidence)
+        gate_result = await store.record_verification_graph_node(
+            gate_evidence, supersede=supersede
+        )
         checkpoint_gate_evidence_id = gate_result.evidence.id
 
         # The checkpoint-body evidence node — a durable record of the legacy
@@ -657,7 +659,9 @@ def build_checkpoint_projector(
             deterministic=True,
             input_refs=[checkpoint_gate_evidence_id],
         )
-        body_result = await store.record_verification_graph_node(body_evidence)
+        body_result = await store.record_verification_graph_node(
+            body_evidence, supersede=supersede
+        )
         checkpoint_evidence_id = body_result.evidence.id
 
         # Step 2: project the legacy dag-group:* compatibility artifact with
@@ -673,6 +677,7 @@ def build_checkpoint_projector(
             source_table="evidence_nodes",
             source_id=checkpoint_gate_evidence_id,
             checkpoint=body,
+            supersede=supersede,
         )
         projection_result = await store.project_group_checkpoint(projection)
 

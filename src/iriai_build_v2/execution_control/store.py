@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import logging
 import os
 from contextlib import asynccontextmanager, nullcontext
 from dataclasses import asdict, dataclass, is_dataclass, replace
@@ -74,6 +75,8 @@ from .models import (
 # mirrors the Slice-09 leaf-import discipline (``regroup_overlay.py`` /
 # ``dag_regroup.py`` import the async typed modules lazily for the same
 # reason) and ``snapshots.py``'s own lazy ``stable_digest`` import.
+
+_LOGGER = logging.getLogger(__name__)
 
 LEGACY_VISIBLE_ENTRY_TYPES: frozenset[str] = frozenset({
     "task_result",
@@ -2888,6 +2891,8 @@ class ExecutionControlStore:
     async def record_verification_graph_node(
         self,
         evidence: VerificationGraphNodeEvidence | dict[str, Any],
+        *,
+        supersede: bool = False,
     ) -> EvidenceNodeResult:
         node = _verification_graph_node_evidence(evidence)
         if node.kind not in VERIFICATION_GRAPH_NODE_KINDS:
@@ -2899,6 +2904,7 @@ class ExecutionControlStore:
                     conn,
                     fields=fields,
                     node=node,
+                    supersede=supersede,
                 )
 
     async def list_verification_graph_nodes(
@@ -4638,6 +4644,7 @@ class ExecutionControlStore:
         *,
         fields: dict[str, Any],
         node: VerificationGraphNodeEvidence,
+        supersede: bool = False,
     ) -> EvidenceNodeResult:
         request_digest = stable_digest({
             "content_hash": fields["content_hash"],
@@ -4669,6 +4676,36 @@ class ExecutionControlStore:
         else:
             row = self._row_from_record(existing)
             journal_created = False
+        # Strict-superset supersede (checkpoint recovery): when the caller
+        # authorized ``supersede`` and the stored verification-graph-node row
+        # carries a STALE digest/content (a partial-coverage checkpoint's gate
+        # or body), update the typed row + evidence node IN PLACE instead of
+        # raising ``IdempotencyConflict``. The strict-superset invariant is
+        # enforced by the projection step (``_group_checkpoint_supersedes``);
+        # this path only mirrors that authorized replacement onto the keyed
+        # gate/body nodes that share the checkpoint key.
+        if (
+            supersede
+            and existing is not None
+            and row.request_digest != write.digest
+        ):
+            row = await self._supersede_verification_graph_node_in_place(
+                conn, row, write
+            )
+            evidence = await self._supersede_evidence_node_in_place(
+                conn, fields, execution_row=row, kind=node.kind
+            )
+            return EvidenceNodeResult(
+                evidence=evidence,
+                execution=ExecutionJournalResult(
+                    row=row,
+                    projection_links=tuple(
+                        await self._fetch_projection_links(conn, row.id)
+                    ),
+                    created=False,
+                ),
+                created=False,
+            )
         self._validate_row_digest(row, write)
         evidence, evidence_created = await self._insert_or_reuse_evidence_node(
             conn,
@@ -5081,6 +5118,7 @@ class ExecutionControlStore:
         )
         self._validate(write)
         projection_payload = _group_checkpoint_projection_payload(projection)
+        supersede = bool(getattr(projection, "supersede", False))
         async with self._connection() as conn:
             async with self._transaction(conn):
                 existing = await self._fetch_existing(
@@ -5093,6 +5131,32 @@ class ExecutionControlStore:
                 else:
                     row = self._row_from_record(existing)
                     created = False
+                # Strict-superset supersede (recovers an invalid partial-coverage
+                # checkpoint once its missing lane integrates): only when the
+                # coordinator authorized ``supersede`` AND the stored ``dag-group``
+                # body's ``task_ids`` are a STRICT subset of the new body's ids,
+                # replace the existing ``:projection`` row + artifact + projection
+                # link IN PLACE (one transaction) instead of raising
+                # ``IdempotencyConflict``. A matching digest is the normal
+                # idempotent no-op; an equal/smaller/disjoint id set is UNCHANGED
+                # (IdempotencyConflict as before) — the strict-superset check is
+                # the airtight gate, re-validated here atomically.
+                if (
+                    supersede
+                    and existing is not None
+                    and row.request_digest != write.digest
+                    and await self._group_checkpoint_supersedes(
+                        conn, row, compat, projection
+                    )
+                ):
+                    return await self._supersede_group_checkpoint_in_place(
+                        conn,
+                        row,
+                        write,
+                        compat,
+                        projection,
+                        projection_payload,
+                    )
                 self._validate_row_digest(row, write)
                 gate_source_id = _optional_int(getattr(projection, "source_id", None))
                 if (
@@ -5134,6 +5198,205 @@ class ExecutionControlStore:
                     projection_links=tuple(links),
                     created=created,
                 )
+
+    @staticmethod
+    def _checkpoint_body_task_ids(value: Any) -> set[str] | None:
+        """Extract the ``task_ids`` set from a ``dag-group:*`` body.
+
+        Returns ``None`` (NOT an empty set) when the body cannot be parsed or
+        lacks a ``task_ids`` list, so a malformed body can NEVER be read as a
+        valid (strict-subset) checkpoint coverage.
+        """
+
+        body: Any = value
+        if isinstance(body, str):
+            try:
+                body = json.loads(body)
+            except (json.JSONDecodeError, ValueError):
+                return None
+        if not isinstance(body, dict):
+            return None
+        task_ids = body.get("task_ids")
+        if not isinstance(task_ids, list):
+            return None
+        return {str(item) for item in task_ids}
+
+    async def _group_checkpoint_supersedes(
+        self,
+        conn: Any,
+        row: ExecutionJournalRow,
+        compat: CompatibilityProjection,
+        projection: Any,
+    ) -> bool:
+        """True only when the new ``dag-group`` body STRICTLY supersedes stored.
+
+        The airtight gate: the new body's ``task_ids`` must be a STRICT superset
+        (``⊋``) of the EXISTING checkpoint artifact's ``task_ids`` AND share the
+        same feature/dag/group scope (the shared idempotency key already pins
+        feature + dag + group, but we re-assert it defensively). On equal,
+        smaller, disjoint, or unparseable stored bodies this returns ``False`` so
+        the caller falls through to the unchanged
+        idempotent-no-op / ``IdempotencyConflict`` behavior.
+        """
+
+        new_ids = self._checkpoint_body_task_ids(compat.value)
+        if new_ids is None:
+            return False
+        link = next(
+            iter(await self._fetch_projection_links(conn, row.id)),
+            None,
+        )
+        if link is None:
+            return False
+        artifact = await conn.fetchrow(
+            """
+            SELECT id, key, value
+            FROM artifacts
+            WHERE id = $1
+            LIMIT 1
+            """,
+            int(link.artifact_id),
+        )
+        if artifact is None:
+            return False
+        stored_ids = self._checkpoint_body_task_ids(_record_get(artifact, "value"))
+        if stored_ids is None:
+            return False
+        # Same scope: the journal row + the projection must agree on feature,
+        # dag, and group with the new projection request.
+        if (
+            row.feature_id != str(getattr(projection, "feature_id", "") or "")
+            or row.dag_sha256 != str(getattr(projection, "dag_sha256", "") or "")
+            or row.group_idx != getattr(projection, "group_idx", None)
+        ):
+            return False
+        # STRICT superset only: equal / smaller / disjoint never supersedes.
+        return new_ids > stored_ids
+
+    async def _supersede_group_checkpoint_in_place(
+        self,
+        conn: Any,
+        row: ExecutionJournalRow,
+        write: ExecutionJournalWrite,
+        compat: CompatibilityProjection,
+        projection: Any,
+        projection_payload: dict[str, Any],
+    ) -> ExecutionJournalResult:
+        """Atomically replace a strict-subset group checkpoint IN PLACE.
+
+        Runs inside the caller's ``_project_group_checkpoint`` transaction. It
+        UPDATEs (never inserts/re-links):
+
+        * the ``:projection`` ``execution_journal_rows`` row's ``payload`` +
+          ``request_digest`` (preserves its id so the sibling lanes'
+          ``checkpoint_projection_id`` FK is untouched by construction);
+        * the ``dag-group:N`` artifact's ``value`` to the new (larger) body;
+        * the ``execution_artifact_projections`` link's ``payload`` +
+          ``projection_sha256`` to the new body.
+
+        Reached only via the authorized strict-superset gate
+        (``_group_checkpoint_supersedes``).
+        """
+
+        # 1. Re-assert + reload the still-approved checkpoint_gate source.
+        gate_source_id = _optional_int(getattr(projection, "source_id", None))
+        if (
+            gate_source_id is None
+            or str(getattr(projection, "source_table", "") or "") != "evidence_nodes"
+        ):
+            raise MissingRequiredProjection(
+                "dag-group checkpoint projection requires existing "
+                "checkpoint_gate evidence source"
+            )
+        gate = await self._fetch_evidence_node_by_id(conn, gate_source_id)
+        if (
+            gate is None
+            or gate.feature_id != write.feature_id
+            or gate.kind != "checkpoint_gate"
+            or gate.status != "approved"
+        ):
+            raise MissingRequiredProjection(
+                "dag-group checkpoint projection source must be an "
+                "approved checkpoint_gate evidence node"
+            )
+
+        link = next(
+            iter(await self._fetch_projection_links(conn, row.id)),
+            None,
+        )
+        if link is None:
+            raise RuntimeError(
+                "group_checkpoint supersede found no existing projection link"
+            )
+        stored_artifact = await conn.fetchrow(
+            "SELECT value FROM artifacts WHERE id = $1 LIMIT 1",
+            int(link.artifact_id),
+        )
+        stored_ids = (
+            self._checkpoint_body_task_ids(_record_get(stored_artifact, "value"))
+            if stored_artifact is not None
+            else None
+        )
+        new_ids = self._checkpoint_body_task_ids(compat.value)
+
+        # 2. UPDATE the :projection typed row in place (id preserved -> the
+        # sibling lanes' checkpoint_projection_id FK is preserved).
+        updated_row = await conn.fetchrow(
+            """
+            UPDATE execution_journal_rows
+            SET request_digest = $1, payload = $2::jsonb, updated_at = NOW()
+            WHERE id = $3 AND entry_type = 'group_checkpoint'
+            RETURNING *
+            """,
+            write.digest,
+            stable_json(write.payload),
+            row.id,
+        )
+        if updated_row is None:
+            raise RuntimeError(
+                "group_checkpoint supersede could not update the projection row"
+            )
+        row = self._row_from_record(updated_row)
+
+        # 3. UPDATE the dag-group:N artifact body in place.
+        new_value = _serialize_artifact_value(compat.value)
+        await conn.execute(
+            "UPDATE artifacts SET value = $1 WHERE id = $2",
+            new_value,
+            int(link.artifact_id),
+        )
+
+        # 4. UPDATE the execution_artifact_projections link in place.
+        new_payload = {
+            **projection_payload,
+            "evidence_kind": "checkpoint_gate",
+            "evidence_node_id": gate.id,
+        }
+        await conn.execute(
+            """
+            UPDATE execution_artifact_projections
+            SET payload = $1::jsonb, projection_sha256 = $2, source_id = $3
+            WHERE id = $4
+            """,
+            stable_json(new_payload),
+            _projection_value_sha256(compat),
+            gate.id,
+            int(link.id),
+        )
+
+        _LOGGER.info(
+            "group_checkpoint superseded g%s: %s -> %s",
+            row.group_idx,
+            sorted(stored_ids) if stored_ids is not None else None,
+            sorted(new_ids) if new_ids is not None else None,
+        )
+
+        links = await self._fetch_projection_links(conn, row.id)
+        return ExecutionJournalResult(
+            row=row,
+            projection_links=tuple(links),
+            created=False,
+        )
 
     @asynccontextmanager
     async def _connection(self) -> AsyncIterator[Any]:
@@ -5788,6 +6051,99 @@ class ExecutionControlStore:
             )
             return evidence, False
         return self._evidence_node_from_record(row), True
+
+    async def _supersede_verification_graph_node_in_place(
+        self,
+        conn: Any,
+        row: ExecutionJournalRow,
+        write: ExecutionJournalWrite,
+    ) -> ExecutionJournalRow:
+        """In-place UPDATE a keyed verification-graph-node typed row.
+
+        Replaces the stored ``payload`` + ``request_digest`` of the EXISTING
+        ``execution_journal_rows`` row (no new row is inserted, so its id and
+        every FK referencing it are preserved). Reached only via the authorized
+        strict-superset supersede path.
+        """
+
+        updated = await conn.fetchrow(
+            """
+            UPDATE execution_journal_rows
+            SET request_digest = $1, payload = $2::jsonb, updated_at = NOW()
+            WHERE id = $3 AND entry_type = 'verification_graph_node'
+            RETURNING *
+            """,
+            write.digest,
+            stable_json(write.payload),
+            row.id,
+        )
+        if updated is None:
+            raise RuntimeError(
+                "verification graph node supersede could not update the typed row"
+            )
+        return self._row_from_record(updated)
+
+    async def _supersede_evidence_node_in_place(
+        self,
+        conn: Any,
+        fields: dict[str, Any],
+        *,
+        execution_row: ExecutionJournalRow,
+        kind: str,
+    ) -> EvidenceNode:
+        """In-place UPDATE the EXISTING evidence node for a keyed graph node.
+
+        Replaces the stored ``content_hash`` + ``payload`` + scalar metadata of
+        the evidence node identified by its idempotency key, preserving its id
+        (and thus any source/projection FK that references it). Reached only via
+        the authorized strict-superset supersede path.
+        """
+
+        existing = await self._fetch_evidence_by_idempotency(
+            conn,
+            str(fields["feature_id"]),
+            str(fields["idempotency_key"]),
+        )
+        if existing is None:
+            # No prior evidence row to supersede — fall back to insert.
+            evidence, _created = await self._insert_or_reuse_evidence_node(
+                conn, fields, execution_row=execution_row, kind=kind
+            )
+            return evidence
+        evidence_id = int(_record_get(existing, "id"))
+        updated = await conn.fetchrow(
+            """
+            UPDATE evidence_nodes
+            SET
+                status = $1,
+                name = $2,
+                summary = $3,
+                source_ref = $4,
+                input_refs = $5::jsonb,
+                output_refs = $6::jsonb,
+                content_hash = $7,
+                metadata = $8::jsonb,
+                payload = $9::jsonb,
+                updated_at = NOW()
+            WHERE id = $10
+            RETURNING *
+            """,
+            fields.get("status") or "approved",
+            fields.get("name") or "",
+            fields.get("summary") or "",
+            fields.get("source_ref") or "",
+            stable_json(fields.get("input_refs") or []),
+            stable_json(fields.get("output_refs") or []),
+            fields["content_hash"],
+            stable_json(fields.get("metadata") or {}),
+            stable_json(fields["payload"]),
+            evidence_id,
+        )
+        if updated is None:
+            raise RuntimeError(
+                "evidence node supersede could not update the evidence row"
+            )
+        return self._evidence_node_from_record(updated)
 
     async def _insert_legacy_event(
         self,
