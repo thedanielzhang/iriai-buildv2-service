@@ -222,7 +222,10 @@ class CloneSubstrate:
                     age = now - run.stat().st_mtime
                 except OSError:
                     age = max_age_s + 1
-                if age < max_age_s and keep_run_id is None:
+                # Only GC genuinely STALE (old) run dirs — never recent siblings.
+                # Keying on run_id just protects the current run; it must not make
+                # GC delete recent, in-use sibling clones.
+                if age < max_age_s:
                     continue
                 pidfile = run / "pids.json"
                 if pidfile.exists():

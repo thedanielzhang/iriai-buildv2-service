@@ -97,11 +97,19 @@ async def test_refuses_to_provision_inside_live_repo(tmp_path):
         await sub.clone_checkpoint(sources={"r": str(src)}, commits={"r": "HEAD"})
 
 
-def test_gc_removes_stale_run_dirs(tmp_path):
+def test_gc_removes_only_stale_run_dirs(tmp_path):
+    import os
+    import time
+
     base = tmp_path / "scratch"
     stale = base / "track" / "old-run"
     stale.mkdir(parents=True)
     (stale / "pids.json").write_text("[]")
+    # make it genuinely old (older than max_age)
+    old = time.time() - 10 * 3600
+    os.utime(stale, (old, old))
+    recent = base / "track" / "recent-run"  # a recent sibling — must survive
+    recent.mkdir(parents=True)
     keep = base / "track" / "keep-run"
     keep.mkdir(parents=True)
     removed = CloneSubstrate.gc_stale(
@@ -109,4 +117,6 @@ def test_gc_removes_stale_run_dirs(tmp_path):
     )
     assert any("old-run" in r for r in removed)
     assert not stale.exists()
+    # the fix: recent siblings + the current run are NEVER deleted
+    assert recent.exists()
     assert keep.exists()
