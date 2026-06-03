@@ -34,6 +34,7 @@ class PwTestResult:
     duration_ms: int
     error: str
     screenshots: list[str] = field(default_factory=list)
+    evidence: list[str] = field(default_factory=list)  # all attachments (trace/video/screenshot)
     retries: int = 0
 
 
@@ -92,11 +93,16 @@ def parse_playwright_json(report: dict[str, Any]) -> PwRunResult:
                 test_status = test.get("status", "")  # expected|unexpected|flaky|skipped
                 is_flaky = test_status == "flaky"
                 screenshots: list[str] = []
+                evidence: list[str] = []
                 errors: list[str] = []
                 for r in results:
                     for att in r.get("attachments", []) or []:
-                        if att.get("name") == "screenshot" and att.get("path"):
-                            screenshots.append(att["path"])
+                        path = att.get("path")
+                        if not path:
+                            continue
+                        evidence.append(path)
+                        if att.get("name") == "screenshot":
+                            screenshots.append(path)
                     if r.get("error"):
                         errors.append(_error_text(r["error"]))
                     for e in r.get("errors", []) or []:
@@ -127,6 +133,7 @@ def parse_playwright_json(report: dict[str, Any]) -> PwRunResult:
                         duration_ms=int(final.get("duration", 0) or 0),
                         error="; ".join(e for e in errors if e)[:1000],
                         screenshots=screenshots,
+                        evidence=evidence,
                         retries=retries,
                     )
                 )

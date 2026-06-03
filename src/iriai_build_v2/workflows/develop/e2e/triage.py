@@ -129,10 +129,18 @@ def native_results_to_verdicts(
                 summary=(match.error[:300] if status == "fail" else match.title),
                 changed_ac_ids=[],
                 critical=spec.critical,
-                evidence_path=(match.screenshots[0] if match.screenshots else ""),
+                evidence_path=_first_evidence(match),
             )
         )
     return verdicts
+
+
+def _first_evidence(t: Any) -> str:
+    ev = getattr(t, "evidence", None) or []
+    if ev:
+        return ev[0]
+    shots = getattr(t, "screenshots", None) or []
+    return shots[0] if shots else ""
 
 
 def _match_test(spec: E2ESpecRecord, native_tests: list[Any]) -> Any | None:
