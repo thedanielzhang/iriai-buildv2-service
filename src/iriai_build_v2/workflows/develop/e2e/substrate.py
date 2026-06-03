@@ -28,6 +28,7 @@ import os
 import shutil
 import signal
 import socket
+import subprocess
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -142,6 +143,61 @@ class CloneSubstrate:
                 )
             out[key] = RepoCheckout(key, src, commit, dst)
         return out
+
+    # Standard dep dirs for a multi-package JS project (VS Code fork has several
+    # nested node_modules — the build tooling deps live in build/node_modules).
+    DEFAULT_DEP_DIRS: tuple[str, ...] = (
+        "node_modules",
+        "build/node_modules",
+        "remote/node_modules",
+        "remote/web/node_modules",
+        "src/webviews/projectSurface/node_modules",
+    )
+
+    async def reuse_prebuilt_deps(
+        self,
+        checkout: Path,
+        source_repo: str,
+        *,
+        dep_dirs: tuple[str, ...] | None = None,
+        include_build: bool = True,
+    ) -> list[str]:
+        """Mirror the source checkout's installed deps into ``checkout`` via APFS
+        clonefile (``cp -Rc``: copy-on-write — fast, space-free, and writes go COW
+        so the live source is never mutated). This reuses the checkpoint's
+        already-installed ``node_modules`` (every nested one) + the prebuilt
+        ``.build`` instead of a fresh ``npm install``, which is the heavy build
+        cost the plan calls out. Returns the relative dirs that were mirrored.
+        """
+        src = Path(source_repo)
+        dst = Path(checkout)
+        if dep_dirs is not None:
+            targets = list(dep_dirs)
+        else:
+            # Discover EVERY top-level-per-package node_modules (a JS monorepo like
+            # a VS Code fork has many: root, build/, remote/, extensions/<each>/...).
+            # Exclude node_modules nested inside another node_modules (deps' deps).
+            res = subprocess.run(
+                ["find", str(src), "-type", "d", "-name", "node_modules",
+                 "-not", "-path", "*/node_modules/*"],
+                capture_output=True, text=True,
+            )
+            targets = [str(Path(line).relative_to(src))
+                       for line in res.stdout.splitlines() if line.strip()]
+        if include_build:
+            targets.append(".build")
+        copied: list[str] = []
+        for rel in targets:
+            s = src / rel
+            d = dst / rel
+            if s.exists() and not d.exists():
+                d.parent.mkdir(parents=True, exist_ok=True)
+                rc, _, err = await self._run("cp", "-Rc", str(s), str(d), timeout=600)
+                if rc == 0:
+                    copied.append(rel)
+                else:
+                    raise SubstrateError(f"clonefile {rel} failed: {err.strip()[:200]}")
+        return copied
 
     def _assert_out_of_tree(self, sources: dict[str, str]) -> None:
         run = self.run_dir.resolve()

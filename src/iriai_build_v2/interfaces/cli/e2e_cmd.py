@@ -123,23 +123,49 @@ async def _run(cmd: str, *, cwd: str, stream: bool = False) -> int:
     return proc.returncode or 0
 
 
-async def _e2e(feature: str, loop: bool) -> None:
+async def _e2e(feature: str, loop: bool, do_pass: bool) -> None:
+    from ...workflows.develop.e2e.checkpoint import fetch_latest_sealed_checkpoint
+    from ...workflows.develop.e2e.models import E2ETrackCursor
+    from ...workflows.develop.e2e.pass_ import run_full_pass
     from ...workflows.develop.e2e.runner_loop import AsyncE2ETrack, host_preflight
 
     pool, registry = await _open_scratch(feature)
     try:
-        track = AsyncE2ETrack(feature_id=feature, live_dsn=LIVE_DSN, registry=registry)
         pf = host_preflight()
         click.echo(f"preflight: ok={pf.ok} load={pf.load1:.1f} "
                    f"free_mem={pf.free_mem_gb:.1f}GB free_disk={pf.free_disk_gb:.0f}GB")
+
+        def _pass(cp):
+            return run_full_pass(cp, feature_id=feature, registry=registry,
+                                 live_dsn=LIVE_DSN, on_log=lambda m: click.echo("  " + m))
+
         if loop:
+            track = AsyncE2ETrack(feature_id=feature, live_dsn=LIVE_DSN,
+                                  registry=registry,
+                                  pass_fn=(_pass if do_pass else None))
             click.echo("Polling latest sealed checkpoint (read-only, no lock). Ctrl-C to stop.")
-            await track.run_loop(do_pass=False)
-        else:
-            res = await track.poll_once(do_pass=False)
-            cp = res.checkpoint
-            click.echo(f"latest sealed: group {cp.group_idx if cp else '?'} "
-                       f"advanced={res.advanced} {res.skipped_reason}")
+            await track.run_loop(do_pass=do_pass)
+            return
+
+        cp = await fetch_latest_sealed_checkpoint(feature, dsn=LIVE_DSN)
+        if cp is None:
+            click.echo("No sealed checkpoint found.")
+            return
+        if not do_pass:
+            click.echo(f"latest sealed: group {cp.group_idx} commits={cp.result_commits()}")
+            return
+        if not pf.ok:
+            click.echo(f"preflight abort (resource-bounded): {pf.reason}")
+            return
+        click.echo(f"running integrated e2e pass @ group {cp.group_idx} ...")
+        s = await run_full_pass(cp, feature_id=feature, registry=registry,
+                                live_dsn=LIVE_DSN, on_log=lambda m: click.echo("  " + m))
+        click.echo(f"PASS @ group {s.group_idx}: {s.detail}")
+        click.echo(f"  green={s.green} preview_url='{s.preview_url}' "
+                   f"backlog+={s.backlog_appended} open_reds={len(s.open_regressions)}")
+        head = next(iter(cp.result_commits().values()), "")
+        await registry.put_cursor(
+            E2ETrackCursor(last_processed_commit=head, group_idx=cp.group_idx))
     finally:
         if pool is not None:
             await pool.close()
@@ -161,9 +187,12 @@ def preview(feature: str, checkpoint: str, build: bool, launch: bool) -> None:
 @click.command("e2e")
 @click.option("--feature", required=True, help="Feature id, e.g. 8ac124d6")
 @click.option("--loop/--once", default=False)
-def e2e(feature: str, loop: bool) -> None:
+@click.option("--pass/--no-pass", "do_pass", default=True,
+              help="Run the full e2e pass (provision+smoke+replay+triage+status), "
+                   "or --no-pass for a read-only checkpoint poll")
+def e2e(feature: str, loop: bool, do_pass: bool) -> None:
     """Run the async e2e track (read-only against sealed checkpoints)."""
-    asyncio.run(_e2e(feature, loop))
+    asyncio.run(_e2e(feature, loop, do_pass))
 
 
 def register_e2e_commands(cli) -> None:
