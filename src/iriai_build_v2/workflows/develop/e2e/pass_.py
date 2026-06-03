@@ -121,10 +121,17 @@ async def run_full_pass(
     checkout = checkouts["iriai-studio"].checkout_dir
     # Mirror the deps the webview lanes need (root + projectSurface); each lane
     # self-builds its dist + self-boots its server in globalSetup/webServer.
+    # Mirror node_modules + the prebuilt webview dist(s) the `vite preview` lanes
+    # serve (badge/lifecycle/projectSurface), discovered from the source checkout.
+    live_studio = _live_repo(feature_id, "iriai-studio")
+    dep_dirs = ["node_modules", "src/webviews/projectSurface/node_modules"]
+    import glob as _glob
+    for d in _glob.glob(f"{live_studio}/src/webviews/*/dist") + _glob.glob(
+        f"{live_studio}/test/*/dist"
+    ):
+        dep_dirs.append(str(Path(d).relative_to(live_studio)))
     await sub.reuse_prebuilt_deps(
-        checkout, _live_repo(feature_id, "iriai-studio"),
-        dep_dirs=("node_modules", "src/webviews/projectSurface/node_modules"),
-        include_build=False)
+        checkout, live_studio, dep_dirs=tuple(dep_dirs), include_build=False)
     adapter = get_adapter(profile.adapter_id)
     instance = await adapter.provision(profile, Path(checkout))
     instance.substrate = sub
