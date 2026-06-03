@@ -18,6 +18,7 @@ import asyncio
 import contextlib
 import json
 import os
+import platform
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -40,6 +41,14 @@ class NativeRun:
     returncode: int
     stderr_tail: str
     report_path: str
+    applicable: bool = True
+    skip_reason: str = ""
+
+
+def _na_run(reason: str) -> "NativeRun":
+    return NativeRun(config="", result=PwRunResult(), returncode=0,
+                     stderr_tail="", report_path="", applicable=False,
+                     skip_reason=reason)
 
 
 class BrowserAdapter:
@@ -133,6 +142,76 @@ class BrowserAdapter:
         if instance.substrate is not None:
             with contextlib.suppress(Exception):
                 await instance.substrate.teardown()
+
+    # ------------------------------------------------------- config discovery
+    @staticmethod
+    def discover_configs(checkout: Path) -> list[str]:
+        """All native playwright configs in the checkout (webview lanes)."""
+        checkout = Path(checkout)
+        found: set[str] = set()
+        for pat in (
+            "playwright.config*.ts",
+            "test/*/playwright.config*.ts",
+            "playwright/*/playwright.config*.ts",
+        ):
+            for p in checkout.glob(pat):
+                if p.is_file():
+                    found.add(str(p.relative_to(checkout)))
+        return sorted(found)
+
+    # ------------------------------------------------- real-app (notarized DMG)
+    @staticmethod
+    def _discover_dmg(checkout: Path, dmg_path: str | None) -> str:
+        if dmg_path and Path(dmg_path).exists():
+            return dmg_path
+        env = os.environ.get("STUDIO_NOTARIZED_DMG")
+        if env and Path(env).exists():
+            return env
+        dist = Path(checkout) / "dist"
+        if dist.exists():
+            cands = sorted(dist.glob("Iriai-Studio-*-arm64.dmg"))
+            if len(cands) == 1:
+                return str(cands[0])
+        return ""
+
+    async def run_real_app_e2e(
+        self, instance: Instance, *, dmg_path: str | None = None,
+        spec_glob: str = "studio/test/e2e", timeout: float = _NATIVE_TIMEOUT_S,
+    ) -> NativeRun:
+        """Release-checkpoint case: run the REAL Electron app e2e specs, which
+        self-launch via Playwright `_electron.launch` from a notarized DMG.
+
+        Gated: darwin-only + a DMG must exist (``STUDIO_NOTARIZED_DMG`` or a
+        unique ``dist/Iriai-Studio-*-arm64.dmg``). Otherwise returns a
+        not-applicable NativeRun (``DMG_NOT_FOUND``) — the dev build never tests a
+        real-app launch, so this is expected until a release DMG is produced.
+        """
+        checkout = Path(instance.checkout_dir)
+        if platform.system() != "Darwin":
+            return _na_run("real-app e2e is darwin-only")
+        dmg = self._discover_dmg(checkout, dmg_path)
+        if not dmg:
+            return _na_run(
+                "DMG_NOT_FOUND: no notarized DMG; real-app launch is a "
+                "release-checkpoint capability (set STUDIO_NOTARIZED_DMG or "
+                "build dist/Iriai-Studio-*-arm64.dmg)"
+            )
+        report = checkout / ".e2e-report-realapp.json"
+        with contextlib.suppress(FileNotFoundError):
+            report.unlink()
+        env = {**os.environ, **instance.env, "STUDIO_NOTARIZED_DMG": dmg,
+               "PLAYWRIGHT_JSON_OUTPUT_NAME": str(report), "CI": "1"}
+        rc, _out, err = await self._sh(
+            ["npx", "playwright", "test", spec_glob, "--reporter=json"],
+            cwd=checkout, env=env, timeout=timeout)
+        data: dict[str, Any] = {}
+        if report.exists():
+            with contextlib.suppress(Exception):
+                data = json.loads(report.read_text())
+        result = parse_playwright_json(data) if data else PwRunResult(
+            global_errors=[f"no JSON report (rc={rc})"], web_server_ok=False)
+        return NativeRun(config=spec_glob, result=result, returncode=rc,
+                         stderr_tail=err[-2000:], report_path=str(report))
 
     # --------------------------------------------------------------- internals
     async def run_native_config(
