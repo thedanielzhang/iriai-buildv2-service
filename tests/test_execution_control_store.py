@@ -5805,7 +5805,7 @@ async def test_put_task_contract_changed_digest_supersedes_prior_active_scope() 
 
 
 @pytest.mark.asyncio
-async def test_put_task_contract_stale_replay_after_supersession_is_idempotent() -> None:
+async def test_put_task_contract_stale_replay_after_supersession_resolves_active_successor() -> None:
     module = _execution_control_module()
     conn = _FakeConnection()
     store = _store(_FakePool(conn))
@@ -5827,8 +5827,14 @@ async def test_put_task_contract_stale_replay_after_supersession_is_idempotent()
     second = await store.put_task_contract(changed)
     stale = await store.put_task_contract(original)
 
-    assert stale.contract.id == first.contract.id
-    assert stale.contract.status == "superseded"
+    # Recompiling the original (now superseded) contract on resume must resolve to
+    # the scope's CURRENT active contract, not resurrect the superseded row. A
+    # commit-hygiene write-set widening supersedes the narrow contract and compiles
+    # a wider active one; the merge-queue enqueue gate (_validate_contracts) rejects
+    # a superseded contract_id, so returning the superseded row here previously
+    # halted resume (feature 8ac124d6, group 80).
+    assert stale.contract.id == second.contract.id
+    assert stale.contract.status == "active"
     assert stale.created is False
     assert stale.execution.created is False
     assert len(conn.typed_rows) == 2

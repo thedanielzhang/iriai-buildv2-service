@@ -3804,8 +3804,28 @@ class ExecutionControlStore:
                     projection_links=tuple(links),
                     created=journal_created,
                 )
+                result_contract = contract_row
+                if (
+                    result_contract.status != "active"
+                    and str(fields["status"]) == "active"
+                ):
+                    # The idempotency-matched contract was superseded — typically by
+                    # a commit-hygiene write-set widening that compiled a wider
+                    # active contract for the same scope. Recompiling the original
+                    # narrow contract on resume re-surfaces this superseded row;
+                    # binding a merge-queue lane to it fails the active-contract
+                    # enqueue gate (_validate_contracts) and halts the workflow
+                    # (feature 8ac124d6, group 80). Return the scope's current
+                    # active contract so callers bind to the live one. The
+                    # compatibility projection above stays keyed to the matched
+                    # (narrow) contract, preserving per-idempotency-key identity.
+                    active_scope = await self._fetch_active_task_contract_for_scope(
+                        conn, fields
+                    )
+                    if active_scope is not None:
+                        result_contract = self._task_contract_from_record(active_scope)
                 return TaskContractResult(
-                    contract=contract_row,
+                    contract=result_contract,
                     execution=execution,
                     created=contract_created,
                 )
