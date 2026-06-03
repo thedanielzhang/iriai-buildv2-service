@@ -1513,3 +1513,82 @@ def test_run_command_raises_sandbox_error_on_timeout(tmp_path: Path, monkeypatch
     monkeypatch.setenv("IRIAI_SANDBOX_COMMAND_TIMEOUT_S", "0.5")
     with pytest.raises(sandbox_module.SandboxError, match="timed out"):
         runner._run_command(tmp_path, ["sleep", "5"])
+
+
+def _capturing_runner(
+    tmp_path: Path, source: Path, *, rc: int = 0
+) -> tuple[SandboxRunner, list[list[str]]]:
+    """Build a SandboxRunner whose command_runner records argv and returns rc."""
+    captured: list[list[str]] = []
+
+    def command_runner(cwd, argv, env):
+        captured.append([str(a) for a in argv])
+        return sandbox_module.CommandResult(returncode=rc, stdout=b"", stderr=b"")
+
+    runner = SandboxRunner(
+        workspace_root=tmp_path,
+        repo_sources={"app": source},
+        allowed_source_roots=[tmp_path],
+        command_runner=command_runner,
+    )
+    return runner, captured
+
+
+def test_provision_dependencies_clones_node_modules_via_cow(tmp_path: Path) -> None:
+    source = tmp_path / "src"
+    (source / "node_modules").mkdir(parents=True)
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    runner, captured = _capturing_runner(tmp_path, source)
+
+    runner._provision_sandbox_dependencies(repo_root, source)
+
+    assert captured == [
+        [
+            "cp",
+            "-c",
+            "-R",
+            str(source / "node_modules"),
+            str(repo_root / "node_modules"),
+        ]
+    ]
+
+
+def test_provision_dependencies_is_idempotent_when_dest_exists(tmp_path: Path) -> None:
+    source = tmp_path / "src"
+    (source / "node_modules").mkdir(parents=True)
+    repo_root = tmp_path / "repo"
+    (repo_root / "node_modules").mkdir(parents=True)
+    runner, captured = _capturing_runner(tmp_path, source)
+
+    runner._provision_sandbox_dependencies(repo_root, source)
+
+    assert captured == []
+
+
+def test_provision_dependencies_falls_back_to_npm_ci_with_lockfile(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "src"
+    source.mkdir()  # no node_modules to copy
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    (repo_root / "package-lock.json").write_text("{}", encoding="utf-8")
+    runner, captured = _capturing_runner(tmp_path, source)
+
+    runner._provision_sandbox_dependencies(repo_root, source)
+
+    assert captured == [["npm", "ci", "--prefer-offline", "--no-audit"]]
+
+
+def test_provision_dependencies_failure_does_not_raise(tmp_path: Path) -> None:
+    source = tmp_path / "src"
+    (source / "node_modules").mkdir(parents=True)
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    # rc != 0 on the cp, and no lockfile so no fallback succeeds -- must be silent.
+    runner, captured = _capturing_runner(tmp_path, source, rc=1)
+
+    runner._provision_sandbox_dependencies(repo_root, source)  # no exception
+
+    assert captured[0][0] == "cp"

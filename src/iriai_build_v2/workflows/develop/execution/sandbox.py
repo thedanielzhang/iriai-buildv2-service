@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import os
 import re
 import shutil
@@ -55,6 +56,9 @@ except Exception:  # pragma: no cover - import guard for partial deployments.
 from .types import RuntimeSandboxTaskBinding, SandboxWorkflowBlocker
 from ....models.outputs import ImplementationTask
 from ..._common._helpers import _write_context_text
+
+
+logger = logging.getLogger(__name__)
 
 
 SandboxMode = Literal["wave", "task", "repair", "canonicalization", "diagnostic"]
@@ -517,6 +521,15 @@ class SandboxRunner:
                         ["clone", "--no-local", str(source_resolved), str(repo_root)],
                     )
                     self._git_text(repo_root, ["checkout", "--detach", base_commit])
+                    # Restore gitignored dependencies (e.g. node_modules) so
+                    # in-sandbox tooling (tsc/tsgo/Playwright) can self-verify.
+                    # Off the event loop like the clone above: an APFS CoW copy
+                    # is fast but an npm-ci fallback can be slow.
+                    await asyncio.to_thread(
+                        self._provision_sandbox_dependencies,
+                        repo_root,
+                        source_resolved,
+                    )
                     self._validate_repo_root(
                         repo_root,
                         sandbox_root=sandbox_root,
@@ -2747,6 +2760,61 @@ class SandboxRunner:
                 f"git {' '.join(args)} failed in {cwd}: {stderr or result.returncode}"
             )
         return result.stdout
+
+    def _provision_sandbox_dependencies(
+        self, repo_root: Path, source_root: Path
+    ) -> None:
+        """Restore ``node_modules`` into a freshly-cloned sandbox repo.
+
+        The clone in :meth:`allocate` produces a working tree without
+        gitignored ``node_modules``, so in-sandbox ``tsc``/``tsgo`` are missing
+        and TS/Playwright tasks fail-close to ``partial``. The canonical source
+        repo already has dependencies installed; restore them via an APFS
+        copy-on-write clone (near-instant, no network) and only fall back to a
+        slow ``npm ci`` when the source has nothing to copy.
+
+        Best-effort: a provisioning failure only reproduces the pre-existing
+        no-tooling state, so this never raises — tasks that don't need the
+        toolchain must be unaffected.
+        """
+        try:
+            dest_modules = repo_root / "node_modules"
+            if dest_modules.exists():
+                return
+
+            source_modules = source_root / "node_modules"
+            if source_modules.is_dir():
+                result = self._run_command(
+                    repo_root,
+                    ["cp", "-c", "-R", str(source_modules), str(dest_modules)],
+                )
+                if result.returncode == 0:
+                    return
+                logger.warning(
+                    "sandbox dependency clone failed (rc=%s) copying %s -> %s; "
+                    "falling back",
+                    result.returncode,
+                    source_modules,
+                    dest_modules,
+                )
+
+            if (repo_root / "package-lock.json").is_file():
+                result = self._run_command(
+                    repo_root,
+                    ["npm", "ci", "--prefer-offline", "--no-audit"],
+                )
+                if result.returncode != 0:
+                    logger.warning(
+                        "sandbox dependency install failed (rc=%s) in %s",
+                        result.returncode,
+                        repo_root,
+                    )
+        except Exception as exc:  # pragma: no cover - best-effort guard.
+            logger.warning(
+                "sandbox dependency provisioning errored for %s: %s",
+                repo_root,
+                exc,
+            )
 
     def _run_command(
         self,
