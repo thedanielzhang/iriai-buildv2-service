@@ -4799,6 +4799,57 @@ async def test_workspace_snapshot_retry_ignores_volatile_capture_times() -> None
 
 
 @pytest.mark.asyncio
+async def test_workspace_snapshot_retry_tolerates_drifted_registry_digest() -> None:
+    # registry_digest is a digest over EVERY repo in the feature registry; a
+    # SIBLING repo advancing (e.g. a later DAG group's lane committing to a shared
+    # repo) drifts it without changing THIS repo's snapshot (its idempotency key
+    # encodes only this repo's head/index/worktree state). Re-recording the same
+    # per-repo snapshot under a drifted registry_digest must be idempotent, not an
+    # IdempotencyConflict — the "later group mutated shared repos" class.
+    module = _execution_control_module()
+    conn = _FakeConnection()
+    store = _store(_FakePool(conn))
+    first_payload = _workspace_snapshot_payload()
+    retry_payload = _workspace_snapshot_payload()
+    retry_payload["registry_digest"] = "registry-digest-2-drifted"
+    first = module.WorkspaceSnapshotEvidence(
+        feature_id=FEATURE_ID,
+        payload=first_payload,
+        dag_sha256=DAG_SHA256,
+        group_idx=45,
+        stage="retry-0",
+        repo_id="app",
+        canonical_path="/workspace/app",
+        registry_digest="registry-digest-1",
+        head_sha="abc123",
+        index_digest="index-digest-1",
+        worktree_status_digest="status-digest-1",
+    )
+    retry = module.WorkspaceSnapshotEvidence(
+        feature_id=FEATURE_ID,
+        payload=retry_payload,
+        dag_sha256=DAG_SHA256,
+        group_idx=45,
+        stage="retry-0",
+        repo_id="app",
+        canonical_path="/workspace/app",
+        registry_digest="registry-digest-2-drifted",
+        head_sha="abc123",
+        index_digest="index-digest-1",
+        worktree_status_digest="status-digest-1",
+    )
+
+    # Same per-repo identity (head/index/worktree) → identical idempotency key.
+    assert first.stable_idempotency_key == retry.stable_idempotency_key
+    await store.record_workspace_snapshot(first)
+    # Must NOT raise despite the drifted registry_digest — reused idempotently.
+    await store.record_workspace_snapshot(retry)
+
+    assert len(conn.typed_rows) == 1
+    assert len(conn.workspace_snapshots) == 1
+
+
+@pytest.mark.asyncio
 async def test_workspace_snapshot_retry_ignores_volatile_attempt_id() -> None:
     # attempt_id (retry*1000+repair_idx on the repair-dispatch path) changes on
     # every resume but is identity-irrelevant; re-recording the same snapshot under

@@ -6622,10 +6622,12 @@ class ExecutionControlStore:
                 "workspace snapshot idempotency key was reused with a different snapshot "
                 f"(differing stable keys: {_workspace_snapshot_differing_keys(row.payload, payload)})"
             )
-        if row.registry_digest != registry_digest:
-            raise IdempotencyConflict(
-                "workspace snapshot registry digest mismatch"
-            )
+        # `registry_digest` is intentionally NOT gated here: it is excluded from
+        # the snapshot identity (see _WORKSPACE_SNAPSHOT_NON_IDENTITY_KEYS) because
+        # a sibling repo advancing drifts it without changing THIS repo's snapshot.
+        # The per-repo idempotency key + the snapshot_digest above already prove the
+        # identity; a hard registry_digest equality check would fail-close a re-run
+        # of an earlier group after a later group touched a shared repo.
 
     def _validate_sandbox_lease_record(
         self,
@@ -9435,11 +9437,23 @@ def _workspace_snapshot_stable_payload(payload: dict[str, Any]) -> dict[str, Any
 # agent_writable_paths flips []<->[<feature path>] for the same git state), so
 # gating idempotency on them dead-locked resume. They remain in the stored payload
 # and the projection — only the identity digest ignores them.
+#
+# `registry_digest` is likewise NOT part of THIS snapshot's identity: a workspace
+# snapshot is per-repo (its idempotency key encodes only that repo's
+# head_sha/index/worktree state), but registry_digest is a digest over EVERY repo
+# in the feature registry. A SIBLING repo advancing (e.g. a later DAG group's lane
+# committing to a shared repo) drifts registry_digest even though this repo's git
+# state is unchanged — the same "later group mutated shared repos" class as the
+# resume-freshness gate. Gating snapshot idempotency on it makes a re-run of an
+# earlier group fail closed (`IdempotencyConflict`) after a later group touched a
+# shared repo. It stays in the stored payload/column for observability — only the
+# identity digest (and the column check below) ignore it.
 _WORKSPACE_SNAPSHOT_NON_IDENTITY_KEYS = frozenset({
     "attempt_id",
     "agent_writable_paths",
     "denied_paths",
     "outside_root_targets",
+    "registry_digest",
     "symlink_paths",
     "warnings",
 })
