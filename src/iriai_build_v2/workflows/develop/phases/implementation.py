@@ -14,7 +14,7 @@ import stat
 import subprocess
 import tempfile
 import time
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -2623,6 +2623,35 @@ async def _artifact_exists(
         return bool(await runner.artifacts.get(key, feature=feature))
     except Exception:
         return False
+
+
+async def _operator_guidance_by_task(
+    runner: WorkflowRunner,
+    feature: Feature,
+    task_ids: Iterable[str],
+) -> dict[str, str]:
+    """Read durable operator guidance for each task being re-dispatched.
+
+    An operator answers a task's filed question (a ``partial`` whose only
+    resolution is operator guidance) by writing the raw guidance text to the
+    ``operator-task-guidance:{task_id}`` artifact. The text is threaded into
+    that task's re-dispatch ``handover_context``, mirroring
+    ``commit_hygiene_feedback_by_task``. A missing artifact (the norm) returns
+    a falsy value and is skipped; a read error is treated as absent guidance.
+    """
+    guidance: dict[str, str] = {}
+    for tid in task_ids:
+        try:
+            raw = await runner.artifacts.get(
+                f"operator-task-guidance:{tid}", feature=feature
+            )
+        except Exception:  # noqa: BLE001 - absent guidance is the norm.
+            raw = None
+        if raw:
+            text = str(raw).strip()
+            if text:
+                guidance[tid] = text
+    return guidance
 
 
 async def _dag_group_has_control_plane_checkpoint_proof(
@@ -20839,6 +20868,15 @@ async def _implement_dag(
         # it MAY edit them to add the carve-out for its own subtree.
         commit_hygiene_widened_paths_by_task: dict[str, list[str]] = {}
 
+        # Durable operator guidance answering a task's filed question (a
+        # `partial` whose only resolution is operator guidance). An operator
+        # writes the raw guidance text to the `operator-task-guidance:{task_id}`
+        # artifact; we thread it into that task's re-dispatch handover_context,
+        # mirroring `commit_hygiene_feedback_by_task`. No contract/DAG/gate edit.
+        operator_guidance_by_task = await _operator_guidance_by_task(
+            runner, feature, group
+        )
+
         for tid in group:
             recovery_lane = commit_hygiene_recovery.get(tid)
             # A task whose lane already `integrated` (via some retry) must NOT be
@@ -21277,6 +21315,8 @@ async def _implement_dag(
                 # plumbing the dispatcher already files to disk when large.
                 task_handover_context = handover_context + (
                     commit_hygiene_feedback_by_task.get(t.id, "")
+                ) + (
+                    operator_guidance_by_task.get(t.id, "")
                 )
                 prefix = f"{repo_prefix}/" if repo_prefix else ""
                 inline_prompt = (
