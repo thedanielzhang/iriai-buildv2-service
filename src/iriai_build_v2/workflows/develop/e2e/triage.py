@@ -17,7 +17,9 @@ from __future__ import annotations
 import hashlib
 import re
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
+
+from .models import E2ESpecRecord, E2EVerdictRecord
 
 _WS = re.compile(r"\s+")
 
@@ -43,6 +45,103 @@ def assertion_digest(ac: Any) -> str:
 def compute_author_assertion_digests(acs: list[Any]) -> dict[str, str]:
     """Map AC-id -> assertion-scoped digest for the ACs a spec covers."""
     return {ac.id: assertion_digest(ac) for ac in acs if getattr(ac, "id", "")}
+
+
+def bind_specs_from_scenarios(
+    scenarios: list[Any],
+    ac_by_id: dict[str, Any],
+    *,
+    adapter_id: str,
+    author_commit: str,
+    source_commit: str = "",
+    test_plan_digest: str = "",
+    spec_path_for: Callable[[Any], str] | None = None,
+    critical_for: Callable[[Any], tuple[bool, str]] | None = None,
+) -> list[E2ESpecRecord]:
+    """Bind native scenarios to ACs + record assertion-scoped digests + provenance.
+
+    This is the orchestrator-computed provenance (the spec_author agent may also
+    run to author/bind native files; the assertion digests are ALWAYS computed
+    here over the ACs' semantic fields, never by the agent).
+    """
+    records: list[E2ESpecRecord] = []
+    for sc in scenarios:
+        linked = list(getattr(sc, "linked_acceptance", None) or [])
+        acs = [ac_by_id[a] for a in linked if a in ac_by_id]
+        digests = compute_author_assertion_digests(acs)
+        critical, justification = (critical_for(sc) if critical_for else (False, ""))
+        records.append(
+            E2ESpecRecord(
+                spec_id=getattr(sc, "id", ""),
+                scenario_id=getattr(sc, "id", ""),
+                title=getattr(sc, "name", ""),
+                adapter_id=adapter_id,
+                priority=getattr(sc, "priority", ""),
+                critical=critical,
+                critical_justification=justification,
+                linked_ac_ids=[ac.id for ac in acs],
+                author_assertion_digests=digests,
+                author_commit=author_commit,
+                source_commit=source_commit,
+                test_plan_digest=test_plan_digest,
+                spec_path=(spec_path_for(sc) if spec_path_for else ""),
+            )
+        )
+    return records
+
+
+def native_results_to_verdicts(
+    specs: list[E2ESpecRecord],
+    native_tests: list[Any],
+    *,
+    source_commit: str,
+) -> list[E2EVerdictRecord]:
+    """Map a native @playwright/test run's per-test results onto bound specs.
+
+    A spec matches a native test when the test title/file references the spec's
+    title or scenario id. Produces one verdict per spec (status + evidence).
+    """
+    verdicts: list[E2EVerdictRecord] = []
+    for spec in specs:
+        match = _match_test(spec, native_tests)
+        if match is None:
+            verdicts.append(
+                E2EVerdictRecord(
+                    spec_id=spec.spec_id, source_commit=source_commit,
+                    status="skipped", summary="no native test matched", critical=spec.critical,
+                )
+            )
+            continue
+        if match.flaky:
+            status, fclass = "pass", "flaky"
+        elif match.status == "passed":
+            status, fclass = "pass", ""
+        elif match.status == "skipped":
+            status, fclass = "skipped", ""
+        else:
+            status, fclass = "fail", ""
+        verdicts.append(
+            E2EVerdictRecord(
+                spec_id=spec.spec_id,
+                source_commit=source_commit,
+                status=status,
+                failure_class=fclass,
+                summary=(match.error[:300] if status == "fail" else match.title),
+                changed_ac_ids=[],
+                critical=spec.critical,
+                evidence_path=(match.screenshots[0] if match.screenshots else ""),
+            )
+        )
+    return verdicts
+
+
+def _match_test(spec: E2ESpecRecord, native_tests: list[Any]) -> Any | None:
+    needles = [n for n in (spec.title, spec.scenario_id, spec.spec_id) if n]
+    for t in native_tests:
+        hay = f"{getattr(t, 'title', '')} {getattr(t, 'file', '')}".lower()
+        if any(n.lower() in hay for n in needles):
+            return t
+    return None
 
 
 @dataclass

@@ -107,3 +107,55 @@ def test_compute_author_assertion_digests():
     digs = compute_author_assertion_digests(acs)
     assert set(digs) == {"AC-1", "AC-2"}
     assert digs["AC-1"] != digs["AC-2"]
+
+
+# ---- author binding + native-result mapping (AC6 building blocks) -----------
+
+def test_bind_specs_records_digests_and_author_commit():
+    from types import SimpleNamespace
+
+    from iriai_build_v2.workflows.develop.e2e.triage import bind_specs_from_scenarios
+
+    ac1 = _ac("AC-1", "badge shows count", vs="comp#badge")
+    ac_by_id = {"AC-1": ac1}
+    scenarios = [SimpleNamespace(id="S-badge", name="badge",
+                                 linked_acceptance=["AC-1"], priority="p0")]
+    specs = bind_specs_from_scenarios(
+        scenarios, ac_by_id, adapter_id="browser", author_commit="0d480cd",
+        source_commit="0d480cd",
+        critical_for=lambda sc: (True, "downstream prereq"),
+    )
+    assert len(specs) == 1
+    spec = specs[0]
+    assert spec.author_commit == "0d480cd"
+    assert spec.linked_ac_ids == ["AC-1"]
+    # the digest is the SEMANTIC-field digest, not a whole-AC content digest
+    assert spec.author_assertion_digests["AC-1"] == assertion_digest(ac1)
+    assert spec.critical is True
+
+
+def test_native_results_to_verdicts_maps_status_and_evidence():
+    from types import SimpleNamespace
+
+    from iriai_build_v2.workflows.develop.e2e.models import E2ESpecRecord
+    from iriai_build_v2.workflows.develop.e2e.triage import native_results_to_verdicts
+
+    specs = [
+        E2ESpecRecord(spec_id="S-pass", title="badge shows count",
+                      linked_ac_ids=["AC-1"]),
+        E2ESpecRecord(spec_id="S-fail", title="count updates",
+                      linked_ac_ids=["AC-2"], critical=True),
+    ]
+    native = [
+        SimpleNamespace(title="badge shows count", file="badge.spec.ts",
+                        status="passed", flaky=False, error="", screenshots=[]),
+        SimpleNamespace(title="count updates", file="badge.spec.ts",
+                        status="failed", flaky=False, error="expected 3 got 0",
+                        screenshots=["/tmp/x.png"]),
+    ]
+    verdicts = native_results_to_verdicts(specs, native, source_commit="cafe")
+    by_id = {v.spec_id: v for v in verdicts}
+    assert by_id["S-pass"].status == "pass"
+    assert by_id["S-fail"].status == "fail"
+    assert by_id["S-fail"].evidence_path == "/tmp/x.png"
+    assert by_id["S-fail"].critical is True
