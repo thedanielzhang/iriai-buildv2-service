@@ -712,6 +712,39 @@ async def test_checkpoint_fails_closed_and_routes_a_failed_drained_lane(
     assert projection is None
 
 
+def test_checkpoint_coverage_redrivable_only_for_all_covered_transient() -> None:
+    """The live-drain checkpoint coverage-not-approved classifier is precise.
+
+    A group whose every task is covered (``missing=[]``, ``duplicate=[]``) but
+    whose failed retry-source lanes are transiently not-yet-seen as superseded is
+    a re-drivable transient (feature 8ac124d6 group 80 sat ``workflow_blocked``
+    ~7h on exactly this: the in-process drain checkpointed the instant the final
+    lane integrated, before the commit was visible to the checkpoint's fresh
+    read). Such a failure must classify recoverable so the orchestrator
+    auto-continues the settled resume re-drive instead of dead-halting. A genuine
+    ``missing``/``duplicate`` coverage gap or a checkpoint exception/decline must
+    stay a non-recoverable hard halt.
+    """
+
+    g = "durable merge queue group 80 checkpoint "
+    assert impl._checkpoint_coverage_redrivable(
+        g + "coverage is not approved (missing=[], duplicate=[], failed=[21, 24])"
+    ) is True
+    # Genuine missing task — never auto-continue a real coverage gap.
+    assert impl._checkpoint_coverage_redrivable(
+        g + "coverage is not approved (missing=['TASK-2'], duplicate=[], failed=[])"
+    ) is False
+    # Genuine duplicate coverage — hard halt.
+    assert impl._checkpoint_coverage_redrivable(
+        g + "coverage is not approved (missing=[], duplicate=['TASK-1'], failed=[])"
+    ) is False
+    # A real checkpoint exception / decline is not a coverage transient.
+    assert impl._checkpoint_coverage_redrivable(g + "raised RuntimeError: boom") is False
+    assert impl._checkpoint_coverage_redrivable("coordinator declined") is False
+    assert impl._checkpoint_coverage_redrivable(None) is False
+    assert impl._checkpoint_coverage_redrivable("") is False
+
+
 # ── fail closed: no silent fallback to the legacy checkpoint ─────────────────
 
 

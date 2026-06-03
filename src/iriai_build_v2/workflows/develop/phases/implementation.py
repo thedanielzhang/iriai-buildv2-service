@@ -7413,6 +7413,31 @@ async def _drain_durable_merge_queue_for_feature(
 # `_MergeQueueCheckpointResult` is shimmed from `..execution.types` (Slice 11a).
 
 
+def _checkpoint_coverage_redrivable(detail: str | None) -> bool:
+    """Is a live-drain checkpoint failure a re-drivable coverage transient?
+
+    The live `_implement_dag` drain only reaches the group checkpoint once the
+    drain has integrated EVERY lane (a lane that could not integrate returns at
+    the earlier drain-failure path). So a ``coverage is not approved`` checkpoint
+    failure with ``missing=[]`` and ``duplicate=[]`` means every expected task is
+    covered by exactly one candidate lane yet the just-committed state was not
+    visible to the checkpoint's fresh read (the failed retry-source lanes were
+    not yet seen as superseded) — a transient that the settled resume re-drive
+    resolves. A genuine ``missing``/``duplicate`` coverage gap, a ``checkpoint
+    raised``/``coordinator declined`` failure, stay non-recoverable immediate
+    halts. Match the typed detail string built by
+    ``_checkpoint_durable_merge_queue_group`` (the existing direct-call
+    checkpoint tests assert ``"not approved" in result.detail``).
+    """
+
+    text = detail or ""
+    return (
+        "coverage is not approved" in text
+        and "missing=[]" in text
+        and "duplicate=[]" in text
+    )
+
+
 async def _checkpoint_durable_merge_queue_group(
     runner: WorkflowRunner,
     feature: Feature,
@@ -22035,11 +22060,41 @@ async def _implement_dag(
                             ),
                         },
                     )
+                    # A `coverage_not_approved` checkpoint failure on the LIVE
+                    # drain path is a re-drivable transient, not a genuine halt:
+                    # the drain integrates the final lane and then immediately
+                    # checkpoints in a fresh connection; if that read does not yet
+                    # observe the just-committed integration, coverage is
+                    # transiently unapproved even though every task is integrated
+                    # or transitively superseded. The settled resume re-drive
+                    # (`_resume_recover_durable_merge_queue_group`) recomputes
+                    # coverage from the fully-committed, quiesced state and seals.
+                    # Classify it recoverable so the orchestrator auto-continues
+                    # that re-drive instead of dead-halting for an operator
+                    # (observed: group 80 sat `workflow_blocked` ~7h on exactly
+                    # this). The progress_token is the coverage signature (the
+                    # detail embeds missing/duplicate/failed): a genuinely
+                    # unapprovable group keeps the same signature across re-drives,
+                    # so it trips the auto-continue no-progress cap and surfaces as
+                    # a defect; a transient changes (seals) on the first re-drive.
+                    coverage_redrivable = _checkpoint_coverage_redrivable(
+                        checkpoint_result.detail
+                    )
                     return _merge_queue_group_blocked(
                         "Durable merge queue group checkpoint did not complete "
                         f"for group {group_idx}: {checkpoint_result.detail}. "
                         "The failure was routed through the typed failure "
-                        "router; the legacy checkpoint is not a fallback."
+                        "router; the legacy checkpoint is not a fallback.",
+                        recoverable=coverage_redrivable,
+                        recovery_class=(
+                            "checkpoint_redrive" if coverage_redrivable else ""
+                        ),
+                        progress_token=(
+                            f"checkpoint-redrive:g{group_idx}:"
+                            f"{checkpoint_result.detail}"
+                            if coverage_redrivable
+                            else ""
+                        ),
                     )
 
                 # ── Group landed via the durable queue. The single
