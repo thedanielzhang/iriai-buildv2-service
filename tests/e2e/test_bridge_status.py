@@ -7,7 +7,11 @@ from types import SimpleNamespace
 import pytest
 from pydantic import BaseModel
 
-from iriai_build_v2.workflows.develop.e2e.bridge import bridge_findings
+from iriai_build_v2.workflows.develop.e2e.bridge import (
+    LaneBuildFailure,
+    bridge_build_failures,
+    bridge_findings,
+)
 from iriai_build_v2.workflows.develop.e2e.models import (
     E2ESpecRecord,
     E2EVerdictRecord,
@@ -93,6 +97,35 @@ async def test_critical_regression_is_paged_not_backlogged():
     assert res.appended == []
     assert len(res.critical) == 1 and res.critical[0].spec_id == "S1"
     assert "enhancement-backlog" not in reg.store  # nothing backlogged
+
+
+@pytest.mark.asyncio
+async def test_build_failure_lands_in_backlog_as_build_finding():
+    reg = FakeRegistry()
+    fails = [LaneBuildFailure(lane="playwright.config.badge.ts",
+                              error='"SanitizedMarkdown" is not exported by ...')]
+    res = await bridge_build_failures(reg, fails, checkpoint_label="group 80",
+                                      file="src/webviews/projectSurface/vite.config.ts")
+    assert len(res.appended) == 1
+    item = res.appended[0]
+    assert item.source == "e2e_preview_build" and item.category == "build"
+    assert item.severity == "major"
+    assert "group 80" in item.description and "badge" in item.description
+    assert item.file == "src/webviews/projectSurface/vite.config.ts"
+    assert reg.store["enhancement-backlog"]["items"][0]["category"] == "build"
+
+
+@pytest.mark.asyncio
+async def test_build_failures_sharing_root_cause_dedupe():
+    reg = FakeRegistry()
+    err = '"SanitizedMarkdown" is not exported by studio/packages/markdown-sanitizer'
+    fails = [
+        LaneBuildFailure(lane="playwright.config.badge.ts", error=err),
+        LaneBuildFailure(lane="playwright.config.lifecycle.ts", error=err),
+    ]
+    res = await bridge_build_failures(reg, fails, checkpoint_label="group 80")
+    # same root-cause error -> Jaccard dedupe collapses to a single finding
+    assert len(res.appended) == 1 and len(res.deduped) == 1
 
 
 @pytest.mark.asyncio

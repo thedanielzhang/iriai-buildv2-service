@@ -199,6 +199,53 @@ class CloneSubstrate:
                     raise SubstrateError(f"clonefile {rel} failed: {err.strip()[:200]}")
         return copied
 
+    async def link_file_deps(
+        self, checkout: Path, *, package_jsons: tuple[str, ...] = ("package.json",),
+    ) -> list[str]:
+        """Recreate the symlinks ``npm install`` makes for ``file:`` deps.
+
+        The clonefile'd ``node_modules`` is reused from the source checkout for
+        speed, but it predates any ``file:`` workspace dependency the project
+        declared later (the source's own ``node_modules`` may simply lack them).
+        npm materializes ``"<name>": "file:./path"`` as a symlink
+        ``node_modules/<name> -> <path>``; we reproduce exactly that link from the
+        project's OWN ``package.json`` so the project's OWN production build can
+        resolve its workspace packages via Node resolution. We never install,
+        build, or patch those packages — ONLY the link npm itself would have made
+        — so a genuine product build defect (e.g. a CJS/ESM interop break) still
+        surfaces honestly as a lane boot failure instead of being masked.
+
+        Returns the dep names that were freshly linked.
+        """
+        checkout = Path(checkout)
+        linked: list[str] = []
+        for pj in package_jsons:
+            pkg = checkout / pj
+            if not pkg.is_file():
+                continue
+            try:
+                data = json.loads(pkg.read_text())
+            except (OSError, ValueError):
+                continue
+            deps = {**(data.get("dependencies") or {}),
+                    **(data.get("devDependencies") or {})}
+            nm_root = pkg.parent / "node_modules"
+            for name, spec in deps.items():
+                if not isinstance(spec, str) or not spec.startswith("file:"):
+                    continue
+                target = pkg.parent / spec[len("file:"):]
+                if not target.exists():
+                    continue
+                link = nm_root / name  # name may be scoped: @scope/pkg
+                if link.is_symlink() or link.exists():
+                    continue  # a real install / prior link already satisfies it
+                link.parent.mkdir(parents=True, exist_ok=True)
+                rel = os.path.relpath(target, link.parent)
+                with contextlib.suppress(OSError):
+                    os.symlink(rel, link)
+                    linked.append(name)
+        return linked
+
     def _assert_out_of_tree(self, sources: dict[str, str]) -> None:
         run = self.run_dir.resolve()
         for src in sources.values():

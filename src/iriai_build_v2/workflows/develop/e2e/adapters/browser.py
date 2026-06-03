@@ -227,6 +227,9 @@ class BrowserAdapter:
             **instance.env,
             "PLAYWRIGHT_JSON_OUTPUT_NAME": str(report),
             "CI": "1",
+            # Studio e2e lanes gate execution on this flag; default it on so the
+            # journey assertions actually run (overridable from the environment).
+            "IRIAI_STUDIO_RUN_TESTS": os.environ.get("IRIAI_STUDIO_RUN_TESTS", "1"),
         }
         cmd = ["npx", "playwright", "test", f"--config={config}",
                "--reporter=json", *extra_args]

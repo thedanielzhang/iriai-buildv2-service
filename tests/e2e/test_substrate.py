@@ -97,6 +97,64 @@ async def test_refuses_to_provision_inside_live_repo(tmp_path):
         await sub.clone_checkpoint(sources={"r": str(src)}, commits={"r": "HEAD"})
 
 
+@pytest.mark.asyncio
+async def test_link_file_deps_creates_npm_equivalent_symlinks(tmp_path):
+    import json
+
+    checkout = tmp_path / "iriai-studio"
+    (checkout / "node_modules").mkdir(parents=True)
+    # a scoped + an unscoped file: dep, both pointing at real package dirs
+    pkg_md = checkout / "studio" / "packages" / "markdown-sanitizer"
+    pkg_md.mkdir(parents=True)
+    (pkg_md / "index.js").write_text("module.exports = {}")
+    pkg_bc = checkout / "studio" / "packages" / "bridge-client"
+    pkg_bc.mkdir(parents=True)
+    (pkg_bc / "index.js").write_text("module.exports = {}")
+    (checkout / "package.json").write_text(json.dumps({
+        "dependencies": {
+            "@iriai-studio/markdown-sanitizer":
+                "file:./studio/packages/markdown-sanitizer",
+            "regular-dep": "^1.0.0",  # non-file: -> ignored
+        },
+        "devDependencies": {
+            "bridge-client": "file:./studio/packages/bridge-client",
+        },
+    }))
+    sub = CloneSubstrate(run_id="lfd", base_dir=tmp_path / "sc", nice=False)
+    linked = await sub.link_file_deps(checkout)
+    assert set(linked) == {"@iriai-studio/markdown-sanitizer", "bridge-client"}
+
+    scoped = checkout / "node_modules" / "@iriai-studio" / "markdown-sanitizer"
+    plain = checkout / "node_modules" / "bridge-client"
+    # symlink exists, resolves to the real package index.js (relative target)
+    assert scoped.is_symlink() and (scoped / "index.js").exists()
+    assert plain.is_symlink() and (plain / "index.js").exists()
+    import os as _os
+    assert not _os.path.isabs(_os.readlink(scoped))  # relative, self-contained
+    # non-file: deps are never linked
+    assert not (checkout / "node_modules" / "regular-dep").exists()
+
+
+@pytest.mark.asyncio
+async def test_link_file_deps_leaves_existing_links_untouched(tmp_path):
+    import json
+    import os as _os
+
+    checkout = tmp_path / "co"
+    nm = checkout / "node_modules" / "@s"
+    nm.mkdir(parents=True)
+    real = checkout / "pkgs" / "p"
+    real.mkdir(parents=True)
+    (real / "index.js").write_text("x")
+    # a pre-existing (e.g. real-install) link must NOT be clobbered
+    _os.symlink("../../pkgs/p", nm / "p")
+    (checkout / "package.json").write_text(json.dumps({
+        "dependencies": {"@s/p": "file:./pkgs/p"}}))
+    sub = CloneSubstrate(run_id="lfd2", base_dir=tmp_path / "sc", nice=False)
+    linked = await sub.link_file_deps(checkout)
+    assert linked == []  # already satisfied -> nothing newly linked
+
+
 def test_gc_removes_only_stale_run_dirs(tmp_path):
     import os
     import time

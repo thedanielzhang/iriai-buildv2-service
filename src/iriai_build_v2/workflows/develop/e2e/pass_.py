@@ -25,10 +25,16 @@ import asyncpg
 from iriai_build_v2.models.outputs import TestPlan
 
 from .adapters import get_adapter
-from .bridge import bridge_findings
+from .bridge import LaneBuildFailure, bridge_build_failures, bridge_findings
 from .checkpoint import SealedCheckpoint
 from .models import E2ESpecRecord, ProjectProfile
-from .status import CapturingPoster, build_status, emit_status, green_pointer_for
+from .status import (
+    CapturingPoster,
+    build_status,
+    emit_status,
+    green_pointer_for,
+    page_critical,
+)
 from .substrate import CloneSubstrate
 from .triage import bind_specs_from_scenarios, native_results_to_verdicts
 
@@ -47,6 +53,14 @@ class LaneResult:
     flaky: int = 0
     started: bool = False
     detail: str = ""
+    boot_error: str = ""  # set ONLY on a real build/webServer failure
+
+    @property
+    def boot_failed(self) -> bool:
+        """True iff a real build/webServer failure was recorded. A genuinely-empty
+        lane (0 spec files, clean report) leaves ``boot_error`` empty and is NOT a
+        boot failure."""
+        return bool(self.boot_error)
 
 
 @dataclass
@@ -69,6 +83,34 @@ class PassSummary:
 
 def _live_repo(feature: str, repo_key: str) -> str:
     return LIVE_REPO_TMPL.format(feature=feature, repo=repo_key)
+
+
+# A genuinely-empty lane (0 spec files) surfaces ONLY this in the native report —
+# it is NOT a build failure and must never become a finding.
+_EMPTY_LANE_MARKERS = ("no tests found", "no tests to run")
+
+
+def lane_boot_error(run: Any, stderr_tail: str = "") -> str:
+    """Build/webServer failure text for a lane, or '' if the lane is healthy OR
+    genuinely empty.
+
+    A real failure is a webServer that didn't come up, or a globalSetup error
+    captured in the native report. A genuinely-empty lane (0 spec files) reports
+    only "No tests found" — Playwright puts that in the report's top-level errors
+    too, so we must filter it out, or the empty lane would be misreported as a
+    build regression.
+    """
+    real_errors = [
+        e for e in run.global_errors
+        if not any(m in e.lower() for m in _EMPTY_LANE_MARKERS)
+    ]
+    if (not run.web_server_ok) or (not run.started and real_errors):
+        return (
+            "; ".join(real_errors).strip()
+            or stderr_tail[-400:].strip()
+            or "harness did not produce a runnable surface"
+        )
+    return ""
 
 
 async def _load_latest(conn, feature: str, key: str):
@@ -132,6 +174,14 @@ async def run_full_pass(
         dep_dirs.append(str(Path(d).relative_to(live_studio)))
     await sub.reuse_prebuilt_deps(
         checkout, live_studio, dep_dirs=tuple(dep_dirs), include_build=False)
+    # Reconcile node_modules with the project's own package.json `file:` deps
+    # (the clonefile'd node_modules predates them). This is the npm-equivalent
+    # link the production webview build needs to resolve workspace packages
+    # (e.g. @iriai-studio/markdown-sanitizer); it does NOT patch the product, so
+    # a genuine build defect still fails the lane honestly.
+    linked = await sub.link_file_deps(checkout)
+    if linked:
+        on_log(f"linked {len(linked)} file: workspace dep(s): {', '.join(linked)}")
     adapter = get_adapter(profile.adapter_id)
     instance = await adapter.provision(profile, Path(checkout))
     instance.substrate = sub
@@ -163,9 +213,11 @@ async def run_full_pass(
             on_log(f"running lane {cfg} ...")
             nr = await adapter.run_native_config(instance, cfg, timeout=900)
             run = nr.result
+            boot_error = lane_boot_error(run, nr.stderr_tail)
             lr = LaneResult(config=cfg, web_server_ok=run.web_server_ok,
                             passed=run.passed, failed=run.failed, flaky=run.flaky,
-                            started=run.started, detail=run.summary())
+                            started=run.started, detail=run.summary(),
+                            boot_error=boot_error)
             summary.lanes.append(lr)
             summary.passed += run.passed
             summary.failed += run.failed
@@ -188,13 +240,38 @@ async def run_full_pass(
                 summary.real_app = (f"ran: {ra.result.summary()}")
             on_log(f"real-app e2e: {summary.real_app}")
 
-        summary.boot_smoke = "pass" if any_started else "fail"
+        label = f"group {checkpoint.group_idx}"
+        # A lane whose globalSetup production build / webServer never came up is a
+        # boot-smoke failure (NOT a genuinely-empty 0-spec lane). It blocks green
+        # even if a lighter lane (chat via vite dev) booted fine.
+        boot_failed = [lr for lr in summary.lanes if lr.boot_failed]
+        summary.boot_smoke = "pass" if (any_started and not boot_failed) else "fail"
         summary.open_regressions = [v.spec_id for v in all_verdicts if v.status == "fail"]
 
         br = await bridge_findings(
             registry, [v for v in all_verdicts if v.failure_class == "regression"],
-            {s.spec_id: s for s in specs}, checkpoint_label=f"group {checkpoint.group_idx}")
+            {s.spec_id: s for s in specs}, checkpoint_label=label)
         summary.backlog_appended = len(br.appended)
+
+        # Build/boot failures -> precise backlog finding (deduped) + a NON-deduped
+        # operator page (the critical tier), and they keep latest-green from
+        # advancing via the open_critical count below.
+        if boot_failed:
+            bf = await bridge_build_failures(
+                registry,
+                [LaneBuildFailure(lane=lr.config, error=lr.boot_error[:500])
+                 for lr in boot_failed],
+                checkpoint_label=label,
+                file="src/webviews/projectSurface/vite.config.ts")
+            summary.backlog_appended += len(bf.appended)
+            await page_critical(
+                registry, poster=poster, checkpoint_label=label,
+                boot_smoke_failures=[
+                    type("BS", (), {"surface": lr.config,
+                                    "detail": lr.boot_error[:300]})()
+                    for lr in boot_failed])
+            on_log(f"  boot-smoke FAIL on {len(boot_failed)} lane(s); "
+                   f"backlog+={len(bf.appended)} (paged)")
 
         preview_url = (f"iriai-build-v2 preview --feature {feature_id} "
                        f"--checkpoint {checkpoint.group_idx}")

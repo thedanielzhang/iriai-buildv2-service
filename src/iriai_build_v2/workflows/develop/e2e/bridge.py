@@ -103,6 +103,58 @@ async def bridge_findings(
     return result
 
 
+@dataclass
+class LaneBuildFailure:
+    lane: str
+    error: str
+
+
+async def bridge_build_failures(
+    registry: Any,
+    failures: list[LaneBuildFailure],
+    *,
+    checkpoint_label: str,
+    severity: str = "major",
+    source: str = "e2e_preview_build",
+    category: str = "build",
+    file: str = "",
+) -> BridgeResult:
+    """Append boot-smoke/preview-build failures to the backlog (deduped).
+
+    A lane whose globalSetup production build (or webServer) fails to come up is
+    a boot-smoke regression — exactly the mid-stream build break this subsystem
+    exists to surface. Unlike a test-level regression it cannot be authored from
+    an ``E2EVerdictRecord`` (zero specs ran), so this is a separate, narrow path.
+    Boot-smoke failures ALSO page via ``status.page_critical``; this records the
+    durable, end-of-DAG-pickup-compatible backlog item with the failing
+    ``file`` + the exact build error. Findings sharing a root cause collapse via
+    the same Jaccard dedupe as ``bridge_findings``.
+    """
+    raw = await registry.get_raw(ENHANCEMENT_BACKLOG_KEY)
+    backlog = _load_backlog(raw)
+    existing = [it.description for it in backlog.items]
+    result = BridgeResult()
+    for f in failures:
+        desc = (
+            f"[e2e preview-build @ {checkpoint_label}] [build] {f.lane}: "
+            f"{f.error}"
+        ).strip()
+        if _is_dupe(desc, existing):
+            result.deduped.append(desc)
+            continue
+        item = EnhancementItem(
+            source=source, severity=severity, description=desc, file=file,
+            category=category, task_context=checkpoint_label,
+        )
+        backlog.items.append(item)
+        existing.append(desc)
+        result.appended.append(item)
+    if result.appended:
+        await registry.put_raw(ENHANCEMENT_BACKLOG_KEY, backlog)
+    result.backlog_size = len(backlog.items)
+    return result
+
+
 def _load_backlog(raw: Any) -> EnhancementBacklog:
     if raw is None:
         return EnhancementBacklog(items=[])
