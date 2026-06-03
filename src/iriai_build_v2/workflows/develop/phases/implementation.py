@@ -9500,10 +9500,14 @@ _COMMIT_HYGIENE_SHARED_CONFIG_ALLOWLIST: frozenset[str] = frozenset(
 )
 
 # Stable hook-stderr line form the parse helper recognizes:
-#   `<abs-path>: line L, col C, Warning - <msg> (local/<rule>)`
-# Captures the offending absolute path and the `local/<rule>` rule id.
+#   `[HH:MM:SS] <abs-path>: line L, col C, Warning - <msg> (local/<rule>)`
+# Captures the offending absolute path and the `local/<rule>` rule id. The
+# product hook is run via gulp, which prefixes each line with a `[HH:MM:SS]`
+# timestamp; that optional prefix MUST be stripped before the path group, or the
+# captured "path" carries the timestamp and never normalizes to a repo-relative
+# path (so the offender silently fails the in-contract check and widening no-ops).
 _COMMIT_HYGIENE_HOOK_LINE_RE = re.compile(
-    r"^(?P<path>\S.*?):\s*line\s+\d+,\s*col\s+\d+,\s*\w+\s*-\s*.*?\((?P<rule>local/[^)]+)\)\s*$"
+    r"^(?:\[\d{1,2}:\d{2}:\d{2}\]\s+)?(?P<path>\S.*?):\s*line\s+\d+,\s*col\s+\d+,\s*\w+\s*-\s*.*?\((?P<rule>local/[^)]+)\)\s*$"
 )
 
 

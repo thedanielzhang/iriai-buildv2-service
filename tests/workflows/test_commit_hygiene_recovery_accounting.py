@@ -741,6 +741,40 @@ def test_parse_hook_offenders_ignores_unparseable_lines():
     assert rules == []
 
 
+def test_parse_hook_offenders_strips_gulp_timestamp_prefix():
+    # The product hygiene hook runs via gulp, which prefixes every stderr line
+    # with a `[HH:MM:SS]` timestamp. The path capture MUST skip it — otherwise the
+    # captured "path" carries the timestamp, never normalizes to a repo-relative
+    # path, and the widening silently no-ops (the real Group-79 failure mode).
+    detail = (
+        "commit_hygiene: commit hook failed (exit 1)\nstderr:\n"
+        "[22:26:50] /repo/app/impl/selection/a.ts: line 1, col 1, Warning - "
+        "Missing definition in `code-import-patterns` for this file. "
+        "(local/code-import-patterns)"
+    )
+    paths, rules = _parse_commit_hygiene_hook_offenders(detail)
+    assert paths == ["/repo/app/impl/selection/a.ts"]
+    assert rules == ["local/code-import-patterns"]
+
+
+def test_widen_grants_eslint_for_timestamped_hook_lines(tmp_path: Path):
+    # End-to-end with the REAL gulp `[HH:MM:SS]`-prefixed stderr format: the
+    # offender still normalizes into the contract and eslint.config.js is granted.
+    repo = tmp_path / "app"
+    (repo / "impl" / "selection").mkdir(parents=True)
+    (repo / "eslint.config.js").write_text("module.exports = [];")
+    contract = _contract([_dir_rule("impl/selection")])
+    detail = (
+        "commit_hygiene: commit hook failed (exit 1)\nstderr:\n"
+        f"[09:01:02] {repo / 'impl' / 'selection' / 'a.ts'}: line 3, col 1, "
+        "Warning - disallowed import (local/code-import-patterns)"
+    )
+    granted = _commit_hygiene_widening_grant(
+        contract=contract, hook_detail=detail, repo_root=repo,
+    )
+    assert granted == ["eslint.config.js"]
+
+
 # ── Trigger / boundary (a)-(d) ───────────────────────────────────────────────
 
 
