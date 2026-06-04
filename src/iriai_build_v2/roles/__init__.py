@@ -106,6 +106,9 @@ from .summarizer import role as summarizer_role
 from .citation_reviewer import role as citation_reviewer_role
 from .observation_collector import role as observation_collector_role
 from .dag_path_resolver import role as dag_path_resolver_role
+from .project_profile_inferrer import role as project_profile_inferrer_role
+from .spec_author import role as spec_author_role
+from .spec_triager import role as spec_triager_role
 
 # Backward compat aliases
 task_planner_role = planning_lead_role
@@ -113,6 +116,18 @@ qa_engineer_role = smoke_tester_role
 reviewer_role = code_reviewer_role
 
 # ── Actors ──────────────────────────────────────────────────────────────────
+# Async e2e-testing subsystem actors (read-only against checkpoints).
+project_profile_inferrer = AgentActor(
+    name="project-profile-inferrer",
+    role=project_profile_inferrer_role,
+    context_keys=[],
+)
+spec_author = AgentActor(
+    name="spec-author", role=spec_author_role, context_keys=[],
+)
+spec_triager = AgentActor(
+    name="spec-triager", role=spec_triager_role, context_keys=[],
+)
 scoper = InterviewActor(name="scoper", role=scoper_role, context_keys=["project"])
 pm = InterviewActor(name="pm", role=pm_role, context_keys=["project", "scope"])
 designer = InterviewActor(name="designer", role=designer_role, context_keys=["project", "prd", "decisions"])

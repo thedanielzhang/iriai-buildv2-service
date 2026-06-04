@@ -588,6 +588,9 @@ def claude_pool_install_launchagents(root: str | None, runner_command: str | Non
 
 
 def main() -> None:
+    from .e2e_cmd import register_e2e_commands
+
+    register_e2e_commands(cli)
     cli()
 
 
