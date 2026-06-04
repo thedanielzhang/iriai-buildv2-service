@@ -46,6 +46,11 @@ from ..._common._autonomy import interaction_actor_for_phase
 from ..._common._helpers import (
     ContextPackage,
     ContextPackageItem,
+    _assert_gate_requests_are_converging,
+    _dedup_revision_requests,
+    _load_gate_ledger,
+    _save_gate_ledger,
+    _update_gate_ledger,
     build_context_package,
     generate_summary,
 )
@@ -887,6 +892,11 @@ class PlanReviewPhase(Phase):
 
         # ── Step 1: Review loop ─────────────────────────────────────
         cycle = 0
+        # Cross-cycle finding ledger so the review→revision loop CONVERGES:
+        # already-resolved findings are suppressed, and a re-review that surfaces
+        # no new distinct finding (or the same unfixed finding set repeating) ends
+        # the loop instead of grinding. This is a fixpoint, NOT a turn cap.
+        gate_ledger = await _load_gate_ledger(runner, feature, "plan-review")
         while True:
             # ── Continue logic: reuse valid report from prior run ─────
             existing_report = await runner.artifacts.get(
@@ -1145,6 +1155,49 @@ class PlanReviewPhase(Phase):
                     break
 
             if revision_plan and revision_plan.requests:
+                # ── Convergence guard (fixpoint, NOT a turn cap) ──────
+                # Digest the FINDING SET (sorted request descriptions), not the
+                # recompiled artifact (which drifts every cycle), so a re-raised
+                # identical finding set is detectable. Suppress findings already
+                # resolved in a prior cycle; if nothing new remains, the loop has
+                # converged. If the SAME unfixed finding set keeps recurring,
+                # _assert_gate_requests_are_converging fails fast (no infinite
+                # grind) instead of looping — e.g. the d31adf8d/ada28430 hang.
+                import hashlib as _hashlib
+
+                finding_digest = _hashlib.sha256(
+                    "\x00".join(
+                        sorted(r.description for r in revision_plan.requests)
+                    ).encode("utf-8")
+                ).hexdigest()[:16]
+                revision_plan, _suppressed = _dedup_revision_requests(
+                    revision_plan, gate_ledger, "plan-review",
+                )
+                if not revision_plan.requests:
+                    logger.info(
+                        "Plan review converged on cycle %d — every finding was "
+                        "already resolved in a prior cycle (no new distinct "
+                        "requests).", cycle + 1,
+                    )
+                    gate_ledger = _update_gate_ledger(
+                        gate_ledger, revision_plan, "plan-review", cycle + 1,
+                    )
+                    await _save_gate_ledger(
+                        runner, feature, gate_ledger, "plan-review",
+                    )
+                    break
+                _assert_gate_requests_are_converging(
+                    revision_plan, gate_ledger, "plan-review",
+                    artifact_digest=finding_digest,
+                )
+                gate_ledger = _update_gate_ledger(
+                    gate_ledger, revision_plan, "plan-review", cycle + 1,
+                    artifact_digest=finding_digest,
+                )
+                await _save_gate_ledger(
+                    runner, feature, gate_ledger, "plan-review",
+                )
+
                 # ── Collect all prior decisions for revision context ──
                 prior_decisions_parts: list[str] = []
                 for prior_cycle in range(cycle + 1):
