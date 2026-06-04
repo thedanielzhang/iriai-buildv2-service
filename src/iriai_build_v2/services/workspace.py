@@ -336,12 +336,19 @@ class WorkspaceManager:
     ) -> ProjectContext:
         """Resolve repos, expand with adjacent repos, create feature-local repo copies."""
         from ..models.outputs import ProjectContext, RepoSpec
+        from ..workflows.develop.execution.git_service import exclude_iriai_from_git
 
         feature_dir = self._base / ".iriai" / "features" / feature.slug
         feature_root = feature_dir / "repos"
         outputs_dir = feature_dir / "outputs"
         feature_root.mkdir(parents=True, exist_ok=True)
         outputs_dir.mkdir(parents=True, exist_ok=True)
+
+        # Keep the orchestrator-written planning artifacts under `<workspace>/.iriai/`
+        # out of git when the workspace root is itself a product repo, so they are
+        # never committed into a PR. Local .git/info/exclude only (uncommitted; the
+        # product's tracked .gitignore is untouched); no-op for a non-git workspace.
+        exclude_iriai_from_git(self._base)
 
         dir_map = self.load_directory_map()
 

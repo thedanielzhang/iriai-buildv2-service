@@ -218,6 +218,50 @@ async def changed_path_set(cwd: Path | str) -> set[str]:
     )
 
 
+def exclude_iriai_from_git(repo_root: str | Path) -> None:
+    """Locally exclude the orchestrator-owned ``/.iriai/`` dir from git in a
+    workflow repo.
+
+    The develop workflow writes planning artifacts (scope/PRD/design/decisions/
+    decomposition/per-subfeature/reviews/...) under ``<workspace>/.iriai/`` to be
+    READ by agents during the run. Those files are untracked inside the product
+    git tree, and every stage/commit site here uses exclude-aware git
+    (``ls-files --others --exclude-standard``, ``add`` without ``-f``), so without
+    an exclude they get swept into the commit and bloat the PR. This writes an
+    anchored ``/.iriai/`` line into the repo's LOCAL ``.git/info/exclude`` so git
+    never stages/commits them — while the files stay on disk at the same absolute
+    paths injected into agent prompts. It is local + uncommitted (never edits the
+    product's tracked ``.gitignore``, so the exclude itself never appears in a PR).
+
+    Idempotent. No-op when ``<repo>/.git`` is not a real directory (absent, or a
+    linked-worktree ``.git`` file) — matching ``_exclude_sandbox_prompt_context_
+    from_capture``. Best-effort: a write failure only reproduces the prior
+    (leaky) behavior, so it never raises.
+    """
+    git_dir = Path(repo_root) / ".git"
+    if not git_dir.is_dir():
+        return
+    exclude_path = git_dir / "info" / "exclude"
+    pattern = "/.iriai/"
+    try:
+        existing = (
+            exclude_path.read_text(encoding="utf-8") if exclude_path.exists() else ""
+        )
+    except OSError:
+        existing = ""
+    if pattern in {line.strip() for line in existing.splitlines()}:
+        return
+    text = existing
+    if text and not text.endswith("\n"):
+        text += "\n"
+    text += f"{pattern}\n"
+    try:
+        exclude_path.parent.mkdir(parents=True, exist_ok=True)
+        exclude_path.write_text(text, encoding="utf-8")
+    except OSError:
+        pass
+
+
 # ── Patch apply ─────────────────────────────────────────────────────────────
 
 

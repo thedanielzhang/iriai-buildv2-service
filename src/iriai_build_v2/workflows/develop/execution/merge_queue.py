@@ -623,6 +623,12 @@ class MergeQueue:
             committed_repo_ids: set[str] = set()
             for target in item.repo_targets:
                 repo_path = Path(target.repo_path)
+                # Keep orchestrator-written planning artifacts (<repo>/.iriai/) out
+                # of the committed diff / PR — a local .git/info/exclude entry, not
+                # the product's tracked .gitignore. Idempotent + harmless where
+                # .iriai/ is absent; authoritative for the exact repo being
+                # committed/pushed regardless of how/when it was created.
+                git_service.exclude_iriai_from_git(repo_path)
                 changed = sorted(await git_service.changed_path_set(repo_path))
                 await git_service.stage_paths(repo_path, changed)
 
