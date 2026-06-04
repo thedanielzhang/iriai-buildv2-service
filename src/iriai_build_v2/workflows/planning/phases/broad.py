@@ -317,7 +317,22 @@ async def _run_decomposition_interview(
         artifact_key="decomposition",
         result=result,
     )
-    decomposition = _parse_model(SubfeatureDecomposition, decomp_text)
+    try:
+        decomposition = _parse_model(SubfeatureDecomposition, decomp_text)
+    except (ValueError, _json.JSONDecodeError) as exc:
+        # The decomposer returned no valid SubfeatureDecomposition (structured
+        # output absent) AND the fallback artifact is empty/non-JSON — typically a
+        # lost-context structured-output retry (runtimes/claude.py: the
+        # `structured_output is None` path cycles the session and the retried agent
+        # comes back without its brief). Fail with a precise, diagnosable error
+        # instead of a raw JSONDecodeError so the halt is actionable + re-runnable.
+        preview = (decomp_text or "").strip()[:200]
+        raise RuntimeError(
+            "Broad decomposition produced no valid SubfeatureDecomposition: the "
+            "decomposer agent returned degraded/non-JSON output "
+            f"(len={len(decomp_text or '')}, starts={preview!r}). This is a degraded "
+            "structured-output turn (lost-context retry) — re-run the feature."
+        ) from exc
     return decomp_text, decomposition, provenance
 
 
