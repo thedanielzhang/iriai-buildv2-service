@@ -974,7 +974,7 @@ def _parse_prd_from_markdown(markdown: str, artifact_key: str) -> PRD:
             if len(row) < 4 or row[0] == "Step":
                 continue
             step = JourneyStep(
-                id=f"{journey_id}-STEP-{step_order}",
+                id=f"{journey_ids[0] if journey_ids else 'journey'}-STEP-{step_order}",
                 step_number=int(row[0]) if row[0].isdigit() else step_order,
                 action=row[1],
                 observes=row[2],

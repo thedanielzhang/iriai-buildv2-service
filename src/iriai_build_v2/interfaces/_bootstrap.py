@@ -21,6 +21,7 @@ if TYPE_CHECKING:
     from ..tasks.feedback import FeedbackService
     from ..tasks.playwright import PlaywrightService
     from ..tasks.preview import PreviewService
+    from ..models.state import BugFixState, BuildState
 from ..workflows import TrackedWorkflowRunner
 from ..runtime_policy import DEFAULT_RUNTIME_POLICY, RuntimePolicy, normalize_runtime_policy
 

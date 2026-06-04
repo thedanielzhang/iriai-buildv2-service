@@ -14,7 +14,7 @@ import stat
 import subprocess
 import tempfile
 import time
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -14466,6 +14466,11 @@ class ImplementationPhase(Phase):
         # acceptance. Returns either a leading "\n\n## Test Plan\n\n..."
         # section or empty string — splice directly.
         test_plan_section = await _load_test_plan_section(runner, feature)
+        # Resolve the feature repos root once for the post-DAG gates (test
+        # author / QA / integration tester / verifier) that thread it into their
+        # bound diagnostic asks. Previously unbound in execute() -> a NameError
+        # that only fired AFTER all DAG groups finished.
+        feature_root = _get_feature_root(runner, feature)
 
         prior_attempts = _load_prior_attempts(
             await runner.artifacts.get("bug-fix-attempts", feature=feature)

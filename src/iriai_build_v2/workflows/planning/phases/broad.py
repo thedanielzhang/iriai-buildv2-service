@@ -54,6 +54,7 @@ from .._control import (
 from .._decisions import refresh_decision_ledger
 from .._sidecars import refresh_sidecar_for_source_artifact
 from .._stage_helpers import (
+    choose_step_mode,
     continue_threaded_interview_in_background,
     outcome_background_requested,
     push_artifact_if_present,
