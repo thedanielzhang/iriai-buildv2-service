@@ -81,18 +81,24 @@ def build_compose_override(
     run_id: str,
     port_strategy: str = "fixed",
     project_prefix: str = "e2e",
+    named_volume_targets: list[str] | None = None,
 ) -> dict:
     """Pure: build a per-run compose override dict (YAML-serializable).
 
-    - Named volumes: every READ-WRITE relative host bind (``./x:/y`` /
-      ``../x:/y``, no ``:ro``) is replaced by a per-run named volume so ``down
-      -v`` removes it and per-run state is clean. ``:ro`` binds (seed scripts /
-      source) are left untouched. Long-form (dict) volume specs are left as-is.
+    - Named volumes: a host bind is replaced by a per-run named volume ONLY when
+      its CONTAINER TARGET is in ``named_volume_targets`` (the profile's declared
+      data dirs, e.g. ``/var/lib/postgresql/data``). This is OPT-IN by target —
+      NOT a "remap every relative bind" heuristic, which would wrongly clobber
+      seed-script binds (kaya's ``init_scripts`` has no ``:ro``), ``*.conf`` config
+      binds, and ``../../`` source mounts. Data isolation for any remaining
+      relative bind comes from the per-run clone (rmtree'd on teardown); ``down
+      -v`` removes the named volumes + anonymous volumes.
     - Ports: ``fixed``/``""`` => unchanged (the single-stack mutex serialises
       passes so the product's own fixed ports are free). ``bump`` => add a
       deterministic ``hash(run_id)`` offset to each published host port.
     """
     services = base_compose.get("services") or {}
+    targets = set(named_volume_targets or [])
     offset = _port_offset(run_id) if port_strategy == "bump" else 0
     override_services: dict[str, dict] = {}
     named_volumes: dict[str, Any] = {}
@@ -107,13 +113,9 @@ def build_compose_override(
         for idx, vol in enumerate(svc.get("volumes") or []):
             if isinstance(vol, str):
                 parts = vol.split(":")
-                host = parts[0]
-                # mode may carry options ("ro,z", "ro,cached"); read-only iff "ro"
-                # is among them — a bare exact-match would miss those and wrongly
-                # remap a seed/source mount to an empty volume.
-                mode_opts = parts[2].split(",") if len(parts) >= 3 else []
-                is_rel = host.startswith("./") or host.startswith("../")
-                if is_rel and len(parts) >= 2 and "ro" not in mode_opts:
+                # parts[1] is the container target of a host:container[:mode] bind.
+                container = parts[1] if len(parts) >= 2 else ""
+                if container and container in targets:
                     vol_name = _sanitize(
                         f"{project_prefix}_{run_id}_{svc_name}_{idx}"
                     )
@@ -283,10 +285,11 @@ class ComposeAdapter:
             run_id=rid,
             port_strategy=profile.compose_port_strategy or "fixed",
             project_prefix=profile.compose_project_prefix or "e2e",
+            named_volume_targets=list(
+                getattr(profile, "compose_named_volume_targets", None) or []),
         )
         override_path = checkout / f"docker-compose.e2e.{_sanitize(rid)}.yaml"
         override_path.write_text(yaml.safe_dump(override, sort_keys=False))
-        _ensure_relative_data_dirs(checkout, base)
 
         compose_files = [str(base_path), str(override_path)]
         # Register BEFORE up so a crash mid-build is still reaped by GC (AC-K-9).
@@ -392,30 +395,6 @@ class ComposeAdapter:
         if instance.substrate is not None:
             with contextlib.suppress(Exception):
                 await instance.substrate.teardown()
-
-
-def _ensure_relative_data_dirs(checkout: Path, base_compose: dict) -> None:
-    """Create any READ-WRITE relative bind source dirs the override did NOT remap.
-
-    Belt-and-suspenders for binds the override left in place (e.g. an unusual
-    long-form spec): a gitignored data dir is absent in the clone, so create it
-    empty (the service seeds it fresh) rather than letting compose fail on a
-    missing bind source.
-    """
-    for svc in (base_compose.get("services") or {}).values():
-        if not isinstance(svc, dict):
-            continue
-        for vol in svc.get("volumes") or []:
-            if isinstance(vol, str):
-                parts = vol.split(":")
-                host = parts[0]
-                mode_opts = parts[2].split(",") if len(parts) >= 3 else []
-                # Only clone-relative ("./") RW bind sources — never "../" (would
-                # mkdir OUTSIDE the clone) and never ":ro" (tracked seed/source is
-                # already present; an empty dir would shadow it).
-                if host.startswith("./") and "ro" not in mode_opts:
-                    with contextlib.suppress(OSError):
-                        (checkout / host).mkdir(parents=True, exist_ok=True)
 
 
 async def _run(

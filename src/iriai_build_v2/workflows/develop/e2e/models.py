@@ -93,6 +93,11 @@ class ProjectProfile(BaseModel):
     service_probe_targets: list[str] = Field(default_factory=list)  # index-aligned w/ service_names
     service_port_keys: list[str] = Field(default_factory=list)  # env keys (in .env.instance) for host ports
     compose_port_strategy: str = ""  # "" | fixed | bump
+    # Container TARGET paths whose host bind is replaced by a per-run NAMED volume
+    # (clean per-run state + `down -v` teardown). ONLY these are remapped — config/
+    # seed/source binds (init_scripts, *.conf, source mounts) are left intact. e.g.
+    # kaya: ["/var/lib/postgresql/data", "/data", "/var/lib/falkordb/data"].
+    compose_named_volume_targets: list[str] = Field(default_factory=list)
 
     def alignment_errors(self) -> list[str]:
         """Non-raising check that index-aligned parallel lists agree in length.

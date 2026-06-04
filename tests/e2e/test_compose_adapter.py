@@ -22,63 +22,77 @@ from iriai_build_v2.workflows.develop.e2e.adapters.junit_report import parse_jun
 
 # --- override generation ------------------------------------------------------
 
+# Realistic kaya-shaped base: data DIR bind, a no-:ro init-script bind, a config
+# FILE bind, a "../../" source bind, env-driven ports — exactly the cases the
+# old "remap every relative bind" heuristic got wrong.
 _BASE = {
     "services": {
         "db": {
             "image": "postgres",
             "volumes": [
                 "./postgres/data:/var/lib/postgresql/data",
-                "./postgres/init_scripts:/docker-entrypoint-initdb.d:ro",
+                "./postgres/init_scripts:/docker-entrypoint-initdb.d",  # NO :ro
             ],
-            "ports": ["5432:5432"],
+            "ports": ["${DB_PORT:-5432}:${DB_PORT:-5432}"],
         },
-        "web": {"image": "web", "ports": ["3000:3000"]},
+        "redis": {
+            "image": "redis",
+            "volumes": [
+                "./redis/data:/data",
+                "./redis/redis.conf:/usr/local/etc/redis/redis.conf",
+            ],
+        },
+        "spend-client": {
+            "image": "web",
+            "volumes": ["../../spend-client:/workspace/spend-client",
+                        "/workspace/node_modules"],
+            "ports": ["3000:3000"],
+        },
     }
 }
 
+# kaya's declared per-run data targets (the only binds to convert to volumes).
+_TARGETS = ["/var/lib/postgresql/data", "/data"]
 
-def test_override_remaps_rw_relative_bind_to_named_volume_keeps_ro():
-    ov = build_compose_override(_BASE, run_id="run1", port_strategy="fixed")
+
+def test_override_remaps_only_declared_data_targets():
+    ov = build_compose_override(_BASE, run_id="run1", port_strategy="fixed",
+                                named_volume_targets=_TARGETS)
+    # db: data dir -> named volume; init_scripts (no :ro!) left intact.
     db_vols = ov["services"]["db"]["volumes"]
-    # rw data bind -> per-run named volume; :ro seed bind untouched.
     assert db_vols[0] == "e2e_run1_db_0:/var/lib/postgresql/data"
-    assert db_vols[1] == "./postgres/init_scripts:/docker-entrypoint-initdb.d:ro"
-    assert ov["volumes"] == {"e2e_run1_db_0": None}
-    # fixed strategy: ports unchanged -> web has no override at all.
-    assert "web" not in ov.get("services", {})
+    assert db_vols[1] == "./postgres/init_scripts:/docker-entrypoint-initdb.d"
+    # redis: /data -> named volume; the .conf FILE bind left intact.
+    redis_vols = ov["services"]["redis"]["volumes"]
+    assert redis_vols[0] == "e2e_run1_redis_0:/data"
+    assert redis_vols[1] == "./redis/redis.conf:/usr/local/etc/redis/redis.conf"
+    # spend-client SOURCE bind is NOT a declared target -> never remapped.
+    assert "spend-client" not in ov.get("services", {})
+    assert set(ov["volumes"]) == {"e2e_run1_db_0", "e2e_run1_redis_0"}
 
 
-def test_override_leaves_ro_binds_with_options_untouched():
-    base = {
-        "services": {
-            "db": {
-                "image": "postgres",
-                "volumes": [
-                    "./postgres/data:/var/lib/postgresql/data",
-                    "./postgres/init_scripts:/docker-entrypoint-initdb.d:ro,z",
-                    "./seed:/seed:ro",
-                ],
-            }
-        }
-    }
-    ov = build_compose_override(base, run_id="r1", port_strategy="fixed")
-    vols = ov["services"]["db"]["volumes"]
-    # rw data -> named; both ro forms (bare ":ro" and ":ro,z") left untouched.
-    assert vols[0] == "e2e_r1_db_0:/var/lib/postgresql/data"
-    assert vols[1] == "./postgres/init_scripts:/docker-entrypoint-initdb.d:ro,z"
-    assert vols[2] == "./seed:/seed:ro"
-    assert list(ov["volumes"]) == ["e2e_r1_db_0"]
+def test_override_no_targets_means_no_volume_remap():
+    # Default (no declared targets): rely on the per-run clone for isolation —
+    # never clobber config/seed/source binds.
+    ov = build_compose_override(_BASE, run_id="r", port_strategy="fixed")
+    assert "volumes" not in ov
+    assert "services" not in ov  # fixed ports + no volume remap => empty
 
 
 def test_override_bump_offsets_host_ports():
-    ov = build_compose_override(_BASE, run_id="run1", port_strategy="bump")
-    web_ports = ov["services"]["web"]["ports"]
+    ov = build_compose_override(_BASE, run_id="run1", port_strategy="bump",
+                                named_volume_targets=_TARGETS)
+    # spend-client has a literal "3000:3000" -> bumped; env-driven ports are
+    # left as-is (can't int-parse "${DB_PORT:-5432}").
+    web_ports = ov["services"]["spend-client"]["ports"]
     host, container = web_ports[0].split(":")
-    assert container == "3000"
-    assert int(host) != 3000  # bumped by the deterministic offset
+    assert container == "3000" and int(host) != 3000
+    # env-driven ports can't be int-bumped -> no ports override emitted for db.
+    assert "ports" not in ov["services"].get("db", {})
     # deterministic: same run_id -> same offset.
-    ov2 = build_compose_override(_BASE, run_id="run1", port_strategy="bump")
-    assert ov2["services"]["web"]["ports"] == web_ports
+    ov2 = build_compose_override(_BASE, run_id="run1", port_strategy="bump",
+                                 named_volume_targets=_TARGETS)
+    assert ov2["services"]["spend-client"]["ports"] == web_ports
 
 
 def test_override_empty_when_nothing_to_change():
@@ -87,9 +101,8 @@ def test_override_empty_when_nothing_to_change():
 
 
 def test_override_custom_project_prefix():
-    ov = build_compose_override(
-        _BASE, run_id="r9", port_strategy="fixed", project_prefix="kaya"
-    )
+    ov = build_compose_override(_BASE, run_id="r9", port_strategy="fixed",
+                                project_prefix="kaya", named_volume_targets=_TARGETS)
     assert "kaya_r9_db_0" in ov["volumes"]
 
 
