@@ -8772,6 +8772,54 @@ async def _capture_and_promote_sandbox_patch(
         raise
 
 
+_PROJECT_PROFILE_LOCKS: dict[str, "_asyncio.Lock"] = {}
+
+
+async def _resolve_project_profile(
+    runner: WorkflowRunner,
+    feature: Feature,
+    source: Path,
+    repo_id: str,
+) -> Any | None:
+    """Cache-first ProjectProfile for stack-aware sandbox provisioning (P1/P2).
+
+    Reads the persisted ``project-profile`` artifact; if absent, infers it ONCE
+    per feature (agentically, against the bound repo checkout) under a per-feature
+    lock and persists it. Fully tolerant: any failure returns ``None`` so the
+    sandbox falls back to the legacy single-root npm path (iriai-studio default).
+    """
+    artifacts = getattr(runner, "artifacts", None)
+    if artifacts is None:
+        return None
+    try:
+        from ..e2e.profile import infer_profile
+        from ..e2e.registry import E2ERegistry
+    except Exception:  # pragma: no cover - import guard
+        return None
+    reg = E2ERegistry(artifacts, feature)
+    try:
+        cached = await reg.get_profile()
+    except Exception:  # noqa: BLE001
+        cached = None
+    if cached is not None:
+        return cached
+    lock = _PROJECT_PROFILE_LOCKS.setdefault(feature.id, _asyncio.Lock())
+    async with lock:
+        try:
+            cached = await reg.get_profile()
+            if cached is not None:
+                return cached
+            return await infer_profile(
+                runner, feature, {repo_id: str(source)}, registry=reg
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "project-profile inference failed; using legacy provisioning: %s",
+                exc,
+            )
+            return None
+
+
 async def _bind_task_sandbox(
     runner: WorkflowRunner,
     feature: Feature,
@@ -8864,6 +8912,7 @@ async def _bind_task_sandbox(
         contract_ids=contract_ids,
         write_guard_scope="contract",
     )
+    project_profile = await _resolve_project_profile(runner, feature, source, repo_id)
     sandbox_runner = SandboxRunner(
         workspace_root=workspace_root,
         repo_sources={repo_id: source},
@@ -8872,6 +8921,7 @@ async def _bind_task_sandbox(
         owner=f"workflow:{feature.id}:g{group_idx}:t{task.id}:a{attempt}",
         allowed_source_roots=[feature_root],
         blocked_roots=[feature_root],
+        project_profile=project_profile,
     )
     try:
         lease = await sandbox_runner.allocate(spec)
