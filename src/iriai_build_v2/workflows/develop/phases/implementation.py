@@ -7316,11 +7316,19 @@ async def _drain_durable_merge_queue_for_feature(
             control_store, _merge_queue_post_apply_gate_decision
         )
         no_dirty_recorder = build_merge_queue_no_dirty_recorder(control_store)
+        # Project-level commit-hygiene strategy (cache-only read; the profile is
+        # already persisted by sandbox binding). "" => studio rule_grant default;
+        # "restage_autofix" => re-stage an auto-fixing hook's edits at commit
+        # time (P3 / AC-K-5). Absent profile reproduces the legacy behavior.
+        commit_hygiene_strategy = _commit_hygiene_strategy_of(
+            await _resolve_project_profile_cached(runner, feature)
+        )
         worker = MergeQueueWorker(
             queue_store,
             apply_input_provider,
             gate_runner=gate_runner,
             no_dirty_recorder=no_dirty_recorder,
+            commit_hygiene_strategy=commit_hygiene_strategy,
         )
 
         for _ in range(max_lanes):
@@ -8818,6 +8826,38 @@ async def _resolve_project_profile(
                 exc,
             )
             return None
+
+
+async def _resolve_project_profile_cached(
+    runner: WorkflowRunner,
+    feature: Feature,
+) -> Any | None:
+    """Pure cache read of the persisted project-profile (NO inference).
+
+    Used where the full :func:`_resolve_project_profile` would be too eager (the
+    merge-queue construction + commit-hygiene recovery sites): the profile is
+    already inferred + persisted during sandbox binding, so a cache miss here
+    just means "iriai-studio defaults" rather than a reason to run agentic
+    inference mid-drain. Fully tolerant — any failure returns ``None``.
+    """
+    artifacts = getattr(runner, "artifacts", None)
+    if artifacts is None:
+        return None
+    try:
+        from ..e2e.registry import E2ERegistry
+    except Exception:  # pragma: no cover - import guard
+        return None
+    try:
+        return await E2ERegistry(artifacts, feature).get_profile()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _commit_hygiene_strategy_of(profile: Any | None) -> str:
+    """Configured commit-hygiene strategy ("" => the studio rule_grant default)."""
+    if profile is None:
+        return ""
+    return str(getattr(profile, "commit_hygiene_strategy", "") or "").strip()
 
 
 async def _bind_task_sandbox(
@@ -21044,11 +21084,23 @@ async def _implement_dag(
                                 feature_root=feature_root,
                                 repo_path=_contract_repo_path(original_contract),
                             )
-                        granted_config_paths = _commit_hygiene_widening_grant(
-                            contract=original_contract,
-                            hook_detail=recovery_lane.hook_detail,
-                            repo_root=widening_repo_root,
+                        hygiene_profile = await _resolve_project_profile_cached(
+                            runner, feature
                         )
+                        if (
+                            _commit_hygiene_strategy_of(hygiene_profile)
+                            == "restage_autofix"
+                        ):
+                            # The formatter's own edits are re-staged at commit
+                            # time (merge_queue); an eslint-style shared-config
+                            # carve-out is never granted under this strategy.
+                            granted_config_paths = []
+                        else:
+                            granted_config_paths = _commit_hygiene_widening_grant(
+                                contract=original_contract,
+                                hook_detail=recovery_lane.hook_detail,
+                                repo_root=widening_repo_root,
+                            )
                         if granted_config_paths:
                             augmented_contract = _commit_hygiene_augmented_contract(
                                 contract=original_contract,

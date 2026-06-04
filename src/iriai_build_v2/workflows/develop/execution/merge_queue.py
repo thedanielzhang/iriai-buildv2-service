@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import fnmatch
 import hashlib
+import logging
 from collections import defaultdict
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -30,6 +31,8 @@ from .journal import (
     MergeQueueStore,
     RepoCommitProof,
 )
+
+logger = logging.getLogger(__name__)
 
 
 # Bound the persisted hook output so a verbose pre-commit/husky log stays within
@@ -211,11 +214,18 @@ class MergeQueue:
         apply_input_provider: ApplyInputProvider,
         gate_runner: GateRunner | None = None,
         no_dirty_recorder: NoDirtyRecorder | None = None,
+        commit_hygiene_strategy: str = "",
     ) -> None:
         self._store = store
         self._provide_apply_inputs = apply_input_provider
         self._gate_runner = gate_runner
         self._record_no_dirty = no_dirty_recorder
+        # "" / "rule_grant" => the iriai-studio default (a commit-hook rejection
+        # is a typed commit_hygiene failure, recovered by the agentic write-set
+        # widening in implementation.py). "restage_autofix" => an auto-fixing
+        # hook (black/prettier --write) rewrote the staged files and exited
+        # non-zero; re-stage its edits and retry the commit once (P3 / AC-K-5).
+        self._commit_hygiene_strategy = (commit_hygiene_strategy or "").strip()
 
     # ── delegating lease methods ────────────────────────────────────────────
 
@@ -617,6 +627,21 @@ class MergeQueue:
                 await git_service.stage_paths(repo_path, changed)
 
                 commit_result = await git_service.commit(repo_path, message)
+                if (
+                    not commit_result.committed
+                    and self._commit_hygiene_strategy == "restage_autofix"
+                ):
+                    # An auto-fixing pre-commit hook (black, prettier --write,
+                    # end-of-file-fixer) rewrote the staged files and exited
+                    # non-zero, leaving its fixes unstaged. Re-stage them and
+                    # retry the commit ONCE — but only if confined to the paths
+                    # this lane already staged (AC-K-5).
+                    commit_result = await self._restage_autofix_retry(
+                        repo_path,
+                        message,
+                        contract_paths=changed,
+                        first_result=commit_result,
+                    )
                 if not commit_result.committed:
                     # Hook rejection — no commit on THIS repo. Reset only repos
                     # that have not committed; earlier repos of a multi-repo
@@ -712,6 +737,58 @@ class MergeQueue:
             )
         finally:
             await self._store.release_feature_lock(item.feature_id)
+
+    async def _restage_autofix_retry(
+        self,
+        repo_path: Path,
+        message: str,
+        *,
+        contract_paths: list[str],
+        first_result: git_service.CommitResult,
+    ) -> git_service.CommitResult:
+        """Re-stage an auto-fixing hook's own edits and retry the commit ONCE.
+
+        Some pre-commit hooks (black, ``prettier --write``, end-of-file-fixer)
+        REWRITE the staged files and exit non-zero, leaving the fixes in the
+        working tree. Under the ``restage_autofix`` strategy we re-stage those
+        edits and retry, but ONLY when they are confined to the paths this lane
+        already staged (its contract set): a hook that touched any OTHER path is
+        out of contract and must fall through to the normal ``commit_hygiene``
+        failure so we never silently commit an unvalidated file. Bounded to a
+        single retry — an idempotent formatter (black) is satisfied on the
+        second pass; a non-idempotent or genuine failure returns ``first_result``
+        and the caller fails the lane as before.
+        """
+        contract_set = set(contract_paths)
+        post_hook = await git_service.changed_path_set(repo_path)
+        if not post_hook:
+            # The hook left no edits — its rejection was not an auto-fix, so a
+            # retry would only reproduce it.
+            return first_result
+        escaped = post_hook - contract_set
+        if escaped:
+            logger.warning(
+                "restage_autofix: hook edits escaped the contract set in %s "
+                "(%s); falling through to commit_hygiene failure",
+                repo_path,
+                sorted(escaped),
+            )
+            return first_result
+        await git_service.stage_paths(repo_path, sorted(post_hook))
+        retry = await git_service.commit(repo_path, message)
+        if retry.committed:
+            logger.info(
+                "restage_autofix: re-staged hook edits and committed %s in %s",
+                retry.commit,
+                repo_path,
+            )
+            return retry
+        logger.warning(
+            "restage_autofix: retry after re-staging hook edits still failed "
+            "in %s; failing the lane as commit_hygiene",
+            repo_path,
+        )
+        return first_result
 
     async def mark_integrated(
         self,

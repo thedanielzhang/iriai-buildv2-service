@@ -12,7 +12,9 @@ from iriai_compose import Feature
 
 from iriai_build_v2.workflows.develop.e2e.models import ProjectProfile
 from iriai_build_v2.workflows.develop.phases.implementation import (
+    _commit_hygiene_strategy_of,
     _resolve_project_profile,
+    _resolve_project_profile_cached,
 )
 
 
@@ -69,3 +71,47 @@ def test_missing_artifacts_returns_none() -> None:
         _resolve_project_profile(_NoArtifacts(), _feature(), Path("/tmp/x"), "r")
     )
     assert out is None
+
+
+# --- P3: cache-only resolver + strategy accessor -------------------------------
+
+
+def test_cached_resolver_reads_profile_without_source_or_repo() -> None:
+    prof = ProjectProfile(commit_hygiene_strategy="restage_autofix")
+    runner = _Runner(_FakeArtifacts({"project-profile": prof.model_dump()}))
+    out = asyncio.run(_resolve_project_profile_cached(runner, _feature()))
+    assert out is not None
+    assert out.commit_hygiene_strategy == "restage_autofix"
+
+
+def test_cached_resolver_missing_artifacts_returns_none() -> None:
+    class _NoArtifacts:
+        pass
+
+    out = asyncio.run(_resolve_project_profile_cached(_NoArtifacts(), _feature()))
+    assert out is None
+
+
+def test_cached_resolver_empty_store_returns_none() -> None:
+    runner = _Runner(_FakeArtifacts({}))
+    out = asyncio.run(_resolve_project_profile_cached(runner, _feature()))
+    assert out is None
+
+
+def test_commit_hygiene_strategy_of() -> None:
+    # Absent profile / unset field => the studio rule_grant default ("").
+    assert _commit_hygiene_strategy_of(None) == ""
+    assert _commit_hygiene_strategy_of(ProjectProfile()) == ""
+    assert (
+        _commit_hygiene_strategy_of(
+            ProjectProfile(commit_hygiene_strategy="restage_autofix")
+        )
+        == "restage_autofix"
+    )
+    # Tolerant of whitespace / duck-typed objects.
+    assert (
+        _commit_hygiene_strategy_of(
+            ProjectProfile(commit_hygiene_strategy="  rule_grant  ")
+        )
+        == "rule_grant"
+    )

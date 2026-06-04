@@ -718,6 +718,100 @@ async def test_commit_and_prove_clean_routes_hook_failure_as_commit_hygiene(
     assert await git_service.working_tree_clean(repo) is True
 
 
+# --- P3: restage_autofix commit-hygiene strategy (AC-K-5) ----------------------
+
+# An idempotent auto-fixer hook (black/prettier --write surrogate): rewrites the
+# staged file and exits non-zero until it is "formatted", then passes.
+_AUTOFIX_HOOK = (
+    "#!/bin/sh\n"
+    "if ! grep -q 'FORMATTED' README.md; then\n"
+    "  echo 'FORMATTED' >> README.md\n"
+    "  echo 'reformatted; restage needed' >&2\n"
+    "  exit 1\n"
+    "fi\n"
+    "exit 0\n"
+)
+
+
+def _install_hook(repo: Path, body: str) -> None:
+    hook = repo / ".git" / "hooks" / "pre-commit"
+    hook.write_text(body)
+    hook.chmod(0o755)
+
+
+@pytest.mark.asyncio
+async def test_restage_autofix_recommits_after_hook_rewrites_staged_file(
+    mq_conn, tmp_path: Path
+) -> None:
+    store, repo, base, item, token = await _apply_gate_to_committing(
+        mq_conn, tmp_path
+    )
+    _install_hook(repo, _AUTOFIX_HOOK)
+
+    queue = MergeQueue(
+        store,
+        _provider("", []),
+        no_dirty_recorder=_no_dirty_recorder(mq_conn),
+        commit_hygiene_strategy="restage_autofix",
+    )
+    commit_result = await queue.commit_and_prove_clean(item, token)
+
+    assert commit_result.committed is True
+    # The hook's own edit was re-staged and committed; tree is clean.
+    assert await git_service.head_commit(repo) != base
+    assert await git_service.working_tree_clean(repo) is True
+    assert "FORMATTED" in (repo / "README.md").read_text()
+
+
+@pytest.mark.asyncio
+async def test_restage_autofix_disabled_by_default_fails_commit_hygiene(
+    mq_conn, tmp_path: Path
+) -> None:
+    store, repo, base, item, token = await _apply_gate_to_committing(
+        mq_conn, tmp_path
+    )
+    _install_hook(repo, _AUTOFIX_HOOK)
+
+    # Default strategy ("") => studio behavior: no restage retry, the hook
+    # rejection is a typed commit_hygiene failure and the repo resets clean.
+    queue = MergeQueue(
+        store, _provider("", []), no_dirty_recorder=_no_dirty_recorder(mq_conn)
+    )
+    commit_result = await queue.commit_and_prove_clean(item, token)
+
+    assert commit_result.committed is False
+    assert commit_result.failure_class == "commit_hygiene"
+    assert await git_service.head_commit(repo) == base
+    assert await git_service.working_tree_clean(repo) is True
+
+
+@pytest.mark.asyncio
+async def test_restage_autofix_falls_through_when_hook_escapes_contract(
+    mq_conn, tmp_path: Path
+) -> None:
+    store, repo, base, item, token = await _apply_gate_to_committing(
+        mq_conn, tmp_path
+    )
+    # A hook that touches a file OUTSIDE the lane's staged/contract set must NOT
+    # be auto-restaged — never commit an unvalidated file.
+    _install_hook(
+        repo,
+        "#!/bin/sh\necho junk > sneaky.txt\necho 'rejected' >&2\nexit 1\n",
+    )
+
+    queue = MergeQueue(
+        store,
+        _provider("", []),
+        no_dirty_recorder=_no_dirty_recorder(mq_conn),
+        commit_hygiene_strategy="restage_autofix",
+    )
+    commit_result = await queue.commit_and_prove_clean(item, token)
+
+    assert commit_result.committed is False
+    assert commit_result.failure_class == "commit_hygiene"
+    assert await git_service.head_commit(repo) == base
+
+
 @pytest.mark.asyncio
 async def test_mark_integrated_requires_a_successful_commit(
     mq_conn, tmp_path: Path
