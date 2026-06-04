@@ -16,6 +16,7 @@ orchestrator auto-spawn is the separate, gated cutover).
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import shutil
 import subprocess
@@ -30,6 +31,10 @@ from .models import E2ETrackCursor
 _MAX_LOAD = float(os.environ.get("IRIAI_E2E_MAX_LOAD", "20"))
 _MIN_FREE_GB = float(os.environ.get("IRIAI_E2E_MIN_FREE_MEM_GB", "1.0"))
 _MIN_DISK_GB = float(os.environ.get("IRIAI_E2E_MIN_DISK_GB", "10"))
+# A ~15-container `up --build` is minutes + many GB — a much higher disk floor
+# than the single-process default, and a single-stack mutex (only one e2e compose
+# project at a time) so passes never pile concurrent stacks onto the host (P4).
+_MIN_COMPOSE_DISK_GB = float(os.environ.get("IRIAI_E2E_COMPOSE_MIN_DISK_GB", "40"))
 
 
 @dataclass
@@ -57,6 +62,59 @@ def host_preflight(*, scratch_dir: str = "/tmp") -> Preflight:
     if free_disk_gb < _MIN_DISK_GB:
         reasons.append(f"free_disk {free_disk_gb:.0f}GB < {_MIN_DISK_GB}")
     return Preflight(not reasons, load1, free_mem_gb, free_disk_gb, "; ".join(reasons))
+
+
+@dataclass
+class ComposePreflight:
+    ok: bool
+    free_disk_gb: float
+    running_projects: list[str] = field(default_factory=list)
+    reason: str = ""
+
+
+def _running_compose_projects() -> list[str]:
+    """Names of currently-up docker compose projects (best-effort; [] on error)."""
+    try:
+        out = subprocess.run(
+            ["docker", "compose", "ls", "--format", "json"],
+            capture_output=True, text=True, timeout=30,
+        )
+        if out.returncode != 0:
+            return []
+        data = json.loads(out.stdout or "[]")
+        return [str(p.get("Name", "")) for p in data if p.get("Name")]
+    except Exception:  # noqa: BLE001 - preflight is best-effort
+        return []
+
+
+def compose_preflight(
+    *,
+    project_prefix: str = "e2e",
+    scratch_dir: str = "/tmp",
+    running_projects: list[str] | None = None,
+) -> ComposePreflight:
+    """Compose-specific preflight: higher disk floor + single-stack mutex.
+
+    Refuses if free disk is below the (much higher) compose floor, OR if any
+    e2e compose project (name starting with ``project_prefix``) is already up —
+    only ONE e2e stack runs at a time, so a pass never stacks ~15 more containers
+    onto a host already running one. ``running_projects`` is injectable for tests.
+    """
+    free_disk_gb = shutil.disk_usage(scratch_dir).free / (1024 ** 3)
+    projects = (
+        running_projects
+        if running_projects is not None
+        else _running_compose_projects()
+    )
+    e2e_up = [p for p in projects if p.startswith(project_prefix)]
+    reasons = []
+    if free_disk_gb < _MIN_COMPOSE_DISK_GB:
+        reasons.append(f"free_disk {free_disk_gb:.0f}GB < {_MIN_COMPOSE_DISK_GB}")
+    if e2e_up:
+        reasons.append(
+            f"single-stack mutex: e2e compose project(s) already up: {e2e_up}"
+        )
+    return ComposePreflight(not reasons, free_disk_gb, e2e_up, "; ".join(reasons))
 
 
 def _free_mem_gb() -> float:

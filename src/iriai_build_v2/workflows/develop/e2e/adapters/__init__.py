@@ -242,7 +242,7 @@ def available_adapters() -> list[str]:
 
 
 def _autoregister() -> None:
-    for mod in ("browser", "http_service"):
+    for mod in ("browser", "http_service", "compose"):
         with contextlib.suppress(Exception):
             __import__(f"{__name__}.{mod}", fromlist=["*"])
 
