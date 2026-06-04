@@ -155,6 +155,17 @@ async def run_full_pass(
     studio_commit = commits.get("iriai-studio") or next(iter(commits.values()), "")
 
     profile = profile or (await registry.get_profile() if registry else None) or _default_profile()
+    if profile.adapter_id == "compose":
+        # Compose-stack products (kaya) take a dedicated pass; the studio
+        # browser/electron path below is left UNTOUCHED.
+        return await _run_compose_pass(
+            checkpoint,
+            feature_id=feature_id,
+            registry=registry,
+            profile=profile,
+            poster=poster,
+            on_log=on_log,
+        )
     sub = CloneSubstrate(role="track", mode="automated", persist=False)
     on_log(f"provisioning @ group {checkpoint.group_idx} ...")
     checkouts = await sub.clone_checkpoint(
@@ -293,3 +304,133 @@ async def run_full_pass(
         return summary
     finally:
         await adapter.teardown(instance)
+
+
+async def _run_compose_pass(
+    checkpoint: SealedCheckpoint,
+    *,
+    feature_id: str,
+    registry: Any,
+    profile: ProjectProfile,
+    poster: Any,
+    on_log=lambda m: None,
+) -> PassSummary:
+    """Compose-stack e2e pass (kaya): clone -> compose up -> per-service boot-smoke
+    -> host unit-test verdicts -> status/green -> down -v. Resource-bounded by the
+    compose preflight + single-stack mutex; uses the SAME green oracle as studio
+    (boot-smoke pass AND no open critical regressions). The studio path is untouched.
+    """
+    import contextlib
+
+    from .runner_loop import compose_preflight  # deferred — avoid an import cycle
+
+    summary = PassSummary(group_idx=checkpoint.group_idx)
+    label = f"group {checkpoint.group_idx}"
+    commits = checkpoint.result_commits()
+    repo_key = profile.repo_path or next(iter(commits), "")
+    commit = commits.get(repo_key) or next(iter(commits.values()), "")
+    slug = profile.compose_project_prefix or repo_key or "default"
+
+    # Resource bound + single-stack mutex BEFORE standing anything up.
+    pf = compose_preflight(project_prefix=(profile.compose_project_prefix or "e2e"))
+    if not pf.ok:
+        summary.boot_smoke = "fail"
+        summary.detail = f"compose preflight refused: {pf.reason}"
+        on_log(summary.detail)
+        return summary  # nothing was brought up — no teardown, no false green
+
+    sub = CloneSubstrate(role="track", mode="automated", persist=False)
+    on_log(f"compose provisioning @ group {checkpoint.group_idx} ...")
+    sources = {key: _live_repo(feature_id, key) for key in commits}
+    if repo_key and repo_key not in sources:
+        sources[repo_key] = _live_repo(feature_id, repo_key)
+    checkouts = await sub.clone_checkpoint(sources=sources, commits=commits)
+    checkout = checkouts[repo_key].checkout_dir
+
+    adapter = get_adapter("compose")
+    instance = None
+    try:
+        try:
+            instance = await adapter.provision(
+                profile, Path(checkout), substrate=sub,
+                run_id=sub.run_id, project_slug=slug)
+        except Exception as exc:  # noqa: BLE001 - a bring-up failure is an honest boot fail
+            summary.boot_smoke = "fail"
+            summary.detail = f"compose provision failed: {exc}"
+            on_log(summary.detail)
+            await page_critical(
+                registry, poster=poster, checkpoint_label=label,
+                boot_smoke_failures=[
+                    type("BS", (), {"surface": "compose", "detail": str(exc)[:300]})()
+                ])
+            status = build_status(
+                checkpoint=checkpoint, smokes=[], verdicts=[],
+                green_pointer=None, preview_url="")
+            await emit_status(registry, status, poster=poster)
+            return summary
+
+        smokes = await adapter.smoke(instance, profile)
+        boot_failed = [s for s in smokes if s.status == "fail"]
+        any_up = any(s.status == "pass" for s in smokes)
+        summary.boot_smoke = "pass" if (any_up and not boot_failed) else "fail"
+        for s in smokes:
+            summary.lanes.append(LaneResult(
+                config=s.surface,
+                web_server_ok=(s.status == "pass"),
+                started=(s.status == "pass"),
+                detail=s.detail,
+                boot_error="" if s.status != "fail" else s.detail))
+        on_log(f"boot-smoke: {summary.boot_smoke} "
+               f"({sum(1 for s in smokes if s.status == 'pass')}/{len(smokes)} up)")
+
+        # Host unit tests only once the stack is up — a dead stack is a boot fail,
+        # not a flood of misleading test failures.
+        all_verdicts = []
+        if not boot_failed:
+            all_verdicts = await adapter.run(instance, [], source_commit=commit)
+            for v in all_verdicts:
+                if v.status == "pass":
+                    summary.passed += 1
+                elif v.status in ("fail", "error"):
+                    summary.failed += 1
+                await registry.put_verdict(v)
+        summary.spec_count = len(all_verdicts)
+        summary.open_regressions = [v.spec_id for v in all_verdicts if v.status == "fail"]
+
+        br = await bridge_findings(
+            registry,
+            [v for v in all_verdicts if v.failure_class == "regression"],
+            {}, checkpoint_label=label)
+        summary.backlog_appended = len(br.appended)
+
+        if boot_failed:
+            await page_critical(
+                registry, poster=poster, checkpoint_label=label,
+                boot_smoke_failures=[
+                    type("BS", (), {"surface": s.surface, "detail": s.detail[:300]})()
+                    for s in boot_failed])
+            on_log(f"  boot-smoke FAIL on {len(boot_failed)} service(s) (paged)")
+
+        gp = green_pointer_for(
+            checkpoint, boot_smoke=summary.boot_smoke,
+            open_critical_regressions=len(br.critical))
+        if gp:
+            await registry.put_green_pointer(gp)
+            summary.green = True
+        status = build_status(
+            checkpoint=checkpoint,
+            smokes=[type("S", (), {"status": s.status, "surface": s.surface})()
+                    for s in smokes],
+            verdicts=all_verdicts, green_pointer=gp, preview_url="")
+        await emit_status(registry, status, poster=poster)
+        summary.detail = (f"compose boot={summary.boot_smoke} "
+                          f"pass/fail={summary.passed}/{summary.failed}")
+        return summary
+    finally:
+        if instance is not None:
+            await adapter.teardown(instance)
+        else:
+            # provision raised after registering the project (or before): the
+            # substrate down -v + rmtree still reaps any partial stack.
+            with contextlib.suppress(Exception):
+                await sub.teardown()
