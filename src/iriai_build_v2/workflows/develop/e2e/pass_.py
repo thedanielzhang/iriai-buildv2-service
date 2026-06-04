@@ -327,7 +327,11 @@ async def _run_compose_pass(
     summary = PassSummary(group_idx=checkpoint.group_idx)
     label = f"group {checkpoint.group_idx}"
     commits = checkpoint.result_commits()
-    repo_key = profile.repo_path or next(iter(commits), "")
+    # result_commits()/clone_checkpoint key by repo-dir BASENAME; profile.repo_path
+    # may be a multi-segment path (e.g. "services/spend-client") — match on the
+    # basename so checkouts[repo_key] never KeyErrors.
+    repo_key = (Path(profile.repo_path).name if profile.repo_path else "") or next(
+        iter(commits), "")
     commit = commits.get(repo_key) or next(iter(commits.values()), "")
     slug = profile.compose_project_prefix or repo_key or "default"
 
@@ -342,9 +346,9 @@ async def _run_compose_pass(
     sub = CloneSubstrate(role="track", mode="automated", persist=False)
     on_log(f"compose provisioning @ group {checkpoint.group_idx} ...")
     sources = {key: _live_repo(feature_id, key) for key in commits}
-    if repo_key and repo_key not in sources:
-        sources[repo_key] = _live_repo(feature_id, repo_key)
     checkouts = await sub.clone_checkpoint(sources=sources, commits=commits)
+    if repo_key not in checkouts:  # defensive: fall back to the first cloned repo
+        repo_key = next(iter(checkouts), repo_key)
     checkout = checkouts[repo_key].checkout_dir
 
     adapter = get_adapter("compose")
@@ -383,10 +387,11 @@ async def _run_compose_pass(
         on_log(f"boot-smoke: {summary.boot_smoke} "
                f"({sum(1 for s in smokes if s.status == 'pass')}/{len(smokes)} up)")
 
-        # Host unit tests only once the stack is up — a dead stack is a boot fail,
-        # not a flood of misleading test failures.
+        # Host unit tests only once the stack is up — a dead stack (or a profile
+        # with NO surfaces configured) is a boot fail, not a flood of misleading
+        # test failures.
         all_verdicts = []
-        if not boot_failed:
+        if summary.boot_smoke == "pass":
             all_verdicts = await adapter.run(instance, [], source_commit=commit)
             for v in all_verdicts:
                 if v.status == "pass":
@@ -403,13 +408,21 @@ async def _run_compose_pass(
             {}, checkpoint_label=label)
         summary.backlog_appended = len(br.appended)
 
-        if boot_failed:
+        if summary.boot_smoke == "fail":
+            # Page on any boot fail — failed services OR an empty-surfaces profile
+            # (no service came up), so a misconfig is a loud honest failure.
+            failures = boot_failed or [
+                type("BS", (), {"surface": "compose",
+                                "detail": "no boot-smoke surfaces came up "
+                                          "(check profile.service_probe_targets)"})()
+            ]
             await page_critical(
                 registry, poster=poster, checkpoint_label=label,
                 boot_smoke_failures=[
-                    type("BS", (), {"surface": s.surface, "detail": s.detail[:300]})()
-                    for s in boot_failed])
-            on_log(f"  boot-smoke FAIL on {len(boot_failed)} service(s) (paged)")
+                    type("BS", (), {"surface": s.surface,
+                                    "detail": (s.detail or "")[:300]})()
+                    for s in failures])
+            on_log(f"  boot-smoke FAIL on {len(failures)} surface(s) (paged)")
 
         gp = green_pointer_for(
             checkpoint, boot_smoke=summary.boot_smoke,

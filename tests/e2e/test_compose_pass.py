@@ -181,6 +181,39 @@ async def test_compose_happy_path_sets_green(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_compose_multisegment_repo_path_does_not_crash(monkeypatch):
+    # profile.repo_path is a multi-segment path; result_commits()/clone keys are
+    # basenames, so the basename match + fallback must avoid a KeyError.
+    smokes = [BootSmoke(status="pass", surface="frontend", probe_kind="http_get")]
+    adapter = FakeComposeAdapter(smokes=smokes, verdicts=[])
+    _wire(monkeypatch, adapter)
+    reg = FakeRegistry(_profile())
+    profile = ProjectProfile(
+        project_kind="full_stack", adapter_id="compose",
+        repo_path="services/spend-client",  # multi-segment -> basename "spend-client"
+        compose_project_prefix="e2e", compose_file="docker-compose.yaml")
+
+    out = await run_full_pass(_checkpoint(), feature_id="f", registry=reg,
+                              live_dsn="x", profile=profile)
+
+    # checkpoint repo is "kaya-main"; basename "spend-client" not in checkouts ->
+    # defensive fallback to the first cloned repo, no crash.
+    assert out.boot_smoke == "pass"
+
+
+@pytest.mark.asyncio
+async def test_compose_empty_surfaces_fails_and_pages(monkeypatch):
+    adapter = FakeComposeAdapter(smokes=[], verdicts=[])  # no surfaces came up
+    _wire(monkeypatch, adapter)
+    reg = FakeRegistry(_profile())
+    out = await run_full_pass(_checkpoint(), feature_id="f", registry=reg,
+                              live_dsn="x", profile=_profile())
+    assert out.boot_smoke == "fail"
+    assert out.green is False
+    assert adapter.ran is False  # no host tests when nothing came up
+
+
+@pytest.mark.asyncio
 async def test_compose_boot_fail_blocks_green_and_skips_tests(monkeypatch):
     smokes = [
         BootSmoke(status="pass", surface="frontend", probe_kind="http_get"),

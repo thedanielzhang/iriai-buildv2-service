@@ -48,6 +48,28 @@ def test_override_remaps_rw_relative_bind_to_named_volume_keeps_ro():
     assert "web" not in ov.get("services", {})
 
 
+def test_override_leaves_ro_binds_with_options_untouched():
+    base = {
+        "services": {
+            "db": {
+                "image": "postgres",
+                "volumes": [
+                    "./postgres/data:/var/lib/postgresql/data",
+                    "./postgres/init_scripts:/docker-entrypoint-initdb.d:ro,z",
+                    "./seed:/seed:ro",
+                ],
+            }
+        }
+    }
+    ov = build_compose_override(base, run_id="r1", port_strategy="fixed")
+    vols = ov["services"]["db"]["volumes"]
+    # rw data -> named; both ro forms (bare ":ro" and ":ro,z") left untouched.
+    assert vols[0] == "e2e_r1_db_0:/var/lib/postgresql/data"
+    assert vols[1] == "./postgres/init_scripts:/docker-entrypoint-initdb.d:ro,z"
+    assert vols[2] == "./seed:/seed:ro"
+    assert list(ov["volumes"]) == ["e2e_r1_db_0"]
+
+
 def test_override_bump_offsets_host_ports():
     ov = build_compose_override(_BASE, run_id="run1", port_strategy="bump")
     web_ports = ov["services"]["web"]["ports"]

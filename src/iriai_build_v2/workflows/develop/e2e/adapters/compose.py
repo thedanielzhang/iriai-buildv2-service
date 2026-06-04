@@ -108,9 +108,12 @@ def build_compose_override(
             if isinstance(vol, str):
                 parts = vol.split(":")
                 host = parts[0]
-                mode = parts[2] if len(parts) >= 3 else ""
+                # mode may carry options ("ro,z", "ro,cached"); read-only iff "ro"
+                # is among them — a bare exact-match would miss those and wrongly
+                # remap a seed/source mount to an empty volume.
+                mode_opts = parts[2].split(",") if len(parts) >= 3 else []
                 is_rel = host.startswith("./") or host.startswith("../")
-                if is_rel and len(parts) >= 2 and mode != "ro":
+                if is_rel and len(parts) >= 2 and "ro" not in mode_opts:
                     vol_name = _sanitize(
                         f"{project_prefix}_{run_id}_{svc_name}_{idx}"
                     )
@@ -404,8 +407,13 @@ def _ensure_relative_data_dirs(checkout: Path, base_compose: dict) -> None:
             continue
         for vol in svc.get("volumes") or []:
             if isinstance(vol, str):
-                host = vol.split(":")[0]
-                if host.startswith("./") or host.startswith("../"):
+                parts = vol.split(":")
+                host = parts[0]
+                mode_opts = parts[2].split(",") if len(parts) >= 3 else []
+                # Only clone-relative ("./") RW bind sources — never "../" (would
+                # mkdir OUTSIDE the clone) and never ":ro" (tracked seed/source is
+                # already present; an empty dir would shadow it).
+                if host.startswith("./") and "ro" not in mode_opts:
                     with contextlib.suppress(OSError):
                         (checkout / host).mkdir(parents=True, exist_ok=True)
 

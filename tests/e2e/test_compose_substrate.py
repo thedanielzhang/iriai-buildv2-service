@@ -143,13 +143,71 @@ def test_sync_teardown_runs_compose_down(tmp_path, monkeypatch):
     )
 
     downed: list[dict] = []
-    monkeypatch.setattr(
-        substrate_module, "_compose_down_sync", lambda entry: downed.append(entry)
-    )
+
+    def fake_down(entry):
+        downed.append(entry)
+        return True
+
+    monkeypatch.setattr(substrate_module, "_compose_down_sync", fake_down)
     sub._sync_teardown()
 
     assert [e["project"] for e in downed] == ["e2e_st"]
     assert not sub.run_dir.exists()
+
+
+@pytest.mark.asyncio
+async def test_teardown_preserves_run_dir_when_down_fails(tmp_path):
+    # persist=True: no atexit (would fire a real `docker compose` at exit since
+    # this test deliberately leaves _torn_down False).
+    sub = CloneSubstrate(
+        run_id="fail", base_dir=tmp_path / "sc", nice=False, persist=True
+    )
+    sub.run_dir.mkdir(parents=True)
+    sub.register_compose_project(
+        "e2e_fail", workdir=str(sub.run_dir), compose_files=["c.yaml"], env_file=""
+    )
+
+    async def failing_run(*args, cwd=None, timeout=None):
+        return 1, "", "down boom"
+
+    sub._run = failing_run
+    await sub.teardown()
+
+    # A failed down must NOT rmtree (would orphan the stack + its sidecar) and
+    # must leave _torn_down False so atexit / gc_stale can retry (AC-K-9).
+    assert sub.run_dir.exists()
+    assert sub._torn_down is False
+    assert sub._composefile.exists()
+
+
+def test_sync_teardown_preserves_run_dir_when_down_fails(tmp_path, monkeypatch):
+    sub = CloneSubstrate(
+        run_id="sfail", base_dir=tmp_path / "sc", nice=False, persist=True
+    )
+    sub.run_dir.mkdir(parents=True)
+    sub.register_compose_project(
+        "e2e_sfail", workdir=str(sub.run_dir), compose_files=["c.yaml"], env_file=""
+    )
+    monkeypatch.setattr(substrate_module, "_compose_down_sync", lambda e: False)
+    sub._sync_teardown()
+    assert sub.run_dir.exists()
+    assert sub._torn_down is False
+
+
+def test_gc_stale_preserves_run_dir_when_down_fails(tmp_path, monkeypatch):
+    base = tmp_path / "scratch"
+    stale = base / "track" / "old"
+    stale.mkdir(parents=True)
+    (stale / "compose.json").write_text(
+        json.dumps([{"project": "e2e_old", "workdir": str(stale),
+                     "compose_files": ["c.yaml"], "env_file": ""}])
+    )
+    old = time.time() - 10 * 3600
+    os.utime(stale, (old, old))
+    monkeypatch.setattr(substrate_module, "_compose_down_sync", lambda e: False)
+    removed = CloneSubstrate.gc_stale(role="track", base_dir=base)
+    assert removed == []  # not reaped — preserved for a later retry
+    assert stale.exists()
 
 
 def test_gc_stale_downs_compose_from_sidecar_before_rmtree(tmp_path, monkeypatch):
@@ -165,9 +223,12 @@ def test_gc_stale_downs_compose_from_sidecar_before_rmtree(tmp_path, monkeypatch
     os.utime(stale, (old, old))
 
     downed: list[dict] = []
-    monkeypatch.setattr(
-        substrate_module, "_compose_down_sync", lambda entry: downed.append(entry)
-    )
+
+    def fake_down(entry):
+        downed.append(entry)
+        return True
+
+    monkeypatch.setattr(substrate_module, "_compose_down_sync", fake_down)
     removed = CloneSubstrate.gc_stale(role="track", base_dir=base)
 
     assert [e["project"] for e in downed] == ["e2e_old"]

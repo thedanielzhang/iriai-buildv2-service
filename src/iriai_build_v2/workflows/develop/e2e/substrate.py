@@ -39,7 +39,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_BASE = Path(os.environ.get("IRIAI_E2E_SCRATCH", "/tmp/iriai-e2e"))
 _GIT_TIMEOUT_S = float(os.environ.get("IRIAI_E2E_GIT_TIMEOUT_S", "1200"))
-_COMPOSE_DOWN_TIMEOUT_S = float(os.environ.get("IRIAI_E2E_COMPOSE_DOWN_TIMEOUT_S", "300"))
+_COMPOSE_DOWN_TIMEOUT_S = float(os.environ.get("IRIAI_E2E_COMPOSE_DOWN_TIMEOUT_S", "600"))
 
 
 class SubstrateError(RuntimeError):
@@ -305,7 +305,13 @@ class CloneSubstrate:
             )
         dst = Path(checkout) / rel_dst
         dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(src, dst)  # content only — never copy mode/owner metadata
+        # Create the dest 0600 from the start (no world/group-readable window),
+        # content only — never copy the source's mode/owner metadata.
+        data = src.read_bytes()
+        fd = os.open(str(dst), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+        # If the file pre-existed with looser perms, O_CREAT won't tighten it.
         with contextlib.suppress(OSError):
             dst.chmod(0o600)
         return dst
@@ -357,9 +363,9 @@ class CloneSubstrate:
     async def teardown(self) -> None:
         if self._torn_down:
             return
-        self._torn_down = True
         # Compose stacks first (before pid-kill/rmtree) so `down -v` can read the
         # still-present compose files and remove the per-run named volumes.
+        all_down = True
         for entry in list(self._compose_projects):
             argv = self._compose_down_argv(entry)
             workdir = entry.get("workdir") or None
@@ -370,11 +376,13 @@ class CloneSubstrate:
                     timeout=_COMPOSE_DOWN_TIMEOUT_S,
                 )
                 if rc != 0:
+                    all_down = False
                     logger.warning(
                         "compose down rc=%s for project %s: %s",
                         rc, entry.get("project"), err.strip()[-300:],
                     )
             except Exception as exc:  # noqa: BLE001 - teardown is best-effort
+                all_down = False
                 logger.warning(
                     "compose down errored for project %s: %s",
                     entry.get("project"), exc,
@@ -382,18 +390,29 @@ class CloneSubstrate:
         for pid in sorted(self._pids):
             _kill_pid(pid)
         await asyncio.sleep(0)  # let signals propagate
-        with contextlib.suppress(OSError):
-            shutil.rmtree(self.run_dir, ignore_errors=True)
+        # ONLY rmtree (and mark done) when every stack is actually down — else
+        # preserve the run dir + compose.json sidecar so atexit / gc_stale can
+        # retry the down. Deleting it on a failed down would orphan the stack +
+        # its volumes with no record to reap them (AC-K-9).
+        if all_down:
+            self._torn_down = True
+            with contextlib.suppress(OSError):
+                shutil.rmtree(self.run_dir, ignore_errors=True)
+        else:
+            logger.warning(
+                "preserving run dir %s for GC retry — compose down did not fully "
+                "succeed (stack may still be up)", self.run_dir,
+            )
 
     def _sync_teardown(self) -> None:
         if self._torn_down:
             return
-        self._torn_down = True
-        for entry in list(self._compose_projects):
-            _compose_down_sync(entry)
+        results = [_compose_down_sync(entry) for entry in list(self._compose_projects)]
         for pid in sorted(self._pids):
             _kill_pid(pid)
-        shutil.rmtree(self.run_dir, ignore_errors=True)
+        if all(results):
+            self._torn_down = True
+            shutil.rmtree(self.run_dir, ignore_errors=True)
 
     async def __aenter__(self) -> "CloneSubstrate":
         return self
@@ -434,16 +453,27 @@ class CloneSubstrate:
                     continue
                 # Tear down any leaked compose stack BEFORE rmtree (the down needs
                 # the still-present compose files); reaps a stack a crash left up.
+                down_ok = True
                 composefile = run / "compose.json"
                 if composefile.exists():
-                    with contextlib.suppress(Exception):
-                        for entry in json.loads(composefile.read_text()):
-                            _compose_down_sync(entry)
+                    try:
+                        entries = json.loads(composefile.read_text())
+                    except Exception:  # noqa: BLE001 - corrupt sidecar
+                        entries = []
+                    results = [_compose_down_sync(entry) for entry in entries]
+                    down_ok = all(results) if results else True
                 pidfile = run / "pids.json"
                 if pidfile.exists():
                     with contextlib.suppress(Exception):
                         for pid in json.loads(pidfile.read_text()):
                             _kill_pid(int(pid))
+                # Preserve a run dir whose stack we could NOT bring down, so a later
+                # GC (or the operator) can still reap it — never lose the record.
+                if not down_ok:
+                    logger.warning(
+                        "gc: preserving %s — compose down did not succeed", run
+                    )
+                    continue
                 shutil.rmtree(run, ignore_errors=True)
                 removed.append(str(run))
         return removed
@@ -456,8 +486,12 @@ def _kill_pid(pid: int) -> None:
         os.kill(pid, signal.SIGTERM)
 
 
-def _compose_down_sync(entry: dict) -> None:
-    """Best-effort synchronous ``docker compose down -v`` (atexit / GC paths)."""
+def _compose_down_sync(entry: dict) -> bool:
+    """Synchronous ``docker compose down -v`` (atexit / GC paths).
+
+    Returns True iff the down succeeded, so the caller can decide whether it is
+    safe to rmtree the run dir (a failed down must preserve the sidecar).
+    """
     argv = CloneSubstrate._compose_down_argv(entry)
     workdir = entry.get("workdir") or None
     try:
@@ -475,7 +509,10 @@ def _compose_down_sync(entry: dict) -> None:
                 entry.get("project"),
                 result.stderr.decode(errors="replace").strip()[-300:],
             )
+            return False
+        return True
     except Exception as exc:  # noqa: BLE001 - GC/atexit cleanup is best-effort
         logger.warning(
             "compose down errored for project %s: %s", entry.get("project"), exc
         )
+        return False
