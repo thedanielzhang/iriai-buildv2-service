@@ -345,7 +345,11 @@ async def _run_compose_pass(
 
     sub = CloneSubstrate(role="track", mode="automated", persist=False)
     on_log(f"compose provisioning @ group {checkpoint.group_idx} ...")
-    sources = {key: _live_repo(feature_id, key) for key in commits}
+    # Use each repo's ACTUAL on-disk path from the checkpoint (NOT the studio
+    # live-repo template, which is iriai-studio-specific) — falling back to the
+    # template only if a checkpoint somehow lacks the path.
+    sources = {r.repo_key: (r.repo_path or _live_repo(feature_id, r.repo_key))
+               for r in checkpoint.repos}
     checkouts = await sub.clone_checkpoint(sources=sources, commits=commits)
     if repo_key not in checkouts:  # defensive: fall back to the first cloned repo
         repo_key = next(iter(checkouts), repo_key)

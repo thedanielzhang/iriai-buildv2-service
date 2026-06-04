@@ -73,6 +73,7 @@ class _Checkout:
 
 class FakeSubstrate:
     constructed = 0
+    last_sources: dict | None = None
 
     def __init__(self, **_kw):
         FakeSubstrate.constructed += 1
@@ -80,6 +81,7 @@ class FakeSubstrate:
         self.torn = False
 
     async def clone_checkpoint(self, sources, commits):
+        FakeSubstrate.last_sources = dict(sources)
         return {key: _Checkout(f"/tmp/{key}") for key in commits}
 
     async def teardown(self):
@@ -178,6 +180,8 @@ async def test_compose_happy_path_sets_green(monkeypatch):
     assert adapter.ran is True
     assert [v.spec_id for v in reg.verdicts] == ["api:t1"]
     assert adapter.torn is True  # teardown ran
+    # Sources come from the checkpoint's actual repo_path, NOT the studio template.
+    assert FakeSubstrate.last_sources == {"kaya-main": "/x/kaya-main"}
 
 
 @pytest.mark.asyncio
