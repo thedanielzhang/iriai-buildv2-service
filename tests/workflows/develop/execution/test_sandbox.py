@@ -1592,3 +1592,406 @@ def test_provision_dependencies_failure_does_not_raise(tmp_path: Path) -> None:
     runner._provision_sandbox_dependencies(repo_root, source)  # no exception
 
     assert captured[0][0] == "cp"
+
+
+# --- P2: stack-aware (profile-driven) provisioning -----------------------------
+
+
+def _profiled_runner(
+    tmp_path: Path,
+    source: Path,
+    *,
+    package_roots: list[str],
+    package_managers: list[str],
+    fail_when=None,
+) -> tuple[SandboxRunner, list[tuple[str, list[str]]]]:
+    """A SandboxRunner with a duck-typed profile; records (cwd, argv) per call.
+
+    ``fail_when(argv)`` -> True makes that command return rc=1 with stderr, so a
+    test can force a specific manager step to fail.
+    """
+    captured: list[tuple[str, list[str]]] = []
+
+    def command_runner(cwd, argv, env):
+        argv_s = [str(a) for a in argv]
+        captured.append((str(cwd), argv_s))
+        rc = 1 if (fail_when and fail_when(argv_s)) else 0
+        return sandbox_module.CommandResult(
+            returncode=rc, stdout=b"", stderr=b"boom" if rc else b""
+        )
+
+    profile = SimpleNamespace(
+        package_roots=package_roots, package_managers=package_managers
+    )
+    runner = SandboxRunner(
+        workspace_root=tmp_path,
+        repo_sources={"app": source},
+        allowed_source_roots=[tmp_path],
+        command_runner=command_runner,
+        project_profile=profile,
+    )
+    return runner, captured
+
+
+def test_provision_pnpm_runs_frozen_install_without_node_modules_copy(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "src"
+    source.mkdir()
+    repo_root = tmp_path / "repo"
+    (repo_root / "spend-client").mkdir(parents=True)
+    runner, captured = _profiled_runner(
+        tmp_path, source, package_roots=["spend-client"], package_managers=["pnpm"]
+    )
+
+    results = runner._provision_sandbox_dependencies(repo_root, source)
+
+    assert captured == [
+        (
+            str(repo_root / "spend-client"),
+            ["pnpm", "install", "--frozen-lockfile", "--prefer-offline"],
+        )
+    ]
+    # Never a node_modules CoW copy for pnpm (symlink farm into a global store).
+    assert all(argv[0] != "cp" for _, argv in captured)
+    assert len(results) == 1
+    assert results[0].ok and results[0].manager == "pnpm"
+    assert results[0].best_effort is False
+
+
+def test_provision_pip_creates_venv_installs_reqs_and_devtools(tmp_path: Path) -> None:
+    source = tmp_path / "src"
+    source.mkdir()
+    repo_root = tmp_path / "repo"
+    backend = repo_root / "api"
+    backend.mkdir(parents=True)
+    (backend / "requirements.txt").write_text("flask\n", encoding="utf-8")
+    runner, captured = _profiled_runner(
+        tmp_path, source, package_roots=["api"], package_managers=["pip"]
+    )
+
+    results = runner._provision_sandbox_dependencies(repo_root, source)
+
+    pip = str(backend / ".venv" / "bin" / "pip")
+    assert [argv for _, argv in captured] == [
+        ["python3", "-m", "venv", ".venv"],
+        [pip, "install", "-r", "requirements.txt"],
+        [pip, "install", "pytest", "mypy", "black"],
+    ]
+    assert all(cwd == str(backend) for cwd, _ in captured)
+    assert results[0].ok and results[0].manager == "pip"
+
+
+def test_provision_pip_editable_install_when_only_pyproject(tmp_path: Path) -> None:
+    source = tmp_path / "src"
+    source.mkdir()
+    repo_root = tmp_path / "repo"
+    backend = repo_root / "api"
+    backend.mkdir(parents=True)
+    (backend / "pyproject.toml").write_text("[project]\nname='x'\n", encoding="utf-8")
+    runner, captured = _profiled_runner(
+        tmp_path, source, package_roots=["api"], package_managers=["pip"]
+    )
+
+    runner._provision_sandbox_dependencies(repo_root, source)
+
+    pip = str(backend / ".venv" / "bin" / "pip")
+    assert [argv for _, argv in captured] == [
+        ["python3", "-m", "venv", ".venv"],
+        [pip, "install", "-e", "."],
+        [pip, "install", "pytest", "mypy", "black"],
+    ]
+
+
+def test_provision_pip_installs_requirements_and_editable_package(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "src"
+    source.mkdir()
+    repo_root = tmp_path / "repo"
+    backend = repo_root / "api"
+    backend.mkdir(parents=True)
+    (backend / "requirements.txt").write_text("flask\n", encoding="utf-8")
+    (backend / "pyproject.toml").write_text(
+        "[project]\nname='api'\n", encoding="utf-8"
+    )
+    runner, captured = _profiled_runner(
+        tmp_path, source, package_roots=["api"], package_managers=["pip"]
+    )
+
+    runner._provision_sandbox_dependencies(repo_root, source)
+
+    pip = str(backend / ".venv" / "bin" / "pip")
+    # The project itself must be editable-installed even though requirements.txt
+    # was present, or its modules are unimportable for in-sandbox pytest/mypy.
+    assert [argv for _, argv in captured] == [
+        ["python3", "-m", "venv", ".venv"],
+        [pip, "install", "-r", "requirements.txt"],
+        [pip, "install", "-e", "."],
+        [pip, "install", "pytest", "mypy", "black"],
+    ]
+
+
+def test_provision_pip_skips_editable_for_tool_only_pyproject(tmp_path: Path) -> None:
+    source = tmp_path / "src"
+    source.mkdir()
+    repo_root = tmp_path / "repo"
+    backend = repo_root / "api"
+    backend.mkdir(parents=True)
+    (backend / "requirements.txt").write_text("flask\n", encoding="utf-8")
+    # A pyproject that only carries tool config is NOT installable; -e . would fail.
+    (backend / "pyproject.toml").write_text(
+        "[tool.black]\nline-length = 88\n", encoding="utf-8"
+    )
+    runner, captured = _profiled_runner(
+        tmp_path, source, package_roots=["api"], package_managers=["pip"]
+    )
+
+    runner._provision_sandbox_dependencies(repo_root, source)
+
+    pip = str(backend / ".venv" / "bin" / "pip")
+    assert [argv for _, argv in captured] == [
+        ["python3", "-m", "venv", ".venv"],
+        [pip, "install", "-r", "requirements.txt"],
+        [pip, "install", "pytest", "mypy", "black"],
+    ]
+    assert ["-e", "."] not in [argv[-2:] for _, argv in captured]
+
+
+def test_provision_poetry_runs_poetry_install(tmp_path: Path) -> None:
+    source = tmp_path / "src"
+    source.mkdir()
+    repo_root = tmp_path / "repo"
+    (repo_root / "svc").mkdir(parents=True)
+    runner, captured = _profiled_runner(
+        tmp_path, source, package_roots=["svc"], package_managers=["poetry"]
+    )
+
+    results = runner._provision_sandbox_dependencies(repo_root, source)
+
+    assert captured == [(str(repo_root / "svc"), ["poetry", "install"])]
+    assert results[0].ok and results[0].manager == "poetry"
+
+
+def test_provision_iterates_multiple_roots(tmp_path: Path) -> None:
+    source = tmp_path / "src"
+    source.mkdir()
+    repo_root = tmp_path / "repo"
+    (repo_root / "frontend").mkdir(parents=True)
+    backend = repo_root / "api"
+    backend.mkdir(parents=True)
+    (backend / "requirements.txt").write_text("flask\n", encoding="utf-8")
+    runner, captured = _profiled_runner(
+        tmp_path,
+        source,
+        package_roots=["frontend", "api"],
+        package_managers=["pnpm", "pip"],
+    )
+
+    results = runner._provision_sandbox_dependencies(repo_root, source)
+
+    cmds = [argv for _, argv in captured]
+    assert ["pnpm", "install", "--frozen-lockfile", "--prefer-offline"] in cmds
+    assert ["python3", "-m", "venv", ".venv"] in cmds
+    assert {r.manager for r in results} == {"pnpm", "pip"}
+    assert all(r.ok for r in results)
+
+
+def test_provision_pnpm_failure_is_surfaced_not_best_effort(tmp_path: Path) -> None:
+    source = tmp_path / "src"
+    source.mkdir()
+    repo_root = tmp_path / "repo"
+    (repo_root / "spend-client").mkdir(parents=True)
+    runner, _ = _profiled_runner(
+        tmp_path,
+        source,
+        package_roots=["spend-client"],
+        package_managers=["pnpm"],
+        fail_when=lambda argv: argv[0] == "pnpm",
+    )
+
+    results = runner._provision_sandbox_dependencies(repo_root, source)
+
+    failure = results[0]
+    assert failure.ok is False
+    assert failure.best_effort is False  # surfaced, not buried
+    assert failure.command == "pnpm install --frozen-lockfile --prefer-offline"
+    assert "rc=1" in failure.detail
+    # Mirrors the allocate() call-site accumulation that records onto the lease.
+    recorded = [r.as_dict() for r in results if not r.ok and not r.best_effort]
+    assert recorded == [
+        {
+            "root": "spend-client",
+            "manager": "pnpm",
+            "ok": False,
+            "command": "pnpm install --frozen-lockfile --prefer-offline",
+            "detail": failure.detail,
+        }
+    ]
+
+
+def test_legacy_npm_failure_stays_best_effort_and_is_not_recorded(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "src"
+    (source / "node_modules").mkdir(parents=True)
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    (repo_root / "package-lock.json").write_text("{}", encoding="utf-8")
+    # No profile -> legacy npm path; rc=1 fails both cp and npm ci.
+    runner, _ = _capturing_runner(tmp_path, source, rc=1)
+
+    results = runner._provision_sandbox_dependencies(repo_root, source)
+
+    assert results[0].manager == "npm"
+    assert results[0].ok is False
+    assert results[0].best_effort is True  # legacy stays best-effort
+    recorded = [r for r in results if not r.ok and not r.best_effort]
+    assert recorded == []
+
+
+def test_provision_unknown_manager_is_surfaced(tmp_path: Path) -> None:
+    source = tmp_path / "src"
+    source.mkdir()
+    repo_root = tmp_path / "repo"
+    (repo_root / "x").mkdir(parents=True)
+    runner, captured = _profiled_runner(
+        tmp_path, source, package_roots=["x"], package_managers=["cargo"]
+    )
+
+    results = runner._provision_sandbox_dependencies(repo_root, source)
+
+    assert captured == []  # no command attempted for an unknown manager
+    assert results[0].ok is False and results[0].best_effort is False
+    assert "unknown package manager" in results[0].detail
+
+
+def test_provision_skips_absent_root(tmp_path: Path) -> None:
+    source = tmp_path / "src"
+    source.mkdir()
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()  # "ghost" subdir intentionally absent
+    runner, captured = _profiled_runner(
+        tmp_path, source, package_roots=["ghost"], package_managers=["pnpm"]
+    )
+
+    results = runner._provision_sandbox_dependencies(repo_root, source)
+
+    assert results == []
+    assert captured == []
+
+
+def test_empty_package_roots_falls_back_to_legacy_npm(tmp_path: Path) -> None:
+    source = tmp_path / "src"
+    (source / "node_modules").mkdir(parents=True)
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    runner, captured = _profiled_runner(
+        tmp_path, source, package_roots=[], package_managers=[]
+    )
+
+    results = runner._provision_sandbox_dependencies(repo_root, source)
+
+    assert [argv for _, argv in captured] == [
+        ["cp", "-c", "-R", str(source / "node_modules"), str(repo_root / "node_modules")]
+    ]
+    assert results[0].manager == "npm" and results[0].best_effort is True
+
+
+def test_unmatched_root_gets_surfaced_unknown_manager(tmp_path: Path) -> None:
+    source = tmp_path / "src"
+    source.mkdir()
+    repo_root = tmp_path / "repo"
+    (repo_root / "a").mkdir(parents=True)
+    (repo_root / "b").mkdir(parents=True)
+    # Two roots, one manager: "b" is unmatched and must NOT be silently dropped.
+    runner, _ = _profiled_runner(
+        tmp_path, source, package_roots=["a", "b"], package_managers=["pnpm"]
+    )
+
+    results = runner._provision_sandbox_dependencies(repo_root, source)
+
+    assert [r.rel_path for r in results] == ["a", "b"]
+    assert results[0].manager == "pnpm" and results[0].ok
+    assert results[1].ok is False and results[1].best_effort is False
+    assert "unknown package manager" in results[1].detail
+
+
+def test_malformed_package_roots_falls_back_to_legacy_npm(tmp_path: Path) -> None:
+    source = tmp_path / "src"
+    (source / "node_modules").mkdir(parents=True)
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    # A non-list package_roots (e.g. an AI-inferred profile gone wrong) must not
+    # raise or iterate a bare string character-by-character.
+    runner, captured = _profiled_runner(
+        tmp_path, source, package_roots="spend-client", package_managers=["pnpm"]
+    )
+
+    results = runner._provision_sandbox_dependencies(repo_root, source)
+
+    assert [argv for _, argv in captured] == [
+        ["cp", "-c", "-R", str(source / "node_modules"), str(repo_root / "node_modules")]
+    ]
+    assert len(results) == 1 and results[0].manager == "npm"
+
+
+def test_lease_from_manifest_carries_provisioning(tmp_path: Path) -> None:
+    source = tmp_path / "src"
+    source.mkdir()
+    runner, _ = _capturing_runner(tmp_path, source)
+    provisioning = {
+        "scope": "sandbox_package_roots",
+        "repos": {
+            "app": [
+                {
+                    "root": "api",
+                    "manager": "pip",
+                    "ok": False,
+                    "command": "pip install -r requirements.txt",
+                    "detail": "rc=1",
+                }
+            ]
+        },
+    }
+    manifest = {
+        "sandbox_id": "sb",
+        "root": str(tmp_path),
+        "expires_at": "2026-01-01T00:00:00+00:00",
+        "owner": "owner",
+        "provisioning": provisioning,
+    }
+
+    lease = runner._lease_from_manifest(manifest)
+
+    assert lease.provisioning == provisioning
+    # Absent key tolerated (back-compat).
+    bare = runner._lease_from_manifest(
+        {
+            "sandbox_id": "sb",
+            "root": str(tmp_path),
+            "expires_at": "2026-01-01T00:00:00+00:00",
+            "owner": "owner",
+        }
+    )
+    assert bare.provisioning == {}
+
+
+def test_allocate_records_and_surfaces_empty_provisioning_when_clean(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "canonical" / "app"
+    base = init_repo(source)
+    runner = runner_for(tmp_path, source)
+
+    lease = run(runner.allocate(spec_for(base)))
+
+    assert lease.provisioning == {"scope": "sandbox_package_roots", "repos": {}}
+    manifest = json.loads(
+        (Path(lease.root) / "sandbox-manifest.json").read_text(encoding="utf-8")
+    )
+    assert manifest["provisioning"]["repos"] == {}
+
+    binding = run(runner.bind_runtime(lease, "codex"))
+    rwb = binding.role_metadata["runtime_workspace_binding"]
+    assert rwb["provisioning"]["repos"] == {}

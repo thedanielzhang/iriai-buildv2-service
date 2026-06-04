@@ -315,6 +315,10 @@ class SandboxLease(_SandboxModel):
     status: SandboxStatus
     patch_summary_ids: list[int]
     lease_version: int = 0
+    # Per-repo new-manager provisioning failures (pnpm/pip/poetry). Empty when all
+    # roots provisioned (or the legacy best-effort npm path). Shape:
+    # {"scope": ..., "repos": {repo_id: [{"root", "manager", "command", "detail"}]}}.
+    provisioning: dict[str, Any] = Field(default_factory=dict)
 
 
 class RuntimeWorkspaceBinding(_SandboxModel):
@@ -372,6 +376,62 @@ class CommandResult:
     returncode: int
     stdout: bytes
     stderr: bytes = b""
+
+
+@dataclass(frozen=True)
+class ProvisionResult:
+    """Outcome of provisioning one package root in a freshly-cloned sandbox.
+
+    ``best_effort`` marks the legacy single-root npm path, whose failures only
+    reproduce the pre-existing no-tooling state and so must NOT surface as task
+    errors. The new manager paths (pnpm/pip/poetry) set ``best_effort=False`` so
+    a failure is logged at ERROR with the exact command, recorded onto the lease,
+    and surfaced to the task (AC-K-4) rather than buried in a ``logger.warning``
+    that leaves pytest/mypy/tsc mysteriously absent.
+    """
+
+    rel_path: str
+    manager: str
+    ok: bool
+    command: str = ""
+    detail: str = ""
+    best_effort: bool = False
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "root": self.rel_path,
+            "manager": self.manager,
+            "ok": self.ok,
+            "command": self.command,
+            "detail": self.detail,
+        }
+
+
+def _command_failure_detail(result: CommandResult, *, limit: int = 600) -> str:
+    """Precise, bounded failure string (rc + stderr tail) — never a log dump."""
+    stderr = result.stderr.decode("utf-8", "replace").strip()
+    tail = stderr[-limit:] if stderr else ""
+    return f"rc={result.returncode}" + (f": {tail}" if tail else "")
+
+
+def _pip_is_installable_package(dest: Path) -> bool:
+    """True when ``dest`` is a pip-installable project (so ``pip install -e .`` is safe).
+
+    A bare ``pyproject.toml`` is frequently just tool config (``[tool.black]``,
+    ``[tool.pytest.ini_options]``, …) and is NOT installable — running ``-e .``
+    on it would fail spuriously. Only treat it as a package when it declares a
+    ``[project]`` or ``[build-system]`` table, or a ``setup.py`` exists.
+    """
+    if (dest / "setup.py").is_file():
+        return True
+    pyproject = dest / "pyproject.toml"
+    if pyproject.is_file():
+        try:
+            text = pyproject.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return False
+        return "[project]" in text or "[build-system]" in text
+    return False
 
 
 CommandRunner = Callable[
@@ -494,6 +554,7 @@ class SandboxRunner:
             base_commits: dict[str, str] = {}
             blocked_roots: list[str] = []
             permission_normalization: dict[str, Any] = {}
+            provisioning_failures: dict[str, list[dict[str, Any]]] = {}
 
             try:
                 for repo_id in spec.repo_ids:
@@ -529,11 +590,18 @@ class SandboxRunner:
                     # in-sandbox tooling (tsc/tsgo/Playwright) can self-verify.
                     # Off the event loop like the clone above: an APFS CoW copy
                     # is fast but an npm-ci fallback can be slow.
-                    await asyncio.to_thread(
+                    prov_results = await asyncio.to_thread(
                         self._provision_sandbox_dependencies,
                         repo_root,
                         source_resolved,
                     )
+                    repo_failures = [
+                        r.as_dict()
+                        for r in prov_results
+                        if not r.ok and not r.best_effort
+                    ]
+                    if repo_failures:
+                        provisioning_failures[repo_id] = repo_failures
                     self._validate_repo_root(
                         repo_root,
                         sandbox_root=sandbox_root,
@@ -646,6 +714,10 @@ class SandboxRunner:
                 "permission_normalization": {
                     "scope": "sandbox_repo_roots",
                     "repos": permission_normalization,
+                },
+                "provisioning": {
+                    "scope": "sandbox_package_roots",
+                    "repos": provisioning_failures,
                 },
                 "expires_at": _isoformat(expires_at),
                 "owner": self.owner,
@@ -764,6 +836,7 @@ class SandboxRunner:
                 "base_snapshot_by_repo": dict(
                     manifest.get("base_snapshot_by_repo") or {}
                 ),
+                "provisioning": dict(manifest.get("provisioning") or {}),
             },
             manifest_path=manifest_path,
         )
@@ -2322,6 +2395,7 @@ class SandboxRunner:
             patch_summary_ids=[
                 int(item) for item in manifest.get("patch_summary_ids", [])
             ],
+            provisioning=dict(manifest.get("provisioning") or {}),
         )
 
     def _coerce_lease(self, value: Any) -> SandboxLease:
@@ -2765,35 +2839,139 @@ class SandboxRunner:
             )
         return result.stdout
 
+    def _profile_package_roots(self) -> list[tuple[str, str]] | None:
+        """``(rel_path, manager)`` pairs from the profile, or ``None``.
+
+        ``None`` selects the legacy single-root npm path (no profile, no/empty
+        ``package_roots``, or a malformed non-list ``package_roots`` — the
+        iriai-studio default, unchanged). A root is never dropped just because its
+        manager is missing: if the index-aligned ``package_managers`` list is
+        shorter, the unmatched roots get an empty manager that dispatches to a
+        surfaced "unknown manager" failure (a path that doesn't exist in the repo
+        is a separate case, handled in the caller).
+
+        Tolerant of a duck-typed/AI-inferred profile: a non-list ``package_roots``
+        falls back to legacy rather than raising (preserving the never-raise
+        provisioning contract) or iterating a bare string character-by-character.
+        """
+        profile = self.project_profile
+        if profile is None:
+            return None
+        roots_raw = getattr(profile, "package_roots", None)
+        if not isinstance(roots_raw, (list, tuple)) or not roots_raw:
+            return None
+        managers_raw = getattr(profile, "package_managers", None)
+        managers = (
+            [str(m) for m in managers_raw]
+            if isinstance(managers_raw, (list, tuple))
+            else []
+        )
+        roots = [str(r) for r in roots_raw]
+        return [
+            (roots[i], managers[i] if i < len(managers) else "")
+            for i in range(len(roots))
+        ]
+
     def _provision_sandbox_dependencies(
         self, repo_root: Path, source_root: Path
-    ) -> None:
-        """Restore ``node_modules`` into a freshly-cloned sandbox repo.
+    ) -> list[ProvisionResult]:
+        """Restore each package root's dependencies into a sandbox clone.
 
-        The clone in :meth:`allocate` produces a working tree without
-        gitignored ``node_modules``, so in-sandbox ``tsc``/``tsgo`` are missing
-        and TS/Playwright tasks fail-close to ``partial``. The canonical source
-        repo already has dependencies installed; restore them via an APFS
-        copy-on-write clone (near-instant, no network) and only fall back to a
-        slow ``npm ci`` when the source has nothing to copy.
+        The clone in :meth:`allocate` produces a working tree without gitignored
+        dependency dirs (``node_modules``/``.venv``), so in-sandbox tooling
+        (``tsc``/``tsgo``/Playwright/``pytest``/``mypy``) is missing and tasks
+        fail-close. This restores them per package root described by
+        ``self.project_profile``.
 
-        Best-effort: a provisioning failure only reproduces the pre-existing
-        no-tooling state, so this never raises — tasks that don't need the
-        toolchain must be unaffected.
+        When no profile (or no ``package_roots``) is present, falls back to the
+        legacy single-root npm path verbatim (iriai-studio default, unchanged).
+
+        Returns one :class:`ProvisionResult` per root. Legacy npm failures stay
+        best-effort (a failure only reproduces the pre-existing no-tooling
+        state); new-manager failures are logged at ERROR with the exact command
+        and recorded onto the lease so the task surfaces a precise error instead
+        of a buried warning (AC-K-4).
         """
-        try:
-            dest_modules = repo_root / "node_modules"
-            if dest_modules.exists():
-                return
+        roots = self._profile_package_roots()
+        if roots is None:
+            return [self._provision_npm(repo_root, source_root)]
 
-            source_modules = source_root / "node_modules"
-            if source_modules.is_dir():
-                result = self._run_command(
+        results: list[ProvisionResult] = []
+        for rel_path, manager in roots:
+            rel = "" if rel_path in {"", "."} else rel_path
+            dest = repo_root if not rel else (repo_root / rel)
+            if not dest.is_dir():
+                # The root belongs to a different repo (multi-repo feature) or is
+                # misconfigured; skip rather than fail this repo's other roots.
+                logger.debug(
+                    "sandbox provisioning: skipping absent root %s (manager=%s) "
+                    "under %s",
+                    rel_path,
+                    manager,
                     repo_root,
+                )
+                continue
+            source = source_root if not rel else (source_root / rel)
+            result = self._provision_root(dest, source, manager, rel_path or ".")
+            if not result.ok and not result.best_effort:
+                logger.error(
+                    "sandbox dependency provisioning FAILED for root %s "
+                    "(manager=%s): command %r: %s",
+                    rel_path or ".",
+                    manager,
+                    result.command,
+                    result.detail,
+                )
+            results.append(result)
+        return results
+
+    def _provision_root(
+        self, dest: Path, source: Path, manager: str, rel_label: str
+    ) -> ProvisionResult:
+        mgr = (manager or "").strip().lower()
+        if mgr == "npm":
+            return self._provision_npm(dest, source, rel_label=rel_label)
+        if mgr == "pnpm":
+            return self._provision_pnpm(dest, rel_label=rel_label)
+        if mgr == "pip":
+            return self._provision_pip(dest, rel_label=rel_label)
+        if mgr == "poetry":
+            return self._provision_poetry(dest, rel_label=rel_label)
+        return ProvisionResult(
+            rel_path=rel_label,
+            manager=manager,
+            ok=False,
+            detail=f"unknown package manager {manager!r} for root {rel_label}",
+        )
+
+    def _provision_npm(
+        self, dest: Path, source: Path, *, rel_label: str = "."
+    ) -> ProvisionResult:
+        """APFS copy-on-write restore of ``node_modules`` (+ ``npm ci`` fallback).
+
+        The canonical source repo already has dependencies installed; restore via
+        an APFS copy-on-write clone (near-instant, no network) and only fall back
+        to a slow ``npm ci`` when the source has nothing to copy. Best-effort: a
+        failure only reproduces the pre-existing no-tooling state, so the legacy
+        single-root npm path never surfaces as a task error.
+        """
+        cmd = ""
+        try:
+            dest_modules = dest / "node_modules"
+            if dest_modules.exists():
+                return ProvisionResult(rel_label, "npm", True, best_effort=True)
+
+            source_modules = source / "node_modules"
+            if source_modules.is_dir():
+                cmd = f"cp -c -R {source_modules} {dest_modules}"
+                result = self._run_command(
+                    dest,
                     ["cp", "-c", "-R", str(source_modules), str(dest_modules)],
                 )
                 if result.returncode == 0:
-                    return
+                    return ProvisionResult(
+                        rel_label, "npm", True, command=cmd, best_effort=True
+                    )
                 logger.warning(
                     "sandbox dependency clone failed (rc=%s) copying %s -> %s; "
                     "falling back",
@@ -2802,22 +2980,151 @@ class SandboxRunner:
                     dest_modules,
                 )
 
-            if (repo_root / "package-lock.json").is_file():
+            if (dest / "package-lock.json").is_file():
+                cmd = "npm ci --prefer-offline --no-audit"
                 result = self._run_command(
-                    repo_root,
+                    dest,
                     ["npm", "ci", "--prefer-offline", "--no-audit"],
                 )
                 if result.returncode != 0:
                     logger.warning(
                         "sandbox dependency install failed (rc=%s) in %s",
                         result.returncode,
-                        repo_root,
+                        dest,
                     )
+                    return ProvisionResult(
+                        rel_label,
+                        "npm",
+                        False,
+                        command=cmd,
+                        detail=_command_failure_detail(result),
+                        best_effort=True,
+                    )
+            return ProvisionResult(
+                rel_label, "npm", True, command=cmd, best_effort=True
+            )
         except Exception as exc:  # pragma: no cover - best-effort guard.
             logger.warning(
                 "sandbox dependency provisioning errored for %s: %s",
-                repo_root,
+                dest,
                 exc,
+            )
+            return ProvisionResult(
+                rel_label, "npm", False, command=cmd, detail=str(exc), best_effort=True
+            )
+
+    def _provision_pnpm(self, dest: Path, *, rel_label: str) -> ProvisionResult:
+        """``pnpm install --frozen-lockfile`` in the package root.
+
+        NOT a ``node_modules`` CoW copy: pnpm's ``node_modules`` is a symlink farm
+        into a global content-addressed store outside the repo, so a copy yields
+        dangling links. ``HOME``/``PNPM_HOME`` propagate via ``_run_command``'s
+        ``merged_env`` (it starts from ``os.environ``), keeping the global store
+        reachable. A failure surfaces (not best-effort) per AC-K-4.
+        """
+        cmd = "pnpm install --frozen-lockfile --prefer-offline"
+        try:
+            result = self._run_command(
+                dest, ["pnpm", "install", "--frozen-lockfile", "--prefer-offline"]
+            )
+            if result.returncode == 0:
+                return ProvisionResult(rel_label, "pnpm", True, command=cmd)
+            return ProvisionResult(
+                rel_label,
+                "pnpm",
+                False,
+                command=cmd,
+                detail=_command_failure_detail(result),
+            )
+        except Exception as exc:
+            return ProvisionResult(
+                rel_label, "pnpm", False, command=cmd, detail=str(exc)
+            )
+
+    def _provision_pip(self, dest: Path, *, rel_label: str) -> ProvisionResult:
+        """``python -m venv .venv`` + install project deps + dev tools.
+
+        Installs declared project dependencies (``requirements*.txt`` or an
+        editable install of ``pyproject``/``setup.py``) plus the dev tools
+        (pytest/mypy/black) so in-sandbox self-verify runs. A failure surfaces
+        (not best-effort) per AC-K-4.
+        """
+        venv_dir = dest / ".venv"
+        cmd = "python3 -m venv .venv"
+        try:
+            if not venv_dir.exists():
+                result = self._run_command(dest, ["python3", "-m", "venv", ".venv"])
+                if result.returncode != 0:
+                    return ProvisionResult(
+                        rel_label,
+                        "pip",
+                        False,
+                        command=cmd,
+                        detail=_command_failure_detail(result),
+                    )
+            pip = str(venv_dir / "bin" / "pip")
+            for req in ("requirements.txt", "requirements-dev.txt"):
+                if (dest / req).is_file():
+                    cmd = f"{pip} install -r {req}"
+                    result = self._run_command(dest, [pip, "install", "-r", req])
+                    if result.returncode != 0:
+                        return ProvisionResult(
+                            rel_label,
+                            "pip",
+                            False,
+                            command=cmd,
+                            detail=_command_failure_detail(result),
+                        )
+            # Editable-install the project itself when it is a real installable
+            # package — independent of requirements*.txt, which usually list only
+            # third-party deps and would otherwise leave the project's own modules
+            # unimportable for in-sandbox pytest/mypy.
+            if _pip_is_installable_package(dest):
+                cmd = f"{pip} install -e ."
+                result = self._run_command(dest, [pip, "install", "-e", "."])
+                if result.returncode != 0:
+                    return ProvisionResult(
+                        rel_label,
+                        "pip",
+                        False,
+                        command=cmd,
+                        detail=_command_failure_detail(result),
+                    )
+            cmd = f"{pip} install pytest mypy black"
+            result = self._run_command(
+                dest, [pip, "install", "pytest", "mypy", "black"]
+            )
+            if result.returncode != 0:
+                return ProvisionResult(
+                    rel_label,
+                    "pip",
+                    False,
+                    command=cmd,
+                    detail=_command_failure_detail(result),
+                )
+            return ProvisionResult(rel_label, "pip", True, command=cmd)
+        except Exception as exc:
+            return ProvisionResult(
+                rel_label, "pip", False, command=cmd, detail=str(exc)
+            )
+
+    def _provision_poetry(self, dest: Path, *, rel_label: str) -> ProvisionResult:
+        """``poetry install`` in the package root (surfaces failures, AC-K-4)."""
+        cmd = "poetry install"
+        try:
+            result = self._run_command(dest, ["poetry", "install"])
+            if result.returncode == 0:
+                return ProvisionResult(rel_label, "poetry", True, command=cmd)
+            return ProvisionResult(
+                rel_label,
+                "poetry",
+                False,
+                command=cmd,
+                detail=_command_failure_detail(result),
+            )
+        except Exception as exc:
+            return ProvisionResult(
+                rel_label, "poetry", False, command=cmd, detail=str(exc)
             )
 
     def _run_command(
@@ -3078,6 +3385,7 @@ def _runtime_binding_metadata(binding: RuntimeWorkspaceBinding) -> dict[str, Any
         "base_snapshot_by_repo": dict(
             binding.role_metadata.get("base_snapshot_by_repo") or {}
         ),
+        "provisioning": dict(binding.role_metadata.get("provisioning") or {}),
         "manifest_path": binding.manifest_path,
         "expires_at": binding.expires_at,
     }
