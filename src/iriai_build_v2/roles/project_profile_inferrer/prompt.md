@@ -58,10 +58,57 @@ strings / empty lists. NEVER put secret values in `env_keys` — names only.
 - `env_keys` — names of env vars the run needs (from the scripts/config), no
   values.
 - `adapter_id` — `browser` (Playwright/Electron webview), `http_service` (API),
-  or `cli`.
+  `cli`, or `compose` (a docker-compose multi-service app — see below).
 - `inference_confidence` — 0.0–1.0 honest confidence.
 - `notes` — anything important (multi-surface layout, a root coordination
   script, version constraints).
 
+### Multi-package / multi-service monorepos
+
+If the repo holds MULTIPLE buildable packages (e.g. a pnpm/npm frontend plus
+several Python services), emit these PARALLEL, INDEX-ALIGNED lists (same length
+within each group; leave all empty for a single-package project):
+
+- `package_roots` / `package_managers` — one entry per installable package
+  directory and its manager, `npm` | `pnpm` | `pip` | `poetry`. Detect the
+  manager from the lockfile (`pnpm-lock.yaml`→pnpm, `package-lock.json`→npm,
+  `poetry.lock`→poetry, `requirements*.txt`/`setup.py`/`pyproject`→pip).
+  Example: `package_roots=["spend-client","supply-chain"]`,
+  `package_managers=["pnpm","poetry"]`.
+- `service_names` / `service_languages` / `service_test_cmds` — one entry per
+  runnable service: its name, language, and the service's OWN test command
+  (`pnpm exec vitest run` / `pytest -q`), `""` if none.
+
+### Commit hygiene (how the repo's pre-commit hooks behave)
+
+- `commit_hygiene_strategy` — `rule_grant` if hooks REPORT lint errors that a
+  config carve-out fixes (eslint family; the default when empty), or
+  `restage_autofix` if hooks REWRITE files in place then fail (the `pre-commit`
+  framework with black / prettier / trailing-whitespace). Detect from
+  `.pre-commit-config.yaml` (→ `restage_autofix`) vs a gulp/husky eslint hook.
+- `commit_hygiene_parser` — `eslint_gulp` (default) or the parser id matching the
+  hook's stderr format.
+
+### docker-compose app (when `adapter_id=compose`)
+
+Set these when the app runs via `docker compose`:
+
+- `compose_file` / `compose_override_file` — paths (relative to repo root) to the
+  base compose file and any instance/override file.
+- `compose_profiles` — compose `--profile` names needed to boot the app (e.g.
+  `["spend-client"]`).
+- `compose_project_prefix` — a short prefix for the isolated `-p` project name.
+- `compose_port_strategy` — `fixed` if the app REQUIRES specific host ports
+  (auth callbacks, hardcoded URLs); `bump` only if ports are freely reassignable.
+- `service_probe_targets` / `service_port_keys` — index-aligned with
+  `service_names`: each service's health path (`/`, `/health`) and the env key
+  (in the compose env file) that carries its host port.
+- `secret_source_path` / `secret_rel_dst` — leave EMPTY; the operator supplies the
+  secret path out-of-band. Only record `secret_rel_dst` (where the app expects its
+  env file inside the repo, e.g. `common/docker/.env.local`) if obvious.
+- `e2e_test_account_user_key` / `e2e_test_account_pass_key` — the env KEY NAMES
+  (never values) an authenticated e2e login would read.
+
 Justify your choices from the actual manifest contents you read. If you cannot
 find a runnable surface, set `project_kind=library` and explain in `notes`.
+Keep every index-aligned list group the SAME length.

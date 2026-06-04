@@ -77,14 +77,21 @@ async def infer_profile(
         feature,
     )
 
-    if refine and not is_structurally_valid(profile):
+    issues: list[str] = []
+    if not is_structurally_valid(profile):
+        issues.append(
+            "structurally incomplete: ensure project_kind is one of "
+            f"{PROJECT_KINDS}, adapter_id is set, and (for a runnable kind) "
+            "start_cmd or native_test_cmd plus a ready_probe_kind are present"
+        )
+    issues.extend(profile.alignment_errors())
+    if refine and issues:
         refine_prompt = (
             prompt
-            + "\n\nYour previous profile was structurally incomplete: "
-            "ensure project_kind is one of "
-            f"{PROJECT_KINDS}, adapter_id is set, and (for a runnable kind) "
-            "start_cmd or native_test_cmd plus a ready_probe_kind are present. "
-            "Re-emit a complete ProjectProfile grounded in the manifests."
+            + "\n\nYour previous profile had these issues:\n- "
+            + "\n- ".join(issues)
+            + "\n\nRe-emit a COMPLETE ProjectProfile grounded in the manifests, "
+            "keeping every index-aligned list group the SAME length."
         )
         profile = await runner.run(
             Ask(

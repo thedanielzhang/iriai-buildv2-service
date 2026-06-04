@@ -54,9 +54,76 @@ class ProjectProfile(BaseModel):
     # Names ONLY — never secret values.
     env_keys: list[str] = Field(default_factory=list)
     seed_cmd: str = ""  # deterministic fixtures/DB seed; "" = no-op
-    adapter_id: str = ""  # browser | http_service | cli
+    adapter_id: str = ""  # browser | http_service | cli | compose
     inference_confidence: float = 0.0
     notes: str = ""
+
+    # --- multi-package provisioning (P1/P2). package_managers[i] is the manager
+    #     for package_roots[i]: one of npm | pnpm | pip | poetry. Empty => the
+    #     legacy single-root npm path (iriai-studio default, unchanged). ---
+    package_roots: list[str] = Field(default_factory=list)
+    package_managers: list[str] = Field(default_factory=list)
+
+    # --- per-service description for a multi-service monorepo (index-aligned). ---
+    service_names: list[str] = Field(default_factory=list)
+    service_languages: list[str] = Field(default_factory=list)
+    service_test_cmds: list[str] = Field(default_factory=list)
+
+    # --- commit-hygiene strategy (P3). Empty => the studio eslint/gulp rule_grant
+    #     default. "restage_autofix" = re-stage a formatter's own edits (black). ---
+    commit_hygiene_strategy: str = ""  # "" | rule_grant | restage_autofix
+    commit_hygiene_parser: str = ""  # "" => eslint_gulp
+
+    # --- authenticated-e2e indirection (P4). KEY NAMES ONLY — never secret values;
+    #     resolved at run time from the injected env/.env file. ---
+    e2e_test_account_user_key: str = ""
+    e2e_test_account_pass_key: str = ""
+
+    # --- docker-compose boot (P4). Empty => non-compose single-surface (studio).
+    #     compose_port_strategy: "" / "fixed" => use the product's OWN fixed ports
+    #     (kaya needs specific ports; a single-stack mutex serialises passes);
+    #     "bump" => offset host ports per run (only for products without fixed-port
+    #     requirements). ---
+    compose_file: str = ""
+    compose_override_file: str = ""
+    compose_profiles: list[str] = Field(default_factory=list)
+    compose_project_prefix: str = ""
+    secret_source_path: str = ""  # orchestrator-side secret store path (never the product repo)
+    secret_rel_dst: str = ""  # where to inject the secret inside the clone
+    service_probe_targets: list[str] = Field(default_factory=list)  # index-aligned w/ service_names
+    service_port_keys: list[str] = Field(default_factory=list)  # env keys (in .env.instance) for host ports
+    compose_port_strategy: str = ""  # "" | fixed | bump
+
+    def alignment_errors(self) -> list[str]:
+        """Non-raising check that index-aligned parallel lists agree in length.
+
+        Returns a list of human-readable mismatches (empty == aligned). Used by
+        the inferrer refine loop to ask for a corrected profile rather than
+        failing structured-output parsing. Empty lists (the studio default) are
+        always aligned.
+        """
+        errors: list[str] = []
+        groups = {
+            "package_roots/package_managers": (
+                len(self.package_roots),
+                len(self.package_managers),
+            ),
+            "service_names/service_languages/service_test_cmds": (
+                len(self.service_names),
+                len(self.service_languages),
+                len(self.service_test_cmds),
+            ),
+            "service_names/service_probe_targets/service_port_keys": (
+                len(self.service_names),
+                len(self.service_probe_targets),
+                len(self.service_port_keys),
+            ),
+        }
+        for label, lengths in groups.items():
+            nonzero = {n for n in lengths if n}
+            if len(nonzero) > 1:
+                errors.append(f"{label} lengths disagree: {lengths}")
+        return errors
 
 
 class BootSmoke(BaseModel):

@@ -398,6 +398,7 @@ class SandboxRunner:
         recovery_owner_prefix: str | None = None,
         recovery_feature_id: str | None = None,
         clock: Callable[[], datetime] | None = None,
+        project_profile: Any | None = None,
     ) -> None:
         self.workspace_root = Path(workspace_root or Path.cwd()).resolve()
         self.repo_sources = {
@@ -406,6 +407,9 @@ class SandboxRunner:
         }
         self.store = store
         self.artifact_writer = artifact_writer
+        # Inferred ProjectProfile (typed Any to avoid an e2e.models import
+        # cycle). None => legacy single-root npm provisioning (studio default).
+        self.project_profile = project_profile
         self.command_runner = command_runner
         self.owner = owner or f"pid:{os.getpid()}"
         self.recovery_owner_prefix = recovery_owner_prefix
