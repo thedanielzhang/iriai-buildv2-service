@@ -214,6 +214,50 @@ async def test_hosted_interview_done_requires_all_declared_artifacts(tmp_path: P
 
 
 @pytest.mark.asyncio
+async def test_done_terminates_on_written_artifact_despite_lingering_question(
+    tmp_path: Path,
+):
+    # Regression for the Broad Design non-termination halt (feature d31adf8d): a
+    # degraded completion turn (structured_output None -> session cycle -> the
+    # agent loses turn-1 context and keeps re-asking for it) must NOT re-open a
+    # finished interview whose artifact is ALREADY written. Completion is detected
+    # by the written+ready deliverable — interviews are NEVER turn-bounded.
+    feature = SimpleNamespace(id="feat-design-halt", name="Design")
+    mirror = ArtifactMirror(tmp_path)
+    runner = SimpleNamespace(
+        artifacts=_ArtifactStore(),
+        services={"hosting": _Hosting(), "artifact_mirror": mirror},
+    )
+    interview = HostedInterview(
+        questioner=AgentActor(name="designer", role=Role(name="designer", prompt="Design.")),
+        responder=InteractionActor(name="user", resolver="terminal"),
+        initial_prompt="Start",
+        done=lambda _result: False,  # base predicate never fires on its own
+        artifact_key="broad-design",
+        artifact_label="Broad Design",
+    )
+    await interview.on_start(runner, feature)
+    staging = interview._artifact_output_paths["broad-design"]
+
+    # Healthy mid-interview: a pending question with NO artifact yet keeps going.
+    assert interview.done(
+        SimpleNamespace(question="which button variant?", output=None, artifact_path="")
+    ) is False
+
+    # The agent writes its final artifact (a NEW file), then its completion turn
+    # is degraded and carries a stale question. The interview must terminate.
+    staging.parent.mkdir(parents=True, exist_ok=True)
+    staging.write_text("# design system", encoding="utf-8")
+    assert interview.done(
+        SimpleNamespace(
+            question="I'm paused awaiting the mode + PRD + output path",
+            output=None,
+            artifact_path="",
+        )
+    ) is True
+
+
+@pytest.mark.asyncio
 async def test_hosted_interview_requires_all_declared_artifacts_before_persisting(tmp_path: Path):
     feature = SimpleNamespace(id="feat-arch", name="Architecture")
     artifacts = _ArtifactStore()

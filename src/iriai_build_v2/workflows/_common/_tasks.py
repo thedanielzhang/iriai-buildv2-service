@@ -441,8 +441,24 @@ class HostedInterview(Interview):
             original_done = self.done
 
             def file_aware_done(response: Any) -> bool:
-                # Envelope question field is authoritative — never exit
-                # while the agent has a pending question for the user
+                # If the FINAL artifact is already written for THIS interview AND
+                # fully resolvable, the interview is complete — even if the agent's
+                # (possibly degraded) turn still carries a stale `question`. A
+                # one-off `structured_output is None` hiccup on the completion turn
+                # would otherwise re-open finished work into an unbounded loop
+                # (it cycles the session, loses the turn-1 context, and the agent
+                # keeps asking for it). Interviews are NEVER turn-bounded;
+                # completion is detected by the written+ready deliverable here.
+                # `_has_new_artifact_file` requires a file that did NOT exist
+                # before this interview, so healthy multi-turn interviews (which
+                # write nothing until the end) are unaffected.
+                if (
+                    self._has_new_artifact_file(response, mirror=mirror, feature=feature)
+                    and self._artifacts_ready(response, mirror=mirror, feature=feature)
+                ):
+                    return True
+                # Otherwise the question field is authoritative — never exit
+                # while the agent has a pending question and no artifact yet.
                 question = getattr(response, "question", "")
                 if question:
                     return False
