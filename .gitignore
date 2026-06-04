@@ -6,3 +6,5 @@ __pycache__/
 dist/
 /build/
 .claude/
+# Orchestrator-side e2e secret store (never commit product secrets); see P4.
+.iriai-secrets/

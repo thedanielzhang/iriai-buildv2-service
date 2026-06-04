@@ -156,12 +156,47 @@ async def probe_exit_zero(
     return ok, f"exit {proc.returncode}: {tail.strip()}"
 
 
+async def probe_tcp_connect(
+    target: str, *, timeout_s: float = 60.0, interval_s: float = 1.0
+) -> tuple[bool, str]:
+    """Poll until a TCP connect to ``host:port`` succeeds (DB/cache readiness).
+
+    ``target`` is ``host:port`` (host defaults to 127.0.0.1 when omitted, e.g.
+    ``:5432``). Used for stack services with no HTTP surface (Postgres, redis).
+    """
+    host, _, port_s = target.rpartition(":")
+    host = host or "127.0.0.1"
+    try:
+        port = int(port_s)
+    except ValueError:
+        return False, f"invalid tcp target {target!r} (want host:port)"
+    deadline = time.monotonic() + timeout_s
+    last = "no attempt"
+    while time.monotonic() < deadline:
+        try:
+            _, writer = await asyncio.wait_for(
+                asyncio.open_connection(host, port), timeout=5.0
+            )
+            writer.close()
+            with contextlib.suppress(Exception):
+                await writer.wait_closed()
+            return True, f"tcp connect ok to {host}:{port}"
+        except (OSError, asyncio.TimeoutError, ConnectionError) as exc:
+            last = f"connect: {exc}"
+        await asyncio.sleep(interval_s)
+    return False, (
+        f"timeout after {timeout_s:.0f}s waiting for tcp {host}:{port} (last: {last})"
+    )
+
+
 async def probe_surface(surface: Surface, *, timeout_s: float = 60.0) -> BootSmoke:
     """Run the surface's declared probe and return a BootSmoke verdict."""
     kind = surface.probe_kind
     target = surface.probe_target
     if kind == "http_get":
         ok, detail = await probe_http_get(target, timeout_s=timeout_s)
+    elif kind == "tcp_connect":
+        ok, detail = await probe_tcp_connect(target, timeout_s=timeout_s)
     elif kind == "log_line":
         needle = surface.base_url or target  # base_url holds the needle if split
         ok, detail = await probe_log_line(surface.log_path or target, needle,

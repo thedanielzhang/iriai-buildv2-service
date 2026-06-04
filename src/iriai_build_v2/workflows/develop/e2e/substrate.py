@@ -24,6 +24,7 @@ import asyncio
 import atexit
 import contextlib
 import json
+import logging
 import os
 import shutil
 import signal
@@ -34,8 +35,11 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
+logger = logging.getLogger(__name__)
+
 DEFAULT_BASE = Path(os.environ.get("IRIAI_E2E_SCRATCH", "/tmp/iriai-e2e"))
 _GIT_TIMEOUT_S = float(os.environ.get("IRIAI_E2E_GIT_TIMEOUT_S", "1200"))
+_COMPOSE_DOWN_TIMEOUT_S = float(os.environ.get("IRIAI_E2E_COMPOSE_DOWN_TIMEOUT_S", "300"))
 
 
 class SubstrateError(RuntimeError):
@@ -59,6 +63,9 @@ class CloneSubstrate:
     nice: bool = True
     persist: bool = False  # if True, survive process exit (caller owns teardown)
     _pids: set[int] = field(default_factory=set, init=False, repr=False)
+    _compose_projects: list[dict] = field(
+        default_factory=list, init=False, repr=False
+    )
     _torn_down: bool = field(default=False, init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -80,6 +87,10 @@ class CloneSubstrate:
     @property
     def _pidfile(self) -> Path:
         return self.run_dir / "pids.json"
+
+    @property
+    def _composefile(self) -> Path:
+        return self.run_dir / "compose.json"
 
     # ----------------------------------------------------------- subprocess
     async def _run(
@@ -274,11 +285,100 @@ class CloneSubstrate:
             self.run_dir.mkdir(parents=True, exist_ok=True)
             self._pidfile.write_text(json.dumps(sorted(self._pids)))
 
+    # ---------------------------------------------------------------- secrets
+    def inject_secret_file(
+        self, checkout: Path, src_path: str | Path, rel_dst: str
+    ) -> Path:
+        """Copy an orchestrator-side secret env file INTO the clone.
+
+        The source is the build-system secret store — NEVER the product checkout
+        (which is never read for secrets nor modified). Copies content only (no
+        ``git add``, never log the contents), chmod 0600, and returns the dest.
+        A missing source RAISES so the caller surfaces an honest ``BootSmoke``
+        fail rather than booting un-authenticated / false-green (AC-K-10).
+        """
+        src = Path(src_path)
+        if not src.is_file():
+            raise SubstrateError(
+                f"secret source not found: {src} — copy the env file into the "
+                f"orchestrator secret store (never read the product repo for it)"
+            )
+        dst = Path(checkout) / rel_dst
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(src, dst)  # content only — never copy mode/owner metadata
+        with contextlib.suppress(OSError):
+            dst.chmod(0o600)
+        return dst
+
+    # ----------------------------------------------------- compose lifecycle
+    def register_compose_project(
+        self,
+        project: str,
+        *,
+        workdir: str | Path,
+        compose_files: list[str],
+        env_file: str | None = None,
+    ) -> None:
+        """Record a docker-compose project so EVERY teardown path tears it down.
+
+        ``compose down -v --remove-orphans`` runs in :meth:`teardown` (in-process),
+        :meth:`_sync_teardown` (atexit), AND cross-process :meth:`gc_stale` — the
+        last reads a ``compose.json`` sidecar (next to ``pids.json``), so a stack
+        leaked by a crash is still reaped, leaving zero stray containers/volumes
+        (AC-K-9). Persisted on registration.
+        """
+        entry = {
+            "project": str(project),
+            "workdir": str(workdir),
+            "compose_files": [str(f) for f in compose_files],
+            "env_file": str(env_file) if env_file else "",
+        }
+        if entry not in self._compose_projects:
+            self._compose_projects.append(entry)
+        self._persist_compose()
+
+    def _persist_compose(self) -> None:
+        with contextlib.suppress(OSError):
+            self.run_dir.mkdir(parents=True, exist_ok=True)
+            self._composefile.write_text(json.dumps(self._compose_projects))
+
+    @staticmethod
+    def _compose_down_argv(entry: dict) -> list[str]:
+        argv = ["docker", "compose", "-p", str(entry.get("project", ""))]
+        for compose_file in entry.get("compose_files") or []:
+            argv += ["-f", str(compose_file)]
+        env_file = entry.get("env_file")
+        if env_file:
+            argv += ["--env-file", str(env_file)]
+        argv += ["down", "-v", "--remove-orphans"]
+        return argv
+
     # ------------------------------------------------------------- teardown
     async def teardown(self) -> None:
         if self._torn_down:
             return
         self._torn_down = True
+        # Compose stacks first (before pid-kill/rmtree) so `down -v` can read the
+        # still-present compose files and remove the per-run named volumes.
+        for entry in list(self._compose_projects):
+            argv = self._compose_down_argv(entry)
+            workdir = entry.get("workdir") or None
+            try:
+                rc, _, err = await self._run(
+                    *argv,
+                    cwd=Path(workdir) if workdir else None,
+                    timeout=_COMPOSE_DOWN_TIMEOUT_S,
+                )
+                if rc != 0:
+                    logger.warning(
+                        "compose down rc=%s for project %s: %s",
+                        rc, entry.get("project"), err.strip()[-300:],
+                    )
+            except Exception as exc:  # noqa: BLE001 - teardown is best-effort
+                logger.warning(
+                    "compose down errored for project %s: %s",
+                    entry.get("project"), exc,
+                )
         for pid in sorted(self._pids):
             _kill_pid(pid)
         await asyncio.sleep(0)  # let signals propagate
@@ -289,6 +389,8 @@ class CloneSubstrate:
         if self._torn_down:
             return
         self._torn_down = True
+        for entry in list(self._compose_projects):
+            _compose_down_sync(entry)
         for pid in sorted(self._pids):
             _kill_pid(pid)
         shutil.rmtree(self.run_dir, ignore_errors=True)
@@ -330,6 +432,13 @@ class CloneSubstrate:
                 # GC delete recent, in-use sibling clones.
                 if age < max_age_s:
                     continue
+                # Tear down any leaked compose stack BEFORE rmtree (the down needs
+                # the still-present compose files); reaps a stack a crash left up.
+                composefile = run / "compose.json"
+                if composefile.exists():
+                    with contextlib.suppress(Exception):
+                        for entry in json.loads(composefile.read_text()):
+                            _compose_down_sync(entry)
                 pidfile = run / "pids.json"
                 if pidfile.exists():
                     with contextlib.suppress(Exception):
@@ -345,3 +454,28 @@ def _kill_pid(pid: int) -> None:
         os.killpg(os.getpgid(pid), signal.SIGTERM)
     with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
         os.kill(pid, signal.SIGTERM)
+
+
+def _compose_down_sync(entry: dict) -> None:
+    """Best-effort synchronous ``docker compose down -v`` (atexit / GC paths)."""
+    argv = CloneSubstrate._compose_down_argv(entry)
+    workdir = entry.get("workdir") or None
+    try:
+        result = subprocess.run(
+            argv,
+            cwd=workdir,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            timeout=_COMPOSE_DOWN_TIMEOUT_S,
+        )
+        if result.returncode != 0:
+            logger.warning(
+                "compose down rc=%s for project %s: %s",
+                result.returncode,
+                entry.get("project"),
+                result.stderr.decode(errors="replace").strip()[-300:],
+            )
+    except Exception as exc:  # noqa: BLE001 - GC/atexit cleanup is best-effort
+        logger.warning(
+            "compose down errored for project %s: %s", entry.get("project"), exc
+        )

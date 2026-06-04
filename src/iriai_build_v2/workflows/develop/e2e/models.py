@@ -17,7 +17,7 @@ from pydantic import BaseModel, Field
 # --------------------------------------------------------------------------- #
 
 PROJECT_KINDS = ("api", "full_stack", "cli", "electron", "library")
-READY_PROBE_KINDS = ("http_get", "log_line", "exit_zero", "file_exists")
+READY_PROBE_KINDS = ("http_get", "log_line", "exit_zero", "file_exists", "tcp_connect")
 VERDICT_STATUSES = ("pass", "fail", "error", "skipped")
 # No `drift` class: locator breaks are plain failures re-authored under citation.
 FAILURE_CLASSES = ("regression", "intended_change", "flaky", "infra")
