@@ -870,18 +870,35 @@ class ClaudeAgentRuntime(AgentRuntime):
             # the workflow still gets a real result. Scoped to the single failing
             # dispatch — every normal dispatch keeps full extended thinking; only
             # one that actually fails to emit degrades, and only on its retry.
-            needs_fallback = bool(output_type) and (
-                rm is None
-                or getattr(rm, "subtype", None) == "error_max_structured_output_retries"
-            )
-            if not needs_fallback:
+            # A structured dispatch can fail to emit its result three ways, all
+            # meaning "thinking-on could not produce structured output here":
+            #   - rm is None                       → the 400 error storm (caught above)
+            #   - subtype == error_max_structured.. → a clean retry-exhaustion
+            #   - structured_output is None         → a degraded/exhausted turn that
+            #     returned a result message carrying no structured payload
+            # The third was previously NOT routed here — it fell through to the
+            # post-dispatch None-guard, which cycled (summarized + DELETED) the
+            # session and retried CONTEXT-LESS, the systemic root of the
+            # interview-spin / re-flagged-review / decomposition-crash symptoms.
+            # Route it through the SAME context-preserving thinking-off
+            # re-dispatch instead: it reliably emits structured output without
+            # touching the session brief.
+            if not bool(output_type):
+                return rm
+            if rm is None:
+                reason = "api error storm"
+            elif getattr(rm, "subtype", None) == "error_max_structured_output_retries":
+                reason = "exhausted retries"
+            elif getattr(rm, "structured_output", None) is None:
+                reason = "structured_output is None"
+            else:
                 return rm
             logger.warning(
                 "Structured output unproduced with thinking on for %s (%s) — "
                 "retrying once with thinking disabled (scoped fallback; normal "
                 "dispatches keep extended thinking)",
                 session_key or role.name,
-                "api error storm" if rm is None else "exhausted retries",
+                reason,
             )
             fallback_options = self._build_options(
                 role, workspace, output_type, disable_thinking=True
@@ -979,21 +996,45 @@ class ClaudeAgentRuntime(AgentRuntime):
                 f"after multiple attempts. Last result: {result_msg.result}"
             )
 
-        # ── Error fallback: structured_output is None (context overflow) ──
+        # ── structured_output is None AFTER the context-preserving thinking-off
+        #    re-dispatch (see _dispatch_with_thinking_fallback) ──
+        # This is a degraded/exhausted turn, NOT necessarily context overflow.
+        # Do NOT reflexively cycle the session: _cycle_session summarizes and
+        # DELETES the agent's brief, so the retry runs context-less and emits
+        # empty/garbage — the systemic root of the interview spin, the
+        # re-flagged review findings, and the decomposition crash. Cycle ONLY as
+        # a last resort when we have a CONFIDENT context-overflow signal: a
+        # multi-turn session whose tracked size has actually reached its char
+        # budget. Otherwise fail honestly — an honest StructuredOutputExhausted
+        # beats a context-less false success (feedback_no_silent_degradation).
         if result_msg.structured_output is None and session_key and self._retry_depth == 0:
-            logger.warning(
-                "structured_output is None for %s (session %s) — cycling and retrying",
+            over_budget = bool(max_chars) and (
+                self._session_sizes.get(session_key, 0) >= max_chars
+            )
+            if over_budget:
+                logger.warning(
+                    "structured_output is None for %s (session %s) AND the "
+                    "session has reached its %d-char budget — genuine context "
+                    "overflow, cycling and retrying",
+                    output_type.__name__, session_key, max_chars,
+                )
+                await self._cycle_session(session_key, role)
+                self._retry_depth += 1
+                try:
+                    return await self.invoke(
+                        role, prompt,
+                        output_type=output_type, workspace=workspace,
+                        session_key=session_key,
+                    )
+                finally:
+                    self._retry_depth -= 1
+            logger.error(
+                "structured_output is None for %s (session %s) after the "
+                "thinking-off re-dispatch, with the session within its char "
+                "budget — degraded turn, failing honestly (NOT cycling: a "
+                "context-less retry would emit garbage)",
                 output_type.__name__, session_key,
             )
-            await self._cycle_session(session_key, role)
-            self._retry_depth += 1
-            try:
-                return await self.invoke(
-                    role, prompt,
-                    output_type=output_type, workspace=workspace, session_key=session_key,
-                )
-            finally:
-                self._retry_depth -= 1
 
         if result_msg.structured_output is None:
             raise StructuredOutputExhausted(

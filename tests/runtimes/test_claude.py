@@ -987,6 +987,231 @@ async def test_invoke_falls_back_to_no_thinking_on_structured_output_exhaustion(
     assert dispatches["n"] == 2
 
 
+def _invoke_runtime_with_session() -> ClaudeAgentRuntime:
+    """A bare runtime carrying a pre-existing multi-turn session "brief" so a
+    regression test can prove the brief survives a structured_output-None turn."""
+    runtime = object.__new__(ClaudeAgentRuntime)
+    runtime._interactive_roles = set()
+    runtime._session_messages = {}
+    runtime._session_sizes = {}
+    runtime._session_context = {}
+    runtime.session_store = None
+    runtime._active_invocations = {}
+    runtime._invocation_activity = {}
+    runtime._retry_depth = 0
+    return runtime
+
+
+@pytest.mark.asyncio
+async def test_invoke_redispatches_thinking_off_on_structured_output_none_without_cycling(monkeypatch):
+    # REGRESSION (the systemic convergence root): a degraded turn that returns a
+    # result message with subtype != error_max_structured_output_retries but
+    # structured_output is None used to fall through to a recovery that
+    # _cycle_session'd (summarized + DELETED) the agent's brief and retried
+    # CONTEXT-LESS — which surfaced downstream as the interview spin, the
+    # re-flagged review findings, and the decomposition crash. It must instead
+    # route through the SAME context-preserving thinking-off re-dispatch: the
+    # brief stays intact and the second dispatch sees the ORIGINAL prompt.
+    runtime = _invoke_runtime_with_session()
+
+    # Multi-turn role (max_session_chars set) so there is a real session brief.
+    role = Role(
+        name="broad", prompt="Decompose the feature", tools=["Read"],
+        metadata={"max_session_chars": 100_000, "keep_recent_messages": 6},
+    )
+    session_key = "broad:feat1"
+    runtime._session_messages[session_key] = ["User: earlier turn", "Assistant: earlier reply"]
+    runtime._session_sizes[session_key] = 40
+
+    build_thinking_flags: list[bool] = []
+
+    def fake_build_options(_role, _workspace, output_type=None, *, disable_thinking=False):
+        build_thinking_flags.append(disable_thinking)
+        return _FakeClaudeAgentOptions(
+            output_format={"type": "json_schema"} if output_type else None
+        )
+
+    monkeypatch.setattr(runtime, "_build_options", fake_build_options)
+
+    cycle_calls: list[str] = []
+
+    async def spy_cycle(sk, _role):
+        cycle_calls.append(sk)
+
+    monkeypatch.setattr(runtime, "_cycle_session", spy_cycle)
+
+    class _Degraded:
+        result = ""
+        subtype = "success"  # NOT error_max_structured_output_retries
+        session_id = None
+        structured_output = None
+
+    class _Good:
+        result = "done"
+        subtype = "success"
+        session_id = None
+        structured_output = {"value": 11}
+
+    prompts: list[str] = []
+    dispatches = {"n": 0}
+
+    async def fake_invoke_default(_opts, _prompt, _ResultMessage, _timeout):
+        dispatches["n"] += 1
+        prompts.append(_prompt)
+        return _Degraded() if dispatches["n"] == 1 else _Good()
+
+    monkeypatch.setattr(runtime, "_invoke_default", fake_invoke_default)
+
+    out = await runtime.invoke(
+        role, "decompose now", output_type=_StructuredOut, session_key=session_key
+    )
+
+    assert isinstance(out, _StructuredOut) and out.value == 11
+    # Recovery happened via the scoped thinking-off re-dispatch: thinking ON
+    # first, OFF on the retry — never a global reasoning-quality cut.
+    assert build_thinking_flags == [False, True]
+    assert dispatches["n"] == 2
+    # (a) the brief was NOT destroyed: no session cycle, prior turns intact.
+    assert cycle_calls == []
+    assert runtime._session_messages[session_key][:2] == [
+        "User: earlier turn", "Assistant: earlier reply",
+    ]
+    # (b) the second (thinking-off) dispatch received the ORIGINAL prompt — not a
+    #     summarized/compressed context that a cycle-and-retry would have built.
+    assert prompts[0] == prompts[1]
+    assert "decompose now" in prompts[1]
+
+
+@pytest.mark.asyncio
+async def test_invoke_fails_honestly_on_persistent_structured_output_none_no_context_less_retry(monkeypatch):
+    # When even the thinking-off re-dispatch cannot emit structured output and the
+    # session is WITHIN its char budget, invoke must fail honestly with
+    # StructuredOutputExhausted — NOT cycle the session and retry context-less
+    # (an honest fail beats a context-less false success; feedback_no_silent_degradation).
+    runtime = _invoke_runtime_with_session()
+
+    role = Role(
+        name="broad", prompt="Decompose the feature", tools=["Read"],
+        metadata={"max_session_chars": 100_000, "keep_recent_messages": 6},
+    )
+    session_key = "broad:feat2"
+    runtime._session_messages[session_key] = ["User: earlier turn", "Assistant: earlier reply"]
+    runtime._session_sizes[session_key] = 40
+
+    build_thinking_flags: list[bool] = []
+
+    def fake_build_options(_role, _workspace, output_type=None, *, disable_thinking=False):
+        build_thinking_flags.append(disable_thinking)
+        return _FakeClaudeAgentOptions(
+            output_format={"type": "json_schema"} if output_type else None
+        )
+
+    monkeypatch.setattr(runtime, "_build_options", fake_build_options)
+
+    cycle_calls: list[str] = []
+
+    async def spy_cycle(sk, _role):
+        cycle_calls.append(sk)
+
+    monkeypatch.setattr(runtime, "_cycle_session", spy_cycle)
+
+    class _Degraded:
+        result = ""
+        subtype = "success"
+        session_id = None
+        structured_output = None
+
+    dispatches = {"n": 0}
+
+    async def fake_invoke_default(_opts, _prompt, _ResultMessage, _timeout):
+        dispatches["n"] += 1
+        return _Degraded()
+
+    monkeypatch.setattr(runtime, "_invoke_default", fake_invoke_default)
+
+    with pytest.raises(StructuredOutputExhausted):
+        await runtime.invoke(
+            role, "decompose now", output_type=_StructuredOut, session_key=session_key
+        )
+
+    # The thinking-off re-dispatch was attempted (first ON, then OFF) and then we
+    # FAILED — no context-less cycle-and-retry.
+    assert build_thinking_flags == [False, True]
+    assert dispatches["n"] == 2
+    assert cycle_calls == []
+    # Brief intact — never summarized/deleted.
+    assert runtime._session_messages[session_key][:2] == [
+        "User: earlier turn", "Assistant: earlier reply",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_invoke_cycles_only_on_genuine_overflow_structured_output_none(monkeypatch):
+    # The guarded last resort: when structured_output stays None AND the session
+    # has genuinely reached its char budget, cycling+retry IS the legitimate
+    # context-overflow recovery and must still happen.
+    runtime = _invoke_runtime_with_session()
+
+    role = Role(
+        name="broad", prompt="Decompose the feature", tools=["Read"],
+        metadata={"max_session_chars": 50, "keep_recent_messages": 6},
+    )
+    session_key = "broad:feat3"
+    runtime._session_messages[session_key] = ["User: earlier turn", "Assistant: earlier reply"]
+    # 40 < 50 so the PROACTIVE pre-dispatch cycle does not fire; appending the
+    # prompt pushes tracked size over the budget, so the post-dispatch None-guard
+    # sees a genuine overflow.
+    runtime._session_sizes[session_key] = 40
+
+    def fake_build_options(_role, _workspace, output_type=None, *, disable_thinking=False):
+        return _FakeClaudeAgentOptions(
+            output_format={"type": "json_schema"} if output_type else None
+        )
+
+    monkeypatch.setattr(runtime, "_build_options", fake_build_options)
+
+    cycle_calls: list[str] = []
+
+    async def spy_cycle(sk, _role):
+        # Mimic the real _cycle_session's effect on bookkeeping so the recursive
+        # retry sees a freed budget and proceeds.
+        cycle_calls.append(sk)
+        runtime._session_sizes[sk] = 0
+        runtime._session_messages[sk] = []
+
+    monkeypatch.setattr(runtime, "_cycle_session", spy_cycle)
+
+    class _Degraded:
+        result = ""
+        subtype = "success"
+        session_id = None
+        structured_output = None
+
+    class _Good:
+        result = "done"
+        subtype = "success"
+        session_id = None
+        structured_output = {"value": 22}
+
+    dispatches = {"n": 0}
+
+    async def fake_invoke_default(_opts, _prompt, _ResultMessage, _timeout):
+        dispatches["n"] += 1
+        # First two (thinking on, then off) are degraded; after the cycle the
+        # recursive invoke's dispatch succeeds.
+        return _Good() if dispatches["n"] >= 3 else _Degraded()
+
+    monkeypatch.setattr(runtime, "_invoke_default", fake_invoke_default)
+
+    out = await runtime.invoke(
+        role, "decompose now", output_type=_StructuredOut, session_key=session_key
+    )
+
+    assert isinstance(out, _StructuredOut) and out.value == 22
+    # Cycled exactly once (the genuine-overflow last resort), via the None-guard.
+    assert cycle_calls == [session_key]
+
+
 class _DeadCliClient(_BaseFakeClient):
     """receive_response() never ends (orphaned stream) while exposing a CLI
     subprocess pid that has already exited and been reaped — models the macOS
