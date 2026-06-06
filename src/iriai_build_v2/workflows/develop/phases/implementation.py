@@ -5185,6 +5185,26 @@ async def _run_git(cwd: Path, *args: str) -> str:
     return stdout.decode().strip()
 
 
+async def _run_gh(*args: str) -> str:
+    """Run a `gh` (GitHub CLI) command asynchronously.
+
+    Analogous to :func:`_run_git`. Used only by the opt-in remote-PR-on-checkpoint
+    hook; no cwd is needed because the github repo is addressed via `--repo`.
+    """
+    proc = await _asyncio.create_subprocess_exec(
+        "gh", *args,
+        stdout=_asyncio.subprocess.PIPE,
+        stderr=_asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await proc.communicate()
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"gh {' '.join(args)} failed (exit {proc.returncode}): "
+            f"{stderr.decode().strip()}"
+        )
+    return stdout.decode().strip()
+
+
 # ── Parallel actor helpers ──────────────────────────────────────────────────
 
 
@@ -8858,6 +8878,30 @@ def _commit_hygiene_strategy_of(profile: Any | None) -> str:
     if profile is None:
         return ""
     return str(getattr(profile, "commit_hygiene_strategy", "") or "").strip()
+
+
+def _remote_pr_enabled_of(profile: Any | None) -> bool:
+    """Whether remote-PR-on-checkpoint is opted in (DEFAULT OFF / absent => False)."""
+    return bool(getattr(profile, "remote_pr_enabled", False)) if profile else False
+
+
+def _remote_pr_base_branch_of(profile: Any | None) -> str:
+    """Configured PR base branch ("" => default to the source repo's current branch)."""
+    if profile is None:
+        return ""
+    return str(getattr(profile, "remote_pr_base_branch", "") or "").strip()
+
+
+def _remote_pr_draft_of(profile: Any | None) -> bool:
+    """Whether the opened PR is a draft (default True — still triggers Vercel)."""
+    return bool(getattr(profile, "remote_pr_draft", True)) if profile else True
+
+
+def _remote_pr_remote_name_of(profile: Any | None) -> str:
+    """SOURCE remote carrying the github URL (default "origin")."""
+    if profile is None:
+        return "origin"
+    return str(getattr(profile, "remote_pr_remote_name", "origin") or "origin").strip()
 
 
 async def _bind_task_sandbox(
@@ -15609,6 +15653,189 @@ async def _push_clones_to_source(
     )
 
 
+def _parse_github_owner_repo(url: str) -> str:
+    """Derive ``owner/repo`` from a github.com remote URL (https or ssh form).
+
+    Returns "" for non-github or unparseable URLs (the caller then SKIPS the
+    repo cleanly — mixed workspaces with local-only repos must degrade).
+    Accepts e.g. ``https://github.com/owner/repo.git``,
+    ``git@github.com:owner/repo.git``, ``ssh://git@github.com/owner/repo``.
+    """
+    text = str(url or "").strip()
+    if not text:
+        return ""
+    remainder = ""
+    # SSH scp-like form: git@github.com:owner/repo(.git)
+    if "@github.com:" in text:
+        remainder = text.split("@github.com:", 1)[1]
+    elif "github.com/" in text:
+        # https://github.com/... or ssh://git@github.com/...
+        remainder = text.split("github.com/", 1)[1]
+    else:
+        return ""
+    remainder = remainder.strip().strip("/")
+    if remainder.endswith(".git"):
+        remainder = remainder[: -len(".git")]
+    parts = [p for p in remainder.split("/") if p]
+    if len(parts) < 2:
+        return ""
+    return f"{parts[0]}/{parts[1]}"
+
+
+async def _push_feature_branch_and_open_pr(
+    runner: WorkflowRunner,
+    feature: Feature,
+    *,
+    feature_root: Path,
+    group_idx: int,
+    profile: Any | None,
+) -> None:
+    """Opt-in, NON-blocking post-checkpoint hook: push ``feature/<slug>`` to the
+    target repo's GitHub remote and (first checkpoint) open a DRAFT PR so a Vercel
+    preview is triggered; later checkpoints push the updated branch to the SAME
+    open PR.
+
+    GATED behind ``ProjectProfile.remote_pr_enabled`` (DEFAULT OFF). When OFF (or
+    profile absent) this returns IMMEDIATELY making ZERO git/gh calls — the
+    byte-for-byte legacy guarantee (AC-K-11). Distinct from the existing local
+    source-push (:func:`_push_clones_to_source`), which is never touched here.
+
+    Failures NEVER halt the develop run: every repo is wrapped in try/except;
+    on failure a ``dag_checkpoint_remote_pr_failed`` feature event is recorded and
+    we continue (the hook never raises out).
+    """
+    if not _remote_pr_enabled_of(profile):
+        return  # hard byte-for-byte off-by-default guarantee — MUST be first.
+
+    base_override = _remote_pr_base_branch_of(profile)
+    draft = _remote_pr_draft_of(profile)
+    remote_name = _remote_pr_remote_name_of(profile)
+    branch = f"feature/{feature.slug}"
+
+    try:
+        expected, optional_noop, _ = await _source_push_expected_origins(
+            runner, feature, feature_root, group_idx=group_idx
+        )
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "remote-PR checkpoint: could not resolve push origins for "
+            "feature=%s group=%s; skipping",
+            feature.id,
+            group_idx,
+            exc_info=True,
+        )
+        return
+    if not expected:
+        return
+
+    for rel, source_path in expected.items():
+        if rel in optional_noop:
+            continue  # source/read-only repos are never pushed to github.
+        clone_dir = feature_root / rel
+        try:
+            # SAFETY: only ever push the feature branch — never the protected base.
+            head = await _run_git(clone_dir, "rev-parse", "--abbrev-ref", "HEAD")
+            if head != branch:
+                logger.info(
+                    "remote-PR checkpoint: skip %s (HEAD %r != %r)",
+                    rel,
+                    head,
+                    branch,
+                )
+                continue
+
+            github_url = await _run_git(
+                Path(source_path), "config", "--get", f"remote.{remote_name}.url"
+            )
+            owner_repo = _parse_github_owner_repo(github_url)
+            if not owner_repo:
+                logger.info(
+                    "remote-PR checkpoint: skip %s (non-github remote %r)",
+                    rel,
+                    github_url,
+                )
+                continue
+
+            # Push the feature branch directly to the github URL (updates an
+            # already-open PR -> Vercel rebuilds; or seeds a new branch to PR).
+            await _run_git(clone_dir, "push", github_url, branch)
+
+            # Idempotent PR: only create when no open PR already heads this branch.
+            existing = await _run_gh(
+                "pr",
+                "list",
+                "--head",
+                branch,
+                "--state",
+                "open",
+                "--repo",
+                owner_repo,
+                "--json",
+                "url",
+            )
+            has_open_pr = bool(str(existing or "").strip() and str(existing).strip() != "[]")
+            if has_open_pr:
+                logger.info(
+                    "remote-PR checkpoint: %s already has an open PR for %s "
+                    "(push-only; Vercel rebuilds)",
+                    owner_repo,
+                    branch,
+                )
+            else:
+                base = base_override or await _run_git(
+                    Path(source_path), "rev-parse", "--abbrev-ref", "HEAD"
+                )
+                create_args = ["pr", "create"]
+                if draft:
+                    create_args.append("--draft")
+                create_args += [
+                    "--head",
+                    branch,
+                    "--base",
+                    base,
+                    "--repo",
+                    owner_repo,
+                    "--title",
+                    f"{feature.name} ({branch})",
+                    "--body",
+                    (
+                        f"Automated draft PR for feature `{feature.slug}` "
+                        f"(checkpoint group {group_idx}). Opens a Vercel preview."
+                    ),
+                ]
+                await _run_gh(*create_args)
+                logger.info(
+                    "remote-PR checkpoint: opened %s PR on %s for %s (base %s)",
+                    "draft" if draft else "ready",
+                    owner_repo,
+                    branch,
+                    base,
+                )
+        except Exception as exc:  # noqa: BLE001
+            await _log_feature_event(
+                runner,
+                feature.id,
+                "dag_checkpoint_remote_pr_failed",
+                "implementation",
+                content=f"g{group_idx}:{rel}",
+                metadata={
+                    "group_idx": group_idx,
+                    "repo": rel,
+                    "branch": branch,
+                    "error": str(exc),
+                },
+            )
+            logger.warning(
+                "remote-PR checkpoint failed for feature=%s group=%s repo=%s: %s",
+                feature.id,
+                group_idx,
+                rel,
+                exc,
+                exc_info=True,
+            )
+            continue
+
+
 def _parse_ls_remote_head(output: str) -> str:
     for line in str(output or "").splitlines():
         parts = line.strip().split()
@@ -20890,6 +21117,26 @@ async def _implement_dag(
                     group_idx=group_idx,
                     priority=20,
                 )
+                # Opt-in (DEFAULT OFF) remote-PR-on-checkpoint side effect. Like
+                # the exhibit refresh above, this is non-blocking: any exception
+                # is logged + swallowed so it can never halt the develop run.
+                try:
+                    profile = await _resolve_project_profile_cached(runner, feature)
+                    await _push_feature_branch_and_open_pr(
+                        runner,
+                        feature,
+                        feature_root=feature_root,
+                        group_idx=group_idx,
+                        profile=profile,
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.warning(
+                        "remote-PR checkpoint hook (resume) failed for "
+                        "feature=%s group=%s; continuing",
+                        feature.id,
+                        group_idx,
+                        exc_info=True,
+                    )
                 logger.info(
                     "Group %d checkpointed on resume via the durable merge "
                     "queue re-drive (commit %s, lanes %s)",
@@ -22287,6 +22534,26 @@ async def _implement_dag(
                     group_idx=group_idx,
                     priority=20,
                 )
+                # Opt-in (DEFAULT OFF) remote-PR-on-checkpoint side effect. Like
+                # the exhibit refresh above, this is non-blocking: any exception
+                # is logged + swallowed so it can never halt the develop run.
+                try:
+                    profile = await _resolve_project_profile_cached(runner, feature)
+                    await _push_feature_branch_and_open_pr(
+                        runner,
+                        feature,
+                        feature_root=feature_root,
+                        group_idx=group_idx,
+                        profile=profile,
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.warning(
+                        "remote-PR checkpoint hook failed for "
+                        "feature=%s group=%s; continuing",
+                        feature.id,
+                        group_idx,
+                        exc_info=True,
+                    )
                 logger.info(
                     "Group %d checkpointed via durable merge queue "
                     "(commit %s, lanes %s)",

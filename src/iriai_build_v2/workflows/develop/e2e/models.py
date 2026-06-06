@@ -99,6 +99,17 @@ class ProjectProfile(BaseModel):
     # kaya: ["/var/lib/postgresql/data", "/data", "/var/lib/falkordb/data"].
     compose_named_volume_targets: list[str] = Field(default_factory=list)
 
+    # --- remote-PR-on-checkpoint (opt-in, DEFAULT OFF). When enabled, each
+    #     SEALED checkpoint pushes the local feature/<slug> branch to the target
+    #     repo's GitHub remote and (first checkpoint) opens a DRAFT PR so a Vercel
+    #     preview is triggered; later checkpoints push the updated branch to the
+    #     same open PR. remote_pr_enabled=False (default) => byte-for-byte legacy
+    #     behavior: NO github push, NO gh calls. ---
+    remote_pr_enabled: bool = False  # OFF by default — gates the whole hook
+    remote_pr_base_branch: str = ""  # "" => the branch the feature was cut from; else this literal base
+    remote_pr_draft: bool = True  # draft PR still triggers a Vercel preview
+    remote_pr_remote_name: str = "origin"  # SOURCE remote carrying the github URL
+
     def alignment_errors(self) -> list[str]:
         """Non-raising check that index-aligned parallel lists agree in length.
 
