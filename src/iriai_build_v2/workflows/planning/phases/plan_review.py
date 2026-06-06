@@ -48,6 +48,7 @@ from ..._common._helpers import (
     ContextPackageItem,
     _assert_gate_requests_are_converging,
     _dedup_revision_requests,
+    _is_transient_runtime_failure,
     _load_gate_ledger,
     _save_gate_ledger,
     _update_gate_ledger,
@@ -1275,6 +1276,14 @@ class PlanReviewPhase(Phase):
                     *revision_coros, return_exceptions=True,
                 )
                 blocked_failures: list[str] = []
+                # A revision can fail two ways: a TRANSIENT agent-runtime failure
+                # (CLI death, provider storm, usage/quota limit, watchdog stall —
+                # re-runnable, external) or a genuine content-convergence failure.
+                # Track whether ANY genuine content failure occurred so the halt
+                # below is reported honestly — an external blip (e.g. the Claude
+                # account running out of usage mid-revision) must not read as "the
+                # revision content failed".
+                blocked_has_content_failure = False
                 for i, res in enumerate(rev_results):
                     if isinstance(res, BaseException):
                         logger.error(
@@ -1284,6 +1293,8 @@ class PlanReviewPhase(Phase):
                         blocked_failures.append(
                             f"{revision_meta[i][0]}: revision dispatch crashed ({res})"
                         )
+                        if not _is_transient_runtime_failure(res):
+                            blocked_has_content_failure = True
 
                 # ── Phase 2: Recompile all affected types in parallel ─
                 old_texts: dict[str, str] = {}
@@ -1302,6 +1313,8 @@ class PlanReviewPhase(Phase):
                             f"{prefix}:{failure.slug} — {failure.reason}"
                             for failure in res.failed
                         )
+                        if not res.has_only_transient_failures:
+                            blocked_has_content_failure = True
                         continue
                     compile_targets.append(meta)
 
@@ -1341,6 +1354,8 @@ class PlanReviewPhase(Phase):
                     if isinstance(compile_result, BaseException):
                         blocked_failures.append(f"{prefix}: compile crashed ({compile_result})")
                         revision_results.append(f"{prefix}: FAILED (compile crashed)")
+                        if not _is_transient_runtime_failure(compile_result):
+                            blocked_has_content_failure = True
                         continue
 
                     new_text = compile_result
@@ -1369,7 +1384,18 @@ class PlanReviewPhase(Phase):
                 if blocked_failures:
                     blocked_report = (
                         f"# Plan Review Blocked — Cycle {cycle + 1}\n\n"
-                        "The revision wave did not complete cleanly, so plan review "
+                        + (
+                            ""
+                            if blocked_has_content_failure
+                            else (
+                                "**Transient agent-runtime failure** (external/infra "
+                                "— e.g. the Claude account ran out of usage/quota "
+                                "mid-revision, or the agent CLI was terminated). This "
+                                "is NOT a content-convergence failure; re-run when the "
+                                "runtime is available.\n\n"
+                            )
+                        )
+                        + "The revision wave did not complete cleanly, so plan review "
                         "stopped before downstream verification and task planning.\n\n"
                         "## Failures\n\n"
                         + "\n".join(f"- {failure}" for failure in blocked_failures)
@@ -1399,9 +1425,17 @@ class PlanReviewPhase(Phase):
                         feature,
                         phase_name=self.name,
                     )
+                    if blocked_has_content_failure:
+                        raise RuntimeError(
+                            f"Plan-review revisions failed in cycle {cycle + 1}. "
+                            f"See `{blocked_key}`."
+                        )
                     raise RuntimeError(
-                        f"Plan-review revisions failed in cycle {cycle + 1}. "
-                        f"See `{blocked_key}`."
+                        f"Plan-review halted in cycle {cycle + 1} by a transient "
+                        f"agent-runtime failure (external/infra — e.g. the Claude "
+                        f"account ran out of usage/quota mid-revision, or the agent "
+                        f"CLI was terminated), NOT a content-convergence failure. "
+                        f"Re-run when the runtime is available. See `{blocked_key}`."
                     )
 
                 # ── Cascade test-plan revisions (per-SF only, no compile) ─
@@ -1452,6 +1486,8 @@ class PlanReviewPhase(Phase):
                                     f"test-plan:{failure.slug} — {failure.reason}"
                                     for failure in test_plan_result.failed
                                 )
+                                if not test_plan_result.has_only_transient_failures:
+                                    blocked_has_content_failure = True
                                 revision_results.append(
                                     f"test-plan: FAILED (revision batches failed for {len(test_plan_result.failed)} subfeatures)"
                                 )
@@ -1492,11 +1528,24 @@ class PlanReviewPhase(Phase):
                                 blocked_failures.append(
                                     f"test-plan: cascade revision crashed ({exc})"
                                 )
+                                if not _is_transient_runtime_failure(exc):
+                                    blocked_has_content_failure = True
 
                 if blocked_failures:
                     blocked_report = (
                         f"# Plan Review Blocked — Cycle {cycle + 1}\n\n"
-                        "The revision wave did not complete cleanly, so plan review "
+                        + (
+                            ""
+                            if blocked_has_content_failure
+                            else (
+                                "**Transient agent-runtime failure** (external/infra "
+                                "— e.g. the Claude account ran out of usage/quota "
+                                "mid-revision, or the agent CLI was terminated). This "
+                                "is NOT a content-convergence failure; re-run when the "
+                                "runtime is available.\n\n"
+                            )
+                        )
+                        + "The revision wave did not complete cleanly, so plan review "
                         "stopped before downstream verification and task planning.\n\n"
                         "## Failures\n\n"
                         + "\n".join(f"- {failure}" for failure in blocked_failures)
@@ -1526,9 +1575,18 @@ class PlanReviewPhase(Phase):
                         feature,
                         phase_name=self.name,
                     )
+                    if blocked_has_content_failure:
+                        raise RuntimeError(
+                            f"Plan-review revisions failed in cycle {cycle + 1}. "
+                            f"See `plan-review-cycle-{cycle + 1}-blocked`."
+                        )
                     raise RuntimeError(
-                        f"Plan-review revisions failed in cycle {cycle + 1}. "
-                        f"See `plan-review-cycle-{cycle + 1}-blocked`."
+                        f"Plan-review halted in cycle {cycle + 1} by a transient "
+                        f"agent-runtime failure (external/infra — e.g. the Claude "
+                        f"account ran out of usage/quota mid-revision, or the agent "
+                        f"CLI was terminated), NOT a content-convergence failure. "
+                        f"Re-run when the runtime is available. See "
+                        f"`plan-review-cycle-{cycle + 1}-blocked`."
                     )
 
                 # ── Save revision summary so continue logic can advance ─

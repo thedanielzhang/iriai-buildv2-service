@@ -456,6 +456,12 @@ class TargetedRevisionFailure:
     artifact_prefix: str
     slug: str
     reason: str
+    # True when this failure was a transient/external AGENT-RUNTIME failure (CLI
+    # process death, provider error storm, usage/quota limit, watchdog stall)
+    # rather than a genuine content-convergence failure — see
+    # _is_transient_runtime_failure. Lets plan-review distinguish an external
+    # blip ("re-run when the runtime is available") from a real content failure.
+    transient: bool = False
 
 
 @dataclass(slots=True)
@@ -468,6 +474,57 @@ class TargetedRevisionResult:
     @property
     def ok(self) -> bool:
         return not self.failed
+
+    @property
+    def has_only_transient_failures(self) -> bool:
+        """True if there ARE failures and EVERY one is a transient runtime
+        failure (no genuine content-convergence failure mixed in)."""
+        return bool(self.failed) and all(f.transient for f in self.failed)
+
+
+def _is_transient_runtime_failure(exc: BaseException | None) -> bool:
+    """True if ``exc`` is a transient/external AGENT-RUNTIME failure — the CLI
+    subprocess died (e.g. SIGTERM / exit -15), a provider error storm, a usage
+    or rate limit, a context-stream watchdog stall, or a structured-output
+    exhaustion — rather than a genuine content-convergence failure.
+
+    Plan-review uses this to report an external blip (e.g. the Claude account
+    running out of usage mid-revision) as a diagnosable, re-runnable
+    "agent-runtime failure" instead of the misleading "revisions failed", which
+    reads like the revision CONTENT could not converge. Matches by exception
+    class NAME (no import coupling) and message signature, and first unwraps
+    iriai_compose's TaskExecutionError to its underlying cause (mirrors
+    runtime_client._diagnostic_exception)."""
+    if exc is None:
+        return False
+    if type(exc).__name__ == "TaskExecutionError":
+        exc = exc.__cause__ or exc
+    type_name = type(exc).__name__
+    if type_name in {
+        "ProcessError",               # claude CLI subprocess died (SIGTERM exit -15, etc.)
+        "ClaudeApiErrorStorm",        # provider 400/error storm
+        "ClaudeStreamWatchdogStall",  # inactivity / stream watchdog
+        "StructuredOutputExhausted",  # runtime could not emit structured output
+        "TimeoutError",
+    }:
+        return True
+    text = f"{type_name}: {exc}".lower()
+    return any(
+        token in text
+        for token in (
+            "out of extra usage",
+            "usage limit",
+            "rate limit",
+            "rate-limit",
+            "overloaded",
+            "api error storm",
+            "provider error storm",
+            "exit code -15",
+            "exit code -9",
+            "sigterm",
+            "sigkill",
+        )
+    )
 
 
 def _format_targeted_revision_failures(result: TargetedRevisionResult) -> str:
@@ -3580,7 +3637,7 @@ async def targeted_revision(
             )
             return result
 
-    async def _revise_one(requests: list[Any], sf_slug: str) -> tuple[str, str | None]:
+    async def _revise_one(requests: list[Any], sf_slug: str) -> tuple[str, str | None, bool]:
         import json as _json
 
         from ...models.outputs import ArtifactPatchSet
@@ -3847,7 +3904,7 @@ async def targeted_revision(
                     "done",
                     feature=feature,
                 )
-            return "skipped", None
+            return "skipped", None, False
 
         batch_queue = _build_revision_batches(artifact_prefix, pending_entries)
         revised = False
@@ -3877,11 +3934,13 @@ async def targeted_revision(
                         return (
                             "failed",
                             f"batch {_revision_batch_suffix(batch_entries, minimal=True)} failed: {minimal_exc}",
+                            _is_transient_runtime_failure(minimal_exc),
                         )
                 else:
                     return (
                         "failed",
                         f"batch {_revision_batch_suffix(batch_entries, minimal=False)} failed: {exc}",
+                        _is_transient_runtime_failure(exc),
                     )
 
             if not patch_set.patches:
@@ -3918,11 +3977,13 @@ async def targeted_revision(
                         f"{_revision_batch_suffix(batch_entries, minimal=used_minimal)} "
                         f"rejected because revised {artifact_prefix}:{sf_slug} "
                         f"is not valid {output_type.__name__} JSON: {exc}",
+                        False,  # invalid revised content — a content failure, not transient
                     )
             if existing_size > 0 and revised_size < existing_size * 0.5:
                 return (
                     "failed",
                     f"batch {_revision_batch_suffix(batch_entries, minimal=used_minimal)} rejected by size guard ({existing_size} → {revised_size})",
+                    False,  # degraded/truncated revision — a content failure, not transient
                 )
 
             await runner.artifacts.put(sf_key, revised_text, feature=feature)
@@ -3970,7 +4031,7 @@ async def targeted_revision(
                 "done",
                 feature=feature,
             )
-        return ("revised" if revised else "skipped"), None
+        return ("revised" if revised else "skipped"), None, False
 
     logger.info(
         "targeted_revision: dispatching %d SF revisions in parallel for %s",
@@ -3992,10 +4053,11 @@ async def targeted_revision(
                     artifact_prefix=artifact_prefix,
                     slug=slug,
                     reason=str(res),
+                    transient=_is_transient_runtime_failure(res),
                 )
             )
             continue
-        status, reason = res
+        status, reason, transient = res
         slug = revision_tasks[i][1]
         if status == "revised":
             result.revised_slugs.append(slug)
@@ -4011,6 +4073,7 @@ async def targeted_revision(
                     artifact_prefix=artifact_prefix,
                     slug=slug,
                     reason=reason or "unknown revision failure",
+                    transient=transient,
                 )
             )
 

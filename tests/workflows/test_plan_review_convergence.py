@@ -15,9 +15,16 @@ from iriai_build_v2.models.outputs import (
     RevisionRequest,
 )
 from iriai_build_v2.workflows._common._helpers import (
+    TargetedRevisionFailure,
+    TargetedRevisionResult,
     _assert_gate_requests_are_converging,
     _dedup_revision_requests,
+    _is_transient_runtime_failure,
     _update_gate_ledger,
+)
+from iriai_build_v2.runtimes.claude import (
+    ClaudeApiErrorStorm,
+    StructuredOutputExhausted,
 )
 
 SRC = "plan-review"
@@ -91,3 +98,101 @@ def test_genuinely_new_finding_still_gets_a_pass():
     p2 = _plan("F2: brand new security gap")
     deduped, _ = _dedup_revision_requests(p2, ledger, SRC)
     assert [r.description for r in deduped.requests] == ["F2: brand new security gap"]
+
+
+# ── Transient-runtime vs content-convergence classification ──────────────────
+# RCA (kaya plan run e98bb92e): the Claude account ran OUT OF USAGE mid-cycle
+# during the test-plan revision wave → api error storm + the agent CLI was
+# SIGTERM'd (ProcessError exit -15) → the revision Ask tasks failed → plan-review
+# fail-fasted with "Plan-review revisions failed in cycle 1". That message reads
+# like the revision CONTENT could not converge, when the cause was external and
+# transient. plan-review must now distinguish the two so an external blip is
+# reported as a re-runnable agent-runtime failure, not a content failure.
+
+
+def _named_exc(name: str, msg: str, *, cause: BaseException | None = None) -> Exception:
+    """Build an exception whose class NAME is ``name`` (the classifier matches by
+    name, so this exercises ProcessError / TaskExecutionError without importing
+    the SDK / iriai_compose)."""
+    exc = type(name, (Exception,), {})(msg)
+    if cause is not None:
+        exc.__cause__ = cause
+    return exc
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        ClaudeApiErrorStorm("provider error storm; produced no output"),
+        StructuredOutputExhausted("structured_output is None for TestPlan"),
+        _named_exc("ProcessError", "Command failed with exit code -15"),
+        _named_exc("ClaudeStreamWatchdogStall", "stream inactivity stall"),
+        TimeoutError("stream inactivity"),
+        RuntimeError("You're out of extra usage · resets Jun 6 at 9am"),
+        RuntimeError("Command failed with exit code -15 (exit code: -15)"),
+        RuntimeError("anthropic rate limit exceeded"),
+        RuntimeError("server overloaded, please retry"),
+    ],
+)
+def test_transient_runtime_failures_are_classified_transient(exc):
+    assert _is_transient_runtime_failure(exc) is True
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        None,
+        ValueError("revised artifact is not valid TestPlan JSON"),
+        RuntimeError("test-plan targeted revision failed"),  # synthetic marker
+        RuntimeError("batch 0-3 rejected by size guard (5000 -> 200)"),
+        KeyError("D-GR-1"),
+    ],
+)
+def test_content_failures_are_not_classified_transient(exc):
+    assert _is_transient_runtime_failure(exc) is False
+
+
+def test_classifier_unwraps_task_execution_error_to_cause():
+    # WorkflowRunner.run wraps the real error in TaskExecutionError(__cause__=...).
+    transient = _named_exc(
+        "TaskExecutionError",
+        "Task Ask failed in phase 'plan-review' for feature 'e98bb92e'",
+        cause=ClaudeApiErrorStorm("storm"),
+    )
+    assert _is_transient_runtime_failure(transient) is True
+    # str(TaskExecutionError) does NOT carry the cause text, so a plain
+    # failure-string match would MISS it — which is exactly why the transient
+    # flag is captured at the source (_revise_one) rather than re-derived here.
+    assert "storm" not in str(transient)
+
+    content = _named_exc(
+        "TaskExecutionError",
+        "Task Ask failed in phase 'plan-review'",
+        cause=ValueError("unconvergent revision content"),
+    )
+    assert _is_transient_runtime_failure(content) is False
+
+
+def test_targeted_revision_failure_transient_defaults_false():
+    f = TargetedRevisionFailure(artifact_prefix="test-plan", slug="sf-a", reason="x")
+    assert f.transient is False
+
+
+def test_result_has_only_transient_failures_drives_the_halt_classification():
+    # No failures → not "transient-only" (nothing to classify).
+    r = TargetedRevisionResult(artifact_prefix="test-plan")
+    assert r.has_only_transient_failures is False
+
+    # All failures transient (the quota-crash shape) → plan-review reports a
+    # re-runnable agent-runtime halt.
+    r.failed.append(
+        TargetedRevisionFailure("test-plan", "sf-a", "batch 0-3 failed: quota", transient=True)
+    )
+    assert r.has_only_transient_failures is True
+
+    # A genuine content failure mixed in flips it back → plan-review must report
+    # a content-convergence failure (the more actionable one), not transient.
+    r.failed.append(
+        TargetedRevisionFailure("test-plan", "sf-b", "invalid JSON", transient=False)
+    )
+    assert r.has_only_transient_failures is False
