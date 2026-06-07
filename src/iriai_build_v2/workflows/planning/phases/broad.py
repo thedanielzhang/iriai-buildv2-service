@@ -11,6 +11,8 @@ from ....models.outputs import (
     Envelope,
     IntegrationReview,
     PRD,
+    RevisionPlan,
+    RevisionRequest,
     SubfeatureDecomposition,
     TechnicalPlan,
     envelope_done,
@@ -35,6 +37,13 @@ from ..._common import (
     get_gate_resume_artifact,
     get_resumable_artifact,
     integration_review,
+)
+from ..._common._helpers import (
+    _assert_gate_requests_are_converging,
+    _dedup_revision_requests,
+    _load_gate_ledger,
+    _save_gate_ledger,
+    _update_gate_ledger,
 )
 from .._control import (
     STEP_AGENT_FILL,
@@ -641,6 +650,16 @@ async def _run_broad_reconciliation_stage(
     set_step_status(control, step=step, status=STEP_RUNNING)
     await persist_planning_control(runner, feature, state, control)
 
+    # Cross-round finding ledger so the review→revise loop CONVERGES (fixpoint,
+    # NOT a turn cap): the reviewer re-runs with a cleared session each round and
+    # can surface new marginal findings indefinitely. Suppress findings already
+    # resolved in a prior round; if nothing new remains, the loop has converged.
+    # If the SAME unfixed finding set keeps recurring, _assert_gate_requests_are_
+    # converging fails fast instead of grinding (~16-round hang).
+    import hashlib as _hashlib
+
+    gate_ledger = await _load_gate_ledger(runner, feature, "broad-reconciliation")
+    cycle = 0
     while True:
         review = await integration_review(
             runner,
@@ -669,6 +688,59 @@ async def _run_broad_reconciliation_stage(
             raise RuntimeError(
                 "Broad reconciliation requested revisions but did not provide revision_instructions",
             )
+        cycle += 1
+
+        # Adapt IntegrationReview.revision_instructions (target->instruction) into
+        # a RevisionPlan so the existing gate-ledger helpers apply unchanged. The
+        # target id is the affected "subfeature" for ledger bookkeeping; the
+        # description carries the per-target instruction so dedup/convergence keys
+        # on the actual finding text.
+        plan = RevisionPlan(
+            requests=[
+                RevisionRequest(
+                    description=f"{target}: {instruction}",
+                    reasoning="",
+                    affected_subfeatures=[target],
+                )
+                for target, instruction in review.revision_instructions.items()
+                if instruction and instruction.strip()
+            ],
+        )
+
+        # Digest the FINDING SET (sorted descriptions), not the artifacts (which
+        # drift every round), so a re-raised identical finding set is detectable.
+        finding_digest = _hashlib.sha256(
+            "\x00".join(sorted(r.description for r in plan.requests)).encode("utf-8")
+        ).hexdigest()[:16]
+
+        plan, _suppressed = _dedup_revision_requests(plan, gate_ledger, "broad-reconciliation")
+        if not plan.requests:
+            logger.info(
+                "Broad reconciliation converged on round %d — every finding was "
+                "already resolved in a prior round (no new distinct revisions).",
+                cycle,
+            )
+            gate_ledger = _update_gate_ledger(gate_ledger, plan, "broad-reconciliation", cycle)
+            await _save_gate_ledger(runner, feature, gate_ledger, "broad-reconciliation")
+            set_step_status(control, step=step, status=STEP_COMPLETE, provenance=record.get("provenance") or "human")
+            await persist_planning_control(runner, feature, state, control)
+            return decomposition
+
+        _assert_gate_requests_are_converging(
+            plan, gate_ledger, "broad-reconciliation", artifact_digest=finding_digest,
+        )
+        gate_ledger = _update_gate_ledger(
+            gate_ledger, plan, "broad-reconciliation", cycle, artifact_digest=finding_digest,
+        )
+        await _save_gate_ledger(runner, feature, gate_ledger, "broad-reconciliation")
+
+        # Apply only the deduped revisions (rebuild the target->instruction dict
+        # from the surviving requests).
+        deduped_instructions = {
+            req.affected_subfeatures[0]: review.revision_instructions[req.affected_subfeatures[0]]
+            for req in plan.requests
+            if req.affected_subfeatures
+        }
         decomposition = await _apply_broad_reconciliation_revisions(
             runner,
             feature,
@@ -676,7 +748,7 @@ async def _run_broad_reconciliation_stage(
             control,
             phase_name=phase_name,
             decomposition=decomposition,
-            revision_instructions=review.revision_instructions,
+            revision_instructions=deduped_instructions,
         )
 
 
