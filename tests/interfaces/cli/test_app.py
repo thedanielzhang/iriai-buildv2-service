@@ -74,6 +74,85 @@ def test_plan_develop_and_bugfix_accept_agent_runtime(monkeypatch, tmp_path):
     assert [call["agent_runtime"] for call in calls] == ["claude_pool", "claude_pool", "claude_pool"]
 
 
+def test_plan_develop_thread_driver_agent(monkeypatch, tmp_path):
+    calls: list[dict] = []
+
+    async def _fake_run(workflow_name, name, workspace, auto, **kwargs):
+        calls.append({"workflow_name": workflow_name, "auto": auto, **kwargs})
+
+    monkeypatch.setattr(app, "_run", _fake_run)
+    runner = CliRunner()
+
+    result = runner.invoke(
+        app.cli,
+        ["plan", "--name", "X", "--workspace", str(tmp_path), "--driver", "agent"],
+    )
+    assert result.exit_code == 0, result.output
+
+    result = runner.invoke(
+        app.cli,
+        ["develop", "--name", "Y", "--workspace", str(tmp_path), "--driver", "agent"],
+    )
+    assert result.exit_code == 0, result.output
+
+    assert [c["workflow_name"] for c in calls] == ["planning", "full-develop"]
+    assert [c["driver"] for c in calls] == ["agent", "agent"]
+    assert [c["auto"] for c in calls] == [False, False]
+
+
+def test_plan_auto_alone_leaves_driver_none(monkeypatch, tmp_path):
+    calls: list[dict] = []
+
+    async def _fake_run(workflow_name, name, workspace, auto, **kwargs):
+        calls.append({"auto": auto, **kwargs})
+
+    monkeypatch.setattr(app, "_run", _fake_run)
+    runner = CliRunner()
+
+    result = runner.invoke(
+        app.cli,
+        ["plan", "--name", "X", "--workspace", str(tmp_path), "--auto"],
+    )
+    assert result.exit_code == 0, result.output
+    assert calls[0]["auto"] is True
+    assert calls[0]["driver"] is None
+
+
+def test_plan_default_driver_none_auto_false(monkeypatch, tmp_path):
+    calls: list[dict] = []
+
+    async def _fake_run(workflow_name, name, workspace, auto, **kwargs):
+        calls.append({"auto": auto, **kwargs})
+
+    monkeypatch.setattr(app, "_run", _fake_run)
+    runner = CliRunner()
+
+    result = runner.invoke(
+        app.cli,
+        ["plan", "--name", "X", "--workspace", str(tmp_path)],
+    )
+    assert result.exit_code == 0, result.output
+    assert calls[0]["auto"] is False
+    assert calls[0]["driver"] is None
+
+
+def test_auto_approve_runtime_unchanged():
+    import asyncio
+
+    from iriai_compose.prompts import Confirm, Select
+    from iriai_compose.runtimes import AutoApproveRuntime
+    from iriai_compose.tasks import Ask
+
+    from iriai_build_v2.roles import user
+
+    rt = AutoApproveRuntime()
+    assert asyncio.run(
+        rt.ask(Ask(actor=user, prompt="pick", input=Select(options=["A", "B"])))
+    ) == "A"
+    assert asyncio.run(rt.ask(Ask(actor=user, prompt="ok?", input=Confirm()))) is True
+    assert asyncio.run(rt.ask(Ask(actor=user, prompt="free"))) == "auto-approved"
+
+
 def test_claude_pool_commands_are_registered():
     runner = CliRunner()
 

@@ -25,6 +25,7 @@ async def _run(
     auto: bool,
     *,
     agent_runtime: str = "claude",
+    driver: str | None = None,
     repos: list[str] | None = None,
     project: str = "",
     bug_report: str = "",
@@ -71,7 +72,13 @@ async def _run(
             )
 
         # Runtimes
-        if auto:
+        if driver == "agent":
+            from .agent_driven_interaction import AgentDrivenInteractionRuntime
+
+            interaction_runtime = AgentDrivenInteractionRuntime(
+                workspace_root=workspace_path
+            )
+        elif auto or driver == "auto":
             interaction_runtime = AutoApproveRuntime()
         else:
             interaction_runtime = ThreadAwareTerminalInteractionRuntime()
@@ -174,6 +181,12 @@ def cli() -> None:
 @click.option("--repo", multiple=True, help="GitHub repo (org/repo) or local path. Repeatable.")
 @click.option("--auto", is_flag=True, help="Auto-approve all gates")
 @click.option(
+    "--driver",
+    type=click.Choice(["auto", "agent"]),
+    default=None,
+    help="Interaction driver: 'auto' (auto-approve) or 'agent' (external driving agent).",
+)
+@click.option(
     "--agent-runtime",
     default=None,
     help="Agent runtime to use for workflow agents (claude, claude_pool, or codex).",
@@ -183,6 +196,7 @@ def plan(
     workspace: str,
     repo: tuple[str, ...],
     auto: bool,
+    driver: str | None,
     agent_runtime: str | None,
 ) -> None:
     """Run the planning workflow (Scoping → PM → Design → Architecture → Plan Review)."""
@@ -199,6 +213,7 @@ def plan(
             workspace,
             auto,
             agent_runtime=resolved_runtime,
+            driver=driver,
             repos=list(repo) or None,
         )
     )
@@ -210,6 +225,12 @@ def plan(
 @click.option("--repo", multiple=True, help="GitHub repo (org/repo) or local path. Repeatable.")
 @click.option("--auto", is_flag=True, help="Auto-approve all gates")
 @click.option(
+    "--driver",
+    type=click.Choice(["auto", "agent"]),
+    default=None,
+    help="Interaction driver: 'auto' (auto-approve) or 'agent' (external driving agent).",
+)
+@click.option(
     "--agent-runtime",
     default=None,
     help="Agent runtime to use for workflow agents (claude, claude_pool, or codex).",
@@ -219,6 +240,7 @@ def develop(
     workspace: str,
     repo: tuple[str, ...],
     auto: bool,
+    driver: str | None,
     agent_runtime: str | None,
 ) -> None:
     """Run the full develop workflow (Planning + Implementation)."""
@@ -235,6 +257,7 @@ def develop(
             workspace,
             auto,
             agent_runtime=resolved_runtime,
+            driver=driver,
             repos=list(repo) or None,
         )
     )
