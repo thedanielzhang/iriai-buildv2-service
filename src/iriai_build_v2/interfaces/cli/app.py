@@ -169,6 +169,110 @@ async def _run(
         await teardown(env)
 
 
+async def _run_resume(
+    feature_id: str,
+    workspace: str,
+    *,
+    agent_runtime: str = "claude",
+    driver: str | None = None,
+    from_phase: str | None = None,
+) -> None:
+    """Resume an interrupted workflow from its persisted phase.
+
+    Mirrors ``_run``'s bootstrap wiring but loads the EXISTING feature (no
+    ``create_feature``) and calls ``resume_workflow`` so completed/sealed work
+    is skipped. The fresh-feature path in ``_run`` is left untouched.
+    """
+    from iriai_compose.runtimes import AutoApproveRuntime
+
+    from ...execution_control.startup import (
+        EnvFlagState,
+        assert_control_plane_ready_for_workflow_launch,
+        read_control_plane_env_flag,
+    )
+    from ...stream import print_stream
+    from .interaction import ThreadAwareTerminalInteractionRuntime
+    from .._bootstrap import (
+        bootstrap,
+        build_runner,
+        maybe_assert_adopted_or_legacy_for_resume,
+        rebuild_state,
+        select_workflow,
+        teardown,
+    )
+
+    workspace_path = Path(workspace).resolve()
+    env = await bootstrap(workspace_path)
+
+    try:
+        flag_state = read_control_plane_env_flag()
+        if flag_state is EnvFlagState.ENABLED:
+            await assert_control_plane_ready_for_workflow_launch(
+                pool=env.pool,
+                require_enabled=True,
+            )
+
+        if driver == "agent":
+            from .agent_driven_interaction import AgentDrivenInteractionRuntime
+
+            interaction_runtime = AgentDrivenInteractionRuntime(
+                workspace_root=workspace_path
+            )
+        elif driver == "auto":
+            interaction_runtime = AutoApproveRuntime()
+        else:
+            interaction_runtime = ThreadAwareTerminalInteractionRuntime()
+
+        runner = build_runner(
+            env,
+            interaction_runtimes={"terminal": interaction_runtime, "auto": interaction_runtime},
+            on_message=print_stream,
+            agent_runtime_name=agent_runtime,
+        )
+
+        feature = await env.feature_store.get_feature(feature_id)
+        if feature is None:
+            raise click.ClickException(
+                f"Cannot resume: feature '{feature_id}' not found in database."
+            )
+
+        # Resume guard (is_resume=True) -- consult the Slice-12d adoption guard
+        # at the workflow seam, identical to Slack's _resume_workflow.
+        await maybe_assert_adopted_or_legacy_for_resume(
+            feature=feature,
+            artifacts=env.artifacts,
+            is_resume=True,
+        )
+
+        workflow = select_workflow(feature.workflow_name)
+        state = await rebuild_state(feature.workflow_name, env.artifacts, feature)
+
+        resume_phase = from_phase or str(feature.metadata.get("_db_phase", "") or "")
+        if not resume_phase:
+            raise click.ClickException(
+                f"Cannot determine resume phase for feature '{feature_id}'; "
+                "pass --from-phase explicitly."
+            )
+
+        print(f"\n{'='*60}")
+        print(f"  iriai-build-v2 — RESUME {feature.workflow_name}")
+        print(f"  Feature: {feature.name[:60]} ({feature.id})")
+        print(f"  Workspace: {workspace_path}")
+        print(f"  Resume from phase: {resume_phase}")
+        print(f"{'='*60}\n")
+
+        await runner.resume_workflow(
+            workflow, feature, state, resume_from_phase=resume_phase
+        )
+
+        print(f"\n{'='*60}")
+        print(f"  Workflow resume complete!")
+        print(f"{'='*60}\n")
+
+    finally:
+        await teardown(env)
+
+
 @click.group()
 def cli() -> None:
     """iriai-build-v2 — Agent orchestration build system."""
@@ -215,6 +319,55 @@ def plan(
             agent_runtime=resolved_runtime,
             driver=driver,
             repos=list(repo) or None,
+        )
+    )
+
+
+@cli.command()
+@click.option("--feature-id", required=True, help="Feature ID to resume")
+@click.option("--workspace", default=".", help="Project workspace path")
+@click.option(
+    "--from-phase",
+    default=None,
+    help="Phase to resume from (defaults to the feature's persisted phase).",
+)
+@click.option(
+    "--driver",
+    type=click.Choice(["auto", "agent"]),
+    default=None,
+    help="Interaction driver: 'auto' (auto-approve) or 'agent' (external driving agent).",
+)
+@click.option(
+    "--agent-runtime",
+    default=None,
+    help="Agent runtime to use for workflow agents (claude, claude_pool, or codex).",
+)
+def resume(
+    feature_id: str,
+    workspace: str,
+    from_phase: str | None,
+    driver: str | None,
+    agent_runtime: str | None,
+) -> None:
+    """Resume an interrupted workflow from its last persisted phase.
+
+    Loads the existing feature + reconstructs state from persisted artifacts,
+    then skips already-completed phases/steps. Unlike ``plan``/``develop`` it
+    does NOT create a fresh feature.
+    """
+    from ...runtimes import normalize_agent_runtime
+
+    try:
+        resolved_runtime = normalize_agent_runtime(agent_runtime)
+    except ValueError as exc:
+        raise click.BadParameter(str(exc), param_hint="--agent-runtime") from exc
+    asyncio.run(
+        _run_resume(
+            feature_id,
+            workspace,
+            agent_runtime=resolved_runtime,
+            driver=driver,
+            from_phase=from_phase,
         )
     )
 
