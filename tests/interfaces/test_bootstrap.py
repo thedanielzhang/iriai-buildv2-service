@@ -5,6 +5,8 @@ from types import SimpleNamespace
 import pytest
 
 from iriai_build_v2.interfaces._bootstrap import (
+    _FEATURE_SLUG_NAME_MAX,
+    _SLACK_CHANNEL_SLUG_MAX,
     build_runner,
     build_state,
     rebuild_state,
@@ -35,6 +37,36 @@ class TestSlugify:
 
     def test_empty(self):
         assert slugify("") == ""
+
+    def test_max_length_none_is_unbounded(self):
+        # Default (no cap) preserves prior behavior byte-for-byte.
+        name = "word " * 200
+        assert slugify(name) == slugify(name, max_length=None)
+        assert len(slugify(name)) > 500
+
+    def test_max_length_caps_and_strips_trailing_dash(self):
+        # Truncation lands on a separator → no dangling trailing dash.
+        assert slugify("aaaa bbbb cccc", max_length=5) == "aaaa"
+        assert slugify("a" * 100, max_length=10) == "a" * 10
+
+    def test_long_name_feature_slug_is_valid_path_component(self, tmp_path):
+        # Regression: a long --name slugified into `.iriai/features/{slug}`
+        # blew the filesystem component limit -> OSError(63) at mkdir. The
+        # name portion is now bounded; the id suffix carries uniqueness.
+        huge = "Submittal Management " * 200  # ~4000 chars
+        feature_id = "74acdead"
+        slug = f"{slugify(huge, max_length=_FEATURE_SLUG_NAME_MAX)}-{feature_id}"
+        assert len(slug) <= _FEATURE_SLUG_NAME_MAX + 1 + len(feature_id)
+        # Must be creatable as a single path component (the exact crash site).
+        (tmp_path / slug / "repos").mkdir(parents=True, exist_ok=True)
+        assert (tmp_path / slug / "repos").is_dir()
+
+    def test_slack_channel_slug_fits_limit(self):
+        # Slack channel names cap at 80 chars: iriai-{slug}-bugs-{id}.
+        huge = "Submittal Management " * 200
+        feature_id = "74acdead"
+        channel = f"iriai-{slugify(huge, max_length=_SLACK_CHANNEL_SLUG_MAX)}-bugs-{feature_id}"
+        assert len(channel) <= 80
 
 
 # ── select_workflow ───────────────────────────────────────────────────────

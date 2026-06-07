@@ -34,6 +34,7 @@ from .._bootstrap import (
     build_state,
     slugify,
     teardown,
+    _SLACK_CHANNEL_SLUG_MAX,
 )
 from ...runtimes import create_agent_runtime
 from ..auto_interaction import AgentDelegateInteractionRuntime
@@ -406,7 +407,7 @@ class SlackWorkflowOrchestrator:
         self._feature_workflows[feature.id] = parsed.workflow_name
 
         # 3. Create channel
-        channel_name = f"iriai-{slugify(parsed.feature_name)}-{feature.id}"
+        channel_name = f"iriai-{slugify(parsed.feature_name, max_length=_SLACK_CHANNEL_SLUG_MAX)}-{feature.id}"
         channel_id = await self._adapter.create_channel(channel_name)
         self._channel_features[channel_id] = feature.id
 
@@ -524,7 +525,7 @@ class SlackWorkflowOrchestrator:
         self._feature_workflows[feature.id] = "bugfix-v2"
         channel_id = ""
         try:
-            channel_name = f"iriai-{slugify(source_feature.name)}-bugs-{feature.id}"
+            channel_name = f"iriai-{slugify(source_feature.name, max_length=_SLACK_CHANNEL_SLUG_MAX)}-bugs-{feature.id}"
             channel_id = await self._adapter.create_channel(channel_name)
             self._channel_features[channel_id] = feature.id
             self._adapter.set_channel_mode(channel_id, "singleplayer")

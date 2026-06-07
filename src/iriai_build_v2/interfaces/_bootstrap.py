@@ -26,8 +26,17 @@ from ..workflows import TrackedWorkflowRunner
 from ..runtime_policy import DEFAULT_RUNTIME_POLICY, RuntimePolicy, normalize_runtime_policy
 
 
-def slugify(name: str) -> str:
+# Bound the human-readable slug portion so `{slug}-{id}` stays a valid path
+# component (filesystem limit ~255B) and Slack channel name (≤80 chars). The
+# id suffix carries uniqueness, so truncating the name portion is safe.
+_FEATURE_SLUG_NAME_MAX = 80
+_SLACK_CHANNEL_SLUG_MAX = 50
+
+
+def slugify(name: str, max_length: int | None = None) -> str:
     slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+    if max_length is not None and len(slug) > max_length:
+        slug = slug[:max_length].rstrip("-")
     return slug
 
 
@@ -202,7 +211,7 @@ async def create_feature(
 
     for _attempt in range(5):
         feature_id = str(uuid.uuid4())[:8]
-        slug = f"{slugify(name)}-{feature_id}"
+        slug = f"{slugify(name, max_length=_FEATURE_SLUG_NAME_MAX)}-{feature_id}"
         feature = Feature(
             id=feature_id,
             name=name,
