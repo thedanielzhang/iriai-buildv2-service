@@ -408,6 +408,11 @@ async def _complete_single_artifact_step(
         artifact_text=artifact_text,
         label=artifact_label,
     )
+    # Resume double-dispatch guard: snapshot the artifact head AFTER our own
+    # pre-gate push so we can detect a concurrent instance superseding it while
+    # our (blocking) gate runs.
+    head_before = await runner.artifacts.get_record(artifact_key, feature=feature)
+    head_before_id = head_before.get("id") if head_before else None
     async with subfeature_lock:
         artifact_obj, artifact_text = await gate_and_revise(
             runner,
@@ -423,6 +428,23 @@ async def _complete_single_artifact_step(
             post_update=post_update,
         )
     final_text = to_str(artifact_obj) if isinstance(artifact_obj, BaseModel) else artifact_text
+    # If a concurrent same-step instance wrote DIFFERENT content while our gate
+    # was blocked, do NOT clobber the newer artifact with our (stale) copy.
+    head_after = await runner.artifacts.get_record(artifact_key, feature=feature)
+    if (
+        head_before_id is not None
+        and head_after is not None
+        and head_after.get("id") != head_before_id
+        and head_after.get("value") != final_text
+    ):
+        logger.warning(
+            "artifact %s advanced during gate (head %s -> %s); skipping stale "
+            "concurrent-instance write",
+            artifact_key,
+            head_before_id,
+            head_after.get("id"),
+        )
+        return head_after.get("value") or final_text
     await runner.artifacts.put(artifact_key, final_text, feature=feature)
     sidecar_source_text = artifact_text if isinstance(artifact_text, str) and artifact_text.strip() else final_text
     await refresh_sidecar_for_source_artifact(
@@ -2566,7 +2588,20 @@ class SubfeaturePhase(Phase):
             )
 
         async def _start_task(sf: Any, step: str) -> None:
-            active_tasks[f"{sf.slug}:{step}"] = asyncio.create_task(_run_ready_step(sf, step))
+            # Resume double-dispatch guard: never overwrite a still-live task for
+            # the same slug:step. Overwriting orphans the first coroutine (which
+            # keeps running its gate and writing the artifact), producing the
+            # duplicate gate queries + last-writer-wins artifact clobber seen on
+            # resumed runs. Skipping is safe: the existing task already runs it.
+            key = f"{sf.slug}:{step}"
+            existing = active_tasks.get(key)
+            if existing is not None and not existing.done():
+                logger.warning(
+                    "skipping duplicate launch of %s; a live task is already running it",
+                    key,
+                )
+                return
+            active_tasks[key] = asyncio.create_task(_run_ready_step(sf, step))
 
         while True:
             for key, task in list(active_tasks.items()):
