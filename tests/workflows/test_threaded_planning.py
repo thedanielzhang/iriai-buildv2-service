@@ -100,6 +100,7 @@ from iriai_build_v2.workflows.planning.phases.subfeature import (
 )
 from iriai_build_v2.workflows._common._helpers import (
     _apply_patches,
+    _assert_compile_complete,
     _write_revision_decision_context,
     _clear_agent_session,
     _build_subfeature_context,
@@ -12083,6 +12084,62 @@ async def test_compile_artifacts_guard_raises_when_bundle_dropped(monkeypatch, t
     # not in the truncated output).
     assert "billing" in msg
     assert "reports" in msg
+
+
+def test_compile_guard_expected_slugs_catches_chunk_stage_drop():
+    """Chunk-stage guard: raw per-SF sources carry no `<!-- SF: -->` markers
+    (the compiler emits them), so the guard keys the survival check on the
+    KNOWN input slugs via ``expected_slugs``. A cluster compile that drops a
+    whole subfeature must HARD-RAISE at its origin instead of poisoning every
+    downstream stage's baseline."""
+    with pytest.raises(RuntimeError) as ei:
+        _assert_compile_complete(
+            # rendered chunk source: `## Subfeature:` headers, NO `<!-- SF -->`
+            sources_text="## Subfeature: S2 (s2)\n\nbody\n\n## Subfeature: S3a (s3a)\n\nbody\n",
+            compiled_text="<!-- SF: s2 -->\n## merged\n",  # s3a marker dropped
+            artifact_prefix="plan-chunk-2",
+            stage_label="cluster-2",
+            expected_slugs={"s2", "s3a"},
+            real_slugs={"s2", "s3a"},
+        )
+    msg = str(ei.value)
+    assert "completeness guard FAILED" in msg
+    assert "s3a" in msg
+
+
+def test_compile_guard_regroup_stage_catches_marker_drop():
+    """Regroup-stage guard: the inputs (cluster outputs) DO carry `<!-- SF -->`
+    markers, so a regroup merge that silently drops one subfeature (the exact
+    S3a/S6 drop the final-only guard missed — its baseline was the already-
+    stripped regroup output) must HARD-RAISE."""
+    src = "<!-- SF: s1 -->\nbody\n<!-- SF: s2 -->\nbody\n<!-- SF: s3a -->\nbody\n"
+    out = "<!-- SF: s1 -->\nbody\n<!-- SF: s2 -->\nbody\n"  # s3a dropped at regroup
+    with pytest.raises(RuntimeError) as ei:
+        _assert_compile_complete(
+            sources_text=src,
+            compiled_text=out,
+            artifact_prefix="plan-regroup-1-1",
+            stage_label="regroup-1-1",
+            real_slugs={"s1", "s2", "s3a"},
+        )
+    assert "s3a" in str(ei.value)
+
+
+def test_compile_guard_real_slugs_ignores_synthetic_markers():
+    """real_slugs filtering: a dropped SYNTHETIC marker (e.g.
+    `compilation-provenance`, or the `cluster-*`/`regroup-*` scaffolding) must
+    NOT raise — only real subfeatures are required to survive. Prevents a false
+    positive when the compiler consolidates synthetic provenance."""
+    src = "<!-- SF: s1 -->\nbody\n<!-- SF: compilation-provenance -->\nx\n"
+    out = "<!-- SF: s1 -->\nbody\n"  # synthetic marker gone, real one kept
+    # Must NOT raise (no exception expected).
+    _assert_compile_complete(
+        sources_text=src,
+        compiled_text=out,
+        artifact_prefix="plan-regroup-1-1",
+        stage_label="regroup-1-1",
+        real_slugs={"s1"},
+    )
 
 
 @pytest.mark.asyncio

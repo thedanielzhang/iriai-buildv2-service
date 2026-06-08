@@ -2135,6 +2135,8 @@ def _assert_compile_complete(
     compiled_text: str,
     artifact_prefix: str,
     stage_label: str,
+    real_slugs: set[str] | None = None,
+    expected_slugs: set[str] | None = None,
 ) -> None:
     """Deterministic post-compile completeness guard (always on).
 
@@ -2142,28 +2144,45 @@ def _assert_compile_complete(
     corrupted artifact can never reach gate review or the store.  Two checks,
     both renumber-safe (they never compare literal IDs):
 
-    1. Subfeature provenance survival — every distinct `<!-- SF: {slug} -->`
-       marker present in the sources must still appear in the output.  If the
-       sources carry zero such markers (e.g. a tiny artifact, or a KIND whose
-       compiler does not emit them), this sub-check is skipped.
+    1. Subfeature provenance survival — every REQUIRED `<!-- SF: {slug} -->`
+       marker must still appear in the output.  The required set is the
+       distinct markers found in the sources, UNLESS ``expected_slugs`` is
+       given (see below).  If the required set is empty (e.g. a tiny artifact,
+       or a KIND whose compiler does not emit markers), this sub-check is
+       skipped.
     2. Component/section body count-floor — if the sources contain
        `n_src > 0` CMP-bearing body headers, the output must contain at least
        `n_src` of them.  Skipped when `n_src == 0`.
 
+    ``expected_slugs`` — when provided (the cluster/chunk stage, whose raw
+    per-subfeature SOURCES carry no `<!-- SF: -->` comments yet — those are
+    emitted by the compiler), the required-marker set is taken from this
+    explicit slug set instead of from the sources text, so a chunk that drops
+    a whole subfeature still fails loud.
+    ``real_slugs`` — when provided, the required set is intersected with it so
+    synthetic markers (``compilation-provenance`` and the ``cluster-*`` /
+    ``regroup-*`` map-reduce scaffolding) are never *required* to survive —
+    only real subfeatures are tracked.  Strictly reduces false positives.
+
     Raises RuntimeError naming the missing subfeatures and the n_out/n_src
     counts.
     """
-    src_markers = _distinct_sf_markers(sources_text)
     out_markers = _distinct_sf_markers(compiled_text)
-    missing = sorted(src_markers - out_markers)
+    if expected_slugs is not None:
+        required = set(expected_slugs)
+    else:
+        required = _distinct_sf_markers(sources_text)
+    if real_slugs is not None:
+        required &= set(real_slugs)
+    missing = sorted(required - out_markers)
 
     n_src = _count_cmp_body_headers(sources_text)
     n_out = _count_cmp_body_headers(compiled_text)
 
     problems: list[str] = []
-    if src_markers and missing:
+    if required and missing:
         problems.append(
-            f"dropped {len(missing)}/{len(src_markers)} subfeature provenance "
+            f"dropped {len(missing)}/{len(required)} subfeature provenance "
             f"markers: {', '.join(missing)}"
         )
     if n_src > 0 and n_out < n_src:
@@ -2177,8 +2196,8 @@ def _assert_compile_complete(
             f"Compile completeness guard FAILED for {artifact_prefix} "
             f"(stage={stage_label}): " + "; ".join(problems) + ". "
             "The merged artifact appears truncated — refusing to seal a "
-            "corrupted document. (subfeature markers "
-            f"src={sorted(src_markers)} out={sorted(out_markers)}; "
+            "corrupted document. (required subfeature markers "
+            f"req={sorted(required)} out={sorted(out_markers)}; "
             f"CMP body headers src={n_src} out={n_out})"
         )
 
@@ -2321,6 +2340,15 @@ async def compile_artifacts(
             raise RuntimeError(f"Compiler wrote empty file at {output_path}")
         return compiled
 
+    # Real subfeature slugs — the authority for the completeness guard's
+    # provenance-survival check.  Intersecting the required-marker set with
+    # this drops synthetic markers (`compilation-provenance`, `cluster-*`,
+    # `regroup-*`) so they never trigger a false positive.
+    real_slugs = {
+        getattr(sf, "slug", "")
+        for sf in getattr(decomposition, "subfeatures", [])
+    } - {""}
+
     source_text = _render_source_bundle(
         artifact_prefix,
         include_broad=True,
@@ -2340,20 +2368,31 @@ async def compile_artifacts(
         for idx, chunk in enumerate(chunks, start=1):
             chunk_sources_path = feature_dir / f"compile-sources-{artifact_prefix}-chunk-{idx}.md"
             chunk_output_path = feature_dir / f"compile-intermediate-{artifact_prefix}-chunk-{idx}.md"
-            chunk_sources_path.write_text(
-                _render_source_bundle(
-                    f"{artifact_prefix}-chunk-{idx}",
-                    include_broad=False,
-                    include_decomposition=False,
-                    sources=chunk,
-                ),
-                encoding="utf-8",
+            chunk_src_text = _render_source_bundle(
+                f"{artifact_prefix}-chunk-{idx}",
+                include_broad=False,
+                include_decomposition=False,
+                sources=chunk,
             )
+            chunk_sources_path.write_text(chunk_src_text, encoding="utf-8")
             intermediate_text = await _run_compile_prompt(
                 stage_label=f"cluster-{idx}",
                 sources_path=chunk_sources_path,
                 output_path=chunk_output_path,
                 source_count=len(chunk),
+            )
+            # Per-cluster completeness guard (at the drop's ORIGIN).  Raw per-SF
+            # sources carry no `<!-- SF: -->` comments yet (the compiler emits
+            # them), so key the survival check on the KNOWN input slugs: a
+            # cluster compile that drops a whole subfeature fails loud here
+            # instead of silently poisoning every downstream stage's baseline.
+            _assert_compile_complete(
+                sources_text=chunk_src_text,
+                compiled_text=intermediate_text,
+                artifact_prefix=f"{artifact_prefix}-chunk-{idx}",
+                stage_label=f"cluster-{idx}",
+                expected_slugs={getattr(s, "slug", "") for s, _ in chunk},
+                real_slugs=real_slugs,
             )
             intermediate_sources.append((type("Intermediate", (), {"name": f"Cluster {idx}", "slug": f"cluster-{idx}"})(), intermediate_text))
 
@@ -2365,8 +2404,17 @@ async def compile_artifacts(
             include_decomposition=True,
             sources=final_sources,
         )
+        # Regroup rounds are LOSSY: each round LLM-merges several cluster
+        # outputs into one larger bundle, and an over-budget merge silently
+        # drops a whole subfeature (observed: the plan regroup dropping S3a/S6).
+        # When ``deterministic_final_merge`` is set we SKIP regroup entirely and
+        # feed the bounded CLUSTER outputs straight into the per-bundle re-emit
+        # + deterministic concat below — no LLM call ever has to emit an
+        # over-budget union, so the truncation class cannot occur.  The default
+        # (non-deterministic) path keeps regrouping, now guarded per round.
         while (
-            len(final_source_text.encode("utf-8")) > COMPILE_HIERARCHICAL_THRESHOLD
+            not deterministic_final_merge
+            and len(final_source_text.encode("utf-8")) > COMPILE_HIERARCHICAL_THRESHOLD
             and len(final_sources) > 1
         ):
             regroup_chunks = _chunk_sources_by_rendered_size(
@@ -2394,15 +2442,13 @@ async def compile_artifacts(
                     feature_dir
                     / f"compile-intermediate-{artifact_prefix}-regroup-{regroup_round}-{idx}.md"
                 )
-                regroup_sources_path.write_text(
-                    _render_source_bundle(
-                        f"{artifact_prefix}-regroup-{regroup_round}-{idx}",
-                        include_broad=False,
-                        include_decomposition=False,
-                        sources=chunk,
-                    ),
-                    encoding="utf-8",
+                regroup_src_text = _render_source_bundle(
+                    f"{artifact_prefix}-regroup-{regroup_round}-{idx}",
+                    include_broad=False,
+                    include_decomposition=False,
+                    sources=chunk,
                 )
+                regroup_sources_path.write_text(regroup_src_text, encoding="utf-8")
                 if len(chunk) == 1:
                     # Single already-compiled source — there is nothing to
                     # merge. Re-emitting it through the LLM is redundant, slow,
@@ -2419,6 +2465,17 @@ async def compile_artifacts(
                         sources_path=regroup_sources_path,
                         output_path=regroup_output_path,
                         source_count=len(chunk),
+                    )
+                    # Per-regroup completeness guard: the inputs (cluster /
+                    # earlier-regroup outputs) DO carry `<!-- SF: -->` markers,
+                    # so a regroup merge that drops a subfeature fails loud here
+                    # rather than poisoning the final guard's baseline.
+                    _assert_compile_complete(
+                        sources_text=regroup_src_text,
+                        compiled_text=regroup_text,
+                        artifact_prefix=f"{artifact_prefix}-regroup-{regroup_round}-{idx}",
+                        stage_label=f"regroup-{regroup_round}-{idx}",
+                        real_slugs=real_slugs,
                     )
                 next_round_sources.append(
                     (
@@ -2559,6 +2616,7 @@ async def compile_artifacts(
                     compiled_text=bundle_compiled,
                     artifact_prefix=f"{artifact_prefix}-finalbundle-{b_idx}",
                     stage_label=f"final-bundle-{b_idx}",
+                    real_slugs=real_slugs,
                 )
                 bundle_outputs.append(bundle_compiled)
                 running_offset += _max_local_cmp(b_text)
@@ -2597,6 +2655,7 @@ async def compile_artifacts(
             compiled_text=compiled_text,
             artifact_prefix=artifact_prefix,
             stage_label="final",
+            real_slugs=real_slugs,
         )
     else:
         sources_path = feature_dir / f"compile-sources-{artifact_prefix}.md"
@@ -2614,6 +2673,7 @@ async def compile_artifacts(
             compiled_text=compiled_text,
             artifact_prefix=artifact_prefix,
             stage_label="single-pass",
+            real_slugs=real_slugs,
         )
 
     if not compiled_text:
