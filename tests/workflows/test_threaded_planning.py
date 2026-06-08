@@ -16187,3 +16187,294 @@ async def test_revision_decision_context_prefers_cited_records_over_full_ledger(
     assert "Referenced Decision Records" in context_text
     assert "D-7: Local decision" in context_text
     assert "Fallback Decision Ledger" not in context_text
+
+
+# ── Deterministic union system-design merge (skip 32K-blowing LLM) ────────────
+
+
+def _sd_part(
+    *,
+    title: str,
+    services: list[tuple[str, str]] | None = None,
+    connections: list[tuple[str, str]] | None = None,
+    endpoints: list[tuple[str, str, str]] | None = None,
+    entities: list[tuple[str, str, str]] | None = None,
+    relations: list[tuple[str, str, str]] | None = None,
+    call_paths: list[str] | None = None,
+    decisions: list[str] | None = None,
+    risks: list[str] | None = None,
+) -> SystemDesign:
+    from iriai_build_v2.models.outputs import (
+        APICallPath,
+        APIEndpoint,
+        Entity,
+        EntityRelation,
+        ServiceConnection,
+        ServiceNode,
+    )
+
+    return SystemDesign(
+        title=title,
+        services=[
+            ServiceNode(id=sid, name=sid, kind="service", description=desc)
+            for sid, desc in (services or [])
+        ],
+        connections=[
+            ServiceConnection(from_id=a, to_id=b, label=f"{a}->{b}")
+            for a, b in (connections or [])
+        ],
+        api_endpoints=[
+            APIEndpoint(method=m, path=p, service_id=s, description=p)
+            for m, p, s in (endpoints or [])
+        ],
+        entities=[
+            Entity(id=eid, name=name, service_id=svc)
+            for eid, name, svc in (entities or [])
+        ],
+        entity_relations=[
+            EntityRelation(from_entity=a, to_entity=b, kind=k)
+            for a, b, k in (relations or [])
+        ],
+        call_paths=[
+            APICallPath(id=cpid, name=cpid, description=cpid)
+            for cpid in (call_paths or [])
+        ],
+        decisions=list(decisions or []),
+        risks=list(risks or []),
+    )
+
+
+def test_merge_system_designs_dedups_by_key_without_content_loss():
+    """merge_system_designs unions per-SF designs, dropping only exact-key dups."""
+    from iriai_build_v2.services.system_design_html import merge_system_designs
+
+    part_a = _sd_part(
+        title="A",
+        services=[("svc-shared", "shared from A"), ("svc-a", "only A")],
+        connections=[("svc-a", "svc-shared")],
+        endpoints=[("GET", "/a", "svc-a"), ("GET", "/shared", "svc-shared")],
+        entities=[("E-shared", "Shared", "svc-shared"), ("E-a", "OnlyA", "svc-a")],
+        relations=[("E-a", "E-shared", "one-to-many")],
+        call_paths=["CP-shared", "CP-a"],
+        decisions=["D shared", "D only-a"],
+        risks=["R shared"],
+    )
+    part_b = _sd_part(
+        title="B",
+        # svc-shared duplicates A's id (dropped); description from A wins (first).
+        services=[("svc-shared", "shared from B"), ("svc-b", "only B")],
+        connections=[("svc-a", "svc-shared"), ("svc-b", "svc-shared")],
+        # (GET,/shared,svc-shared) duplicates A's endpoint (dropped).
+        endpoints=[("GET", "/shared", "svc-shared"), ("POST", "/b", "svc-b")],
+        entities=[("E-shared", "Shared", "svc-shared"), ("E-b", "OnlyB", "svc-b")],
+        relations=[("E-a", "E-shared", "one-to-many"), ("E-b", "E-shared", "one-to-one")],
+        call_paths=["CP-shared", "CP-b"],
+        decisions=["D shared", "D only-b"],
+        risks=["R shared", "R only-b"],
+    )
+
+    merged = merge_system_designs([part_a, part_b], title="Union", overview="ov")
+
+    assert merged.title == "Union"
+    assert merged.overview == "ov"
+    assert merged.complete is True
+
+    # services: dedup by id, first occurrence (A's description) wins.
+    assert [s.id for s in merged.services] == ["svc-shared", "svc-a", "svc-b"]
+    assert merged.services[0].description == "shared from A"
+
+    # connections: dedup by (from_id, to_id).
+    assert [(c.from_id, c.to_id) for c in merged.connections] == [
+        ("svc-a", "svc-shared"),
+        ("svc-b", "svc-shared"),
+    ]
+
+    # api_endpoints: dedup by (method, path, service_id).
+    assert [(e.method, e.path, e.service_id) for e in merged.api_endpoints] == [
+        ("GET", "/a", "svc-a"),
+        ("GET", "/shared", "svc-shared"),
+        ("POST", "/b", "svc-b"),
+    ]
+
+    # entities: dedup by id.
+    assert [e.id for e in merged.entities] == ["E-shared", "E-a", "E-b"]
+
+    # entity_relations: dedup by (from, to, kind) — the two E-x->E-shared with
+    # different kinds are BOTH kept (not collapsed).
+    assert [(r.from_entity, r.to_entity, r.kind) for r in merged.entity_relations] == [
+        ("E-a", "E-shared", "one-to-many"),
+        ("E-b", "E-shared", "one-to-one"),
+    ]
+
+    # call_paths: dedup by id.
+    assert [cp.id for cp in merged.call_paths] == ["CP-shared", "CP-a", "CP-b"]
+
+    # decisions / risks: concat + dedup preserving order.
+    assert merged.decisions == ["D shared", "D only-a", "D only-b"]
+    assert merged.risks == ["R shared", "R only-b"]
+
+
+def test_merge_system_designs_roundtrips_through_json_fast_path():
+    """The merged model serializes to JSON the existing fast-path can re-parse."""
+    from iriai_build_v2.services.system_design_html import (
+        merge_system_designs,
+        render_system_design_html,
+    )
+
+    merged = merge_system_designs(
+        [_sd_part(title="A", services=[("svc-a", "A")])],
+        title="Union",
+    )
+    sd_json = merged.model_dump_json(indent=2)
+
+    # Mirror the JSON fast-path in _convert_and_host_sd.
+    reparsed = SystemDesign.model_validate(json.loads(sd_json))
+    assert any(
+        getattr(reparsed, f)
+        for f in ("services", "connections", "api_endpoints", "entities")
+    )
+    html = render_system_design_html(reparsed)
+    assert "<!DOCTYPE html>" in html
+
+
+@pytest.mark.asyncio
+async def test_convert_and_host_union_uses_deterministic_merge_not_llm(tmp_path, monkeypatch):
+    """For the union key, _convert_and_host_sd merges per-SF sidecars and never
+    invokes the sd-converter LLM Ask."""
+    from iriai_build_v2.services.artifacts import structured_artifact_key
+    from iriai_build_v2.models.outputs import StructuredArtifactEnvelope, StructuredArtifact
+
+    decomposition = SubfeatureDecomposition(
+        subfeatures=[
+            Subfeature(id="SF-1", slug="alpha", name="Alpha", description="a"),
+            Subfeature(id="SF-2", slug="beta", name="Beta", description="b"),
+        ],
+        decomposition_rationale="Two subfeatures.",
+    )
+
+    def _sidecar_payload(content: SystemDesign, slug: str) -> str:
+        return StructuredArtifact[SystemDesign](
+            meta=StructuredArtifactEnvelope(
+                artifact_family="system-design",
+                artifact_key=f"system-design:{slug}",
+                scope_kind="subfeature",
+                scope_slug=slug,
+            ),
+            content=content,
+        ).model_dump_json()
+
+    store = {
+        "decomposition": decomposition.model_dump_json(),
+        structured_artifact_key("system-design:alpha"): _sidecar_payload(
+            _sd_part(
+                title="Alpha",
+                services=[("svc-alpha", "alpha")],
+                decisions=["D shared", "D alpha"],
+            ),
+            "alpha",
+        ),
+        structured_artifact_key("system-design:beta"): _sidecar_payload(
+            _sd_part(
+                title="Beta",
+                services=[("svc-alpha", "dup"), ("svc-beta", "beta")],
+                decisions=["D shared", "D beta"],
+            ),
+            "beta",
+        ),
+    }
+
+    class _Artifacts:
+        async def get(self, key, *, feature):
+            del feature
+            return store.get(key, "")
+
+        async def put(self, key, value, *, feature):
+            del feature
+            store[key] = value
+
+    pushed: dict[str, str] = {}
+
+    class _Hosting:
+        async def push(self, feature_id, key, content, label):
+            pushed[key] = content
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("runner.run (LLM Ask) must NOT be called for the union merge")
+
+    mirror = _TestMirror(tmp_path)
+    runner = SimpleNamespace(
+        artifacts=_Artifacts(),
+        services={"artifact_mirror": mirror, "hosting": _Hosting()},
+        run=_boom,
+    )
+    feature = SimpleNamespace(id="feat-union", name="Union Feature")
+
+    union_prose = "## Compiled Union\n\nProse aggregation of all subfeatures.\n"
+    result = await ArchitecturePhase()._convert_and_host_sd(
+        runner, feature, "system-design", union_prose, "Union Feature"
+    )
+
+    # The deterministic merge fired: result is merged JSON, HTML was pushed,
+    # and the LLM Ask (runner.run) was never invoked (would have raised).
+    merged = SystemDesign.model_validate(json.loads(result))
+    assert [s.id for s in merged.services] == ["svc-alpha", "svc-beta"]
+    assert merged.services[0].description == "alpha"  # first-occurrence wins
+    assert merged.decisions == ["D shared", "D alpha", "D beta"]
+    assert "system-design" in pushed
+    assert "<!DOCTYPE html>" in pushed["system-design"]
+
+    # The prose source companion is preserved (NOT overwritten with JSON).
+    source_rel = _sd_source_path("system-design")
+    source_path = mirror.feature_dir("feat-union") / source_rel
+    assert source_path.read_text(encoding="utf-8") == union_prose
+
+
+@pytest.mark.asyncio
+async def test_convert_and_host_union_falls_through_to_llm_when_sidecars_missing(
+    tmp_path, monkeypatch
+):
+    """When per-SF sidecars are absent, the union path falls through to the
+    existing LLM converter (no regression)."""
+    decomposition = SubfeatureDecomposition(
+        subfeatures=[
+            Subfeature(id="SF-1", slug="alpha", name="Alpha", description="a"),
+            Subfeature(id="SF-2", slug="beta", name="Beta", description="b"),
+        ],
+    )
+    store = {"decomposition": decomposition.model_dump_json()}
+
+    class _Artifacts:
+        async def get(self, key, *, feature):
+            del feature
+            return store.get(key, "")
+
+        async def put(self, key, value, *, feature):
+            del feature
+            store[key] = value
+
+    ran = {"called": False}
+
+    async def _fake_run(task, feature, **kwargs):
+        ran["called"] = True
+        return _sd_part(title="LLM", services=[("svc-llm", "from-llm")])
+
+    class _Hosting:
+        async def push(self, feature_id, key, content, label):
+            pass
+
+    mirror = _TestMirror(tmp_path)
+    runner = SimpleNamespace(
+        artifacts=_Artifacts(),
+        services={"artifact_mirror": mirror, "hosting": _Hosting()},
+        run=_fake_run,
+    )
+    feature = SimpleNamespace(id="feat-missing", name="Union Feature")
+
+    result = await ArchitecturePhase()._convert_and_host_sd(
+        runner, feature, "system-design", "## Prose union\n", "Union Feature"
+    )
+
+    # No usable sidecars → fell through to the LLM Ask.
+    assert ran["called"] is True
+    merged = SystemDesign.model_validate(json.loads(result))
+    assert [s.id for s in merged.services] == ["svc-llm"]

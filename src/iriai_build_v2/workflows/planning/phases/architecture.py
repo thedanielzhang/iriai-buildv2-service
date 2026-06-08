@@ -29,8 +29,11 @@ from ....roles import (
     sysdesign_compiler,
     user,
 )
-from ....services.system_design_html import render_system_design_html
-from .._sidecars import refresh_sidecar_for_source_artifact
+from ....services.system_design_html import (
+    merge_system_designs,
+    render_system_design_html,
+)
+from .._sidecars import load_structured_artifact, refresh_sidecar_for_source_artifact
 from ..._common import (
     HostedInterview,
     broad_interview,
@@ -563,6 +566,60 @@ class ArchitecturePhase(Phase):
                 source_path.write_text(sd_text, encoding="utf-8")
 
         hosting = runner.services.get("hosting")
+
+        # Deterministic union merge (NO LLM): the union system-design aggregates
+        # all per-subfeature designs, and its single structured-output conversion
+        # routinely exceeds the 32K output-token cap → expensive SDK retries →
+        # raw-text fallback. The per-subfeature ``SystemDesign`` objects are
+        # already persisted as structured JSON sidecars, so we can union them
+        # deterministically and skip the LLM converter entirely. Only the union
+        # key takes this path; per-subfeature keys (``system-design:{slug}``) and
+        # the missing-sidecar case fall through to the existing LLM behavior
+        # unchanged. The prose source companion (``system-design-source.md``,
+        # consumed by the gate reviewer + decision-mirror sync) was already saved
+        # above with the original ``sd_text`` and is intentionally NOT touched.
+        if sd_key == "system-design":
+            try:
+                decomposition = await self._load_decomposition(
+                    runner, feature, BuildState()
+                )
+                slugs = [sf.slug for sf in decomposition.subfeatures]
+                parts: list[SystemDesign] = []
+                for slug in slugs:
+                    sidecar = await load_structured_artifact(
+                        runner, feature, f"system-design:{slug}"
+                    )
+                    if sidecar is not None and isinstance(sidecar.content, SystemDesign):
+                        parts.append(sidecar.content)
+                # Require at least 2 parts AND a majority of decomposition slugs
+                # present; otherwise the deterministic union would be incomplete
+                # relative to the prose union, so fall through to the LLM path.
+                enough = len(parts) >= 2 and (
+                    not slugs or len(parts) >= max(2, (len(slugs) + 1) // 2)
+                )
+                if enough:
+                    merged = merge_system_designs(
+                        parts,
+                        title=f"System Design — {sf_name}",
+                        overview=decomposition.decomposition_rationale or "",
+                    )
+                    if hosting:
+                        html = render_system_design_html(merged)
+                        await hosting.push(
+                            feature.id, sd_key, html, f"System Design — {sf_name}"
+                        )
+                    logger.info(
+                        "union system-design built via deterministic merge of "
+                        "%d per-SF sidecars (skipping 32K-blowing LLM converter)",
+                        len(parts),
+                    )
+                    return merged.model_dump_json(indent=2)
+            except Exception:
+                logger.warning(
+                    "deterministic union system-design merge failed — "
+                    "falling through to LLM converter",
+                    exc_info=True,
+                )
 
         # Try to parse as existing SystemDesign JSON first
         try:

@@ -405,6 +405,96 @@ def render_system_design_html(model: SystemDesign) -> str:
     return "\n".join(parts)
 
 
+# ── Deterministic union merge (no LLM) ───────────────────────────────────────
+
+
+def merge_system_designs(
+    parts: list[SystemDesign], *, title: str, overview: str = ""
+) -> SystemDesign:
+    """Deterministically union per-subfeature SystemDesign models into one.
+
+    Pure Python, NO LLM, NO I/O. This is the deterministic alternative to the
+    LLM ``sd-converter`` Ask for the *union* system design — the union prose can
+    aggregate ~7 subfeature designs into >32K output tokens, which blows the
+    structured-output cap and triggers expensive retries before falling back to
+    raw text.
+
+    Dedup rules (stable order, first-occurrence wins — preserve everything,
+    drop only exact-key duplicates):
+
+    - services: by ``id``
+    - connections: by ``(from_id, to_id)``
+    - api_endpoints: by ``(method, path, service_id)``
+    - entities: by ``id`` if present else ``(name, service_id)``
+    - entity_relations: by ``(from_entity, to_entity, kind)``
+    - call_paths: by ``id``
+    - decisions, risks: ``list[str]`` — concat + dedup preserving order
+
+    ``title``/``overview`` come from the args. Nothing that is not an exact-key
+    duplicate is ever dropped.
+    """
+    merged = SystemDesign(title=title, overview=overview, complete=True)
+
+    seen_services: set[str] = set()
+    seen_connections: set[tuple[str, str]] = set()
+    seen_endpoints: set[tuple[str, str, str]] = set()
+    seen_entities: set[tuple[str, str]] = set()
+    seen_relations: set[tuple[str, str, str]] = set()
+    seen_call_paths: set[str] = set()
+    seen_decisions: set[str] = set()
+    seen_risks: set[str] = set()
+
+    for part in parts:
+        if part is None:
+            continue
+        for svc in part.services:
+            if svc.id in seen_services:
+                continue
+            seen_services.add(svc.id)
+            merged.services.append(svc)
+        for conn in part.connections:
+            ckey = (conn.from_id, conn.to_id)
+            if ckey in seen_connections:
+                continue
+            seen_connections.add(ckey)
+            merged.connections.append(conn)
+        for ep in part.api_endpoints:
+            ekey = (ep.method, ep.path, ep.service_id)
+            if ekey in seen_endpoints:
+                continue
+            seen_endpoints.add(ekey)
+            merged.api_endpoints.append(ep)
+        for ent in part.entities:
+            entkey = (ent.id, "") if ent.id else (ent.name, ent.service_id)
+            if entkey in seen_entities:
+                continue
+            seen_entities.add(entkey)
+            merged.entities.append(ent)
+        for rel in part.entity_relations:
+            rkey = (rel.from_entity, rel.to_entity, rel.kind)
+            if rkey in seen_relations:
+                continue
+            seen_relations.add(rkey)
+            merged.entity_relations.append(rel)
+        for cp in part.call_paths:
+            if cp.id in seen_call_paths:
+                continue
+            seen_call_paths.add(cp.id)
+            merged.call_paths.append(cp)
+        for dec in part.decisions:
+            if dec in seen_decisions:
+                continue
+            seen_decisions.add(dec)
+            merged.decisions.append(dec)
+        for risk in part.risks:
+            if risk in seen_risks:
+                continue
+            seen_risks.add(risk)
+            merged.risks.append(risk)
+
+    return merged
+
+
 # ── Embedded CSS ─────────────────────────────────────────────────────────────
 
 _CSS = """\
