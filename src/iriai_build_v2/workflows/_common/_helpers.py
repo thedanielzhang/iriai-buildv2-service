@@ -2403,12 +2403,23 @@ async def compile_artifacts(
                     ),
                     encoding="utf-8",
                 )
-                regroup_text = await _run_compile_prompt(
-                    stage_label=f"regroup-{regroup_round}-{idx}",
-                    sources_path=regroup_sources_path,
-                    output_path=regroup_output_path,
-                    source_count=len(chunk),
-                )
+                if len(chunk) == 1:
+                    # Single already-compiled source — there is nothing to
+                    # merge. Re-emitting it through the LLM is redundant, slow,
+                    # and prone to output-truncation / read-loop stalls on large
+                    # bundles (observed: a ~108K cluster re-emit looping
+                    # indefinitely without producing output). Pass it through
+                    # deterministically; the next round / final merge handles
+                    # the actual union.
+                    regroup_text = chunk[0][1]
+                    regroup_output_path.write_text(regroup_text, encoding="utf-8")
+                else:
+                    regroup_text = await _run_compile_prompt(
+                        stage_label=f"regroup-{regroup_round}-{idx}",
+                        sources_path=regroup_sources_path,
+                        output_path=regroup_output_path,
+                        source_count=len(chunk),
+                    )
                 next_round_sources.append(
                     (
                         type(
