@@ -2095,6 +2095,94 @@ def _build_prior_revision_context(
     return _offload_if_large(result, base, "gate-review-history")
 
 
+# ── Compile completeness guard ──────────────────────────────────────────
+#
+# Provenance markers are emitted by `_render_source_bundle` (the
+# `## Subfeature: {name} ({slug})` header at ~_helpers.py:2152) AND by the
+# compiler role prompt (`<!-- SF: {slug} -->` comments — see
+# roles/compiler/prompt.md:18).  The `<!-- SF: {slug} -->` comment is the
+# stable per-subfeature token that propagates verbatim through every
+# map-reduce stage's *body* (real subfeature slugs survive into the regroup
+# intermediates and the final union), whereas the `## Subfeature:` wrapper
+# header is rewritten to synthetic `Cluster N` / `Regroup N-M` names at the
+# intermediate stages.  We therefore key the survival check on the
+# `<!-- SF: {slug} -->` body comment so the guard tracks the real
+# subfeatures, not the map-reduce scaffolding.
+_SF_MARKER_RE = re.compile(r"<!--\s*SF:\s*([A-Za-z0-9][A-Za-z0-9_-]*)")
+# A "component/section body" is delimited by a markdown header (## / ### /
+# ####) that names a renumbered component id (CMP-<n>).  This is the stable,
+# renumber-safe delimiter: IDs are globally renumbered between source and
+# output, so we count *header lines bearing a CMP id*, never the literal id
+# values.  One header may name several components
+# (e.g. `#### DocumentsPane (CMP-23) / PrimaryArtifactCard (CMP-25)`), so this
+# is a count of body sections, not of CMP ids.
+_CMP_BODY_HEADER_RE = re.compile(r"(?m)^#{2,4}\s+.*\bCMP-\d+")
+
+
+def _distinct_sf_markers(text: str) -> set[str]:
+    """Return the set of distinct subfeature slugs referenced by SF markers."""
+    return {m.group(1) for m in _SF_MARKER_RE.finditer(text or "")}
+
+
+def _count_cmp_body_headers(text: str) -> int:
+    """Count markdown header lines that delimit a CMP-bearing component body."""
+    return len(_CMP_BODY_HEADER_RE.findall(text or ""))
+
+
+def _assert_compile_complete(
+    *,
+    sources_text: str,
+    compiled_text: str,
+    artifact_prefix: str,
+    stage_label: str,
+) -> None:
+    """Deterministic post-compile completeness guard (always on).
+
+    HARD-RAISES (never warns) when the merged output appears truncated, so a
+    corrupted artifact can never reach gate review or the store.  Two checks,
+    both renumber-safe (they never compare literal IDs):
+
+    1. Subfeature provenance survival — every distinct `<!-- SF: {slug} -->`
+       marker present in the sources must still appear in the output.  If the
+       sources carry zero such markers (e.g. a tiny artifact, or a KIND whose
+       compiler does not emit them), this sub-check is skipped.
+    2. Component/section body count-floor — if the sources contain
+       `n_src > 0` CMP-bearing body headers, the output must contain at least
+       `n_src` of them.  Skipped when `n_src == 0`.
+
+    Raises RuntimeError naming the missing subfeatures and the n_out/n_src
+    counts.
+    """
+    src_markers = _distinct_sf_markers(sources_text)
+    out_markers = _distinct_sf_markers(compiled_text)
+    missing = sorted(src_markers - out_markers)
+
+    n_src = _count_cmp_body_headers(sources_text)
+    n_out = _count_cmp_body_headers(compiled_text)
+
+    problems: list[str] = []
+    if src_markers and missing:
+        problems.append(
+            f"dropped {len(missing)}/{len(src_markers)} subfeature provenance "
+            f"markers: {', '.join(missing)}"
+        )
+    if n_src > 0 and n_out < n_src:
+        problems.append(
+            f"component-body count fell from {n_src} (sources) to {n_out} "
+            f"(output)"
+        )
+
+    if problems:
+        raise RuntimeError(
+            f"Compile completeness guard FAILED for {artifact_prefix} "
+            f"(stage={stage_label}): " + "; ".join(problems) + ". "
+            "The merged artifact appears truncated — refusing to seal a "
+            "corrupted document. (subfeature markers "
+            f"src={sorted(src_markers)} out={sorted(out_markers)}; "
+            f"CMP body headers src={n_src} out={n_out})"
+        )
+
+
 async def compile_artifacts(
     runner: WorkflowRunner,
     feature: Feature,
@@ -2106,11 +2194,19 @@ async def compile_artifacts(
     broad_key: str,
     final_key: str,
     compiled_transform: Callable[[str], Awaitable[str]] | None = None,
+    deterministic_final_merge: bool = False,
 ) -> str:
     """Compile per-subfeature artifacts into a single final artifact.
 
     The compiler writes the unified document to a file (bypassing structured
     output token limits), and we read it back for artifact storage.
+
+    When ``deterministic_final_merge`` is True (default False — existing path
+    untouched), the TOP-LEVEL final merge of the already-merged,
+    non-overlapping regroup intermediates is performed by a deterministic
+    per-bundle driver loop instead of a single LLM call that has to emit the
+    whole union in one response.  See the call site below for the rationale
+    and the per-bundle vs pure-deterministic trade-off.
     """
     from pathlib import Path
 
@@ -2340,11 +2436,156 @@ async def compile_artifacts(
             final_source_text,
             encoding="utf-8",
         )
-        compiled_text = await _run_compile_prompt(
+        if deterministic_final_merge and final_sources:
+            # ── Part 2: deterministic top-level union (flag-gated) ───────
+            #
+            # The top-level final merge unions the regroup-1 intermediates,
+            # which are ALREADY-MERGED, NON-OVERLAPPING bundles.  A single
+            # LLM call has to emit that entire union in ONE response; when the
+            # union exceeds the model's output budget the agent silently
+            # truncates (emits one bundle in full + a stub for the others) and
+            # we seal a corrupted artifact.  This block kills that truncation
+            # class.
+            #
+            # VARIANT IMPLEMENTED: per-bundle DRIVER LOOP (the prompt's
+            # sanctioned feasibility fallback), NOT pure-code renumbering.
+            # Rationale: the cross-bundle reference set (e.g. a later bundle
+            # citing an earlier bundle's shared `ExternalShell`) is encoded in
+            # the lower-level merges' free-form, LLM-authored crosswalk tables
+            # using INCONSISTENT notations (`S2 CMP-17`, `S4 CMP-8`,
+            # `S2 CMP-7/9/17`).  Parsing those reliably enough to drive a
+            # correct global offset in pure code is too error-prone to ship —
+            # a subtly-wrong renumber would corrupt cross-references silently.
+            # Instead we invoke the LLM merge once PER BUNDLE, each call
+            # bounded well within the output budget ("emit ONLY this bundle's
+            # bodies, renumbered to the given global offset; leave
+            # cross-bundle `Sx CMP-n` refs untouched"), then DETERMINISTICALLY
+            # concatenate the per-bundle outputs under a single frame.  The
+            # global CMP offset for each bundle is computed in pure code (max
+            # local CMP id of all prior bundles), so ID continuity is
+            # deterministic even though the body text is produced per-bundle.
+            # The Part-1 guard backstops every per-bundle output.
+            # The global offset for bundle k is the running sum of the prior
+            # bundles' OWNED component counts.  Each regroup intermediate uses a
+            # contiguous local `CMP-1..CMP-M` sequence for the components it
+            # OWNS, so `M` = max local owned CMP id.  We must NOT count
+            # cross-bundle references (written `Sx CMP-n`, owned by another
+            # bundle) — those would inflate the offset and silently corrupt ID
+            # continuity.  We exclude any `CMP-n` that is immediately preceded
+            # by an owning prefix like `S2 ` / `S4 ` (e.g. `S2 CMP-17`).
+            _cross_prefix_re = re.compile(r"\b[A-Za-z]+\d+ CMP-(\d+)")
+
+            def _max_local_cmp(text: str) -> int:
+                text = text or ""
+                cross = {m.start(1) for m in _cross_prefix_re.finditer(text)}
+                vals = [
+                    int(m.group(1))
+                    for m in re.finditer(r"\bCMP-(\d+)", text)
+                    if m.start(1) not in cross
+                ]
+                return max(vals) if vals else 0
+
+            bundle_outputs: list[str] = []
+            running_offset = 0
+            for b_idx, (b_obj, b_text) in enumerate(final_sources, start=1):
+                bundle_src_path = (
+                    feature_dir
+                    / f"compile-sources-{artifact_prefix}-finalbundle-{b_idx}.md"
+                )
+                bundle_out_path = (
+                    feature_dir
+                    / f"compile-intermediate-{artifact_prefix}-finalbundle-{b_idx}.md"
+                )
+                bundle_src_path.write_text(b_text, encoding="utf-8")
+                # Bounded, single-bundle merge: the agent only has to re-emit
+                # ONE already-merged bundle, well within the output budget.
+                await runner.run(
+                    Ask(
+                        actor=compiler_actor,
+                        prompt=(
+                            f"You are assembling part {b_idx} of {len(final_sources)} "
+                            f"of the final unified {artifact_prefix} document.\n\n"
+                            f"This bundle (`{bundle_src_path}`) is an ALREADY-MERGED, "
+                            "non-overlapping intermediate. Re-emit it VERBATIM and IN "
+                            "FULL — preserve every section, component, journey, "
+                            "decision, gap, state, and citation. Do NOT summarize, "
+                            "drop, or stub anything.\n\n"
+                            "ID renumbering (deterministic global sequence):\n"
+                            f"- Add a GLOBAL OFFSET of +{running_offset} to every "
+                            "LOCAL `CMP-n` id that THIS bundle OWNS "
+                            f"(so this bundle's CMP-1 becomes CMP-{running_offset + 1}, "
+                            "etc.). Handle singles, `/`-groups (`CMP-7/8`), and "
+                            "`..`-ranges (`CMP-1..13`).\n"
+                            "- Do NOT offset CROSS-BUNDLE references to components "
+                            "OWNED BY ANOTHER bundle — those are written with an owning "
+                            "subfeature prefix (e.g. `S2 CMP-17`, `S4 CMP-8`) in this "
+                            "bundle's crosswalk. Leave every such cross-bundle "
+                            "reference EXACTLY as written.\n"
+                            "- Preserve all `<!-- SF: {slug} -->` provenance markers.\n\n"
+                            f"**Read the bundle from:** `{bundle_src_path}`\n"
+                            f"**Write the renumbered bundle (bodies only, no global "
+                            f"document frame/preamble) to:** `{bundle_out_path}`\n"
+                        ),
+                    ),
+                    feature,
+                    phase_name=phase_name,
+                )
+                if not bundle_out_path.exists():
+                    raise RuntimeError(
+                        f"Per-bundle final merge did not write output to "
+                        f"{bundle_out_path}"
+                    )
+                bundle_compiled = bundle_out_path.read_text(encoding="utf-8").strip()
+                if not bundle_compiled:
+                    raise RuntimeError(
+                        f"Per-bundle final merge wrote empty file at "
+                        f"{bundle_out_path}"
+                    )
+                # Per-bundle backstop: this single bundle must keep all of its
+                # OWN subfeature markers and component bodies.
+                _assert_compile_complete(
+                    sources_text=b_text,
+                    compiled_text=bundle_compiled,
+                    artifact_prefix=f"{artifact_prefix}-finalbundle-{b_idx}",
+                    stage_label=f"final-bundle-{b_idx}",
+                )
+                bundle_outputs.append(bundle_compiled)
+                running_offset += _max_local_cmp(b_text)
+
+            # Deterministic frame + concatenation of the per-bundle bodies.
+            frame_header = (
+                f"# Compiled {artifact_prefix.upper()} "
+                f"— {getattr(feature, 'name', feature.id)} (`{feature.id}`)\n\n"
+                "> **Compiled unified document** (deterministic top-level union "
+                f"of {len(final_sources)} already-merged bundles). Each bundle's "
+                "OWNED component IDs are renumbered into a single global "
+                "`CMP-*` sequence; cross-bundle references are preserved as "
+                "written by the upstream merges.\n"
+            )
+            parts_out = [frame_header]
+            for p_idx, bundle_compiled in enumerate(bundle_outputs, start=1):
+                parts_out.append(
+                    f"\n\n<!-- ===== Part {p_idx} of {len(bundle_outputs)} "
+                    "===== -->\n\n" + bundle_compiled
+                )
+            compiled_text = "\n".join(parts_out).strip()
+            file_path.write_text(compiled_text, encoding="utf-8")
+        else:
+            compiled_text = await _run_compile_prompt(
+                stage_label="final",
+                sources_path=final_sources_path,
+                output_path=file_path,
+                source_count=len(final_sources),
+            )
+        # ── Part 1: deterministic post-compile completeness guard ───────
+        # ALWAYS ON (safety invariant). Runs on the full final union, before
+        # the artifact is cached / returned / used, so a truncated document
+        # can never reach gate review or the store.
+        _assert_compile_complete(
+            sources_text=final_source_text,
+            compiled_text=compiled_text,
+            artifact_prefix=artifact_prefix,
             stage_label="final",
-            sources_path=final_sources_path,
-            output_path=file_path,
-            source_count=len(final_sources),
         )
     else:
         sources_path = feature_dir / f"compile-sources-{artifact_prefix}.md"
@@ -2355,6 +2596,13 @@ async def compile_artifacts(
             sources_path=sources_path,
             output_path=file_path,
             source_count=len(sf_sources),
+        )
+        # ── Part 1: completeness guard on the single-pass path too ──────
+        _assert_compile_complete(
+            sources_text=source_text,
+            compiled_text=compiled_text,
+            artifact_prefix=artifact_prefix,
+            stage_label="single-pass",
         )
 
     if not compiled_text:
@@ -2413,6 +2661,7 @@ async def interview_gate_review(
     revision_plan_handler: Callable[[Any, str, Any, int], Awaitable[tuple[Any, str]]] | None = None,
     warn_after_cycles: int = 3,
     compiled_artifact_text: str = "",
+    deterministic_final_merge: bool = False,
 ) -> str:
     """Interview-based gate review. Replaces gate_and_revise for compiled artifacts.
 
@@ -2576,6 +2825,7 @@ async def interview_gate_review(
                     broad_key=broad_key,
                     final_key=compiled_key,
                     compiled_transform=compiled_transform,
+                    deterministic_final_merge=deterministic_final_merge,
                 )
                 if post_compile:
                     await post_compile()
@@ -2879,6 +3129,7 @@ async def interview_gate_review(
             broad_key=broad_key,
             final_key=compiled_key,
             compiled_transform=compiled_transform,
+            deterministic_final_merge=deterministic_final_merge,
         )
 
         # ── Update ledger after revisions and recompile ──

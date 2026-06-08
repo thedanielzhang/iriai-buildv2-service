@@ -1329,6 +1329,10 @@ class PlanReviewPhase(Phase):
                                 artifact_prefix=prefix,
                                 broad_key=bk,
                                 final_key=fk,
+                                # Deterministic top-level union (Part 2) — kills
+                                # the silent-truncation class on the plan-review
+                                # recompile path.
+                                deterministic_final_merge=True,
                             )
                             for prefix, ca, bk, fk in compile_targets
                         ],
@@ -1648,6 +1652,8 @@ class PlanReviewPhase(Phase):
                 artifact_prefix=prefix,
                 broad_key=broad_key,
                 final_key=prefix,
+                # Deterministic top-level union (Part 2) — recompile-before-gate.
+                deterministic_final_merge=True,
             )
             if compiled:
                 hosting = runner.services.get("hosting")
@@ -1672,6 +1678,7 @@ class PlanReviewPhase(Phase):
                 output_type=PRD,
                 compiler_actor=pm_compiler,
                 broad_key="prd:broad",
+                deterministic_final_merge=True,
             )
             state.prd = prd_text
             await runner.artifacts.put("plan-review-gate:prd", "approved", feature=feature)
@@ -1692,6 +1699,7 @@ class PlanReviewPhase(Phase):
                 compiler_actor=design_compiler,
                 broad_key="design:broad",
                 context_keys=["project", "scope", "prd"],
+                deterministic_final_merge=True,
             )
             state.design = design_text
             await runner.artifacts.put("plan-review-gate:design", "approved", feature=feature)
@@ -1712,6 +1720,7 @@ class PlanReviewPhase(Phase):
                 compiler_actor=plan_arch_compiler,
                 broad_key="plan:broad",
                 context_keys=["project", "scope", "prd", "design"],
+                deterministic_final_merge=True,
             )
             state.plan = plan_text
             await runner.artifacts.put("plan-review-gate:plan", "approved", feature=feature)
@@ -1736,6 +1745,7 @@ class PlanReviewPhase(Phase):
                     compiler_actor=sysdesign_compiler,
                     broad_key="plan:broad",
                     context_keys=["project", "scope", "prd", "design"],
+                    deterministic_final_merge=True,
                 )
                 state.system_design = sd_text
                 await runner.artifacts.put(

@@ -11875,7 +11875,18 @@ async def test_compile_artifacts_uses_hierarchical_compile_when_large(monkeypatc
     )
 
     broad_text = "broad\n" * 30
-    long_text = "section\n" * 20
+    # Each per-SF source carries its own provenance marker + a CMP body header,
+    # so the always-on completeness guard has real markers to track through the
+    # map-reduce stages (and the final union must preserve all three).
+    sf_source = {
+        slug: (
+            f"<!-- SF: {slug} -->\n"
+            f"## Subfeature body ({slug})\n\n"
+            f"#### Widget (CMP-1)\n\n"
+            + ("section\n" * 20)
+        )
+        for slug in ("accounts", "billing", "reports")
+    }
 
     class _Artifacts:
         async def get(self, key: str, *, feature):
@@ -11883,9 +11894,9 @@ async def test_compile_artifacts_uses_hierarchical_compile_when_large(monkeypatc
             values = {
                 "plan:broad": broad_text,
                 "decomposition": decomposition.model_dump_json(indent=2),
-                "plan:accounts": long_text,
-                "plan:billing": long_text,
-                "plan:reports": long_text,
+                "plan:accounts": sf_source["accounts"],
+                "plan:billing": sf_source["billing"],
+                "plan:reports": sf_source["reports"],
             }
             return values.get(key, "")
 
@@ -11898,8 +11909,19 @@ async def test_compile_artifacts_uses_hierarchical_compile_when_large(monkeypatc
         paths = re.findall(r"`([^`]+)`", task.prompt)
         assert paths
         stage = re.search(r"Stage: ([^\n]+)", task.prompt).group(1)
-        stage_sources[stage] = Path(paths[0]).read_text(encoding="utf-8")
-        Path(paths[-1]).write_text("compiled line\n" * 6, encoding="utf-8")
+        source_text = Path(paths[0]).read_text(encoding="utf-8")
+        stage_sources[stage] = source_text
+        # Faithful fake compiler: echo every SF provenance marker and CMP body
+        # header present in the source, so the always-on guard sees a complete
+        # union at every stage.
+        markers = re.findall(r"<!--\s*SF:\s*([A-Za-z0-9][A-Za-z0-9_-]*)", source_text)
+        n_cmp = len(re.findall(r"(?m)^#{2,4}\s+.*\bCMP-\d+", source_text))
+        body = "compiled line\n" * 6
+        for slug in dict.fromkeys(markers):  # preserve order, dedup
+            body += f"<!-- SF: {slug} -->\n"
+        for i in range(max(n_cmp, 1)):
+            body += f"#### CompiledWidget (CMP-{i + 1})\n"
+        Path(paths[-1]).write_text(body, encoding="utf-8")
         return None
 
     runner = SimpleNamespace(
@@ -11928,7 +11950,11 @@ async def test_compile_artifacts_uses_hierarchical_compile_when_large(monkeypatc
         final_key="plan",
     )
 
-    assert compiled == ("compiled line\n" * 6).strip()
+    assert compiled.startswith(("compiled line\n" * 6).strip())
+    # The always-on completeness guard passed: all three subfeature markers
+    # survived into the final union.
+    for slug in ("accounts", "billing", "reports"):
+        assert f"<!-- SF: {slug} -->" in compiled
     assert len(calls) > 1
     assert any("Stage: regroup-1-1" in prompt for prompt in calls)
     assert "## Broad Artifact (plan:broad)" not in stage_sources["cluster-1"]
@@ -11937,6 +11963,332 @@ async def test_compile_artifacts_uses_hierarchical_compile_when_large(monkeypatc
     assert "## Decomposition" not in stage_sources["regroup-1-1"]
     assert "## Broad Artifact (plan:broad)" in stage_sources["final"]
     assert "## Decomposition" in stage_sources["final"]
+
+
+def _build_hier_compile_runner(
+    tmp_path,
+    *,
+    final_writer,
+    slugs=("accounts", "billing", "reports"),
+    cmp_per_sf=1,
+):
+    """Shared harness: 3-SF decomposition + a fake runner whose intermediate
+    stages echo every SF marker / CMP body header, and whose FINAL stage is
+    produced by ``final_writer(source_text) -> str``.
+
+    Returns (feature, decomposition, runner).
+    """
+    feature = SimpleNamespace(id="feat-compile-guard", metadata={})
+    mirror = _TestMirror(tmp_path / "features")
+    decomposition = SubfeatureDecomposition(
+        subfeatures=[
+            Subfeature(id=f"SF-{i + 1}", slug=slug, name=slug.title(), description=slug)
+            for i, slug in enumerate(slugs)
+        ],
+        edges=[],
+        complete=True,
+    )
+    broad_text = "broad\n" * 30
+
+    def _sf_body(slug):
+        body = f"<!-- SF: {slug} -->\n## Subfeature body ({slug})\n\n"
+        for i in range(cmp_per_sf):
+            body += f"#### Widget-{slug}-{i} (CMP-{i + 1})\n\n" + ("section\n" * 20)
+        return body
+
+    sf_source = {slug: _sf_body(slug) for slug in slugs}
+
+    class _Artifacts:
+        async def get(self, key: str, *, feature):
+            del feature
+            values = {
+                "plan:broad": broad_text,
+                "decomposition": decomposition.model_dump_json(indent=2),
+            }
+            for slug in slugs:
+                values[f"plan:{slug}"] = sf_source[slug]
+            return values.get(key, "")
+
+    async def _fake_run(task, feature, phase_name):
+        del feature, phase_name
+        paths = re.findall(r"`([^`]+)`", task.prompt)
+        assert paths
+        source_path = Path(paths[0])
+        out_path = Path(paths[-1])
+        source_text = source_path.read_text(encoding="utf-8")
+        stage_match = re.search(r"Stage: ([^\n]+)", task.prompt)
+        stage = stage_match.group(1) if stage_match else "per-bundle"
+        if stage == "final":
+            out_path.write_text(final_writer(source_text), encoding="utf-8")
+            return None
+        # Intermediate / per-bundle stages: faithful echo of all markers + CMP
+        # body headers found in the source.
+        markers = re.findall(
+            r"<!--\s*SF:\s*([A-Za-z0-9][A-Za-z0-9_-]*)", source_text
+        )
+        n_cmp = len(re.findall(r"(?m)^#{2,4}\s+.*\bCMP-\d+", source_text))
+        body = "compiled line\n" * 6
+        for slug in dict.fromkeys(markers):
+            body += f"<!-- SF: {slug} -->\n"
+        for i in range(max(n_cmp, 1)):
+            body += f"#### CompiledWidget (CMP-{i + 1})\n"
+        out_path.write_text(body, encoding="utf-8")
+        return None
+
+    runner = SimpleNamespace(
+        artifacts=_Artifacts(),
+        services={"artifact_mirror": mirror},
+        run=_fake_run,
+    )
+    return feature, decomposition, runner
+
+
+@pytest.mark.asyncio
+async def test_compile_artifacts_guard_raises_when_bundle_dropped(monkeypatch, tmp_path):
+    """Negative guard test: a final-merge output that drops a subfeature
+    marker (and most component bodies) must HARD-RAISE naming the dropped SF."""
+
+    def _truncating_final(source_text):
+        # Simulate the truncation defect: emit ONLY the first subfeature's
+        # marker + a single CMP body, dropping the rest.
+        first = re.search(
+            r"<!--\s*SF:\s*([A-Za-z0-9][A-Za-z0-9_-]*)", source_text
+        ).group(1)
+        return f"<!-- SF: {first} -->\n#### OnlyWidget (CMP-1)\nbody\n"
+
+    feature, decomposition, runner = _build_hier_compile_runner(
+        tmp_path, final_writer=_truncating_final
+    )
+    monkeypatch.setattr(
+        "iriai_build_v2.workflows._common._helpers.COMPILE_HIERARCHICAL_THRESHOLD", 500
+    )
+    monkeypatch.setattr(
+        "iriai_build_v2.workflows._common._helpers.COMPILE_CLUSTER_TARGET_BYTES", 300
+    )
+
+    with pytest.raises(RuntimeError) as excinfo:
+        await compile_artifacts(
+            runner,
+            feature,
+            "plan-review",
+            compiler_actor=lead_architect_reviewer,
+            decomposition=decomposition,
+            artifact_prefix="plan",
+            broad_key="plan:broad",
+            final_key="plan",
+        )
+    msg = str(excinfo.value)
+    assert "completeness guard FAILED" in msg
+    # Names the dropped subfeatures (billing + reports survive in sources but
+    # not in the truncated output).
+    assert "billing" in msg
+    assert "reports" in msg
+
+
+@pytest.mark.asyncio
+async def test_compile_artifacts_guard_passes_on_complete_renumbered_union(
+    monkeypatch, tmp_path
+):
+    """Positive guard test: a complete union with GLOBALLY-RENUMBERED IDs
+    (input CMP-1.. → output CMP-80..126) passes — the guard never compares
+    literal IDs, only marker survival + body count-floor."""
+
+    def _complete_renumbered_final(source_text):
+        markers = list(
+            dict.fromkeys(
+                re.findall(
+                    r"<!--\s*SF:\s*([A-Za-z0-9][A-Za-z0-9_-]*)", source_text
+                )
+            )
+        )
+        n_cmp = len(re.findall(r"(?m)^#{2,4}\s+.*\bCMP-\d+", source_text))
+        body = "# Compiled\n\n"
+        for slug in markers:
+            body += f"<!-- SF: {slug} -->\n"
+        # Renumber into a high, disjoint global range (CMP-80..) to prove the
+        # guard is renumber-safe; emit at least as many bodies as the sources.
+        for i in range(n_cmp):
+            body += f"#### CompiledWidget (CMP-{80 + i})\n"
+        return body
+
+    feature, decomposition, runner = _build_hier_compile_runner(
+        tmp_path, final_writer=_complete_renumbered_final, cmp_per_sf=3
+    )
+    monkeypatch.setattr(
+        "iriai_build_v2.workflows._common._helpers.COMPILE_HIERARCHICAL_THRESHOLD", 500
+    )
+    monkeypatch.setattr(
+        "iriai_build_v2.workflows._common._helpers.COMPILE_CLUSTER_TARGET_BYTES", 300
+    )
+
+    compiled = await compile_artifacts(
+        runner,
+        feature,
+        "plan-review",
+        compiler_actor=lead_architect_reviewer,
+        decomposition=decomposition,
+        artifact_prefix="plan",
+        broad_key="plan:broad",
+        final_key="plan",
+    )
+    for slug in ("accounts", "billing", "reports"):
+        assert f"<!-- SF: {slug} -->" in compiled
+    # Renumbered output ids present, original low ids absent.
+    assert "CMP-80" in compiled
+    assert "(CMP-1)" not in compiled
+
+
+@pytest.mark.asyncio
+async def test_compile_artifacts_deterministic_final_merge(monkeypatch, tmp_path):
+    """Deterministic-merge test: with deterministic_final_merge=True the final
+    stage is assembled per-bundle WITHOUT an LLM 'final' call; the output
+    contains every bundle's bodies (all expected global CMP ids) and does NOT
+    mis-offset a cross-bundle reference."""
+
+    final_stage_calls: list[str] = []
+    per_bundle_calls: list[str] = []
+
+    feature = SimpleNamespace(id="feat-det-merge", metadata={})
+    mirror = _TestMirror(tmp_path / "features")
+    slugs = ("accounts", "billing", "reports")
+    decomposition = SubfeatureDecomposition(
+        subfeatures=[
+            Subfeature(id=f"SF-{i + 1}", slug=slug, name=slug.title(), description=slug)
+            for i, slug in enumerate(slugs)
+        ],
+        edges=[],
+        complete=True,
+    )
+    broad_text = "broad\n" * 30
+
+    def _sf_body(slug, *, cross_ref=False):
+        body = f"<!-- SF: {slug} -->\n## Subfeature body ({slug})\n\n"
+        # Two owned components per SF, local CMP-1 / CMP-2. Bodies are sized so
+        # the hierarchical compile retains >=2 bundles at the final stage,
+        # exercising a genuine multi-bundle deterministic union.
+        body += f"#### Owned-{slug}-A (CMP-1)\n\n" + ("section text line\n" * 120)
+        body += f"#### Owned-{slug}-B (CMP-2)\n\n" + ("section text line\n" * 120)
+        if cross_ref:
+            # A cross-bundle reference written with an owning-SF prefix; the
+            # per-bundle driver must NOT offset this.
+            body += "This composes S2 CMP-17 (owned elsewhere).\n"
+        return body
+
+    sf_source = {
+        "accounts": _sf_body("accounts"),
+        "billing": _sf_body("billing", cross_ref=True),
+        "reports": _sf_body("reports"),
+    }
+
+    class _Artifacts:
+        async def get(self, key: str, *, feature):
+            del feature
+            values = {
+                "plan:broad": broad_text,
+                "decomposition": decomposition.model_dump_json(indent=2),
+            }
+            for slug in slugs:
+                values[f"plan:{slug}"] = sf_source[slug]
+            return values.get(key, "")
+
+    async def _fake_run(task, feature, phase_name):
+        del feature, phase_name
+        paths = re.findall(r"`([^`]+)`", task.prompt)
+        assert paths
+        source_text = Path(paths[0]).read_text(encoding="utf-8")
+        out_path = Path(paths[-1])
+        stage_match = re.search(r"Stage: ([^\n]+)", task.prompt)
+        if stage_match and stage_match.group(1) == "final":
+            # MUST NOT be reached when deterministic_final_merge=True.
+            final_stage_calls.append(task.prompt)
+            out_path.write_text("SHOULD NOT HAPPEN\n", encoding="utf-8")
+            return None
+        # Per-bundle or intermediate stage. Emit markers + CMP bodies. When the
+        # prompt carries a global offset (per-bundle driver), apply it to OWNED
+        # CMP ids but leave 'Sx CMP-n' cross-refs untouched.
+        offset_match = re.search(r"GLOBAL OFFSET of \+(\d+)", task.prompt)
+        markers = list(
+            dict.fromkeys(
+                re.findall(
+                    r"<!--\s*SF:\s*([A-Za-z0-9][A-Za-z0-9_-]*)", source_text
+                )
+            )
+        )
+        body = "compiled line\n" * 6
+        for slug in markers:
+            body += f"<!-- SF: {slug} -->\n"
+        if offset_match is not None:
+            per_bundle_calls.append(task.prompt)
+            offset = int(offset_match.group(1))
+            # Owned components: re-emit each source's local owned CMP ids,
+            # offset to global. Find owned (non 'Sx CMP-') CMP headers.
+            owned = re.findall(r"(?m)^#{2,4}\s+.*\bCMP-(\d+)", source_text)
+            for local in owned:
+                body += f"#### Global (CMP-{int(local) + offset})\n"
+            # Preserve any cross-bundle 'Sx CMP-n' refs verbatim.
+            for cross in re.findall(r"\bS\d+ CMP-\d+", source_text):
+                body += f"ref {cross}\n"
+        else:
+            # Intermediate (cluster/regroup) merge: echo CMP body headers AND
+            # carry forward any 'Sx CMP-n' cross-bundle references verbatim
+            # (a faithful intermediate merge preserves them), plus pad the body
+            # so the final stage retains >=2 bundles.
+            n_cmp = len(re.findall(r"(?m)^#{2,4}\s+.*\bCMP-\d+", source_text))
+            for i in range(max(n_cmp, 1)):
+                body += f"#### CompiledWidget (CMP-{i + 1})\n\n" + (
+                    "intermediate body line\n" * 120
+                )
+            for cross in re.findall(r"\bS\d+ CMP-\d+", source_text):
+                body += f"composes {cross}\n"
+        out_path.write_text(body, encoding="utf-8")
+        return None
+
+    runner = SimpleNamespace(
+        artifacts=_Artifacts(),
+        services={"artifact_mirror": mirror},
+        run=_fake_run,
+    )
+    monkeypatch.setattr(
+        "iriai_build_v2.workflows._common._helpers.COMPILE_HIERARCHICAL_THRESHOLD", 500
+    )
+    monkeypatch.setattr(
+        "iriai_build_v2.workflows._common._helpers.COMPILE_CLUSTER_TARGET_BYTES", 300
+    )
+
+    compiled = await compile_artifacts(
+        runner,
+        feature,
+        "plan-review",
+        compiler_actor=lead_architect_reviewer,
+        decomposition=decomposition,
+        artifact_prefix="plan",
+        broad_key="plan:broad",
+        final_key="plan",
+        deterministic_final_merge=True,
+    )
+
+    # The LLM 'final' single-shot merge was NEVER invoked.
+    assert final_stage_calls == []
+    # The per-bundle driver ran — a genuine multi-bundle union (>=2 bundles),
+    # one bounded LLM call per bundle.
+    assert len(per_bundle_calls) >= 2
+    assert "<!-- ===== Part 2 of " in compiled
+    # Every subfeature survived.
+    for slug in slugs:
+        assert f"<!-- SF: {slug} -->" in compiled
+    # The cross-bundle reference was preserved verbatim (NOT offset).
+    assert "S2 CMP-17" in compiled
+    # Global renumbering applied: a later bundle's owned ids were offset past
+    # the first bundle's local range (the second bundle's CMP-1/2 became
+    # CMP-(1+offset)/CMP-(2+offset) with offset>0), so a global id beyond the
+    # first bundle's max-local id appears.
+    global_ids = sorted(
+        int(m) for m in re.findall(r"^#### Global \(CMP-(\d+)\)", compiled, re.M)
+    )
+    assert global_ids, "expected globally-renumbered owned component ids"
+    assert max(global_ids) > 2, "second bundle's ids should be offset past CMP-2"
+    # Guard passed (no raise) — output reaches here.
+    assert compiled
 
 
 @pytest.mark.asyncio
