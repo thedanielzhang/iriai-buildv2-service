@@ -1333,6 +1333,11 @@ class PlanReviewPhase(Phase):
                                 # the silent-truncation class on the plan-review
                                 # recompile path.
                                 deterministic_final_merge=True,
+                                # Resumable per-piece reuse: a re-entered
+                                # recompile (gate cycle or restart) reuses
+                                # unchanged clusters/bundles instead of redoing
+                                # the whole compile.
+                                incremental_compile=True,
                             )
                             for prefix, ca, bk, fk in compile_targets
                         ],
@@ -1654,6 +1659,10 @@ class PlanReviewPhase(Phase):
                 final_key=prefix,
                 # Deterministic top-level union (Part 2) — recompile-before-gate.
                 deterministic_final_merge=True,
+                # Resumable per-piece reuse: a re-entered recompile (gate cycle
+                # or restart) reuses unchanged clusters/bundles instead of
+                # re-doing the whole compile.
+                incremental_compile=True,
             )
             if compiled:
                 hosting = runner.services.get("hosting")

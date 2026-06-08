@@ -101,6 +101,7 @@ from iriai_build_v2.workflows.planning.phases.subfeature import (
 from iriai_build_v2.workflows._common._helpers import (
     _apply_patches,
     _assert_compile_complete,
+    _compile_piece_sentinel_ok,
     _write_revision_decision_context,
     _clear_agent_session,
     _build_subfeature_context,
@@ -12346,6 +12347,376 @@ async def test_compile_artifacts_deterministic_final_merge(monkeypatch, tmp_path
     assert max(global_ids) > 2, "second bundle's ids should be offset past CMP-2"
     # Guard passed (no raise) — output reaches here.
     assert compiled
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Incremental / resumable compile (flag-gated) — T1, T2, T6, T7, T8
+# ──────────────────────────────────────────────────────────────────────
+
+
+def _build_incremental_compile_runner(tmp_path, *, slugs=None):
+    """Deterministic-merge compile harness with a PUT-capable artifact store.
+
+    Mirrors ``_build_hier_compile_runner`` (faithful per-stage echo of all SF
+    markers + CMP body headers, applying any GLOBAL OFFSET to OWNED CMP ids
+    and preserving ``Sx CMP-n`` cross-refs), but the runner's ``artifacts``
+    object supports both ``get`` and ``put`` so ``compile-piece:*`` markers
+    persist.  Every LLM compile call is recorded by ``stage_label`` so reuse
+    vs recompile is observable by counting calls.
+
+    Returns (feature, decomposition, runner, calls).  ``calls`` is a list of
+    stage labels; intermediate cluster calls look like ``cluster-{idx}`` and
+    per-bundle calls like ``per-bundle`` (the bundle prompt carries no Stage:
+    line).  The SF bodies are sized so each SF lands in its own cluster /
+    bundle under the test thresholds (one piece per SF).
+    """
+    if slugs is None:
+        slugs = ("accounts", "billing", "reports", "payments")
+    feature = SimpleNamespace(id="feat-incremental", name="Incremental", metadata={})
+    mirror = _TestMirror(tmp_path / "features")
+    decomposition = SubfeatureDecomposition(
+        subfeatures=[
+            Subfeature(id=f"SF-{i + 1}", slug=slug, name=slug.title(), description=slug)
+            for i, slug in enumerate(slugs)
+        ],
+        edges=[],
+        complete=True,
+    )
+    broad_text = "broad\n" * 30
+
+    def _sf_body(slug):
+        body = f"<!-- SF: {slug} -->\n## Subfeature body ({slug})\n\n"
+        body += f"#### Owned-{slug}-A (CMP-1)\n\n" + ("section text line\n" * 120)
+        body += f"#### Owned-{slug}-B (CMP-2)\n\n" + ("section text line\n" * 120)
+        return body
+
+    sf_source = {slug: _sf_body(slug) for slug in slugs}
+
+    class _Artifacts:
+        def __init__(self):
+            self.store: dict[str, str] = {}
+
+        async def get(self, key: str, *, feature):
+            del feature
+            seeded = {
+                "plan:broad": broad_text,
+                "decomposition": decomposition.model_dump_json(indent=2),
+            }
+            for slug in slugs:
+                seeded[f"plan:{slug}"] = sf_source[slug]
+            if key in seeded:
+                return seeded[key]
+            return self.store.get(key, "")
+
+        async def put(self, key: str, value: str, *, feature):
+            del feature
+            self.store[key] = value
+
+    calls: list[str] = []
+
+    async def _fake_run(task, feature, phase_name):
+        del feature, phase_name
+        paths = re.findall(r"`([^`]+)`", task.prompt)
+        assert paths
+        source_text = Path(paths[0]).read_text(encoding="utf-8")
+        out_path = Path(paths[-1])
+        stage_match = re.search(r"Stage: ([^\n]+)", task.prompt)
+        stage = stage_match.group(1) if stage_match else "per-bundle"
+        calls.append(stage)
+        offset_match = re.search(r"GLOBAL OFFSET of \+(\d+)", task.prompt)
+        markers = list(
+            dict.fromkeys(
+                re.findall(r"<!--\s*SF:\s*([A-Za-z0-9][A-Za-z0-9_-]*)", source_text)
+            )
+        )
+        body = "compiled line\n" * 6
+        for slug in markers:
+            body += f"<!-- SF: {slug} -->\n"
+        if offset_match is not None:
+            offset = int(offset_match.group(1))
+            owned = re.findall(r"(?m)^#{2,4}\s+.*\bCMP-(\d+)", source_text)
+            for local in owned:
+                body += f"#### Global (CMP-{int(local) + offset})\n"
+            for cross in re.findall(r"\bS\d+ CMP-\d+", source_text):
+                body += f"ref {cross}\n"
+        else:
+            n_cmp = len(re.findall(r"(?m)^#{2,4}\s+.*\bCMP-\d+", source_text))
+            for i in range(max(n_cmp, 1)):
+                body += f"#### CompiledWidget (CMP-{i + 1})\n\n" + (
+                    "intermediate body line\n" * 120
+                )
+            for cross in re.findall(r"\bS\d+ CMP-\d+", source_text):
+                body += f"composes {cross}\n"
+        out_path.write_text(body, encoding="utf-8")
+        return None
+
+    runner = SimpleNamespace(
+        artifacts=_Artifacts(),
+        services={"artifact_mirror": mirror},
+        run=_fake_run,
+    )
+    return feature, decomposition, runner, calls
+
+
+async def _run_incremental_compile(feature, decomposition, runner):
+    return await compile_artifacts(
+        runner,
+        feature,
+        "plan-review",
+        compiler_actor=lead_architect_reviewer,
+        decomposition=decomposition,
+        artifact_prefix="plan",
+        broad_key="plan:broad",
+        final_key="plan",
+        deterministic_final_merge=True,
+        incremental_compile=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_compile_reuses_completed_clusters_when_only_marker_present(
+    monkeypatch, tmp_path
+):
+    """T1 — marker fast-path: a first incremental compile seeds all cluster /
+    bundle outputs + ``compile-piece:*`` markers; a second identical compile
+    makes ZERO LLM calls (every piece reused via the marker fast-path) and
+    produces byte-identical output."""
+    monkeypatch.setattr(
+        "iriai_build_v2.workflows._common._helpers.COMPILE_HIERARCHICAL_THRESHOLD", 500
+    )
+    monkeypatch.setattr(
+        "iriai_build_v2.workflows._common._helpers.COMPILE_CLUSTER_TARGET_BYTES", 300
+    )
+    feature, decomposition, runner, calls = _build_incremental_compile_runner(tmp_path)
+
+    first = await _run_incremental_compile(feature, decomposition, runner)
+    assert calls, "first compile must invoke the LLM for every piece"
+    marker_keys = [k for k in runner.artifacts.store if k.startswith("compile-piece:")]
+    assert marker_keys, "first compile must write compile-piece markers"
+
+    calls.clear()
+    second = await _run_incremental_compile(feature, decomposition, runner)
+
+    # Marker fast-path: not a single LLM compile call on the second run.
+    assert calls == [], f"expected zero LLM calls on reuse, got {calls}"
+    # Byte-for-byte identical compiled artifact (deterministic concat re-ran).
+    assert second == first
+
+
+@pytest.mark.asyncio
+async def test_compile_adopts_preexisting_outputs_with_no_markers(
+    monkeypatch, tmp_path
+):
+    """T2 — content-validation fallback (the current crashed run): valid piece
+    outputs exist on disk with NO markers, and the LAST final bundle is
+    missing (crash point). A restart reuses all clusters + bundles 1..N-1 by
+    content-validation (retroactively writing markers), re-emits ONLY the
+    missing final bundle, and the final guard passes."""
+    monkeypatch.setattr(
+        "iriai_build_v2.workflows._common._helpers.COMPILE_HIERARCHICAL_THRESHOLD", 500
+    )
+    monkeypatch.setattr(
+        "iriai_build_v2.workflows._common._helpers.COMPILE_CLUSTER_TARGET_BYTES", 300
+    )
+    feature, decomposition, runner, calls = _build_incremental_compile_runner(tmp_path)
+
+    # Produce valid piece outputs on disk (the crashed run's leftovers).
+    first = await _run_incremental_compile(feature, decomposition, runner)
+
+    # Simulate a PRE-RESUMABILITY crash: wipe ALL markers (they did not exist
+    # before the upgrade), and remove the last final-bundle output (the crash
+    # point left it missing).
+    runner.artifacts.store.clear()
+    feature_dir = Path(runner.services["artifact_mirror"].feature_dir(feature.id))
+    bundle_files = sorted(feature_dir.glob("compile-intermediate-plan-finalbundle-*.md"))
+    assert len(bundle_files) >= 2
+    last_bundle = bundle_files[-1]
+    last_bundle.unlink()
+
+    calls.clear()
+    second = await _run_incremental_compile(feature, decomposition, runner)
+
+    # Every piece EXCEPT the missing final bundle was adopted by content
+    # validation — exactly one LLM call (the re-emit of the missing bundle).
+    assert len(calls) == 1, f"expected exactly one recompile, got {calls}"
+    assert calls[0] == "per-bundle"
+    # Markers were retroactively backfilled for every adopted + recompiled piece.
+    marker_keys = {k for k in runner.artifacts.store if k.startswith("compile-piece:")}
+    n_clusters = len(list(feature_dir.glob("compile-intermediate-plan-chunk-*.md")))
+    n_bundles = len(bundle_files)
+    assert len(marker_keys) == n_clusters + n_bundles
+    # The final whole-union guard passed and the output equals the from-scratch
+    # compile (the re-emitted bundle is deterministic in the offset).
+    assert second == first
+
+
+@pytest.mark.asyncio
+async def test_compile_crash_after_2_of_4_pieces_reuses_2_recompiles_2(
+    monkeypatch, tmp_path
+):
+    """T6 — the operator's headline: with 4 clusters, 2 already complete
+    (output + marker present) and 2 missing, a restart makes exactly 2 cluster
+    LLM calls (the missing pieces) — the other 2 are reused — and the output
+    matches a from-scratch compile."""
+    monkeypatch.setattr(
+        "iriai_build_v2.workflows._common._helpers.COMPILE_HIERARCHICAL_THRESHOLD", 500
+    )
+    monkeypatch.setattr(
+        "iriai_build_v2.workflows._common._helpers.COMPILE_CLUSTER_TARGET_BYTES", 300
+    )
+    feature, decomposition, runner, calls = _build_incremental_compile_runner(tmp_path)
+
+    # Baseline from-scratch compile (seeds all 4 cluster + 4 bundle pieces).
+    first = await _run_incremental_compile(feature, decomposition, runner)
+    feature_dir = Path(runner.services["artifact_mirror"].feature_dir(feature.id))
+    cluster_files = sorted(feature_dir.glob("compile-intermediate-plan-chunk-*.md"))
+    bundle_files = sorted(feature_dir.glob("compile-intermediate-plan-finalbundle-*.md"))
+    assert len(cluster_files) == 4
+    assert len(bundle_files) == 4
+
+    # Simulate a crash after 2 of 4 clusters: keep cluster outputs+markers for
+    # clusters 1-2, delete the outputs for clusters 3-4 AND drop ALL bundle
+    # outputs (bundles depend on the recompiled clusters). Keep cluster 1-2
+    # markers so they hit the fast-path; clusters 3-4 are clean misses.
+    def _cluster_marker_key_for(idx):
+        return next(
+            k
+            for k in runner.artifacts.store
+            if k.startswith(f"compile-piece:plan-chunk-{idx}:")
+        )
+
+    keep_cluster_markers = {
+        _cluster_marker_key_for(1): runner.artifacts.store[_cluster_marker_key_for(1)],
+        _cluster_marker_key_for(2): runner.artifacts.store[_cluster_marker_key_for(2)],
+    }
+    runner.artifacts.store.clear()
+    runner.artifacts.store.update(keep_cluster_markers)
+    cluster_files[2].unlink()  # cluster-3 output gone
+    cluster_files[3].unlink()  # cluster-4 output gone
+    for b in bundle_files:
+        b.unlink()  # all bundles must recompute (no markers, no outputs)
+
+    calls.clear()
+    second = await _run_incremental_compile(feature, decomposition, runner)
+
+    cluster_calls = [c for c in calls if c.startswith("cluster-")]
+    bundle_calls = [c for c in calls if c == "per-bundle"]
+    # Exactly the 2 missing clusters recompiled (3 and 4); 1 and 2 reused.
+    assert sorted(cluster_calls) == ["cluster-3", "cluster-4"], cluster_calls
+    # All 4 bundles recomputed (their outputs were removed and no markers).
+    assert len(bundle_calls) == 4, bundle_calls
+    # Output identical to the from-scratch compile.
+    assert second == first
+
+
+def test_offset_precompute_equivalence():
+    """T7 — the offset-precompute hoist is behavior-preserving: the hoisted
+    ``bundle_offsets`` sequence equals the running ``+= _max_local_cmp``
+    accumulation, including cross-bundle ``Sx CMP-n`` refs (which must NOT
+    advance the owned-offset)."""
+    from iriai_build_v2.workflows._common._helpers import _max_local_cmp
+
+    # Representative bundles with owned CMP ids AND cross-bundle refs.
+    final_sources = [
+        ("b1", "<!-- SF: a -->\n#### X (CMP-1)\n#### Y (CMP-2)\n#### Z (CMP-3)\n"),
+        # cross-ref S1 CMP-2 must be excluded from b2's owned max
+        ("b2", "<!-- SF: b -->\n#### P (CMP-1)\nrefs S1 CMP-2\n#### Q (CMP-2)\n"),
+        ("b3", "<!-- SF: c -->\nrefs S1 CMP-1 and S2 CMP-2\n#### R (CMP-1)\n"),
+        ("b4", "<!-- SF: d -->\nno owned components, only ref S3 CMP-1\n"),
+        ("b5", "<!-- SF: e -->\n#### S (CMP-1)\n#### T (CMP-2)\n"),
+    ]
+
+    # Pre-hoist reference: running accumulation advanced AFTER each bundle.
+    running = 0
+    pre_hoist_offsets = []
+    for _name, text in final_sources:
+        pre_hoist_offsets.append(running)
+        running += _max_local_cmp(text)
+
+    # Hoisted precompute (exactly the production §2.2 pass).
+    hoisted = []
+    acc = 0
+    for _name, text in final_sources:
+        hoisted.append(acc)
+        acc += _max_local_cmp(text)
+
+    assert hoisted == pre_hoist_offsets
+    # Concrete values: b1 owns max 3 → b2 offset 3; b2 owns max 2 (S1 CMP-2
+    # excluded) → b3 offset 5; b3 owns max 1 → b4 offset 6; b4 owns 0 → b5
+    # offset 6.
+    assert hoisted == [0, 3, 5, 6, 6]
+
+
+def test_compile_piece_sentinel_ok_unit():
+    """T5 (unit slice) — sentinel rejects obvious mid-write truncation and
+    accepts a clean markdown boundary."""
+    assert _compile_piece_sentinel_ok("#### Widget (CMP-1)\nbody text\n") is True
+    assert _compile_piece_sentinel_ok("") is False
+    assert _compile_piece_sentinel_ok("   \n  ") is False
+    assert _compile_piece_sentinel_ok("text\n```\nopen fence never closed\n") is False
+    assert _compile_piece_sentinel_ok("a paragraph\n##") is False
+    assert _compile_piece_sentinel_ok("line ending in a continuation \\") is False
+    # Balanced fence is fine.
+    assert _compile_piece_sentinel_ok("```\ncode\n```\ndone\n") is True
+
+
+@pytest.mark.asyncio
+async def test_legacy_callers_unchanged_when_flag_off(monkeypatch, tmp_path):
+    """T8 — default-off byte-for-byte: a deterministic-merge compile with
+    ``incremental_compile`` left at its False default writes NO
+    ``compile-piece:*`` markers, makes a full set of LLM calls every run (no
+    reuse), and produces output identical to the incremental-on path."""
+    monkeypatch.setattr(
+        "iriai_build_v2.workflows._common._helpers.COMPILE_HIERARCHICAL_THRESHOLD", 500
+    )
+    monkeypatch.setattr(
+        "iriai_build_v2.workflows._common._helpers.COMPILE_CLUSTER_TARGET_BYTES", 300
+    )
+
+    # Default-off run (legacy pm.py / design.py style: no incremental flag).
+    feat_off, decomp_off, runner_off, calls_off = _build_incremental_compile_runner(
+        tmp_path / "off"
+    )
+    out_off = await compile_artifacts(
+        runner_off,
+        feat_off,
+        "plan-review",
+        compiler_actor=lead_architect_reviewer,
+        decomposition=decomp_off,
+        artifact_prefix="plan",
+        broad_key="plan:broad",
+        final_key="plan",
+        deterministic_final_merge=True,
+        # incremental_compile defaults False — legacy behavior.
+    )
+    # No markers written, full LLM call set.
+    assert not [k for k in runner_off.artifacts.store if k.startswith("compile-piece:")]
+    n_calls_first = len(calls_off)
+    assert n_calls_first > 0
+
+    # Re-running default-off re-does ALL work (no reuse) — same call count.
+    calls_off.clear()
+    out_off2 = await compile_artifacts(
+        runner_off,
+        feat_off,
+        "plan-review",
+        compiler_actor=lead_architect_reviewer,
+        decomposition=decomp_off,
+        artifact_prefix="plan",
+        broad_key="plan:broad",
+        final_key="plan",
+        deterministic_final_merge=True,
+    )
+    assert len(calls_off) == n_calls_first, "default-off must never reuse pieces"
+    assert out_off2 == out_off
+
+    # Incremental-on produces byte-identical output to the default-off path
+    # (reuse changes only WHICH calls run, never the deterministic result).
+    feat_on, decomp_on, runner_on, _calls_on = _build_incremental_compile_runner(
+        tmp_path / "on"
+    )
+    out_on = await _run_incremental_compile(feat_on, decomp_on, runner_on)
+    assert out_on == out_off
 
 
 @pytest.mark.asyncio

@@ -2202,6 +2202,235 @@ def _assert_compile_complete(
         )
 
 
+# ── Deterministic top-level union offset math (module-level / pure) ──────
+# A bundle's GLOBAL CMP offset is the running sum of the prior bundles'
+# OWNED component counts.  Each regroup/cluster intermediate uses a
+# contiguous local `CMP-1..CMP-M` sequence for the components it OWNS, so
+# `M` = max local owned CMP id.  We must NOT count cross-bundle references
+# (written `Sx CMP-n`, owned by another bundle) — those would inflate the
+# offset and silently corrupt ID continuity.  We exclude any `CMP-n` that
+# is immediately preceded by an owning prefix like `S2 ` / `S4 `
+# (e.g. `S2 CMP-17`).  Hoisted to module scope (from inside the Stage-D
+# block) so it is pure/reusable for the precompute pass and the bundle
+# digest below — the arithmetic is byte-identical to the inline version.
+_cross_prefix_re = re.compile(r"\b[A-Za-z]+\d+ CMP-(\d+)")
+
+
+def _max_local_cmp(text: str) -> int:
+    text = text or ""
+    cross = {m.start(1) for m in _cross_prefix_re.finditer(text)}
+    vals = [
+        int(m.group(1))
+        for m in re.finditer(r"\bCMP-(\d+)", text)
+        if m.start(1) not in cross
+    ]
+    return max(vals) if vals else 0
+
+
+# ── Compile-piece resumability helpers (additive, flag-gated) ───────────
+#
+# A "piece" is one cluster (Stage A) or one final bundle (Stage D) of the
+# deterministic compile.  These helpers let a crash mid-compile restart
+# WITHOUT re-doing completed pieces.  Reuse is decided per piece by a
+# source DIGEST in a marker key (`compile-piece:{prefix}:{slug}:{digest}`,
+# written like develop's `dag-task:*`) PLUS content-validation of the
+# on-disk output with the same `_assert_compile_complete` guard used after
+# the LLM call.  See docs/compile-resumability-implementation-plan.md.
+
+
+def _compile_content_digest(text: str) -> str:
+    """sha256 of a single text blob — mirrors task_planning._content_digest."""
+    return hashlib.sha256((text or "").encode("utf-8")).hexdigest()
+
+
+def _compile_json_digest(payload: Any) -> str:
+    """sha256 of canonical JSON — mirrors task_planning._json_digest (sort_keys)."""
+    import json as _json
+
+    return hashlib.sha256(
+        _json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=True).encode(
+            "utf-8"
+        )
+    ).hexdigest()
+
+
+def _cluster_piece_digest(
+    *,
+    artifact_prefix: str,
+    member_slugs: list[str],
+    member_source_texts: list[str],
+) -> str:
+    """Digest of a CLUSTER piece's inputs (Stage A).
+
+    Hashes the ORDERED list of ``(slug, sha256(sf_text))`` for the
+    subfeatures in this cluster — exactly the inputs to the cluster compile.
+    Order matters (chunk membership/order changes the rendered bundle).
+    Broad and decomposition are EXCLUDED (they are excluded from cluster
+    sources), so they never enter this digest.
+    """
+    return _compile_json_digest(
+        {
+            "kind": "cluster",
+            "artifact_prefix": artifact_prefix,
+            "members": [
+                [slug, _compile_content_digest(text)]
+                for slug, text in zip(member_slugs, member_source_texts, strict=False)
+            ],
+        }
+    )
+
+
+def _final_bundle_piece_digest(
+    *,
+    artifact_prefix: str,
+    bundle_text: str,
+    offset: int,
+) -> str:
+    """Digest of a FINAL-BUNDLE piece's inputs (Stage D).
+
+    Hashes ``sha256(b_text)`` PLUS the precomputed global offset.  The
+    offset is LOAD-BEARING: if an upstream bundle gains/loses an owned
+    component its ``_max_local_cmp`` changes, shifting THIS bundle's offset,
+    which changes this bundle's renumbered ids even though ``b_text`` is
+    unchanged — so the cached re-emit is stale and MUST be recomputed.
+    This is the invalidation cascade.
+    """
+    return _compile_json_digest(
+        {
+            "kind": "finalbundle",
+            "artifact_prefix": artifact_prefix,
+            "bundle_sha256": _compile_content_digest(bundle_text),
+            "offset": int(offset),
+        }
+    )
+
+
+def _cluster_piece_slug(member_slugs: list[str]) -> str:
+    """Content-stable cluster identity for the marker key (not the file path).
+
+    Derived from the SORTED member slugs (not the volatile enumerate index)
+    so reordering does not spuriously invalidate, and adding/removing a
+    subfeature changes the slug → cache miss → recompile.
+    """
+    h = hashlib.sha256(
+        "|".join(sorted(member_slugs)).encode("utf-8")
+    ).hexdigest()[:16]
+    return f"cluster-{h}"
+
+
+def _final_bundle_piece_slug(bundle_member_slugs: list[str]) -> str:
+    """Content-stable final-bundle identity for the marker key.
+
+    ``bundle_member_slugs`` = the real SF slugs whose ``<!-- SF: -->``
+    markers appear in ``b_text`` (intersected with ``real_slugs``).
+    """
+    h = hashlib.sha256(
+        "|".join(sorted(bundle_member_slugs)).encode("utf-8")
+    ).hexdigest()[:16]
+    return f"finalbundle-{h}"
+
+
+def _compile_piece_sentinel_ok(text: str) -> bool:
+    """Cheap structural sanity for a reused piece body.
+
+    A complete compiler output ends at a natural markdown boundary, never
+    mid-token.  Reject obvious mid-write truncation: empty, or a final
+    non-whitespace line that ends inside an unbalanced markdown construct
+    (open code fence / dangling header marker / trailing backslash).  This
+    is a sanity floor, not a parser — ``_assert_compile_complete`` is the
+    real check; this only catches the residual "cut off after the last CMP
+    header" case.
+    """
+    t = (text or "").rstrip()
+    if not t:
+        return False
+    if t.count("```") % 2 != 0:  # unbalanced fenced block ⇒ cut mid-fence
+        return False
+    last = t.splitlines()[-1].rstrip()
+    if last.endswith("\\"):  # line continuation cut mid-write
+        return False
+    if last in ("#", "##", "###", "####"):  # bare header marker ⇒ cut mid-header
+        return False
+    return True
+
+
+async def _compile_piece_reuse(
+    runner: WorkflowRunner,
+    feature: Feature,
+    *,
+    artifact_prefix: str,
+    piece_slug: str,
+    src_digest: str,
+    output_path: Path,
+    sources_text: str,
+    stage_label: str,
+    real_slugs: set[str],
+    expected_slugs: set[str] | None,
+) -> str | None:
+    """Return the reusable on-disk output text, or None if (re)compile needed.
+
+    Path 1 (marker fast-path): if ``compile-piece:{prefix}:{slug}:{digest}``
+        exists in the store AND ``output_path`` exists AND its bytes re-pass
+        the guard → reuse.  (Still revalidates the bytes —
+        belt-and-suspenders, mirroring develop's completed-task lineage
+        revalidation.)
+    Path 2 (content-validation fallback): NO marker (pre-resumability crash,
+        e.g. the current run).  If ``output_path`` exists, READ it and
+        validate by content (non-empty, ``_assert_compile_complete``,
+        sentinel).  On success → reuse AND retroactively write the marker.
+
+    Any failure / exception in either path → return None (recompile).
+    Fail-OPEN to recompute, never reuse a suspect piece: a bad reuse is a
+    silent corruption; a needless recompute is just slow.
+    """
+    if not output_path.exists():
+        return None
+    try:
+        cached = output_path.read_text(encoding="utf-8").strip()
+    except Exception:
+        return None
+    if not cached:
+        return None
+
+    marker_key = f"compile-piece:{artifact_prefix}:{piece_slug}:{src_digest}"
+    marker = await runner.artifacts.get(marker_key, feature=feature)
+
+    # Content-validation runs in BOTH paths (it is the safety net):
+    try:
+        _assert_compile_complete(
+            sources_text=sources_text,
+            compiled_text=cached,
+            artifact_prefix=artifact_prefix,
+            stage_label=f"{stage_label}-reuse-validate",
+            real_slugs=real_slugs,
+            expected_slugs=expected_slugs,
+        )
+    except Exception:
+        logger.info(
+            "compile reuse REJECTED %s (guard failed on cached bytes) — recompiling",
+            marker_key,
+        )
+        return None
+    if not _compile_piece_sentinel_ok(cached):
+        logger.info(
+            "compile reuse REJECTED %s (incomplete/no sentinel) — recompiling",
+            marker_key,
+        )
+        return None
+
+    if not marker:
+        # Path 2: retroactively adopt a pre-resumability output (the current
+        # run's situation — no marker existed before the upgrade).
+        await runner.artifacts.put(marker_key, "complete", feature=feature)
+        logger.info(
+            "compile reuse ADOPTED pre-existing output %s (no prior marker)",
+            marker_key,
+        )
+    else:
+        logger.info("compile reuse HIT %s", marker_key)
+    return cached
+
+
 async def compile_artifacts(
     runner: WorkflowRunner,
     feature: Feature,
@@ -2214,6 +2443,7 @@ async def compile_artifacts(
     final_key: str,
     compiled_transform: Callable[[str], Awaitable[str]] | None = None,
     deterministic_final_merge: bool = False,
+    incremental_compile: bool = False,
 ) -> str:
     """Compile per-subfeature artifacts into a single final artifact.
 
@@ -2226,6 +2456,17 @@ async def compile_artifacts(
     per-bundle driver loop instead of a single LLM call that has to emit the
     whole union in one response.  See the call site below for the rationale
     and the per-bundle vs pure-deterministic trade-off.
+
+    When ``incremental_compile`` is True (default False — byte-for-byte
+    current behavior), each per-piece compile (cluster in Stage A, bundle in
+    Stage D) first checks ``_compile_piece_reuse``: if a valid prior output
+    exists on disk (marker fast-path OR content-validation of a
+    pre-resumability crash) it is reused and the LLM call is skipped, then a
+    ``compile-piece:*`` marker is written after the post-LLM guard passes.
+    Reuse is active ONLY when ``incremental_compile and
+    deterministic_final_merge`` (the deterministic path is the only one with
+    bounded, non-lossy pieces worth caching).  The deterministic concat +
+    final whole-union guard ALWAYS run (never cached).
     """
     from pathlib import Path
 
@@ -2375,25 +2616,61 @@ async def compile_artifacts(
                 sources=chunk,
             )
             chunk_sources_path.write_text(chunk_src_text, encoding="utf-8")
-            intermediate_text = await _run_compile_prompt(
-                stage_label=f"cluster-{idx}",
-                sources_path=chunk_sources_path,
-                output_path=chunk_output_path,
-                source_count=len(chunk),
-            )
-            # Per-cluster completeness guard (at the drop's ORIGIN).  Raw per-SF
-            # sources carry no `<!-- SF: -->` comments yet (the compiler emits
-            # them), so key the survival check on the KNOWN input slugs: a
-            # cluster compile that drops a whole subfeature fails loud here
-            # instead of silently poisoning every downstream stage's baseline.
-            _assert_compile_complete(
-                sources_text=chunk_src_text,
-                compiled_text=intermediate_text,
-                artifact_prefix=f"{artifact_prefix}-chunk-{idx}",
-                stage_label=f"cluster-{idx}",
-                expected_slugs={getattr(s, "slug", "") for s, _ in chunk},
-                real_slugs=real_slugs,
-            )
+
+            member_slugs = [getattr(s, "slug", "") for s, _ in chunk]
+            expected = set(member_slugs)
+            # ── Compile-piece reuse slot (Stage A) ──────────────────────
+            cluster_src_digest = ""
+            cluster_piece_slug = ""
+            intermediate_text = None
+            if incremental_compile and deterministic_final_merge:
+                cluster_src_digest = _cluster_piece_digest(
+                    artifact_prefix=artifact_prefix,
+                    member_slugs=member_slugs,
+                    member_source_texts=[t for _s, t in chunk],
+                )
+                cluster_piece_slug = _cluster_piece_slug(member_slugs)
+                intermediate_text = await _compile_piece_reuse(
+                    runner,
+                    feature,
+                    artifact_prefix=f"{artifact_prefix}-chunk-{idx}",
+                    piece_slug=cluster_piece_slug,
+                    src_digest=cluster_src_digest,
+                    output_path=chunk_output_path,
+                    sources_text=chunk_src_text,
+                    stage_label=f"cluster-{idx}",
+                    real_slugs=real_slugs,
+                    expected_slugs=expected,
+                )
+
+            if intermediate_text is None:  # cache miss or flag off → compile
+                intermediate_text = await _run_compile_prompt(
+                    stage_label=f"cluster-{idx}",
+                    sources_path=chunk_sources_path,
+                    output_path=chunk_output_path,
+                    source_count=len(chunk),
+                )
+                # Per-cluster completeness guard (at the drop's ORIGIN).  Raw
+                # per-SF sources carry no `<!-- SF: -->` comments yet (the
+                # compiler emits them), so key the survival check on the KNOWN
+                # input slugs: a cluster compile that drops a whole subfeature
+                # fails loud here instead of silently poisoning every
+                # downstream stage's baseline.
+                _assert_compile_complete(
+                    sources_text=chunk_src_text,
+                    compiled_text=intermediate_text,
+                    artifact_prefix=f"{artifact_prefix}-chunk-{idx}",
+                    stage_label=f"cluster-{idx}",
+                    expected_slugs=expected,
+                    real_slugs=real_slugs,
+                )
+                if incremental_compile and deterministic_final_merge:
+                    await runner.artifacts.put(
+                        f"compile-piece:{artifact_prefix}-chunk-{idx}:"
+                        f"{cluster_piece_slug}:{cluster_src_digest}",
+                        "complete",
+                        feature=feature,
+                    )
             intermediate_sources.append((type("Intermediate", (), {"name": f"Cluster {idx}", "slug": f"cluster-{idx}"})(), intermediate_text))
 
         final_sources = intermediate_sources
@@ -2541,20 +2818,23 @@ async def compile_artifacts(
             # bundle) — those would inflate the offset and silently corrupt ID
             # continuity.  We exclude any `CMP-n` that is immediately preceded
             # by an owning prefix like `S2 ` / `S4 ` (e.g. `S2 CMP-17`).
-            _cross_prefix_re = re.compile(r"\b[A-Za-z]+\d+ CMP-(\d+)")
-
-            def _max_local_cmp(text: str) -> int:
-                text = text or ""
-                cross = {m.start(1) for m in _cross_prefix_re.finditer(text)}
-                vals = [
-                    int(m.group(1))
-                    for m in re.finditer(r"\bCMP-(\d+)", text)
-                    if m.start(1) not in cross
-                ]
-                return max(vals) if vals else 0
+            # `_max_local_cmp` / `_cross_prefix_re` are module-level (pure).
+            #
+            # OFFSET PRECOMPUTE HOIST (behavior-preserving): the global offset
+            # for each bundle is pure code over `b_text`, which is fully in
+            # hand here.  Compute every bundle's offset BEFORE the loop so the
+            # per-bundle step is order-independent (a prerequisite for
+            # parallelism) and so the bundle digest is computable up front.
+            # This is EXACTLY the arithmetic the inline `running_offset +=
+            # _max_local_cmp(b_text)` accumulated at the end of each iteration
+            # — byte-identical offsets, byte-identical outputs.
+            bundle_offsets: list[int] = []
+            _acc = 0
+            for (_b_obj, _b_text) in final_sources:
+                bundle_offsets.append(_acc)
+                _acc += _max_local_cmp(_b_text)
 
             bundle_outputs: list[str] = []
-            running_offset = 0
             for b_idx, (b_obj, b_text) in enumerate(final_sources, start=1):
                 bundle_src_path = (
                     feature_dir
@@ -2565,61 +2845,102 @@ async def compile_artifacts(
                     / f"compile-intermediate-{artifact_prefix}-finalbundle-{b_idx}.md"
                 )
                 bundle_src_path.write_text(b_text, encoding="utf-8")
-                # Bounded, single-bundle merge: the agent only has to re-emit
-                # ONE already-merged bundle, well within the output budget.
-                await runner.run(
-                    Ask(
-                        actor=compiler_actor,
-                        prompt=(
-                            f"You are assembling part {b_idx} of {len(final_sources)} "
-                            f"of the final unified {artifact_prefix} document.\n\n"
-                            f"This bundle (`{bundle_src_path}`) is an ALREADY-MERGED, "
-                            "non-overlapping intermediate. Re-emit it VERBATIM and IN "
-                            "FULL — preserve every section, component, journey, "
-                            "decision, gap, state, and citation. Do NOT summarize, "
-                            "drop, or stub anything.\n\n"
-                            "ID renumbering (deterministic global sequence):\n"
-                            f"- Add a GLOBAL OFFSET of +{running_offset} to every "
-                            "LOCAL `CMP-n` id that THIS bundle OWNS "
-                            f"(so this bundle's CMP-1 becomes CMP-{running_offset + 1}, "
-                            "etc.). Handle singles, `/`-groups (`CMP-7/8`), and "
-                            "`..`-ranges (`CMP-1..13`).\n"
-                            "- Do NOT offset CROSS-BUNDLE references to components "
-                            "OWNED BY ANOTHER bundle — those are written with an owning "
-                            "subfeature prefix (e.g. `S2 CMP-17`, `S4 CMP-8`) in this "
-                            "bundle's crosswalk. Leave every such cross-bundle "
-                            "reference EXACTLY as written.\n"
-                            "- Preserve all `<!-- SF: {slug} -->` provenance markers.\n\n"
-                            f"**Read the bundle from:** `{bundle_src_path}`\n"
-                            f"**Write the renumbered bundle (bodies only, no global "
-                            f"document frame/preamble) to:** `{bundle_out_path}`\n"
+                # Precomputed global offset for this bundle (§2.2 hoist).  No
+                # inline `running_offset +=` advance any more — it is pure code
+                # computed before the loop.
+                running_offset = bundle_offsets[b_idx - 1]
+
+                # ── Compile-piece reuse slot (Stage D) ──────────────────
+                bundle_src_digest = ""
+                bundle_piece_slug = ""
+                bundle_compiled = None
+                if incremental_compile:  # deterministic path implied here
+                    bundle_member_slugs = sorted(
+                        _distinct_sf_markers(b_text) & real_slugs
+                    )
+                    bundle_src_digest = _final_bundle_piece_digest(
+                        artifact_prefix=artifact_prefix,
+                        bundle_text=b_text,
+                        offset=running_offset,
+                    )
+                    bundle_piece_slug = _final_bundle_piece_slug(bundle_member_slugs)
+                    bundle_compiled = await _compile_piece_reuse(
+                        runner,
+                        feature,
+                        artifact_prefix=f"{artifact_prefix}-finalbundle-{b_idx}",
+                        piece_slug=bundle_piece_slug,
+                        src_digest=bundle_src_digest,
+                        output_path=bundle_out_path,
+                        sources_text=b_text,
+                        stage_label=f"final-bundle-{b_idx}",
+                        real_slugs=real_slugs,
+                        expected_slugs=None,  # b_text carries <!-- SF: --> markers
+                    )
+
+                if bundle_compiled is None:  # cache miss or flag off → compile
+                    # Bounded, single-bundle merge: the agent only has to
+                    # re-emit ONE already-merged bundle, well within the output
+                    # budget.
+                    await runner.run(
+                        Ask(
+                            actor=compiler_actor,
+                            prompt=(
+                                f"You are assembling part {b_idx} of {len(final_sources)} "
+                                f"of the final unified {artifact_prefix} document.\n\n"
+                                f"This bundle (`{bundle_src_path}`) is an ALREADY-MERGED, "
+                                "non-overlapping intermediate. Re-emit it VERBATIM and IN "
+                                "FULL — preserve every section, component, journey, "
+                                "decision, gap, state, and citation. Do NOT summarize, "
+                                "drop, or stub anything.\n\n"
+                                "ID renumbering (deterministic global sequence):\n"
+                                f"- Add a GLOBAL OFFSET of +{running_offset} to every "
+                                "LOCAL `CMP-n` id that THIS bundle OWNS "
+                                f"(so this bundle's CMP-1 becomes CMP-{running_offset + 1}, "
+                                "etc.). Handle singles, `/`-groups (`CMP-7/8`), and "
+                                "`..`-ranges (`CMP-1..13`).\n"
+                                "- Do NOT offset CROSS-BUNDLE references to components "
+                                "OWNED BY ANOTHER bundle — those are written with an owning "
+                                "subfeature prefix (e.g. `S2 CMP-17`, `S4 CMP-8`) in this "
+                                "bundle's crosswalk. Leave every such cross-bundle "
+                                "reference EXACTLY as written.\n"
+                                "- Preserve all `<!-- SF: {slug} -->` provenance markers.\n\n"
+                                f"**Read the bundle from:** `{bundle_src_path}`\n"
+                                f"**Write the renumbered bundle (bodies only, no global "
+                                f"document frame/preamble) to:** `{bundle_out_path}`\n"
+                            ),
                         ),
-                    ),
-                    feature,
-                    phase_name=phase_name,
-                )
-                if not bundle_out_path.exists():
-                    raise RuntimeError(
-                        f"Per-bundle final merge did not write output to "
-                        f"{bundle_out_path}"
+                        feature,
+                        phase_name=phase_name,
                     )
-                bundle_compiled = bundle_out_path.read_text(encoding="utf-8").strip()
-                if not bundle_compiled:
-                    raise RuntimeError(
-                        f"Per-bundle final merge wrote empty file at "
-                        f"{bundle_out_path}"
+                    if not bundle_out_path.exists():
+                        raise RuntimeError(
+                            f"Per-bundle final merge did not write output to "
+                            f"{bundle_out_path}"
+                        )
+                    bundle_compiled = bundle_out_path.read_text(encoding="utf-8").strip()
+                    if not bundle_compiled:
+                        raise RuntimeError(
+                            f"Per-bundle final merge wrote empty file at "
+                            f"{bundle_out_path}"
+                        )
+                    # Per-bundle backstop: this single bundle must keep all of
+                    # its OWN subfeature markers and component bodies.
+                    _assert_compile_complete(
+                        sources_text=b_text,
+                        compiled_text=bundle_compiled,
+                        artifact_prefix=f"{artifact_prefix}-finalbundle-{b_idx}",
+                        stage_label=f"final-bundle-{b_idx}",
+                        real_slugs=real_slugs,
                     )
-                # Per-bundle backstop: this single bundle must keep all of its
-                # OWN subfeature markers and component bodies.
-                _assert_compile_complete(
-                    sources_text=b_text,
-                    compiled_text=bundle_compiled,
-                    artifact_prefix=f"{artifact_prefix}-finalbundle-{b_idx}",
-                    stage_label=f"final-bundle-{b_idx}",
-                    real_slugs=real_slugs,
-                )
+                    if incremental_compile:
+                        await runner.artifacts.put(
+                            f"compile-piece:{artifact_prefix}-finalbundle-{b_idx}:"
+                            f"{bundle_piece_slug}:{bundle_src_digest}",
+                            "complete",
+                            feature=feature,
+                        )
                 bundle_outputs.append(bundle_compiled)
-                running_offset += _max_local_cmp(b_text)
+                # NOTE: no inline running_offset += here anymore — precomputed.
 
             # Deterministic frame + concatenation of the per-bundle bodies.
             frame_header = (
