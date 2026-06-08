@@ -1845,6 +1845,7 @@ async def _run_global_prd_tail(
             broad_key="prd:broad",
             revision_observer=lambda plan: _collect_revision_requests(collected, plan),
             deterministic_final_merge=True,
+            incremental_compile=True,
         )
         mark_compiled_provenance(
             control,
@@ -1894,6 +1895,7 @@ async def _run_global_prd_tail(
         broad_key="prd:broad",
         final_key="prd",
         deterministic_final_merge=True,
+        incremental_compile=True,
     )
     state.prd = await interview_gate_review(
         runner,
@@ -1909,6 +1911,7 @@ async def _run_global_prd_tail(
         broad_key="prd:broad",
         revision_observer=lambda plan: _collect_revision_requests(collected, plan),
         deterministic_final_merge=True,
+        incremental_compile=True,
     )
     mark_compiled_provenance(
         control,
@@ -1972,6 +1975,7 @@ async def _run_global_design_tail(
             context_keys=["project", "scope", "prd"],
             revision_observer=lambda plan: _collect_revision_requests(collected, plan),
             deterministic_final_merge=True,
+            incremental_compile=True,
         )
         mark_compiled_provenance(
             control,
@@ -2028,6 +2032,7 @@ async def _run_global_design_tail(
         broad_key="design:broad",
         final_key="design",
         deterministic_final_merge=True,
+        incremental_compile=True,
     )
     unified_mockup = await DesignPhase._compile_mockup(runner, feature, decomposition)
     if unified_mockup:
@@ -2055,6 +2060,7 @@ async def _run_global_design_tail(
         post_compile=_refresh_mockup,
         revision_observer=lambda plan: _collect_revision_requests(collected, plan),
         deterministic_final_merge=True,
+        incremental_compile=True,
     )
     mark_compiled_provenance(
         control,
@@ -2127,6 +2133,7 @@ async def _run_global_architecture_tail(
             context_keys=["project", "scope", "prd", "design"],
             revision_observer=lambda plan: _collect_revision_requests(collected, plan),
             deterministic_final_merge=True,
+            incremental_compile=True,
         )
     else:
         review = await integration_review(
@@ -2179,6 +2186,7 @@ async def _run_global_architecture_tail(
             broad_key="plan:broad",
             final_key="plan",
             deterministic_final_merge=True,
+            incremental_compile=True,
         )
 
         state.plan = await interview_gate_review(
@@ -2196,6 +2204,7 @@ async def _run_global_architecture_tail(
             context_keys=["project", "scope", "prd", "design"],
             revision_observer=lambda plan: _collect_revision_requests(collected, plan),
             deterministic_final_merge=True,
+            incremental_compile=True,
         )
 
     if approved_system_design:
@@ -2220,6 +2229,7 @@ async def _run_global_architecture_tail(
             post_update=lambda key, text: arch_helpers._convert_and_host_sd(runner, feature, key, text, feature.name),
             post_compile=lambda: arch_helpers._compile_system_design(runner, feature, decomposition),
             deterministic_final_merge=True,
+            incremental_compile=True,
         )
     else:
         await arch_helpers._compile_system_design(runner, feature, decomposition)
@@ -2239,6 +2249,7 @@ async def _run_global_architecture_tail(
             post_update=lambda key, text: arch_helpers._convert_and_host_sd(runner, feature, key, text, feature.name),
             post_compile=lambda: arch_helpers._compile_system_design(runner, feature, decomposition),
             deterministic_final_merge=True,
+            incremental_compile=True,
         )
     prov = [control.get("broad_steps", {}).get("architecture", {}).get("provenance", "")] + [
         get_step_record(control, sf.slug, "architecture").get("provenance", "")

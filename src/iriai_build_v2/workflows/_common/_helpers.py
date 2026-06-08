@@ -3054,6 +3054,7 @@ async def interview_gate_review(
     warn_after_cycles: int = 3,
     compiled_artifact_text: str = "",
     deterministic_final_merge: bool = False,
+    incremental_compile: bool = False,
 ) -> str:
     """Interview-based gate review. Replaces gate_and_revise for compiled artifacts.
 
@@ -3218,6 +3219,7 @@ async def interview_gate_review(
                     final_key=compiled_key,
                     compiled_transform=compiled_transform,
                     deterministic_final_merge=deterministic_final_merge,
+                    incremental_compile=incremental_compile,
                 )
                 if post_compile:
                     await post_compile()
