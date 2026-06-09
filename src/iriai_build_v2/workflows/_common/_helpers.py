@@ -3663,7 +3663,11 @@ def _count_matching_sections(
     return count
 
 
-def _apply_patches(text: str, patches: list) -> str:
+class PatchApplicationError(ValueError):
+    """Raised when a generated artifact patch cannot be applied safely."""
+
+
+def _apply_patches(text: str, patches: list, *, strict: bool = False) -> str:
     """Apply section-level patches to markdown/HTML text.
 
     Handles duplicate headers by tracking per-target occurrence counts.
@@ -3671,8 +3675,16 @@ def _apply_patches(text: str, patches: list) -> str:
     successive occurrences (1st, 2nd, 3rd, ...).
 
     Re-parses after each patch to handle offset shifts.
-    Unmatched targets are logged and skipped.
+    Unmatched targets are logged and skipped by default. In ``strict`` mode,
+    any skipped patch raises so revision flows can retry instead of silently
+    accepting an unchanged or partially changed artifact.
     """
+
+    def _warn_or_raise(message: str, *args: object) -> None:
+        logger.warning(message, *args)
+        if strict:
+            raise PatchApplicationError(message % args if args else message)
+
     # Track how many times each target has been used so far,
     # so successive patches to the same header hit successive occurrences.
     target_usage: dict[str, int] = {}
@@ -3685,6 +3697,11 @@ def _apply_patches(text: str, patches: list) -> str:
             normalized_full = raw_operation if raw_operation != "set" else "replace"
             if normalized_full in {"replace", "replace_section", "revise"}:
                 text = patch.content.rstrip("\n") + "\n"
+            else:
+                _warn_or_raise(
+                    "Unsupported FULL_DOCUMENT patch operation: %r — skipping",
+                    patch.operation,
+                )
             continue
 
         target_key = _clean_header(patch.target)
@@ -3697,7 +3714,7 @@ def _apply_patches(text: str, patches: list) -> str:
 
         # If the nth occurrence doesn't exist, try the first (for non-duplicate targets)
         if not match and occurrence > 1:
-            logger.warning(
+            _warn_or_raise(
                 "Patch target %r occurrence %d not found — skipping (may be duplicate header issue)",
                 patch.target, occurrence,
             )
@@ -3705,7 +3722,7 @@ def _apply_patches(text: str, patches: list) -> str:
 
         if operation == "replace":
             if not match:
-                logger.warning(
+                _warn_or_raise(
                     "Patch target not found for replace: %r — skipping",
                     patch.target,
                 )
@@ -3723,7 +3740,7 @@ def _apply_patches(text: str, patches: list) -> str:
 
         elif operation == "insert_after":
             if not match:
-                logger.warning(
+                _warn_or_raise(
                     "Patch target not found for insert_after: %r — appending to end",
                     patch.target,
                 )
@@ -3735,7 +3752,7 @@ def _apply_patches(text: str, patches: list) -> str:
 
         elif operation == "delete":
             if not match:
-                logger.warning(
+                _warn_or_raise(
                     "Patch target not found for delete: %r — skipping",
                     patch.target,
                 )
@@ -3745,7 +3762,7 @@ def _apply_patches(text: str, patches: list) -> str:
 
         elif operation == "find_replace":
             if not match:
-                logger.warning(
+                _warn_or_raise(
                     "Patch target not found for find_replace: %r — skipping",
                     patch.target,
                 )
@@ -3753,7 +3770,7 @@ def _apply_patches(text: str, patches: list) -> str:
             _, _, start, end = match
             section_text = text[start:end]
             if not patch.find or patch.find not in section_text:
-                logger.warning(
+                _warn_or_raise(
                     "find_replace: text %r not found in section %r — skipping",
                     (patch.find or "")[:50], patch.target[:40],
                 )
@@ -3762,7 +3779,7 @@ def _apply_patches(text: str, patches: list) -> str:
             text = text[:start] + new_section + text[end:]
 
         else:
-            logger.warning("Unknown patch operation: %r — skipping", patch.operation)
+            _warn_or_raise("Unknown patch operation: %r — skipping", patch.operation)
 
     return text
 
@@ -4138,6 +4155,7 @@ def _build_revision_batch_prompt(
     decision_context_path: str,
     batch_requests_path: str,
     clarification: str = "",
+    artifact_is_json: bool = False,
 ) -> str:
     batch_count = len(batch_entries)
     request_instruction = (
@@ -4166,31 +4184,49 @@ def _build_revision_batch_prompt(
         if clarification.strip()
         else ""
     )
-    targeting_rules = (
-        f"- Target individual steps by unique header "
-        f"(e.g. '### STEP-5:', '## Architecture', '## File Manifest').\n"
-        f"- Each STEP has a unique ID — use it as the target.\n\n"
-        if artifact_prefix == "plan"
-        else f"- For system-designs (HTML): target unique section headers "
-        f"like 'Overview', 'Services', 'CP-14', 'ENT-30'.\n\n"
-        if artifact_prefix == "system-design"
-        else f"- DAG artifacts are JSON `ImplementationDAG` objects, not markdown. "
-        f"Do NOT add markdown sections to a DAG artifact. If the requested change "
-        f"belongs to the compiled root DAG rather than this per-subfeature JSON DAG, "
-        f"return an empty patch list and explain the no-op in summary. Only use "
-        f"`FULL_DOCUMENT` when you can return the complete, valid JSON object while "
-        f"preserving every existing task.\n\n"
-        if artifact_prefix == "dag"
-        else f"- This artifact may have non-unique subsection headers. "
-        f"Produce a SINGLE patch with target 'FULL_DOCUMENT' to "
-        f"replace the entire artifact content. Include all sections.\n\n"
-    )
+    if artifact_is_json:
+        targeting_rules = (
+            "- This artifact is JSON-backed, not markdown. Produce a SINGLE "
+            "patch with target 'FULL_DOCUMENT' and operation 'replace'. The "
+            "content must be the complete valid JSON object, preserving every "
+            "existing field/item not intentionally changed.\n"
+            "- Do NOT target markdown/HTML section names like 'Services', "
+            "'Connections', 'API Endpoints', or individual STEP headers.\n\n"
+        )
+        rewrite_instruction = (
+            "IMPORTANT: This artifact is JSON-backed. Return exactly one "
+            "FULL_DOCUMENT replacement patch containing the complete revised JSON.\n\n"
+        )
+    else:
+        targeting_rules = (
+            f"- Target individual steps by unique header "
+            f"(e.g. '### STEP-5:', '## Architecture', '## File Manifest').\n"
+            f"- Each STEP has a unique ID — use it as the target.\n\n"
+            if artifact_prefix == "plan"
+            else f"- For system-designs (HTML): target unique section headers "
+            f"like 'Overview', 'Services', 'CP-14', 'ENT-30'.\n\n"
+            if artifact_prefix == "system-design"
+            else f"- DAG artifacts are JSON `ImplementationDAG` objects, not markdown. "
+            f"Do NOT add markdown sections to a DAG artifact. If the requested change "
+            f"belongs to the compiled root DAG rather than this per-subfeature JSON DAG, "
+            f"return an empty patch list and explain the no-op in summary. Only use "
+            f"`FULL_DOCUMENT` when you can return the complete, valid JSON object while "
+            f"preserving every existing task.\n\n"
+            if artifact_prefix == "dag"
+            else f"- This artifact may have non-unique subsection headers. "
+            f"Produce a SINGLE patch with target 'FULL_DOCUMENT' to "
+            f"replace the entire artifact content. Include all sections.\n\n"
+        )
+        rewrite_instruction = (
+            "IMPORTANT: Do NOT rewrite the entire document. Produce targeted "
+            "patches only for sections that need to change.\n\n"
+        )
     return (
         f"Revise the {artifact_prefix} for subfeature '{sf_slug}' by producing a list of PATCHES.\n\n"
         f"{request_instruction}"
         f"Address ALL {batch_count} change(s) in this batch.\n\n"
         f"{clarification_block}"
-        f"IMPORTANT: Do NOT rewrite the entire document. Produce targeted patches only for sections that need to change.\n\n"
+        f"{rewrite_instruction}"
         f"{artifact_instruction}\n"
         f"{manifest_instruction}"
         f"{decision_instruction}\n"
@@ -4414,6 +4450,7 @@ async def targeted_revision(
                 manifest_path=manifest_path,
                 decision_context_path=decision_context_path,
                 batch_requests_path=batch_requests_path,
+                artifact_is_json=existing.lstrip().startswith(("{", "[")),
             )
             patch_set = await runner.run(
                 Ask(
@@ -4509,6 +4546,7 @@ async def targeted_revision(
                     decision_context_path=decision_context_path,
                     batch_requests_path=batch_requests_path,
                     clarification=answers,
+                    artifact_is_json=existing.lstrip().startswith(("{", "[")),
                 )
                 patch_set = await runner.run(
                     Ask(
@@ -4531,6 +4569,22 @@ async def targeted_revision(
             )
             return patch_set
 
+        async def _clear_batch_patch_cache(
+            batch_entries: list[tuple[int, Any]], *, minimal: bool
+        ) -> None:
+            patch_key = _revision_batch_patch_key(
+                checkpoint_prefix,
+                artifact_prefix,
+                sf_slug,
+                batch_entries,
+                minimal=minimal,
+            )
+            delete = getattr(runner.artifacts, "delete", None)
+            if callable(delete):
+                await delete(patch_key, feature=feature)
+            else:
+                await runner.artifacts.put(patch_key, "", feature=feature)
+
         pending_entries = []
         for idx, req in enumerate(requests):
             marker = await runner.artifacts.get(
@@ -4552,6 +4606,7 @@ async def targeted_revision(
             return "skipped", None, False
 
         batch_queue = _build_revision_batches(artifact_prefix, pending_entries)
+        patch_application_retries: dict[tuple[tuple[int, ...], bool], int] = {}
         revised = False
         while batch_queue:
             batch_entries = batch_queue.pop(0)
@@ -4607,28 +4662,70 @@ async def targeted_revision(
                 "targeted_revision: applying %d batch patches to %s",
                 len(patch_set.patches), sf_key,
             )
-            revised_text = _apply_patches(existing, patch_set.patches)
+            try:
+                existing_size = len(existing)
+                existing_is_json = existing.lstrip().startswith(("{", "["))
+                if existing_is_json:
+                    non_full_targets = [
+                        str(getattr(patch, "target", "") or "")
+                        for patch in patch_set.patches
+                        if str(getattr(patch, "target", "") or "").strip().upper()
+                        != "FULL_DOCUMENT"
+                    ]
+                    if non_full_targets:
+                        sample = ", ".join(repr(t) for t in non_full_targets[:3])
+                        raise PatchApplicationError(
+                            f"JSON-backed {artifact_prefix}:{sf_slug} requires "
+                            "FULL_DOCUMENT replacement patches; got targeted "
+                            f"patches {sample}"
+                        )
 
-            existing_size = len(existing)
-            revised_size = len(revised_text)
-            existing_is_json = existing.lstrip().startswith(("{", "["))
-            if existing_is_json:
-                try:
-                    output_type.model_validate_json(revised_text)
-                except Exception as exc:
-                    return (
-                        "failed",
-                        "batch "
-                        f"{_revision_batch_suffix(batch_entries, minimal=used_minimal)} "
-                        f"rejected because revised {artifact_prefix}:{sf_slug} "
-                        f"is not valid {output_type.__name__} JSON: {exc}",
-                        False,  # invalid revised content — a content failure, not transient
+                revised_text = _apply_patches(existing, patch_set.patches, strict=True)
+                if revised_text == existing:
+                    raise PatchApplicationError(
+                        f"patches made no changes to {artifact_prefix}:{sf_slug}"
                     )
-            if existing_size > 0 and revised_size < existing_size * 0.5:
+
+                revised_size = len(revised_text)
+                if existing_is_json:
+                    try:
+                        output_type.model_validate_json(revised_text)
+                    except Exception as exc:
+                        raise PatchApplicationError(
+                            f"revised {artifact_prefix}:{sf_slug} is not valid "
+                            f"{output_type.__name__} JSON: {exc}"
+                        ) from exc
+                if existing_size > 0 and revised_size < existing_size * 0.5:
+                    raise PatchApplicationError(
+                        f"size guard rejected {artifact_prefix}:{sf_slug} "
+                        f"({existing_size} → {revised_size})"
+                    )
+            except PatchApplicationError as exc:
+                retry_key = (
+                    tuple(idx for idx, _req in batch_entries),
+                    used_minimal,
+                )
+                retry_count = patch_application_retries.get(retry_key, 0)
+                if retry_count < 1:
+                    patch_application_retries[retry_key] = retry_count + 1
+                    await _clear_batch_patch_cache(
+                        batch_entries,
+                        minimal=used_minimal,
+                    )
+                    batch_queue.insert(0, batch_entries)
+                    logger.warning(
+                        "targeted_revision: rejected batch patches for %s (%s): %s; regenerating once",
+                        sf_key,
+                        _revision_batch_suffix(batch_entries, minimal=used_minimal),
+                        exc,
+                    )
+                    continue
                 return (
                     "failed",
-                    f"batch {_revision_batch_suffix(batch_entries, minimal=used_minimal)} rejected by size guard ({existing_size} → {revised_size})",
-                    False,  # degraded/truncated revision — a content failure, not transient
+                    "batch "
+                    f"{_revision_batch_suffix(batch_entries, minimal=used_minimal)} "
+                    f"rejected by patch guard after retry: {exc}",
+                    False,  # inapplicable/generated patch content — not transient
                 )
 
             await runner.artifacts.put(sf_key, revised_text, feature=feature)

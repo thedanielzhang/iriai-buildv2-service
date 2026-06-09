@@ -4,6 +4,7 @@ import os
 import re
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 from iriai_compose import Ask
@@ -16130,6 +16131,112 @@ async def test_targeted_revision_rejects_invalid_json_artifact_rewrite(tmp_path)
     assert result.failed
     assert "not valid ImplementationDAG JSON" in result.failed[0].reason
     assert runner.artifacts.store["dag:accounts"] == existing_dag
+
+
+@pytest.mark.asyncio
+async def test_targeted_revision_retries_json_artifact_section_patch_after_cache_clear(tmp_path):
+    feature = SimpleNamespace(id="feat-auto-rev-json-targeted", metadata={})
+    decomposition = SubfeatureDecomposition(
+        subfeatures=[
+            Subfeature(id="SF-1", slug="accounts", name="Accounts", description="Accounts"),
+        ],
+        complete=True,
+    )
+    mirror = _TestMirror(tmp_path / "features")
+    existing_sd = SystemDesign(
+        title="Accounts",
+        overview="Current service boundary.",
+        complete=True,
+    ).model_dump_json(indent=2)
+    revised_sd = SystemDesign(
+        title="Accounts",
+        overview="Revised service boundary.",
+        complete=True,
+    ).model_dump_json(indent=2)
+
+    class _Artifacts:
+        def __init__(self) -> None:
+            self.store: dict[str, str] = {"system-design:accounts": existing_sd}
+            self.deletes: list[str] = []
+
+        async def get(self, key: str, *, feature):
+            del feature
+            return self.store.get(key, "")
+
+        async def put(self, key: str, value: str, *, feature):
+            del feature
+            self.store[key] = value
+
+        async def delete(self, key: str, *, feature):
+            del feature
+            self.deletes.append(key)
+            self.store.pop(key, None)
+
+    class _Runner:
+        def __init__(self) -> None:
+            self.artifacts = _Artifacts()
+            self.services = {"artifact_mirror": mirror}
+            self.prompts: list[str] = []
+
+        async def run(self, task, feature, phase_name=""):
+            del feature, phase_name
+            self.prompts.append(task.prompt)
+            if len(self.prompts) == 1:
+                return ArtifactPatchSet(
+                    patches=[
+                        {
+                            "target": "Services",
+                            "operation": "find_replace",
+                            "content": "new service",
+                            "find": "old service",
+                            "reasoning": "bad section patch for JSON",
+                        }
+                    ],
+                    summary="",
+                )
+            return ArtifactPatchSet(
+                patches=[
+                    {
+                        "target": "FULL_DOCUMENT",
+                        "operation": "replace",
+                        "content": revised_sd,
+                        "find": "",
+                        "reasoning": "valid full JSON replacement",
+                    }
+                ],
+                summary="",
+            )
+
+    runner = _Runner()
+    result = await targeted_revision(
+        runner,
+        feature,
+        "plan-review",
+        revision_plan=RevisionPlan(
+            requests=[
+                RevisionRequest(
+                    description="Revise system-design service boundary.",
+                    reasoning="Plan review requested a structured update.",
+                    affected_subfeatures=["accounts"],
+                )
+            ]
+        ),
+        decomposition=decomposition,
+        base_role=lead_architect_gate_reviewer.role,
+        output_type=SystemDesign,
+        artifact_prefix="system-design",
+        checkpoint_prefix="cycle-json",
+    )
+
+    assert result.ok is True
+    assert runner.artifacts.store["system-design:accounts"].strip() == revised_sd
+    assert len(runner.prompts) == 2
+    assert "This artifact is JSON-backed" in runner.prompts[0]
+    assert "Do NOT target markdown/HTML section names" in runner.prompts[0]
+    assert any(
+        key.startswith("patches:cycle-json:system-design:accounts:batch-0")
+        for key in runner.artifacts.deletes
+    )
 
 
 @pytest.mark.asyncio
