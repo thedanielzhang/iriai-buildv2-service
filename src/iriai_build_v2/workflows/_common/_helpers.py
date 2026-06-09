@@ -3691,6 +3691,65 @@ _PATCHSET_POINTER_MAX_CHARS = 1_000
 _PATCHSET_POINTER_FILE_MAX_BYTES = 5 * 1024 * 1024
 _ABSOLUTE_JSON_PATH_RE = re.compile(r"(/[^\s`'\"<>]+?\.json)\b")
 
+# ── Sanctioned file-pointer path for oversized FULL_DOCUMENT replacements ──
+# A FULL_DOCUMENT regen of a large (≈56KB+) artifact emitted INLINE in
+# structured output reliably hits the 32k output-token cap and arrives
+# truncated — the size floor / completeness guards then correctly reject it,
+# the revision fails, and the cycle is lost.  When the CURRENT artifact
+# content exceeds this threshold, the revision prompts instead instruct the
+# agent to WRITE the complete revised document to a sanctioned scratch file
+# (pool agents run with default tools + bypassPermissions, so the Write tool
+# is available; /tmp is writable by every pool member user) and return a tiny
+# pointer patch: target FULL_DOCUMENT, operation "replace_from_file", content
+# = the scratch path.  The applier resolves the pointer by READING the file
+# and then runs the EXISTING guards (size floor + _assert_compile_complete)
+# against the RESOLVED content — guards are never weakened.  Inline
+# FULL_DOCUMENT replace patches keep working unchanged.
+FULL_DOC_FILE_POINTER_THRESHOLD_BYTES = 40_000
+FULL_DOC_REPLACE_FROM_FILE_OPERATION = "replace_from_file"
+_FULL_DOC_FILE_POINTER_DEFAULT_DIR = "/tmp/iriai-fulldoc-revisions"
+
+
+def _full_doc_file_pointer_threshold_bytes() -> int:
+    raw = os.environ.get("IRIAI_FULL_DOC_FILE_POINTER_THRESHOLD_BYTES", "").strip()
+    if not raw:
+        return FULL_DOC_FILE_POINTER_THRESHOLD_BYTES
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise RuntimeError(
+            "Invalid IRIAI_FULL_DOC_FILE_POINTER_THRESHOLD_BYTES="
+            f"{raw!r}; expected a positive integer byte count"
+        ) from exc
+    if value <= 0:
+        raise RuntimeError(
+            "Invalid IRIAI_FULL_DOC_FILE_POINTER_THRESHOLD_BYTES="
+            f"{raw!r}; expected a positive integer byte count"
+        )
+    return value
+
+
+def _full_doc_file_pointer_scratch_path(artifact_prefix: str, sf_slug: str) -> Path:
+    """Allocate a fresh sanctioned scratch path for one FULL_DOCUMENT regen.
+
+    Default lives under /tmp (writable by every pool agent user — the
+    workspace .iriai tree is owned by the supervisor user and may not be
+    writable by pool members).  The directory is created sticky+world-writable
+    (like /tmp itself) so any pool user can create files inside it; the
+    filename carries a uuid so retries never collide or reuse stale content.
+    Override the directory with IRIAI_FULL_DOC_FILE_POINTER_DIR.
+    """
+    import uuid as _uuid
+
+    raw_dir = os.environ.get("IRIAI_FULL_DOC_FILE_POINTER_DIR", "").strip()
+    scratch_dir = Path(raw_dir) if raw_dir else Path(_FULL_DOC_FILE_POINTER_DEFAULT_DIR)
+    scratch_dir.mkdir(parents=True, exist_ok=True)
+    with contextlib.suppress(OSError):
+        os.chmod(scratch_dir, 0o1777)
+    safe_prefix = re.sub(r"[^A-Za-z0-9._-]+", "-", artifact_prefix) or "artifact"
+    safe_slug = re.sub(r"[^A-Za-z0-9._-]+", "-", sf_slug) or "subfeature"
+    return scratch_dir / f"{safe_prefix}-{safe_slug}-{_uuid.uuid4().hex}.md"
+
 
 def _is_single_full_document_replace_patch_set(patch_set: Any) -> bool:
     patches = getattr(patch_set, "patches", None)
@@ -3703,8 +3762,95 @@ def _is_single_full_document_replace_patch_set(patch_set: Any) -> bool:
     )
 
 
+def _is_single_full_document_replace_from_file_patch_set(patch_set: Any) -> bool:
+    patches = getattr(patch_set, "patches", None)
+    if not isinstance(patches, list) or len(patches) != 1:
+        return False
+    patch = patches[0]
+    return (
+        str(getattr(patch, "target", "") or "").strip().upper() == "FULL_DOCUMENT"
+        and str(getattr(patch, "operation", "") or "").strip().lower()
+        == FULL_DOC_REPLACE_FROM_FILE_OPERATION
+    )
+
+
+def _resolve_full_document_replace_from_file(patch_set: Any) -> Any:
+    """Resolve a sanctioned FULL_DOCUMENT ``replace_from_file`` pointer patch.
+
+    The patch ``content`` carries the absolute path of a scratch file the
+    agent WROTE the complete revised document to (raw markdown/HTML, NOT a
+    JSON-wrapped patch set).  Unlike the legacy implicit .json pointer below,
+    this operation is explicitly instructed by the oversized-document
+    revision prompts, so failure to resolve is a hard PatchApplicationError —
+    never a silent fall-through that would let an unreadable/empty pointer
+    masquerade as content.  The returned patch set is a plain inline
+    FULL_DOCUMENT replace, so every existing guard (strict apply, no-change
+    check, size floor, _assert_compile_complete) runs against the RESOLVED
+    content downstream.
+    """
+    from ...models.outputs import ArtifactPatch, ArtifactPatchSet
+
+    patch = patch_set.patches[0]
+    raw_pointer = str(getattr(patch, "content", "") or "").strip().strip("`'\"")
+    if not raw_pointer:
+        raise PatchApplicationError(
+            "FULL_DOCUMENT replace_from_file patch has no file path in `content`"
+        )
+    path = Path(raw_pointer)
+    if not path.is_absolute():
+        raise PatchApplicationError(
+            f"FULL_DOCUMENT replace_from_file path must be absolute: {raw_pointer!r}"
+        )
+    try:
+        stat = path.stat()
+    except OSError as exc:
+        raise PatchApplicationError(
+            f"FULL_DOCUMENT replace_from_file path {raw_pointer!r} is missing "
+            f"or unreadable: {exc}"
+        ) from exc
+    if not path.is_file():
+        raise PatchApplicationError(
+            f"FULL_DOCUMENT replace_from_file path {raw_pointer!r} is not a file"
+        )
+    if stat.st_size > _PATCHSET_POINTER_FILE_MAX_BYTES:
+        raise PatchApplicationError(
+            f"FULL_DOCUMENT replace_from_file path {raw_pointer!r} exceeds the "
+            f"{_PATCHSET_POINTER_FILE_MAX_BYTES} byte cap ({stat.st_size} bytes)"
+        )
+    try:
+        content = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise PatchApplicationError(
+            f"FULL_DOCUMENT replace_from_file path {raw_pointer!r} could not "
+            f"be read: {exc}"
+        ) from exc
+    if not content.strip():
+        raise PatchApplicationError(
+            f"FULL_DOCUMENT replace_from_file path {raw_pointer!r} is empty"
+        )
+    logger.info(
+        "resolved FULL_DOCUMENT replace_from_file pointer: %s (%d bytes)",
+        path, stat.st_size,
+    )
+    return ArtifactPatchSet(
+        patches=[
+            ArtifactPatch(
+                target="FULL_DOCUMENT",
+                operation="replace",
+                content=content,
+                find="",
+                reasoning=str(getattr(patch, "reasoning", "") or ""),
+            )
+        ],
+        summary=str(getattr(patch_set, "summary", "") or ""),
+    )
+
+
 def _resolve_full_document_patchset_file_reference(patch_set: Any) -> Any:
     """Resolve a safe one-level pointer to a FULL_DOCUMENT patch set JSON file."""
+    # Sanctioned explicit pointer (oversized-document path): resolves LOUDLY.
+    if _is_single_full_document_replace_from_file_patch_set(patch_set):
+        return _resolve_full_document_replace_from_file(patch_set)
     if not _is_single_full_document_replace_patch_set(patch_set):
         return patch_set
     patch = patch_set.patches[0]
@@ -4009,6 +4155,23 @@ def _revision_request_done_key(
     return f"revision-request-done:{artifact_prefix}:{sf_slug}:{request_index}"
 
 
+def _revision_failed_key(
+    checkpoint_prefix: str,
+    artifact_prefix: str,
+    sf_slug: str,
+) -> str:
+    """Distinct FAILED marker for a subfeature revision.
+
+    Written when a revision fails terminally so the failure is diagnosable
+    after a restart.  Resume logic treats it as "re-run" (it never causes a
+    skip) — only `revision-done` / `revision-request-done` markers, which are
+    written exclusively on success, gate skipping.
+    """
+    if checkpoint_prefix:
+        return f"revision-failed:{checkpoint_prefix}:{artifact_prefix}:{sf_slug}"
+    return f"revision-failed:{artifact_prefix}:{sf_slug}"
+
+
 def _revision_batch_suffix(batch_entries: list[tuple[int, Any]], *, minimal: bool) -> str:
     indices = [idx for idx, _req in batch_entries]
     if not indices:
@@ -4248,8 +4411,33 @@ def _build_revision_batch_prompt(
     batch_requests_path: str,
     clarification: str = "",
     artifact_is_json: bool = False,
+    file_pointer_path: str = "",
 ) -> str:
     batch_count = len(batch_entries)
+    # Oversized-document escape hatch: when the CURRENT artifact exceeds the
+    # file-pointer threshold, an inline FULL_DOCUMENT regen would blow the
+    # structured-output token cap and arrive truncated.  Instruct the agent
+    # to write the complete document to the sanctioned scratch path instead
+    # and return a tiny replace_from_file pointer patch.  Inline replacement
+    # stays fully supported for everything below the threshold.
+    file_pointer_instruction = (
+        (
+            "LARGE DOCUMENT RULE: the current artifact is too large to return "
+            "inline as a FULL_DOCUMENT replacement — emitting it in structured "
+            "output would exceed the output token cap and arrive truncated "
+            "(which will be rejected). If you need a FULL_DOCUMENT replacement, "
+            "use the Write tool to write the COMPLETE revised document (raw "
+            "artifact content exactly as it should be stored — NOT wrapped in "
+            "JSON) to exactly this path:\n"
+            f"`{file_pointer_path}`\n"
+            "Then return exactly one patch with target 'FULL_DOCUMENT', "
+            f"operation '{FULL_DOC_REPLACE_FROM_FILE_OPERATION}', and content set to exactly "
+            f"'{file_pointer_path}' (leave find empty). Targeted patches are "
+            "still preferred whenever they suffice.\n\n"
+        )
+        if file_pointer_path
+        else ""
+    )
     request_instruction = (
         f"Revision batch request file: `{batch_requests_path}`\n"
         "Read that file and address every request in this batch.\n"
@@ -4319,6 +4507,7 @@ def _build_revision_batch_prompt(
         f"Address ALL {batch_count} change(s) in this batch.\n\n"
         f"{clarification_block}"
         f"{rewrite_instruction}"
+        f"{file_pointer_instruction}"
         f"{artifact_instruction}\n"
         f"{manifest_instruction}"
         f"{decision_instruction}\n"
@@ -4351,6 +4540,7 @@ def _build_revision_full_document_retry_prompt(
     batch_requests_path: str,
     current_headings: list[str],
     rejection_reason: str,
+    file_pointer_path: str = "",
 ) -> str:
     batch_count = len(batch_entries)
     heading_lines = "\n".join(f"- {heading}" for heading in current_headings)
@@ -4372,14 +4562,43 @@ def _build_revision_full_document_retry_prompt(
         if batch_requests_path
         else ""
     )
+    if file_pointer_path:
+        # Oversized document: an inline regen would exceed the 32k
+        # output-token cap and arrive truncated (then be rejected by the
+        # size/completeness guards).  Sanctioned path: WRITE the complete
+        # document to the scratch file and return a tiny pointer patch.
+        recovery_instruction = (
+            "Recovery mode (large document): return exactly one pointer patch. "
+            "The current artifact is too large to return inline — emitting the "
+            "full document in structured output would exceed the output token "
+            "cap and arrive truncated, which will be rejected.\n\n"
+            "Instead, use the Write tool to write the COMPLETE revised artifact "
+            "(raw document content exactly as it should be stored — markdown/"
+            "HTML, NOT wrapped in JSON, NEVER truncated or summarized, "
+            "preserving every existing section and detail not intentionally "
+            "changed by the batch requests) to exactly this path:\n"
+            f"`{file_pointer_path}`\n\n"
+            "Then return exactly one patch with target 'FULL_DOCUMENT', "
+            f"operation '{FULL_DOC_REPLACE_FROM_FILE_OPERATION}', and content set to exactly "
+            f"'{file_pointer_path}'. Leave find empty.\n\n"
+        )
+        closing_instruction = (
+            "Write the complete document to the path above, then return the "
+            f"single FULL_DOCUMENT {FULL_DOC_REPLACE_FROM_FILE_OPERATION} pointer patch only."
+        )
+    else:
+        recovery_instruction = (
+            "Recovery mode: return exactly one patch with target 'FULL_DOCUMENT' "
+            "and operation 'replace'. The content must be the complete revised "
+            "artifact, preserving every existing section and detail not intentionally "
+            "changed by the batch requests.\n\n"
+        )
+        closing_instruction = "Return a single FULL_DOCUMENT replacement patch only."
     return (
         f"Revise the {artifact_prefix} for subfeature '{sf_slug}'.\n\n"
         "Your previous patch output was rejected by the patch guard:\n"
         f"{rejection_reason}\n\n"
-        "Recovery mode: return exactly one patch with target 'FULL_DOCUMENT' "
-        "and operation 'replace'. The content must be the complete revised "
-        "artifact, preserving every existing section and detail not intentionally "
-        "changed by the batch requests.\n\n"
+        f"{recovery_instruction}"
         "Do NOT target non-existent or stale section names. In particular, do "
         "not use headings that are absent from the current artifact.\n\n"
         f"{request_instruction}"
@@ -4389,7 +4608,7 @@ def _build_revision_full_document_retry_prompt(
         f"{decision_instruction}"
         "Current artifact headings detected now:\n"
         f"{heading_lines}\n\n"
-        "Return a single FULL_DOCUMENT replacement patch only."
+        f"{closing_instruction}"
     )
 
 
@@ -4479,7 +4698,10 @@ async def targeted_revision(
                     "targeted_revision: %s:%s already revised — skipping",
                     artifact_prefix, sf_slug,
                 )
-                return "skipped", None
+                # 3-tuple to match every other _revise_one return — the caller
+                # unpacks (status, reason, transient); a 2-tuple here crashed
+                # resumed waves with ValueError.
+                return "skipped", None, False
 
         existing = await runner.artifacts.get(sf_key, feature=feature) or ""
         if not existing:
@@ -4588,6 +4810,12 @@ async def targeted_revision(
                 batch_entries=batch_entries,
                 minimal=minimal,
             )
+            file_pointer_path = (
+                str(_full_doc_file_pointer_scratch_path(artifact_prefix, sf_slug))
+                if len(existing.encode("utf-8"))
+                > _full_doc_file_pointer_threshold_bytes()
+                else ""
+            )
             prompt = _build_revision_batch_prompt(
                 artifact_prefix=artifact_prefix,
                 sf_slug=sf_slug,
@@ -4597,6 +4825,7 @@ async def targeted_revision(
                 decision_context_path=decision_context_path,
                 batch_requests_path=batch_requests_path,
                 artifact_is_json=existing.lstrip().startswith(("{", "[")),
+                file_pointer_path=file_pointer_path,
             )
             patch_set = await runner.run(
                 Ask(
@@ -4694,6 +4923,7 @@ async def targeted_revision(
                     batch_requests_path=batch_requests_path,
                     clarification=answers,
                     artifact_is_json=existing.lstrip().startswith(("{", "[")),
+                    file_pointer_path=file_pointer_path,
                 )
                 patch_set = await runner.run(
                     Ask(
@@ -4733,6 +4963,64 @@ async def targeted_revision(
             else:
                 await runner.artifacts.put(patch_key, "", feature=feature)
 
+        async def _record_batch_failure(
+            batch_entries: list[tuple[int, Any]],
+            *,
+            minimal: bool,
+            reason: str,
+        ) -> None:
+            """A terminally-failed batch must leave NO state that lets a resume
+            skip it or silently replay its rejected content.
+
+            (1) Clear the saved batch patch cache: the patch set is persisted
+            BEFORE the guards run, so after a guard rejection + restart the
+            saved (rejected) patches would be re-applied through the normal
+            path WITHOUT an agent re-run — the exact "failed revision skipped
+            on resume" defect.  Rejected content must be REGENERATED, never
+            replayed.
+            (2) Write a distinct `revision-failed` marker (diagnostic only —
+            resume treats it as "re-run"; done-markers are success-only).
+            Best-effort: recording must never mask the original failure.
+            """
+            try:
+                await _clear_batch_patch_cache(batch_entries, minimal=minimal)
+            except Exception:
+                logger.warning(
+                    "targeted_revision: failed to clear batch patch cache for "
+                    "%s (%s) after failure",
+                    sf_key,
+                    _revision_batch_suffix(batch_entries, minimal=minimal),
+                    exc_info=True,
+                )
+            if checkpoint_prefix:
+                try:
+                    await runner.artifacts.put(
+                        _revision_failed_key(
+                            checkpoint_prefix, artifact_prefix, sf_slug,
+                        ),
+                        f"failed: {reason}",
+                        feature=feature,
+                    )
+                except Exception:
+                    logger.warning(
+                        "targeted_revision: failed to write revision-failed "
+                        "marker for %s",
+                        sf_key,
+                        exc_info=True,
+                    )
+
+        async def _clear_revision_failed_marker() -> None:
+            if not checkpoint_prefix:
+                return
+            failed_key = _revision_failed_key(
+                checkpoint_prefix, artifact_prefix, sf_slug,
+            )
+            delete = getattr(runner.artifacts, "delete", None)
+            if callable(delete):
+                await delete(failed_key, feature=feature)
+            else:
+                await runner.artifacts.put(failed_key, "", feature=feature)
+
         async def _run_full_document_retry(
             batch_entries: list[tuple[int, Any]],
             *,
@@ -4763,6 +5051,15 @@ async def targeted_revision(
                 batch_entries=batch_entries,
                 minimal=minimal,
             )
+            # Oversized documents must NOT be regenerated inline — the 32k
+            # output-token cap truncates them and the guards reject the regen,
+            # losing the cycle.  Instruct the sanctioned file-pointer path.
+            file_pointer_path = (
+                str(_full_doc_file_pointer_scratch_path(artifact_prefix, sf_slug))
+                if len(existing.encode("utf-8"))
+                > _full_doc_file_pointer_threshold_bytes()
+                else ""
+            )
             prompt = _build_revision_full_document_retry_prompt(
                 artifact_prefix=artifact_prefix,
                 sf_slug=sf_slug,
@@ -4773,6 +5070,7 @@ async def targeted_revision(
                 batch_requests_path=batch_requests_path,
                 current_headings=_revision_current_headings(existing),
                 rejection_reason=rejection_reason,
+                file_pointer_path=file_pointer_path,
             )
             patch_set = await runner.run(
                 Ask(
@@ -4824,6 +5122,7 @@ async def targeted_revision(
 
         if not pending_entries:
             if checkpoint_prefix:
+                await _clear_revision_failed_marker()
                 await runner.artifacts.put(
                     f"revision-done:{checkpoint_prefix}:{artifact_prefix}:{sf_slug}",
                     "done",
@@ -4857,12 +5156,18 @@ async def targeted_revision(
                         used_minimal = True
                         patch_set = await _run_batch(batch_entries, minimal=True)
                     except Exception as minimal_exc:
+                        await _record_batch_failure(
+                            batch_entries, minimal=True, reason=str(minimal_exc),
+                        )
                         return (
                             "failed",
                             f"batch {_revision_batch_suffix(batch_entries, minimal=True)} failed: {minimal_exc}",
                             _is_transient_runtime_failure(minimal_exc),
                         )
                 else:
+                    await _record_batch_failure(
+                        batch_entries, minimal=False, reason=str(exc),
+                    )
                     return (
                         "failed",
                         f"batch {_revision_batch_suffix(batch_entries, minimal=False)} failed: {exc}",
@@ -4926,6 +5231,38 @@ async def targeted_revision(
                         f"size guard rejected {artifact_prefix}:{sf_slug} "
                         f"({existing_size} → {revised_size})"
                     )
+                # Completeness guard on FULL_DOCUMENT replacements in the
+                # NORMAL apply path — previously this guard only ran inside
+                # the forced-retry handler, so a full-document patch set
+                # SAVED before a guard rejection (the patch cache is written
+                # before the guards run) could be silently replayed and
+                # ACCEPTED here on resume, dropping subfeature provenance /
+                # CMP bodies while staying above the 50% size floor.  Same
+                # deterministic guard, same arguments as the retry path —
+                # a no-op for documents that carry no SF markers/CMP bodies.
+                if not existing_is_json and any(
+                    str(getattr(patch, "target", "") or "").strip().upper()
+                    == "FULL_DOCUMENT"
+                    and str(getattr(patch, "operation", "") or "")
+                    .strip()
+                    .lower()
+                    in {"replace", "set", "replace_section", "revise"}
+                    for patch in patch_set.patches
+                ):
+                    try:
+                        _assert_compile_complete(
+                            sources_text=existing,
+                            compiled_text=revised_text,
+                            artifact_prefix=artifact_prefix,
+                            stage_label="targeted-revision-batch-full-document",
+                            real_slugs=valid_slugs,
+                        )
+                    except RuntimeError as guard_exc:
+                        raise PatchApplicationError(
+                            "completeness guard rejected FULL_DOCUMENT "
+                            f"patch for {artifact_prefix}:{sf_slug}: "
+                            f"{guard_exc}"
+                        ) from guard_exc
             except PatchApplicationError as exc:
                 retry_key = (
                     tuple(idx for idx, _req in batch_entries),
@@ -5002,6 +5339,15 @@ async def targeted_revision(
                                     f"{guard_exc}"
                                 ) from guard_exc
                     except Exception as fallback_exc:
+                        # The retry saved its (now rejected) patch set to the
+                        # cache BEFORE the guards ran — clear it + record the
+                        # failure so a resume REGENERATES instead of replaying
+                        # the rejected full document.
+                        await _record_batch_failure(
+                            batch_entries,
+                            minimal=used_minimal,
+                            reason=str(fallback_exc),
+                        )
                         return (
                             "failed",
                             "batch "
@@ -5016,6 +5362,9 @@ async def targeted_revision(
                             _revision_batch_suffix(batch_entries, minimal=used_minimal),
                         )
                 else:
+                    await _record_batch_failure(
+                        batch_entries, minimal=used_minimal, reason=str(exc),
+                    )
                     return (
                         "failed",
                         "batch "
@@ -5064,6 +5413,7 @@ async def targeted_revision(
             await _mark_batch_done(batch_entries)
 
         if checkpoint_prefix:
+            await _clear_revision_failed_marker()
             await runner.artifacts.put(
                 f"revision-done:{checkpoint_prefix}:{artifact_prefix}:{sf_slug}",
                 "done",

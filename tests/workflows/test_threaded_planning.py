@@ -15966,6 +15966,208 @@ async def test_plan_review_system_design_cascade_noop_when_flag_off(monkeypatch)
     assert len(sd_dispatches) == 1, dispatches
 
 
+async def _drive_plan_review_blocked_cycle(
+    monkeypatch,
+    *,
+    store: dict[str, str],
+    targeted_revision_impl,
+):
+    """Drive PlanReviewPhase.execute over a persistent ``store`` (so a second
+    call simulates a plain restart) with a swappable targeted_revision fake.
+
+    Cycle 1 is short-circuited via a pre-seeded report + recovered discussion;
+    cycle 2 reviews all approve. Returns the list of dispatched
+    ``(artifact_prefix, RevisionPlan)`` tuples."""
+    phase = PlanReviewPhase()
+    decomposition = _decomposition()
+    state = BuildState(decomposition=decomposition.model_dump_json())
+    feature = SimpleNamespace(id="feat-plan-review-blocked", metadata={})
+
+    review_outcome = ReviewOutcome(
+        approved=False,
+        revision_plan=RevisionPlan(
+            requests=[
+                RevisionRequest(
+                    description="Restore the dropped accounts PRD sections",
+                    reasoning="Revision wave correctness",
+                    affected_subfeatures=["accounts"],
+                    severity="blocker",
+                )
+            ],
+            new_decisions=[],
+        ),
+        complete=True,
+    )
+    discussion_json = (
+        "```json\n"
+        + json.dumps({"output": review_outcome.model_dump(), "complete": True})
+        + "\n```"
+    )
+    store.setdefault(
+        "plan-review-cycle-1",
+        "# Plan Review Report\n\n**1 concerns, 0 gaps** across 2 subfeatures.\n",
+    )
+    store.setdefault("plan-review-discussion-1", discussion_json)
+    store.setdefault("prd:accounts", "# Accounts PRD\n\nold\n")
+
+    class _Artifacts:
+        async def get(self, key: str, *, feature):
+            del feature
+            return store.get(key, "")
+
+        async def put(self, key: str, value: str, *, feature):
+            del feature
+            store[key] = value
+
+        async def delete(self, key: str, *, feature):
+            del feature
+            store.pop(key, None)
+
+    runner = SimpleNamespace(
+        artifacts=_Artifacts(),
+        services={},
+        feature_store=None,
+    )
+
+    async def _approve_reviews(task, feature, phase_name=""):
+        del feature, phase_name
+        if isinstance(task, Ask):
+            return Verdict(approved=True, summary="ok")
+        return None
+
+    runner.run = _approve_reviews
+
+    dispatches: list[tuple[str, RevisionPlan]] = []
+
+    async def _fake_targeted_revision(_runner, _feature, _phase, **kwargs):
+        dispatches.append((kwargs["artifact_prefix"], kwargs["revision_plan"]))
+        return await targeted_revision_impl(**kwargs)
+
+    async def _fake_compile(_runner, _feature, _phase, **kwargs):
+        del _runner, _feature, _phase
+        return f"compiled {kwargs['artifact_prefix']}"
+
+    async def _noop_async(*args, **kwargs):
+        return None
+
+    async def _fake_build_context(*args, **kwargs):
+        return "context"
+
+    async def _fake_build_package(*args, **kwargs):
+        return None
+
+    async def _fake_run_gates(self, runner_arg, feature_arg, state_arg, decomp_arg):
+        del self, runner_arg, feature_arg, decomp_arg
+        state_arg.metadata["ran_gates"] = True
+        return state_arg
+
+    mod = "iriai_build_v2.workflows.planning.phases.plan_review"
+    monkeypatch.setattr(f"{mod}.targeted_revision", _fake_targeted_revision)
+    monkeypatch.setattr(f"{mod}.compile_artifacts", _fake_compile)
+    monkeypatch.setattr(f"{mod}.refresh_decision_ledger", _noop_async)
+    monkeypatch.setattr(f"{mod}.generate_summary", _noop_async)
+    monkeypatch.setattr(f"{mod}._build_sf_review_context", _fake_build_context)
+    monkeypatch.setattr(f"{mod}._build_edge_review_context", _fake_build_context)
+    monkeypatch.setattr(
+        f"{mod}._build_sf_review_context_package", _fake_build_package
+    )
+    monkeypatch.setattr(
+        f"{mod}._build_edge_review_context_package", _fake_build_package
+    )
+    monkeypatch.setattr(f"{mod}.PlanReviewPhase._run_gates", _fake_run_gates)
+
+    await phase.execute(runner, feature, state)
+    return dispatches
+
+
+@pytest.mark.asyncio
+async def test_plan_review_blocked_cycle_leaves_no_revised_marker_and_reruns(
+    monkeypatch,
+):
+    """Fix B-2 (3, cycle level): a BLOCKED revision wave must NOT write the
+    `-revised` marker (which made a plain restart silently skip the failed
+    cycle), and a plain restart must RE-RUN the cycle's revision wave."""
+    from iriai_build_v2.workflows._common._helpers import (
+        TargetedRevisionFailure,
+        TargetedRevisionResult,
+    )
+
+    store: dict[str, str] = {}
+
+    async def _failing_revision(**kwargs):
+        result = TargetedRevisionResult(artifact_prefix=kwargs["artifact_prefix"])
+        result.failed.append(
+            TargetedRevisionFailure(
+                artifact_prefix=kwargs["artifact_prefix"],
+                slug="accounts",
+                reason="completeness guard rejected FULL_DOCUMENT retry",
+                transient=False,
+            )
+        )
+        return result
+
+    with pytest.raises(RuntimeError, match="revisions failed in cycle 1"):
+        await _drive_plan_review_blocked_cycle(
+            monkeypatch, store=store, targeted_revision_impl=_failing_revision,
+        )
+
+    # Blocked marker recorded; NO -revised marker (the old bug wrote both).
+    assert "plan-review-cycle-1-blocked" in store
+    assert "plan-review-cycle-1-revised" not in store
+    # The failure details survive in the blocked report.
+    assert "completeness guard" in store["plan-review-cycle-1-blocked"]
+
+    # ── Plain restart: the cycle must RE-RUN, succeed, and unblock ──
+    async def _succeeding_revision(**kwargs):
+        result = TargetedRevisionResult(artifact_prefix=kwargs["artifact_prefix"])
+        result.revised_slugs.append("accounts")
+        return result
+
+    dispatches = await _drive_plan_review_blocked_cycle(
+        monkeypatch, store=store, targeted_revision_impl=_succeeding_revision,
+    )
+
+    # The revision wave was re-dispatched (not skipped).
+    assert dispatches, "blocked cycle was skipped on restart instead of re-run"
+    assert any(prefix == "prd" for prefix, _plan in dispatches)
+    # Success now records -revised and clears the stale -blocked marker.
+    assert "plan-review-cycle-1-revised" in store
+    assert not store.get("plan-review-cycle-1-blocked", "")
+
+
+@pytest.mark.asyncio
+async def test_plan_review_legacy_blocked_cycle_with_stale_revised_marker_reruns(
+    monkeypatch,
+):
+    """Fix B-2 (3, legacy state): runs that hit the OLD bug have BOTH
+    `-blocked` and `-revised` for the failed cycle. The resume check must
+    treat the lingering blocked marker as authoritative and re-run the cycle
+    instead of advancing past it."""
+    from iriai_build_v2.workflows._common._helpers import TargetedRevisionResult
+
+    store: dict[str, str] = {
+        # Legacy bad state written by the old blocked path.
+        "plan-review-cycle-1-revised": "# Revisions Applied — Cycle 1\n\n- prd: FAILED\n",
+        "plan-review-cycle-1-blocked": "# Plan Review Blocked — Cycle 1\n\nfailures\n",
+    }
+
+    async def _succeeding_revision(**kwargs):
+        result = TargetedRevisionResult(artifact_prefix=kwargs["artifact_prefix"])
+        result.revised_slugs.append("accounts")
+        return result
+
+    dispatches = await _drive_plan_review_blocked_cycle(
+        monkeypatch, store=store, targeted_revision_impl=_succeeding_revision,
+    )
+
+    # Cycle 1 re-ran (a skip would advance with zero dispatches).
+    assert dispatches, "legacy blocked cycle was silently skipped on restart"
+    assert any(prefix == "prd" for prefix, _plan in dispatches)
+    # The re-run rewrote -revised and cleared the stale -blocked marker.
+    assert "FAILED" not in store["plan-review-cycle-1-revised"]
+    assert not store.get("plan-review-cycle-1-blocked", "")
+
+
 @pytest.mark.asyncio
 async def test_scoping_phase_reuses_existing_scope_draft_and_marks_approval(monkeypatch):
     phase = ScopingPhase()
@@ -16575,6 +16777,404 @@ async def test_targeted_revision_full_document_retry_rejects_dropped_marker(tmp_
     assert result.failed
     assert "completeness guard" in result.failed[0].reason
     assert runner.artifacts.store["prd:accounts"] == existing_text
+
+
+# ── Fix B-1/B-2 scaffolding: shared single-SF revision runner ────────────────
+
+_FULLDOC_EXISTING_TEXT = (
+    "<!-- SF: accounts -->\n"
+    "## 1. Overview\nintro\n\n"
+    "#### LoginForm (CMP-1)\nlogin body here with plenty of text to clear floors\n\n"
+    "#### SignupForm (CMP-2)\nsignup body here with plenty of text to clear floors\n"
+)
+
+_FULLDOC_LOSSY_REGEN = (
+    "## 1. Overview\nrewritten intro with plenty of additional padding text "
+    "so the size floor is comfortably cleared and only the markers are lost\n"
+)
+
+_FULLDOC_GOOD_REGEN = (
+    "<!-- SF: accounts -->\n"
+    "## 1. Overview\nrewritten intro carrying every provenance marker\n\n"
+    "#### LoginForm (CMP-1)\nlogin body here with plenty of text to clear floors\n\n"
+    "#### SignupForm (CMP-2)\nsignup body here with plenty of text to clear floors\n"
+)
+
+
+def _single_sf_decomposition() -> SubfeatureDecomposition:
+    return SubfeatureDecomposition(
+        subfeatures=[
+            Subfeature(id="SF-1", slug="accounts", name="Accounts", description="A"),
+        ],
+        edges=[],
+        complete=True,
+    )
+
+
+class _RevisionStore:
+    def __init__(self, initial: dict[str, str]) -> None:
+        self.store: dict[str, str] = dict(initial)
+
+    async def get(self, key: str, *, feature):
+        del feature
+        return self.store.get(key, "")
+
+    async def put(self, key: str, value: str, *, feature):
+        del feature
+        self.store[key] = value
+
+    async def delete(self, key: str, *, feature):
+        del feature
+        self.store.pop(key, None)
+
+
+class _RevisionRunner:
+    """Runner whose agent behavior is a (prompt_index, prompt) -> ArtifactPatchSet
+    responder. Shares an externally-owned artifact store so tests can simulate
+    a restart by constructing a second runner over the same store."""
+
+    def __init__(self, artifacts: _RevisionStore, mirror, responder) -> None:
+        self.artifacts = artifacts
+        self.services = {"artifact_mirror": mirror}
+        self.prompts: list[str] = []
+        self._responder = responder
+
+    async def run(self, task, feature, phase_name=""):
+        del feature, phase_name
+        prompt = getattr(task, "prompt", "")
+        self.prompts.append(prompt)
+        return self._responder(len(self.prompts), prompt)
+
+
+def _stale_then(full_document_responder):
+    """First two attempts return an unmatchable patch (forces guard rejection →
+    cache-clear regen → repeated rejection → FULL_DOCUMENT retry); subsequent
+    prompts are answered by ``full_document_responder``."""
+
+    def _respond(prompt_index: int, prompt: str):
+        if prompt_index <= 2:
+            return ArtifactPatchSet(
+                patches=[
+                    {
+                        "target": "Overview",
+                        "operation": "find_replace",
+                        "content": "x",
+                        "find": "THIS TEXT IS NOT IN THE DOCUMENT",
+                        "reasoning": "force rejection",
+                    }
+                ],
+                summary="",
+            )
+        return full_document_responder(prompt_index, prompt)
+
+    return _respond
+
+
+def _full_document_patch_set(content: str) -> ArtifactPatchSet:
+    return ArtifactPatchSet(
+        patches=[
+            {
+                "target": "FULL_DOCUMENT",
+                "operation": "replace",
+                "content": content,
+                "find": "",
+                "reasoning": "full document regen",
+            }
+        ],
+        summary="",
+    )
+
+
+async def _run_single_sf_revision(runner, feature, *, checkpoint_prefix: str):
+    return await targeted_revision(
+        runner,
+        feature,
+        "plan-review",
+        revision_plan=RevisionPlan(
+            requests=[
+                RevisionRequest(
+                    description="Revise accounts PRD.",
+                    reasoning="Exercise revision failure/resume semantics.",
+                    affected_subfeatures=["accounts"],
+                )
+            ]
+        ),
+        decomposition=_single_sf_decomposition(),
+        base_role=lead_pm_gate_reviewer.role,
+        output_type=PRD,
+        artifact_prefix="prd",
+        checkpoint_prefix=checkpoint_prefix,
+    )
+
+
+@pytest.mark.asyncio
+async def test_targeted_revision_failure_leaves_failed_marker_and_no_skip_state(
+    tmp_path,
+):
+    """Fix B-2 (1): a FAILED revision must leave NO skip-causing marker.
+
+    No revision-done / revision-request-done / patches-applied markers may
+    survive, the saved batch patch cache (written BEFORE the guards run) must
+    be cleared so a resume regenerates instead of replaying rejected content,
+    and a distinct revision-failed marker records the failure."""
+    feature = SimpleNamespace(
+        id="feat-fulldoc-fail-marker", metadata={"_db_phase": "plan-review"}
+    )
+    mirror = _TestMirror(tmp_path / "features")
+    _write_mirror_artifact(
+        mirror,
+        feature_id=feature.id,
+        artifact_key="prd:accounts",
+        text=_FULLDOC_EXISTING_TEXT,
+    )
+    artifacts = _RevisionStore({"prd:accounts": _FULLDOC_EXISTING_TEXT})
+    runner = _RevisionRunner(
+        artifacts,
+        mirror,
+        _stale_then(lambda _i, _p: _full_document_patch_set(_FULLDOC_LOSSY_REGEN)),
+    )
+
+    result = await _run_single_sf_revision(
+        runner, feature, checkpoint_prefix="cycle-fail-marker"
+    )
+
+    assert result.failed
+    assert "completeness guard" in result.failed[0].reason
+    store = artifacts.store
+    # Distinct failed marker is present and carries the reason.
+    failed_marker = store.get("revision-failed:cycle-fail-marker:prd:accounts", "")
+    assert failed_marker.startswith("failed: ")
+    assert "completeness guard" in failed_marker
+    # No skip-causing markers survive the failure.
+    assert "revision-done:cycle-fail-marker:prd:accounts" not in store
+    assert not [k for k in store if k.startswith("revision-request-done:cycle-fail-marker:")]
+    assert not [k for k in store if k.startswith("patches-applied:cycle-fail-marker:")]
+    # The saved (rejected) batch patch cache was cleared — a resume must
+    # REGENERATE, not replay the rejected full document.
+    assert not store.get("patches:cycle-fail-marker:prd:accounts:batch-0", "")
+    # The artifact itself is untouched.
+    assert store["prd:accounts"] == _FULLDOC_EXISTING_TEXT
+
+
+@pytest.mark.asyncio
+async def test_targeted_revision_resume_reruns_previously_failed_revision(tmp_path):
+    """Fix B-2 (2): after a failed revision + restart, the revision RE-RUNS the
+    agent (it is not skipped), and on success the failed marker is cleared and
+    the normal done markers are written."""
+    feature = SimpleNamespace(
+        id="feat-fulldoc-fail-resume", metadata={"_db_phase": "plan-review"}
+    )
+    mirror = _TestMirror(tmp_path / "features")
+    _write_mirror_artifact(
+        mirror,
+        feature_id=feature.id,
+        artifact_key="prd:accounts",
+        text=_FULLDOC_EXISTING_TEXT,
+    )
+    artifacts = _RevisionStore({"prd:accounts": _FULLDOC_EXISTING_TEXT})
+
+    # Run 1: fails (lossy full-document regen rejected by the guards).
+    first_runner = _RevisionRunner(
+        artifacts,
+        mirror,
+        _stale_then(lambda _i, _p: _full_document_patch_set(_FULLDOC_LOSSY_REGEN)),
+    )
+    first = await _run_single_sf_revision(
+        first_runner, feature, checkpoint_prefix="cycle-fail-resume"
+    )
+    assert first.failed
+
+    # Run 2 ("plain restart"): a fresh runner over the SAME store. The agent
+    # must be re-asked (no skip) and now produces a complete document.
+    second_runner = _RevisionRunner(
+        artifacts,
+        mirror,
+        lambda _i, _p: _full_document_patch_set(_FULLDOC_GOOD_REGEN),
+    )
+    second = await _run_single_sf_revision(
+        second_runner, feature, checkpoint_prefix="cycle-fail-resume"
+    )
+
+    assert second.ok is True
+    assert second.revised_slugs == ["accounts"]
+    # The agent actually re-ran — a skip would have produced zero prompts.
+    assert len(second_runner.prompts) >= 1
+    store = artifacts.store
+    assert store["prd:accounts"] == _FULLDOC_GOOD_REGEN.rstrip("\n") + "\n"
+    assert store.get("revision-done:cycle-fail-resume:prd:accounts") == "done"
+    # The failed marker from run 1 was cleared on success.
+    assert "revision-failed:cycle-fail-resume:prd:accounts" not in store
+
+
+@pytest.mark.asyncio
+async def test_targeted_revision_does_not_replay_saved_rejected_full_document(
+    tmp_path,
+):
+    """Fix B-2 RCA guard: the batch patch cache is persisted BEFORE the guards
+    run, so a pre-restart cache holding a REJECTED lossy full-document regen
+    used to be replayed through the normal apply path on resume — which lacked
+    the completeness guard — silently accepting the truncation with no agent
+    re-run. The normal path now runs _assert_compile_complete on FULL_DOCUMENT
+    replacements: the replay is rejected, the cache cleared, and the agent
+    regenerates."""
+    feature = SimpleNamespace(
+        id="feat-fulldoc-replay-hole", metadata={"_db_phase": "plan-review"}
+    )
+    mirror = _TestMirror(tmp_path / "features")
+    _write_mirror_artifact(
+        mirror,
+        feature_id=feature.id,
+        artifact_key="prd:accounts",
+        text=_FULLDOC_EXISTING_TEXT,
+    )
+    artifacts = _RevisionStore(
+        {
+            "prd:accounts": _FULLDOC_EXISTING_TEXT,
+            # Simulates the pre-restart state: the rejected lossy regen is
+            # still sitting in the saved batch patch cache.
+            "patches:cycle-replay:prd:accounts:batch-0": _full_document_patch_set(
+                _FULLDOC_LOSSY_REGEN
+            ).model_dump_json(indent=2),
+        }
+    )
+    runner = _RevisionRunner(
+        artifacts,
+        mirror,
+        lambda _i, _p: _full_document_patch_set(_FULLDOC_GOOD_REGEN),
+    )
+
+    result = await _run_single_sf_revision(
+        runner, feature, checkpoint_prefix="cycle-replay"
+    )
+
+    assert result.ok is True
+    assert result.revised_slugs == ["accounts"]
+    # The lossy cached regen was never accepted; the agent re-ran and the
+    # complete document was stored.
+    assert artifacts.store["prd:accounts"] == _FULLDOC_GOOD_REGEN.rstrip("\n") + "\n"
+    assert len(runner.prompts) >= 1
+
+
+@pytest.mark.asyncio
+async def test_targeted_revision_large_doc_retry_instructs_file_pointer(
+    tmp_path, monkeypatch,
+):
+    """Fix B-1: when the current artifact exceeds the file-pointer threshold,
+    the FULL_DOCUMENT recovery prompt instructs the agent to WRITE the complete
+    document to the sanctioned scratch path and return a replace_from_file
+    pointer patch; the applier resolves the pointer and runs the existing
+    guards against the RESOLVED content."""
+    monkeypatch.setenv("IRIAI_FULL_DOC_FILE_POINTER_THRESHOLD_BYTES", "100")
+    monkeypatch.setenv(
+        "IRIAI_FULL_DOC_FILE_POINTER_DIR", str(tmp_path / "fulldoc-scratch")
+    )
+    feature = SimpleNamespace(
+        id="feat-fulldoc-pointer", metadata={"_db_phase": "plan-review"}
+    )
+    mirror = _TestMirror(tmp_path / "features")
+    _write_mirror_artifact(
+        mirror,
+        feature_id=feature.id,
+        artifact_key="prd:accounts",
+        text=_FULLDOC_EXISTING_TEXT,
+    )
+    artifacts = _RevisionStore({"prd:accounts": _FULLDOC_EXISTING_TEXT})
+
+    def _pointer_responder(_i: int, prompt: str):
+        match = re.search(r"to exactly this path:\n`([^`]+)`", prompt)
+        assert match, "recovery prompt must name the sanctioned scratch path"
+        pointer_path = Path(match.group(1))
+        pointer_path.write_text(_FULLDOC_GOOD_REGEN, encoding="utf-8")
+        return ArtifactPatchSet(
+            patches=[
+                {
+                    "target": "FULL_DOCUMENT",
+                    "operation": "replace_from_file",
+                    "content": str(pointer_path),
+                    "find": "",
+                    "reasoning": "complete document written to scratch file",
+                }
+            ],
+            summary="",
+        )
+
+    runner = _RevisionRunner(artifacts, mirror, _stale_then(_pointer_responder))
+    result = await _run_single_sf_revision(
+        runner, feature, checkpoint_prefix="cycle-pointer"
+    )
+
+    assert result.ok is True
+    assert result.revised_slugs == ["accounts"]
+    assert artifacts.store["prd:accounts"] == _FULLDOC_GOOD_REGEN.rstrip("\n") + "\n"
+    assert len(runner.prompts) == 3
+    # The normal batch prompt advertises the large-document rule…
+    assert "LARGE DOCUMENT RULE" in runner.prompts[0]
+    assert "replace_from_file" in runner.prompts[0]
+    # …and the recovery prompt mandates the file-pointer flow.
+    recovery_prompt = runner.prompts[2]
+    assert "Recovery mode (large document)" in recovery_prompt
+    assert "replace_from_file" in recovery_prompt
+    assert str(tmp_path / "fulldoc-scratch") in recovery_prompt
+    # The scratch path lives under the sanctioned dir, not the workspace tree.
+    saved_pointer_dir = tmp_path / "fulldoc-scratch"
+    assert saved_pointer_dir.is_dir()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pointer_state", ["missing", "empty"])
+async def test_targeted_revision_file_pointer_missing_or_empty_fails_loud(
+    tmp_path, monkeypatch, pointer_state,
+):
+    """Fix B-1 guards: a replace_from_file pointer whose file is missing or
+    empty must be REJECTED loudly — never silently accepted or degraded."""
+    monkeypatch.setenv("IRIAI_FULL_DOC_FILE_POINTER_THRESHOLD_BYTES", "100")
+    monkeypatch.setenv(
+        "IRIAI_FULL_DOC_FILE_POINTER_DIR", str(tmp_path / "fulldoc-scratch")
+    )
+    feature = SimpleNamespace(
+        id=f"feat-fulldoc-pointer-{pointer_state}",
+        metadata={"_db_phase": "plan-review"},
+    )
+    mirror = _TestMirror(tmp_path / "features")
+    _write_mirror_artifact(
+        mirror,
+        feature_id=feature.id,
+        artifact_key="prd:accounts",
+        text=_FULLDOC_EXISTING_TEXT,
+    )
+    artifacts = _RevisionStore({"prd:accounts": _FULLDOC_EXISTING_TEXT})
+
+    def _bad_pointer_responder(_i: int, prompt: str):
+        match = re.search(r"to exactly this path:\n`([^`]+)`", prompt)
+        assert match
+        pointer_path = Path(match.group(1))
+        if pointer_state == "empty":
+            pointer_path.write_text("", encoding="utf-8")
+        return ArtifactPatchSet(
+            patches=[
+                {
+                    "target": "FULL_DOCUMENT",
+                    "operation": "replace_from_file",
+                    "content": str(pointer_path),
+                    "find": "",
+                    "reasoning": "pointer to bad scratch file",
+                }
+            ],
+            summary="",
+        )
+
+    runner = _RevisionRunner(artifacts, mirror, _stale_then(_bad_pointer_responder))
+    result = await _run_single_sf_revision(
+        runner, feature, checkpoint_prefix=f"cycle-bad-pointer-{pointer_state}"
+    )
+
+    assert result.failed
+    assert "replace_from_file" in result.failed[0].reason
+    # Nothing was written; no skip-causing state survives.
+    assert artifacts.store["prd:accounts"] == _FULLDOC_EXISTING_TEXT
+    prefix = f"cycle-bad-pointer-{pointer_state}"
+    assert f"revision-done:{prefix}:prd:accounts" not in artifacts.store
+    assert not artifacts.store.get(f"patches:{prefix}:prd:accounts:batch-0", "")
 
 
 @pytest.mark.asyncio

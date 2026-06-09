@@ -924,7 +924,16 @@ class PlanReviewPhase(Phase):
             already_revised = await runner.artifacts.get(
                 f"plan-review-cycle-{cycle + 1}-revised", feature=feature,
             )
-            if existing_report and already_revised:
+            # A BLOCKED cycle (revision wave failed → RuntimeError raised) must
+            # NOT be skipped on a plain restart.  Legacy runs wrote BOTH
+            # `-blocked` and `-revised` on the blocked path, so `-revised`
+            # alone is not proof of success — re-run the cycle whenever the
+            # blocked marker is still present (it is cleared when the re-run
+            # completes cleanly).
+            cycle_blocked = await runner.artifacts.get(
+                f"plan-review-cycle-{cycle + 1}-blocked", feature=feature,
+            )
+            if existing_report and already_revised and not cycle_blocked:
                 # Report exists AND revisions already applied — advance
                 logger.info(
                     "Cycle %d already revised — advancing to next cycle",
@@ -933,6 +942,12 @@ class PlanReviewPhase(Phase):
                 cycle += 1
                 continue
             elif existing_report and _is_valid_report(existing_report):
+                if cycle_blocked:
+                    logger.warning(
+                        "Cycle %d was previously BLOCKED (revision wave failed) "
+                        "— re-running it instead of skipping",
+                        cycle + 1,
+                    )
                 logger.info(
                     "Valid review report exists for cycle %d — skipping to discussion",
                     cycle + 1,
@@ -1463,20 +1478,24 @@ class PlanReviewPhase(Phase):
                         "stopped before downstream verification and task planning.\n\n"
                         "## Failures\n\n"
                         + "\n".join(f"- {failure}" for failure in blocked_failures)
+                        + (
+                            "\n\n## Revision Results\n\n"
+                            + "\n".join(f"- {r}" for r in revision_results)
+                            if revision_results
+                            else ""
+                        )
                     )
                     blocked_key = f"plan-review-cycle-{cycle + 1}-blocked"
                     await runner.artifacts.put(blocked_key, blocked_report, feature=feature)
                     mirror = runner.services.get("artifact_mirror")
                     if mirror:
                         mirror.write_artifact(feature.id, blocked_key, blocked_report)
-                    await runner.artifacts.put(
-                        f"plan-review-cycle-{cycle + 1}-revised",
-                        (
-                            f"# Revisions Applied — Cycle {cycle + 1}\n\n"
-                            + "\n".join(f"- {r}" for r in revision_results)
-                        ),
-                        feature=feature,
-                    )
+                    # Deliberately NO `-revised` marker here: this cycle FAILED.
+                    # Writing `-revised` made a plain restart treat the blocked
+                    # cycle as complete and silently skip re-running it (the
+                    # resume check at the top of the loop advances on
+                    # report+revised).  The revision results are preserved in
+                    # the blocked report above.
                     await runner.run(
                         Notify(
                             message=(
@@ -1723,20 +1742,20 @@ class PlanReviewPhase(Phase):
                         "stopped before downstream verification and task planning.\n\n"
                         "## Failures\n\n"
                         + "\n".join(f"- {failure}" for failure in blocked_failures)
+                        + (
+                            "\n\n## Revision Results\n\n"
+                            + "\n".join(f"- {r}" for r in revision_results)
+                            if revision_results
+                            else ""
+                        )
                     )
                     blocked_key = f"plan-review-cycle-{cycle + 1}-blocked"
                     await runner.artifacts.put(blocked_key, blocked_report, feature=feature)
                     mirror = runner.services.get("artifact_mirror")
                     if mirror:
                         mirror.write_artifact(feature.id, blocked_key, blocked_report)
-                    await runner.artifacts.put(
-                        f"plan-review-cycle-{cycle + 1}-revised",
-                        (
-                            f"# Revisions Applied — Cycle {cycle + 1}\n\n"
-                            + "\n".join(f"- {r}" for r in revision_results)
-                        ),
-                        feature=feature,
-                    )
+                    # Deliberately NO `-revised` marker here: this cycle FAILED
+                    # (see the matching comment on the first blocked block).
                     await runner.run(
                         Notify(
                             message=(
@@ -1773,6 +1792,16 @@ class PlanReviewPhase(Phase):
                     revision_summary,
                     feature=feature,
                 )
+                # Clear any stale `-blocked` marker from a previously failed
+                # attempt at this cycle — the resume check treats a lingering
+                # blocked marker as "re-run this cycle", which would loop
+                # forever once the re-run has actually succeeded.
+                _blocked_key = f"plan-review-cycle-{cycle + 1}-blocked"
+                _delete = getattr(runner.artifacts, "delete", None)
+                if callable(_delete):
+                    await _delete(_blocked_key, feature=feature)
+                else:
+                    await runner.artifacts.put(_blocked_key, "", feature=feature)
 
                 # Notify user of revision results
                 await runner.run(
