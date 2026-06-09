@@ -104,6 +104,14 @@ DEFAULT_PROBE_FAILED_AFTER_SECONDS = float(
 DEFAULT_RECENT_USAGE_WINDOW_SECONDS = float(
     os.environ.get("IRIAI_CLAUDE_POOL_RECENT_USAGE_WINDOW_SECONDS", "21600") or "21600"
 )
+# When NO pool member is available (e.g. every account hit its usage window at
+# once), wait up to this many seconds for a member to recover instead of
+# raising and crashing the whole workflow. Usage windows reset on their own
+# within minutes-to-hours, so waiting is almost always the right call. ``0``
+# disables waiting and preserves the previous fail-fast behavior exactly.
+DEFAULT_USAGE_WAIT_MAX_SECONDS = float(
+    os.environ.get("IRIAI_CLAUDE_POOL_USAGE_WAIT_MAX_SECONDS", "7200") or "7200"
+)
 DEFAULT_AVAILABILITY_TIMEOUT_SECONDS = float(
     os.environ.get("IRIAI_CLAUDE_POOL_AVAILABILITY_TIMEOUT_SECONDS", "45") or "45"
 )
@@ -1051,6 +1059,11 @@ def _optional_int(value: Any) -> int | None:
         return None
 
 
+def _now() -> datetime:
+    """Current UTC time. Module-level seam so tests can inject a fake clock."""
+    return datetime.now(UTC)
+
+
 def _classify_claude_pool_error(error: str) -> str | None:
     lowered = error.lower()
     if "overloaded_error" in lowered or '"message":"overloaded"' in lowered or "overloaded" in lowered:
@@ -1322,7 +1335,7 @@ class ClaudePoolRuntime(AgentRuntime):
             else:
                 session = await self.session_store.load(session_key)
 
-        profile = await self._select_profile(
+        profile, _waited = await self._select_profile_waiting(
             session_key=session_key,
             persistent=persistent,
             exclude_kinds=self._excluded_kinds_for_role(role),
@@ -1495,6 +1508,102 @@ class ClaudePoolRuntime(AgentRuntime):
             self._record_profile_dispatch(data, profile)
             _write_json_atomic(path, data)
             return profile
+
+    _NO_PROFILE_AVAILABLE_MARKER = "No Claude pool profile is currently available"
+
+    def _next_probe_sleep_seconds(self) -> tuple[float, datetime | None]:
+        """Seconds to sleep until the earliest ``probe_after`` among profiles.
+
+        Reads the live profile-state file (not the raised error message, which
+        would be fragile to parse) and clamps the sleep to [15, 120] seconds so
+        the wait loop neither spins nor oversleeps a recovery.
+        """
+        state = _read_json(_profile_state_path(self.root), {})
+        profile_state = state.get("profiles") if isinstance(state, dict) else {}
+        now = _now()
+        earliest: datetime | None = None
+        if isinstance(profile_state, dict):
+            for profile in self.profiles:
+                record = profile_state.get(profile.name)
+                if not isinstance(record, dict):
+                    continue
+                until = _profile_probe_after(record)
+                if until is None:
+                    continue
+                if earliest is None or until < earliest:
+                    earliest = until
+        raw = (earliest - now).total_seconds() if earliest is not None else 60.0
+        return (min(max(raw, 15.0), 120.0), earliest)
+
+    async def _select_profile_waiting(
+        self,
+        *,
+        session_key: str | None,
+        persistent: bool,
+        exclude_kinds: frozenset[str] = frozenset(),
+        already_waited_seconds: float = 0.0,
+    ) -> tuple[ClaudePoolProfile, float]:
+        """Select a profile, waiting for quota/availability recovery if needed.
+
+        Wraps :meth:`_select_profile`. When it raises the all-unavailable
+        RuntimeError and waiting is enabled (``DEFAULT_USAGE_WAIT_MAX_SECONDS``
+        > 0), sleep until the earliest readiness probe and retry, bounded by
+        the wall-clock deadline (``already_waited_seconds`` carries wait time
+        already consumed by earlier calls in the same failover loop). With
+        waiting disabled (env ``0``) the original exception is re-raised
+        unchanged, preserving the previous fail-fast behavior byte-for-byte.
+
+        Returns ``(profile, waited_seconds_this_call)``; a positive second
+        element means an all-unavailable wait occurred and a member recovered.
+        """
+        max_wait = DEFAULT_USAGE_WAIT_MAX_SECONDS
+        started = _now()
+        waited = False
+        while True:
+            try:
+                profile = await self._select_profile(
+                    session_key=session_key,
+                    persistent=persistent,
+                    exclude_kinds=exclude_kinds,
+                )
+            except RuntimeError as exc:
+                if self._NO_PROFILE_AVAILABLE_MARKER not in str(exc):
+                    raise
+                if max_wait <= 0:
+                    raise
+                local_waited = (_now() - started).total_seconds()
+                elapsed = already_waited_seconds + local_waited
+                if elapsed >= max_wait:
+                    raise RuntimeError(
+                        "Claude pool exhausted: all members unavailable and "
+                        f"none recovered after waiting {elapsed:.0f}s "
+                        f"(IRIAI_CLAUDE_POOL_USAGE_WAIT_MAX_SECONDS={max_wait:.0f}): "
+                        f"{exc}"
+                    ) from exc
+                sleep_seconds, next_probe = self._next_probe_sleep_seconds()
+                logger.warning(
+                    "Claude pool: ALL members unavailable; waiting for "
+                    "quota/availability reset (elapsed %.0fs / max %.0fs; "
+                    "next readiness probe after %s)",
+                    elapsed,
+                    max_wait,
+                    next_probe.isoformat() if next_probe else "unknown",
+                )
+                waited = True
+                await asyncio.sleep(sleep_seconds)
+                continue
+            local_waited = (_now() - started).total_seconds()
+            if waited:
+                logger.info(
+                    "Claude pool: member %s recovered after %.0fs wait; "
+                    "resuming dispatch",
+                    profile.name,
+                    already_waited_seconds + local_waited,
+                )
+                # Strictly positive so callers can use ``waited > 0`` as the
+                # "a wait actually occurred" signal even with sub-ms clocks.
+                return (profile, max(local_waited, 0.001))
+            return (profile, 0.0)
 
     def _sync_affinity_weights(self, affinity_data: dict[str, Any]) -> None:
         weights = {profile.name: profile.weight for profile in self.profiles}
@@ -1803,13 +1912,32 @@ class ClaudePoolRuntime(AgentRuntime):
         last_error: RuntimeError | None = None
         exclude_kinds = self._excluded_kinds_for_role(role)
 
-        for _ in range(max(len(self.profiles), 1)):
+        # Bounded while-loop instead of a fixed for-loop: when an
+        # all-unavailable wait recovers a member (see _select_profile_waiting)
+        # the ``attempted`` set is cleared so the recovered profile can be
+        # re-attempted. The attempt cap plus the wall-clock wait deadline
+        # (threaded via ``total_waited_seconds``) bound pathological cases.
+        # With waiting disabled (DEFAULT_USAGE_WAIT_MAX_SECONDS == 0) the
+        # attempt cap and every raise message match the previous behavior.
+        base_attempts = max(len(self.profiles), 1)
+        max_attempts = (
+            base_attempts * 3 if DEFAULT_USAGE_WAIT_MAX_SECONDS > 0 else base_attempts
+        )
+        total_waited_seconds = 0.0
+        attempts = 0
+
+        while attempts < max_attempts:
+            attempts += 1
             if self._profile_is_unavailable(profile.name):
-                profile = await self._select_profile(
+                profile, waited = await self._select_profile_waiting(
                     session_key=session_key,
                     persistent=persistent,
                     exclude_kinds=exclude_kinds,
+                    already_waited_seconds=total_waited_seconds,
                 )
+                if waited > 0:
+                    total_waited_seconds += waited
+                    attempted.clear()
             attempted.add(profile.name)
             try:
                 return await self._submit_and_wait(
@@ -1833,15 +1961,19 @@ class ClaudePoolRuntime(AgentRuntime):
                     kind,
                 )
                 try:
-                    next_profile = await self._select_profile(
+                    next_profile, waited = await self._select_profile_waiting(
                         session_key=session_key,
                         persistent=persistent,
                         exclude_kinds=exclude_kinds,
+                        already_waited_seconds=total_waited_seconds,
                     )
                 except RuntimeError as select_exc:
                     raise RuntimeError(
                         f"Claude pool exhausted after {kind} on {profile.name}: {select_exc}"
                     ) from exc
+                if waited > 0:
+                    total_waited_seconds += waited
+                    attempted.clear()
                 if next_profile.name in attempted:
                     break
                 profile = next_profile
