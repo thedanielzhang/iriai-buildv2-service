@@ -178,6 +178,8 @@ async def _run_resume(
     workspace: str,
     *,
     agent_runtime: str = "claude",
+    runtime_policy: str = DEFAULT_RUNTIME_POLICY,
+    single_agent_runtime: bool = False,
     driver: str | None = None,
     from_phase: str | None = None,
 ) -> None:
@@ -232,6 +234,8 @@ async def _run_resume(
             interaction_runtimes={"terminal": interaction_runtime, "auto": interaction_runtime},
             on_message=print_stream,
             agent_runtime_name=agent_runtime,
+            runtime_policy=normalize_runtime_policy(runtime_policy),
+            single_agent_runtime=single_agent_runtime,
         )
 
         feature = await env.feature_store.get_feature(feature_id)
@@ -374,12 +378,29 @@ def plan(
     default=None,
     help="Agent runtime to use for workflow agents (claude, claude_pool, or codex).",
 )
+@click.option(
+    "--runtime-policy",
+    type=click.Choice(list(SUPPORTED_RUNTIME_POLICIES)),
+    default=DEFAULT_RUNTIME_POLICY,
+    show_default=True,
+    help=(
+        "Runtime routing policy. 'alternating' (default) spreads planning "
+        "fan-out ~50/50 across the Claude primary and Codex secondary."
+    ),
+)
+@click.option(
+    "--claude-only",
+    is_flag=True,
+    help="When using Claude primary, also use Claude as the secondary runtime (no alternation).",
+)
 def resume(
     feature_id: str,
     workspace: str,
     from_phase: str | None,
     driver: str | None,
     agent_runtime: str | None,
+    runtime_policy: str,
+    claude_only: bool,
 ) -> None:
     """Resume an interrupted workflow from its last persisted phase.
 
@@ -393,11 +414,22 @@ def resume(
         resolved_runtime = normalize_agent_runtime(agent_runtime)
     except ValueError as exc:
         raise click.BadParameter(str(exc), param_hint="--agent-runtime") from exc
+    try:
+        resolved_runtime_policy = normalize_runtime_policy(runtime_policy)
+    except ValueError as exc:
+        raise click.BadParameter(str(exc), param_hint="--runtime-policy") from exc
+    if claude_only and resolved_runtime not in {"claude", "claude_pool"}:
+        raise click.BadParameter(
+            "--claude-only can only be used with Claude or Claude pool as the primary runtime.",
+            param_hint="--claude-only",
+        )
     asyncio.run(
         _run_resume(
             feature_id,
             workspace,
             agent_runtime=resolved_runtime,
+            runtime_policy=resolved_runtime_policy,
+            single_agent_runtime=claude_only,
             driver=driver,
             from_phase=from_phase,
         )
