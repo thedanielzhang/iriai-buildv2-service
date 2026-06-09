@@ -2151,9 +2151,9 @@ async def test_codex_probe_failure_re_marks_member(tmp_path: Path):
     assert state["profiles"]["codex"]["reason"] == "usage_limited"
 
 
-# 9. bound write-producing role excludes codex (binding minted runtime=claude_pool).
+# 9. bound write-producing role remains eligible for codex.
 @pytest.mark.asyncio
-async def test_bound_write_role_excludes_codex_member(tmp_path: Path):
+async def test_bound_write_role_can_select_codex_member(tmp_path: Path):
     runtime = _runtime_with_fake_codex(tmp_path)
     cwd = tmp_path / "sandbox"
     cwd.mkdir()
@@ -2169,10 +2169,10 @@ async def test_bound_write_role_excludes_codex_member(tmp_path: Path):
             }
         },
     )
-    assert runtime._excluded_kinds_for_role(role) == frozenset({"codex"})
+    assert runtime._excluded_kinds_for_role(role) == frozenset()
 
     # Drive codex to be the least-loaded member (so it WOULD win selection for
-    # an unconstrained role): give every claude member prior dispatch load.
+    # the bound write role): give every claude member prior dispatch load.
     affinity = {
         "next_index": 0,
         "session_profiles": {},
@@ -2194,14 +2194,52 @@ async def test_bound_write_role_excludes_codex_member(tmp_path: Path):
     unconstrained = await runtime._select_best_available_profile(affinity, {})
     assert unconstrained.name == "codex"
 
-    # Bound write-producing role -> codex is excluded, a claude member is chosen
-    # instead. The binding was minted runtime=="claude_pool"; the embedded codex
-    # would reject it, so the additive filter keeps it off codex.
+    # Bound write-producing role -> codex is still eligible; dispatch adapts the
+    # role binding immediately before invoking the embedded Codex runtime.
     bound = await runtime._select_best_available_profile(
         affinity, {}, exclude_kinds=runtime._excluded_kinds_for_role(role)
     )
-    assert bound.kind == "claude"
-    assert bound.name != "codex"
+    assert bound.name == "codex"
+    assert bound.kind == "codex"
+
+
+# 9a. codex dispatch rewrites only the binding runtime on the cloned role.
+@pytest.mark.asyncio
+async def test_submit_and_wait_codex_adapts_binding_runtime_only(tmp_path: Path):
+    runtime = _runtime_with_fake_codex(tmp_path)
+    codex_profile = next(p for p in runtime.profiles if p.kind == "codex")
+    cwd = tmp_path / "sandbox"
+    cwd.mkdir()
+    binding = {
+        "runtime": "claude_pool",
+        "cwd": str(cwd),
+        "manifest_path": str(cwd / "sandbox-manifest.json"),
+        "sandbox_id": "sandbox-04",
+        "writable_roots": [str(cwd / "src")],
+        "expires_at": (datetime.now(UTC) + timedelta(hours=1)).isoformat(),
+    }
+    role = Role(
+        name="implementer",
+        prompt="Implement.",
+        tools=["Write", "Edit"],
+        metadata={"runtime_workspace_binding": binding, "write_producing": True},
+    )
+
+    await runtime._submit_and_wait(
+        role,
+        "Do it.",
+        output_type=None,
+        workspace=SimpleNamespace(path=cwd),
+        session_key="implementer:feat-1",
+        profile=codex_profile,
+    )
+
+    assert len(runtime._codex_runtime.calls) == 1
+    passed_role = runtime._codex_runtime.calls[0]["role"]
+    passed_binding = passed_role.metadata["runtime_workspace_binding"]
+    assert passed_role is not role
+    assert passed_binding == {**binding, "runtime": "codex"}
+    assert role.metadata["runtime_workspace_binding"] == binding
 
 
 # 9b. a binding-less write role (planning artifact author) still reaches codex.
@@ -2212,7 +2250,11 @@ def test_binding_less_write_role_does_not_exclude_codex(tmp_path: Path):
 
 
 # 10. factory wiring.
-def test_factory_agent_pool_resolves_to_claude_pool_runtime(tmp_path: Path):
+def test_factory_agent_pool_resolves_to_claude_pool_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    import iriai_build_v2.runtimes.claude_pool as claude_pool_module
     from iriai_build_v2.runtimes import (
         create_agent_runtime,
         normalize_agent_runtime,
@@ -2225,6 +2267,8 @@ def test_factory_agent_pool_resolves_to_claude_pool_runtime(tmp_path: Path):
     # Its own secondary -> alternation bypassed.
     assert secondary_agent_runtime_name("agent_pool", single_runtime=True) == "agent_pool"
 
+    monkeypatch.setattr(claude_pool_module, "DEFAULT_POOL_ROOT", tmp_path)
+    monkeypatch.setenv("IRIAI_CLAUDE_POOL_PROFILES", "iriai-claude-1")
     runtime = create_agent_runtime(
         "agent_pool",
         session_store=None,

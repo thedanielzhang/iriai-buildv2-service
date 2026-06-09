@@ -243,6 +243,16 @@ def _runtime_workspace_binding(role: Any) -> dict[str, Any] | None:
     return dict(raw)
 
 
+def _role_for_codex_dispatch(role: Role) -> Role:
+    binding = _runtime_workspace_binding(role)
+    if binding is None:
+        return role
+
+    metadata = dict(getattr(role, "metadata", None) or {})
+    metadata[_RUNTIME_WORKSPACE_BINDING_KEY] = {**binding, "runtime": "codex"}
+    return role.model_copy(update={"metadata": metadata})
+
+
 def _profile_runtime_scratch_roots(profile: ClaudePoolProfile) -> list[Path]:
     try:
         home = Path(pwd.getpwnam(profile.user).pw_dir)
@@ -1427,16 +1437,10 @@ class ClaudePoolRuntime(AgentRuntime):
     def _excluded_kinds_for_role(self, role: Role) -> frozenset[str]:
         """Kinds that cannot serve *role* and must be skipped during selection.
 
-        A BOUND write-producing role (one carrying a runtime workspace binding)
-        is excluded from codex members: the binding was minted with
-        runtime == "claude_pool" and CodexAgentRuntime rejects bound write roles
-        whose binding runtime != "codex". Everything else (read roles,
-        structured-output roles, and binding-less write roles such as planning
-        artifact authors) can rotate to / spill to codex co-equally.
+        Bound workspace roles remain eligible for Codex members: the dispatch
+        path adapts the binding runtime to ``"codex"`` immediately before
+        invoking the embedded Codex runtime.
         """
-        binding = _runtime_workspace_binding(role)
-        if binding and _role_is_write_producing(role):
-            return frozenset({"codex"})
         return frozenset()
 
     async def _select_profile(
@@ -1540,12 +1544,9 @@ class ClaudePoolRuntime(AgentRuntime):
         available: list[ClaudePoolProfile] = []
         unavailable: list[tuple[datetime, ClaudePoolProfile]] = []
         for profile in self.profiles:
-            # Bound-write authority filter (additive). A codex member's embedded
-            # CodexAgentRuntime validates that a write-producing binding carries
-            # runtime == "codex"; the pool mints runtime == "claude_pool", so a
-            # BOUND write-producing role cannot run on codex. Exclude codex from
-            # selection for those roles only. Read roles, structured-output
-            # roles, and binding-less write roles still rotate/spill to codex.
+            # Capability filter (additive). Codex members stay eligible for
+            # bound workspace roles; their binding is adapted just before the
+            # embedded CodexAgentRuntime sees it.
             if profile.kind in exclude_kinds:
                 continue
             record = profile_state.get(profile.name) if isinstance(profile_state, dict) else None
@@ -1862,10 +1863,11 @@ class ClaudePoolRuntime(AgentRuntime):
             raise RuntimeError(
                 f"Claude pool codex member {profile.name} has no embedded codex runtime"
             )
+        codex_role = _role_for_codex_dispatch(role)
         self._record_codex_dispatch_active(profile.name, 1)
         try:
             result = await self._codex_runtime.invoke(
-                role,
+                codex_role,
                 prompt,
                 output_type=output_type,
                 workspace=workspace,
