@@ -4561,6 +4561,120 @@ async def test_targeted_revision_marks_failure_after_exhausting_single_request_r
     assert runner.ask_count == 2
 
 
+@pytest.mark.asyncio
+async def test_targeted_revision_recovers_stale_markdown_section_targets_with_full_document_retry(
+    tmp_path,
+):
+    feature = SimpleNamespace(id="feat-prd-stale-target-retry", metadata={})
+    decomposition = _decomposition()
+    mirror = _TestMirror(tmp_path / "features")
+    existing_text = (
+        "# Accounts PRD\n\n"
+        "## Requirements\n\n"
+        "REQ-1: Accounts can sign in.\n\n"
+        "## Journeys\n\n"
+        "J-1: User signs in.\n"
+    )
+    revised_text = (
+        "# Accounts PRD\n\n"
+        "## Requirements\n\n"
+        "REQ-1: Accounts can sign in with the guarded retry behavior documented.\n\n"
+        "## Journeys\n\n"
+        "J-1: User signs in.\n"
+    )
+    _write_mirror_artifact(
+        mirror,
+        feature_id=feature.id,
+        artifact_key="prd:accounts",
+        text=existing_text,
+    )
+
+    class _Artifacts:
+        def __init__(self) -> None:
+            self.store: dict[str, str] = {"prd:accounts": existing_text}
+
+        async def get(self, key: str, *, feature):
+            del feature
+            return self.store.get(key, "")
+
+        async def put(self, key: str, value: str, *, feature):
+            del feature
+            self.store[key] = value
+
+        async def delete(self, key: str, *, feature):
+            del feature
+            self.store.pop(key, None)
+
+    class _Runner:
+        def __init__(self) -> None:
+            self.artifacts = _Artifacts()
+            self.services = {"artifact_mirror": mirror}
+            self.prompts: list[str] = []
+
+        async def run(self, task, feature, phase_name=""):
+            del feature, phase_name
+            self.prompts.append(task.prompt)
+            if len(self.prompts) <= 2:
+                return ArtifactPatchSet(
+                    patches=[
+                        {
+                            "target": "## 1. Architecture Summary",
+                            "operation": "replace",
+                            "content": "## 1. Architecture Summary\n\nStale section content.\n",
+                            "find": "",
+                            "reasoning": "stale section-targeted patch",
+                        }
+                    ],
+                    summary="",
+                )
+            return ArtifactPatchSet(
+                patches=[
+                    {
+                        "target": "FULL_DOCUMENT",
+                        "operation": "replace",
+                        "content": revised_text,
+                        "find": "",
+                        "reasoning": "recover with complete document",
+                    }
+                ],
+                summary="",
+            )
+
+    runner = _Runner()
+    result = await targeted_revision(
+        runner,
+        feature,
+        "plan-review",
+        revision_plan=RevisionPlan(
+            requests=[
+                RevisionRequest(
+                    description="Document the guarded retry behavior.",
+                    reasoning="Plan review requested a PRD correction.",
+                    affected_subfeatures=["accounts"],
+                )
+            ]
+        ),
+        decomposition=decomposition,
+        base_role=lead_pm_gate_reviewer.role,
+        output_type=PRD,
+        artifact_prefix="prd",
+        checkpoint_prefix="cycle-stale-target",
+    )
+
+    assert result.ok is True
+    assert result.revised_slugs == ["accounts"]
+    assert runner.artifacts.store["prd:accounts"] == revised_text.rstrip("\n") + "\n"
+    assert len(runner.prompts) == 3
+    fallback_prompt = runner.prompts[2]
+    assert (
+        "Recovery mode: return exactly one patch with target 'FULL_DOCUMENT'"
+        in fallback_prompt
+    )
+    assert "Do NOT target non-existent or stale section names" in fallback_prompt
+    assert "- Requirements" in fallback_prompt
+    assert "- Journeys" in fallback_prompt
+
+
 def test_offload_if_large_returns_absolute_prompt_path(tmp_path):
     large_prompt = "x" * 100_001
 

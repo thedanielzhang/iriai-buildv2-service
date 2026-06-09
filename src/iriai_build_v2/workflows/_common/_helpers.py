@@ -3867,6 +3867,13 @@ def _sync_revision_artifact_mirror_from_store(
     return str(final_path)
 
 
+def _revision_current_headings(text: str, *, limit: int = 40) -> list[str]:
+    return [
+        _clean_header(header)
+        for header, _level, _start, _end in _parse_markdown_sections(text)[:limit]
+    ]
+
+
 def _estimate_revision_request_size(request: Any) -> int:
     return (
         len(getattr(request, "description", "") or "")
@@ -4248,6 +4255,59 @@ def _build_revision_batch_prompt(
     )
 
 
+def _build_revision_full_document_retry_prompt(
+    *,
+    artifact_prefix: str,
+    sf_slug: str,
+    batch_entries: list[tuple[int, Any]],
+    artifact_instruction: str,
+    manifest_path: str,
+    decision_context_path: str,
+    batch_requests_path: str,
+    current_headings: list[str],
+    rejection_reason: str,
+) -> str:
+    batch_count = len(batch_entries)
+    heading_lines = "\n".join(f"- {heading}" for heading in current_headings)
+    if not heading_lines:
+        heading_lines = "- No markdown/HTML headings were detected in the current artifact."
+    manifest_instruction = (
+        f"Revision source manifest: `{manifest_path}`\n"
+        if manifest_path
+        else ""
+    )
+    decision_instruction = (
+        f"Revision decision context: `{decision_context_path}`\n"
+        if decision_context_path
+        else ""
+    )
+    request_instruction = (
+        f"Revision batch request file: `{batch_requests_path}`\n"
+        "Read that file and address every request in this batch.\n"
+        if batch_requests_path
+        else ""
+    )
+    return (
+        f"Revise the {artifact_prefix} for subfeature '{sf_slug}'.\n\n"
+        "Your previous patch output was rejected by the patch guard:\n"
+        f"{rejection_reason}\n\n"
+        "Recovery mode: return exactly one patch with target 'FULL_DOCUMENT' "
+        "and operation 'replace'. The content must be the complete revised "
+        "artifact, preserving every existing section and detail not intentionally "
+        "changed by the batch requests.\n\n"
+        "Do NOT target non-existent or stale section names. In particular, do "
+        "not use headings that are absent from the current artifact.\n\n"
+        f"{request_instruction}"
+        f"Address ALL {batch_count} change(s) in this batch.\n\n"
+        f"{artifact_instruction}\n"
+        f"{manifest_instruction}"
+        f"{decision_instruction}"
+        "Current artifact headings detected now:\n"
+        f"{heading_lines}\n\n"
+        "Return a single FULL_DOCUMENT replacement patch only."
+    )
+
+
 async def targeted_revision(
     runner: WorkflowRunner,
     feature: Feature,
@@ -4585,6 +4645,83 @@ async def targeted_revision(
             else:
                 await runner.artifacts.put(patch_key, "", feature=feature)
 
+        async def _run_full_document_retry(
+            batch_entries: list[tuple[int, Any]],
+            *,
+            minimal: bool,
+            rejection_reason: str,
+        ) -> ArtifactPatchSet:
+            await _clear_agent_session(runner, revision_actor, feature)
+            artifact_instruction = (
+                f"Read the current artifact from: `{current_artifact_path}`\n"
+                if current_artifact_path
+                else f"Current artifact:\n{existing}"
+            )
+            batch_requests_path = await _write_revision_batch_requests(
+                runner,
+                feature,
+                artifact_prefix=artifact_prefix,
+                sf_slug=sf_slug,
+                batch_entries=batch_entries,
+                minimal=minimal,
+            )
+            decision_context_path = await _write_revision_decision_context(
+                runner,
+                feature,
+                artifact_prefix=artifact_prefix,
+                sf_slug=sf_slug,
+                revision_plan=revision_plan,
+                prior_decisions=prior_decisions,
+                batch_entries=batch_entries,
+                minimal=minimal,
+            )
+            prompt = _build_revision_full_document_retry_prompt(
+                artifact_prefix=artifact_prefix,
+                sf_slug=sf_slug,
+                batch_entries=batch_entries,
+                artifact_instruction=artifact_instruction,
+                manifest_path=manifest_path,
+                decision_context_path=decision_context_path,
+                batch_requests_path=batch_requests_path,
+                current_headings=_revision_current_headings(existing),
+                rejection_reason=rejection_reason,
+            )
+            patch_set = await runner.run(
+                Ask(
+                    actor=revision_actor,
+                    prompt=prompt,
+                    output_type=ArtifactPatchSet,
+                ),
+                feature,
+                phase_name=phase_name,
+            )
+            if (
+                len(patch_set.patches) != 1
+                or str(
+                    getattr(patch_set.patches[0], "target", "") or "",
+                ).strip().upper()
+                != "FULL_DOCUMENT"
+                or str(
+                    getattr(patch_set.patches[0], "operation", "") or "",
+                ).strip().lower()
+                != "replace"
+            ):
+                raise PatchApplicationError(
+                    "FULL_DOCUMENT retry must return exactly one FULL_DOCUMENT replace patch"
+                )
+            await runner.artifacts.put(
+                _revision_batch_patch_key(
+                    checkpoint_prefix,
+                    artifact_prefix,
+                    sf_slug,
+                    batch_entries,
+                    minimal=minimal,
+                ),
+                patch_set.model_dump_json(indent=2),
+                feature=feature,
+            )
+            return patch_set
+
         pending_entries = []
         for idx, req in enumerate(requests):
             marker = await runner.artifacts.get(
@@ -4720,13 +4857,58 @@ async def targeted_revision(
                         exc,
                     )
                     continue
-                return (
-                    "failed",
-                    "batch "
-                    f"{_revision_batch_suffix(batch_entries, minimal=used_minimal)} "
-                    f"rejected by patch guard after retry: {exc}",
-                    False,  # inapplicable/generated patch content — not transient
-                )
+                if not existing_is_json:
+                    try:
+                        logger.warning(
+                            "targeted_revision: forcing FULL_DOCUMENT retry for %s "
+                            "(%s) after repeated patch guard rejection: %s",
+                            sf_key,
+                            _revision_batch_suffix(batch_entries, minimal=used_minimal),
+                            exc,
+                        )
+                        patch_set = await _run_full_document_retry(
+                            batch_entries,
+                            minimal=used_minimal,
+                            rejection_reason=str(exc),
+                        )
+                        revised_text = _apply_patches(
+                            existing,
+                            patch_set.patches,
+                            strict=True,
+                        )
+                        if revised_text == existing:
+                            raise PatchApplicationError(
+                                "FULL_DOCUMENT retry made no changes to "
+                                f"{artifact_prefix}:{sf_slug}"
+                            )
+                        revised_size = len(revised_text)
+                        if existing_size > 0 and revised_size < existing_size * 0.5:
+                            raise PatchApplicationError(
+                                f"size guard rejected {artifact_prefix}:{sf_slug} "
+                                f"({existing_size} → {revised_size})"
+                            )
+                    except Exception as fallback_exc:
+                        return (
+                            "failed",
+                            "batch "
+                            f"{_revision_batch_suffix(batch_entries, minimal=used_minimal)} "
+                            f"rejected by patch guard after full-document retry: {fallback_exc}",
+                            _is_transient_runtime_failure(fallback_exc),
+                        )
+                    else:
+                        logger.info(
+                            "targeted_revision: recovered %s (%s) with FULL_DOCUMENT retry",
+                            sf_key,
+                            _revision_batch_suffix(batch_entries, minimal=used_minimal),
+                        )
+                else:
+                    return (
+                        "failed",
+                        "batch "
+                        f"{_revision_batch_suffix(batch_entries, minimal=used_minimal)} "
+                        f"rejected by patch guard after retry: {exc}",
+                        False,  # inapplicable/generated patch content — not transient
+                    )
 
             await runner.artifacts.put(sf_key, revised_text, feature=feature)
             await _refresh_public_exhibit_after_artifact(runner, feature, sf_key)
