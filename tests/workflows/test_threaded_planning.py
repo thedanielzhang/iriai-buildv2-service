@@ -102,6 +102,8 @@ from iriai_build_v2.workflows.planning.phases.subfeature import (
 from iriai_build_v2.workflows._common._helpers import (
     _apply_patches,
     _assert_compile_complete,
+    _find_section,
+    _parse_markdown_sections,
     _compile_piece_sentinel_ok,
     _write_revision_decision_context,
     _clear_agent_session,
@@ -16098,6 +16100,197 @@ def test_apply_patches_supports_common_alias_operations():
 
     assert "new text" in revised
     assert "## Appendix\nextra" in revised
+
+
+def test_find_section_normalized_match_tolerates_whitespace_and_slash_spacing():
+    """The exact `_clean_header` rule misses headers that differ only by
+    internal whitespace or ` / ` vs `/` spacing; the normalized-match fallback
+    must still locate the section instead of forcing a full-document rewrite."""
+    text = (
+        "## 1. Overview\nintro\n\n"
+        "## 2. Services/Components\nservice body\n\n"
+        "## 3. Data  Model\ndata body\n"
+    )
+    sections = _parse_markdown_sections(text)
+
+    # ' / ' spacing in the target vs '/' in the real header.
+    match = _find_section(sections, "2. Services / Components")
+    assert match is not None
+    assert match[0] == "## 2. Services/Components"
+
+    # Internal double-space in the real header, single space in the target.
+    match2 = _find_section(sections, "3. Data Model")
+    assert match2 is not None
+    assert match2[0] == "## 3. Data  Model"
+
+
+def test_apply_patches_find_replace_matches_normalized_header():
+    """find_replace whose target differs from the real header only by ` / ` vs
+    `/` spacing must now APPLY (via the normalized fallback) instead of being
+    skipped and falling back to a full rewrite."""
+    text = (
+        "## 1. Overview\nintro\n\n"
+        "## 2. Services / Components\nold service text\n"
+    )
+    patches = [
+        SimpleNamespace(
+            target="2. Services/Components",
+            operation="find_replace",
+            content="new service text",
+            find="old service text",
+            reasoning="",
+        ),
+    ]
+
+    revised = _apply_patches(text, patches)
+
+    assert "new service text" in revised
+    assert "old service text" not in revised
+
+
+def test_apply_patches_find_replace_honors_occurrence_for_duplicate_headers():
+    """A duplicate-header occurrence=2 find_replace must edit the SECOND
+    matching section, leaving the first untouched — exercised through the
+    normalized fallback path as well."""
+    text = (
+        "## Services / Components\nfirst body\n\n"
+        "## Other\nmiddle\n\n"
+        "## Services/Components\nsecond body\n"
+    )
+    patches = [
+        SimpleNamespace(
+            target="Services/Components",
+            operation="find_replace",
+            content="second body REVISED",
+            find="second body",
+            reasoning="",
+            occurrence=2,
+        ),
+    ]
+
+    revised = _apply_patches(text, patches)
+
+    assert "first body" in revised
+    assert "second body REVISED" in revised
+    # The first occurrence's body is left intact.
+    assert revised.count("first body") == 1
+
+
+@pytest.mark.asyncio
+async def test_targeted_revision_full_document_retry_rejects_dropped_marker(tmp_path):
+    """DEFECT-2 guard: after repeated patch-guard rejection, the FULL_DOCUMENT
+    retry output is now completeness-guarded. A regen that stays above the 50%
+    size floor but silently DROPS a subfeature provenance marker / CMP body
+    must be REJECTED (fail loud), not accepted and written."""
+    feature = SimpleNamespace(
+        id="feat-fulldoc-guard", metadata={"_db_phase": "plan-review"}
+    )
+    decomposition = SubfeatureDecomposition(
+        subfeatures=[
+            Subfeature(id="SF-1", slug="accounts", name="Accounts", description="A"),
+        ],
+        edges=[],
+        complete=True,
+    )
+    mirror = _TestMirror(tmp_path / "features")
+    # Existing doc carries the SF marker + two CMP component bodies.
+    existing_text = (
+        "<!-- SF: accounts -->\n"
+        "## 1. Overview\nintro\n\n"
+        "#### LoginForm (CMP-1)\nlogin body here with plenty of text to clear floors\n\n"
+        "#### SignupForm (CMP-2)\nsignup body here with plenty of text to clear floors\n"
+    )
+    # Regen stays well above 50% size but drops the SF marker AND both CMP bodies.
+    lossy_regen = (
+        "## 1. Overview\nrewritten intro with plenty of additional padding text "
+        "so the size floor is comfortably cleared and only the markers are lost\n"
+    )
+    _write_mirror_artifact(
+        mirror,
+        feature_id=feature.id,
+        artifact_key="prd:accounts",
+        text=existing_text,
+    )
+
+    class _Artifacts:
+        def __init__(self) -> None:
+            self.store: dict[str, str] = {"prd:accounts": existing_text}
+
+        async def get(self, key: str, *, feature):
+            del feature
+            return self.store.get(key, "")
+
+        async def put(self, key: str, value: str, *, feature):
+            del feature
+            self.store[key] = value
+
+        async def delete(self, key: str, *, feature):
+            del feature
+            self.store.pop(key, None)
+
+    class _Runner:
+        def __init__(self) -> None:
+            self.artifacts = _Artifacts()
+            self.services = {"artifact_mirror": mirror}
+            self.prompts: list[str] = []
+
+        async def run(self, task, feature, phase_name=""):
+            del feature, phase_name
+            self.prompts.append(getattr(task, "prompt", ""))
+            # First two batch attempts: a find_replace whose find text is NOT
+            # present, so the patch guard rejects → forces FULL_DOCUMENT retry.
+            if len(self.prompts) <= 2:
+                return ArtifactPatchSet(
+                    patches=[
+                        {
+                            "target": "Overview",
+                            "operation": "find_replace",
+                            "content": "x",
+                            "find": "THIS TEXT IS NOT IN THE DOCUMENT",
+                            "reasoning": "force rejection",
+                        }
+                    ],
+                    summary="",
+                )
+            # FULL_DOCUMENT retry returns the lossy regen.
+            return ArtifactPatchSet(
+                patches=[
+                    {
+                        "target": "FULL_DOCUMENT",
+                        "operation": "replace",
+                        "content": lossy_regen,
+                        "find": "",
+                        "reasoning": "lossy full-document regen",
+                    }
+                ],
+                summary="",
+            )
+
+    runner = _Runner()
+    result = await targeted_revision(
+        runner,
+        feature,
+        "plan-review",
+        revision_plan=RevisionPlan(
+            requests=[
+                RevisionRequest(
+                    description="Revise accounts PRD.",
+                    reasoning="Exercise full-document completeness guard.",
+                    affected_subfeatures=["accounts"],
+                )
+            ]
+        ),
+        decomposition=decomposition,
+        base_role=lead_pm_gate_reviewer.role,
+        output_type=PRD,
+        artifact_prefix="prd",
+        checkpoint_prefix="cycle-fulldoc",
+    )
+
+    # The lossy regen must be REJECTED, never written to the store.
+    assert result.failed
+    assert "completeness guard" in result.failed[0].reason
+    assert runner.artifacts.store["prd:accounts"] == existing_text
 
 
 @pytest.mark.asyncio

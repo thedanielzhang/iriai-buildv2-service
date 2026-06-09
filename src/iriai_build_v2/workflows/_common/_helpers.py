@@ -3647,6 +3647,26 @@ def _find_section(
             found += 1
             if found == occurrence:
                 return (header, level, start, end)
+
+    # Normalized-match FALLBACK — tried ONLY after the exact rule above finds
+    # nothing, so currently-passing matches are never altered.  Collapses
+    # internal whitespace, normalizes ` / ` vs `/` spacing, and lowercases so
+    # targets like '2. Services / Components' still match a real header such as
+    # '## 2. Services/Components' (or one with a double space) instead of
+    # forcing a needless full-document regeneration.  Safe because find_replace
+    # independently re-checks `patch.find in section_text` before mutating, so
+    # a looser section hit cannot mis-edit content.
+    def _norm(s: str) -> str:
+        return re.sub(r"\s+", " ", s).replace(" / ", "/").strip().lower()
+
+    target_norm = _norm(target_clean)
+    found = 0
+    for header, level, start, end in sections:
+        header_norm = _norm(_clean_header(header))
+        if header_norm.startswith(target_norm) or target_norm in header_norm:
+            found += 1
+            if found == occurrence:
+                return (header, level, start, end)
     return None
 
 
@@ -4944,6 +4964,31 @@ async def targeted_revision(
                                 f"size guard rejected {artifact_prefix}:{sf_slug} "
                                 f"({existing_size} → {revised_size})"
                             )
+                        # Completeness guard on the regenerated full document —
+                        # the size floor (>= 50%) is NOT enough: a regen can stay
+                        # large while silently dropping subfeature provenance
+                        # markers / CMP component bodies that the prior doc had.
+                        # Reuse the same deterministic guard the compile path
+                        # runs (sources_text=prior doc which already carries the
+                        # `<!-- SF: -->` markers, compiled_text=the regen), so a
+                        # lossy full-document retry HARD-FAILS instead of being
+                        # accepted.  `real_slugs=valid_slugs` mirrors the compile
+                        # call so only real subfeatures are required to survive.
+                        if not existing_is_json:
+                            try:
+                                _assert_compile_complete(
+                                    sources_text=existing,
+                                    compiled_text=revised_text,
+                                    artifact_prefix=artifact_prefix,
+                                    stage_label="targeted-revision-full-document",
+                                    real_slugs=valid_slugs,
+                                )
+                            except RuntimeError as guard_exc:
+                                raise PatchApplicationError(
+                                    "completeness guard rejected FULL_DOCUMENT "
+                                    f"retry for {artifact_prefix}:{sf_slug}: "
+                                    f"{guard_exc}"
+                                ) from guard_exc
                     except Exception as fallback_exc:
                         return (
                             "failed",
