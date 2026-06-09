@@ -4675,6 +4675,127 @@ async def test_targeted_revision_recovers_stale_markdown_section_targets_with_fu
     assert "- Journeys" in fallback_prompt
 
 
+@pytest.mark.asyncio
+async def test_targeted_revision_resolves_full_document_retry_patchset_pointer(
+    tmp_path,
+):
+    feature = SimpleNamespace(id="feat-prd-patchset-pointer", metadata={})
+    decomposition = _decomposition()
+    mirror = _TestMirror(tmp_path / "features")
+    existing_text = (
+        "# Accounts PRD\n\n"
+        "## Requirements\n\n"
+        "REQ-1: Accounts can sign in.\n"
+    )
+    revised_text = (
+        "# Accounts PRD\n\n"
+        "## Requirements\n\n"
+        "REQ-1: Accounts can sign in with the file pointer retry documented.\n"
+    )
+    pointer_patchset_path = tmp_path / "s3b-prd-patch.json"
+    pointer_patchset_path.write_text(
+        ArtifactPatchSet(
+            patches=[
+                {
+                    "target": "FULL_DOCUMENT",
+                    "operation": "replace",
+                    "content": revised_text,
+                    "find": "",
+                    "reasoning": "real full document replacement",
+                }
+            ],
+            summary="",
+        ).model_dump_json(indent=2),
+        encoding="utf-8",
+    )
+    _write_mirror_artifact(
+        mirror,
+        feature_id=feature.id,
+        artifact_key="prd:accounts",
+        text=existing_text,
+    )
+
+    class _Artifacts:
+        def __init__(self) -> None:
+            self.store: dict[str, str] = {"prd:accounts": existing_text}
+
+        async def get(self, key: str, *, feature):
+            del feature
+            return self.store.get(key, "")
+
+        async def put(self, key: str, value: str, *, feature):
+            del feature
+            self.store[key] = value
+
+        async def delete(self, key: str, *, feature):
+            del feature
+            self.store.pop(key, None)
+
+    class _Runner:
+        def __init__(self) -> None:
+            self.artifacts = _Artifacts()
+            self.services = {"artifact_mirror": mirror}
+            self.prompts: list[str] = []
+
+        async def run(self, task, feature, phase_name=""):
+            del feature, phase_name
+            self.prompts.append(task.prompt)
+            if len(self.prompts) <= 2:
+                return ArtifactPatchSet(
+                    patches=[
+                        {
+                            "target": "## Missing Section",
+                            "operation": "replace",
+                            "content": "## Missing Section\n\nStale target.\n",
+                            "find": "",
+                            "reasoning": "force full document retry",
+                        }
+                    ],
+                    summary="",
+                )
+            return ArtifactPatchSet(
+                patches=[
+                    {
+                        "target": "FULL_DOCUMENT",
+                        "operation": "replace",
+                        "content": (
+                            f"{pointer_patchset_path} contains the complete revised "
+                            "artifact content. Use the already-written file."
+                        ),
+                        "find": "",
+                        "reasoning": "pointer to patchset file",
+                    }
+                ],
+                summary="",
+            )
+
+    runner = _Runner()
+    result = await targeted_revision(
+        runner,
+        feature,
+        "plan-review",
+        revision_plan=RevisionPlan(
+            requests=[
+                RevisionRequest(
+                    description="Document the retry behavior.",
+                    reasoning="Plan review requested the PRD correction.",
+                    affected_subfeatures=["accounts"],
+                )
+            ]
+        ),
+        decomposition=decomposition,
+        base_role=lead_pm_gate_reviewer.role,
+        output_type=PRD,
+        artifact_prefix="prd",
+        checkpoint_prefix="cycle-patchset-pointer",
+    )
+
+    assert result.ok is True
+    assert result.revised_slugs == ["accounts"]
+    assert runner.artifacts.store["prd:accounts"] == revised_text.rstrip("\n") + "\n"
+    assert len(runner.prompts) == 3
+
+
 def test_offload_if_large_returns_absolute_prompt_path(tmp_path):
     large_prompt = "x" * 100_001
 

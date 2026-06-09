@@ -3667,6 +3667,59 @@ class PatchApplicationError(ValueError):
     """Raised when a generated artifact patch cannot be applied safely."""
 
 
+_PATCHSET_POINTER_MAX_CHARS = 1_000
+_PATCHSET_POINTER_FILE_MAX_BYTES = 5 * 1024 * 1024
+_ABSOLUTE_JSON_PATH_RE = re.compile(r"(/[^\s`'\"<>]+?\.json)\b")
+
+
+def _is_single_full_document_replace_patch_set(patch_set: Any) -> bool:
+    patches = getattr(patch_set, "patches", None)
+    if not isinstance(patches, list) or len(patches) != 1:
+        return False
+    patch = patches[0]
+    return (
+        str(getattr(patch, "target", "") or "").strip().upper() == "FULL_DOCUMENT"
+        and str(getattr(patch, "operation", "") or "").strip().lower() == "replace"
+    )
+
+
+def _resolve_full_document_patchset_file_reference(patch_set: Any) -> Any:
+    """Resolve a safe one-level pointer to a FULL_DOCUMENT patch set JSON file."""
+    if not _is_single_full_document_replace_patch_set(patch_set):
+        return patch_set
+    patch = patch_set.patches[0]
+    content = str(getattr(patch, "content", "") or "")
+    if not content or len(content) > _PATCHSET_POINTER_MAX_CHARS:
+        return patch_set
+    match = _ABSOLUTE_JSON_PATH_RE.search(content)
+    if not match:
+        return patch_set
+
+    path = Path(match.group(1))
+    try:
+        stat = path.stat()
+    except OSError:
+        return patch_set
+    if (
+        not path.is_absolute()
+        or path.suffix.lower() != ".json"
+        or not path.is_file()
+        or stat.st_size > _PATCHSET_POINTER_FILE_MAX_BYTES
+    ):
+        return patch_set
+
+    try:
+        from ...models.outputs import ArtifactPatchSet
+
+        resolved = ArtifactPatchSet.model_validate_json(path.read_text(encoding="utf-8"))
+    except Exception:
+        return patch_set
+    if not _is_single_full_document_replace_patch_set(resolved):
+        return patch_set
+    logger.info("resolved FULL_DOCUMENT patch set file reference: %s", path)
+    return resolved
+
+
 def _apply_patches(text: str, patches: list, *, strict: bool = False) -> str:
     """Apply section-level patches to markdown/HTML text.
 
@@ -4466,6 +4519,7 @@ async def targeted_revision(
             if saved_json:
                 try:
                     patch_set = ArtifactPatchSet.model_validate(_json.loads(saved_json))
+                    patch_set = _resolve_full_document_patchset_file_reference(patch_set)
                     logger.info(
                         "targeted_revision: loaded saved batch patches for %s (%s)",
                         sf_key,
@@ -4521,6 +4575,7 @@ async def targeted_revision(
                 feature,
                 phase_name=phase_name,
             )
+            patch_set = _resolve_full_document_patchset_file_reference(patch_set)
 
             if not patch_set.patches and patch_set.summary:
                 logger.info(
@@ -4617,6 +4672,7 @@ async def targeted_revision(
                     feature,
                     phase_name=phase_name,
                 )
+                patch_set = _resolve_full_document_patchset_file_reference(patch_set)
 
             await runner.artifacts.put(
                 patch_key, patch_set.model_dump_json(indent=2), feature=feature,
@@ -4695,6 +4751,7 @@ async def targeted_revision(
                 feature,
                 phase_name=phase_name,
             )
+            patch_set = _resolve_full_document_patchset_file_reference(patch_set)
             if (
                 len(patch_set.patches) != 1
                 or str(
