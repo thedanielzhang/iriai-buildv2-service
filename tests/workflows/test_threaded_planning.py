@@ -15740,6 +15740,231 @@ async def test_plan_review_still_uses_decomposition_edges_for_edge_reviews(monke
     assert result.metadata["ran_gates"] is True
 
 
+async def _drive_plan_review_cascade(
+    monkeypatch,
+    *,
+    revision_requests: list[RevisionRequest],
+    seed_artifacts: dict[str, str],
+):
+    """Drive PlanReviewPhase.execute through one revision wave and capture every
+    targeted_revision dispatch.
+
+    Cycle 1 is short-circuited via the "valid report exists" continue path
+    (a pre-seeded ``plan-review-cycle-1`` report) so the phase jumps straight to
+    the recovered discussion → revision wave → cascades. Cycle 2 runs reviews
+    that all approve, ending the loop. Returns the list of
+    ``(artifact_prefix, RevisionPlan)`` dispatched through targeted_revision.
+    """
+    from iriai_build_v2.workflows._common._helpers import TargetedRevisionResult
+
+    phase = PlanReviewPhase()
+    decomposition = _decomposition()
+    state = BuildState(decomposition=decomposition.model_dump_json())
+    feature = SimpleNamespace(id="feat-plan-review-cascade", metadata={})
+
+    review_outcome = ReviewOutcome(
+        approved=False,
+        revision_plan=RevisionPlan(requests=revision_requests, new_decisions=[]),
+        complete=True,
+    )
+    discussion_json = (
+        "```json\n"
+        + json.dumps({"output": review_outcome.model_dump(), "complete": True})
+        + "\n```"
+    )
+
+    store: dict[str, str] = {
+        "plan-review-cycle-1": (
+            "# Plan Review Report\n\n**1 concerns, 0 gaps** across 2 subfeatures.\n"
+        ),
+        "plan-review-discussion-1": discussion_json,
+    }
+    store.update(seed_artifacts)
+
+    class _Artifacts:
+        async def get(self, key: str, *, feature):
+            del feature
+            return store.get(key, "")
+
+        async def put(self, key: str, value: str, *, feature):
+            del feature
+            store[key] = value
+
+    runner = SimpleNamespace(
+        artifacts=_Artifacts(),
+        services={},
+        feature_store=None,
+    )
+
+    async def _approve_reviews(task, feature, phase_name=""):
+        # Cycle-2 reviews + Notify tasks: approve everything so the loop ends.
+        del feature, phase_name
+        if isinstance(task, Ask):
+            return Verdict(approved=True, summary="ok")
+        return None
+
+    runner.run = _approve_reviews
+
+    dispatches: list[tuple[str, RevisionPlan]] = []
+
+    async def _fake_targeted_revision(_runner, _feature, _phase, **kwargs):
+        dispatches.append((kwargs["artifact_prefix"], kwargs["revision_plan"]))
+        return TargetedRevisionResult(artifact_prefix=kwargs["artifact_prefix"])
+
+    async def _fake_compile(_runner, _feature, _phase, **kwargs):
+        del _runner, _feature, _phase
+        return f"compiled {kwargs['artifact_prefix']}"
+
+    async def _noop_async(*args, **kwargs):
+        return None
+
+    async def _fake_build_context(*args, **kwargs):
+        return "context"
+
+    async def _fake_build_package(*args, **kwargs):
+        # Return None so the phase falls back to inline context (no mirror).
+        return None
+
+    async def _fake_run_gates(self, runner_arg, feature_arg, state_arg, decomp_arg):
+        del self, runner_arg, feature_arg, decomp_arg
+        state_arg.metadata["ran_gates"] = True
+        return state_arg
+
+    mod = "iriai_build_v2.workflows.planning.phases.plan_review"
+    monkeypatch.setattr(f"{mod}.targeted_revision", _fake_targeted_revision)
+    monkeypatch.setattr(f"{mod}.compile_artifacts", _fake_compile)
+    monkeypatch.setattr(f"{mod}.refresh_decision_ledger", _noop_async)
+    monkeypatch.setattr(f"{mod}.generate_summary", _noop_async)
+    monkeypatch.setattr(f"{mod}._build_sf_review_context", _fake_build_context)
+    monkeypatch.setattr(f"{mod}._build_edge_review_context", _fake_build_context)
+    monkeypatch.setattr(
+        f"{mod}._build_sf_review_context_package", _fake_build_package
+    )
+    monkeypatch.setattr(
+        f"{mod}._build_edge_review_context_package", _fake_build_package
+    )
+    monkeypatch.setattr(
+        f"{mod}.PlanReviewPhase._run_gates", _fake_run_gates
+    )
+
+    await phase.execute(runner, feature, state)
+    return dispatches
+
+
+@pytest.mark.asyncio
+async def test_plan_review_test_plan_cascade_forwards_requirement_signal(monkeypatch):
+    # Fix A: the per-SF test-plan cascade must forward the AC-coverage signal
+    # (affected_requirement_ids + severity + cross_subfeature) so the
+    # test-planner gains ACs for new/changed REQs in the SAME cycle, breaking
+    # the producer-consumer lag loop.
+    req = RevisionRequest(
+        description="Add new requirement REQ-accounts-9 for SSO login",
+        reasoning="User decided SSO is in scope",
+        affected_subfeatures=["accounts"],
+        affected_requirement_ids=["REQ-accounts-9", "REQ-accounts-10"],
+        severity="major",
+        cross_subfeature=True,
+    )
+    dispatches = await _drive_plan_review_cascade(
+        monkeypatch,
+        revision_requests=[req],
+        seed_artifacts={
+            "test-plan:accounts": "## Acceptance Criteria\n\n- AC-accounts-1\n",
+        },
+    )
+
+    test_plan_dispatches = [
+        plan for prefix, plan in dispatches if prefix == "test-plan"
+    ]
+    assert len(test_plan_dispatches) == 1, dispatches
+    forwarded = test_plan_dispatches[0].requests
+    assert len(forwarded) == 1
+    fwd = forwarded[0]
+    # The REQ-ids survive the cascade rebuild (previously dropped).
+    assert fwd.affected_requirement_ids == ["REQ-accounts-9", "REQ-accounts-10"]
+    assert fwd.severity == "major"
+    assert fwd.cross_subfeature is True
+    assert fwd.affected_subfeatures == ["accounts"]
+
+
+@pytest.mark.asyncio
+async def test_plan_review_system_design_cascade_dispatches_when_flag_on(monkeypatch):
+    # Fix B (flag ON): a peer system-design artifact gets a targeted revision
+    # dispatch in the same cycle, forwarding the requirement signal.
+    monkeypatch.setattr(
+        "iriai_build_v2.workflows.planning.phases.plan_review.PLAN_REVIEW_SD_CASCADE",
+        True,
+    )
+    req = RevisionRequest(
+        description="Account service now needs an event bus topic",
+        reasoning="New async decision",
+        affected_subfeatures=["accounts"],
+        affected_requirement_ids=["REQ-accounts-12"],
+        severity="blocker",
+        cross_subfeature=False,
+    )
+    dispatches = await _drive_plan_review_cascade(
+        monkeypatch,
+        revision_requests=[req],
+        seed_artifacts={
+            "system-design:accounts": "# System Design — accounts\n\nold\n",
+        },
+    )
+
+    # The main _ARTIFACT_CONFIGS wave dispatches system-design once (the request
+    # touches system-design:accounts); the cascade adds a SECOND, terminal
+    # per-SF dispatch. Flag ON => 2 system-design dispatches.
+    sd_dispatches = [
+        plan for prefix, plan in dispatches if prefix == "system-design"
+    ]
+    assert len(sd_dispatches) == 2, dispatches
+    # Every dispatched system-design request forwards the requirement signal.
+    for plan in sd_dispatches:
+        assert len(plan.requests) == 1
+        fwd = plan.requests[0]
+        assert fwd.affected_subfeatures == ["accounts"]
+        assert fwd.affected_requirement_ids == ["REQ-accounts-12"]
+        assert fwd.severity == "blocker"
+        assert fwd.cross_subfeature is False
+
+
+@pytest.mark.asyncio
+async def test_plan_review_system_design_cascade_noop_when_flag_off(monkeypatch):
+    # Fix B (flag OFF, default): NO extra system-design cascade dispatch — the
+    # flag-off path must be a strict no-op (additivity / no regression).
+    monkeypatch.setattr(
+        "iriai_build_v2.workflows.planning.phases.plan_review.PLAN_REVIEW_SD_CASCADE",
+        False,
+    )
+    req = RevisionRequest(
+        description="Account service now needs an event bus topic",
+        reasoning="New async decision",
+        affected_subfeatures=["accounts"],
+        affected_requirement_ids=["REQ-accounts-12"],
+        severity="blocker",
+        cross_subfeature=False,
+    )
+    dispatches = await _drive_plan_review_cascade(
+        monkeypatch,
+        revision_requests=[req],
+        seed_artifacts={
+            "system-design:accounts": "# System Design — accounts\n\nold\n",
+        },
+    )
+
+    # The main wave dispatches the request against the system-design artifact
+    # config too, but NO terminal system-design *cascade* dispatch should appear
+    # beyond it. With the flag off there is exactly the main-wave dispatch and
+    # no cascade-specific re-dispatch. Assert there is no extra dispatch beyond
+    # what the main _ARTIFACT_CONFIGS wave produces for this single request.
+    sd_dispatches = [
+        plan for prefix, plan in dispatches if prefix == "system-design"
+    ]
+    # Main wave dispatches system-design once (from _ARTIFACT_CONFIGS); the
+    # cascade adds a SECOND dispatch only when the flag is on. Flag off => 1.
+    assert len(sd_dispatches) == 1, dispatches
+
+
 @pytest.mark.asyncio
 async def test_scoping_phase_reuses_existing_scope_draft_and_marks_approval(monkeypatch):
     phase = ScopingPhase()

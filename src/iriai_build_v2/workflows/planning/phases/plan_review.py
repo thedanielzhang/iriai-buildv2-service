@@ -9,7 +9,7 @@ from typing import Any
 from iriai_compose import AgentActor, Ask, Feature, Phase, WorkflowRunner
 from iriai_compose.actors import Role
 
-from ....config import BUDGET_TIERS
+from ....config import BUDGET_TIERS, PLAN_REVIEW_SD_CASCADE
 from ....models.outputs import (
     PRD,
     DesignDecisions,
@@ -1526,6 +1526,16 @@ class PlanReviewPhase(Phase):
                                     description=req.description,
                                     reasoning=req.reasoning,
                                     affected_subfeatures=affected_with_tp,
+                                    # Forward the AC-coverage signal so the
+                                    # test-planner adds ACs for new/changed REQs
+                                    # in the SAME cycle. Dropping these caused a
+                                    # producer-consumer lag loop (test-plan
+                                    # trailed one cycle and re-flagged stale).
+                                    affected_requirement_ids=list(
+                                        req.affected_requirement_ids
+                                    ),
+                                    severity=req.severity,
+                                    cross_subfeature=req.cross_subfeature,
                                 )
                             )
                             affected_slugs_set.update(affected_with_tp)
@@ -1591,6 +1601,106 @@ class PlanReviewPhase(Phase):
                             if not blocked_failures:
                                 blocked_failures.append(
                                     f"test-plan: cascade revision crashed ({exc})"
+                                )
+                                if not _is_transient_runtime_failure(exc):
+                                    blocked_has_content_failure = True
+
+                # ── Cascade system-design revisions (per-SF, opt-in) ──────
+                # Mirrors the test-plan cascade but for per-SF
+                # `system-design:{slug}` artifacts, which otherwise trail one
+                # cycle behind PRD/design/plan revisions and re-flag stale in
+                # the next cycle. Gated behind IRIAI_PLAN_REVIEW_SD_CASCADE
+                # (default OFF) — when the flag is off this whole block is a
+                # strict no-op and plan-review behavior is byte-identical to
+                # today. Targeted-only: routes through `targeted_revision`,
+                # never adds or alters FULL_DOCUMENT-regen behavior.
+                if PLAN_REVIEW_SD_CASCADE and revision_plan.requests:
+                    sd_requests: list[RevisionRequest] = []
+                    sd_affected_slugs_set: set[str] = set()
+                    for req in revision_plan.requests:
+                        affected_with_sd = [
+                            slug
+                            for slug in req.affected_subfeatures
+                            if await runner.artifacts.get(
+                                f"system-design:{slug}", feature=feature,
+                            )
+                        ]
+                        if affected_with_sd:
+                            sd_requests.append(
+                                RevisionRequest(
+                                    description=req.description,
+                                    reasoning=req.reasoning,
+                                    affected_subfeatures=affected_with_sd,
+                                    affected_requirement_ids=list(
+                                        req.affected_requirement_ids
+                                    ),
+                                    severity=req.severity,
+                                    cross_subfeature=req.cross_subfeature,
+                                )
+                            )
+                            sd_affected_slugs_set.update(affected_with_sd)
+                    if sd_requests:
+                        try:
+                            sd_result = await targeted_revision(
+                                runner, feature, self.name,
+                                revision_plan=RevisionPlan(
+                                    requests=sd_requests,
+                                    new_decisions=list(revision_plan.new_decisions),
+                                ),
+                                decomposition=decomposition,
+                                base_role=architect_role,
+                                output_type=SystemDesign,
+                                artifact_prefix="system-design",
+                                context_keys=["project", "scope", "prd", "design"],
+                                checkpoint_prefix=f"cycle-{cycle + 1}",
+                                prior_decisions=prior_decisions,
+                            )
+                            if not sd_result.ok:
+                                blocked_failures.extend(
+                                    f"system-design:{failure.slug} — {failure.reason}"
+                                    for failure in sd_result.failed
+                                )
+                                if not sd_result.has_only_transient_failures:
+                                    blocked_has_content_failure = True
+                                revision_results.append(
+                                    f"system-design: FAILED (revision batches failed for {len(sd_result.failed)} subfeatures)"
+                                )
+                                raise RuntimeError(
+                                    "system-design targeted revision failed"
+                                )
+                            for slug in sorted(sd_affected_slugs_set):
+                                revised_text = await runner.artifacts.get(
+                                    f"system-design:{slug}", feature=feature,
+                                ) or ""
+                                await refresh_decision_ledger(
+                                    runner,
+                                    feature,
+                                    ledger_key=f"decisions:{slug}",
+                                    label=f"Decision Ledger — {slug}",
+                                    source_phase="plan-review-system-design",
+                                    artifact_kind="system-design",
+                                    state=state,
+                                    control=None,
+                                    subfeature_slug=slug,
+                                    source_texts=[revised_text],
+                                    summary_key=f"decisions-summary:{slug}",
+                                )
+                                await generate_summary(
+                                    runner, feature, "system-design", slug,
+                                )
+                            revision_results.append(
+                                f"system-design: revised ({len(sd_requests)} requests, {len(sd_affected_slugs_set)} SFs)"
+                            )
+                        except Exception as exc:
+                            logger.error(
+                                "system-design cascade revision crashed: %s", exc
+                            )
+                            revision_results.append(
+                                "system-design: FAILED (cascade revision crashed)"
+                            )
+                            if not blocked_failures:
+                                blocked_failures.append(
+                                    f"system-design: cascade revision crashed ({exc})"
                                 )
                                 if not _is_transient_runtime_failure(exc):
                                     blocked_has_content_failure = True

@@ -8,6 +8,21 @@ DATABASE_URL = os.environ.get(
 
 DASHBOARD_BASE_URL = os.environ.get("IRIAI_DASHBOARD_BASE_URL", "").rstrip("/")
 
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    """Read a boolean env flag. Truthy values: 1/true/yes/on (case-insensitive)."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+# Opt-in: cascade a TARGETED system-design revision to sibling artifacts when an
+# in-cycle plan-review request touches a subfeature that has a system-design
+# artifact. Default OFF — when off, plan-review behavior is byte-identical to
+# today (no extra dispatch). Targeted-only; never triggers full-document regen.
+PLAN_REVIEW_SD_CASCADE = _env_flag("IRIAI_PLAN_REVIEW_SD_CASCADE", default=False)
+
 BUDGET_TIERS = {
     "sonnet": "claude-sonnet-4-6",
     "opus": "claude-opus-4-8",
