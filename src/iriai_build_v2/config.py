@@ -40,17 +40,14 @@ ECONOMY_MODE = _env_flag("IRIAI_ECONOMY_MODE", default=False)
 
 # Keyed by Role.name. Generation/revision roles move to Sonnet; verification
 # whose verdicts are auto-consumed with no operator gate (the develop-phase
-# pipeline) moves to the top model. Roles with an operator (driver) backstop —
-# plan-review reviewers, gate reviewers, software-architect pre-seal — are
-# deliberately NOT mapped. Task-planning (planning-lead/lead-task-planner)
-# IS mapped to the top model: it produces the develop-phase DAG, the
-# highest-leverage artifact after the seal.
+# pipeline), the seal-gate reviewers, pre-seal compile/citation verification,
+# and task-planning (planning-lead/lead-task-planner — it produces the
+# develop-phase DAG, the highest-leverage artifact after the seal) move to the
+# top model. software-architect stays deliberately unmapped (opus) until seal.
 ECONOMY_MODEL_OVERRIDES = {
     # generation / revision → Sonnet (revision-wave actors inherit these names)
     "product-manager": BUDGET_TIERS["sonnet"],
     "ux-designer": BUDGET_TIERS["sonnet"],
-    "lead-product-manager": BUDGET_TIERS["sonnet"],
-    "lead-designer": BUDGET_TIERS["sonnet"],
     "test-planner": BUDGET_TIERS["sonnet"],
     "spec-author": BUDGET_TIERS["sonnet"],
     "scoper": BUDGET_TIERS["sonnet"],
@@ -85,6 +82,17 @@ ECONOMY_MODEL_OVERRIDES = {
     # reviewers, so mapping the name moves all three together.
     "planning-lead": BUDGET_TIERS["fable"],
     "lead-task-planner": BUDGET_TIERS["fable"],
+    # seal-gate reviewers + pre-seal verification → top model. lead-pm/lead-
+    # designer drafting duty is already complete, so this only upgrades gate
+    # work; lead-architect also covers sibling lead reviews (software-architect
+    # itself stays opus until seal). All bounded pre-seal volume.
+    "lead-product-manager": BUDGET_TIERS["fable"],
+    "lead-designer": BUDGET_TIERS["fable"],
+    "lead-architect": BUDGET_TIERS["fable"],
+    "sf-plan-reviewer": BUDGET_TIERS["fable"],
+    "edge-plan-reviewer": BUDGET_TIERS["fable"],
+    "citation-reviewer": BUDGET_TIERS["fable"],
+    "plan-validator": BUDGET_TIERS["fable"],
 }
 
 # ── MCP Server Definitions ──────────────────────────────────────────────────
