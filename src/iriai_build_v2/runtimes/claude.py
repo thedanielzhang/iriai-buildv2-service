@@ -16,6 +16,8 @@ from typing import TYPE_CHECKING, Any
 from pydantic import BaseModel
 
 from iriai_compose.runner import AgentRuntime
+
+from ..config import ECONOMY_MODE, ECONOMY_MODEL_OVERRIDES
 from iriai_compose.storage import AgentSession, SessionStore
 
 if TYPE_CHECKING:
@@ -220,6 +222,10 @@ def _default_effort_for_model(model: Any) -> str:
 
 def _resolve_model_and_effort(role: Any) -> tuple[str, str]:
     model = str(getattr(role, "model", None) or "").strip() or _DEFAULT_CLAUDE_MODEL
+    if ECONOMY_MODE:
+        override = ECONOMY_MODEL_OVERRIDES.get(str(getattr(role, "name", "") or "").strip())
+        if override:
+            model = override
     effort = getattr(role, "effort", None)
     raw_effort = str(effort) if effort is not None else _default_effort_for_model(model)
     normalized_effort = raw_effort.strip().lower()

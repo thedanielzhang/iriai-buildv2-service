@@ -29,6 +29,55 @@ BUDGET_TIERS = {
     # Opus 4.8 ships with a native 1M context window.
     "opus_1m": "claude-opus-4-8",
     "haiku": "claude-haiku-4-5-20251001",
+    "fable": "claude-fable-5",
+}
+
+# Opt-in: economy-mode model tiering. When ON, roles named in
+# ECONOMY_MODEL_OVERRIDES resolve to the mapped model instead of their declared
+# one; unmapped roles are untouched. Default OFF — when off, model resolution
+# is byte-identical to today.
+ECONOMY_MODE = _env_flag("IRIAI_ECONOMY_MODE", default=False)
+
+# Keyed by Role.name. Generation/revision roles move to Sonnet; verification
+# whose verdicts are auto-consumed with no operator gate (the develop-phase
+# pipeline) moves to the top model. Roles with an operator (driver) backstop —
+# plan-review reviewers, gate reviewers, software-architect pre-seal,
+# planning-lead/task-planning — are deliberately NOT mapped.
+ECONOMY_MODEL_OVERRIDES = {
+    # generation / revision → Sonnet (revision-wave actors inherit these names)
+    "product-manager": BUDGET_TIERS["sonnet"],
+    "ux-designer": BUDGET_TIERS["sonnet"],
+    "lead-product-manager": BUDGET_TIERS["sonnet"],
+    "lead-designer": BUDGET_TIERS["sonnet"],
+    "test-planner": BUDGET_TIERS["sonnet"],
+    "spec-author": BUDGET_TIERS["sonnet"],
+    "scoper": BUDGET_TIERS["sonnet"],
+    "senior-engineer": BUDGET_TIERS["sonnet"],
+    "backend-implementer": BUDGET_TIERS["sonnet"],
+    "frontend-implementer": BUDGET_TIERS["sonnet"],
+    "database-implementer": BUDGET_TIERS["sonnet"],
+    "package-implementer": BUDGET_TIERS["sonnet"],
+    "bug-fixer": BUDGET_TIERS["sonnet"],
+    "bug-reproducer": BUDGET_TIERS["sonnet"],
+    "root-cause-analyst": BUDGET_TIERS["sonnet"],
+    "documentation": BUDGET_TIERS["sonnet"],
+    "deployer": BUDGET_TIERS["sonnet"],
+    "release-manager": BUDGET_TIERS["sonnet"],
+    "analytics-engineer": BUDGET_TIERS["sonnet"],
+    "observability-engineer": BUDGET_TIERS["sonnet"],
+    "ui-designer": BUDGET_TIERS["sonnet"],
+    # auto-consumed verification (no operator backstop) + fidelity-critical
+    # compile/test-bar generation → top model
+    "code-reviewer": BUDGET_TIERS["fable"],
+    "security-auditor": BUDGET_TIERS["fable"],
+    "verifier": BUDGET_TIERS["fable"],
+    "integration-tester": BUDGET_TIERS["fable"],
+    "smoke-tester": BUDGET_TIERS["fable"],
+    "regression-tester": BUDGET_TIERS["fable"],
+    "accessibility-auditor": BUDGET_TIERS["fable"],
+    "performance-analyst": BUDGET_TIERS["fable"],
+    "test-author": BUDGET_TIERS["fable"],
+    "compiler": BUDGET_TIERS["fable"],
 }
 
 # ── MCP Server Definitions ──────────────────────────────────────────────────
