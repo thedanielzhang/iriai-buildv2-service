@@ -100,6 +100,7 @@ from iriai_build_v2.workflows.planning.phases.subfeature import (
     _test_planning_prompt,
 )
 from iriai_build_v2.workflows._common._helpers import (
+    PatchApplicationError,
     _apply_patches,
     _assert_compile_complete,
     _find_section,
@@ -16325,6 +16326,64 @@ def test_apply_patches_supports_common_alias_operations():
 
     assert "new text" in revised
     assert "## Appendix\nextra" in revised
+
+
+def test_apply_patches_full_document_find_replace_edits_front_matter():
+    text = (
+        "> **Repo:** `amber-service` (old ownership)\n\n"
+        "## Overview\nbody stays\n"
+    )
+    patches = [
+        SimpleNamespace(
+            target="FULL_DOCUMENT",
+            operation="find_replace",
+            content="> **Repo:** `amber-service` (new ownership)",
+            find="> **Repo:** `amber-service` (old ownership)",
+            reasoning="",
+        ),
+    ]
+
+    revised = _apply_patches(text, patches)
+
+    assert "(new ownership)" in revised
+    assert "(old ownership)" not in revised
+    assert "body stays" in revised
+
+
+def test_apply_patches_full_document_find_replace_missing_find_skips_or_raises():
+    text = "## Overview\nbody\n"
+    patches = [
+        SimpleNamespace(
+            target="FULL_DOCUMENT",
+            operation="find_replace",
+            content="replacement",
+            find="text that is not present",
+            reasoning="",
+        ),
+    ]
+
+    assert _apply_patches(text, patches) == text
+
+    with pytest.raises(PatchApplicationError):
+        _apply_patches(text, patches, strict=True)
+
+
+def test_apply_patches_full_document_find_replace_replaces_first_occurrence_only():
+    text = "## A\nshared token here\n\n## B\nshared token here\n"
+    patches = [
+        SimpleNamespace(
+            target="FULL_DOCUMENT",
+            operation="find_replace",
+            content="replaced token",
+            find="shared token",
+            reasoning="",
+        ),
+    ]
+
+    revised = _apply_patches(text, patches)
+
+    assert revised.count("replaced token") == 1
+    assert revised.count("shared token") == 1
 
 
 def test_find_section_normalized_match_tolerates_whitespace_and_slash_spacing():

@@ -3770,6 +3770,18 @@ def _apply_patches(text: str, patches: list, *, strict: bool = False) -> str:
             normalized_full = raw_operation if raw_operation != "set" else "replace"
             if normalized_full in {"replace", "replace_section", "revise"}:
                 text = patch.content.rstrip("\n") + "\n"
+            elif normalized_full == "find_replace":
+                # Document-scoped find/replace: the only way agents can edit
+                # content that sits outside any section (front matter above
+                # the first heading). Rejecting it forced a needless — and
+                # truncation-prone — full-document regeneration.
+                if not patch.find or patch.find not in text:
+                    _warn_or_raise(
+                        "find_replace: text %r not found in FULL_DOCUMENT — skipping",
+                        (patch.find or "")[:50],
+                    )
+                else:
+                    text = text.replace(patch.find, patch.content, 1)
             else:
                 _warn_or_raise(
                     "Unsupported FULL_DOCUMENT patch operation: %r — skipping",
