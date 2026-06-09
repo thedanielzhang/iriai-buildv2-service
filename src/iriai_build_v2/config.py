@@ -41,8 +41,10 @@ ECONOMY_MODE = _env_flag("IRIAI_ECONOMY_MODE", default=False)
 # Keyed by Role.name. Generation/revision roles move to Sonnet; verification
 # whose verdicts are auto-consumed with no operator gate (the develop-phase
 # pipeline) moves to the top model. Roles with an operator (driver) backstop —
-# plan-review reviewers, gate reviewers, software-architect pre-seal,
-# planning-lead/task-planning — are deliberately NOT mapped.
+# plan-review reviewers, gate reviewers, software-architect pre-seal — are
+# deliberately NOT mapped. Task-planning (planning-lead/lead-task-planner)
+# IS mapped to the top model: it produces the develop-phase DAG, the
+# highest-leverage artifact after the seal.
 ECONOMY_MODEL_OVERRIDES = {
     # generation / revision → Sonnet (revision-wave actors inherit these names)
     "product-manager": BUDGET_TIERS["sonnet"],
@@ -78,6 +80,11 @@ ECONOMY_MODEL_OVERRIDES = {
     "performance-analyst": BUDGET_TIERS["fable"],
     "test-author": BUDGET_TIERS["fable"],
     "compiler": BUDGET_TIERS["fable"],
+    # task-planning (DAG production) → top model; "planning-lead" is the single
+    # Role shared by the workstream-planner and both task-planning gate
+    # reviewers, so mapping the name moves all three together.
+    "planning-lead": BUDGET_TIERS["fable"],
+    "lead-task-planner": BUDGET_TIERS["fable"],
 }
 
 # ── MCP Server Definitions ──────────────────────────────────────────────────
