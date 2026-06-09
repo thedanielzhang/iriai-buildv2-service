@@ -1243,6 +1243,7 @@ class ClaudePoolRuntime(AgentRuntime):
         self._job_absolute_timeout = job_absolute_timeout
         self._affinity_lock = asyncio.Lock()
         self._invocation_jobs: dict[str, set[str]] = {}
+        self._invocation_activity: dict[str, Any | None] = {}
         self._feature_sessions: dict[str, str] = {}
         self._queued_user_notes: dict[str, list[str]] = {}
         # In-memory concurrent-load counter for codex members (no job-queue dir).
@@ -1262,18 +1263,26 @@ class ClaudePoolRuntime(AgentRuntime):
 
     @asynccontextmanager
     async def bind_invocation(self, invocation_id: str, activity_sink: Any | None):
-        del activity_sink
         token = _current_invocation_var.set(invocation_id)
         self._invocation_jobs.setdefault(invocation_id, set())
+        self._invocation_activity[invocation_id] = activity_sink
         try:
             yield
         finally:
             _current_invocation_var.reset(token)
             self._invocation_jobs.pop(invocation_id, None)
+            self._invocation_activity.pop(invocation_id, None)
 
     def invocation_has_live_work(self, invocation_id: str) -> bool:
         job_ids = self._invocation_jobs.get(invocation_id, set())
-        return any(self._job_is_live(job_id) for job_id in job_ids)
+        if any(self._job_is_live(job_id) for job_id in job_ids):
+            return True
+        if self._codex_runtime is None:
+            return False
+        live_work = getattr(self._codex_runtime, "invocation_has_live_work", None)
+        if live_work is None:
+            return False
+        return bool(live_work(invocation_id))
 
     def _job_is_live(self, job_id: str) -> bool:
         for profile in self.profiles:
@@ -1866,13 +1875,30 @@ class ClaudePoolRuntime(AgentRuntime):
         codex_role = _role_for_codex_dispatch(role)
         self._record_codex_dispatch_active(profile.name, 1)
         try:
-            result = await self._codex_runtime.invoke(
-                codex_role,
-                prompt,
-                output_type=output_type,
-                workspace=workspace,
-                session_key=session_key,
+            invocation_id = _current_invocation_var.get()
+            sink = (
+                self._invocation_activity.get(invocation_id)
+                if invocation_id is not None
+                else None
             )
+            binder = getattr(self._codex_runtime, "bind_invocation", None)
+            if invocation_id is not None and callable(binder):
+                async with binder(invocation_id, sink):
+                    result = await self._codex_runtime.invoke(
+                        codex_role,
+                        prompt,
+                        output_type=output_type,
+                        workspace=workspace,
+                        session_key=session_key,
+                    )
+            else:
+                result = await self._codex_runtime.invoke(
+                    codex_role,
+                    prompt,
+                    output_type=output_type,
+                    workspace=workspace,
+                    session_key=session_key,
+                )
         finally:
             self._record_codex_dispatch_active(profile.name, -1)
         if output_type is not None and isinstance(result, BaseModel):

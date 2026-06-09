@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import tempfile
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -1858,8 +1859,23 @@ class _FakeCodexRuntime:
         raises: Exception | None = None,
     ) -> None:
         self.calls: list[dict[str, object]] = []
+        self.bind_calls: list[dict[str, object]] = []
+        self.live_invocations: set[str] = set()
         self._responses = list(responses or [])
         self._raises = raises
+
+    @asynccontextmanager
+    async def bind_invocation(self, invocation_id: str, activity_sink):
+        self.bind_calls.append(
+            {"invocation_id": invocation_id, "activity_sink": activity_sink}
+        )
+        try:
+            yield
+        finally:
+            pass
+
+    def invocation_has_live_work(self, invocation_id: str) -> bool:
+        return invocation_id in self.live_invocations
 
     async def invoke(
         self,
@@ -2090,6 +2106,38 @@ async def test_submit_and_wait_codex_tracks_active_and_adapts_return(tmp_path: P
     # Counter returned to zero after the await completes.
     assert runtime._codex_active.get("codex", 0) == 0
     assert len(runtime._codex_runtime.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_submit_and_wait_codex_forwards_bound_invocation_to_embedded_runtime(
+    tmp_path: Path,
+):
+    runtime = _runtime_with_fake_codex(tmp_path)
+    codex_profile = next(p for p in runtime.profiles if p.kind == "codex")
+    role = Role(name="reader", prompt="Read.", metadata={})
+    sink = object()
+
+    async with runtime.bind_invocation("inv-codex-1", sink):
+        await runtime._submit_and_wait(
+            role,
+            "Do it.",
+            output_type=None,
+            workspace=SimpleNamespace(path=tmp_path),
+            session_key="reader:feat-1",
+            profile=codex_profile,
+        )
+
+    assert runtime._codex_runtime.bind_calls == [
+        {"invocation_id": "inv-codex-1", "activity_sink": sink}
+    ]
+
+
+def test_invocation_liveness_consults_embedded_codex_runtime(tmp_path: Path):
+    runtime = _runtime_with_fake_codex(tmp_path)
+    runtime._codex_runtime.live_invocations.add("inv-codex-1")
+
+    assert runtime.invocation_has_live_work("inv-codex-1") is True
+    assert runtime.invocation_has_live_work("other-invocation") is False
 
 
 # 7c. structured output from codex is adapted to the (json, dict, None) triple.
