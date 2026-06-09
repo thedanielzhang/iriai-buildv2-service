@@ -103,8 +103,36 @@ from .._stage_helpers import (
     thread_outcome_pending_response,
 )
 from .._threading import ensure_planning_thread, make_thread_actor, make_thread_user
+from .._alternation import planning_alternation_runtime
 
 logger = logging.getLogger(__name__)
+
+
+def _subfeature_alternation_runtime(
+    runner: Any,
+    decomposition: Any,
+    sf: Any,
+    *,
+    step: str,
+) -> str:
+    """Deterministic ~50/50 primary/secondary routing for a subfeature lead.
+
+    Alternation is keyed on the subfeature slug's sorted-index parity over the
+    full decomposition, so every step of a given subfeature lands on the SAME
+    runtime (keeping the thread/session coherent) and a resumed run re-derives
+    the identical assignment.  Returns ``"primary"`` when the alternating
+    policy is inactive or no real secondary runtime exists.
+    """
+    ordered = [
+        str(getattr(item, "slug", "") or "")
+        for item in getattr(decomposition, "subfeatures", []) or []
+    ]
+    return planning_alternation_runtime(
+        runner,
+        key=str(getattr(sf, "slug", "") or ""),
+        ordered_keys=ordered,
+        step=step,
+    )
 
 
 def _parse_decomposition(text: str) -> SubfeatureDecomposition:
@@ -606,6 +634,7 @@ async def _run_pm_step(
         pm,
         handle=handle,
         suffix="pm",
+        runtime=_subfeature_alternation_runtime(runner, decomposition, sf, step="pm"),
         context_keys=_lightweight_context_keys("pm", sf.slug),
     )
     shadow = make_thread_actor(
@@ -897,6 +926,7 @@ async def _run_design_step(
         designer,
         handle=handle,
         suffix="design",
+        runtime=_subfeature_alternation_runtime(runner, decomposition, sf, step="design"),
         context_keys=_lightweight_context_keys("design", sf.slug),
     )
     shadow = make_thread_actor(
@@ -1200,6 +1230,7 @@ async def _run_architecture_step(
         architect,
         handle=handle,
         suffix="architecture",
+        runtime=_subfeature_alternation_runtime(runner, decomposition, sf, step="architecture"),
         context_keys=_lightweight_context_keys("architecture", sf.slug),
     )
     shadow = make_thread_actor(
@@ -1639,6 +1670,7 @@ async def _run_test_planning_step(
         test_planner,
         handle=handle,
         suffix="test-planning",
+        runtime=_subfeature_alternation_runtime(runner, decomposition, sf, step="test_planning"),
         context_keys=_lightweight_context_keys("test_planning", sf.slug),
     )
     shadow = make_thread_actor(

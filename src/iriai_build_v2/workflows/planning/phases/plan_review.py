@@ -64,6 +64,7 @@ from .._decisions import (
     refresh_decision_ledger,
     sync_compiled_decision_mirrors,
 )
+from .._alternation import alternating_runtime_for, runtime_names_from_runner, runtime_policy_from_runner
 
 logger = logging.getLogger(__name__)
 
@@ -278,11 +279,28 @@ _ARTIFACT_CONFIGS = [
 ]
 
 
-def _make_parallel_actor(base: AgentActor, suffix: str) -> AgentActor:
-    """Create a parallel-safe copy of an AgentActor with a unique name."""
+def _make_parallel_actor(
+    base: AgentActor,
+    suffix: str,
+    *,
+    runtime: str | None = None,
+) -> AgentActor:
+    """Create a parallel-safe copy of an AgentActor with a unique name.
+
+    When *runtime* is ``"secondary"`` the copied actor's role metadata is
+    tagged so ``TrackedWorkflowRunner.resolve()`` routes it to the secondary
+    runtime (Codex) — used by the alternating policy to spread plan-review
+    verdicts ~50/50.  When *runtime* is ``None`` / ``"primary"`` the behavior
+    is unchanged (resolves to the primary runtime).
+    """
+    role = base.role
+    if runtime == "secondary":
+        metadata = dict(role.metadata)
+        metadata["runtime"] = "secondary"
+        role = role.model_copy(update={"metadata": metadata})
     return AgentActor(
         name=f"{base.name}-{suffix}",
-        role=base.role,
+        role=role,
         context_keys=base.context_keys,
         persistent=base.persistent,
     )
@@ -925,6 +943,32 @@ class PlanReviewPhase(Phase):
                 all_tasks: list[Ask] = []
                 task_labels: list[tuple[str, ...]] = []
 
+                # Deterministic ~50/50 alternation across the WHOLE review
+                # fan-out: build the stable ordered key set of every review
+                # task (comp/sec per subfeature, plus one per unique edge) so a
+                # resumed run re-derives the identical primary/secondary split.
+                _unique_edges_for_keys = _deduplicate_edges(decomposition.edges)
+                _review_task_keys: list[str] = []
+                for _sf in decomposition.subfeatures:
+                    _review_task_keys.append(f"comp-{_sf.slug}")
+                    _review_task_keys.append(f"sec-{_sf.slug}")
+                for _edge in _unique_edges_for_keys:
+                    _review_task_keys.append(
+                        f"edge-{_edge.from_subfeature}-{_edge.to_subfeature}"
+                    )
+                _rt_policy = runtime_policy_from_runner(runner)
+                _primary_name, _secondary_name = runtime_names_from_runner(runner)
+
+                def _review_runtime(task_key: str) -> str:
+                    return alternating_runtime_for(
+                        task_key,
+                        ordered_keys=_review_task_keys,
+                        runtime_policy=_rt_policy,
+                        primary_runtime_name=_primary_name,
+                        secondary_runtime_name=_secondary_name,
+                        step="plan_review",
+                    )
+
                 for sf in decomposition.subfeatures:
                     context = await _build_sf_review_context(
                         runner, feature, sf.slug, decomposition,
@@ -941,13 +985,21 @@ class PlanReviewPhase(Phase):
                         else f"{_SCOPE_PREFIX}{context}\n\n"
                     )
                     all_tasks.append(Ask(
-                        actor=_make_parallel_actor(_sf_reviewer, f"comp-{sf.slug}"),
+                        actor=_make_parallel_actor(
+                            _sf_reviewer,
+                            f"comp-{sf.slug}",
+                            runtime=_review_runtime(f"comp-{sf.slug}"),
+                        ),
                         prompt=f"{prompt_body}{_COMPLETENESS_PROMPT}",
                         output_type=Verdict,
                     ))
                     task_labels.append(("sf", sf.slug, "completeness"))
                     all_tasks.append(Ask(
-                        actor=_make_parallel_actor(_sf_reviewer, f"sec-{sf.slug}"),
+                        actor=_make_parallel_actor(
+                            _sf_reviewer,
+                            f"sec-{sf.slug}",
+                            runtime=_review_runtime(f"sec-{sf.slug}"),
+                        ),
                         prompt=f"{prompt_body}{_SECURITY_PROMPT}",
                         output_type=Verdict,
                     ))
@@ -971,6 +1023,9 @@ class PlanReviewPhase(Phase):
                         actor=_make_parallel_actor(
                             _edge_reviewer,
                             f"edge-{edge.from_subfeature}-{edge.to_subfeature}",
+                            runtime=_review_runtime(
+                                f"edge-{edge.from_subfeature}-{edge.to_subfeature}"
+                            ),
                         ),
                         prompt=f"{prompt_body}{_EDGE_PROMPT}",
                         output_type=Verdict,
