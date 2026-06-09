@@ -156,7 +156,11 @@ def build_runner(
     ``single_agent_runtime`` is true, the secondary runtime matches the
     primary runtime exactly.
     """
-    from ..runtimes import create_agent_runtime, secondary_agent_runtime_name
+    from ..runtimes import (
+        create_agent_runtime,
+        normalize_agent_runtime,
+        secondary_agent_runtime_name,
+    )
     from ..workflows import TrackedWorkflowRunner
 
     agent_runtime = create_agent_runtime(
@@ -171,11 +175,18 @@ def build_runner(
         agent_runtime_name,
         single_runtime=single_agent_runtime,
     )
-    secondary_runtime = create_agent_runtime(
-        secondary_name,
-        session_store=env.sessions,
-        on_message=on_message,
-    )
+    if normalize_agent_runtime(agent_runtime_name) == "agent_pool":
+        # agent_pool is a single FLAT pool whose codex member is co-equal with
+        # the claude accounts. Reuse the SAME pool instance as the secondary so
+        # the in-memory codex-load counter, profile affinity, and embedded codex
+        # runtime are not duplicated across two pool objects.
+        secondary_runtime = agent_runtime
+    else:
+        secondary_runtime = create_agent_runtime(
+            secondary_name,
+            session_store=env.sessions,
+            on_message=on_message,
+        )
     resolved_runtime_policy = normalize_runtime_policy(runtime_policy)
 
     return TrackedWorkflowRunner(

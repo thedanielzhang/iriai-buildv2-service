@@ -301,7 +301,12 @@ def cli() -> None:
 @click.option(
     "--agent-runtime",
     default=None,
-    help="Agent runtime to use for workflow agents (claude, claude_pool, or codex).",
+    help=(
+        "Agent runtime to use for workflow agents "
+        "(claude, claude_pool, agent_pool, or codex). agent_pool is a flat "
+        "heterogeneous pool: N Claude accounts + Codex, co-equal with "
+        "usage-limit cooldown, dynamic re-probe, and Claude->Codex spillover."
+    ),
 )
 @click.option(
     "--runtime-policy",
@@ -339,9 +344,10 @@ def plan(
         resolved_runtime_policy = normalize_runtime_policy(runtime_policy)
     except ValueError as exc:
         raise click.BadParameter(str(exc), param_hint="--runtime-policy") from exc
-    if claude_only and resolved_runtime not in {"claude", "claude_pool"}:
+    if claude_only and resolved_runtime not in {"claude", "claude_pool", "agent_pool"}:
         raise click.BadParameter(
-            "--claude-only can only be used with Claude or Claude pool as the primary runtime.",
+            "--claude-only can only be used with Claude, Claude pool, or agent "
+            "pool as the primary runtime.",
             param_hint="--claude-only",
         )
     asyncio.run(
@@ -376,7 +382,12 @@ def plan(
 @click.option(
     "--agent-runtime",
     default=None,
-    help="Agent runtime to use for workflow agents (claude, claude_pool, or codex).",
+    help=(
+        "Agent runtime to use for workflow agents "
+        "(claude, claude_pool, agent_pool, or codex). agent_pool is a flat "
+        "heterogeneous pool: N Claude accounts + Codex, co-equal with "
+        "usage-limit cooldown, dynamic re-probe, and Claude->Codex spillover."
+    ),
 )
 @click.option(
     "--runtime-policy",
@@ -418,9 +429,10 @@ def resume(
         resolved_runtime_policy = normalize_runtime_policy(runtime_policy)
     except ValueError as exc:
         raise click.BadParameter(str(exc), param_hint="--runtime-policy") from exc
-    if claude_only and resolved_runtime not in {"claude", "claude_pool"}:
+    if claude_only and resolved_runtime not in {"claude", "claude_pool", "agent_pool"}:
         raise click.BadParameter(
-            "--claude-only can only be used with Claude or Claude pool as the primary runtime.",
+            "--claude-only can only be used with Claude, Claude pool, or agent "
+            "pool as the primary runtime.",
             param_hint="--claude-only",
         )
     asyncio.run(
@@ -450,7 +462,12 @@ def resume(
 @click.option(
     "--agent-runtime",
     default=None,
-    help="Agent runtime to use for workflow agents (claude, claude_pool, or codex).",
+    help=(
+        "Agent runtime to use for workflow agents "
+        "(claude, claude_pool, agent_pool, or codex). agent_pool is a flat "
+        "heterogeneous pool: N Claude accounts + Codex, co-equal with "
+        "usage-limit cooldown, dynamic re-probe, and Claude->Codex spillover."
+    ),
 )
 @click.option(
     "--runtime-policy",
@@ -489,9 +506,10 @@ def develop(
         resolved_runtime_policy = normalize_runtime_policy(runtime_policy)
     except ValueError as exc:
         raise click.BadParameter(str(exc), param_hint="--runtime-policy") from exc
-    if claude_only and resolved_runtime not in {"claude", "claude_pool"}:
+    if claude_only and resolved_runtime not in {"claude", "claude_pool", "agent_pool"}:
         raise click.BadParameter(
-            "--claude-only can only be used with Claude or Claude pool as the primary runtime.",
+            "--claude-only can only be used with Claude, Claude pool, or agent "
+            "pool as the primary runtime.",
             param_hint="--claude-only",
         )
     asyncio.run(
@@ -524,7 +542,12 @@ def develop(
 @click.option(
     "--agent-runtime",
     default=None,
-    help="Agent runtime to use for workflow agents (claude, claude_pool, or codex).",
+    help=(
+        "Agent runtime to use for workflow agents "
+        "(claude, claude_pool, agent_pool, or codex). agent_pool is a flat "
+        "heterogeneous pool: N Claude accounts + Codex, co-equal with "
+        "usage-limit cooldown, dynamic re-probe, and Claude->Codex spillover."
+    ),
 )
 def bugfix(
     name: str,
@@ -573,7 +596,12 @@ def bugfix(
 @click.option(
     "--agent-runtime",
     default=None,
-    help="Agent runtime to use for workflow agents (claude, claude_pool, or codex).",
+    help=(
+        "Agent runtime to use for workflow agents "
+        "(claude, claude_pool, agent_pool, or codex). agent_pool is a flat "
+        "heterogeneous pool: N Claude accounts + Codex, co-equal with "
+        "usage-limit cooldown, dynamic re-probe, and Claude->Codex spillover."
+    ),
 )
 @click.option(
     "--runtime-policy",
@@ -666,9 +694,10 @@ def slack_cmd(
         resolved_runtime_policy = PRIMARY_IMPL_SECONDARY_REVIEW_POLICY
         runtime_policy_override = True
 
-    if claude_only and resolved_runtime not in {"claude", "claude_pool"}:
+    if claude_only and resolved_runtime not in {"claude", "claude_pool", "agent_pool"}:
         raise click.BadParameter(
-            "--claude-only can only be used with Claude or Claude pool as the primary runtime.",
+            "--claude-only can only be used with Claude, Claude pool, or agent "
+            "pool as the primary runtime.",
             param_hint="--claude-only",
         )
 

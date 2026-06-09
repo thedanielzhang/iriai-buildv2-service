@@ -115,6 +115,15 @@ DEFAULT_AVAILABILITY_PROBE_PROMPT = os.environ.get(
     "IRIAI_CLAUDE_POOL_PROBE_PROMPT",
     "Reply with exactly OK.",
 )
+# OPTIONAL / OFF-BY-DEFAULT capability probe model for CLAUDE members. When
+# empty (the default) behavior is unchanged: the availability probe uses the
+# cheap Haiku model. When set to an Opus model id, the readiness probe runs on
+# that model so a Claude account that has lost Opus capability (but can still
+# serve Haiku) fails the probe and is cooled down. Strictly opt-in.
+DEFAULT_CAPABILITY_PROBE_MODEL = os.environ.get(
+    "IRIAI_CLAUDE_POOL_CAPABILITY_PROBE_MODEL",
+    "",
+)
 
 _current_invocation_var: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "claude_pool_runtime_invocation_id", default=None,
@@ -127,6 +136,11 @@ class ClaudePoolProfile:
     user: str
     claude_command: str = DEFAULT_CLAUDE_COMMAND
     weight: float = 1.0
+    # Pool members are heterogeneous: ``"claude"`` accounts dispatched via the
+    # LaunchAgent job queue, or ``"codex"`` dispatched in-process via the
+    # embedded CodexAgentRuntime. Defaults to ``"claude"`` so existing pools
+    # stay byte-identical.
+    kind: str = "claude"
 
 
 @dataclass
@@ -653,11 +667,16 @@ def _coerce_profile(entry: Any) -> ClaudePoolProfile:
         name = str(entry.get("name") or entry.get("user") or "").strip()
         if not name:
             raise ValueError(f"Invalid Claude pool profile entry: {entry!r}")
+        # Heterogeneous pool members. ``kind`` defaults to ``"claude"`` so
+        # existing entries are unchanged; ``"codex"`` members are dispatched
+        # in-process and need no real OS ``user`` (default it to the name).
+        kind = str(entry.get("kind") or "claude").strip().lower()
         return ClaudePoolProfile(
             name=name,
             user=str(entry.get("user") or name),
             claude_command=str(entry.get("claude_command") or DEFAULT_CLAUDE_COMMAND),
             weight=_coerce_profile_weight(entry.get("weight"), name=name),
+            kind=kind,
         )
     raise ValueError(f"Invalid Claude pool profile entry: {entry!r}")
 
@@ -767,6 +786,7 @@ def load_profiles(root: Path = DEFAULT_POOL_ROOT) -> list[ClaudePoolProfile]:
                         "user": profile.user,
                         "claude_command": profile.claude_command,
                         "weight": profile.weight,
+                        "kind": profile.kind,
                     }
                     for profile in profiles
                 ]
@@ -818,6 +838,7 @@ def ensure_pool_layout(
                         "user": profile.user,
                         "claude_command": profile.claude_command,
                         "weight": profile.weight,
+                        "kind": profile.kind,
                     }
                     for profile in profiles
                 ]
@@ -1029,6 +1050,10 @@ def _classify_claude_pool_error(error: str) -> str | None:
         or '"type":"api_error"' in lowered
         or '"type": "api_error"' in lowered
         or "'type': 'api_error'" in lowered
+        # Codex/OpenAI transient surfaces (additive; never matched by Claude
+        # accounts' own error text in the cases above).
+        or "rate limit" in lowered
+        or "too many requests" in lowered
     ):
         return "transient_api_error"
     if (
@@ -1039,6 +1064,14 @@ def _classify_claude_pool_error(error: str) -> str | None:
         or "api_error_status=429" in lowered
         or '"api_error_status":429' in lowered
         or "api_error_status': 429" in lowered
+        # Codex/OpenAI usage-cap surfaces (additive). A usage-limited codex
+        # member is cooled down + failed-over exactly like a claude account.
+        or "usage limit reached" in lowered
+        or "you've reached your usage limit" in lowered
+        or "quota" in lowered
+        or "insufficient_quota" in lowered
+        or "plan limit" in lowered
+        or "resets at" in lowered
     ):
         return "usage_limited"
     if "login" in lowered or "not logged" in lowered or "auth" in lowered:
@@ -1202,6 +1235,20 @@ class ClaudePoolRuntime(AgentRuntime):
         self._invocation_jobs: dict[str, set[str]] = {}
         self._feature_sessions: dict[str, str] = {}
         self._queued_user_notes: dict[str, list[str]] = {}
+        # In-memory concurrent-load counter for codex members (no job-queue dir).
+        self._codex_active: dict[str, int] = {}
+        # Lazily build the embedded codex runtime ONLY when a codex member is
+        # configured, so a pure-claude pool keeps zero Codex-CLI dependency and
+        # stays byte-identical to claude_pool.
+        self._codex_runtime: Any | None = None
+        if any(profile.kind == "codex" for profile in self.profiles):
+            from .codex import CodexAgentRuntime
+
+            self._codex_runtime = CodexAgentRuntime(
+                session_store=session_store,
+                on_message=on_message,
+                interactive_roles=self._interactive_roles,
+            )
 
     @asynccontextmanager
     async def bind_invocation(self, invocation_id: str, activity_sink: Any | None):
@@ -1256,7 +1303,11 @@ class ClaudePoolRuntime(AgentRuntime):
             else:
                 session = await self.session_store.load(session_key)
 
-        profile = await self._select_profile(session_key=session_key, persistent=persistent)
+        profile = await self._select_profile(
+            session_key=session_key,
+            persistent=persistent,
+            exclude_kinds=self._excluded_kinds_for_role(role),
+        )
         effective_prompt = self._compose_prompt(
             role,
             prompt,
@@ -1373,7 +1424,28 @@ class ClaudePoolRuntime(AgentRuntime):
             return []
         return self._queued_user_notes.pop(feature_id, [])
 
-    async def _select_profile(self, *, session_key: str | None, persistent: bool) -> ClaudePoolProfile:
+    def _excluded_kinds_for_role(self, role: Role) -> frozenset[str]:
+        """Kinds that cannot serve *role* and must be skipped during selection.
+
+        A BOUND write-producing role (one carrying a runtime workspace binding)
+        is excluded from codex members: the binding was minted with
+        runtime == "claude_pool" and CodexAgentRuntime rejects bound write roles
+        whose binding runtime != "codex". Everything else (read roles,
+        structured-output roles, and binding-less write roles such as planning
+        artifact authors) can rotate to / spill to codex co-equally.
+        """
+        binding = _runtime_workspace_binding(role)
+        if binding and _role_is_write_producing(role):
+            return frozenset({"codex"})
+        return frozenset()
+
+    async def _select_profile(
+        self,
+        *,
+        session_key: str | None,
+        persistent: bool,
+        exclude_kinds: frozenset[str] = frozenset(),
+    ) -> ClaudePoolProfile:
         async with self._affinity_lock:
             path = self.root / "affinity.json"
             data = _read_json(path, {"next_index": 0, "session_profiles": {}})
@@ -1386,14 +1458,23 @@ class ClaudePoolRuntime(AgentRuntime):
                 existing = session_profiles.get(session_key)
                 if existing in names:
                     state = await self._refresh_due_profile_state(state, [existing])
-                if existing in names and not self._profile_is_unavailable(existing, state):
+                existing_kind = (
+                    self._profile_by_name(existing).kind if existing in names else None
+                )
+                if (
+                    existing in names
+                    and (existing_kind not in exclude_kinds)
+                    and not self._profile_is_unavailable(existing, state)
+                ):
                     profile = self._profile_by_name(existing)
                     self._record_profile_dispatch(data, profile)
                     _write_json_atomic(path, data)
                     return profile
 
             state = await self._refresh_due_profile_state(state, names)
-            profile = await self._select_best_available_profile(data, state)
+            profile = await self._select_best_available_profile(
+                data, state, exclude_kinds=exclude_kinds
+            )
             selected_index = names.index(profile.name)
             data["next_index"] = (selected_index + 1) % len(self.profiles)
             if persistent and session_key:
@@ -1449,6 +1530,8 @@ class ClaudePoolRuntime(AgentRuntime):
         self,
         affinity_data: dict[str, Any],
         state: dict[str, Any],
+        *,
+        exclude_kinds: frozenset[str] = frozenset(),
     ) -> ClaudePoolProfile:
         names = [profile.name for profile in self.profiles]
         next_index = int(affinity_data.get("next_index", 0) or 0)
@@ -1457,6 +1540,14 @@ class ClaudePoolRuntime(AgentRuntime):
         available: list[ClaudePoolProfile] = []
         unavailable: list[tuple[datetime, ClaudePoolProfile]] = []
         for profile in self.profiles:
+            # Bound-write authority filter (additive). A codex member's embedded
+            # CodexAgentRuntime validates that a write-producing binding carries
+            # runtime == "codex"; the pool mints runtime == "claude_pool", so a
+            # BOUND write-producing role cannot run on codex. Exclude codex from
+            # selection for those roles only. Read roles, structured-output
+            # roles, and binding-less write roles still rotate/spill to codex.
+            if profile.kind in exclude_kinds:
+                continue
             record = profile_state.get(profile.name) if isinstance(profile_state, dict) else None
             if isinstance(record, dict) and _profile_unavailable_active(record, now=now):
                 until = _profile_probe_after(record) or now
@@ -1524,12 +1615,61 @@ class ClaudePoolRuntime(AgentRuntime):
                     break
         return state
 
+    async def _probe_codex_available(self, profile: ClaudePoolProfile) -> bool:
+        """Dynamic, restart-free recovery probe for a codex member.
+
+        Runs a tiny throwaway in-process codex turn. On success the member's
+        unavailable record is cleared (it rejoins the pool); on failure it is
+        re-marked with the classified reason so cooldown/re-probe continues.
+        """
+        if self._codex_runtime is None:
+            return False
+        from iriai_compose.actors import Role as _Role
+
+        probe_role = _Role(
+            name=f"{profile.name}-availability-probe",
+            prompt="Reply with exactly OK.",
+            metadata={},
+        )
+        try:
+            await asyncio.wait_for(
+                self._codex_runtime.invoke(
+                    probe_role,
+                    DEFAULT_AVAILABILITY_PROBE_PROMPT,
+                    output_type=None,
+                    workspace=None,
+                    session_key=None,
+                ),
+                timeout=DEFAULT_AVAILABILITY_TIMEOUT_SECONDS,
+            )
+        except Exception as exc:
+            kind = _classify_claude_pool_error(str(exc)) or "probe_failed"
+            self._mark_profile_unavailable(profile, kind, str(exc))
+            logger.info(
+                "Claude pool codex member %s readiness probe failed: %s",
+                profile.name,
+                exc,
+            )
+            return False
+        self._clear_profile_unavailable(profile.name)
+        logger.info(
+            "Claude pool codex member %s readiness probe succeeded", profile.name
+        )
+        return True
+
     async def _probe_profile_available(self, profile: ClaudePoolProfile) -> bool:
+        if profile.kind == "codex":
+            return await self._probe_codex_available(profile)
+        # OPTIONAL opt-in: probe claude members on the capability model (e.g.
+        # Opus) so an account that lost the higher-tier capability is cooled
+        # down. Empty (default) -> None -> cheap Haiku probe, behavior unchanged.
+        capability_model = DEFAULT_CAPABILITY_PROBE_MODEL or None
         try:
             result = await submit_availability_check(
                 root=self.root,
                 profile=profile,
                 timeout=DEFAULT_AVAILABILITY_TIMEOUT_SECONDS,
+                model=capability_model,
             )
         except Exception as exc:
             kind = _classify_claude_pool_error(str(exc)) or "probe_failed"
@@ -1544,7 +1684,25 @@ class ClaudePoolRuntime(AgentRuntime):
         self._mark_profile_failure(profile, error)
         return False
 
+    def _record_codex_dispatch_active(self, name: str, delta: int) -> None:
+        """Track in-flight in-process codex turns for selector neutrality.
+
+        Codex members have no job-queue directory, so their concurrent-load
+        signal lives in memory. Clamped at >= 0.
+        """
+        current = self._codex_active.get(name, 0) + delta
+        self._codex_active[name] = current if current > 0 else 0
+
     def _profile_load_score(self, profile_name: str) -> float:
+        # Codex members have no job-queue dir and would otherwise score 0.0
+        # forever (starve-winning every selection). Mirror claude's
+        # active*1000.0 units using the in-memory active counter so the
+        # weighted-least-loaded selector treats codex co-equally.
+        profile = next(
+            (p for p in self.profiles if p.name == profile_name), None
+        )
+        if profile is not None and profile.kind == "codex":
+            return self._codex_active.get(profile_name, 0) * 1000.0
         active = 0
         for state_name in ("queued", "running"):
             active += len(list((self.root / "jobs" / state_name / profile_name).glob("*.json")))
@@ -1633,10 +1791,15 @@ class ClaudePoolRuntime(AgentRuntime):
         attempted: set[str] = set()
         last_kind: str | None = None
         last_error: RuntimeError | None = None
+        exclude_kinds = self._excluded_kinds_for_role(role)
 
         for _ in range(max(len(self.profiles), 1)):
             if self._profile_is_unavailable(profile.name):
-                profile = await self._select_profile(session_key=session_key, persistent=persistent)
+                profile = await self._select_profile(
+                    session_key=session_key,
+                    persistent=persistent,
+                    exclude_kinds=exclude_kinds,
+                )
             attempted.add(profile.name)
             try:
                 return await self._submit_and_wait(
@@ -1663,6 +1826,7 @@ class ClaudePoolRuntime(AgentRuntime):
                     next_profile = await self._select_profile(
                         session_key=session_key,
                         persistent=persistent,
+                        exclude_kinds=exclude_kinds,
                     )
                 except RuntimeError as select_exc:
                     raise RuntimeError(
@@ -1678,6 +1842,41 @@ class ClaudePoolRuntime(AgentRuntime):
             f"Claude pool exhausted{detail}; attempted profiles: {attempted_text}"
         ) from last_error
 
+    async def _submit_and_wait_codex(
+        self,
+        role: Role,
+        prompt: str,
+        *,
+        output_type: type[BaseModel] | None,
+        workspace: Workspace | None,
+        session_key: str | None,
+        profile: ClaudePoolProfile,
+    ) -> tuple[str, Any, Any]:
+        """Dispatch a single turn to the embedded codex runtime in-process.
+
+        Increments/decrements the in-memory active counter (selector load) and
+        adapts CodexAgentRuntime.invoke's ``str | BaseModel`` return to the
+        (text, structured, raw) triple the failover loop expects.
+        """
+        if self._codex_runtime is None:
+            raise RuntimeError(
+                f"Claude pool codex member {profile.name} has no embedded codex runtime"
+            )
+        self._record_codex_dispatch_active(profile.name, 1)
+        try:
+            result = await self._codex_runtime.invoke(
+                role,
+                prompt,
+                output_type=output_type,
+                workspace=workspace,
+                session_key=session_key,
+            )
+        finally:
+            self._record_codex_dispatch_active(profile.name, -1)
+        if output_type is not None and isinstance(result, BaseModel):
+            return (result.model_dump_json(), result.model_dump(mode="json"), None)
+        return (str(result), None, None)
+
     async def _submit_and_wait(
         self,
         role: Role,
@@ -1688,6 +1887,20 @@ class ClaudePoolRuntime(AgentRuntime):
         session_key: str | None,
         profile: ClaudePoolProfile,
     ) -> tuple[str, Any, Any]:
+        # Codex members dispatch IN-PROCESS. This branch sits at the very top of
+        # _submit_and_wait — before any job-id/payload/manifest/heartbeat/stale
+        # machinery — so the codex path never touches the job queue, and so it
+        # stays inside _submit_and_wait_with_failover's loop (cooldown / failover
+        # / reselect apply to codex uniformly). Liveness == the in-process await.
+        if profile.kind == "codex":
+            return await self._submit_and_wait_codex(
+                role,
+                prompt,
+                output_type=output_type,
+                workspace=workspace,
+                session_key=session_key,
+                profile=profile,
+            )
         job_id = uuid.uuid4().hex
         invocation_id = _current_invocation_var.get()
         if invocation_id:
@@ -2425,6 +2638,7 @@ async def submit_availability_check(
     root: Path,
     profile: ClaudePoolProfile,
     timeout: float = DEFAULT_AVAILABILITY_TIMEOUT_SECONDS,
+    model: str | None = None,
 ) -> dict[str, Any]:
     """Queue a tiny real Claude turn for one profile.
 
@@ -2448,7 +2662,7 @@ async def submit_availability_check(
         "status": "queued",
         "created_at": _utc_now_iso(),
         "updated_at": _utc_now_iso(),
-        "model": DEFAULT_AVAILABILITY_PROBE_MODEL,
+        "model": str(model or DEFAULT_AVAILABILITY_PROBE_MODEL),
         "effort": "low",
         "timeout": timeout,
         "paths": {
@@ -2484,6 +2698,9 @@ async def doctor(
     profiles = ensure_pool_layout(root)
     lines: list[str] = [f"Claude pool root: {root}"]
     for profile in profiles:
+        if profile.kind == "codex":
+            lines.append(f"{profile.name}: in-process member (codex; no runner/heartbeat)")
+            continue
         heartbeat_path = root / "heartbeats" / f"{profile.name}.json"
         heartbeat = _read_json(heartbeat_path, {})
         updated_at = _parse_iso(heartbeat.get("updated_at"))
@@ -2521,6 +2738,9 @@ def install_launchagent_templates(
     _ensure_dir(template_dir)
 
     for profile in profiles:
+        if profile.kind == "codex":
+            output_lines.append(f"Skipping {profile.name}: in-process member (no LaunchAgent)")
+            continue
         label = f"com.iriai.claude-pool.{profile.name}"
         plist_path = template_dir / f"{label}.plist"
         program_args = [

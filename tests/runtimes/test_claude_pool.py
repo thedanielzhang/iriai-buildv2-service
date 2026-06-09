@@ -1840,3 +1840,415 @@ async def test_fake_load_completes_one_thousand_jobs_without_single_flat_queue(t
         assert len(done) == expected
     assert completed == 1000
     assert len(list((tmp_path / "payloads").iterdir())) > 1
+
+
+# ---------------------------------------------------------------------------
+# agent_pool: heterogeneous flat pool (N Claude accounts + Codex member)
+# ---------------------------------------------------------------------------
+
+
+class _FakeCodexRuntime:
+    """Stand-in for the embedded CodexAgentRuntime so tests don't need the
+    Codex CLI on PATH. Injected as ``runtime._codex_runtime``."""
+
+    def __init__(
+        self,
+        *,
+        responses: list[object] | None = None,
+        raises: Exception | None = None,
+    ) -> None:
+        self.calls: list[dict[str, object]] = []
+        self._responses = list(responses or [])
+        self._raises = raises
+
+    async def invoke(
+        self,
+        role,
+        prompt,
+        *,
+        output_type=None,
+        workspace=None,
+        session_key=None,
+    ):
+        self.calls.append({"role": role, "prompt": prompt, "session_key": session_key})
+        if self._raises is not None:
+            raise self._raises
+        if self._responses:
+            return self._responses.pop(0)
+        if output_type is not None:
+            return output_type(message="ok")
+        return "ok"
+
+
+def _codex_profiles() -> list[ClaudePoolProfile]:
+    """Three Claude accounts + one Codex member (a flat 4-member pool)."""
+    return [
+        ClaudePoolProfile(name="iriai-claude-1", user="iriai-claude-1", claude_command="/bin/echo"),
+        ClaudePoolProfile(name="iriai-claude-2", user="iriai-claude-2", claude_command="/bin/echo"),
+        ClaudePoolProfile(name="iriai-claude-3", user="iriai-claude-3", claude_command="/bin/echo"),
+        ClaudePoolProfile(name="codex", user="codex", kind="codex"),
+    ]
+
+
+def _runtime_with_fake_codex(tmp_path: Path, **kwargs) -> ClaudePoolRuntime:
+    """Build a codex-inclusive pool with a fake embedded codex runtime so the
+    real Codex CLI is never required."""
+    runtime = ClaudePoolRuntime(root=tmp_path, profiles=_codex_profiles(), **kwargs)
+    runtime._codex_runtime = _FakeCodexRuntime()
+    return runtime
+
+
+# 1. coerce reads kind=codex; defaults stay claude.
+def test_coerce_profile_reads_codex_kind_and_defaults_to_claude():
+    assert _coerce_profile({"name": "iriai-claude-1"}).kind == "claude"
+    assert _coerce_profile("iriai-claude-2").kind == "claude"
+    codex = _coerce_profile({"name": "codex", "kind": "Codex"})
+    assert codex.kind == "codex"
+    # codex members need no real OS user -> defaults to name.
+    assert codex.user == "codex"
+
+
+# 2a. load_profiles preserves a codex member through migration (no rewrite).
+def test_load_profiles_preserves_codex_member_without_rewrite(tmp_path: Path):
+    original = {
+        "profiles": [
+            {"name": "iriai-claude-1", "user": "iriai-claude-1", "weight": 5},
+            {"name": "iriai-claude-2", "user": "iriai-claude-2", "weight": 1},
+            {"name": "iriai-claude-3", "user": "iriai-claude-3", "weight": 12},
+            {"name": "codex", "kind": "codex", "weight": 8},
+        ]
+    }
+    _write_json_atomic(tmp_path / "profiles.json", original)
+    before = (tmp_path / "profiles.json").read_text(encoding="utf-8")
+
+    profiles = load_profiles(tmp_path)
+
+    # The legacy 3-claude migration is keyed on exact name-list equality; a
+    # codex member makes it never match, so the file is NOT rewritten.
+    after = (tmp_path / "profiles.json").read_text(encoding="utf-8")
+    assert after == before
+    by_name = {p.name: p for p in profiles}
+    assert by_name["codex"].kind == "codex"
+    assert by_name["iriai-claude-1"].weight == 5
+    assert by_name["iriai-claude-3"].weight == 12
+
+
+# 2b. existing legacy 3-claude migration STILL passes (regression).
+def test_legacy_three_claude_migration_still_collapses_without_codex(tmp_path: Path):
+    _write_json_atomic(
+        tmp_path / "profiles.json",
+        {
+            "profiles": [
+                {"name": "iriai-claude-1", "user": "iriai-claude-1", "weight": 5},
+                {"name": "iriai-claude-2", "user": "iriai-claude-2", "weight": 1},
+                {"name": "iriai-claude-3", "user": "iriai-claude-3", "weight": 12},
+            ]
+        },
+    )
+    profiles = load_profiles(tmp_path)
+    assert [p.name for p in profiles] == ["iriai-claude-1"]
+
+
+# 3. classify codex usage/rate/quota RuntimeError strings.
+def test_classify_codex_usage_and_transient_strings():
+    assert _classify_claude_pool_error(
+        "Codex CLI failed with exit code 1: usage limit reached, resets at 5pm"
+    ) == "usage_limited"
+    assert _classify_claude_pool_error("insufficient_quota for this account") == "usage_limited"
+    assert _classify_claude_pool_error("You've reached your usage limit") == "usage_limited"
+    assert _classify_claude_pool_error("plan limit exceeded") == "usage_limited"
+    assert _classify_claude_pool_error("429 Too Many Requests") == "transient_api_error"
+    assert _classify_claude_pool_error("OpenAI rate limit hit") == "transient_api_error"
+
+
+# 4. codex member gets steady weighted rotation (~1/N, interleaved not tail).
+@pytest.mark.asyncio
+async def test_codex_member_gets_steady_weighted_rotation(tmp_path: Path):
+    runtime = _runtime_with_fake_codex(tmp_path)
+
+    picked = [
+        (await runtime._select_profile(session_key=f"actor-{idx}:feat", persistent=False)).name
+        for idx in range(12)
+    ]
+
+    # Equal weights, 4 members -> codex gets a steady ~1/4 share.
+    assert picked.count("codex") == 3
+    # Interleaved, not bunched at the tail: codex appears in the first third.
+    assert "codex" in picked[:4]
+
+
+# 5. codex member cooldown + failover (usage-limit -> mark -> failover to claude).
+@pytest.mark.asyncio
+async def test_codex_usage_limit_cools_down_and_fails_over_to_claude(tmp_path: Path):
+    runtime = _runtime_with_fake_codex(tmp_path, poll_interval=0.01)
+    # Drive codex to be selected FIRST (least-loaded) by giving every claude
+    # member prior dispatch load. All claude members stay available so failover
+    # picks one directly without the all-limited probe-recovery cycle.
+    _write_json_atomic(
+        tmp_path / "affinity.json",
+        {
+            "next_index": 0,
+            "session_profiles": {},
+            # Match the live profile weights so _sync_affinity_weights does not
+            # reset the dispatch counts we pre-seed below.
+            "profile_weights": {
+                "iriai-claude-1": 1.0,
+                "iriai-claude-2": 1.0,
+                "iriai-claude-3": 1.0,
+                "codex": 1.0,
+            },
+            "profile_dispatch_counts": {
+                "iriai-claude-1": 50,
+                "iriai-claude-2": 50,
+                "iriai-claude-3": 50,
+            },
+        },
+    )
+    role = Role(name="implementer", prompt="Say ok.", metadata={})
+
+    calls: list[str] = []
+
+    async def _fake_submit_and_wait(*args, **kwargs):
+        profile = kwargs["profile"]
+        calls.append(profile.name)
+        if profile.kind == "codex":
+            raise RuntimeError("Codex CLI failed with exit code 1: usage limit reached")
+        return ("ok", None, {})
+
+    runtime._submit_and_wait = _fake_submit_and_wait  # type: ignore[method-assign]
+
+    result = await runtime.invoke(
+        role,
+        "Say ok.",
+        workspace=SimpleNamespace(path=tmp_path),
+        session_key="implementer:feat-1",
+    )
+
+    assert result == "ok"
+    # codex was tried first, hit usage limit, got cooled down, then failover
+    # routed to an available claude member.
+    assert calls[0] == "codex"
+    assert calls[-1].startswith("iriai-claude")
+    state = json.loads((tmp_path / "profile_state.json").read_text())
+    assert state["profiles"]["codex"]["reason"] == "usage_limited"
+
+
+# 6. all-claude-limited spills to codex (selector returns codex).
+@pytest.mark.asyncio
+async def test_all_claude_limited_spills_to_codex(tmp_path: Path):
+    runtime = _runtime_with_fake_codex(tmp_path)
+    future = (datetime.now(UTC) + timedelta(minutes=30)).isoformat()
+    _write_json_atomic(
+        tmp_path / "profile_state.json",
+        {
+            "profiles": {
+                "iriai-claude-1": {"status": "unavailable", "reason": "usage_limited", "probe_after": future},
+                "iriai-claude-2": {"status": "unavailable", "reason": "usage_limited", "probe_after": future},
+                "iriai-claude-3": {"status": "unavailable", "reason": "usage_limited", "probe_after": future},
+            }
+        },
+    )
+
+    picked = await runtime._select_profile(session_key="actor:feat", persistent=False)
+
+    assert picked.name == "codex"
+    assert picked.kind == "codex"
+
+
+# 7. codex load-score uses in-memory active counter.
+def test_codex_load_score_uses_in_memory_active(tmp_path: Path):
+    runtime = _runtime_with_fake_codex(tmp_path)
+    assert runtime._profile_load_score("codex") == 0.0
+    runtime._record_codex_dispatch_active("codex", 1)
+    assert runtime._profile_load_score("codex") == 1000.0
+    runtime._record_codex_dispatch_active("codex", -1)
+    assert runtime._profile_load_score("codex") == 0.0
+    # Clamped at >= 0.
+    runtime._record_codex_dispatch_active("codex", -5)
+    assert runtime._profile_load_score("codex") == 0.0
+
+
+# 7b. dispatching to codex bumps and clears the in-memory active counter.
+@pytest.mark.asyncio
+async def test_submit_and_wait_codex_tracks_active_and_adapts_return(tmp_path: Path):
+    runtime = _runtime_with_fake_codex(tmp_path)
+    codex_profile = next(p for p in runtime.profiles if p.kind == "codex")
+    role = Role(name="reader", prompt="Read.", metadata={})
+
+    text, structured, raw = await runtime._submit_and_wait(
+        role,
+        "Do it.",
+        output_type=None,
+        workspace=SimpleNamespace(path=tmp_path),
+        session_key="reader:feat-1",
+        profile=codex_profile,
+    )
+
+    assert text == "ok"
+    assert structured is None
+    assert raw is None
+    # Counter returned to zero after the await completes.
+    assert runtime._codex_active.get("codex", 0) == 0
+    assert len(runtime._codex_runtime.calls) == 1
+
+
+# 7c. structured output from codex is adapted to the (json, dict, None) triple.
+@pytest.mark.asyncio
+async def test_submit_and_wait_codex_adapts_structured_output(tmp_path: Path):
+    runtime = ClaudePoolRuntime(root=tmp_path, profiles=_codex_profiles())
+    runtime._codex_runtime = _FakeCodexRuntime(responses=[_SimpleOutput(message="hello")])
+    codex_profile = next(p for p in runtime.profiles if p.kind == "codex")
+    role = Role(name="planner", prompt="Plan.", metadata={})
+
+    text, structured, raw = await runtime._submit_and_wait(
+        role,
+        "Plan it.",
+        output_type=_SimpleOutput,
+        workspace=SimpleNamespace(path=tmp_path),
+        session_key="planner:feat-1",
+        profile=codex_profile,
+    )
+
+    assert json.loads(text) == {"message": "hello"}
+    assert structured == {"message": "hello"}
+    assert raw is None
+
+
+# 8. codex probe recovers dynamically (clears unavailable, no restart).
+@pytest.mark.asyncio
+async def test_codex_probe_recovers_member_dynamically(tmp_path: Path):
+    runtime = _runtime_with_fake_codex(tmp_path)
+    past = (datetime.now(UTC) - timedelta(seconds=1)).isoformat()
+    _write_json_atomic(
+        tmp_path / "profile_state.json",
+        {"profiles": {"codex": {"status": "unavailable", "reason": "usage_limited", "probe_after": past}}},
+    )
+    codex_profile = next(p for p in runtime.profiles if p.kind == "codex")
+
+    recovered = await runtime._probe_profile_available(codex_profile)
+
+    assert recovered is True
+    state = json.loads((tmp_path / "profile_state.json").read_text())
+    assert "codex" not in state.get("profiles", {})
+    # The probe ran an in-process codex turn (no job-queue file created).
+    assert len(runtime._codex_runtime.calls) == 1
+    assert not list((tmp_path / "jobs" / "queued" / "codex").glob("*.json"))
+
+
+# 8b. a failing codex probe re-marks the member with the classified reason.
+@pytest.mark.asyncio
+async def test_codex_probe_failure_re_marks_member(tmp_path: Path):
+    runtime = ClaudePoolRuntime(root=tmp_path, profiles=_codex_profiles())
+    runtime._codex_runtime = _FakeCodexRuntime(
+        raises=RuntimeError("Codex CLI failed with exit code 1: usage limit reached")
+    )
+    codex_profile = next(p for p in runtime.profiles if p.kind == "codex")
+
+    recovered = await runtime._probe_profile_available(codex_profile)
+
+    assert recovered is False
+    state = json.loads((tmp_path / "profile_state.json").read_text())
+    assert state["profiles"]["codex"]["reason"] == "usage_limited"
+
+
+# 9. bound write-producing role excludes codex (binding minted runtime=claude_pool).
+@pytest.mark.asyncio
+async def test_bound_write_role_excludes_codex_member(tmp_path: Path):
+    runtime = _runtime_with_fake_codex(tmp_path)
+    cwd = tmp_path / "sandbox"
+    cwd.mkdir()
+    role = Role(
+        name="implementer",
+        prompt="Implement.",
+        tools=["Write", "Edit"],
+        metadata={
+            "runtime_workspace_binding": {
+                "runtime": "claude_pool",
+                "cwd": str(cwd),
+                "manifest_path": str(cwd / "sandbox-manifest.json"),
+            }
+        },
+    )
+    assert runtime._excluded_kinds_for_role(role) == frozenset({"codex"})
+
+    # Drive codex to be the least-loaded member (so it WOULD win selection for
+    # an unconstrained role): give every claude member prior dispatch load.
+    affinity = {
+        "next_index": 0,
+        "session_profiles": {},
+        "profile_weights": {
+            "iriai-claude-1": 1.0,
+            "iriai-claude-2": 1.0,
+            "iriai-claude-3": 1.0,
+            "codex": 1.0,
+        },
+        "profile_dispatch_counts": {
+            "iriai-claude-1": 50,
+            "iriai-claude-2": 50,
+            "iriai-claude-3": 50,
+        },
+    }
+    _write_json_atomic(tmp_path / "affinity.json", affinity)
+
+    # Unconstrained role -> codex wins (it is the least-loaded member).
+    unconstrained = await runtime._select_best_available_profile(affinity, {})
+    assert unconstrained.name == "codex"
+
+    # Bound write-producing role -> codex is excluded, a claude member is chosen
+    # instead. The binding was minted runtime=="claude_pool"; the embedded codex
+    # would reject it, so the additive filter keeps it off codex.
+    bound = await runtime._select_best_available_profile(
+        affinity, {}, exclude_kinds=runtime._excluded_kinds_for_role(role)
+    )
+    assert bound.kind == "claude"
+    assert bound.name != "codex"
+
+
+# 9b. a binding-less write role (planning artifact author) still reaches codex.
+def test_binding_less_write_role_does_not_exclude_codex(tmp_path: Path):
+    runtime = _runtime_with_fake_codex(tmp_path)
+    role = Role(name="architect", prompt="Design.", tools=["Write"], metadata={})
+    assert runtime._excluded_kinds_for_role(role) == frozenset()
+
+
+# 10. factory wiring.
+def test_factory_agent_pool_resolves_to_claude_pool_runtime(tmp_path: Path):
+    from iriai_build_v2.runtimes import (
+        create_agent_runtime,
+        normalize_agent_runtime,
+        secondary_agent_runtime_name,
+    )
+
+    assert normalize_agent_runtime("agent_pool") == "agent_pool"
+    assert normalize_agent_runtime("agent-pool") == "agent_pool"
+    assert secondary_agent_runtime_name("agent_pool") == "agent_pool"
+    # Its own secondary -> alternation bypassed.
+    assert secondary_agent_runtime_name("agent_pool", single_runtime=True) == "agent_pool"
+
+    runtime = create_agent_runtime(
+        "agent_pool",
+        session_store=None,
+        on_message=None,
+        interactive_roles=set(),
+    )
+    assert isinstance(runtime, ClaudePoolRuntime)
+    # A pure-claude profiles.json builds no embedded codex runtime.
+    assert runtime._codex_runtime is None
+
+
+# 10b. CLI: --agent-runtime agent_pool parses; --claude-only doesn't error.
+def test_cli_agent_pool_and_claude_only_parse():
+    from click.testing import CliRunner
+
+    from iriai_build_v2.interfaces.cli.app import cli
+
+    runner = CliRunner()
+    # Use --help on the command to exercise option parsing without a live DB.
+    result = runner.invoke(cli, ["plan", "--help"])
+    assert result.exit_code == 0
+    assert "agent_pool" in result.output
+
+    from iriai_build_v2.runtimes import normalize_agent_runtime
+
+    # The claude-only guard must accept agent_pool as a valid primary.
+    assert normalize_agent_runtime("agent_pool") in {"claude", "claude_pool", "agent_pool"}

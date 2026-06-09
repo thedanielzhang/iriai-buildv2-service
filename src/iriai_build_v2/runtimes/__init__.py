@@ -8,11 +8,12 @@ if TYPE_CHECKING:
     from iriai_compose.runner import AgentRuntime
     from iriai_compose.storage import SessionStore
 
-AgentRuntimeName = Literal["claude", "codex", "claude_pool"]
+AgentRuntimeName = Literal["claude", "codex", "claude_pool", "agent_pool"]
 SUPPORTED_AGENT_RUNTIMES: tuple[AgentRuntimeName, ...] = (
     "claude",
     "codex",
     "claude_pool",
+    "agent_pool",
 )
 
 _RUNTIME_ALIASES = {
@@ -23,6 +24,8 @@ _RUNTIME_ALIASES = {
     "openai": "codex",
     "codex": "codex",
     "pool": "claude_pool",
+    "agent_pool": "agent_pool",
+    "agent-pool": "agent_pool",
 }
 
 
@@ -51,6 +54,13 @@ def secondary_agent_runtime_name(
     primary = normalize_agent_runtime(name)
     if single_runtime:
         return primary
+    # agent_pool is a FLAT heterogeneous pool that already contains codex as a
+    # co-equal member, so it is its own secondary (no separate Codex-as-secondary
+    # runtime). Returning the same name makes secondary_alternation_enabled False
+    # (primary == secondary), so planning fan-out never tags "secondary" and the
+    # alternation path is bypassed -- in-pool selection handles distribution.
+    if primary == "agent_pool":
+        return "agent_pool"
     return "codex" if primary in {"claude", "claude_pool"} else primary
 
 
@@ -71,7 +81,11 @@ def create_agent_runtime(
             interactive_roles=interactive_roles,
         )
 
-    if runtime_name == "claude_pool":
+    if runtime_name in {"claude_pool", "agent_pool"}:
+        # Both names resolve to the same ClaudePoolRuntime. It loads the
+        # codex-inclusive profiles.json and only builds an embedded codex
+        # runtime when a kind=="codex" member is configured; for a pure-claude
+        # profiles.json it is byte-identical to claude_pool.
         from .claude_pool import ClaudePoolRuntime
 
         return ClaudePoolRuntime(
