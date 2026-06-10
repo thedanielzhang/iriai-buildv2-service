@@ -41,6 +41,7 @@ from iriai_build_v2.roles import (
     lead_task_planner_review_role,
     lead_task_planner_reviewer,
     lead_task_planner_role,
+    planning_lead_ask_role,
     planning_lead_review_role,
     planning_lead_role,
 )
@@ -52,6 +53,8 @@ from iriai_build_v2.runtimes.claude_pool import (
 from iriai_build_v2.workflows.planning.phases.task_planning import (
     _sf_task_planner_gate_reviewer,
     _sf_task_planner_reviewer,
+    _slice_planner_actor,
+    _workstream_planner,
 )
 
 REVIEWER_ACTORS = [
@@ -183,3 +186,81 @@ def test_reviewer_prompt_carries_review_only_instructions(actor) -> None:
     writes; the variant must override that so a write-less reviewer reliably
     falls back to structured-output verdicts instead of dead-ending."""
     assert "Review-Only Mode" in actor.role.prompt
+
+
+# ── Ask-only planning actors (defect W-4) ────────────────────────────────────
+#
+# Regression tests for the dag-ws slice-planner crash:
+#     RuntimeError('Claude pool write-producing job requires runtime workspace binding')
+#
+# The slice planners (and the workstream planner) are one-shot Asks that
+# return ONLY structured output (ImplementationDAG / WorkstreamDecomposition)
+# and never write workspace files, yet they wrapped the full planning_lead
+# generation role whose tools include Write — so claude-pool dispatch
+# classified the job write-producing and demanded a workspace binding that
+# ask dispatches never inject. Fix follows the B-4 precedent: an ask-only
+# role variant (roles._ask_only_role) with the SAME Role.name.
+
+ASK_ONLY_PLANNING_ACTORS = [
+    _slice_planner_actor("dag-ws-ws-foundation-sf-slug-slice-2-target-only"),
+    _slice_planner_actor("dag-ws-ws-foundation-sf-slug-slice-2-repair-target-only"),
+    _workstream_planner,
+]
+
+
+@pytest.mark.parametrize(
+    "actor", ASK_ONLY_PLANNING_ACTORS, ids=lambda actor: actor.name,
+)
+def test_ask_only_planning_actor_role_is_not_write_producing(actor) -> None:
+    """The exact predicate claude_pool dispatch uses must classify the
+    slice-planner/workstream-planner jobs read-only."""
+    assert not _role_is_write_producing(actor.role), (
+        f"{actor.name} wraps a write-producing role (tools={actor.role.tools}) "
+        "— claude pool dispatch would demand a runtime workspace binding the "
+        "planning asks never carry"
+    )
+
+
+@pytest.mark.parametrize(
+    "actor", ASK_ONLY_PLANNING_ACTORS, ids=lambda actor: actor.name,
+)
+def test_ask_only_planning_actor_manifest_role_is_not_write_producing(actor) -> None:
+    manifest_role = {
+        "name": actor.role.name,
+        "tools": [str(tool) for tool in (actor.role.tools or [])],
+        "metadata": dict(actor.role.metadata or {}),
+    }
+    assert not _manifest_role_is_write_producing(manifest_role)
+
+
+@pytest.mark.parametrize(
+    "actor", ASK_ONLY_PLANNING_ACTORS, ids=lambda actor: actor.name,
+)
+def test_ask_only_planning_actor_keeps_read_tools(actor) -> None:
+    """Slice planners still Read the context-package files referenced in the
+    prompt — only write-producing tools may be stripped."""
+    for tool in ("Read", "Glob", "Grep"):
+        assert tool in (actor.role.tools or []), (
+            f"{actor.name} lost required read tool {tool}"
+        )
+
+
+def test_planning_lead_ask_role_preserves_name_model_metadata() -> None:
+    """Economy overrides key on Role.name — the ask variant must keep it,
+    and must not mutate the shared write-producing base role."""
+    assert planning_lead_ask_role is not planning_lead_role
+    assert planning_lead_ask_role.name == planning_lead_role.name
+    assert planning_lead_ask_role.model == planning_lead_role.model
+    assert dict(planning_lead_ask_role.metadata or {}) == dict(planning_lead_role.metadata or {})
+    # The base generation role must REMAIN write-producing.
+    assert _role_is_write_producing(planning_lead_role)
+
+
+@pytest.mark.parametrize(
+    "actor", ASK_ONLY_PLANNING_ACTORS, ids=lambda actor: actor.name,
+)
+def test_ask_only_planning_actor_prompt_carries_no_write_instructions(actor) -> None:
+    """The planning_lead prompt instructs Write-tool artifact writes; the ask
+    variant must override that so a write-less planner falls back to
+    structured output instead of dead-ending."""
+    assert "Structured-Output-Only Mode" in actor.role.prompt

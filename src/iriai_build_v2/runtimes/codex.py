@@ -277,8 +277,65 @@ def _read_global_codex_config() -> dict[str, Any]:
         return {}
 
 
+def _is_open_map_schema(node: Any) -> bool:
+    """True for JSON-Schema "map" objects (e.g. ``dict[str, list[str]]``):
+
+    an object type with no fixed ``properties`` whose ``additionalProperties``
+    is a schema (or ``true``). OpenAI strict structured output cannot express
+    these, and the Codex CLI strict-mode sanitizer DROPS such entries from
+    ``properties`` while leaving them in ``required`` — the API then rejects
+    the request with ``invalid_json_schema`` ("Extra required key ...
+    supplied")."""
+    if not isinstance(node, dict):
+        return False
+    if node.get("type") != "object":
+        return False
+    if node.get("properties"):
+        return False
+    additional = node.get("additionalProperties")
+    return additional is True or isinstance(additional, dict)
+
+
+def _degraded_map_schema(node: dict[str, Any]) -> dict[str, Any]:
+    """Strict-compatible degradation of an open-map schema to a JSON string.
+
+    Instead of silently dropping the field (which desyncs ``required`` from
+    ``properties`` and 400s), ask the model for a JSON-encoded object as a
+    string. ``_restore_degraded_maps`` decodes it back before Pydantic
+    validation, so no data is lost."""
+    parts = [str(node.get("description") or "").strip()]
+    hint = (
+        "Encode this field as a STRING containing a JSON object, e.g. "
+        '"{\\"key\\": ...}". It is JSON-decoded back into an object before '
+        "validation."
+    )
+    additional = node.get("additionalProperties")
+    if isinstance(additional, dict) and additional:
+        hint += " Every value in the encoded object must match this JSON Schema: " + json.dumps(
+            additional, sort_keys=True
+        )
+    parts.append(hint)
+    degraded: dict[str, Any] = {
+        "type": "string",
+        "description": " ".join(part for part in parts if part),
+    }
+    if "title" in node:
+        degraded["title"] = node["title"]
+    return degraded
+
+
 def _prepare_schema(schema: dict[str, Any]) -> dict[str, Any]:
-    """Normalize a Pydantic schema for Codex structured output."""
+    """Normalize a Pydantic schema for Codex structured output.
+
+    Strict-mode invariants (OpenAI ``text.format`` + Codex CLI sanitizer):
+
+    - every object node carries ``additionalProperties: false`` and a
+      ``properties`` map (possibly empty),
+    - ``required`` always lists exactly the surviving property keys, so
+      ``required`` ⊆ ``properties`` at every level,
+    - open-map fields (``additionalProperties`` as a schema) are degraded to
+      JSON-string fields via ``_degraded_map_schema`` instead of being left
+      for the CLI to drop (which 400s with ``invalid_json_schema``)."""
     defs = schema.pop("$defs", None)
 
     def _resolve(obj: Any) -> Any:
@@ -290,7 +347,11 @@ def _prepare_schema(schema: dict[str, Any]) -> dict[str, Any]:
                     return _resolve(defs[name])
 
             resolved = {key: _resolve(value) for key, value in obj.items()}
-            if resolved.get("type") == "object" and "additionalProperties" not in resolved:
+            if _is_open_map_schema(resolved):
+                return _degraded_map_schema(resolved)
+            if resolved.get("type") == "object":
+                if not isinstance(resolved.get("properties"), dict):
+                    resolved["properties"] = {}
                 resolved["additionalProperties"] = False
             properties = resolved.get("properties")
             if isinstance(properties, dict):
@@ -303,6 +364,71 @@ def _prepare_schema(schema: dict[str, Any]) -> dict[str, Any]:
         return obj
 
     return _resolve(schema)
+
+
+def _restore_degraded_maps(payload: Any, output_type: type[BaseModel]) -> Any:
+    """Decode JSON-string values back into objects for map-typed fields.
+
+    Counterpart of the ``_degraded_map_schema`` degradation in
+    ``_prepare_schema``: walks the ORIGINAL Pydantic schema of
+    ``output_type`` alongside the parsed payload and ``json.loads`` string
+    values wherever the model declares an open map (``dict[str, ...]``).
+    Values that are already objects (or fail to decode) pass through
+    untouched, so this is a no-op for non-degraded payloads."""
+    try:
+        schema = output_type.model_json_schema()
+    except Exception:  # pragma: no cover — defensive
+        return payload
+    defs = schema.get("$defs") or {}
+
+    def _deref(node: Any) -> Any:
+        hops = 0
+        while isinstance(node, dict) and isinstance(node.get("$ref"), str) and hops < 32:
+            name = node["$ref"].rsplit("/", 1)[-1]
+            if name not in defs:
+                break
+            node = defs[name]
+            hops += 1
+        return node
+
+    def _walk(value: Any, node: Any) -> Any:
+        node = _deref(node)
+        if not isinstance(node, dict):
+            return value
+        for combinator in ("anyOf", "oneOf", "allOf"):
+            branches = node.get(combinator)
+            if isinstance(branches, list):
+                for branch in branches:
+                    restored = _walk(value, branch)
+                    if restored is not value:
+                        return restored
+        if _is_open_map_schema(node):
+            if isinstance(value, str):
+                try:
+                    decoded = json.loads(value)
+                except (json.JSONDecodeError, ValueError):
+                    return value
+                if not isinstance(decoded, dict):
+                    return value
+                value = decoded
+            if isinstance(value, dict):
+                additional = node.get("additionalProperties")
+                if isinstance(additional, dict):
+                    return {key: _walk(item, additional) for key, item in value.items()}
+                return dict(value)
+            return value
+        properties = node.get("properties")
+        if isinstance(value, dict) and isinstance(properties, dict):
+            return {
+                key: _walk(item, properties[key]) if key in properties else item
+                for key, item in value.items()
+            }
+        items = node.get("items")
+        if isinstance(value, list) and isinstance(items, dict):
+            return [_walk(item, items) for item in value]
+        return value
+
+    return _walk(payload, schema)
 
 
 @dataclass
@@ -582,6 +708,9 @@ class CodexAgentRuntime(AgentRuntime):
         for attempt in range(max_retries + 1):
             try:
                 payload = json.loads(final_text)
+                # Decode JSON-string values for map fields degraded by
+                # _prepare_schema (strict mode can't express dict[str, ...]).
+                payload = _restore_degraded_maps(payload, output_type)
                 return output_type.model_validate(payload)
             except (json.JSONDecodeError, Exception) as exc:
                 last_error = exc

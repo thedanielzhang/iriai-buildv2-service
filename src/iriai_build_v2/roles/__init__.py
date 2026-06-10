@@ -103,6 +103,43 @@ def _review_only_role(base_role):
         "prompt": base_role.prompt + _REVIEW_ONLY_INSTRUCTIONS,
     })
 
+
+_ASK_ONLY_INSTRUCTIONS = """
+
+## Structured-Output-Only Mode (no file writes)
+
+You are running as a one-shot planning actor WITHOUT file-write access: you
+have no Write, Edit, or Bash tools. IGNORE any earlier or later instruction
+telling you to write your result to a file — you cannot. You may still Read
+the context files referenced in the prompt (read them selectively).
+Return your COMPLETE result as the structured output for this task —
+populate every field of the output schema directly.
+"""
+
+
+def _ask_only_role(base_role):
+    """Read-only Role variant for one-shot structured-output ``Ask`` actors.
+
+    Same rationale as ``_review_only_role`` (W-4 follows the B-4 precedent):
+    Ask-only actors (e.g. the dag-ws slice planners and the workstream
+    planner in task_planning) return ONLY structured output and never write
+    workspace files, but wrapping the full generation role (which carries
+    Write/Bash) makes claude_pool._role_is_write_producing() classify their
+    jobs write-producing — and pool dispatch then raises
+    RuntimeError('Claude pool write-producing job requires runtime workspace
+    binding') because review/ask dispatches never inject a workspace binding.
+    Role.name is preserved so economy-mode model overrides
+    (config.ECONOMY_MODEL_OVERRIDES, keyed on Role.name) still apply.
+    """
+    tools = [
+        tool for tool in (base_role.tools or [])
+        if tool not in _REVIEW_ONLY_TOOL_EXCLUSIONS
+    ]
+    return base_role.model_copy(update={
+        "tools": tools,
+        "prompt": base_role.prompt + _ASK_ONLY_INSTRUCTIONS,
+    })
+
 # ── Role imports ────────────────────────────────────────────────────────────
 from .pm import role as pm_role
 from .designer import role as designer_role
@@ -172,6 +209,12 @@ lead_designer_review_role = _review_only_role(lead_designer_role)
 lead_architect_review_role = _review_only_role(lead_architect_role)
 planning_lead_review_role = _review_only_role(planning_lead_role)
 lead_task_planner_review_role = _review_only_role(lead_task_planner_role)
+
+# ── Ask-only role variants ───────────────────────────────────────────────────
+# One-shot Ask actors that return only structured output (no file artifacts)
+# must not carry write-producing tools, or claude-pool dispatch demands a
+# runtime workspace binding the ask never carries (W-4; see _ask_only_role).
+planning_lead_ask_role = _ask_only_role(planning_lead_role)
 
 # ── Actors ──────────────────────────────────────────────────────────────────
 # Async e2e-testing subsystem actors (read-only against checkpoints).

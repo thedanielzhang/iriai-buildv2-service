@@ -8,7 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from pydantic import BaseModel
+from pydantic import BaseModel, Field as PydField
 
 from iriai_compose.actors import Role
 from iriai_compose.storage import AgentSession
@@ -16,7 +16,7 @@ from iriai_compose.storage import AgentSession
 from iriai_build_v2.runtimes import normalize_agent_runtime, secondary_agent_runtime_name
 import iriai_build_v2.runtimes.codex as codex_mod
 from iriai_build_v2.runtimes.codex import CodexAgentRuntime, _prepare_schema
-from iriai_build_v2.models.outputs import Envelope, ReviewOutcome
+from iriai_build_v2.models.outputs import Envelope, ImplementationDAG, ReviewOutcome
 
 
 def _write_sandbox_manifest(
@@ -1601,3 +1601,127 @@ class TestCodexInvocationLiveness:
             await runtime._read_stderr(reader, state=state, trace_path=None)
             fresh = runtime._invocation_last_activity["inv-stderr"]
             assert loop.time() - fresh < 5.0
+
+
+# ── Strict-schema map degradation (defect N-1) ──────────────────────────────
+#
+# Regression tests for the dag-ws slice-planner 400s:
+#   invalid_request_error / invalid_json_schema: "'required' is required to be
+#   supplied and to be an array including every key in properties. Extra
+#   required key 'requirement_coverage' supplied."
+#
+# ImplementationDAG.requirement_coverage is dict[str, list[str]] — an open-map
+# object schema (additionalProperties as a schema, no fixed properties).
+# OpenAI strict structured output cannot express open maps and the Codex CLI
+# sanitizer DROPPED the property while leaving it in `required`. _prepare_schema
+# now degrades open maps to JSON-string fields (no property is ever dropped,
+# so required stays ⊆ properties), and _restore_degraded_maps decodes the
+# strings back before Pydantic validation.
+
+
+class _MapRepro(BaseModel):
+    """Minimal repro of the construct that broke (dict[str, list[str]])."""
+
+    name: str = ""
+    coverage: dict[str, list[str]] = PydField(default_factory=dict)
+    loose: dict[str, object] = PydField(default_factory=dict)
+
+
+def _assert_strict_invariants(node: object, path: str = "$") -> None:
+    """required ⊆ properties and no open-map object survives anywhere."""
+    if isinstance(node, dict):
+        required = node.get("required")
+        properties = node.get("properties")
+        if isinstance(required, list):
+            property_keys = set(properties.keys()) if isinstance(properties, dict) else set()
+            missing = [key for key in required if key not in property_keys]
+            assert not missing, f"{path}: required keys missing from properties: {missing}"
+        if node.get("type") == "object":
+            assert node.get("additionalProperties") is False, (
+                f"{path}: object node must carry additionalProperties=false"
+            )
+            assert isinstance(properties, dict), f"{path}: object node must carry properties"
+        for key, value in node.items():
+            _assert_strict_invariants(value, f"{path}.{key}")
+    elif isinstance(node, list):
+        for idx, value in enumerate(node):
+            _assert_strict_invariants(value, f"{path}[{idx}]")
+
+
+class TestPrepareSchemaOpenMapDegradation:
+    def test_implementation_dag_schema_keeps_required_consistent(self):
+        prepared = _prepare_schema(ImplementationDAG.model_json_schema())
+
+        _assert_strict_invariants(prepared)
+        # requirement_coverage must SURVIVE (degraded, not dropped) …
+        assert "requirement_coverage" in prepared["properties"]
+        assert "requirement_coverage" in prepared["required"]
+        # … as a strict-compatible JSON-string field.
+        degraded = prepared["properties"]["requirement_coverage"]
+        assert degraded["type"] == "string"
+        assert "JSON" in degraded["description"]
+
+    def test_minimal_repro_schema_required_subset_of_properties(self):
+        prepared = _prepare_schema(_MapRepro.model_json_schema())
+
+        _assert_strict_invariants(prepared)
+        assert set(prepared["required"]) == {"name", "coverage", "loose"}
+        assert prepared["properties"]["coverage"]["type"] == "string"
+        assert prepared["properties"]["loose"]["type"] == "string"
+
+    def test_envelope_schema_unaffected_regression(self):
+        # The pre-existing behaviour for non-map schemas must hold.
+        prepared = _prepare_schema(Envelope[ReviewOutcome].model_json_schema())
+        assert prepared["additionalProperties"] is False
+        assert prepared["required"] == [
+            "question", "options", "output", "complete", "artifact_path",
+        ]
+        _assert_strict_invariants(prepared)
+
+
+class TestRestoreDegradedMaps:
+    def test_round_trip_json_string_map(self):
+        payload = {
+            "name": "s1",
+            "coverage": json.dumps({"REQ-1": ["t1", "t2"], "REQ-2": ["t3"]}),
+            "loose": json.dumps({"k": 1}),
+        }
+        restored = codex_mod._restore_degraded_maps(payload, _MapRepro)
+        model = _MapRepro.model_validate(restored)
+        assert model.coverage == {"REQ-1": ["t1", "t2"], "REQ-2": ["t3"]}
+        assert model.loose == {"k": 1}
+
+    def test_implementation_dag_payload_round_trip(self):
+        payload = {
+            "tasks": [
+                {
+                    "id": "t1",
+                    "name": "Task 1",
+                    "description": "do the thing",
+                }
+            ],
+            "num_teams": 1,
+            "execution_order": [["t1"]],
+            "requirement_coverage": json.dumps({"REQ-1": ["t1"]}),
+            "complete": True,
+        }
+        restored = codex_mod._restore_degraded_maps(payload, ImplementationDAG)
+        dag = ImplementationDAG.model_validate(restored)
+        assert dag.requirement_coverage == {"REQ-1": ["t1"]}
+        assert dag.tasks[0].id == "t1"
+
+    def test_passthrough_when_map_already_object(self):
+        payload = {
+            "name": "s1",
+            "coverage": {"REQ-1": ["t1"]},
+            "loose": {},
+        }
+        restored = codex_mod._restore_degraded_maps(payload, _MapRepro)
+        assert _MapRepro.model_validate(restored).coverage == {"REQ-1": ["t1"]}
+
+    def test_undecodable_string_left_for_pydantic_error(self):
+        payload = {"name": "s1", "coverage": "not-json", "loose": "{}"}
+        restored = codex_mod._restore_degraded_maps(payload, _MapRepro)
+        assert restored["coverage"] == "not-json"
+        with pytest.raises(Exception):
+            _MapRepro.model_validate(restored)

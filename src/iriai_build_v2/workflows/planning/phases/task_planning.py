@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json as _json
 import logging
+import os
 import re
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Iterable
@@ -48,6 +49,7 @@ from ....roles import (
     InterviewActor,
     dag_compiler,
     dag_path_resolver_role,
+    planning_lead_ask_role,
     planning_lead_review_role,
     planning_lead_role,
 )
@@ -166,8 +168,34 @@ _SF14_DEFAULT_VARIANT_TASK_IDS = (
 )
 _SLICE_MANIFEST_DERIVATION_VERSION = 2
 _PLANNING_SIDECAR_NORMALIZER_VERSION = "2026-04-22-sidecar-rewrite-v5"
-_SLICE_CONTEXT_SOFT_CAP_BYTES = 180_000
-_SLICE_PEER_CAP_BYTES = 60_000
+
+
+def _cap_bytes_from_env(env_var: str, default: int) -> int:
+    """Read a byte-cap knob from the environment at module import.
+
+    Mirrors the CONTEXT_PACKAGE_ITEM_MAX_CHARS style in
+    workflows/_common/_helpers.py. Invalid or non-positive values fall back
+    to the default (never silently disable the budget guard)."""
+    raw = os.environ.get(env_var, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("%s=%r is not an integer — using default %d", env_var, raw, default)
+        return default
+    if value <= 0:
+        logger.warning("%s=%d is not positive — using default %d", env_var, value, default)
+        return default
+    return value
+
+
+_SLICE_CONTEXT_SOFT_CAP_BYTES = _cap_bytes_from_env(
+    "IRIAI_TASK_PLANNING_SLICE_CONTEXT_CAP_BYTES", 180_000
+)
+_SLICE_PEER_CAP_BYTES = _cap_bytes_from_env(
+    "IRIAI_TASK_PLANNING_SLICE_PEER_CAP_BYTES", 60_000
+)
 _WORKSTREAM_CONTEXT_SOFT_CAP_BYTES = 180_000
 _WORKSTREAM_SUBFEATURE_DIGEST_BUDGET = 8_000
 _WORKSTREAM_CLUSTER_TARGET_BYTES = 100_000
@@ -669,9 +697,29 @@ async def _validate_verification_gates_coverage(
 
 _workstream_planner = AgentActor(
     name="workstream-planner",
-    role=planning_lead_role,
+    # Ask-only structured output (WorkstreamDecomposition) — read-only role
+    # variant so claude-pool dispatch never demands a runtime workspace
+    # binding (W-4; see roles._ask_only_role).
+    role=planning_lead_ask_role,
     context_keys=["project", "scope", "decomposition"],
 )
+
+
+def _slice_planner_actor(name: str) -> AgentActor:
+    """Build a dag-ws slice-planner Ask actor.
+
+    Slice planners return ONLY structured output (ImplementationDAG) and
+    never write workspace files, so they use the ask-only planning-lead role
+    variant: with Write/Bash present, claude_pool._role_is_write_producing()
+    classifies the job write-producing and pool dispatch raises
+    RuntimeError('Claude pool write-producing job requires runtime workspace
+    binding') (W-4). Role.name stays 'planning-lead' for economy mapping."""
+    return AgentActor(
+        name=name,
+        role=planning_lead_ask_role,
+        context_keys=["project", "scope"],
+    )
+
 
 _sf_task_planner_gate_reviewer = InterviewActor(
     name="sf-task-planner-gate-reviewer",
@@ -758,6 +806,28 @@ class TaskPlanningPhase(Phase):
         if mode_label != "target-only" and size_breakdown.get("peer", 0) > _SLICE_PEER_CAP_BYTES:
             return True
         return False
+
+    @staticmethod
+    def _slice_over_budget_error(
+        total_bytes: int,
+        size_breakdown: dict[str, int],
+    ) -> str:
+        """Build the over-budget attempt error with the full layer breakdown.
+
+        The per-layer sizes (and the active caps, which are env-tunable via
+        IRIAI_TASK_PLANNING_SLICE_CONTEXT_CAP_BYTES /
+        IRIAI_TASK_PLANNING_SLICE_PEER_CAP_BYTES) make the next overflow
+        diagnosable from the attempt record alone."""
+        breakdown = ", ".join(
+            f"{layer}={size}" for layer, size in sorted(size_breakdown.items())
+        )
+        return (
+            "estimated context exceeds task-planning budget "
+            f"({total_bytes} bytes, peer={size_breakdown.get('peer', 0)}, "
+            f"cap={_SLICE_CONTEXT_SOFT_CAP_BYTES}, "
+            f"peer_cap={_SLICE_PEER_CAP_BYTES}, "
+            f"size_breakdown=[{breakdown}])"
+        )
 
     @staticmethod
     async def _clear_stale_blocked_artifact(
@@ -6325,10 +6395,8 @@ class TaskPlanningPhase(Phase):
         direct_peer_only: bool,
     ) -> SlicePlanResult:
         mode_stem = re.sub(r"[^A-Za-z0-9._-]+", "-", mode_label.strip()).strip("-") or "default"
-        actor = AgentActor(
-            name=f"dag-ws-{workstream.id}-{subfeature.slug}-{slice_info.slice_id}-{mode_stem}",
-            role=planning_lead_role,
-            context_keys=["project", "scope"],
+        actor = _slice_planner_actor(
+            f"dag-ws-{workstream.id}-{subfeature.slug}-{slice_info.slice_id}-{mode_stem}",
         )
         prompt, context_package = await self._build_subfeature_task_prompt(
             runner,
@@ -6364,10 +6432,7 @@ class TaskPlanningPhase(Phase):
         attempt.size_breakdown = size_breakdown
         if self._slice_context_over_budget(total_bytes, size_breakdown, mode_label=mode_label):
             attempt.status = "failed"
-            attempt.error = (
-                "estimated context exceeds task-planning budget "
-                f"({total_bytes} bytes, peer={size_breakdown.get('peer', 0)})"
-            )
+            attempt.error = self._slice_over_budget_error(total_bytes, size_breakdown)
             return SlicePlanResult(
                 slice_id=slice_info.slice_id,
                 error=attempt.error,
@@ -6466,10 +6531,8 @@ class TaskPlanningPhase(Phase):
         direct_peer_only: bool,
     ) -> SlicePlanResult:
         mode_stem = re.sub(r"[^A-Za-z0-9._-]+", "-", mode_label.strip()).strip("-") or "default"
-        actor = AgentActor(
-            name=f"dag-ws-{workstream.id}-{subfeature.slug}-{slice_info.slice_id}-repair-{mode_stem}",
-            role=planning_lead_role,
-            context_keys=["project", "scope"],
+        actor = _slice_planner_actor(
+            f"dag-ws-{workstream.id}-{subfeature.slug}-{slice_info.slice_id}-repair-{mode_stem}",
         )
         prompt, context_package = await self._build_subfeature_task_prompt(
             runner,
@@ -6507,9 +6570,8 @@ class TaskPlanningPhase(Phase):
         attempt.size_breakdown = size_breakdown
         if self._slice_context_over_budget(total_bytes, size_breakdown, mode_label=mode_label):
             attempt.status = "failed"
-            attempt.error = (
-                "estimated repair context exceeds task-planning budget "
-                f"({total_bytes} bytes, peer={size_breakdown.get('peer', 0)})"
+            attempt.error = "repair: " + self._slice_over_budget_error(
+                total_bytes, size_breakdown
             )
             return SlicePlanResult(
                 slice_id=slice_info.slice_id,
