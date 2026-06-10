@@ -16,6 +16,7 @@ import shutil
 import sys
 import time
 import uuid
+import zlib
 from collections.abc import Iterable, Mapping
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
@@ -107,6 +108,12 @@ DEFAULT_HEALTH_TIMEOUT_SECONDS = float(
     os.environ.get("IRIAI_CLAUDE_POOL_HEALTH_TIMEOUT_SECONDS", "60") or "60"
 )
 DEFAULT_RUNNER_UMASK = os.environ.get("IRIAI_CLAUDE_POOL_RUNNER_UMASK", "0002")
+# Runner self-bounce-on-stale-code (W-8): env names are read at monitor
+# construction time (not import time) so tests and launchd plists can toggle
+# them per-process.
+SELF_BOUNCE_ENV_VAR = "IRIAI_POOL_RUNNER_SELF_BOUNCE"
+SELF_BOUNCE_SOURCE_REPO_ENV_VAR = "IRIAI_POOL_RUNNER_SOURCE_REPO"
+SELF_BOUNCE_STAGGER_MODULO_SECONDS = 120
 DEFAULT_LIMIT_PROBE_AFTER_SECONDS = float(
     os.environ.get("IRIAI_CLAUDE_POOL_LIMIT_PROBE_AFTER_SECONDS", "60") or "60"
 )
@@ -2374,6 +2381,161 @@ class ClaudePoolRuntime(AgentRuntime):
         self._queued_user_notes.setdefault(feature_id, []).append(text)
 
 
+def _self_bounce_stagger_seconds(profile_name: str) -> int:
+    """Deterministic per-profile stagger so pool members never bounce together.
+
+    Uses zlib.crc32 (stable across processes) — Python's built-in hash() is
+    salted per-process and would not stagger consistently.
+    """
+    return zlib.crc32(profile_name.encode("utf-8")) % SELF_BOUNCE_STAGGER_MODULO_SECONDS
+
+
+def _self_bounce_source_repo_root() -> Path | None:
+    """Locate the git checkout backing this (editable) install.
+
+    Honors ``IRIAI_POOL_RUNNER_SOURCE_REPO`` when set; otherwise walks up
+    from this module file looking for a ``.git`` entry — editable installs
+    point straight back into the source checkout, so ``__file__`` lives
+    under the repo root.  Returns None when no repo can be found.
+    """
+    override = os.environ.get(SELF_BOUNCE_SOURCE_REPO_ENV_VAR, "").strip()
+    if override:
+        candidate = Path(override).expanduser()
+        if (candidate / ".git").exists():
+            return candidate
+        return None
+    module_path = Path(__file__).resolve()
+    for parent in module_path.parents:
+        if (parent / ".git").exists():
+            return parent
+    return None
+
+
+def _read_git_head_sha(repo_root: Path) -> str | None:
+    """Read the repo's current HEAD commit sha with plain file reads.
+
+    No subprocess — this runs on every runner tick.  Handles:
+    - symbolic refs (``ref: refs/heads/...`` -> loose ref file or packed-refs)
+    - detached HEAD (plain sha in ``.git/HEAD``)
+    - ``.git``-file checkouts (worktrees: ``gitdir: <path>``)
+    Returns None when the sha cannot be determined.  HEAD only changes on
+    commit/checkout, so uncommitted working-tree edits never alter the result.
+    """
+    git_dir = repo_root / ".git"
+    if git_dir.is_file():
+        text = git_dir.read_text(encoding="utf-8").strip()
+        if not text.startswith("gitdir:"):
+            return None
+        gitdir = Path(text.split(":", 1)[1].strip()).expanduser()
+        if not gitdir.is_absolute():
+            gitdir = (repo_root / gitdir).resolve()
+        git_dir = gitdir
+    head_text = (git_dir / "HEAD").read_text(encoding="utf-8").strip()
+    if not head_text:
+        return None
+    if not head_text.startswith("ref:"):
+        # Detached HEAD: the file holds the commit sha directly.
+        return head_text
+    ref = head_text.split(":", 1)[1].strip()
+    if not ref:
+        return None
+    ref_path = git_dir / ref
+    if ref_path.is_file():
+        sha = ref_path.read_text(encoding="utf-8").strip()
+        return sha or None
+    packed = git_dir / "packed-refs"
+    if packed.is_file():
+        for line in packed.read_text(encoding="utf-8").splitlines():
+            entry = line.strip()
+            if not entry or entry.startswith(("#", "^")):
+                continue
+            parts = entry.split(None, 1)
+            if len(parts) == 2 and parts[1].strip() == ref:
+                return parts[0]
+    return None
+
+
+class _RunnerSelfBounceMonitor:
+    """Latching staleness detector for the runner's loaded source code.
+
+    Records the source repo HEAD sha at startup and re-reads it on each
+    runner tick (cheap stat+read).  A differing sha means new code landed
+    (commit/checkout) since this long-lived process imported the package,
+    so the runner should drain and exit — launchd KeepAlive relaunches it
+    on fresh code with zero operator privileges.
+
+    Fail-safe direction is "keep running": any startup or per-tick read
+    problem logs once and disables the monitor for the process lifetime,
+    so a broken sha read can never bounce-loop the runner.  Opt out with
+    ``IRIAI_POOL_RUNNER_SELF_BOUNCE=0`` (default ON).
+    """
+
+    def __init__(self, profile_name: str) -> None:
+        self.profile_name = profile_name
+        self.stagger_seconds = _self_bounce_stagger_seconds(profile_name)
+        self.stale = False
+        self.startup_sha: str | None = None
+        self.current_sha: str | None = None
+        self._repo_root: Path | None = None
+        self.enabled = os.environ.get(SELF_BOUNCE_ENV_VAR, "1").strip() != "0"
+        if not self.enabled:
+            logger.info(
+                "runner self-bounce disabled by %s for profile %s",
+                SELF_BOUNCE_ENV_VAR,
+                profile_name,
+            )
+            return
+        try:
+            self._repo_root = _self_bounce_source_repo_root()
+            if self._repo_root is not None:
+                self.startup_sha = _read_git_head_sha(self._repo_root)
+        except OSError:
+            logger.warning(
+                "runner self-bounce disabled for profile %s: error reading source git HEAD",
+                profile_name,
+                exc_info=True,
+            )
+        if self.startup_sha is None:
+            logger.warning(
+                "runner self-bounce disabled for profile %s: no readable source git HEAD "
+                "(repo_root=%s)",
+                profile_name,
+                self._repo_root,
+            )
+            self.enabled = False
+
+    def check_stale(self) -> bool:
+        """Re-read HEAD; return True when the loaded code is stale (latched)."""
+        if not self.enabled:
+            return False
+        if self.stale:
+            return True
+        try:
+            current = _read_git_head_sha(self._repo_root)  # type: ignore[arg-type]
+        except OSError:
+            logger.warning(
+                "runner self-bounce disabled for profile %s: source git HEAD became "
+                "unreadable",
+                self.profile_name,
+                exc_info=True,
+            )
+            self.enabled = False
+            return False
+        if current is None:
+            logger.warning(
+                "runner self-bounce disabled for profile %s: source git HEAD sha could "
+                "not be resolved (repo_root=%s)",
+                self.profile_name,
+                self._repo_root,
+            )
+            self.enabled = False
+            return False
+        if current != self.startup_sha:
+            self.stale = True
+            self.current_sha = current
+        return self.stale
+
+
 class ClaudePoolRunner:
     """Per-profile runner intended to run as the matching macOS user."""
 
@@ -2394,16 +2556,62 @@ class ClaudePoolRunner:
         if self.profile_config is None:
             raise RuntimeError(f"Unknown Claude pool profile: {profile}")
         self._active: dict[str, asyncio.Task[None]] = {}
+        self._self_bounce = _RunnerSelfBounceMonitor(profile)
 
     async def run_forever(self) -> None:
         logger.info("Claude pool runner started for profile %s", self.profile)
+        if self._self_bounce.enabled:
+            logger.info(
+                "runner self-bounce armed for profile %s: startup sha %s, stagger %ds",
+                self.profile,
+                self._self_bounce.startup_sha,
+                self._self_bounce.stagger_seconds,
+            )
         while True:
             self._reap_active()
             await self.run_once(wait=False)
             self._write_profile_heartbeat()
+            await self._maybe_self_bounce()
             await asyncio.sleep(self.poll_interval)
 
+    async def _maybe_self_bounce(self) -> None:
+        """Drain-then-exit when the loaded source code is stale.
+
+        Called once per heartbeat tick.  The drain gate is the critical
+        invariant: this NEVER exits while a claimed job is still running —
+        once staleness latches, ``run_once`` declines to claim new work and
+        this method waits for ``self._active`` to empty.  It then sleeps the
+        deterministic per-profile stagger delay (so pool members never
+        bounce simultaneously) and exits 0 for launchd KeepAlive to
+        relaunch on fresh code.
+        """
+        if not self._self_bounce.check_stale():
+            return
+        if self._active:
+            # Drain gate: a claimed job is still running; exit on a later tick.
+            return
+        logger.warning(
+            "runner self-bounce: code stale %s->%s "
+            "(profile=%s, idle, exiting 0 after %ds stagger; "
+            "launchd KeepAlive relaunches on fresh code)",
+            self._self_bounce.startup_sha,
+            self._self_bounce.current_sha,
+            self.profile,
+            self._self_bounce.stagger_seconds,
+        )
+        await asyncio.sleep(self._self_bounce.stagger_seconds)
+        sys.exit(0)
+
     async def run_once(self, *, wait: bool = True) -> None:
+        if self._self_bounce.stale:
+            # Self-bounce pending: decline new work so the drain gate in
+            # _maybe_self_bounce can empty out and exit.
+            logger.info(
+                "Claude pool runner profile %s declining new work: "
+                "self-bounce pending (stale code)",
+                self.profile,
+            )
+            return
         if not self._profile_is_enabled():
             logger.warning(
                 "Claude pool runner profile %s is disabled in profiles.json; refusing to claim work",
