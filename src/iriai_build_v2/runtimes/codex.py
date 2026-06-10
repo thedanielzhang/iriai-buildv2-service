@@ -83,6 +83,22 @@ _PRE_WORK_STALL_SECONDS = int(
 _PRE_WORK_STALL_RETRIES = int(
     os.environ.get("IRIAI_CODEX_PRE_WORK_STALL_RETRIES", "1") or "1"
 )
+# A codex dispatch's invocation counts as "live work" — which the workflow
+# liveness watchdog (workflows/_runner.py) honors by EXTENDING its grace
+# period — only while its CLI is still producing output. The old
+# process-alive-only check let a wedged-but-alive ``codex exec`` (silent
+# stdout/stderr, 0 CPU) extend grace FOREVER: the observed resume30 wedge sat
+# 35+ minutes after its last stdout event while the watchdog extended grace on
+# every poll. Mirrors claude.py's _LIVE_WORK_STALE_SECONDS: if no
+# stdout/stderr output arrives within this window, invocation_has_live_work()
+# flips False, the outer watchdog stops extending grace and cancels the
+# dispatch (CancelledError → _abort_process SIGKILLs the subprocess), and the
+# existing AgentStalled retry machinery takes over — loud, bounded, retryable.
+# This bounds INACTIVITY only: a healthy dispatch that keeps streaming events
+# (tool calls, reasoning, file changes, agent messages) is never interrupted.
+_LIVE_WORK_STALE_SECONDS = float(
+    _bounded_int_env("IRIAI_CODEX_LIVE_WORK_STALE_SECONDS", 120, maximum=3600)
+)
 _TRACE_TEXT_LIMIT = 1_000
 _current_invocation_var: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "codex_runtime_invocation_id", default=None,
@@ -359,6 +375,10 @@ class CodexAgentRuntime(AgentRuntime):
         self._global_codex_config = _read_global_codex_config()
         self._invocation_activity: dict[str, Any] = {}
         self._invocation_processes: dict[str, asyncio.subprocess.Process] = {}
+        # invocation_id → loop.time() of the last observed CLI output
+        # (stdout event or stderr line). Bounds invocation_has_live_work():
+        # a merely-alive-but-silent subprocess must not count as live work.
+        self._invocation_last_activity: dict[str, float] = {}
 
     @staticmethod
     def _bound_runtime_allowed_roots(authority: _BoundRuntimeAuthority) -> list[Path]:
@@ -455,6 +475,7 @@ class CodexAgentRuntime(AgentRuntime):
             _current_invocation_var.reset(token)
             self._invocation_activity.pop(invocation_id, None)
             self._invocation_processes.pop(invocation_id, None)
+            self._invocation_last_activity.pop(invocation_id, None)
 
     def invocation_has_live_work(self, invocation_id: str) -> bool:
         proc = self._invocation_processes.get(invocation_id)
@@ -466,7 +487,30 @@ class CodexAgentRuntime(AgentRuntime):
             os.kill(proc.pid, 0)
         except OSError:
             return False
-        return True
+        # The process being alive is necessary but NOT sufficient: a wedged
+        # ``codex exec`` can sit alive and silent forever, and reporting it as
+        # live work would make the outer liveness watchdog extend its grace
+        # period indefinitely (the resume30 35-minute wedge). Only count the
+        # dispatch as live while its CLI produced output recently — mirrors
+        # ClaudeAgentRuntime.invocation_has_live_work's staleness bound.
+        last_activity = self._invocation_last_activity.get(invocation_id)
+        if last_activity is None:
+            return False
+        return (
+            asyncio.get_running_loop().time() - last_activity
+        ) < _LIVE_WORK_STALE_SECONDS
+
+    def _record_invocation_activity(self) -> None:
+        """Stamp the current invocation's last-output time (loop clock).
+
+        Called from the CLI's stdout/stderr readers on every parsed event or
+        line so invocation_has_live_work() reflects actual stream output, and
+        at process start so a just-launched dispatch is not instantly stale."""
+        invocation_id = _current_invocation_var.get()
+        if invocation_id:
+            self._invocation_last_activity[invocation_id] = (
+                asyncio.get_running_loop().time()
+            )
 
     async def invoke(
         self,
@@ -1422,6 +1466,7 @@ class CodexAgentRuntime(AgentRuntime):
         invocation_id = _current_invocation_var.get()
         if invocation_id:
             self._invocation_processes[invocation_id] = proc
+            self._record_invocation_activity()
         proc_pid = getattr(proc, "pid", None)
         self._write_trace(
             trace_path,
@@ -1837,6 +1882,11 @@ class CodexAgentRuntime(AgentRuntime):
         event_type = str(event.get("type") or "")
         state["stdout_events"] = int(state.get("stdout_events", 0) or 0) + 1
         state["last_event_type"] = event_type
+        # EVERY parsed stdout event is liveness — including item types that are
+        # never re-emitted as messages (file_change, mcp_tool_call, turn.*).
+        # The resume30 wedge's last event was a file_change item.completed;
+        # liveness must key off the raw stream, not the emitted subset.
+        self._record_invocation_activity()
 
         if event.get("type") == "thread.started":
             state["thread_id"] = event.get("thread_id")
@@ -2033,6 +2083,9 @@ class CodexAgentRuntime(AgentRuntime):
             if not text:
                 return
             state["stderr_lines"] = int(state.get("stderr_lines", 0) or 0) + 1
+            # stderr output is liveness too (e.g. slow MCP startup logging):
+            # a dispatch producing stderr must not be treated as a silent wedge.
+            self._record_invocation_activity()
             append_tail(text)
             self._write_trace(
                 trace_path,

@@ -1477,3 +1477,127 @@ class TestCodexHomeIsolation:
         )
 
         assert database_url == "postgresql://danielzhang@localhost:5431/compose_dev"
+
+
+class TestCodexInvocationLiveness:
+    """invocation_has_live_work must be bounded by output staleness.
+
+    The workflow liveness watchdog (workflows/_runner.py) extends its grace
+    period while a runtime reports live work. The old process-alive-only check
+    let a wedged-but-alive ``codex exec`` (silent stream, 0 CPU) extend grace
+    FOREVER — the resume30 wedge: last stdout event, then 35+ minutes of
+    silence with the orchestrator parked in an await. Mirrors the claude.py
+    staleness contract (test_claude.py::
+    test_invocation_live_work_goes_stale_when_stream_wedges).
+    """
+
+    def _runtime(self, monkeypatch: pytest.MonkeyPatch) -> CodexAgentRuntime:
+        monkeypatch.setattr(
+            "iriai_build_v2.runtimes.codex.shutil.which",
+            lambda _command: "/usr/local/bin/codex",
+        )
+        return CodexAgentRuntime()
+
+    @staticmethod
+    def _alive_proc() -> SimpleNamespace:
+        # os.kill(os.getpid(), 0) always succeeds → "alive" to the prober.
+        import os
+
+        return SimpleNamespace(pid=os.getpid(), returncode=None)
+
+    @pytest.mark.asyncio
+    async def test_live_work_goes_stale_when_stream_goes_silent(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        runtime = self._runtime(monkeypatch)
+        loop = asyncio.get_running_loop()
+
+        runtime._invocation_processes["inv"] = self._alive_proc()
+
+        # Slow-but-active stream: recent output → still live work (the
+        # watchdog keeps extending grace; an active dispatch is never killed).
+        runtime._invocation_last_activity["inv"] = loop.time()
+        assert runtime.invocation_has_live_work("inv") is True
+
+        # Silent stream: activity older than the stale window → NOT live work,
+        # even though the subprocess is still alive. The outer watchdog stops
+        # extending grace and cancels (idle abort → AgentStalled retry).
+        runtime._invocation_last_activity["inv"] = loop.time() - (
+            codex_mod._LIVE_WORK_STALE_SECONDS + 5
+        )
+        assert runtime.invocation_has_live_work("inv") is False
+
+        # No recorded activity at all → not live work (never extend on a
+        # process whose stream produced nothing we can vouch for).
+        runtime._invocation_last_activity.pop("inv", None)
+        assert runtime.invocation_has_live_work("inv") is False
+
+        assert runtime.invocation_has_live_work("unknown") is False
+
+    @pytest.mark.asyncio
+    async def test_dead_process_is_never_live_work_even_with_fresh_activity(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        runtime = self._runtime(monkeypatch)
+        loop = asyncio.get_running_loop()
+
+        runtime._invocation_processes["inv"] = SimpleNamespace(
+            pid=4_000_000, returncode=1
+        )
+        runtime._invocation_last_activity["inv"] = loop.time()
+        assert runtime.invocation_has_live_work("inv") is False
+
+    @pytest.mark.asyncio
+    async def test_stdout_events_refresh_activity_including_unemitted_items(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        # The wedged trace's LAST event was a file_change item.completed —
+        # an event type that is never re-emitted as a message. Liveness must
+        # key off the raw stdout stream, not the emitted subset.
+        runtime = self._runtime(monkeypatch)
+        loop = asyncio.get_running_loop()
+
+        async def _in_invocation() -> None:
+            async with runtime.bind_invocation("inv-stdout", None):
+                runtime._invocation_last_activity["inv-stdout"] = (
+                    loop.time() - codex_mod._LIVE_WORK_STALE_SECONDS - 5
+                )
+                state: dict[str, object] = {}
+                runtime._handle_stdout_line(
+                    json.dumps(
+                        {
+                            "type": "item.completed",
+                            "item": {"type": "file_change", "id": "item_62"},
+                        }
+                    ),
+                    state=state,
+                    output_type=None,
+                    trace_path=None,
+                )
+                fresh = runtime._invocation_last_activity["inv-stdout"]
+                assert loop.time() - fresh < 5.0
+
+        await _in_invocation()
+        # bind_invocation teardown clears per-invocation liveness state.
+        assert "inv-stdout" not in runtime._invocation_last_activity
+        assert runtime.invocation_has_live_work("inv-stdout") is False
+
+    @pytest.mark.asyncio
+    async def test_stderr_lines_refresh_activity(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        runtime = self._runtime(monkeypatch)
+        loop = asyncio.get_running_loop()
+
+        reader = asyncio.StreamReader()
+        reader.feed_data(b"mcp server starting...\n")
+        reader.feed_eof()
+
+        async with runtime.bind_invocation("inv-stderr", None):
+            runtime._invocation_last_activity["inv-stderr"] = (
+                loop.time() - codex_mod._LIVE_WORK_STALE_SECONDS - 5
+            )
+            state: dict[str, object] = {}
+            await runtime._read_stderr(reader, state=state, trace_path=None)
+            fresh = runtime._invocation_last_activity["inv-stderr"]
+            assert loop.time() - fresh < 5.0
