@@ -2060,6 +2060,38 @@ def _partition_revision_plan(
     return filtered, deferred
 
 
+_DEFERRED_NOTICE_DESC_LIMIT = 200  # chars of each description shown to the reviewer
+
+
+def _build_deferred_requests_notice(deferred: list) -> str:
+    """Render a reviewer-facing notice for auto-deferred revision requests.
+
+    ``deferred`` is the list of RevisionRequests that ``_partition_revision_plan``
+    routed to the enhancement backlog. The notice tells the next review cycle's
+    reviewer NOT to re-file them (re-filing loops the gate forever — observed
+    live: the same minor request deferred 3 cycles in a row). Returns an empty
+    string when nothing was deferred.
+    """
+    if not deferred:
+        return ""
+    bullets = []
+    for req in deferred:
+        severity = getattr(req, "severity", "") or "minor"
+        description = (getattr(req, "description", "") or "").strip()
+        if len(description) > _DEFERRED_NOTICE_DESC_LIMIT:
+            description = description[:_DEFERRED_NOTICE_DESC_LIMIT].rstrip() + "…"
+        bullets.append(f"- [{severity}] {description}")
+    return (
+        "NOTE — auto-deferred requests from your previous pass: the following "
+        "requests were classified minor/nit and were DEFERRED to the "
+        "enhancement backlog; this gate will NOT execute them. Do NOT re-file "
+        "them — re-filing loops the gate. If one is genuinely blocking, "
+        "re-file it once with severity 'major' and justify; otherwise record "
+        "approval if no blocking issues remain.\n"
+        + "\n".join(bullets)
+    )
+
+
 async def _append_gate_enhancements(
     runner: WorkflowRunner, feature: Feature,
     items: list, artifact_prefix: str,
@@ -3436,6 +3468,11 @@ async def interview_gate_review(
             f"Gate review requires compiled artifact `{compiled_key}` before launch"
         )
 
+    # Deferred requests from the most recent cycle's _partition_revision_plan
+    # call. Surfaced to the NEXT cycle's reviewer so it does not re-file
+    # identical minor/nit requests forever (the gate-loop defect).
+    last_deferred_notes: list = []
+
     while True:
         # ── Cycle tracking ──
         review_cycle += 1
@@ -3460,6 +3497,12 @@ async def interview_gate_review(
                 f"- **{label}**: {url}" for label, url in additional_urls.items()
             )
             extra_links = f"\n\nAdditional resources for review:\n{links}"
+
+        # ── Deferred-requests notice (inject once, then clear) ──
+        deferred_notice = _build_deferred_requests_notice(last_deferred_notes)
+        deferred_notice_block = f"\n\n{deferred_notice}" if deferred_notice else ""
+        last_deferred_notes = []
+
         decision_text = await runner.artifacts.get("decisions", feature=feature) or ""
         decision_context = ""
         if decision_text:
@@ -3528,7 +3571,7 @@ async def interview_gate_review(
                     f"or Design interview.\n\n"
                     f"I've compiled the {artifact_prefix} from all subfeatures. "
                     f"Please review it and let me know if there is anything you'd like changed.{url_note}"
-                    f"{extra_links}\n\n"
+                    f"{extra_links}{deferred_notice_block}\n\n"
                     + (
                         f"Read the context index first: `{review_package.index_path}`\n"
                         f"Then read the context manifest: `{review_package.manifest_path}`\n"
@@ -3637,6 +3680,7 @@ async def interview_gate_review(
             )
             if deferred:
                 await _append_gate_enhancements(runner, feature, deferred, artifact_prefix)
+                last_deferred_notes = list(deferred)
                 logger.info(
                     "interview_gate_review: deferred %d minor revision requests for %s",
                     len(deferred), artifact_prefix,
@@ -3653,9 +3697,12 @@ async def interview_gate_review(
 
             # If all requests were resolved/deferred, skip revision+recompile
             if not outcome.revision_plan.requests:
-                logger.info(
-                    "interview_gate_review: all revision requests resolved/deferred "
-                    "for %s — skipping recompile", artifact_prefix,
+                logger.warning(
+                    "interview_gate_review: ALL revision requests for %s were "
+                    "resolved/deferred (%d deferred to the enhancement backlog, "
+                    "%d duplicate-suppressed) — skipping recompile; the gate "
+                    "will re-present with a deferred-requests notice",
+                    artifact_prefix, len(deferred), len(suppressed),
                 )
                 gate_ledger.cycle = review_cycle
                 await _save_gate_ledger(runner, feature, gate_ledger, artifact_prefix)

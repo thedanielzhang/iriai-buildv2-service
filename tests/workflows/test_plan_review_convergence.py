@@ -18,8 +18,10 @@ from iriai_build_v2.workflows._common._helpers import (
     TargetedRevisionFailure,
     TargetedRevisionResult,
     _assert_gate_requests_are_converging,
+    _build_deferred_requests_notice,
     _dedup_revision_requests,
     _is_transient_runtime_failure,
+    _partition_revision_plan,
     _update_gate_ledger,
 )
 from iriai_build_v2.runtimes.claude import (
@@ -98,6 +100,61 @@ def test_genuinely_new_finding_still_gets_a_pass():
     p2 = _plan("F2: brand new security gap")
     deduped, _ = _dedup_revision_requests(p2, ledger, SRC)
     assert [r.description for r in deduped.requests] == ["F2: brand new security gap"]
+
+
+# ── Minor/nit deferral: partition + reviewer-facing deferral notice ──────────
+# RCA (kaya system-design gate, cycles 4→6): when ALL of a cycle's revision
+# requests are minor/nit they get deferred to the enhancement backlog and the
+# gate re-presents — but the reviewer was never told, so it re-filed the
+# identical minor request every cycle (3 wasted cycles). The notice built by
+# _build_deferred_requests_notice is injected into the NEXT cycle's prompt.
+
+
+def _req(description: str, severity: str) -> RevisionRequest:
+    return RevisionRequest(description=description, reasoning="r", severity=severity)
+
+
+def test_partition_defers_minor_and_nit_keeps_major_and_unknown_blocking():
+    plan = RevisionPlan(
+        requests=[
+            _req("B: drop the table", "blocker"),
+            _req("M: wrong API contract", "major"),
+            _req("m: rename a heading", "minor"),
+            _req("n: trailing whitespace", "nit"),
+            _req("U: unclassified severity", ""),  # unknown -> blocking
+        ]
+    )
+    filtered, deferred = _partition_revision_plan(plan, SRC)
+    assert [r.description for r in deferred] == [
+        "m: rename a heading",
+        "n: trailing whitespace",
+    ]
+    assert [r.description for r in filtered.requests] == [
+        "B: drop the table",
+        "M: wrong API contract",
+        "U: unclassified severity",
+    ]
+    # Original plan must not be mutated (model_copy semantics).
+    assert len(plan.requests) == 5
+
+
+def test_deferred_notice_renders_severity_and_truncated_description():
+    long_desc = "x" * 300
+    notice = _build_deferred_requests_notice(
+        [_req("rename a heading", "minor"), _req(long_desc, "nit")]
+    )
+    # Severity tags + descriptions are rendered as bullets.
+    assert "- [minor] rename a heading" in notice
+    assert "- [nit] " + "x" * 200 + "…" in notice
+    assert "x" * 201 not in notice  # description capped at ~200 chars
+    # The anti-loop instructions the reviewer must see.
+    assert "DEFERRED to the" in notice
+    assert "Do NOT re-file" in notice
+    assert "severity 'major'" in notice
+
+
+def test_deferred_notice_is_empty_for_empty_list():
+    assert _build_deferred_requests_notice([]) == ""
 
 
 # ── Transient-runtime vs content-convergence classification ──────────────────
