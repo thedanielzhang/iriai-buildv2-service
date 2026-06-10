@@ -6,7 +6,7 @@ import json as _json
 import logging
 import re
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Iterable
 from pathlib import Path
 
 from pydantic import BaseModel, Field as PydanticField
@@ -418,6 +418,42 @@ def _extract_decision_ids(text: str) -> set[str]:
     return set(_DECISION_ID_PATTERN.findall(text))
 
 
+def _normalize_id_numeric_segments(identifier: str) -> str:
+    """Normalize zero-padding drift in id numeric segments for comparison.
+
+    ``REQ-POST-20260606-1`` and ``REQ-POST-20260606-01`` are the same id
+    written by different generations of the planning agents. Strip leading
+    zeros from purely-numeric dash segments so both sides compare equal.
+    Comparison-time only — never used to rewrite stored ids.
+    """
+    return "-".join(
+        (segment.lstrip("0") or "0") if segment.isdigit() else segment
+        for segment in identifier.split("-")
+    )
+
+
+def _bare_requirement_family_tokens(
+    candidate_ids: Iterable[str],
+    known_full_ids: Iterable[str],
+) -> set[str]:
+    """Identify bare requirement-family shorthand among candidate REQ tokens.
+
+    A bare family token (e.g. ``REQ-POST``) is a digit-less ``REQ-`` token
+    that is a dash-prefix of a fuller known id (``REQ-POST-20260606-01``) —
+    prose shorthand for the family, not a requirement id itself. Tokens that
+    are legitimate alpha-only ids in their own right (e.g. ``REQ-shared``
+    with no fuller sibling) are NOT treated as bare.
+    """
+    full_ids = [full_id for full_id in known_full_ids if full_id.startswith("REQ-")]
+    return {
+        token
+        for token in candidate_ids
+        if token.startswith("REQ-")
+        and not any(ch.isdigit() for ch in token)
+        and any(full_id.startswith(token + "-") for full_id in full_ids)
+    }
+
+
 def _extract_ac_ids(test_plan_text: str) -> set[str]:
     """Extract AC-id tokens from a test-plan artifact (markdown or JSON).
 
@@ -457,14 +493,35 @@ def _extract_ac_ids(test_plan_text: str) -> set[str]:
 def _effective_coverage_ids_for_task_planning(
     slug: str,
     canonical_ac_ids: set[str],
+    contract_waived_ac_ids: Iterable[str] | None = None,
 ) -> tuple[set[str], dict[str, str]]:
-    if slug != _BFS_SLUG:
-        return set(canonical_ac_ids), {}
-    waived = {
-        ac_id: reason
-        for ac_id, reason in _BFS_EFFECTIVE_COVERAGE_WAIVERS.items()
-        if ac_id in canonical_ac_ids
-    }
+    """Resolve the effective (coverage-audited) AC universe for a subfeature.
+
+    Waivers come from two additive sources, both logged loudly (no silent
+    waivers):
+    - the hardcoded builtin map (backend-foundation-setup only), and
+    - ``waived_ac_ids`` recorded on the persisted per-SF planning contract
+      (data-driven waivers approved at the DAG gate).
+    """
+    waived: dict[str, str] = {}
+    waiver_sources: dict[str, str] = {}
+    if slug == _BFS_SLUG:
+        for ac_id, reason in _BFS_EFFECTIVE_COVERAGE_WAIVERS.items():
+            if ac_id in canonical_ac_ids:
+                waived[ac_id] = reason
+                waiver_sources[ac_id] = "builtin"
+    for ac_id in contract_waived_ac_ids or []:
+        if ac_id in canonical_ac_ids and ac_id not in waived:
+            waived[ac_id] = "waived via planning-contract waived_ac_ids (recorded at the DAG gate)"
+            waiver_sources[ac_id] = "contract"
+    for ac_id in sorted(waived):
+        logger.warning(
+            "coverage waiver applied: %s (source: %s) — %s [%s]",
+            ac_id,
+            waiver_sources[ac_id],
+            waived[ac_id],
+            slug,
+        )
     return set(canonical_ac_ids) - set(waived), waived
 
 
@@ -561,7 +618,11 @@ async def _validate_verification_gates_coverage(
     waived_ac_ids = (
         {ac_id: "contract waiver" for ac_id in contract.waived_ac_ids}
         if contract_matches_canonical_ac_ids
-        else _effective_coverage_ids_for_task_planning(slug, real_ac_ids)[1]
+        else _effective_coverage_ids_for_task_planning(
+            slug,
+            real_ac_ids,
+            contract.waived_ac_ids if contract is not None else None,
+        )[1]
     )
     effective_ac_ids = set(real_ac_ids) - set(waived_ac_ids)
     if waived_ac_ids:
@@ -2090,7 +2151,14 @@ class TaskPlanningPhase(Phase):
     ) -> list[str]:
         metadata = cls._step_section_metadata(section_text)
         explicit_refs = cls._expand_shorthand_id_list(metadata.get("requirement refs", ""))
-        return sorted(set(explicit_refs) | set(_REQ_ID_PATTERN.findall(section_text)))
+        refs = set(explicit_refs) | set(_REQ_ID_PATTERN.findall(section_text))
+        bare_family_tokens = _bare_requirement_family_tokens(refs, refs)
+        if bare_family_tokens:
+            logger.debug(
+                "Ignoring bare requirement-family tokens (family prefixes of fuller ids): %s",
+                ", ".join(sorted(bare_family_tokens)),
+            )
+        return sorted(refs - bare_family_tokens)
 
     @classmethod
     def _journey_refs_from_step_section(
@@ -2291,13 +2359,48 @@ class TaskPlanningPhase(Phase):
         sf_upstream: dict[str, dict[str, str]] | None = None,
     ) -> SubfeaturePlanningContract:
         backfill_status = await cls._load_backfill_status(runner, feature)
+        degenerate_sidecar = False
         if cls._slug_is_migrated(backfill_status, slug):
-            return await cls._compile_subfeature_planning_contract_from_sidecars(
-                runner,
-                feature,
-                slug,
+            # Guard against a degenerate migrated sidecar: if the structured
+            # test-plan sidecar yields ZERO acceptance criteria while the
+            # markdown twin defines some, the sidecar would silently destroy
+            # coverage checking (empty canonical universe validates clean).
+            # Fall back to the markdown compile path for this subfeature.
+            test_plan_sidecar = await load_structured_artifact(runner, feature, f"test-plan:{slug}")
+            sidecar_ac_count = (
+                sum(1 for criterion in test_plan_sidecar.content.acceptance_criteria if criterion.id)
+                if test_plan_sidecar is not None
+                else 0
             )
-        target_texts = await cls._load_target_texts(runner, feature, slug, sf_upstream or {})
+            if sidecar_ac_count == 0:
+                markdown_twin_text = await runner.artifacts.get(f"test-plan:{slug}", feature=feature) or ""
+                markdown_ac_ids = _extract_ac_ids(markdown_twin_text)
+                if markdown_ac_ids:
+                    degenerate_sidecar = True
+                    logger.warning(
+                        "DEGENERATE migrated test-plan sidecar for %s: sidecar yields 0 "
+                        "acceptance criteria while the markdown twin defines %d — "
+                        "falling back to the markdown compile path over the raw "
+                        "markdown artifacts (coverage checking would otherwise be "
+                        "silently destroyed)",
+                        slug,
+                        len(markdown_ac_ids),
+                    )
+            if not degenerate_sidecar:
+                return await cls._compile_subfeature_planning_contract_from_sidecars(
+                    runner,
+                    feature,
+                    slug,
+                )
+        if degenerate_sidecar:
+            # The sidecar-aware loader would render the degenerate sidecars
+            # back at us; compile from the raw markdown twins instead.
+            target_texts = {
+                prefix: await runner.artifacts.get(f"{prefix}:{slug}", feature=feature) or ""
+                for prefix in ("plan", "prd", "design", "system-design", "test-plan", "decisions")
+            }
+        else:
+            target_texts = await cls._load_target_texts(runner, feature, slug, sf_upstream or {})
         normalized_plan = cls._normalize_artifact_markdown(target_texts.get("plan", ""), f"plan:{slug}")
         normalized_plan = cls._normalize_plan_markdown_for_slice_derivation(normalized_plan)
         normalized_test_plan = cls._normalize_artifact_markdown(target_texts.get("test-plan", ""), "test-plan")
@@ -2324,9 +2427,11 @@ class TaskPlanningPhase(Phase):
                 for ac_id in canonical_ac_ids
             }
 
+        prior_contract = await cls._load_subfeature_planning_contract(runner, feature, slug)
         effective_ac_ids, waived_map = _effective_coverage_ids_for_task_planning(
             slug,
             set(canonical_ac_ids),
+            prior_contract.waived_ac_ids if prior_contract is not None else None,
         )
         normalized_prd = cls._normalize_artifact_markdown(target_texts.get("prd", ""), f"prd:{slug}")
         normalized_design = cls._normalize_artifact_markdown(target_texts.get("design", ""), f"design:{slug}")
@@ -2350,7 +2455,6 @@ class TaskPlanningPhase(Phase):
         step_sections: dict[str, str] = {}
         explicit_owner_map: dict[str, set[str]] = {}
         for step_id, title, section_text in step_sections_list:
-            step_sections[step_id] = section_text
             structured_step = structured_steps.get(step_id)
             requirement_ids = sorted(
                 set(cls._requirement_refs_from_step_section(section_text))
@@ -2369,6 +2473,42 @@ class TaskPlanningPhase(Phase):
             )
             for ac_id in explicit_owned_ac_ids:
                 explicit_owner_map.setdefault(ac_id, set()).add(step_id)
+            existing_contract = step_contracts.get(step_id)
+            if existing_contract is not None:
+                # Addendum-style repeated STEP heading (e.g. "### STEP-2 …
+                # Addendum"): merge additively into the parent step contract —
+                # union all traces and AC refs, append the section text. Never
+                # replace the parent contract or enter the step id twice.
+                merged_section = step_sections[step_id] + "\n\n" + section_text
+                step_sections[step_id] = merged_section
+                existing_contract.section_digest = cls._content_digest(merged_section)
+                existing_contract.requirement_ids = sorted(
+                    set(existing_contract.requirement_ids) | set(requirement_ids)
+                )
+                existing_contract.journey_ids = sorted(
+                    set(existing_contract.journey_ids) | set(journey_ids)
+                )
+                existing_contract.decision_ids = sorted(
+                    set(existing_contract.decision_ids) | set(decision_ids)
+                )
+                existing_contract.nfr_ids = sorted(set(existing_contract.nfr_ids) | set(nfr_ids))
+                existing_contract.verifiable_state_ids = sorted(
+                    set(existing_contract.verifiable_state_ids) | set(verifiable_state_ids)
+                )
+                existing_contract.explicit_owned_ac_ids = sorted(
+                    set(existing_contract.explicit_owned_ac_ids) | set(explicit_owned_ac_ids)
+                )
+                existing_contract.owned_ac_ids = sorted(
+                    set(existing_contract.owned_ac_ids) | set(explicit_owned_ac_ids)
+                )
+                logger.info(
+                    "Merged repeated step heading for %s (%s) into the existing step contract "
+                    "(addendum section; traces unioned, text appended)",
+                    step_id,
+                    slug,
+                )
+                continue
+            step_sections[step_id] = section_text
             step_contracts[step_id] = StepPlanningContract(
                 step_id=step_id,
                 title=title,
@@ -2505,10 +2645,10 @@ class TaskPlanningPhase(Phase):
             has_design_artifact=bool(normalized_design.strip()),
             has_system_design_artifact=bool(normalized_system_design.strip()),
             has_test_plan_artifact=bool(normalized_test_plan.strip()),
-            step_contracts=[
-                step_contracts[step_id]
-                for step_id, _title, _section in step_sections_list
-            ],
+            # dict preserves first-appearance order and guarantees a single
+            # entry per step id even when the plan repeats a STEP heading
+            # (addendum sections merge into the parent contract above).
+            step_contracts=list(step_contracts.values()),
         )
 
         for step_contract in contract.step_contracts:
@@ -2598,12 +2738,35 @@ class TaskPlanningPhase(Phase):
         unresolved = sorted(set(unresolved_ac_ids or []))
 
         owned_counts: dict[str, int] = {ac_id: 0 for ac_id in contract.canonical_ac_ids}
+        # Compare requirement ids with zero-padding drift normalized on BOTH
+        # sides (REQ-POST-20260606-1 == REQ-POST-20260606-01) — comparison
+        # time only, the stored universe is never rewritten.
+        normalized_requirement_universe = {
+            _normalize_id_numeric_segments(requirement_id)
+            for requirement_id in contract.requirement_universe
+        }
         for step_contract in contract.step_contracts:
             step_set = {step_contract.step_id}
             if not step_set:
                 messages.append("step contract is missing step_id")
+            bare_family_refs = _bare_requirement_family_tokens(
+                step_contract.requirement_ids,
+                set(step_contract.requirement_ids) | set(contract.requirement_universe),
+            )
+            if bare_family_refs:
+                logger.debug(
+                    "%s: ignoring bare requirement-family tokens during universe validation: %s",
+                    step_contract.step_id,
+                    ", ".join(sorted(bare_family_refs)),
+                )
             for requirement_id in step_contract.requirement_ids:
-                if requirement_id not in contract.requirement_universe and requirement_id not in step_contract.nfr_ids:
+                if requirement_id in bare_family_refs:
+                    continue
+                if (
+                    requirement_id not in contract.requirement_universe
+                    and _normalize_id_numeric_segments(requirement_id) not in normalized_requirement_universe
+                    and requirement_id not in step_contract.nfr_ids
+                ):
                     messages.append(
                         f"{step_contract.step_id} references unknown requirement_id {requirement_id}"
                     )
@@ -3476,17 +3639,38 @@ class TaskPlanningPhase(Phase):
         decisions_sidecar = await load_structured_artifact(runner, feature, f"decisions:{slug}")
         shared_index = await cls._load_shared_planning_index(runner, feature)
         planning_index = await cls._load_subfeature_planning_index(runner, feature, slug)
+        ledger_backfill_status = await cls._load_backfill_status(runner, feature)
         if plan_sidecar is None or test_plan_sidecar is None or planning_index is None:
             raise RuntimeError(f"migrated subfeature {slug} is missing sidecars or planning index")
+
+        async def _decision_ledger_text(artifact_key: str) -> str:
+            # Decision-universe admission only — an absent/unsidecared ledger
+            # means fewer admitted ids (fail-closed), never a compile failure.
+            try:
+                return await cls._load_artifact_text_for_planning(
+                    runner,
+                    feature,
+                    artifact_key,
+                    backfill_status=ledger_backfill_status,
+                )
+            except Exception:
+                logger.debug(
+                    "decision ledger %s unavailable for sidecar decision-universe admission",
+                    artifact_key,
+                    exc_info=True,
+                )
+                return ""
 
         canonical_ac_ids = [
             criterion.id
             for criterion in test_plan_sidecar.content.acceptance_criteria
             if criterion.id
         ]
+        prior_contract = await cls._load_subfeature_planning_contract(runner, feature, slug)
         _effective_ac_ids, waived_map = _effective_coverage_ids_for_task_planning(
             slug,
             set(canonical_ac_ids),
+            prior_contract.waived_ac_ids if prior_contract is not None else None,
         )
         global_obligation_candidate_step_ids: dict[str, list[str]] = {}
         step_chunk_to_slice_input = {
@@ -3586,6 +3770,19 @@ class TaskPlanningPhase(Phase):
                         if decision.id
                     ),
                     *((shared_index.decision_ids if shared_index is not None else [])),
+                    # Mirror the markdown path's admission rules (ea11fd3):
+                    # plan-local decision ids defined in the plan itself plus
+                    # the feature/global decision ledgers must validate here
+                    # too — the sidecar's own decisions list is not the whole
+                    # universe steps may legitimately cite. Ledgers load via
+                    # the sidecar-aware planning loader so stale raw broad
+                    # artifacts are not consumed on migrated features.
+                    *cls._decision_universe_from_texts(
+                        render_structured_markdown(plan_sidecar),
+                        await _decision_ledger_text("decisions"),
+                        await _decision_ledger_text("decisions:broad"),
+                        await _decision_ledger_text(GLOBAL_DECISIONS_KEY),
+                    ),
                 }
             ),
             verifiable_state_universe=sorted(

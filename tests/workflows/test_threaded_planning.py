@@ -19035,3 +19035,473 @@ def test_gate_review_legacy_markdown_outcome_line_still_approved():
     from iriai_build_v2.workflows._common._helpers import _gate_review_is_approved
     md = "# PRD Gate Review\n\n**Outcome:** approved\n\n- detail\n"
     assert _gate_review_is_approved(md) is True
+
+
+# ---------------------------------------------------------------------------
+# T-1 contract-compiler defect regressions (L1-L4 + data-driven waivers)
+# ---------------------------------------------------------------------------
+
+
+class _SimpleCompileArtifacts:
+    def __init__(self, store: dict[str, str]) -> None:
+        self.store = dict(store)
+
+    async def get(self, key: str, *, feature):
+        del feature
+        return self.store.get(key, "")
+
+    async def put(self, key: str, value: str, *, feature):
+        del feature
+        self.store[key] = value
+
+    async def delete(self, key: str, *, feature):
+        del feature
+        self.store.pop(key, None)
+
+
+@pytest.mark.asyncio
+async def test_duplicate_step_addendum_heading_merges_instead_of_clobbering(tmp_path):
+    """L1: a repeated `### STEP-N … Addendum` heading must merge additively
+    into the parent step contract (union of AC refs / REQ / J traces, text
+    appended) and never enter the same step id twice in step_contracts."""
+    feature = SimpleNamespace(id="feat-l1-addendum-merge", metadata={})
+    mirror = _TestMirror(tmp_path / "features")
+    runner = SimpleNamespace(
+        artifacts=_SimpleCompileArtifacts(
+            {
+                "plan:addmerge": """
+## Implementation Steps
+
+### STEP-1 — Parent scope
+
+Implements REQ-1 for J-1.
+
+- **AC refs.** AC-addmerge-1
+
+### STEP-2 — Sibling
+
+Implements REQ-2.
+
+- **AC refs.** AC-addmerge-2
+
+### STEP-1 — Parent scope (Addendum)
+
+Addendum traces: implements REQ-3.
+
+- **AC refs.** AC-addmerge-3
+""".strip(),
+                "prd:addmerge": (
+                    "## Requirements\n\nREQ-1\nParent.\n\nREQ-2\nSibling.\n\nREQ-3\nAddendum.\n\n"
+                    "## Journeys\n\nJ-1\nParent journey.\n"
+                ),
+                "design:addmerge": "",
+                "system-design:addmerge": "",
+                "test-plan:addmerge": """
+## Acceptance Criteria
+
+- **AC-addmerge-1** — Parent behavior.
+  - linked_requirement: `REQ-1`
+  - verification_method: `unit`
+  - pass_condition: parent behavior holds
+
+- **AC-addmerge-2** — Sibling behavior.
+  - linked_requirement: `REQ-2`
+  - verification_method: `unit`
+  - pass_condition: sibling behavior holds
+
+- **AC-addmerge-3** — Addendum behavior.
+  - linked_requirement: `REQ-3`
+  - verification_method: `unit`
+  - pass_condition: addendum behavior holds
+""".strip(),
+                "decisions:addmerge": "",
+                "decisions": "",
+                "decisions:broad": "",
+            }
+        ),
+        services={"artifact_mirror": mirror},
+    )
+
+    contract = await TaskPlanningPhase._compile_subfeature_planning_contract(
+        runner,
+        feature,
+        "addmerge",
+    )
+
+    # Single entry per step id — the addendum never double-enters STEP-1.
+    assert [step.step_id for step in contract.step_contracts] == ["STEP-1", "STEP-2"]
+    step_map = {step.step_id: step for step in contract.step_contracts}
+    # AC refs from BOTH the parent section and the addendum are unioned.
+    assert step_map["STEP-1"].explicit_owned_ac_ids == ["AC-addmerge-1", "AC-addmerge-3"]
+    assert step_map["STEP-1"].owned_ac_ids == ["AC-addmerge-1", "AC-addmerge-3"]
+    # REQ/J traces are unioned, not clobbered by the addendum.
+    assert {"REQ-1", "REQ-3"} <= set(step_map["STEP-1"].requirement_ids)
+    assert "J-1" in step_map["STEP-1"].journey_ids
+    # Genuinely distinct steps keep their own contracts.
+    assert step_map["STEP-2"].owned_ac_ids == ["AC-addmerge-2"]
+    assert "dag-contract:addmerge" in runner.artifacts.store
+
+
+@pytest.mark.asyncio
+async def test_degenerate_migrated_test_plan_sidecar_falls_back_to_markdown(tmp_path, caplog):
+    """L2: a migrated test-plan sidecar that parses 0 ACs while the markdown
+    twin defines some must trigger a loud warning + markdown-path fallback,
+    not silently destroy coverage checking."""
+    import logging
+
+    from iriai_build_v2.services.artifacts import structured_artifact_key
+
+    feature = SimpleNamespace(id="feat-l2-degenerate-sidecar", metadata={})
+    mirror = _TestMirror(tmp_path / "features")
+    decomposition = SubfeatureDecomposition(
+        subfeatures=[
+            Subfeature(id="SF-1", slug="degen", name="Degen", description="Degen"),
+        ],
+        complete=True,
+    )
+    runner = SimpleNamespace(
+        artifacts=_SimpleCompileArtifacts(
+            {
+                "decomposition": decomposition.model_dump_json(indent=2),
+                "prd:degen": """
+## Requirements
+
+| ID | Category | Priority | Description |
+| --- | --- | --- | --- |
+| REQ-1 | functional | must | Bootstrap works |
+""".strip(),
+                "design:degen": """
+## Verifiable States
+
+| Component ID | State | Visual Description |
+| --- | --- | --- |
+| CMP-1 | ready | Ready state is visible |
+""".strip(),
+                "plan:degen": """
+## Implementation Steps
+
+### STEP-1: Bootstrap
+
+- **Requirement refs.** REQ-1
+- **Decision refs.** D-SF1-P1
+- **Verifiable state refs.** CMP-1#ready
+- **AC refs.** AC-degen-1
+""".strip(),
+                "system-design:degen": SystemDesign(
+                    title="Degen System Design",
+                    overview="Degen system overview",
+                    complete=True,
+                ).model_dump_json(indent=2),
+                "test-plan:degen": """
+## Acceptance Criteria
+
+- **AC-degen-1** — Bootstrap works.
+  - linked_requirement: `REQ-1`
+  - verification_method: `integration`
+  - pass_condition: bootstrap works
+""".strip(),
+                "decisions:degen": _decision_ledger_text(
+                    DecisionRecord(
+                        id="D-101",
+                        aliases=["D-SF1-P1"],
+                        statement="Bootstrap uses the canonical startup contract.",
+                        source_phase="subfeature",
+                        subfeature_slug="degen",
+                    ),
+                ),
+                "decisions": "",
+                "decisions:broad": "",
+            }
+        ),
+        services={"artifact_mirror": mirror},
+    )
+
+    status = await TaskPlanningPhase._ensure_planning_sidecar_migration(
+        runner,
+        feature,
+        decomposition,
+    )
+    assert status.subfeatures["degen"].migration_state == "migrated"
+
+    # Corrupt the structured test-plan sidecar into the degenerate shape
+    # (0 acceptance criteria) while the markdown twin still defines 1.
+    sidecar_key = structured_artifact_key("test-plan:degen")
+    payload = json.loads(runner.artifacts.store[sidecar_key])
+    payload["content"]["acceptance_criteria"] = []
+    runner.artifacts.store[sidecar_key] = json.dumps(payload)
+
+    with caplog.at_level(logging.WARNING):
+        contract = await TaskPlanningPhase._compile_subfeature_planning_contract(
+            runner,
+            feature,
+            "degen",
+        )
+
+    assert contract.canonical_ac_ids == ["AC-degen-1"]
+    assert contract.step_contracts[0].owned_ac_ids == ["AC-degen-1"]
+    assert any(
+        "DEGENERATE migrated test-plan sidecar for degen" in record.message
+        for record in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_sidecar_path_admits_plan_local_and_ledger_decision_ids(tmp_path):
+    """L3: the sidecar compile path must admit plan-cited decision ids the
+    same way the markdown path does (plan-local ids + feature/global decision
+    ledgers), instead of rejecting them as unknown."""
+    feature = SimpleNamespace(id="feat-l3-sidecar-decisions", metadata={})
+    mirror = _TestMirror(tmp_path / "features")
+    decomposition = SubfeatureDecomposition(
+        subfeatures=[
+            Subfeature(id="SF-1", slug="sdadmit", name="SdAdmit", description="SdAdmit"),
+        ],
+        complete=True,
+    )
+    runner = SimpleNamespace(
+        artifacts=_SimpleCompileArtifacts(
+            {
+                "decomposition": decomposition.model_dump_json(indent=2),
+                "prd:sdadmit": """
+## Requirements
+
+| ID | Category | Priority | Description |
+| --- | --- | --- | --- |
+| REQ-1 | functional | must | Bootstrap works |
+""".strip(),
+                "design:sdadmit": """
+## Verifiable States
+
+| Component ID | State | Visual Description |
+| --- | --- | --- |
+| CMP-1 | ready | Ready state is visible |
+""".strip(),
+                "plan:sdadmit": """
+## Decision Log
+
+- **D-6 — Plan-local call.** Local architecture decision.
+
+## Implementation Steps
+
+### STEP-1: Bootstrap
+
+- **Requirement refs.** REQ-1
+- **Decision refs.** D-6
+- **Verifiable state refs.** CMP-1#ready
+- **AC refs.** AC-sdadmit-1
+""".strip(),
+                "system-design:sdadmit": SystemDesign(
+                    title="SdAdmit System Design",
+                    overview="SdAdmit system overview",
+                    complete=True,
+                ).model_dump_json(indent=2),
+                "test-plan:sdadmit": """
+## Acceptance Criteria
+
+- **AC-sdadmit-1** — Bootstrap works.
+  - linked_requirement: `REQ-1`
+  - verification_method: `integration`
+  - pass_condition: bootstrap works
+""".strip(),
+                "decisions:sdadmit": _decision_ledger_text(
+                    DecisionRecord(
+                        id="D-101",
+                        statement="Ledger decision for sdadmit.",
+                        source_phase="subfeature",
+                        subfeature_slug="sdadmit",
+                    ),
+                ),
+                "decisions": "",
+                "decisions:broad": "",
+            }
+        ),
+        services={"artifact_mirror": mirror},
+    )
+
+    status = await TaskPlanningPhase._ensure_planning_sidecar_migration(
+        runner,
+        feature,
+        decomposition,
+    )
+    assert status.subfeatures["sdadmit"].migration_state == "migrated"
+
+    contract = await TaskPlanningPhase._compile_subfeature_planning_contract(
+        runner,
+        feature,
+        "sdadmit",
+    )
+    # Previously: `STEP-1 references unknown decision_id D-6` (the sidecar
+    # decision universe only admitted decisions-sidecar + shared-index ids).
+    assert "D-6" in contract.decision_universe
+    assert contract.canonical_ac_ids == ["AC-sdadmit-1"]
+
+
+def test_normalize_id_numeric_segments_zero_padding():
+    """L3: REQ-POST-20260606-1 and REQ-POST-20260606-01 must compare equal."""
+    normalize = task_planning_module._normalize_id_numeric_segments
+    assert normalize("REQ-POST-20260606-01") == "REQ-POST-20260606-1"
+    assert normalize("REQ-POST-20260606-1") == "REQ-POST-20260606-1"
+    assert normalize("REQ-POST-20260606-01") == normalize("REQ-POST-20260606-1")
+    # Non-numeric segments and unpadded ids are untouched.
+    assert normalize("REQ-shared") == "REQ-shared"
+    assert normalize("REQ-7") == "REQ-7"
+
+
+def test_validate_contract_normalizes_requirement_zero_padding_both_sides():
+    """L3: zero-padding drift between a step's requirement ref and the
+    requirement universe must not produce `unknown requirement_id`."""
+    contract = task_planning_module.SubfeaturePlanningContract(
+        slug="settings-access-views-closeout",
+        canonical_ac_ids=["AC-s5-1"],
+        requirement_universe=["REQ-POST-20260606-01", "REQ-2"],
+        step_contracts=[
+            task_planning_module.StepPlanningContract(
+                step_id="STEP-1",
+                requirement_ids=["REQ-POST-20260606-1", "REQ-02"],
+                explicit_owned_ac_ids=["AC-s5-1"],
+                owned_ac_ids=["AC-s5-1"],
+            )
+        ],
+        has_test_plan_artifact=True,
+    )
+    messages = TaskPlanningPhase._validate_subfeature_planning_contract(contract)
+    assert not any("unknown requirement_id" in message for message in messages)
+
+
+def test_requirement_refs_ignore_bare_family_shorthand_tokens():
+    """L4: a bare family token (`REQ-POST`) that is a dash-prefix of a fuller
+    id is prose shorthand, not a requirement id — ignored. Legitimate
+    alpha-only ids with no fuller sibling are preserved."""
+    section = """### STEP-1 — Closeout
+
+Implements REQ-POST-20260606-1; the REQ-POST family covers post-award flows.
+""".strip()
+    refs = TaskPlanningPhase._requirement_refs_from_step_section(section)
+    assert refs == ["REQ-POST-20260606-1"]
+
+    alpha_section = """### STEP-1 — Shared
+
+- **Requirement refs.** REQ-shared
+""".strip()
+    assert TaskPlanningPhase._requirement_refs_from_step_section(alpha_section) == ["REQ-shared"]
+
+
+def test_validate_contract_ignores_bare_family_tokens_against_universe():
+    """L4: a bare family token that slipped into step requirement refs must
+    not be flagged unknown when the universe holds fuller ids of the family."""
+    contract = task_planning_module.SubfeaturePlanningContract(
+        slug="settings-access-views-closeout",
+        canonical_ac_ids=["AC-s5-1"],
+        requirement_universe=["REQ-POST-20260606-01"],
+        step_contracts=[
+            task_planning_module.StepPlanningContract(
+                step_id="STEP-1",
+                requirement_ids=["REQ-POST", "REQ-POST-20260606-01"],
+                explicit_owned_ac_ids=["AC-s5-1"],
+                owned_ac_ids=["AC-s5-1"],
+            )
+        ],
+        has_test_plan_artifact=True,
+    )
+    messages = TaskPlanningPhase._validate_subfeature_planning_contract(contract)
+    assert not any("unknown requirement_id" in message for message in messages)
+
+
+def test_effective_coverage_waivers_builtin_source_logged(caplog):
+    """W: builtin (hardcoded-map) waivers still apply and are loudly logged."""
+    import logging
+
+    with caplog.at_level(logging.WARNING):
+        effective, waived = task_planning_module._effective_coverage_ids_for_task_planning(
+            task_planning_module._BFS_SLUG,
+            {"AC-backend-foundation-setup-26", "AC-backend-foundation-setup-1"},
+        )
+    assert effective == {"AC-backend-foundation-setup-1"}
+    assert set(waived) == {"AC-backend-foundation-setup-26"}
+    assert any(
+        "coverage waiver applied: AC-backend-foundation-setup-26 (source: builtin)" in record.message
+        for record in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_contract_recorded_waiver_suppresses_coverage_failure_and_logs(tmp_path, caplog):
+    """W: per-SF `waived_ac_ids` recorded on the persisted planning contract
+    must suppress the coverage failure for those ACs (data-driven waivers),
+    with a loud log line per applied waiver. No silent waivers."""
+    import logging
+
+    feature = SimpleNamespace(id="feat-w-contract-waiver", metadata={})
+    mirror = _TestMirror(tmp_path / "features")
+    store = {
+        "plan:wvr": """
+## Implementation Steps
+
+### STEP-1 — Producer
+
+Implements REQ-1.
+
+- **AC refs.** AC-wvr-1
+
+### STEP-2 — Consumer
+
+Implements REQ-2.
+
+- **AC refs.** AC-wvr-3
+""".strip(),
+        "prd:wvr": "## Requirements\n\nREQ-1\nProducer.\n\nREQ-2\nConsumer.\n",
+        "design:wvr": "",
+        "system-design:wvr": "",
+        "test-plan:wvr": """
+## Acceptance Criteria
+
+- **AC-wvr-1** — Producer behavior.
+  - linked_requirement: `REQ-1`
+  - verification_method: `unit`
+  - pass_condition: producer behavior holds
+
+- **AC-wvr-3** — Consumer behavior.
+  - linked_requirement: `REQ-2`
+  - verification_method: `unit`
+  - pass_condition: consumer behavior holds
+
+- **AC-wvr-9** — Superseded behavior with no owner.
+  - verification_method: `manual`
+  - pass_condition: superseded
+""".strip(),
+        "decisions:wvr": "",
+        "decisions": "",
+        "decisions:broad": "",
+    }
+
+    # Without a recorded waiver the compile fails closed on AC-wvr-9.
+    runner = SimpleNamespace(
+        artifacts=_SimpleCompileArtifacts(store),
+        services={"artifact_mirror": mirror},
+    )
+    with pytest.raises(task_planning_module.PlanningContractError):
+        await TaskPlanningPhase._compile_subfeature_planning_contract(runner, feature, "wvr")
+
+    # Record the waiver on the persisted per-SF planning contract (as the
+    # DAG gate does) — the compile must now pass, loudly.
+    prior = task_planning_module.SubfeaturePlanningContract(
+        slug="wvr",
+        waived_ac_ids=["AC-wvr-9"],
+    )
+    runner.artifacts.store["dag-contract:wvr"] = prior.model_dump_json(indent=2)
+
+    with caplog.at_level(logging.WARNING):
+        contract = await TaskPlanningPhase._compile_subfeature_planning_contract(
+            runner,
+            feature,
+            "wvr",
+        )
+
+    assert contract.waived_ac_ids == ["AC-wvr-9"]
+    step_map = {step.step_id: step for step in contract.step_contracts}
+    assert step_map["STEP-1"].owned_ac_ids == ["AC-wvr-1"]
+    assert step_map["STEP-2"].owned_ac_ids == ["AC-wvr-3"]
+    assert any(
+        "coverage waiver applied: AC-wvr-9 (source: contract)" in record.message
+        for record in caplog.records
+    )
