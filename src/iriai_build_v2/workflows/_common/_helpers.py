@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import datetime as _dt
 import hashlib
+import json
 import logging
 import os
 import re
@@ -191,7 +192,21 @@ def _bounded_context_item_text(
 
 
 def _gate_review_is_approved(review_text: str) -> bool:
-    """Return True when a persisted gate-review artifact records approval."""
+    """Return True when a persisted gate-review artifact records approval.
+
+    Structured JSON verdicts (the envelope form the subfeature gate battery
+    persists) are authoritative: ``{"approved": true, ...}`` parses directly
+    and never falls through to the prose heuristic, so a JSON verdict with
+    ``approved`` false (or absent) can never be mistaken for approval by a
+    stray "approved" inside its text fields. Legacy markdown reviews keep the
+    line-scan below.
+    """
+    try:
+        data = json.loads(review_text)
+    except (json.JSONDecodeError, TypeError):
+        data = None
+    if isinstance(data, dict):
+        return data.get("approved") is True
     for raw_line in review_text.splitlines():
         line = raw_line.strip().lower().replace("*", "")
         if not line:

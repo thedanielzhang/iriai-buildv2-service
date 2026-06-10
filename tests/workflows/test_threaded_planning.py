@@ -19011,3 +19011,27 @@ async def test_context_package_small_artifact_items_have_no_truncation_banner(tm
     item_text = Path(package.item_paths["plan-accounts"]).read_text(encoding="utf-8")
     assert "(compacted)" not in item_text
     assert small_text in item_text
+
+
+# ── W-11: structured gate-verdict parsing (_gate_review_is_approved) ──────────
+
+def test_gate_review_json_verdict_approved_true():
+    from iriai_build_v2.workflows._common._helpers import _gate_review_is_approved
+    assert _gate_review_is_approved('{"approved": true, "summary": "all good"}') is True
+
+
+def test_gate_review_json_verdict_approved_false_even_with_approved_prose():
+    from iriai_build_v2.workflows._common._helpers import _gate_review_is_approved
+    text = '{"approved": false, "summary": "cannot be approved: outcome: approved sections missing"}'
+    assert _gate_review_is_approved(text) is False
+
+
+def test_gate_review_stub_mirror_text_is_not_approved():
+    from iriai_build_v2.workflows._common._helpers import _gate_review_is_approved
+    assert _gate_review_is_approved("# Decision Ledger\n\n_No decisions recorded yet._\n") is False
+
+
+def test_gate_review_legacy_markdown_outcome_line_still_approved():
+    from iriai_build_v2.workflows._common._helpers import _gate_review_is_approved
+    md = "# PRD Gate Review\n\n**Outcome:** approved\n\n- detail\n"
+    assert _gate_review_is_approved(md) is True
