@@ -48,6 +48,7 @@ from ....roles import (
     InterviewActor,
     dag_compiler,
     dag_path_resolver_role,
+    planning_lead_review_role,
     planning_lead_role,
 )
 from .._decisions import GLOBAL_DECISIONS_KEY, _decision_sort_key, parse_decision_ledger
@@ -601,13 +602,13 @@ _workstream_planner = AgentActor(
 
 _sf_task_planner_gate_reviewer = InterviewActor(
     name="sf-task-planner-gate-reviewer",
-    role=planning_lead_role,
+    role=planning_lead_review_role,
     context_keys=["project", "scope", "decomposition"],
 )
 
 _sf_task_planner_reviewer = InterviewActor(
     name="sf-task-planner-reviewer",
-    role=planning_lead_role,
+    role=planning_lead_review_role,
     context_keys=["project", "scope", "decomposition"],
 )
 

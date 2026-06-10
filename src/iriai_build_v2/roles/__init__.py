@@ -60,6 +60,49 @@ def _shadow_role(base_role):
         "metadata": metadata,
     })
 
+
+# Tools that classify a role as "write-producing" for pool dispatch — must stay
+# a superset-match of claude_pool._WRITE_PRODUCING_TOOLS (claude_pool.py:49)
+# and claude._WRITE_PRODUCING_TOOLS (claude.py:36).
+_REVIEW_ONLY_TOOL_EXCLUSIONS = {"Write", "Edit", "MultiEdit", "NotebookEdit", "Bash"}
+
+_REVIEW_ONLY_INSTRUCTIONS = """
+
+## Review-Only Mode (no file writes)
+
+You are running as a review/gate actor WITHOUT file-write access: you have no
+Write, Edit, or Bash tools. IGNORE any earlier or later instruction telling you
+to write your artifact/review to a file with the Write tool — you cannot.
+Instead:
+- Deliver your COMPLETE verdict in the structured `output` field (populate
+  every field of the output schema; never leave it null on your final turn)
+- Leave `artifact_path` empty
+- Set `complete = true` only when the review discussion is finished
+"""
+
+
+def _review_only_role(base_role):
+    """Read-only Role variant for gate/integration reviewer actors.
+
+    Same Role.name, model, and metadata as the generation role — economy-mode
+    model overrides key on Role.name (config.ECONOMY_MODEL_OVERRIDES, resolved
+    at runtimes/claude.py _resolve_model_and_effort), so the seal-gate
+    reviewers keep their fable mapping. Write-producing tools are removed so
+    claude_pool._role_is_write_producing() classifies the role read-only and
+    pool dispatch does not demand a runtime workspace binding (worker
+    enforcement in claude_pool._validate_bound_job_manifest). Reviewer
+    verdicts flow through structured output (Envelope[ReviewOutcome] /
+    Envelope[IntegrationReview]); reviewers never write files.
+    """
+    tools = [
+        tool for tool in (base_role.tools or [])
+        if tool not in _REVIEW_ONLY_TOOL_EXCLUSIONS
+    ]
+    return base_role.model_copy(update={
+        "tools": tools,
+        "prompt": base_role.prompt + _REVIEW_ONLY_INSTRUCTIONS,
+    })
+
 # ── Role imports ────────────────────────────────────────────────────────────
 from .pm import role as pm_role
 from .designer import role as designer_role
@@ -114,6 +157,21 @@ from .spec_triager import role as spec_triager_role
 task_planner_role = planning_lead_role
 qa_engineer_role = smoke_tester_role
 reviewer_role = code_reviewer_role
+
+# ── Review-only role variants ────────────────────────────────────────────────
+# Gate/integration reviewer actors only ever produce structured-output verdicts
+# (consumed from envelope.output in interview_gate_review / integration_review)
+# and never write workspace files. Wrapping the full generation roles (which
+# carry Write/Bash) made the claude pool classify their jobs write-producing
+# and demand a runtime workspace binding the review asks never carry —
+# crashing dispatch whenever the job landed on a claude member instead of the
+# in-process codex member. Same Role.name as the base role so economy-mode
+# model overrides still apply.
+lead_pm_review_role = _review_only_role(lead_pm_role)
+lead_designer_review_role = _review_only_role(lead_designer_role)
+lead_architect_review_role = _review_only_role(lead_architect_role)
+planning_lead_review_role = _review_only_role(planning_lead_role)
+lead_task_planner_review_role = _review_only_role(lead_task_planner_role)
 
 # ── Actors ──────────────────────────────────────────────────────────────────
 # Async e2e-testing subsystem actors (read-only against checkpoints).
@@ -291,10 +349,10 @@ lead_pm_decomposer = InterviewActor(
     name="lead-pm-decomposer", role=lead_pm_role, context_keys=["project", "scope", "prd:broad", "design:broad", "plan:broad", "decisions:broad"],
 )
 lead_pm_reviewer = InterviewActor(
-    name="lead-pm-reviewer", role=lead_pm_role, context_keys=["project", "scope"],
+    name="lead-pm-reviewer", role=lead_pm_review_role, context_keys=["project", "scope"],
 )
 lead_pm_gate_reviewer = InterviewActor(
-    name="lead-pm-gate-reviewer", role=lead_pm_role, context_keys=["project", "scope"],
+    name="lead-pm-gate-reviewer", role=lead_pm_review_role, context_keys=["project", "scope"],
 )
 pm_compiler = AgentActor(
     name="pm-compiler", role=compiler_role, context_keys=[],
@@ -314,10 +372,10 @@ lead_designer = InterviewActor(
     name="lead-designer", role=lead_designer_role, context_keys=["project", "scope", "prd", "decomposition", "decisions"],
 )
 lead_designer_reviewer = InterviewActor(
-    name="lead-designer-reviewer", role=lead_designer_role, context_keys=["project", "scope"],
+    name="lead-designer-reviewer", role=lead_designer_review_role, context_keys=["project", "scope"],
 )
 lead_designer_gate_reviewer = InterviewActor(
-    name="lead-designer-gate-reviewer", role=lead_designer_role, context_keys=["project", "scope"],
+    name="lead-designer-gate-reviewer", role=lead_designer_review_role, context_keys=["project", "scope"],
 )
 design_compiler = AgentActor(
     name="design-compiler", role=compiler_role, context_keys=[],
@@ -331,10 +389,10 @@ lead_architect = InterviewActor(
     name="lead-architect", role=lead_architect_role, context_keys=["project", "scope", "prd", "design", "decomposition", "decisions"],
 )
 lead_architect_reviewer = InterviewActor(
-    name="lead-architect-reviewer", role=lead_architect_role, context_keys=["project", "scope"],
+    name="lead-architect-reviewer", role=lead_architect_review_role, context_keys=["project", "scope"],
 )
 lead_architect_gate_reviewer = InterviewActor(
-    name="lead-architect-gate-reviewer", role=lead_architect_role, context_keys=["project", "scope"],
+    name="lead-architect-gate-reviewer", role=lead_architect_review_role, context_keys=["project", "scope"],
 )
 plan_arch_compiler = AgentActor(
     name="plan-arch-compiler", role=compiler_role, context_keys=[],
@@ -383,11 +441,11 @@ lead_task_planner = InterviewActor(
     context_keys=["project", "scope", "prd", "design", "plan", "system-design", "mockup", "decomposition", "decisions"],
 )
 lead_task_planner_reviewer = InterviewActor(
-    name="lead-task-planner-reviewer", role=lead_task_planner_role,
+    name="lead-task-planner-reviewer", role=lead_task_planner_review_role,
     context_keys=["project", "scope"],
 )
 lead_task_planner_gate_reviewer = InterviewActor(
-    name="lead-task-planner-gate-reviewer", role=lead_task_planner_role,
+    name="lead-task-planner-gate-reviewer", role=lead_task_planner_review_role,
     context_keys=["project", "scope"],
 )
 dag_compiler = AgentActor(

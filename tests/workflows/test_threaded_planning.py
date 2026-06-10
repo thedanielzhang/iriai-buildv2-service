@@ -16169,6 +16169,105 @@ async def test_plan_review_legacy_blocked_cycle_with_stale_revised_marker_reruns
 
 
 @pytest.mark.asyncio
+async def test_plan_review_stale_blocked_row_on_early_cycle_is_cleared_not_rerun(
+    monkeypatch,
+):
+    """Bounded blocked re-run: a `-blocked` row for an EARLY cycle is STALE
+    when a LATER cycle already has state (report/-revised) — cycles run
+    strictly sequentially, so the early cycle must have been recovered. A
+    resume must NOT re-run the recovered cycle; it clears the stale row and
+    advances via the normal report+revised logic."""
+    _report = "# Plan Review Report\n\n**1 concerns, 0 gaps** across 2 subfeatures.\n"
+    store: dict[str, str] = {
+        # Cycle 1: recovered long ago, but old code never cleared `-blocked`.
+        "plan-review-cycle-1": _report,
+        "plan-review-cycle-1-revised": "# Revisions Applied — Cycle 1\n\n- prd: revised\n",
+        "plan-review-cycle-1-blocked": "# Plan Review Blocked — Cycle 1\n\nstale historical failure\n",
+        # Cycle 2: completed AFTER cycle 1 — proof the blocked row is stale.
+        "plan-review-cycle-2": _report,
+        "plan-review-cycle-2-revised": "# Revisions Applied — Cycle 2\n\n- prd: revised\n",
+    }
+
+    async def _must_not_dispatch(**kwargs):
+        raise AssertionError(
+            f"stale blocked cycle was re-run (dispatched {kwargs['artifact_prefix']})"
+        )
+
+    dispatches = await _drive_plan_review_blocked_cycle(
+        monkeypatch, store=store, targeted_revision_impl=_must_not_dispatch,
+    )
+
+    # No revision wave ran for ANY cycle: cycles 1-2 advanced on
+    # report+revised, cycle 3 ran fresh reviews that all approved.
+    assert dispatches == [], dispatches
+    # The stale blocked row was cleared (deleted — the store supports delete).
+    assert "plan-review-cycle-1-blocked" not in store
+    assert not store.get("plan-review-cycle-1-blocked", "")
+    # The genuine completion markers were left untouched.
+    assert "revised" in store["plan-review-cycle-1-revised"]
+    assert "revised" in store["plan-review-cycle-2-revised"]
+
+
+@pytest.mark.asyncio
+async def test_plan_review_blocked_row_on_latest_cycle_still_forces_rerun(
+    monkeypatch,
+):
+    """B-2 preserved: a `-blocked` row on the LATEST cycle (no later cycle has
+    any state) is the genuine failed-revision-wave case and must still force
+    the re-run instead of being treated as stale."""
+    from iriai_build_v2.workflows._common._helpers import TargetedRevisionResult
+
+    _report = "# Plan Review Report\n\n**1 concerns, 0 gaps** across 2 subfeatures.\n"
+    review_outcome = ReviewOutcome(
+        approved=False,
+        revision_plan=RevisionPlan(
+            requests=[
+                RevisionRequest(
+                    description="Restore the dropped accounts PRD sections",
+                    reasoning="Revision wave correctness",
+                    affected_subfeatures=["accounts"],
+                    severity="blocker",
+                )
+            ],
+            new_decisions=[],
+        ),
+        complete=True,
+    )
+    discussion_json = (
+        "```json\n"
+        + json.dumps({"output": review_outcome.model_dump(), "complete": True})
+        + "\n```"
+    )
+    store: dict[str, str] = {
+        # Cycle 1: cleanly completed.
+        "plan-review-cycle-1": _report,
+        "plan-review-cycle-1-revised": "# Revisions Applied — Cycle 1\n\n- prd: revised\n",
+        # Cycle 2: LATEST cycle, blocked mid-revision — nothing later exists.
+        "plan-review-cycle-2": _report,
+        "plan-review-cycle-2-blocked": "# Plan Review Blocked — Cycle 2\n\nfailures\n",
+        "plan-review-discussion-2": discussion_json,
+    }
+
+    async def _succeeding_revision(**kwargs):
+        result = TargetedRevisionResult(artifact_prefix=kwargs["artifact_prefix"])
+        result.revised_slugs.append("accounts")
+        return result
+
+    dispatches = await _drive_plan_review_blocked_cycle(
+        monkeypatch, store=store, targeted_revision_impl=_succeeding_revision,
+    )
+
+    # The latest blocked cycle RE-RAN its revision wave (not skipped/stale).
+    assert dispatches, "genuinely blocked latest cycle was skipped on restart"
+    assert any(prefix == "prd" for prefix, _plan in dispatches)
+    # The re-run completed cycle 2 and cleared its blocked row.
+    assert "plan-review-cycle-2-revised" in store
+    assert not store.get("plan-review-cycle-2-blocked", "")
+    # Cycle 1 was never touched.
+    assert "revised" in store["plan-review-cycle-1-revised"]
+
+
+@pytest.mark.asyncio
 async def test_scoping_phase_reuses_existing_scope_draft_and_marks_approval(monkeypatch):
     phase = ScopingPhase()
     feature = SimpleNamespace(id="feat-1", name="Feature", slug="feature", metadata={})

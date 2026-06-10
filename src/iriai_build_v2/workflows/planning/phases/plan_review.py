@@ -868,6 +868,34 @@ def _compile_review_report(
     return "\n".join(parts)
 
 
+async def _clear_blocked_cycle_marker(
+    runner: WorkflowRunner, feature: Feature, cycle: int
+) -> None:
+    """Remove a lingering ``plan-review-cycle-{N}-blocked`` row.
+
+    The resume check at the top of the review loop treats a truthy blocked
+    row as "re-run this cycle", so EVERY path that completes a cycle (revision
+    dispatch success, all-reviews-approved, user-approved discussion,
+    convergence break, decisions-only advance) must clear it — otherwise a
+    future resume re-grinds a long-recovered cycle. Deletes when the artifact
+    store supports it; otherwise overwrites with an empty string (falsy to
+    the resume check). No-op when no row exists. ``cycle`` is the 0-based
+    loop variable (artifact keys use ``cycle + 1``).
+    """
+    blocked_key = f"plan-review-cycle-{cycle + 1}-blocked"
+    existing = await runner.artifacts.get(blocked_key, feature=feature)
+    if not existing:
+        return
+    logger.info(
+        "Clearing `-blocked` row for completed plan-review cycle %d", cycle + 1,
+    )
+    delete = getattr(runner.artifacts, "delete", None)
+    if callable(delete):
+        await delete(blocked_key, feature=feature)
+    else:
+        await runner.artifacts.put(blocked_key, "", feature=feature)
+
+
 # ── Phase ────────────────────────────────────────────────────────────────────
 
 
@@ -933,6 +961,34 @@ class PlanReviewPhase(Phase):
             cycle_blocked = await runner.artifacts.get(
                 f"plan-review-cycle-{cycle + 1}-blocked", feature=feature,
             )
+            if cycle_blocked:
+                # Bound the blocked re-run to the LATEST cycle.  Cycles run
+                # strictly sequentially (a block raises RuntimeError before
+                # the next cycle can start), so any state for the NEXT cycle
+                # — a review report or a `-revised` row — proves this cycle
+                # already completed by some path after the block.  Such a
+                # row is STALE history (e.g. written by old code that never
+                # cleared it); re-running the long-recovered cycle on every
+                # resume grinds the whole history.  Clear it and let the
+                # normal report+revised advance logic run.
+                later_report = await runner.artifacts.get(
+                    f"plan-review-cycle-{cycle + 2}", feature=feature,
+                )
+                later_revised = await runner.artifacts.get(
+                    f"plan-review-cycle-{cycle + 2}-revised", feature=feature,
+                )
+                if later_report or later_revised:
+                    logger.warning(
+                        "Cycle %d has a lingering `-blocked` row but cycle %d "
+                        "already has state (report=%s, revised=%s) — the "
+                        "blocked row is STALE (cycle %d was recovered by a "
+                        "later run); clearing it and advancing normally "
+                        "instead of re-running the cycle.",
+                        cycle + 1, cycle + 2,
+                        bool(later_report), bool(later_revised), cycle + 1,
+                    )
+                    await _clear_blocked_cycle_marker(runner, feature, cycle)
+                    cycle_blocked = ""
             if existing_report and already_revised and not cycle_blocked:
                 # Report exists AND revisions already applied — advance
                 logger.info(
@@ -1085,6 +1141,9 @@ class PlanReviewPhase(Phase):
 
                 if all_approved:
                     logger.info("All reviews passed on cycle %d", cycle + 1)
+                    # Cycle completed — a lingering `-blocked` row from a
+                    # previously failed attempt must not survive it.
+                    await _clear_blocked_cycle_marker(runner, feature, cycle)
                     break
 
                 # ── Compile report ───────────────────────────────────
@@ -1122,6 +1181,9 @@ class PlanReviewPhase(Phase):
                 )
                 if approved:
                     logger.info("Recovered discussion accepts artifacts as-is — skipping revisions")
+                    # Cycle completed (approved) — clear any lingering
+                    # `-blocked` row so a future resume can't re-grind it.
+                    await _clear_blocked_cycle_marker(runner, feature, cycle)
                     break
             else:
                 # Collect prior decisions for discussion context
@@ -1223,6 +1285,9 @@ class PlanReviewPhase(Phase):
                 )
                 if approved:
                     logger.info("User accepted artifacts as-is — skipping revisions")
+                    # Cycle completed (approved) — clear any lingering
+                    # `-blocked` row so a future resume can't re-grind it.
+                    await _clear_blocked_cycle_marker(runner, feature, cycle)
                     break
 
             if revision_plan and revision_plan.requests:
@@ -1256,6 +1321,13 @@ class PlanReviewPhase(Phase):
                     await _save_gate_ledger(
                         runner, feature, gate_ledger, "plan-review",
                     )
+                    # Cycle completed (converged) — clear any lingering
+                    # `-blocked` row so a future resume can't re-grind it.
+                    # THIS is the path the original success-path clear missed:
+                    # a re-run of an already-recovered cycle dedups every
+                    # finding away and breaks here, never reaching the
+                    # revision-summary write below.
+                    await _clear_blocked_cycle_marker(runner, feature, cycle)
                     break
                 _assert_gate_requests_are_converging(
                     revision_plan, gate_ledger, "plan-review",
@@ -1796,12 +1868,7 @@ class PlanReviewPhase(Phase):
                 # attempt at this cycle — the resume check treats a lingering
                 # blocked marker as "re-run this cycle", which would loop
                 # forever once the re-run has actually succeeded.
-                _blocked_key = f"plan-review-cycle-{cycle + 1}-blocked"
-                _delete = getattr(runner.artifacts, "delete", None)
-                if callable(_delete):
-                    await _delete(_blocked_key, feature=feature)
-                else:
-                    await runner.artifacts.put(_blocked_key, "", feature=feature)
+                await _clear_blocked_cycle_marker(runner, feature, cycle)
 
                 # Notify user of revision results
                 await runner.run(
@@ -1820,6 +1887,9 @@ class PlanReviewPhase(Phase):
                     logger.info("Persisted plan-review decisions with no revision dispatch required")
                 else:
                     logger.warning("No revision requests extracted from discussion")
+                # Cycle completed (no revision dispatch needed) — clear any
+                # lingering `-blocked` row so a future resume can't re-grind it.
+                await _clear_blocked_cycle_marker(runner, feature, cycle)
 
             cycle += 1
 
