@@ -2554,6 +2554,16 @@ async def compile_artifacts(
         file_path = feature_dir / f"{final_key}.md"
         file_path.parent.mkdir(parents=True, exist_ok=True)
 
+    # Compile agents WRITE their outputs to a sticky world-writable scratch
+    # dir (pool agent users cannot write the supervisor-owned .iriai tree);
+    # the orchestrator reads them back, falling back to the legacy
+    # feature_dir path for outputs an earlier in-process run already wrote.
+    # The actor copy declares the scratch root in role metadata so pool
+    # dispatch runs it as a sandbox-confined scratch-write job
+    # (runtimes/claude_pool.py _validate_pool_scratch_write_manifest).
+    scratch_dir = _compile_intermediate_scratch_dir(feature.id)
+    compiler_actor = _compile_scratch_actor(compiler_actor, scratch_dir)
+
     sf_sources: list[tuple[Any, str]] = []
     for sf in decomposition.subfeatures:
         sf_text = await runner.artifacts.get(f"{artifact_prefix}:{sf.slug}", feature=feature)
@@ -2622,6 +2632,8 @@ async def compile_artifacts(
         sources_path: Path,
         output_path: Path,
         source_count: int,
+        legacy_output_path: Path | None = None,
+        mirror_path: Path | None = None,
     ) -> str:
         await runner.run(
             Ask(
@@ -2647,11 +2659,17 @@ async def compile_artifacts(
             feature,
             phase_name=phase_name,
         )
-        if not output_path.exists():
-            raise RuntimeError(f"Compiler did not write output to {output_path}")
-        compiled = output_path.read_text(encoding="utf-8").strip()
-        if not compiled:
-            raise RuntimeError(f"Compiler wrote empty file at {output_path}")
+        compiled = _read_compile_output(
+            output_path,
+            legacy_output_path,
+            stage_label=stage_label,
+        )
+        if mirror_path is not None and mirror_path != output_path:
+            # The agent wrote the scratch path; the canonical .iriai mirror
+            # location (orchestrator-writable) is kept populated for hosting
+            # and downstream mirror-path readers, exactly as when the agent
+            # wrote it directly.
+            mirror_path.write_text(compiled, encoding="utf-8")
         return compiled
 
     # Real subfeature slugs — the authority for the completeness guard's
@@ -2678,10 +2696,22 @@ async def compile_artifacts(
             target_bytes=COMPILE_CLUSTER_TARGET_BYTES,
         )
 
+        # Reuse probe: prefer the new scratch location; fall back to a legacy
+        # .iriai intermediate written by an earlier in-process (codex) run so
+        # resumed runs keep their compile-piece reuse.
+        def _reuse_probe_path(scratch_path: Path, legacy_path: Path) -> Path:
+            if scratch_path.exists():
+                return scratch_path
+            if legacy_path.exists():
+                return legacy_path
+            return scratch_path
+
         intermediate_sources: list[tuple[Any, str]] = []
         for idx, chunk in enumerate(chunks, start=1):
             chunk_sources_path = feature_dir / f"compile-sources-{artifact_prefix}-chunk-{idx}.md"
-            chunk_output_path = feature_dir / f"compile-intermediate-{artifact_prefix}-chunk-{idx}.md"
+            chunk_output_name = f"compile-intermediate-{artifact_prefix}-chunk-{idx}.md"
+            chunk_output_path = scratch_dir / chunk_output_name
+            chunk_legacy_output_path = feature_dir / chunk_output_name
             chunk_src_text = _render_source_bundle(
                 f"{artifact_prefix}-chunk-{idx}",
                 include_broad=False,
@@ -2709,7 +2739,9 @@ async def compile_artifacts(
                     artifact_prefix=f"{artifact_prefix}-chunk-{idx}",
                     piece_slug=cluster_piece_slug,
                     src_digest=cluster_src_digest,
-                    output_path=chunk_output_path,
+                    output_path=_reuse_probe_path(
+                        chunk_output_path, chunk_legacy_output_path
+                    ),
                     sources_text=chunk_src_text,
                     stage_label=f"cluster-{idx}",
                     real_slugs=real_slugs,
@@ -2722,6 +2754,7 @@ async def compile_artifacts(
                     sources_path=chunk_sources_path,
                     output_path=chunk_output_path,
                     source_count=len(chunk),
+                    legacy_output_path=chunk_legacy_output_path,
                 )
                 # Normalize header-form provenance into the canonical
                 # `<!-- SF: -->` comment BEFORE the guard.  Evidence-gated:
@@ -2811,10 +2844,11 @@ async def compile_artifacts(
                     feature_dir
                     / f"compile-sources-{artifact_prefix}-regroup-{regroup_round}-{idx}.md"
                 )
-                regroup_output_path = (
-                    feature_dir
-                    / f"compile-intermediate-{artifact_prefix}-regroup-{regroup_round}-{idx}.md"
+                regroup_output_name = (
+                    f"compile-intermediate-{artifact_prefix}-regroup-{regroup_round}-{idx}.md"
                 )
+                regroup_output_path = scratch_dir / regroup_output_name
+                regroup_legacy_output_path = feature_dir / regroup_output_name
                 regroup_src_text = _render_source_bundle(
                     f"{artifact_prefix}-regroup-{regroup_round}-{idx}",
                     include_broad=False,
@@ -2838,6 +2872,7 @@ async def compile_artifacts(
                         sources_path=regroup_sources_path,
                         output_path=regroup_output_path,
                         source_count=len(chunk),
+                        legacy_output_path=regroup_legacy_output_path,
                     )
                     # Per-regroup completeness guard: the inputs (cluster /
                     # earlier-regroup outputs) DO carry `<!-- SF: -->` markers,
@@ -2936,10 +2971,11 @@ async def compile_artifacts(
                     feature_dir
                     / f"compile-sources-{artifact_prefix}-finalbundle-{b_idx}.md"
                 )
-                bundle_out_path = (
-                    feature_dir
-                    / f"compile-intermediate-{artifact_prefix}-finalbundle-{b_idx}.md"
+                bundle_out_name = (
+                    f"compile-intermediate-{artifact_prefix}-finalbundle-{b_idx}.md"
                 )
+                bundle_out_path = scratch_dir / bundle_out_name
+                bundle_legacy_out_path = feature_dir / bundle_out_name
                 bundle_src_path.write_text(b_text, encoding="utf-8")
                 # Precomputed global offset for this bundle (§2.2 hoist).  No
                 # inline `running_offset +=` advance any more — it is pure code
@@ -2966,7 +3002,9 @@ async def compile_artifacts(
                         artifact_prefix=f"{artifact_prefix}-finalbundle-{b_idx}",
                         piece_slug=bundle_piece_slug,
                         src_digest=bundle_src_digest,
-                        output_path=bundle_out_path,
+                        output_path=_reuse_probe_path(
+                            bundle_out_path, bundle_legacy_out_path
+                        ),
                         sources_text=b_text,
                         stage_label=f"final-bundle-{b_idx}",
                         real_slugs=real_slugs,
@@ -3008,17 +3046,11 @@ async def compile_artifacts(
                         feature,
                         phase_name=phase_name,
                     )
-                    if not bundle_out_path.exists():
-                        raise RuntimeError(
-                            f"Per-bundle final merge did not write output to "
-                            f"{bundle_out_path}"
-                        )
-                    bundle_compiled = bundle_out_path.read_text(encoding="utf-8").strip()
-                    if not bundle_compiled:
-                        raise RuntimeError(
-                            f"Per-bundle final merge wrote empty file at "
-                            f"{bundle_out_path}"
-                        )
+                    bundle_compiled = _read_compile_output(
+                        bundle_out_path,
+                        bundle_legacy_out_path,
+                        stage_label=f"final-bundle-{b_idx}",
+                    )
                     # Per-bundle backstop: this single bundle must keep all of
                     # its OWN subfeature markers and component bodies.
                     _assert_compile_complete(
@@ -3060,8 +3092,10 @@ async def compile_artifacts(
             compiled_text = await _run_compile_prompt(
                 stage_label="final",
                 sources_path=final_sources_path,
-                output_path=file_path,
+                output_path=scratch_dir / f"compile-final-{artifact_prefix}.md",
                 source_count=len(final_sources),
+                legacy_output_path=file_path,
+                mirror_path=file_path,
             )
         # ── Part 1: deterministic post-compile completeness guard ───────
         # ALWAYS ON (safety invariant). Runs on the full final union, before
@@ -3081,8 +3115,10 @@ async def compile_artifacts(
         compiled_text = await _run_compile_prompt(
             stage_label="single-pass",
             sources_path=sources_path,
-            output_path=file_path,
+            output_path=scratch_dir / f"compile-final-{artifact_prefix}.md",
             source_count=len(sf_sources),
+            legacy_output_path=file_path,
+            mirror_path=file_path,
         )
         # ── Part 1: completeness guard on the single-pass path too ──────
         _assert_compile_complete(
@@ -3804,6 +3840,109 @@ _ABSOLUTE_JSON_PATH_RE = re.compile(r"(/[^\s`'\"<>]+?\.json)\b")
 FULL_DOC_FILE_POINTER_THRESHOLD_BYTES = 40_000
 FULL_DOC_REPLACE_FROM_FILE_OPERATION = "replace_from_file"
 _FULL_DOC_FILE_POINTER_DEFAULT_DIR = "/tmp/iriai-fulldoc-revisions"
+
+# ── Compile-intermediate scratch handoff (mirrors the fulldoc dir above) ──
+# Compile agents WRITE their stage outputs (compile-intermediate-*.md and the
+# final compiled document) and the orchestrator READS them back.  The
+# workspace ``.iriai`` tree is owned by the supervisor user and is NOT
+# writable by pool agent users (drwxr-xr-x), so the write paths handed to
+# compile agents live in a sticky world-writable temp dir instead — exactly
+# the B-1 fulldoc-revision pattern.  Pool dispatch of the Write-bearing
+# compiler role is authorized via the scratch-write job shape
+# (runtimes/claude_pool.py ``_validate_pool_scratch_write_manifest``), which
+# sandbox-exec-confines the agent's writes to this directory.
+_COMPILE_INTERMEDIATE_DEFAULT_DIR = "/tmp/iriai-compile-intermediates"
+# Must match runtimes/claude.py ``_POOL_SCRATCH_WRITE_ROOT_KEY`` /
+# runtimes/claude_pool.py — the role-metadata key the runtimes validate.
+_POOL_SCRATCH_WRITE_ROOT_METADATA_KEY = "pool_scratch_write_root"
+
+
+def _compile_intermediate_scratch_base() -> Path:
+    """Sticky world-writable base dir for compile-intermediate handoff.
+
+    Override with ``IRIAI_COMPILE_INTERMEDIATE_DIR``.  NOTE: pool dispatch
+    validates the root is strictly inside a system temp dir
+    (runtimes/claude.py ``_validated_pool_scratch_root``) — a non-temp
+    override fails loud at dispatch rather than silently widening the
+    sandbox.
+    """
+    raw_dir = os.environ.get("IRIAI_COMPILE_INTERMEDIATE_DIR", "").strip()
+    base = Path(raw_dir) if raw_dir else Path(_COMPILE_INTERMEDIATE_DEFAULT_DIR)
+    base.mkdir(parents=True, exist_ok=True)
+    with contextlib.suppress(OSError):
+        os.chmod(base, 0o1777)
+    return base
+
+
+def _compile_intermediate_scratch_dir(feature_id: str) -> Path:
+    """Per-feature scratch dir: confines each feature's compile agents to
+    their own subtree (sandbox-exec scope is this dir, not the shared base),
+    so a compromised compile agent cannot touch another feature's files."""
+    safe_id = re.sub(r"[^A-Za-z0-9._-]+", "-", str(feature_id)) or "feature"
+    scratch_dir = _compile_intermediate_scratch_base() / safe_id
+    scratch_dir.mkdir(parents=True, exist_ok=True)
+    with contextlib.suppress(OSError):
+        os.chmod(scratch_dir, 0o1777)
+    return scratch_dir
+
+
+def _compile_scratch_actor(actor: Any, scratch_dir: Path) -> Any:
+    """Copy of *actor* whose role declares the compile scratch write root.
+
+    Actor name (and thus ``session_key``) is unchanged; only role metadata
+    gains ``pool_scratch_write_root`` so the pool can dispatch the
+    Write-bearing compiler role as a sandbox-confined scratch-write job.
+    """
+    role = actor.role
+    metadata = dict(getattr(role, "metadata", None) or {})
+    metadata[_POOL_SCRATCH_WRITE_ROOT_METADATA_KEY] = str(scratch_dir)
+    return actor.model_copy(
+        update={"role": role.model_copy(update={"metadata": metadata})}
+    )
+
+
+def _read_compile_output(
+    output_path: Path,
+    legacy_output_path: Path | None,
+    *,
+    stage_label: str,
+) -> str:
+    """Read a compile stage output, NEW scratch path first, legacy second.
+
+    New-path-first rationale: the prompt for THIS dispatch names the scratch
+    path, so a compliant agent's fresh output lives there; the legacy
+    ``.iriai`` path can only hold output from an OLDER in-process (codex)
+    attempt and may be stale.  The legacy fallback exists for resume
+    backward-compat: an interrupted run whose codex member already wrote an
+    intermediate at the old path must not lose it.  Missing/empty BOTH paths
+    fails loud — never silently degrade.
+    """
+    candidates: list[Path] = [output_path]
+    if legacy_output_path is not None and legacy_output_path != output_path:
+        candidates.append(legacy_output_path)
+    for candidate in candidates:
+        if not candidate.exists():
+            continue
+        text = candidate.read_text(encoding="utf-8").strip()
+        if text:
+            if candidate is not output_path:
+                logger.info(
+                    "compile stage %s: read LEGACY intermediate %s (scratch "
+                    "path %s missing — prior in-process run output)",
+                    stage_label,
+                    candidate,
+                    output_path,
+                )
+            return text
+        raise RuntimeError(f"Compiler wrote empty file at {candidate}")
+    raise RuntimeError(
+        f"Compiler did not write output to {output_path}"
+        + (
+            f" (legacy path {legacy_output_path} also missing)"
+            if legacy_output_path is not None and legacy_output_path != output_path
+            else ""
+        )
+    )
 
 
 def _full_doc_file_pointer_threshold_bytes() -> int:

@@ -28,7 +28,13 @@ from pydantic import BaseModel
 from iriai_compose.runner import AgentRuntime
 from iriai_compose.storage import AgentSession, SessionStore
 
-from .claude import _inline_defs, _resolve_model_and_effort, _validate_runtime_workspace_binding
+from .claude import (
+    _inline_defs,
+    _pool_scratch_write_root,
+    _resolve_model_and_effort,
+    _validate_runtime_workspace_binding,
+    _validated_pool_scratch_root,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -45,6 +51,18 @@ _BOUND_WRITE_AUTH_SECRET_FILE = "runtime-write-auth.secret"
 _BOUND_WRITE_AUTH_SECRET_MODE = 0o640
 _BOUND_WRITE_GUARD_KEY = "runtime_workspace_write_guard"
 _BOUND_WRITE_GUARD_SANDBOX_EXEC = "sandbox_exec"
+# ── Pool scratch-write jobs (NOT workspace bindings) ─────────────────────
+# A write-producing role may declare ONE validated temp-dir scratch root via
+# role metadata ``pool_scratch_write_root`` (see runtimes/claude.py
+# ``_validated_pool_scratch_root``).  Such jobs dispatch WITHOUT a runtime
+# workspace binding but are still wrapped in the sandbox-exec write guard,
+# confined to the scratch root + the job payload dir + the profile's
+# session-env scratch.  They carry an HMAC authorization (same pool secret as
+# bound jobs) so a hand-written manifest cannot claim the shape.  Write-
+# producing jobs with NEITHER a binding NOR this shape are still rejected —
+# the binding enforcement for repo-mutating roles is unchanged.
+_POOL_SCRATCH_WRITE_ROOT_KEY = "pool_scratch_write_root"
+_POOL_SCRATCH_WRITE_AUTHORIZATION_KEY = "pool_scratch_write_authorization"
 _AUTHORITY_GRANT_SCHEMA_VERSION = "runtime-workspace-authority-grant-v1"
 _WRITE_PRODUCING_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit", "Bash"}
 
@@ -2178,6 +2196,30 @@ class ClaudePoolRuntime(AgentRuntime):
                     manifest,
                     _pool_write_auth_secret(self.root),
                 )
+        elif _role_is_write_producing(role):
+            # Scratch-write job (no workspace binding): the role declares a
+            # validated temp-dir scratch root (compile intermediates handoff —
+            # see workflows/_common/_helpers.py).  Confine it with the SAME
+            # sandbox-exec write guard used for bound jobs: ``write_guard_roots``
+            # feeds ``_write_guard_roots`` → the sandbox profile allows writes
+            # ONLY to the scratch root, the job payload dir, and the profile's
+            # session-env scratch — never the repo or the workspace .iriai
+            # tree.  The HMAC covers ``write_guard_roots`` + the guard key, so
+            # the runner can verify a queued manifest was produced by a holder
+            # of the pool secret.  Roles WITHOUT this metadata keep failing at
+            # the runner with the binding-required error (enforcement
+            # unchanged); a malformed scratch root fails loud right here.
+            scratch_root = _pool_scratch_write_root(role)
+            if scratch_root is not None:
+                manifest[_POOL_SCRATCH_WRITE_ROOT_KEY] = str(scratch_root)
+                manifest["write_guard_roots"] = [str(scratch_root)]
+                manifest[_BOUND_WRITE_GUARD_KEY] = _BOUND_WRITE_GUARD_SANDBOX_EXEC
+                manifest[_POOL_SCRATCH_WRITE_AUTHORIZATION_KEY] = (
+                    _bound_write_authorization(
+                        manifest,
+                        _pool_write_auth_secret(self.root),
+                    )
+                )
         queued_path = _job_state_path(self.root, "queued", profile.name, job_id)
         _write_json_atomic(queued_path, manifest)
         logger.info("Queued Claude pool job %s on profile %s", job_id, profile.name)
@@ -2428,9 +2470,7 @@ class ClaudePoolRunner:
         binding = manifest.get(_RUNTIME_WORKSPACE_BINDING_KEY)
         if binding is None:
             if _manifest_role_is_write_producing(manifest.get("role")):
-                raise RuntimeError(
-                    "Claude pool write-producing job requires runtime workspace binding"
-                )
+                self._validate_pool_scratch_write_manifest(manifest)
             return
         if not isinstance(binding, Mapping):
             raise RuntimeError("Bound Claude pool job has invalid runtime workspace binding")
@@ -2511,6 +2551,54 @@ class ClaudePoolRunner:
             raise RuntimeError("Bound Claude pool job is missing or has invalid expires_at")
         if expires_at <= datetime.now(UTC):
             raise RuntimeError("Bound Claude pool job binding is expired")
+
+    def _validate_pool_scratch_write_manifest(self, manifest: dict[str, Any]) -> None:
+        """Validate the scratch-write shape of an UNBOUND write-producing job.
+
+        A write-producing job without a runtime workspace binding is legal
+        ONLY when it carries the full scratch-write shape: a validated
+        temp-dir scratch root, ``write_guard_roots`` equal to exactly that
+        root (it feeds the sandbox-exec profile), the sandbox-exec guard key,
+        and an HMAC authorization minted with the pool write-auth secret
+        (covering the guard key + guard roots, so none of them can be
+        forged or edited after submit).  Anything less raises the SAME
+        binding-required error as before — repo-mutating roles without
+        bindings are rejected exactly as they always were.
+        """
+        role_map = manifest.get("role")
+        role_name = str(role_map.get("name") if isinstance(role_map, Mapping) else "unknown")
+        raw_root = str(manifest.get(_POOL_SCRATCH_WRITE_ROOT_KEY) or "").strip()
+        if not raw_root:
+            raise RuntimeError(
+                "Claude pool write-producing job requires runtime workspace binding"
+            )
+        scratch_root = _validated_pool_scratch_root(
+            raw_root, role_name=role_name or "unknown"
+        )
+        guard_roots = [
+            str(Path(str(path)).expanduser().resolve(strict=False))
+            for path in (manifest.get("write_guard_roots") or [])
+            if str(path).strip()
+        ]
+        if guard_roots != [str(scratch_root)]:
+            raise RuntimeError(
+                f"Scratch-write Claude pool job {role_name} write guard roots "
+                "must equal the scratch root"
+            )
+        if manifest.get(_BOUND_WRITE_GUARD_KEY) != _BOUND_WRITE_GUARD_SANDBOX_EXEC:
+            raise RuntimeError(
+                f"Scratch-write Claude pool job {role_name} requires the "
+                "sandbox-exec write guard"
+            )
+        expected_authorization = _bound_write_authorization(
+            manifest,
+            _pool_write_auth_secret(self.root),
+        )
+        if manifest.get(_POOL_SCRATCH_WRITE_AUTHORIZATION_KEY) != expected_authorization:
+            raise RuntimeError(
+                f"Scratch-write Claude pool job {role_name} has invalid write "
+                "authorization"
+            )
 
     async def _execute_claimed(self, running_path: Path) -> None:
         manifest = _read_json(running_path, {})

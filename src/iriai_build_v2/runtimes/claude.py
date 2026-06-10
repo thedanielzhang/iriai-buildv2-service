@@ -42,6 +42,16 @@ _PATH_PARAMS: dict[str, str] = {
     "NotebookEdit": "file_path",
 }
 _RUNTIME_WORKSPACE_BINDING_KEY = "runtime_workspace_binding"
+# ── Pool scratch-write roles ───────────────────────────────────────────
+# Role metadata key naming ONE temp-dir scratch root the role's agent writes
+# its file-handoff outputs to (e.g. compile intermediates — see
+# workflows/_common/_helpers.py compile_artifacts).  This is NOT a runtime
+# workspace binding: it grants no repo/workspace write authority.  The value
+# must be an existing directory STRICTLY inside a system temp base
+# (validated by ``_validated_pool_scratch_root``); anything else fails loud
+# at dispatch.  Repo-mutating roles keep requiring a full
+# ``runtime_workspace_binding`` — that enforcement is unchanged.
+_POOL_SCRATCH_WRITE_ROOT_KEY = "pool_scratch_write_root"
 _DEFAULT_CLAUDE_MODEL = "claude-opus-4-8"
 _DEFAULT_CLAUDE_EFFORT = "high"
 _OPUS_4_8_EFFORT = "high"
@@ -257,6 +267,62 @@ def _role_is_write_producing(role: Any) -> bool:
     return bool(
         tools & _WRITE_PRODUCING_TOOLS
         or (getattr(role, "metadata", None) or {}).get("write_producing")
+    )
+
+
+def _validated_pool_scratch_root(raw: Any, *, role_name: str) -> Path:
+    """Validate a role-declared scratch write root; fail loud on any miss.
+
+    The root must be an absolute, existing, non-symlink directory whose
+    RESOLVED path lives STRICTLY inside a system temp base (``/tmp``,
+    ``/private/tmp``, or ``tempfile.gettempdir()``).  This guarantees a
+    scratch-write role can never name a repo/workspace/home path: a symlinked
+    dir that escapes the temp tree resolves outside the bases and is
+    rejected.  The temp-base itself is rejected too (a job confined to all of
+    ``/tmp`` could clobber other features' scratch files)."""
+    import tempfile
+
+    text = str(raw or "").strip()
+    if not text:
+        raise RuntimeError(f"Scratch-write role {role_name} has an empty scratch root")
+    path = Path(text).expanduser()
+    if not path.is_absolute():
+        raise RuntimeError(
+            f"Scratch-write role {role_name} scratch root must be absolute: {text}"
+        )
+    if path.is_symlink():
+        raise RuntimeError(
+            f"Scratch-write role {role_name} scratch root is symlinked: {text}"
+        )
+    if not path.is_dir():
+        raise RuntimeError(
+            f"Scratch-write role {role_name} scratch root is not an existing "
+            f"directory: {text}"
+        )
+    resolved = path.resolve(strict=True)
+    bases: list[Path] = []
+    for base in ("/tmp", "/private/tmp", tempfile.gettempdir()):
+        try:
+            bases.append(Path(base).resolve(strict=True))
+        except OSError:
+            continue
+    if not any(
+        resolved != base and _path_is_relative_to(resolved, base) for base in bases
+    ):
+        raise RuntimeError(
+            f"Scratch-write role {role_name} scratch root must be strictly "
+            f"inside a system temp directory: {text}"
+        )
+    return resolved
+
+
+def _pool_scratch_write_root(role: Any) -> Path | None:
+    """Return the validated scratch write root a role declares, or None."""
+    raw = (getattr(role, "metadata", None) or {}).get(_POOL_SCRATCH_WRITE_ROOT_KEY)
+    if raw is None or not str(raw).strip():
+        return None
+    return _validated_pool_scratch_root(
+        raw, role_name=str(getattr(role, "name", "") or "unknown")
     )
 
 
@@ -1428,6 +1494,20 @@ class ClaudeAgentRuntime(AgentRuntime):
                 if authority is not None
                 else _as_string_list((binding or {}).get("blocked_roots"))
             )
+            # Scratch-write roles (compile intermediates handoff): widen the
+            # write guard by EXACTLY one validated temp-dir root.  Unbound
+            # roles only — bound write roles keep their authority-derived
+            # roots untouched.  When ``writable_roots`` is empty the guard
+            # falls back to ``[cwd]``, so cwd is re-included explicitly here
+            # to keep the existing workspace allowance byte-identical.
+            scratch_write_root = (
+                _pool_scratch_write_root(role) if not bound_write_role else None
+            )
+            if scratch_write_root is not None:
+                writable_roots = [
+                    *(writable_roots or [cwd]),
+                    str(scratch_write_root),
+                ]
             write_guard = _make_write_guard(
                 cwd,
                 allowed_roots=writable_roots,

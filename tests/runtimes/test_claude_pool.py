@@ -1690,6 +1690,170 @@ async def test_bound_pool_worker_rejects_unbound_write_role_manifest(
         await runner._execute_claude(manifest)
 
 
+def _scratch_write_manifest(tmp_path: Path, scratch: Path) -> dict:
+    """Manifest with the exact scratch-write shape the submit side produces."""
+    manifest = {
+        "id": "job-scratch",
+        "kind": "claude",
+        "created_at": datetime.now(UTC).isoformat(),
+        "cwd": str(tmp_path),
+        "role": {"name": "compiler", "tools": ["Read", "Glob", "Grep", "Write"]},
+        "paths": {"prompt": str(tmp_path / "payload" / "prompt.md")},
+        "runtime_scratch_roots": [],
+        "pool_scratch_write_root": str(scratch.resolve()),
+        "write_guard_roots": [str(scratch.resolve())],
+        "runtime_workspace_write_guard": "sandbox_exec",
+    }
+    manifest["pool_scratch_write_authorization"] = _bound_write_authorization(
+        manifest,
+        _pool_write_auth_secret(tmp_path),
+    )
+    return manifest
+
+
+@pytest.mark.asyncio
+async def test_scratch_write_role_submits_sandbox_confined_scratch_job(
+    tmp_path: Path,
+) -> None:
+    """B-5 dispatch fix: a Write-bearing compile role WITHOUT a workspace
+    binding dispatches legally when it declares a validated temp scratch
+    root — manifest carries the sandbox-exec guard scoped to that root plus
+    an HMAC authorization, and the pool worker validation accepts it."""
+    runtime = ClaudePoolRuntime(root=tmp_path, profiles=_profiles(), poll_interval=0.01)
+    profile = _profiles()[0]
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    scratch = tmp_path / "compile-scratch"
+    scratch.mkdir()
+    role = Role(
+        name="compiler",
+        prompt="Compile.",
+        tools=["Read", "Glob", "Grep", "Write"],
+        metadata={"pool_scratch_write_root": str(scratch)},
+    )
+
+    task = asyncio.create_task(runtime._submit_and_wait(
+        role,
+        "Compile the sources.",
+        output_type=None,
+        workspace=SimpleNamespace(path=workspace),
+        session_key="pm-compiler:feat-1",
+        profile=profile,
+    ))
+    await asyncio.sleep(0.05)
+    queued = list((tmp_path / "jobs" / "queued" / profile.name).glob("*.json"))
+    assert len(queued) == 1
+    manifest = json.loads(queued[0].read_text(encoding="utf-8"))
+    resolved_scratch = str(scratch.resolve())
+    assert manifest["pool_scratch_write_root"] == resolved_scratch
+    assert manifest["write_guard_roots"] == [resolved_scratch]
+    assert manifest["runtime_workspace_write_guard"] == "sandbox_exec"
+    assert "runtime_workspace_binding" not in manifest
+    assert manifest["pool_scratch_write_authorization"] == _bound_write_authorization(
+        manifest,
+        _pool_write_auth_secret(tmp_path),
+    )
+
+    # The pool worker validation accepts the queued manifest as-is — the
+    # binding-required rejection no longer fires for this shape.
+    runner = ClaudePoolRunner(profile=profile.name, root=tmp_path)
+    runner._validate_bound_job_manifest(manifest)
+
+    result_path = Path(manifest["paths"]["result"])
+    _write_json_atomic(result_path, {"ok": True, "result_text": "ok"})
+    _write_json_atomic(
+        _job_state_path(tmp_path, "done", profile.name, manifest["id"]),
+        {**manifest, "status": "done"},
+    )
+    result_text, structured_output, raw = await task
+    assert result_text == "ok"
+    assert structured_output is None
+
+
+def test_scratch_write_submit_rejects_non_temp_scratch_root(tmp_path: Path) -> None:
+    """A scratch root OUTSIDE the system temp tree fails loud at submit."""
+    del tmp_path
+    from iriai_build_v2.runtimes.claude import _validated_pool_scratch_root
+
+    outside = Path.home()
+    with pytest.raises(RuntimeError, match="strictly inside a system temp"):
+        _validated_pool_scratch_root(str(outside), role_name="compiler")
+    with pytest.raises(RuntimeError, match="not an existing directory"):
+        _validated_pool_scratch_root("/tmp/iriai-test-missing-scratch-dir-xyz", role_name="compiler")
+    with pytest.raises(RuntimeError, match="must be absolute"):
+        _validated_pool_scratch_root("relative/dir", role_name="compiler")
+    # The temp base itself is rejected — only strict subdirectories qualify.
+    # (/private/tmp, not /tmp: on macOS /tmp is a symlink, which is rejected
+    # even earlier by the symlink check.)
+    with pytest.raises(RuntimeError, match="strictly inside a system temp"):
+        _validated_pool_scratch_root("/private/tmp", role_name="compiler")
+
+
+@pytest.mark.asyncio
+async def test_scratch_write_pool_worker_rejects_tampered_scratch_manifests(
+    tmp_path: Path,
+) -> None:
+    """Hand-edited scratch-write manifests are rejected: guard-root mismatch,
+    missing sandbox-exec guard, forged authorization, non-temp root."""
+    runner = ClaudePoolRunner(profile="iriai-claude-1", root=tmp_path)
+    scratch = tmp_path / "compile-scratch"
+    scratch.mkdir()
+
+    # Guard roots widened beyond the scratch root.
+    manifest = _scratch_write_manifest(tmp_path, scratch)
+    manifest["write_guard_roots"] = [str(scratch.resolve()), str(tmp_path)]
+    with pytest.raises(RuntimeError, match="write guard roots"):
+        await runner._execute_claude(manifest)
+
+    # Missing sandbox-exec guard key.
+    manifest = _scratch_write_manifest(tmp_path, scratch)
+    manifest.pop("runtime_workspace_write_guard")
+    with pytest.raises(RuntimeError, match="sandbox-exec write guard"):
+        await runner._execute_claude(manifest)
+
+    # Forged/edited authorization.
+    manifest = _scratch_write_manifest(tmp_path, scratch)
+    manifest["pool_scratch_write_authorization"] = "0" * 64
+    with pytest.raises(RuntimeError, match="invalid write authorization"):
+        await runner._execute_claude(manifest)
+
+    # Scratch root swapped to a non-temp path after authorization.
+    manifest = _scratch_write_manifest(tmp_path, scratch)
+    manifest["pool_scratch_write_root"] = str(Path.home())
+    with pytest.raises(RuntimeError, match="strictly inside a system temp"):
+        await runner._execute_claude(manifest)
+
+
+def test_runner_wraps_scratch_write_jobs_in_sandbox_exec(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The scratch-write job command is wrapped in sandbox-exec with writes
+    allowed ONLY under the scratch root + payload dir — never the cwd."""
+    runner = _FakeClaudeRunner(profile="iriai-claude-1", root=tmp_path)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    scratch = tmp_path / "compile-scratch"
+    scratch.mkdir()
+    profile_path = tmp_path / "payload" / "sandbox-exec.sb"
+    manifest = _scratch_write_manifest(tmp_path, scratch)
+    manifest["cwd"] = str(workspace)
+    manifest["paths"] = {"sandbox_profile": str(profile_path)}
+    manifest["claude"] = {"command": "/bin/echo"}
+    monkeypatch.setattr(
+        "iriai_build_v2.runtimes.claude_pool.shutil.which",
+        lambda name: f"/usr/bin/{name}",
+    )
+
+    command = runner._build_claude_command(manifest, system_prompt="", schema=None)
+
+    assert command[:3] == ["/usr/bin/sandbox-exec", "-f", str(profile_path)]
+    profile = profile_path.read_text(encoding="utf-8")
+    assert "(deny file-write*)" in profile
+    assert str(scratch.resolve()) in profile
+    assert str(workspace) not in profile
+
+
 @pytest.mark.asyncio
 async def test_bound_pool_worker_rejects_spoofed_write_authorization_flag(
     tmp_path: Path,

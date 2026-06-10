@@ -237,6 +237,23 @@ def _slice_manifest_with_current_digests(
     )
 
 
+@pytest.fixture(autouse=True)
+def _compile_scratch_env(monkeypatch, tmp_path):
+    """Route the compile-intermediate scratch handoff dir (B-5: agents write
+    /tmp scratch, orchestrator reads back — _helpers.py
+    ``_compile_intermediate_scratch_base``) into the per-test tmp dir so
+    compile tests never share state through the real ``/tmp`` default."""
+    monkeypatch.setenv(
+        "IRIAI_COMPILE_INTERMEDIATE_DIR", str(tmp_path / "compile-scratch")
+    )
+
+
+def _compile_scratch_feature_dir(tmp_path: Path, feature_id: str) -> Path:
+    """Where compile agents WRITE intermediates for *feature_id* under the
+    autouse ``_compile_scratch_env`` fixture."""
+    return tmp_path / "compile-scratch" / feature_id
+
+
 class _TestMirror:
     def __init__(self, base_dir: Path) -> None:
         self.base_dir = base_dir
@@ -12328,6 +12345,157 @@ async def test_compile_artifacts_guard_raises_when_bundle_dropped(monkeypatch, t
     assert "reports" in msg
 
 
+def _build_scratch_compile_fixture(tmp_path, *, feature_id):
+    """Small single-pass compile fixture for the scratch-dir handoff tests."""
+    feature = SimpleNamespace(id=feature_id, metadata={})
+    mirror = _TestMirror(tmp_path / "features")
+    decomposition = SubfeatureDecomposition(
+        subfeatures=[
+            Subfeature(id="SF-1", slug="accounts", name="Accounts", description="Accounts"),
+        ],
+        edges=[],
+        complete=True,
+    )
+    sf_text = (
+        "<!-- SF: accounts -->\n## Subfeature body (accounts)\n\n"
+        "#### Widget (CMP-1)\n\nsection\n"
+    )
+
+    class _Artifacts:
+        async def get(self, key: str, *, feature):
+            del feature
+            return {
+                "plan:broad": "broad\n",
+                "decomposition": decomposition.model_dump_json(indent=2),
+                "plan:accounts": sf_text,
+            }.get(key, "")
+
+    return feature, mirror, decomposition, _Artifacts()
+
+
+@pytest.mark.asyncio
+async def test_compile_artifacts_hands_off_outputs_via_scratch_dir(monkeypatch, tmp_path):
+    """B-5: compile agents WRITE to the sticky scratch dir (pool agent users
+    cannot write the supervisor-owned .iriai tree); the orchestrator reads
+    the output back and mirrors it to the canonical .iriai path itself."""
+    monkeypatch.setenv("IRIAI_COMPILE_INTERMEDIATE_DIR", str(tmp_path / "scratch"))
+    feature, mirror, decomposition, artifacts = _build_scratch_compile_fixture(
+        tmp_path, feature_id="feat-compile-scratch"
+    )
+    captured: dict[str, object] = {}
+
+    async def _fake_run(task, feature, phase_name):
+        del feature, phase_name
+        captured["actor"] = task.actor
+        paths = re.findall(r"`([^`]+)`", task.prompt)
+        out_path = Path(paths[-1])
+        captured["output_path"] = out_path
+        body = "compiled\n<!-- SF: accounts -->\n#### CompiledWidget (CMP-1)\n"
+        out_path.write_text(body, encoding="utf-8")
+        return None
+
+    runner = SimpleNamespace(
+        artifacts=artifacts, services={"artifact_mirror": mirror}, run=_fake_run
+    )
+    compiled = await compile_artifacts(
+        runner,
+        feature,
+        "plan-review",
+        compiler_actor=lead_architect_reviewer,
+        decomposition=decomposition,
+        artifact_prefix="plan",
+        broad_key="plan:broad",
+        final_key="plan",
+    )
+
+    scratch_feature_dir = tmp_path / "scratch" / "feat-compile-scratch"
+    # The write path handed to the AGENT lives in the scratch dir, not .iriai.
+    assert captured["output_path"].parent == scratch_feature_dir
+    # The actor copy declares the scratch root so pool dispatch runs it as a
+    # sandbox-confined scratch-write job (claude_pool.py).
+    assert (
+        captured["actor"].role.metadata["pool_scratch_write_root"]
+        == str(scratch_feature_dir)
+    )
+    # Same actor name → unchanged session key derivation.
+    assert captured["actor"].name == lead_architect_reviewer.name
+    # The ORCHESTRATOR mirrored the compiled text to the canonical .iriai
+    # path for hosting / downstream mirror-path readers.
+    mirror_file = Path(mirror.feature_dir(feature.id)) / _key_to_path("plan")
+    assert mirror_file.read_text(encoding="utf-8") == compiled
+    assert "<!-- SF: accounts -->" in compiled
+
+
+@pytest.mark.asyncio
+async def test_compile_artifacts_reads_legacy_intermediate_when_scratch_missing(
+    monkeypatch, tmp_path
+):
+    """Backward compat: an in-process (codex) compiler that wrote the output
+    at the legacy .iriai path is still read when the scratch path is empty."""
+    monkeypatch.setenv("IRIAI_COMPILE_INTERMEDIATE_DIR", str(tmp_path / "scratch"))
+    feature, mirror, decomposition, artifacts = _build_scratch_compile_fixture(
+        tmp_path, feature_id="feat-compile-legacy"
+    )
+    legacy_file = Path(mirror.feature_dir(feature.id)) / _key_to_path("plan")
+    legacy_file.parent.mkdir(parents=True, exist_ok=True)
+
+    async def _fake_run(task, feature, phase_name):
+        del feature, phase_name
+        # Simulate the legacy in-process behavior: output written to the
+        # .iriai mirror path, NOT the scratch path named in the prompt.
+        body = "compiled\n<!-- SF: accounts -->\n#### CompiledWidget (CMP-1)\n"
+        legacy_file.write_text(body, encoding="utf-8")
+        return None
+
+    runner = SimpleNamespace(
+        artifacts=artifacts, services={"artifact_mirror": mirror}, run=_fake_run
+    )
+    compiled = await compile_artifacts(
+        runner,
+        feature,
+        "plan-review",
+        compiler_actor=lead_architect_reviewer,
+        decomposition=decomposition,
+        artifact_prefix="plan",
+        broad_key="plan:broad",
+        final_key="plan",
+    )
+    assert "<!-- SF: accounts -->" in compiled
+    # No file ever appeared in the scratch dir.
+    scratch_feature_dir = tmp_path / "scratch" / "feat-compile-legacy"
+    assert not list(scratch_feature_dir.glob("*.md"))
+
+
+@pytest.mark.asyncio
+async def test_compile_artifacts_fails_loud_when_no_output_at_either_path(
+    monkeypatch, tmp_path
+):
+    """Missing output at BOTH the scratch and legacy paths hard-raises."""
+    monkeypatch.setenv("IRIAI_COMPILE_INTERMEDIATE_DIR", str(tmp_path / "scratch"))
+    feature, mirror, decomposition, artifacts = _build_scratch_compile_fixture(
+        tmp_path, feature_id="feat-compile-missing"
+    )
+
+    async def _fake_run(task, feature, phase_name):
+        del task, feature, phase_name
+        return None  # compiler "succeeds" without writing anything
+
+    runner = SimpleNamespace(
+        artifacts=artifacts, services={"artifact_mirror": mirror}, run=_fake_run
+    )
+    with pytest.raises(RuntimeError, match="did not write output"):
+        await compile_artifacts(
+            runner,
+            feature,
+            "plan-review",
+            compiler_actor=lead_architect_reviewer,
+            decomposition=decomposition,
+            artifact_prefix="plan",
+            broad_key="plan:broad",
+            final_key="plan",
+        )
+
+
 def test_compile_guard_expected_slugs_catches_chunk_stage_drop():
     """Chunk-stage guard: raw per-SF sources carry no `<!-- SF: -->` markers
     (the compiler emits them), so the guard keys the survival check on the
@@ -12621,9 +12789,10 @@ async def test_compile_artifacts_normalizes_verbatim_single_sf_cluster_copy(
     # All three subfeature markers survive into the final union.
     for slug in slugs:
         assert f"<!-- SF: {slug} -->" in compiled
-    # The on-disk chunk intermediates were normalized in place.
-    feature_dir = Path(mirror.feature_dir(feature.id))
-    chunk_files = sorted(feature_dir.glob("compile-intermediate-plan-chunk-*.md"))
+    # The on-disk chunk intermediates were normalized in place (they live in
+    # the agent-writable compile scratch dir, not the .iriai feature dir).
+    scratch_dir = _compile_scratch_feature_dir(tmp_path, feature.id)
+    chunk_files = sorted(scratch_dir.glob("compile-intermediate-plan-chunk-*.md"))
     assert chunk_files, "hierarchical path must have produced chunk intermediates"
     marked = "".join(p.read_text(encoding="utf-8") for p in chunk_files)
     for slug in slugs:
@@ -13014,8 +13183,8 @@ async def test_compile_adopts_preexisting_outputs_with_no_markers(
     # before the upgrade), and remove the last final-bundle output (the crash
     # point left it missing).
     runner.artifacts.store.clear()
-    feature_dir = Path(runner.services["artifact_mirror"].feature_dir(feature.id))
-    bundle_files = sorted(feature_dir.glob("compile-intermediate-plan-finalbundle-*.md"))
+    scratch_dir = _compile_scratch_feature_dir(tmp_path, feature.id)
+    bundle_files = sorted(scratch_dir.glob("compile-intermediate-plan-finalbundle-*.md"))
     assert len(bundle_files) >= 2
     last_bundle = bundle_files[-1]
     last_bundle.unlink()
@@ -13029,7 +13198,7 @@ async def test_compile_adopts_preexisting_outputs_with_no_markers(
     assert calls[0] == "per-bundle"
     # Markers were retroactively backfilled for every adopted + recompiled piece.
     marker_keys = {k for k in runner.artifacts.store if k.startswith("compile-piece:")}
-    n_clusters = len(list(feature_dir.glob("compile-intermediate-plan-chunk-*.md")))
+    n_clusters = len(list(scratch_dir.glob("compile-intermediate-plan-chunk-*.md")))
     n_bundles = len(bundle_files)
     assert len(marker_keys) == n_clusters + n_bundles
     # The final whole-union guard passed and the output equals the from-scratch
@@ -13055,9 +13224,9 @@ async def test_compile_crash_after_2_of_4_pieces_reuses_2_recompiles_2(
 
     # Baseline from-scratch compile (seeds all 4 cluster + 4 bundle pieces).
     first = await _run_incremental_compile(feature, decomposition, runner)
-    feature_dir = Path(runner.services["artifact_mirror"].feature_dir(feature.id))
-    cluster_files = sorted(feature_dir.glob("compile-intermediate-plan-chunk-*.md"))
-    bundle_files = sorted(feature_dir.glob("compile-intermediate-plan-finalbundle-*.md"))
+    scratch_dir = _compile_scratch_feature_dir(tmp_path, feature.id)
+    cluster_files = sorted(scratch_dir.glob("compile-intermediate-plan-chunk-*.md"))
+    bundle_files = sorted(scratch_dir.glob("compile-intermediate-plan-finalbundle-*.md"))
     assert len(cluster_files) == 4
     assert len(bundle_files) == 4
 
