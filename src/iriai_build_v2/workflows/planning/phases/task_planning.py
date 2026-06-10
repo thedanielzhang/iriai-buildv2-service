@@ -105,8 +105,11 @@ logger = logging.getLogger(__name__)
 # to avoid over-matching into adjacent prose.
 _AC_ID_PATTERN = re.compile(r"\bAC-[A-Za-z0-9][A-Za-z0-9-]*\b")
 _AC_DEFINITION_PATTERN = re.compile(
-    r"(?m)^\s*(?:[-*]|\d+[.)])\s*(?:\[[ xX]\]\s*)?(?:\*\*)?"
-    r"(AC-[A-Za-z0-9][A-Za-z0-9-]*)(?:\*\*)?\b"
+    r"(?m)^\s*(?:"
+    r"(?:[-*]|\d+[.)])\s*(?:\[[ xX]\]\s*)?(?:\*\*)?"  # list-item: `- **AC-x** — …`
+    r"|#{1,6}\s+(?:\*\*)?"  # heading: `### AC-x — …` / `#### AC-x — …`
+    r"|\*\*"  # bold paragraph: `**AC-x — …** · refs` / `**AC-x** — …`
+    r")(AC-[A-Za-z0-9][A-Za-z0-9-]*)(?:\*\*)?\b"
 )
 
 # Matches a top-level "## Acceptance Criteria" (or "## Acceptance Criteria ...")
@@ -125,10 +128,19 @@ _JOURNEY_ID_PATTERN = re.compile(r"\bJ-[A-Za-z0-9][A-Za-z0-9-]*\b")
 _STEP_ID_PATTERN = re.compile(r"\bSTEP-[A-Za-z0-9][A-Za-z0-9-]*\b")
 _VERIFIABLE_STATE_ID_PATTERN = re.compile(r"\b[A-Za-z][A-Za-z0-9_-]*#[A-Za-z0-9_-]+\b")
 _MARKDOWN_METADATA_LINE_PATTERN = re.compile(
-    r"(?m)^\s*-\s+([A-Za-z_][A-Za-z0-9_]*):\s*(.+?)\s*$"
+    r"(?m)^\s*-\s+[`*]*([A-Za-z_][A-Za-z0-9_]*)[`*]*:[`*]*\s*(.+?)\s*$"
 )
 _MARKDOWN_AC_BLOCK_PATTERN = re.compile(
-    r"(?ms)^\s*-\s+\*\*(AC-[A-Za-z0-9][A-Za-z0-9-]*)\*\*\s*[—-]\s*(.*?)\s*$"
+    r"(?ms)^\s*-\s+\*\*(AC-[A-Za-z0-9][A-Za-z0-9-]*)\*\*\s*[—–-]\s*(.*?)\s*$"
+)
+# `**AC-x — Title…** · refs` or `**AC-x** — desc` definitions written as bold
+# paragraphs (no list marker).
+_MARKDOWN_AC_BOLD_PARAGRAPH_BLOCK_PATTERN = re.compile(
+    r"(?m)^\s*\*\*(AC-[A-Za-z0-9][A-Za-z0-9-]*)(?:\*\*)?\s*[—–-]\s*(.*?)\s*$"
+)
+# `### AC-x — title` / `#### AC-x — title` definitions written as headings.
+_MARKDOWN_AC_HEADING_BLOCK_PATTERN = re.compile(
+    r"(?m)^\s*#{2,6}\s+(AC-[A-Za-z0-9][A-Za-z0-9-]*)\b(?:\s*[—–:-]\s*(.*?))?\s*$"
 )
 _MARKDOWN_SCENARIO_HEADING_PATTERN = re.compile(r"(?m)^###\s+(.+?)\s*$")
 _EMBEDDED_STEP_HEADING_PATTERN = re.compile(r"(?<!\n)(###\s+STEP-[A-Za-z0-9][^\n]*)")
@@ -1932,7 +1944,19 @@ class TaskPlanningPhase(Phase):
         cls,
         section_text: str,
     ) -> list[TestAcceptanceCriterion]:
-        matches = list(_MARKDOWN_AC_BLOCK_PATTERN.finditer(section_text))
+        # Test plans in the wild define criteria in three shapes: list items
+        # (`- **AC-x** — …`), bold paragraphs (`**AC-x — Title** · refs`),
+        # and headings (`### AC-x — title`). Use whichever shape yields the
+        # most definitions; ties prefer the list-item form.
+        match_sets = [
+            list(pattern.finditer(section_text))
+            for pattern in (
+                _MARKDOWN_AC_BLOCK_PATTERN,
+                _MARKDOWN_AC_BOLD_PARAGRAPH_BLOCK_PATTERN,
+                _MARKDOWN_AC_HEADING_BLOCK_PATTERN,
+            )
+        ]
+        matches = max(match_sets, key=len)
         if not matches:
             return []
         criteria: list[TestAcceptanceCriterion] = []
@@ -1940,10 +1964,15 @@ class TaskPlanningPhase(Phase):
             block_start = match.start()
             block_end = matches[idx + 1].start() if idx + 1 < len(matches) else len(section_text)
             metadata = cls._parse_markdown_metadata_map(section_text[block_start:block_end])
+            description = (match.group(2) or "").strip()
+            if metadata.get("description"):
+                description = "\n".join(
+                    part for part in (description, metadata["description"]) if part
+                )
             criteria.append(
                 TestAcceptanceCriterion(
                     id=match.group(1).strip(),
-                    description=match.group(2).strip(),
+                    description=description,
                     linked_requirement=metadata.get("linked_requirement", ""),
                     verification_method=metadata.get("verification_method", ""),
                     pass_condition=metadata.get("pass_condition", ""),
@@ -2459,6 +2488,11 @@ class TaskPlanningPhase(Phase):
             ),
             decision_universe=cls._decision_universe_from_texts(
                 target_texts.get("decisions", ""),
+                # The technical plan defines plan-local decision ids (e.g. an
+                # in-plan architecture decision log) that step sections cite;
+                # admit them like the requirement/journey universes already
+                # admit plan-defined ids.
+                normalized_plan,
                 await runner.artifacts.get("decisions", feature=feature) or "",
                 await runner.artifacts.get("decisions:broad", feature=feature) or "",
                 await runner.artifacts.get(GLOBAL_DECISIONS_KEY, feature=feature) or "",

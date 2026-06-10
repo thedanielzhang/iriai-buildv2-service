@@ -2739,6 +2739,173 @@ Create consumer workflow.
     assert "dag-contract-report:contracts-unresolved" in runner.artifacts.store
 
 
+def test_parse_test_plan_supports_bold_paragraph_ac_definitions():
+    """Regenerated test plans define ACs as bold paragraphs with backticked
+    metadata keys; the markdown parser must not fall back to whole-section
+    token scans (which pollute the canonical universe with PRD cross-refs)."""
+    test_plan_markdown = """
+# Test Plan — S1
+
+## Acceptance Criteria
+
+> ID format `AC-fds-N` (stable; never renumbered). Each cites >=1 PRD `REQ-id`.
+
+### Foundation: models
+
+**AC-fds-1 — Canonical record integrity** · `REQ-1`, `REQ-16` (PRD AC-3)
+- `verification_method`: unit
+- `pass_condition`: record persists exactly once [decision: DEC-PR12-01]
+- `linked_journey_step_id`: J-2.1
+
+**AC-fds-2** — Auto number allocated inside create_batch · `REQ-2` (PRD AC-3, AC-4)
+- `verification_method`: integration
+- `pass_condition`: numbering is race-safe
+
+## Test Scenarios
+
+### TS-1 — Smoke
+- priority: p0
+""".strip()
+    parsed = TaskPlanningPhase._parse_test_plan(test_plan_markdown)
+    assert parsed is not None
+    assert [criterion.id for criterion in parsed.acceptance_criteria] == [
+        "AC-fds-1",
+        "AC-fds-2",
+    ]
+    first = parsed.acceptance_criteria[0]
+    assert "REQ-1" in first.description
+    assert first.verification_method == "unit"
+    assert first.pass_condition.startswith("record persists")
+    assert first.linked_journey_step_id == "J-2.1"
+    # Canonical extraction must return only the defined ids — not the
+    # `AC-fds-N` placeholder from the blockquote nor PRD cross-refs (AC-3/AC-4).
+    assert task_planning_module._extract_ac_ids(test_plan_markdown) == {
+        "AC-fds-1",
+        "AC-fds-2",
+    }
+
+
+def test_parse_test_plan_supports_heading_ac_definitions():
+    """Test plans that define ACs as `###`/`####` headings with bold metadata
+    keys (`- **linked_requirement:** …`) must parse structurally."""
+    test_plan_markdown = """
+# Test Plan — S2
+
+## Acceptance Criteria
+
+### Handoff (U01 → J-1)
+
+#### AC-hrdd-1 — Handoff row action gating
+- **Description:** Row action is enabled on awarded rows only.
+- **linked_requirement:** REQ-1
+- **verification_method:** e2e
+- **pass_condition:** action disabled on non-awarded rows
+
+#### AC-hrdd-2 — Handoff modal multi-select
+- **linked_requirement:** REQ-2
+- **verification_method:** integration
+- **pass_condition:** modal renders the multi-select table
+""".strip()
+    parsed = TaskPlanningPhase._parse_test_plan(test_plan_markdown)
+    assert parsed is not None
+    assert [criterion.id for criterion in parsed.acceptance_criteria] == [
+        "AC-hrdd-1",
+        "AC-hrdd-2",
+    ]
+    first = parsed.acceptance_criteria[0]
+    assert first.linked_requirement == "REQ-1"
+    assert first.verification_method == "e2e"
+    # The `- **Description:** …` metadata is folded into the description so
+    # trace inference sees its REQ/journey tokens.
+    assert "Row action is enabled" in first.description
+    assert task_planning_module._extract_ac_ids(test_plan_markdown) == {
+        "AC-hrdd-1",
+        "AC-hrdd-2",
+    }
+
+
+@pytest.mark.asyncio
+async def test_task_planning_contract_compiler_handles_bold_paragraph_test_plan_and_plan_local_decisions(tmp_path):
+    """End-to-end repro of the S1 (foundation-dashboard-substrate) blocker:
+    a regenerated bold-paragraph test plan + a plan that cites plan-local
+    decision ids defined in its own decision log must compile a valid
+    contract with trace-inferred AC ownership."""
+    feature = SimpleNamespace(id="feat-contract-compiler-boldpara", metadata={})
+    mirror = _TestMirror(tmp_path / "features")
+
+    class _Artifacts:
+        def __init__(self) -> None:
+            self.store = {
+                "plan:boldpara": """
+## 2. Decision Log (architecture)
+
+- **D-arch-1 — Atomic create transaction.** Everything in one session scope.
+
+## 3. Implementation Steps
+
+### STEP-1 — Author canonical models
+
+Implements REQ-1 per D-arch-1.
+
+- **Acceptance:** model round-trip succeeds.
+
+### STEP-2 — Create service
+
+Implements REQ-2 [decision: D-arch-1].
+""".strip(),
+                "prd:boldpara": "## Requirements\n\nREQ-1\nModels.\n\nREQ-2\nCreate.\n",
+                "design:boldpara": "",
+                "system-design:boldpara": "",
+                "test-plan:boldpara": """
+## Acceptance Criteria
+
+> ID format `AC-boldpara-N`. Each cites >=1 PRD `REQ-id`.
+
+**AC-boldpara-1 — Canonical record integrity** · `REQ-1` (PRD AC-3)
+- `verification_method`: unit
+- `pass_condition`: record persists exactly once
+
+**AC-boldpara-2 — Create is atomic** · `REQ-2` (PRD AC-4)
+- `verification_method`: integration
+- `pass_condition`: rollback leaves no partial rows
+""".strip(),
+                "decisions:boldpara": "",
+                "decisions": "",
+                "decisions:broad": "",
+            }
+
+        async def get(self, key: str, *, feature):
+            del feature
+            return self.store.get(key, "")
+
+        async def put(self, key: str, value: str, *, feature):
+            del feature
+            self.store[key] = value
+
+        async def delete(self, key: str, *, feature):
+            del feature
+            self.store.pop(key, None)
+
+    runner = SimpleNamespace(artifacts=_Artifacts(), services={"artifact_mirror": mirror})
+
+    contract = await TaskPlanningPhase._compile_subfeature_planning_contract(
+        runner,
+        feature,
+        "boldpara",
+    )
+
+    # Canonical universe excludes PRD cross-refs (AC-3/AC-4) and the
+    # blockquote placeholder (AC-boldpara-N).
+    assert contract.canonical_ac_ids == ["AC-boldpara-1", "AC-boldpara-2"]
+    step_map = {step.step_id: step for step in contract.step_contracts}
+    assert step_map["STEP-1"].owned_ac_ids == ["AC-boldpara-1"]
+    assert step_map["STEP-2"].owned_ac_ids == ["AC-boldpara-2"]
+    # Plan-local decision ids defined by the plan's own decision log are part
+    # of the decision universe (no `unknown decision_id D-arch-1` failure).
+    assert "D-arch-1" in contract.decision_universe
+    assert "dag-contract:boldpara" in runner.artifacts.store
+
+
 @pytest.mark.asyncio
 async def test_task_planning_contract_compiler_ignores_legacy_manifest_state(tmp_path):
     feature = SimpleNamespace(id="feat-contract-compiler-legacy-ignore", metadata={})
