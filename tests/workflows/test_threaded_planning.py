@@ -103,6 +103,8 @@ from iriai_build_v2.workflows._common._helpers import (
     PatchApplicationError,
     _apply_patches,
     _assert_compile_complete,
+    _compile_piece_reuse,
+    _inject_missing_sf_markers,
     _find_section,
     _parse_markdown_sections,
     _compile_piece_sentinel_ok,
@@ -12380,6 +12382,252 @@ def test_compile_guard_real_slugs_ignores_synthetic_markers():
         stage_label="regroup-1-1",
         real_slugs={"s1"},
     )
+
+
+def test_inject_missing_sf_markers_normalizes_header_form_provenance():
+    """kaya cycle-13 defect (prd-chunk-7 / design-chunk-3 /
+    system-design-chunk-4): a single-SF cluster chunk copied VERBATIM carries
+    the `## Subfeature: {name} ({slug})` header (the provenance form the
+    compiler prompt historically sanctioned) but no `<!-- SF: -->` comment, so
+    the guard saw out=[] on complete content. The normalizer must inject the
+    canonical marker right after the surviving header, after which the guard
+    passes — content (incl. CMP body count) untouched."""
+    # Verbatim copy of a _render_source_bundle chunk: header + 17 CMP bodies
+    # (the design-chunk-3 signature: src=17 out=17 but markers dropped 1/1).
+    body = "## Subfeature: Internal Review (internal-review-cover-send)\n\n"
+    for i in range(17):
+        body += f"#### Widget-{i} (CMP-{i + 1})\n\nsection\n\n"
+    normalized, injected = _inject_missing_sf_markers(
+        body, expected_slugs={"internal-review-cover-send"}
+    )
+    assert injected == ["internal-review-cover-send"]
+    assert "<!-- SF: internal-review-cover-send -->" in normalized
+    # Marker lands immediately after the header line, before the bodies.
+    assert normalized.index("<!-- SF:") < normalized.index("#### Widget-0")
+    # CMP body count preserved (only a comment line was added).
+    assert len(re.findall(r"(?m)^#{2,4}\s+.*\bCMP-\d+", normalized)) == 17
+    # Guard now passes on the normalized text (same call shape as cluster).
+    _assert_compile_complete(
+        sources_text=body,
+        compiled_text=normalized,
+        artifact_prefix="design-chunk-3",
+        stage_label="cluster-3",
+        expected_slugs={"internal-review-cover-send"},
+        real_slugs={"internal-review-cover-send"},
+    )
+
+
+def test_inject_missing_sf_markers_requires_header_evidence_guard_still_raises():
+    """Guard preservation: a truncated output that GENUINELY dropped the
+    subfeature (no header, no marker) gets NOTHING injected, and the guard
+    still hard-raises — the normalizer never masks a real drop."""
+    truncated = "compiled stub\nno provenance of any form here\n"
+    normalized, injected = _inject_missing_sf_markers(
+        truncated, expected_slugs={"amber-delegated-writeback"}
+    )
+    assert injected == []
+    assert normalized == truncated
+    with pytest.raises(RuntimeError) as ei:
+        _assert_compile_complete(
+            sources_text="## Subfeature: Amber (amber-delegated-writeback)\n\nbody\n",
+            compiled_text=normalized,
+            artifact_prefix="prd-chunk-7",
+            stage_label="cluster-7",
+            expected_slugs={"amber-delegated-writeback"},
+            real_slugs={"amber-delegated-writeback"},
+        )
+    assert "amber-delegated-writeback" in str(ei.value)
+
+
+def test_inject_missing_sf_markers_noop_when_marker_already_present():
+    """A compliant output (comment form already present) is byte-identical
+    after normalization — zero injections."""
+    text = "<!-- SF: s2 -->\n## Subfeature: S2 (s2)\n\nbody\n"
+    normalized, injected = _inject_missing_sf_markers(text, expected_slugs={"s2"})
+    assert injected == []
+    assert normalized == text
+
+
+@pytest.mark.asyncio
+async def test_compile_piece_reuse_adopts_header_form_provenance_output(tmp_path):
+    """Resume path for the live cycle-13 leftovers: a cached on-disk chunk
+    output with header-form provenance ONLY (no `<!-- SF: -->` comment) must
+    be normalized, pass the guard, be persisted back with the marker, and be
+    adopted (marker key written) instead of failing reuse-validate."""
+    feature = SimpleNamespace(id="feat-reuse-headerform", metadata={})
+    slug = "release-confirmation-alerts-notifications"
+    cached_body = (
+        f"## Subfeature: Release & Alerts ({slug})\n\n" + "content line\n" * 10
+    )
+    output_path = tmp_path / "compile-intermediate-system-design-chunk-4.md"
+    output_path.write_text(cached_body, encoding="utf-8")
+
+    class _Artifacts:
+        def __init__(self):
+            self.store = {}
+
+        async def get(self, key, *, feature):
+            del feature
+            return self.store.get(key, "")
+
+        async def put(self, key, value, *, feature):
+            del feature
+            self.store[key] = value
+
+    runner = SimpleNamespace(artifacts=_Artifacts())
+    result = await _compile_piece_reuse(
+        runner,
+        feature,
+        artifact_prefix="system-design-chunk-4",
+        piece_slug="cluster-abc123",
+        src_digest="deadbeef",
+        output_path=output_path,
+        sources_text=f"## Subfeature: Release & Alerts ({slug})\n\nsrc body\n",
+        stage_label="cluster-4",
+        real_slugs={slug},
+        expected_slugs={slug},
+    )
+    assert result is not None, "header-form output must be adopted, not recompiled"
+    assert f"<!-- SF: {slug} -->" in result
+    # Normalized text persisted back so downstream stages read marked content.
+    assert f"<!-- SF: {slug} -->" in output_path.read_text(encoding="utf-8")
+    # Retroactive adoption marker written.
+    assert any(k.startswith("compile-piece:") for k in runner.artifacts.store)
+
+
+@pytest.mark.asyncio
+async def test_compile_piece_reuse_still_rejects_genuinely_dropped_subfeature(
+    tmp_path,
+):
+    """Guard preservation on the reuse path: a cached chunk output with
+    NEITHER marker NOR header evidence for its expected subfeature is
+    REJECTED (returns None → recompile), exactly as before the normalizer."""
+    feature = SimpleNamespace(id="feat-reuse-dropped", metadata={})
+    output_path = tmp_path / "compile-intermediate-prd-chunk-7.md"
+    output_path.write_text("stub with no provenance\n", encoding="utf-8")
+
+    class _Artifacts:
+        def __init__(self):
+            self.store = {}
+
+        async def get(self, key, *, feature):
+            del feature
+            return self.store.get(key, "")
+
+        async def put(self, key, value, *, feature):
+            del feature
+            self.store[key] = value
+
+    runner = SimpleNamespace(artifacts=_Artifacts())
+    result = await _compile_piece_reuse(
+        runner,
+        feature,
+        artifact_prefix="prd-chunk-7",
+        piece_slug="cluster-def456",
+        src_digest="cafebabe",
+        output_path=output_path,
+        sources_text="## Subfeature: Amber (amber-delegated-writeback)\n\nbody\n",
+        stage_label="cluster-7",
+        real_slugs={"amber-delegated-writeback"},
+        expected_slugs={"amber-delegated-writeback"},
+    )
+    assert result is None
+    assert not runner.artifacts.store, "no adoption marker for a rejected piece"
+
+
+@pytest.mark.asyncio
+async def test_compile_artifacts_normalizes_verbatim_single_sf_cluster_copy(
+    monkeypatch, tmp_path
+):
+    """End-to-end cycle-13 reproduction through compile_artifacts: raw SF
+    sources carry NO `<!-- SF: -->` markers (production-realistic), and the
+    cluster stage copies its single-SF source bundle VERBATIM (header-form
+    provenance only — the compiler prompt's old escape hatch). Before the fix
+    this hard-raised at cluster-1 with out=[]; with the normalizer the compile
+    completes, the on-disk chunk intermediates carry injected markers, and the
+    final union preserves all subfeature provenance."""
+    monkeypatch.setattr(
+        "iriai_build_v2.workflows._common._helpers.COMPILE_HIERARCHICAL_THRESHOLD", 500
+    )
+    monkeypatch.setattr(
+        "iriai_build_v2.workflows._common._helpers.COMPILE_CLUSTER_TARGET_BYTES", 300
+    )
+    slugs = ("accounts", "billing", "reports")
+    feature = SimpleNamespace(id="feat-verbatim-cluster", metadata={})
+    mirror = _TestMirror(tmp_path / "features")
+    decomposition = SubfeatureDecomposition(
+        subfeatures=[
+            Subfeature(id=f"SF-{i + 1}", slug=slug, name=slug.title(), description=slug)
+            for i, slug in enumerate(slugs)
+        ],
+        edges=[],
+        complete=True,
+    )
+    broad_text = "broad\n" * 30
+    # Production-realistic raw SF sources: NO `<!-- SF: -->` comments.
+    sf_source = {slug: f"intro for {slug}\n\n" + ("body line\n" * 30) for slug in slugs}
+
+    class _Artifacts:
+        async def get(self, key: str, *, feature):
+            del feature
+            values = {
+                "plan:broad": broad_text,
+                "decomposition": decomposition.model_dump_json(indent=2),
+            }
+            for slug in slugs:
+                values[f"plan:{slug}"] = sf_source[slug]
+            return values.get(key, "")
+
+    async def _fake_run(task, feature_, phase_name):
+        del feature_, phase_name
+        paths = re.findall(r"`([^`]+)`", task.prompt)
+        assert paths
+        source_path = Path(paths[0])
+        out_path = Path(paths[-1])
+        source_text = source_path.read_text(encoding="utf-8")
+        stage_match = re.search(r"Stage: ([^\n]+)", task.prompt)
+        stage = stage_match.group(1) if stage_match else "per-bundle"
+        if stage.startswith("cluster-"):
+            # The defect: verbatim copy of the single source bundle —
+            # `## Subfeature: {name} ({slug})` header survives, no comment.
+            out_path.write_text(source_text, encoding="utf-8")
+            return None
+        # Regroup / final: faithful echo of every marker found in sources.
+        markers = re.findall(
+            r"<!--\s*SF:\s*([A-Za-z0-9][A-Za-z0-9_-]*)", source_text
+        )
+        body = "compiled line\n" * 6
+        for slug in dict.fromkeys(markers):
+            body += f"<!-- SF: {slug} -->\n"
+        out_path.write_text(body, encoding="utf-8")
+        return None
+
+    runner = SimpleNamespace(
+        artifacts=_Artifacts(),
+        services={"artifact_mirror": mirror},
+        run=_fake_run,
+    )
+
+    compiled = await compile_artifacts(
+        runner,
+        feature,
+        "plan-review",
+        compiler_actor=lead_architect_reviewer,
+        decomposition=decomposition,
+        artifact_prefix="plan",
+        broad_key="plan:broad",
+        final_key="plan",
+    )
+    # All three subfeature markers survive into the final union.
+    for slug in slugs:
+        assert f"<!-- SF: {slug} -->" in compiled
+    # The on-disk chunk intermediates were normalized in place.
+    feature_dir = Path(mirror.feature_dir(feature.id))
+    chunk_files = sorted(feature_dir.glob("compile-intermediate-plan-chunk-*.md"))
+    assert chunk_files, "hierarchical path must have produced chunk intermediates"
+    marked = "".join(p.read_text(encoding="utf-8") for p in chunk_files)
+    for slug in slugs:
+        assert f"<!-- SF: {slug} -->" in marked
 
 
 @pytest.mark.asyncio

@@ -15,7 +15,7 @@ You merge per-subfeature planning artifacts into a single compiled document. You
 
 3. **Preserve citations.** Every citation from every subfeature artifact MUST be preserved in the compiled output. Do not strip citation metadata.
 
-4. **Add subfeature provenance.** Each section should indicate which subfeature it originated from, using a comment like `<!-- SF: visual-workflow-canvas -->` or by including the subfeature name in the section header.
+4. **Add subfeature provenance.** Each section MUST indicate which subfeature it originated from using an HTML comment in exactly this format: `<!-- SF: {slug} -->` (e.g. `<!-- SF: visual-workflow-canvas -->`). This comment marker is MANDATORY for every source subfeature — a section header containing the subfeature name is NOT a substitute, and the marker is required even when your output is a verbatim copy of a single source bundle. Preserve every existing `<!-- SF: -->` marker verbatim; never drop or rewrite them.
 
 5. **Merge overlapping content.** If two subfeatures define the same data entity or share a journey step, merge them — but preserve all fields from both definitions. When in doubt, keep both versions with a note about the overlap.
 

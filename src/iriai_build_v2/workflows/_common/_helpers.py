@@ -2129,6 +2129,52 @@ def _count_cmp_body_headers(text: str) -> int:
     return len(_CMP_BODY_HEADER_RE.findall(text or ""))
 
 
+def _inject_missing_sf_markers(
+    compiled_text: str,
+    *,
+    expected_slugs: set[str],
+) -> tuple[str, list[str]]:
+    """Normalize header-form subfeature provenance into `<!-- SF: -->` markers.
+
+    The compiler role prompt historically sanctioned TWO provenance
+    spellings — the `<!-- SF: {slug} -->` comment OR "the subfeature name in
+    the section header" — but the completeness guard only recognizes the
+    comment form (`_SF_MARKER_RE`).  When a cluster chunk contains a single
+    source bundle the agent may copy it verbatim, which carries the
+    `## Subfeature: {name} ({slug})` header emitted by
+    ``_render_source_bundle`` but no comment, and the guard then fails with
+    `out=[]` even though the content is complete (observed: kaya cycle-13
+    prd-chunk-7 / design-chunk-3 / system-design-chunk-4).
+
+    This helper deterministically converts the sanctioned header form into
+    the canonical comment form.  Injection is EVIDENCE-GATED: a marker is
+    added for a slug ONLY when a markdown header line containing `({slug})`
+    is verifiably present in the compiled output.  A truncated output that
+    genuinely dropped the subfeature has no such header, so nothing is
+    injected and ``_assert_compile_complete`` still hard-raises — guard
+    semantics are unchanged; this only rewrites one sanctioned provenance
+    spelling into the other.
+
+    Returns ``(normalized_text, injected_slugs)``; ``injected_slugs`` is
+    empty when the text already satisfies the guard's marker form (or when
+    no header evidence exists).
+    """
+    present = _distinct_sf_markers(compiled_text)
+    injected: list[str] = []
+    text = compiled_text or ""
+    for slug in sorted(set(expected_slugs) - present):
+        header_re = re.compile(
+            r"(?m)^(#{1,6}[^\n]*\(" + re.escape(slug) + r"\)[^\n]*)$"
+        )
+        match = header_re.search(text)
+        if match is None:
+            continue  # no surviving header evidence → leave it to the guard
+        insert_at = match.end(1)
+        text = text[:insert_at] + f"\n\n<!-- SF: {slug} -->" + text[insert_at:]
+        injected.append(slug)
+    return text, injected
+
+
 def _assert_compile_complete(
     *,
     sources_text: str,
@@ -2395,6 +2441,17 @@ async def _compile_piece_reuse(
     marker_key = f"compile-piece:{artifact_prefix}:{piece_slug}:{src_digest}"
     marker = await runner.artifacts.get(marker_key, feature=feature)
 
+    # Normalize header-form provenance into `<!-- SF: -->` markers before
+    # validating (chunk stage only — ``expected_slugs`` is provided there).
+    # Evidence-gated, so a cached file that genuinely dropped a subfeature
+    # still fails the guard below and is recompiled.
+    injected_slugs: list[str] = []
+    if expected_slugs is not None:
+        cached, injected_slugs = _inject_missing_sf_markers(
+            cached,
+            expected_slugs=set(expected_slugs) & set(real_slugs),
+        )
+
     # Content-validation runs in BOTH paths (it is the safety net):
     try:
         _assert_compile_complete(
@@ -2417,6 +2474,17 @@ async def _compile_piece_reuse(
             marker_key,
         )
         return None
+
+    if injected_slugs:
+        # Persist the normalized text so the on-disk intermediate matches
+        # what downstream stages consume (only done after validation passed).
+        output_path.write_text(cached, encoding="utf-8")
+        logger.warning(
+            "compile reuse %s: normalized header-form provenance into "
+            "<!-- SF: --> markers for %s on cached output",
+            marker_key,
+            injected_slugs,
+        )
 
     if not marker:
         # Path 2: retroactively adopt a pre-resumability output (the current
@@ -2564,7 +2632,12 @@ async def compile_artifacts(
                     "- Preserve ALL detail from every source bundle\n"
                     "- Re-number IDs globally (REQ-1 through REQ-N, etc.)\n"
                     "- Preserve all citations\n"
-                    "- Add subfeature provenance markers\n"
+                    "- Add an HTML-comment provenance marker of exactly the "
+                    "form '<!-- SF: {slug} -->' for EVERY source subfeature, "
+                    "using the subfeature slug. This is MANDATORY even when "
+                    "the output is identical to a single source bundle; a "
+                    "section header naming the subfeature does NOT count. "
+                    "Preserve all existing '<!-- SF: -->' markers verbatim\n"
                     "- Merge overlapping content, keeping all fields\n\n"
                     f"Stage: {stage_label}\n"
                     f"**Read the source artifacts from:** `{sources_path}`\n"
@@ -2650,6 +2723,29 @@ async def compile_artifacts(
                     output_path=chunk_output_path,
                     source_count=len(chunk),
                 )
+                # Normalize header-form provenance into the canonical
+                # `<!-- SF: -->` comment BEFORE the guard.  Evidence-gated:
+                # only slugs whose `({slug})` header survives in the output
+                # get a marker, so a genuinely dropped subfeature still
+                # fails the guard below (kaya cycle-13: single-SF chunks
+                # copied verbatim carried the header but no comment).
+                intermediate_text, injected_slugs = _inject_missing_sf_markers(
+                    intermediate_text,
+                    expected_slugs=expected & real_slugs,
+                )
+                if injected_slugs:
+                    logger.warning(
+                        "compile %s-chunk-%d (stage=cluster-%d): normalized "
+                        "header-form provenance into <!-- SF: --> markers "
+                        "for %s (compiler omitted the comment form)",
+                        artifact_prefix,
+                        idx,
+                        idx,
+                        injected_slugs,
+                    )
+                    chunk_output_path.write_text(
+                        intermediate_text, encoding="utf-8"
+                    )
                 # Per-cluster completeness guard (at the drop's ORIGIN).  Raw
                 # per-SF sources carry no `<!-- SF: -->` comments yet (the
                 # compiler emits them), so key the survival check on the KNOWN
