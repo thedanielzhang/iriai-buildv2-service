@@ -148,20 +148,40 @@ def _offload_if_large(
     )
 
 
-def _bounded_context_item_text(text: str, *, label: str, key: str) -> str:
-    """Return bounded context item text while preserving a retrievable signal."""
+def _bounded_context_item_text(
+    text: str,
+    *,
+    label: str,
+    key: str,
+    source_path: str | None = None,
+) -> str:
+    """Return bounded context item text while preserving a retrievable signal.
+
+    When *source_path* is provided (artifact-backed items), the truncation
+    banner embeds the absolute path of the full on-disk mirror so reviewers
+    can Read the omitted middle instead of guessing where the source lives.
+    """
     limit = max(10_000, CONTEXT_PACKAGE_ITEM_MAX_CHARS)
     if len(text) <= limit:
         return text
     head_budget = max(4_000, limit // 2)
     tail_budget = max(4_000, limit - head_budget - 1_500)
     omitted = len(text) - head_budget - tail_budget
+    if source_path:
+        retrieval_hint = (
+            f"the full untruncated artifact is on disk at `{source_path}` — "
+            "Read that file when exact historical detail is required."
+        )
+    else:
+        retrieval_hint = (
+            "use the cited source artifact or full archive pointer when exact "
+            "historical detail is required."
+        )
     return (
         f"# {label} (compacted)\n\n"
         f"Context item `{key}` was {len(text)} chars and exceeded the "
         f"{limit} char context-package cap. The middle {omitted} chars were "
-        "omitted from this prompt transport file; use the cited source artifact "
-        "or full archive pointer when exact historical detail is required.\n\n"
+        f"omitted from this prompt transport file; {retrieval_hint}\n\n"
         "## Head\n\n"
         f"{text[:head_budget].rstrip()}\n\n"
         "## Tail\n\n"
@@ -399,10 +419,21 @@ async def build_context_package(
                     file_stem=file_stem,
                     item=item,
                 )
+                # Resolve the full-mirror path so the truncation banner (when
+                # the cap trips) points reviewers at the untruncated source.
+                staging_path, final_path = _artifact_paths(
+                    runner, feature, item.artifact_key
+                )
+                source_path: str | None = None
+                for candidate in (final_path, staging_path):
+                    if candidate is not None and candidate.exists():
+                        source_path = str(candidate.resolve())
+                        break
                 bounded = _bounded_context_item_text(
                     text.rstrip(),
                     label=item.label,
                     key=item.key,
+                    source_path=source_path,
                 )
                 _write_context_text(item_path, bounded.rstrip() + "\n")
                 path = str(item_path)

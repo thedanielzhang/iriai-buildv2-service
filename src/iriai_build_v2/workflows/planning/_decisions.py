@@ -22,6 +22,54 @@ from ...models.outputs import (
 from ...services.markdown import to_markdown
 from ._control import load_planning_control, persist_planning_control
 
+# Full decision-citation grammar. Canonical ledger record ids are ``D-N``,
+# but reviewers also cite alias families that survive only as the leading
+# token of a canonical record's statement (e.g. D-250's statement begins
+# ``DEC-PR1-03 — ...``). Families verified against the production ledger
+# (kaya 5b280bb4 decisions.md): DD-30 / DD-FRAME-02 / DD-AUDIT, GF-002,
+# DEC-PR12-01 / DEC-PR14-AUTH, D-FRAME-02, D-CANON-04, CHK-S1-CORE / CHK-1.
+# CHK/DD alpha segments are uppercase-only on purpose: the ledger contains
+# adjectival noise such as ``CHK-gated`` / ``CHK-S1-CORE-gated`` that must
+# not be extracted as citations.
+DECISION_CITATION_PATTERN = re.compile(
+    r"\b("
+    r"D-\d+"
+    r"|DD-[A-Z0-9]+(?:-[A-Z0-9]+)*"
+    r"|GF-\d+"
+    r"|DEC-PR\d+-(?:\d+[A-Za-z]?|[A-Z][A-Z0-9]*)"
+    r"|D-FRAME-[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*"
+    r"|D-CANON-\d+"
+    r"|CHK-[A-Z0-9]+(?:-[A-Z0-9]+)*"
+    r")\b"
+)
+
+_CANONICAL_DECISION_ID_PATTERN = re.compile(r"D-\d+$")
+
+
+def extract_decision_citation_ids(text: str) -> list[str]:
+    """Extract every decision citation (canonical ``D-N`` plus alias families)."""
+    return DECISION_CITATION_PATTERN.findall(text)
+
+
+def decision_statement_alias(statement: str) -> str | None:
+    """Return the leading citation token of a decision statement, if any.
+
+    Ledger statements frequently begin with the citation id used by the source
+    review (``DEC-PR1-03 — server-side ...``, ``DD-30: ...``) while the
+    canonical record id is a renumbered ``D-N``. That leading token is the
+    alias reviewers cite; canonical ``D-N`` leads are excluded because those
+    resolve through the record id itself.
+    """
+    head = statement.lstrip().lstrip("*_` ")
+    match = DECISION_CITATION_PATTERN.match(head)
+    if match is None:
+        return None
+    token = match.group(1)
+    if _CANONICAL_DECISION_ID_PATTERN.fullmatch(token):
+        return None
+    return token
+
+
 _DEFAULT_APPLIES_TO = ["prd", "design", "plan", "system-design", "dag"]
 _DECISION_SECTION_NAMES = {
     "decision log",
@@ -465,7 +513,7 @@ def _normalized_decision_key(statement: str) -> str:
 
 
 def _extract_referenced_decision_ids(statement: str) -> list[str]:
-    return re.findall(r"\bD-\d+\b", statement)
+    return extract_decision_citation_ids(statement)
 
 
 def _strip_supersession_prefix(statement: str) -> str:

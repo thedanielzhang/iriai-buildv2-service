@@ -59,6 +59,8 @@ from ..._common._tasks import HostedInterview
 from .._decisions import (
     GLOBAL_DECISIONS_KEY,
     artifact_applies_to,
+    decision_statement_alias,
+    extract_decision_citation_ids,
     parse_decision_ledger,
     rebuild_canonical_decisions,
     refresh_decision_ledger,
@@ -623,28 +625,45 @@ async def _build_review_decision_pack(
 
     for artifact_key in target_keys:
         artifact_text = await runner.artifacts.get(artifact_key, feature=feature) or ""
-        candidate_ids.update(re.findall(r"\bD-\d+\b", artifact_text))
+        candidate_ids.update(extract_decision_citation_ids(artifact_text))
     for text in supporting_texts or []:
-        candidate_ids.update(re.findall(r"\bD-\d+\b", text))
+        candidate_ids.update(extract_decision_citation_ids(text))
 
     excluded_ids: set[str] = set()
     for ledger_key in excluded_ledger_keys or []:
         ledger_text = await runner.artifacts.get(ledger_key, feature=feature) or ""
-        excluded_ids.update(re.findall(r"\bD-\d+\b", ledger_text))
+        excluded_ids.update(extract_decision_citation_ids(ledger_text))
     candidate_ids.difference_update(excluded_ids)
 
     selected: list[str] = []
     if candidate_ids:
+        selected_record_ids: set[str] = set()
+        # Alias families (DEC-PR*, DD-*, GF-*, D-FRAME-*, D-CANON-*, CHK-*)
+        # have no DecisionRecord of their own — they survive only as the
+        # leading token of a canonical D-N record's statement. Index those
+        # leading tokens so alias citations resolve to their records.
+        alias_index: dict[str, Any] = {}
         for ledger_text in (compiled_text, global_text):
             if not ledger_text:
                 continue
             ledger = parse_decision_ledger(ledger_text)
             for decision in ledger.decisions:
+                alias = decision_statement_alias(decision.statement)
+                if alias and alias not in alias_index:
+                    alias_index[alias] = decision
                 if decision.id in candidate_ids:
-                    selected.append(f"- {decision.id}: {decision.statement}")
                     candidate_ids.discard(decision.id)
+                    if decision.id not in selected_record_ids:
+                        selected_record_ids.add(decision.id)
+                        selected.append(f"- {decision.id}: {decision.statement}")
             if not candidate_ids:
                 break
+        for alias in sorted(candidate_ids & alias_index.keys()):
+            decision = alias_index[alias]
+            candidate_ids.discard(alias)
+            if decision.id not in selected_record_ids:
+                selected_record_ids.add(decision.id)
+                selected.append(f"- {decision.id}: {decision.statement}")
 
     lines = ["# Referenced Decisions", ""]
     if selected:

@@ -18413,3 +18413,257 @@ async def test_convert_and_host_union_falls_through_to_llm_when_sidecars_missing
     assert ran["called"] is True
     merged = SystemDesign.model_validate(json.loads(result))
     assert [s.id for s in merged.services] == ["svc-llm"]
+
+
+# ── Decision-pack alias-family citation resolution (plan review) ─────────────
+
+
+def test_extract_decision_citation_ids_covers_alias_families_and_rejects_noise():
+    from iriai_build_v2.workflows.planning._decisions import extract_decision_citation_ids
+
+    text = (
+        "Cites D-250, DEC-PR12-01, DEC-PR14-AUTH, DD-30/DD-31, DD-FRAME-02, "
+        "GF-002, D-FRAME-02, D-CANON-04, CHK-S1-CORE and CHK-1. "
+        "Adjectival noise: CHK-gated columns, CHK-annotated, CHK-confirmed, "
+        "persistence is CHK-DUE-DATE-gated."
+    )
+    ids = set(extract_decision_citation_ids(text))
+
+    assert {
+        "D-250",
+        "DEC-PR12-01",
+        "DEC-PR14-AUTH",
+        "DD-30",
+        "DD-31",
+        "DD-FRAME-02",
+        "GF-002",
+        "D-FRAME-02",
+        "D-CANON-04",
+        "CHK-S1-CORE",
+        "CHK-1",
+    } <= ids
+    # Lowercase adjectival CHK-* uses must not be extracted as citations.
+    assert "CHK-gated" not in ids
+    assert "CHK-annotated" not in ids
+    assert "CHK-confirmed" not in ids
+    assert "CHK-DUE-DATE-gated" not in ids
+    # CHK-DUE-DATE-gated still yields the real id prefix it gates on.
+    assert "CHK-DUE-DATE" in ids
+
+
+@pytest.mark.asyncio
+async def test_plan_review_decision_pack_resolves_alias_family_citations():
+    from iriai_build_v2.workflows.planning.phases.plan_review import (
+        _build_review_decision_pack,
+    )
+
+    feature = SimpleNamespace(id="feat-alias-pack", metadata={})
+    compiled_ledger = _decision_ledger_text(
+        DecisionRecord(
+            id="D-250",
+            statement=(
+                "DEC-PR1-03 — server-side no-token-no-write rejection "
+                "(REQ-9 server half) is an S1-owned MUST blocking dependency."
+            ),
+            source_phase="plan-review",
+        ),
+        DecisionRecord(
+            id="D-167",
+            statement="DD-30: Amber server-side actor derivation is mandatory.",
+            source_phase="plan-review",
+        ),
+        DecisionRecord(
+            id="D-5",
+            statement="Plain decision without an alias lead.",
+            source_phase="broad",
+        ),
+    )
+    global_ledger = _decision_ledger_text(
+        DecisionRecord(
+            id="D-247",
+            statement="GF-002 — global fix: share-link OTP stays the default.",
+            source_phase="plan-review",
+        ),
+    )
+    store = {
+        "decisions": compiled_ledger,
+        "decisions:global": global_ledger,
+        "plan:accounts": (
+            "Plan cites DEC-PR1-03 and D-250 (same record twice), DD-30, "
+            "GF-002, D-5, and the genuinely-undefined CHK-S1-CORE."
+        ),
+    }
+
+    class _Artifacts:
+        async def get(self, key, *, feature):
+            del feature
+            return store.get(key, "")
+
+    runner = SimpleNamespace(artifacts=_Artifacts())
+
+    pack = await _build_review_decision_pack(
+        runner,
+        feature,
+        target_keys=["plan:accounts"],
+    )
+
+    # Alias-family citations resolve through the statement leading tokens.
+    assert "- D-250: DEC-PR1-03 — server-side no-token-no-write rejection" in pack
+    assert "- D-167: DD-30: Amber server-side actor derivation is mandatory." in pack
+    assert "- D-247: GF-002 — global fix: share-link OTP stays the default." in pack
+    # Exact canonical-id citations keep working.
+    assert "- D-5: Plain decision without an alias lead." in pack
+    # Citing both the alias and the canonical id yields exactly one entry.
+    assert pack.count("- D-250:") == 1
+    # Genuinely-undefined ids (alias families included) reach the Missing list.
+    assert "## Missing Decision IDs" in pack
+    missing_section = pack.split("## Missing Decision IDs", 1)[1]
+    assert "- CHK-S1-CORE" in missing_section
+    # Resolved citations must not be reported missing.
+    assert "DEC-PR1-03" not in missing_section
+    assert "DD-30" not in missing_section
+    assert "GF-002" not in missing_section
+    assert "D-250" not in missing_section
+
+
+@pytest.mark.asyncio
+async def test_plan_review_decision_pack_reports_only_missing_when_nothing_resolves():
+    from iriai_build_v2.workflows.planning.phases.plan_review import (
+        _build_review_decision_pack,
+    )
+
+    feature = SimpleNamespace(id="feat-alias-missing", metadata={})
+    store = {
+        "decisions": _decision_ledger_text(
+            DecisionRecord(id="D-1", statement="Unrelated decision.", source_phase="broad"),
+        ),
+        "decisions:global": "",
+        "plan:accounts": "Plan cites DEC-PR99-01 and D-CANON-77 only.",
+    }
+
+    class _Artifacts:
+        async def get(self, key, *, feature):
+            del feature
+            return store.get(key, "")
+
+    runner = SimpleNamespace(artifacts=_Artifacts())
+
+    pack = await _build_review_decision_pack(
+        runner,
+        feature,
+        target_keys=["plan:accounts"],
+    )
+
+    assert "_No additional non-target decisions were explicitly referenced._" in pack
+    assert "## Missing Decision IDs" in pack
+    assert "- DEC-PR99-01" in pack
+    assert "- D-CANON-77" in pack
+
+
+# ── Context-package truncation banner mirror-path pointer ────────────────────
+
+
+@pytest.mark.asyncio
+async def test_context_package_truncation_banner_embeds_mirror_path(tmp_path, monkeypatch):
+    from iriai_build_v2.workflows._common import _helpers as helpers_module
+
+    # 10_000 is the hard floor inside _bounded_context_item_text.
+    monkeypatch.setattr(helpers_module, "CONTEXT_PACKAGE_ITEM_MAX_CHARS", 10_000)
+
+    feature = SimpleNamespace(id="feat-trunc-banner", metadata={})
+    mirror = _TestMirror(tmp_path / "features")
+    big_text = "\n".join(
+        f"line {index:05d} of the oversized accounts plan artifact body"
+        for index in range(600)
+    )
+    assert len(big_text) > 10_000
+    mirror_path = mirror.write_artifact(feature.id, "plan:accounts", big_text)
+
+    store = {"plan:accounts": big_text}
+
+    class _Artifacts:
+        async def get(self, key, *, feature):
+            del feature
+            return store.get(key, "")
+
+    runner = SimpleNamespace(
+        artifacts=_Artifacts(),
+        services={"artifact_mirror": mirror},
+    )
+
+    package = await build_context_package(
+        runner,
+        feature,
+        title="Truncation Banner",
+        file_stem="trunc-banner",
+        intro_lines=["intro"],
+        items=[
+            ContextPackageItem(
+                key="plan-accounts",
+                label="Plan — accounts",
+                group="Target",
+                artifact_key="plan:accounts",
+            ),
+            ContextPackageItem(
+                key="inline-blob",
+                label="Inline blob",
+                group="Supporting Context",
+                content=big_text,
+            ),
+        ],
+    )
+
+    assert package is not None
+
+    artifact_item_text = Path(package.item_paths["plan-accounts"]).read_text(encoding="utf-8")
+    assert "(compacted)" in artifact_item_text
+    # The banner must point at the absolute full-mirror path of the artifact.
+    assert str(mirror_path.resolve()) in artifact_item_text
+    assert "Read that file when exact historical detail is required." in artifact_item_text
+
+    # Non-artifact (inline content) items keep the legacy banner without a path.
+    inline_item_text = Path(package.item_paths["inline-blob"]).read_text(encoding="utf-8")
+    assert "(compacted)" in inline_item_text
+    assert "use the cited source artifact or full archive pointer" in inline_item_text
+    assert str(mirror_path.resolve()) not in inline_item_text
+
+
+@pytest.mark.asyncio
+async def test_context_package_small_artifact_items_have_no_truncation_banner(tmp_path):
+    feature = SimpleNamespace(id="feat-no-trunc", metadata={})
+    mirror = _TestMirror(tmp_path / "features")
+    small_text = "Small accounts plan body."
+    mirror.write_artifact(feature.id, "plan:accounts", small_text)
+
+    store = {"plan:accounts": small_text}
+
+    class _Artifacts:
+        async def get(self, key, *, feature):
+            del feature
+            return store.get(key, "")
+
+    runner = SimpleNamespace(
+        artifacts=_Artifacts(),
+        services={"artifact_mirror": mirror},
+    )
+
+    package = await build_context_package(
+        runner,
+        feature,
+        title="No Truncation",
+        file_stem="no-trunc",
+        intro_lines=["intro"],
+        items=[
+            ContextPackageItem(
+                key="plan-accounts",
+                label="Plan — accounts",
+                group="Target",
+                artifact_key="plan:accounts",
+            ),
+        ],
+    )
+
+    assert package is not None
+    item_text = Path(package.item_paths["plan-accounts"]).read_text(encoding="utf-8")
+    assert "(compacted)" not in item_text
+    assert small_text in item_text
