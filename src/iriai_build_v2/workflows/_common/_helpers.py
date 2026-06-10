@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import datetime as _dt
 import hashlib
 import logging
 import os
@@ -2729,11 +2730,18 @@ async def compile_artifacts(
 
         # Reuse probe: prefer the new scratch location; fall back to a legacy
         # .iriai intermediate written by an earlier in-process (codex) run so
-        # resumed runs keep their compile-piece reuse.
+        # resumed runs keep their compile-piece reuse.  A legacy file OLDER
+        # than its same-stage compile-sources file is from a PREVIOUS compile
+        # era (different bundle composition) and must not be probed — the
+        # structural completeness guard inside _compile_piece_reuse can pass
+        # on wrong-era content and retroactively adopt it under the current
+        # digest (see _legacy_compile_output_is_stale).
         def _reuse_probe_path(scratch_path: Path, legacy_path: Path) -> Path:
             if scratch_path.exists():
                 return scratch_path
-            if legacy_path.exists():
+            if legacy_path.exists() and not _legacy_compile_output_is_stale(
+                legacy_path
+            ):
                 return legacy_path
             return scratch_path
 
@@ -3932,6 +3940,70 @@ def _compile_scratch_actor(actor: Any, scratch_dir: Path) -> Any:
     )
 
 
+# Filename pair for one compile stage, side by side in the feature's .iriai
+# dir (production-verified): the orchestrator writes
+# ``compile-sources-<kind>-<stage>.md`` immediately BEFORE dispatching the
+# agent that produces ``compile-intermediate-<kind>-<stage>.md``.
+_COMPILE_INTERMEDIATE_FILE_PREFIX = "compile-intermediate-"
+_COMPILE_SOURCES_FILE_PREFIX = "compile-sources-"
+
+
+def _compile_sources_path_for_intermediate(intermediate_path: Path) -> Path | None:
+    """Same-stage ``compile-sources-*`` sibling of a compile intermediate.
+
+    Returns None when the filename does not follow the
+    ``compile-intermediate-<kind>-<stage>.md`` convention (e.g. the
+    final-merge legacy path, which is the final artifact file itself).
+    """
+    name = intermediate_path.name
+    if not name.startswith(_COMPILE_INTERMEDIATE_FILE_PREFIX):
+        return None
+    return intermediate_path.with_name(
+        _COMPILE_SOURCES_FILE_PREFIX + name[len(_COMPILE_INTERMEDIATE_FILE_PREFIX):]
+    )
+
+
+def _legacy_compile_output_is_stale(legacy_output_path: Path) -> bool:
+    """True iff a legacy ``.iriai`` compile intermediate predates its stage's
+    sources file — i.e. it was produced by a PREVIOUS compile era, possibly
+    with a DIFFERENT bundle composition, and must be treated as MISSING.
+
+    Rationale (kaya 5b280bb4 resume35): the plan-finalbundle-4 agent died
+    mid-task without writing the scratch output, and the legacy fallback
+    adopted a two-day-old intermediate from an earlier compile era with a
+    different bundle composition — the completeness guard then failed on
+    ghost content, masking the real failure (agent produced nothing).  The
+    orchestrator rewrites the ``compile-sources-*`` file for a stage
+    immediately before dispatching that stage's agent, so any legitimate
+    same-era legacy output is NEWER than its sources file; an OLDER one can
+    only come from a previous era.  No sources file (or no derivable name)
+    → freshness cannot be judged → keep current adopt behavior.
+    """
+    sources_path = _compile_sources_path_for_intermediate(legacy_output_path)
+    if sources_path is None or not sources_path.exists():
+        return False
+    try:
+        legacy_mtime = legacy_output_path.stat().st_mtime
+        sources_mtime = sources_path.stat().st_mtime
+    except OSError:
+        # Race (file vanished between exists() and stat()) — cannot judge
+        # freshness; keep current behavior rather than inventing staleness.
+        return False
+    if legacy_mtime >= sources_mtime:
+        return False
+    logger.warning(
+        "compile: SKIPPING STALE legacy intermediate %s (mtime %s) — older "
+        "than its same-stage sources file %s (mtime %s). It was produced by "
+        "a PREVIOUS compile era (possibly a different bundle composition) "
+        "and is treated as MISSING.",
+        legacy_output_path,
+        _dt.datetime.fromtimestamp(legacy_mtime).isoformat(timespec="seconds"),
+        sources_path,
+        _dt.datetime.fromtimestamp(sources_mtime).isoformat(timespec="seconds"),
+    )
+    return True
+
+
 def _read_compile_output(
     output_path: Path,
     legacy_output_path: Path | None,
@@ -3945,14 +4017,18 @@ def _read_compile_output(
     ``.iriai`` path can only hold output from an OLDER in-process (codex)
     attempt and may be stale.  The legacy fallback exists for resume
     backward-compat: an interrupted run whose codex member already wrote an
-    intermediate at the old path must not lose it.  Missing/empty BOTH paths
-    fails loud — never silently degrade.
+    intermediate at the old path must not lose it.  A legacy file OLDER than
+    its same-stage ``compile-sources-*`` file is from a previous compile era
+    (see ``_legacy_compile_output_is_stale``) and is treated as MISSING.
+    Missing/empty BOTH paths fails loud — never silently degrade.
     """
     candidates: list[Path] = [output_path]
     if legacy_output_path is not None and legacy_output_path != output_path:
         candidates.append(legacy_output_path)
     for candidate in candidates:
         if not candidate.exists():
+            continue
+        if candidate is not output_path and _legacy_compile_output_is_stale(candidate):
             continue
         text = candidate.read_text(encoding="utf-8").strip()
         if text:
@@ -3969,7 +4045,8 @@ def _read_compile_output(
     raise RuntimeError(
         f"Compiler did not write output to {output_path}"
         + (
-            f" (legacy path {legacy_output_path} also missing)"
+            f" (legacy path {legacy_output_path} also missing or STALE — "
+            "older than its same-stage compile-sources file)"
             if legacy_output_path is not None and legacy_output_path != output_path
             else ""
         )

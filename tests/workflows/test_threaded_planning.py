@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import re
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -104,6 +105,8 @@ from iriai_build_v2.workflows._common._helpers import (
     _apply_patches,
     _assert_compile_complete,
     _compile_piece_reuse,
+    _legacy_compile_output_is_stale,
+    _read_compile_output,
     _inject_missing_sf_markers,
     _find_section,
     _parse_markdown_sections,
@@ -12483,6 +12486,180 @@ async def test_compile_artifacts_fails_loud_when_no_output_at_either_path(
     runner = SimpleNamespace(
         artifacts=artifacts, services={"artifact_mirror": mirror}, run=_fake_run
     )
+    with pytest.raises(RuntimeError, match="did not write output"):
+        await compile_artifacts(
+            runner,
+            feature,
+            "plan-review",
+            compiler_actor=lead_architect_reviewer,
+            decomposition=decomposition,
+            artifact_prefix="plan",
+            broad_key="plan:broad",
+            final_key="plan",
+        )
+
+
+# ── Legacy-intermediate freshness gate (kaya 5b280bb4 resume35) ────────────
+# A legacy .iriai compile intermediate OLDER than its same-stage
+# compile-sources file was produced by a PREVIOUS compile era (possibly a
+# different bundle composition) and must be treated as MISSING — never
+# evaluated as ghost content by the completeness guard.
+
+
+def _legacy_freshness_fixture(tmp_path, *, stage="plan-finalbundle-4"):
+    """(scratch_path, legacy_path, sources_path) for one compile stage, with
+    the legacy intermediate and its same-stage sources file side by side in
+    the feature dir (the production .iriai layout)."""
+    feature_dir = tmp_path / "features" / "feat"
+    scratch_dir = tmp_path / "scratch" / "feat"
+    feature_dir.mkdir(parents=True, exist_ok=True)
+    scratch_dir.mkdir(parents=True, exist_ok=True)
+    name = f"compile-intermediate-{stage}.md"
+    return (
+        scratch_dir / name,
+        feature_dir / name,
+        feature_dir / f"compile-sources-{stage}.md",
+    )
+
+
+def test_read_compile_output_treats_stale_legacy_intermediate_as_missing(
+    tmp_path, caplog
+):
+    """resume35 regression: the agent wrote NOTHING to the scratch path and
+    the legacy file predates the freshly written sources file (two-day-old
+    prior-era bundle). It must be skipped — the fail-loud missing-output
+    error surfaces the REAL failure instead of evaluating ghost content."""
+    scratch, legacy, sources = _legacy_freshness_fixture(tmp_path)
+    legacy.write_text(
+        "<!-- SF: prior-era-bundle -->\nghost content\n", encoding="utf-8"
+    )
+    sources.write_text("current era sources\n", encoding="utf-8")
+    now = time.time()
+    os.utime(legacy, (now - 2 * 86400, now - 2 * 86400))  # the Jun 8 vs Jun 10 gap
+    os.utime(sources, (now, now))
+
+    with caplog.at_level("WARNING"):
+        with pytest.raises(RuntimeError, match="did not write output"):
+            _read_compile_output(scratch, legacy, stage_label="final-bundle-4")
+    warnings = "\n".join(
+        record.getMessage() for record in caplog.records
+    )
+    # Loud warning names the stale file and BOTH mtimes' owners.
+    assert "STALE legacy intermediate" in warnings
+    assert str(legacy) in warnings
+    assert str(sources) in warnings
+
+
+def test_read_compile_output_adopts_legacy_newer_than_sources(tmp_path):
+    """Same-era legacy output (written AFTER the orchestrator wrote the
+    stage's sources file — the legitimate resume backward-compat case) is
+    still adopted exactly as before."""
+    scratch, legacy, sources = _legacy_freshness_fixture(tmp_path)
+    body = "<!-- SF: same-era-bundle -->\nfresh legacy content\n"
+    sources.write_text("current era sources\n", encoding="utf-8")
+    legacy.write_text(body, encoding="utf-8")
+    now = time.time()
+    os.utime(sources, (now - 600, now - 600))
+    os.utime(legacy, (now, now))
+
+    assert (
+        _read_compile_output(scratch, legacy, stage_label="final-bundle-4")
+        == body.strip()
+    )
+
+
+def test_read_compile_output_adopts_legacy_when_no_sources_file(tmp_path):
+    """No same-stage sources file → freshness cannot be judged → current
+    adopt behavior is preserved (stages without sources files unbroken)."""
+    scratch, legacy, sources = _legacy_freshness_fixture(tmp_path)
+    assert not sources.exists()
+    body = "<!-- SF: unjudgeable-bundle -->\nlegacy content\n"
+    legacy.write_text(body, encoding="utf-8")
+    old = time.time() - 2 * 86400
+    os.utime(legacy, (old, old))
+
+    assert (
+        _read_compile_output(scratch, legacy, stage_label="final-bundle-4")
+        == body.strip()
+    )
+
+
+def test_read_compile_output_prefers_scratch_over_stale_legacy(tmp_path):
+    """Scratch output present → the legacy path is never consulted, stale or
+    not (new-path-first invariant untouched)."""
+    scratch, legacy, sources = _legacy_freshness_fixture(tmp_path)
+    scratch_body = "<!-- SF: fresh-bundle -->\nscratch content\n"
+    scratch.write_text(scratch_body, encoding="utf-8")
+    legacy.write_text("ghost content\n", encoding="utf-8")
+    sources.write_text("current era sources\n", encoding="utf-8")
+    now = time.time()
+    os.utime(legacy, (now - 2 * 86400, now - 2 * 86400))
+    os.utime(sources, (now, now))
+
+    assert (
+        _read_compile_output(scratch, legacy, stage_label="final-bundle-4")
+        == scratch_body.strip()
+    )
+
+
+def test_legacy_staleness_gate_ignores_nonconforming_filenames(tmp_path):
+    """The gate only understands compile-intermediate-* names. The final-merge
+    legacy path is the final artifact file itself (e.g. plan.md) — it has no
+    derivable sources sibling and must never be judged stale."""
+    feature_dir = tmp_path / "features" / "feat"
+    feature_dir.mkdir(parents=True)
+    final_artifact = feature_dir / "plan.md"
+    final_artifact.write_text("final artifact\n", encoding="utf-8")
+    # Even with an arbitrary newer compile-sources file in the same dir.
+    (feature_dir / "compile-sources-plan.md").write_text("src\n", encoding="utf-8")
+    old = time.time() - 2 * 86400
+    os.utime(final_artifact, (old, old))
+
+    assert _legacy_compile_output_is_stale(final_artifact) is False
+
+
+@pytest.mark.asyncio
+async def test_compile_artifacts_fails_loud_on_stale_prior_era_legacy(
+    monkeypatch, tmp_path
+):
+    """End-to-end resume35 regression through compile_artifacts: the cluster-1
+    agent dies without writing (usage-cap death), and a PRIOR-ERA legacy
+    intermediate sits at the .iriai path with content that would PASS the
+    completeness guard if adopted. The freshness gate must treat it as
+    missing so the missing-output error names the real failure."""
+    monkeypatch.setenv("IRIAI_COMPILE_INTERMEDIATE_DIR", str(tmp_path / "scratch"))
+    feature, decomposition, runner = _build_hier_compile_runner(
+        tmp_path, final_writer=lambda source_text: source_text  # never reached
+    )
+    monkeypatch.setattr(
+        "iriai_build_v2.workflows._common._helpers.COMPILE_HIERARCHICAL_THRESHOLD", 500
+    )
+    monkeypatch.setattr(
+        "iriai_build_v2.workflows._common._helpers.COMPILE_CLUSTER_TARGET_BYTES", 300
+    )
+
+    # Prior-era legacy intermediate for cluster-1 (guard-passing content for
+    # the chunk's own subfeature), two days older than "now" — the freshly
+    # rewritten compile-sources-plan-chunk-1.md will outdate it.
+    feature_dir = tmp_path / "features" / "feat-compile-guard"
+    feature_dir.mkdir(parents=True, exist_ok=True)
+    legacy = feature_dir / "compile-intermediate-plan-chunk-1.md"
+    legacy.write_text(
+        "<!-- SF: accounts -->\n#### GhostWidget (CMP-1)\nghost era\n",
+        encoding="utf-8",
+    )
+    two_days_ago = time.time() - 2 * 86400
+    os.utime(legacy, (two_days_ago, two_days_ago))
+
+    real_run = runner.run
+
+    async def _run_with_dead_cluster1(task, feature, phase_name):
+        if "Stage: cluster-1" in task.prompt:
+            return None  # agent produced no output at all
+        return await real_run(task, feature, phase_name)
+
+    runner.run = _run_with_dead_cluster1
+
     with pytest.raises(RuntimeError, match="did not write output"):
         await compile_artifacts(
             runner,
