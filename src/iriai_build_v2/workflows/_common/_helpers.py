@@ -218,6 +218,69 @@ def _gate_review_is_approved(review_text: str) -> bool:
     return False
 
 
+def _is_placeholder_gate_review_text(text: str) -> bool:
+    """True when a gate-review artifact holds the empty decision-ledger stub.
+
+    W-11 stub-render defect: hosting's display conversion used to overwrite
+    ``reviews/*-gate-review.md`` with ``# Decision Ledger / _No decisions
+    recorded yet._`` whenever the persisted verdict was JSON, and the next
+    persistence cycle re-ingested that stub into the DB.  Such text is never
+    a real verdict.
+    """
+    from ...services.markdown import is_empty_decision_ledger_text
+
+    return is_empty_decision_ledger_text(text)
+
+
+async def _ensure_gate_verdict_persisted(
+    runner: WorkflowRunner,
+    feature: Feature,
+    *,
+    gate_review_key: str,
+    outcome: Any,
+) -> None:
+    """Backstop: gate_review_key must always hold a readable verdict.
+
+    ``HostedInterview.on_done`` normally persists the reviewer's file (or the
+    structured Envelope JSON), but if the DB row or the mirror file ended up
+    empty / holding a placeholder render, the resume fast-path
+    (``_gate_review_is_approved``) cannot see the verdict and forces a full
+    gate re-review.  This writes the structured verdict JSON
+    (``{"approved": ..., "revision_plan": ...}`` — the shape the JSON-first
+    reader added in 43e5492 parses) wherever placeholder/empty content is
+    found.  Real review content (markdown or richer JSON) is never replaced.
+    """
+    if outcome is None:
+        return
+    try:
+        verdict_json = outcome.model_dump_json(indent=2)
+    except AttributeError:
+        return
+
+    stored = await runner.artifacts.get(gate_review_key, feature=feature)
+    if not (stored or "").strip() or _is_placeholder_gate_review_text(stored):
+        logger.warning(
+            "interview_gate_review: persisted %s was %s — writing structured "
+            "verdict JSON backstop",
+            gate_review_key,
+            "empty" if not (stored or "").strip() else "the empty-ledger placeholder stub",
+        )
+        await runner.artifacts.put(gate_review_key, verdict_json, feature=feature)
+
+    staging_path, final_path = _artifact_paths(runner, feature, gate_review_key)
+    if final_path is not None:
+        existing = final_path.read_text(encoding="utf-8") if final_path.exists() else ""
+        if not existing.strip() or _is_placeholder_gate_review_text(existing):
+            final_path.parent.mkdir(parents=True, exist_ok=True)
+            final_path.write_text(verdict_json, encoding="utf-8")
+    if staging_path is not None and staging_path.exists():
+        staged = staging_path.read_text(encoding="utf-8")
+        if not staged.strip() or _is_placeholder_gate_review_text(staged):
+            # A clobbered/placeholder staging draft would shadow the final
+            # mirror on resume (get_resumable_artifact prefers newer staging).
+            staging_path.unlink()
+
+
 def _artifact_digest(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
 
@@ -3599,6 +3662,16 @@ async def interview_gate_review(
                 len(outcome.revision_plan.requests),
             )
             outcome.approved = False
+
+        # W-11 backstop: never leave gate_review_key holding the empty
+        # decision-ledger stub (or nothing) — persist the structured verdict
+        # so the resume fast-path can read approval without a re-review.
+        await _ensure_gate_verdict_persisted(
+            runner,
+            feature,
+            gate_review_key=gate_review_key,
+            outcome=outcome,
+        )
 
         if outcome.approved:
             break

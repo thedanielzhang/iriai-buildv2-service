@@ -60,6 +60,14 @@ _ARTIFACT_MODELS: list[type[BaseModel]] = [
     TestPlan,
 ]
 
+# Keys whose mirror file doubles as workflow resume state. Their content must
+# be written through verbatim — never replaced by a guessed model render.
+# (W-11 stub-render defect: a gate-review verdict JSON validated against the
+# all-default DecisionLedger model and was persisted as the 47-byte
+# "# Decision Ledger / _No decisions recorded yet._" stub, breaking the
+# resume fast-path in _gate_review_is_approved.)
+_DISPLAY_PASSTHROUGH_BASE_KEYS = {"gate-review"}
+
 _SERVE_PORT = 9000
 
 
@@ -292,6 +300,27 @@ class DocHostingService:
         return False
 
     @staticmethod
+    def _has_non_default_content(model: BaseModel) -> bool:
+        """Like ``_has_content`` but ignores fields still at their declared default.
+
+        Used by the model-guessing fallback in ``_to_display_content``: a model
+        whose only "content" is a non-empty *default* string (e.g.
+        ``DecisionLedger.title == "Decision Ledger"``) must not count as a
+        match, otherwise any JSON object renders as an empty-model stub.
+        """
+        for name, field_info in type(model).model_fields.items():
+            if name == "complete":
+                continue
+            value = getattr(model, name)
+            if value == field_info.default:
+                continue
+            if isinstance(value, str) and value:
+                return True
+            if isinstance(value, list) and value:
+                return True
+        return False
+
+    @staticmethod
     def _to_display_content(content: str, key: str = "") -> str:
         """Convert JSON-serialized Pydantic models to display format.
 
@@ -301,13 +330,20 @@ class DocHostingService:
         Namespaced keys (e.g. ``prd:broad``, ``design:canvas``) are resolved
         to their base key for model matching.
         """
+        # Resolve namespaced key to base key for model matching
+        base_key = key.split(":")[0] if ":" in key else key
+
+        # Resume-state keys are hosted verbatim: their on-disk mirror file is
+        # read back as the artifact itself (get_resumable_artifact /
+        # HostedInterview._mirror_path_text), so display conversion would
+        # corrupt workflow state.
+        if base_key in _DISPLAY_PASSTHROUGH_BASE_KEYS:
+            return content
+
         try:
             data = json.loads(content)
         except (json.JSONDecodeError, TypeError):
             return content
-
-        # Resolve namespaced key to base key for model matching
-        base_key = key.split(":")[0] if ":" in key else key
 
         if base_key == "system-design":
             try:
@@ -328,7 +364,11 @@ class DocHostingService:
         for model_cls in _ARTIFACT_MODELS:
             try:
                 model = model_cls.model_validate(data)
-                if DocHostingService._has_content(model):
+                # Stricter than the key-matched path above: guessing a model
+                # from arbitrary JSON requires non-default content, otherwise
+                # all-default models (DecisionLedger validates ANY object)
+                # hijack the render (W-11 stub-render defect).
+                if DocHostingService._has_non_default_content(model):
                     return to_markdown(model)
             except ValidationError:
                 continue

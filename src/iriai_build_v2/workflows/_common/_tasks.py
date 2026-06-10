@@ -222,6 +222,21 @@ class ThreadedInterviewOutcome:
     pending_response: Any | None = None
 
 
+def _is_placeholder_artifact_text(text: str) -> bool:
+    """True for known placeholder renders that must never become an artifact.
+
+    The hosting display layer historically wrote the empty decision-ledger
+    render ("# Decision Ledger / _No decisions recorded yet._") over
+    ``reviews/*-gate-review.md`` mirror files (W-11 stub-render defect).
+    ``HostedInterview`` payload resolution reads those same files back, so a
+    placeholder there must be treated as *missing* — letting resolution fall
+    through to the structured Envelope output (the real verdict).
+    """
+    from ...services.markdown import is_empty_decision_ledger_text
+
+    return is_empty_decision_ledger_text(text)
+
+
 class HostedInterview(Interview):
     """Interview that pushes artifacts to DocHostingService on completion.
 
@@ -291,7 +306,7 @@ class HostedInterview(Interview):
         if not path.exists():
             return None
         text = path.read_text(encoding="utf-8").strip()
-        if not text:
+        if not text or _is_placeholder_artifact_text(text):
             return None
         return text, f"reported path `{reported_path}`"
 
@@ -304,7 +319,7 @@ class HostedInterview(Interview):
         path = self._artifact_output_paths.get(key) or self._staging_path(mirror, feature, key)
         if path.exists():
             text = path.read_text(encoding="utf-8").strip()
-            if text:
+            if text and not _is_placeholder_artifact_text(text):
                 return text, f"staging path `{path}`"
 
         from ...services.artifacts import _key_to_path
@@ -312,7 +327,7 @@ class HostedInterview(Interview):
         final_path = mirror.feature_dir(feature.id) / _key_to_path(key)
         if final_path.exists():
             text = final_path.read_text(encoding="utf-8").strip()
-            if text:
+            if text and not _is_placeholder_artifact_text(text):
                 return text, f"legacy file path `{final_path}`"
         return None
 

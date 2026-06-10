@@ -533,3 +533,182 @@ async def test_doc_hosting_renders_decomposition_as_markdown(tmp_path: Path):
     assert rendered.startswith("# Subfeature Decomposition")
     assert "`accounts`" in rendered
     assert "## Complete" in rendered
+
+
+# ── W-11 stub-render regression (gate-review verdicts clobbered by the empty
+#    decision-ledger placeholder) ─────────────────────────────────────────────
+
+
+def _empty_ledger_stub() -> str:
+    """The exact placeholder render that clobbered gate-review artifacts."""
+    from iriai_build_v2.models.outputs import DecisionLedger
+    from iriai_build_v2.services.markdown import to_markdown
+
+    return to_markdown(DecisionLedger())
+
+
+def _gate_review_interview() -> HostedInterview:
+    from iriai_build_v2.models.outputs import ReviewOutcome  # noqa: F401
+
+    role = Role(name="gate-reviewer", prompt="Review it.")
+    return HostedInterview(
+        questioner=AgentActor(name="gate-reviewer", role=role),
+        responder=InteractionActor(name="user", resolver="terminal"),
+        initial_prompt="Start",
+        done=lambda _result: True,
+        artifact_key="gate-review:plan",
+        artifact_label="Gate Review — plan",
+    )
+
+
+def test_display_content_passes_gate_review_verdict_through_verbatim():
+    """Root cause 1: hosting display conversion rendered any verdict JSON as
+    the empty DecisionLedger stub and wrote it over the gate-review mirror."""
+    import json as _json
+
+    from iriai_build_v2.models.outputs import ReviewOutcome
+
+    verdict = ReviewOutcome(approved=True, complete=True).model_dump_json(indent=2)
+    out = DocHostingService._to_display_content(verdict, "gate-review:plan")
+    assert out == verdict
+    assert _json.loads(out)["approved"] is True
+
+
+def test_display_content_never_guesses_all_default_decision_ledger():
+    """Root cause 1b: the model-guessing fallback must not match a model whose
+    only content is a default field (DecisionLedger validates ANY object)."""
+    out = DocHostingService._to_display_content('{"some": "payload"}', "unmapped-key")
+    assert "_No decisions recorded yet._" not in out
+    assert out.startswith("```json")
+
+
+@pytest.mark.asyncio
+async def test_gate_review_on_done_ignores_stub_mirror_and_persists_verdict(tmp_path: Path):
+    """Root cause 2 (re-ingestion): a prior display-clobbered mirror file
+    (reviews/plan-gate-review.md == empty-ledger stub) must be treated as
+    missing, so on_done falls back to the structured Envelope verdict.
+
+    Reproduces live rows 2245985/2246025 (47-byte stubs persisted to the DB)
+    and proves the persisted artifact is now a readable verdict.
+    """
+    import json as _json
+
+    from iriai_build_v2.models.outputs import ReviewOutcome
+    from iriai_build_v2.workflows._common._helpers import _gate_review_is_approved
+
+    feature = SimpleNamespace(id="feat-gate-stub", name="Feature")
+    artifacts = _ArtifactStore()
+    mirror = ArtifactMirror(tmp_path)
+    hosting = DocHostingService(mirror)  # real service: writes the mirror file
+
+    # Simulate the prior cycle's clobber: final mirror holds the stub, and a
+    # stale staging draft holds the stub too. No fresh agent-written file.
+    stub = _empty_ledger_stub()
+    final_path = mirror.feature_dir(feature.id) / "reviews" / "plan-gate-review.md"
+    final_path.parent.mkdir(parents=True, exist_ok=True)
+    final_path.write_text(stub, encoding="utf-8")
+    staging_path = (
+        mirror.feature_dir(feature.id) / ".staging" / "reviews" / "plan-gate-review.md"
+    )
+    staging_path.parent.mkdir(parents=True, exist_ok=True)
+    staging_path.write_text(stub, encoding="utf-8")
+
+    runner = SimpleNamespace(
+        artifacts=artifacts,
+        services={"hosting": hosting, "artifact_mirror": mirror},
+    )
+
+    interview = _gate_review_interview()
+    await interview.on_start(runner, feature)
+    verdict = ReviewOutcome(approved=True, complete=True)
+    await interview.on_done(
+        runner,
+        feature,
+        result=SimpleNamespace(artifact_path="", output=verdict),
+    )
+
+    stored = await artifacts.get("gate-review:plan", feature=feature)
+    assert stored is not None
+    assert "_No decisions recorded yet._" not in stored
+    assert _json.loads(stored)["approved"] is True
+    assert _gate_review_is_approved(stored) is True
+
+    # The hosted mirror file must now hold the verbatim verdict, not the stub
+    # (this is what the resume fast-path reads via get_resumable_artifact).
+    mirrored = final_path.read_text(encoding="utf-8")
+    assert "_No decisions recorded yet._" not in mirrored
+    assert _json.loads(mirrored)["approved"] is True
+
+
+@pytest.mark.asyncio
+async def test_ensure_gate_verdict_persisted_replaces_stub_everywhere(tmp_path: Path):
+    """Backstop: stub/empty DB row + mirror + staging are replaced by the
+    structured verdict JSON; the resume fast-path then reads approval."""
+    import json as _json
+
+    from iriai_build_v2.models.outputs import ReviewOutcome
+    from iriai_build_v2.workflows._common._helpers import (
+        _ensure_gate_verdict_persisted,
+        _gate_review_is_approved,
+    )
+
+    feature = SimpleNamespace(id="feat-gate-backstop", name="Feature")
+    artifacts = _ArtifactStore()
+    mirror = ArtifactMirror(tmp_path)
+    runner = SimpleNamespace(
+        artifacts=artifacts,
+        services={"hosting": _Hosting(), "artifact_mirror": mirror},
+    )
+
+    stub = _empty_ledger_stub()
+    await artifacts.put("gate-review:plan", stub, feature=feature)
+    final_path = mirror.feature_dir(feature.id) / "reviews" / "plan-gate-review.md"
+    final_path.parent.mkdir(parents=True, exist_ok=True)
+    final_path.write_text(stub, encoding="utf-8")
+    staging_path = (
+        mirror.feature_dir(feature.id) / ".staging" / "reviews" / "plan-gate-review.md"
+    )
+    staging_path.parent.mkdir(parents=True, exist_ok=True)
+    staging_path.write_text(stub, encoding="utf-8")
+
+    outcome = ReviewOutcome(approved=True, complete=True)
+    await _ensure_gate_verdict_persisted(
+        runner, feature, gate_review_key="gate-review:plan", outcome=outcome
+    )
+
+    stored = await artifacts.get("gate-review:plan", feature=feature)
+    assert _json.loads(stored)["approved"] is True
+    assert _gate_review_is_approved(stored) is True
+    assert _json.loads(final_path.read_text(encoding="utf-8"))["approved"] is True
+    assert not staging_path.exists()  # stale stub draft no longer shadows resume
+
+
+@pytest.mark.asyncio
+async def test_ensure_gate_verdict_persisted_never_overwrites_real_review(tmp_path: Path):
+    """The backstop must not clobber a real reviewer-written gate review."""
+    from iriai_build_v2.models.outputs import ReviewOutcome
+    from iriai_build_v2.workflows._common._helpers import _ensure_gate_verdict_persisted
+
+    feature = SimpleNamespace(id="feat-gate-keep", name="Feature")
+    artifacts = _ArtifactStore()
+    mirror = ArtifactMirror(tmp_path)
+    runner = SimpleNamespace(
+        artifacts=artifacts,
+        services={"hosting": _Hosting(), "artifact_mirror": mirror},
+    )
+
+    review_md = "# Plan Gate Review\n\n**Outcome:** approved\n\nDetailed reasoning."
+    await artifacts.put("gate-review:plan", review_md, feature=feature)
+    final_path = mirror.feature_dir(feature.id) / "reviews" / "plan-gate-review.md"
+    final_path.parent.mkdir(parents=True, exist_ok=True)
+    final_path.write_text(review_md, encoding="utf-8")
+
+    await _ensure_gate_verdict_persisted(
+        runner,
+        feature,
+        gate_review_key="gate-review:plan",
+        outcome=ReviewOutcome(approved=True, complete=True),
+    )
+
+    assert await artifacts.get("gate-review:plan", feature=feature) == review_md
+    assert final_path.read_text(encoding="utf-8") == review_md

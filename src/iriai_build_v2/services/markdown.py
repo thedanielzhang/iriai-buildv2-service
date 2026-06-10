@@ -548,8 +548,33 @@ def _render_decision_ledger(m: DecisionLedger) -> str:
     _append_group("Active Decisions", active)
     _append_group("Superseded Decisions", superseded)
     if not active and not superseded:
-        parts.append("\n_No decisions recorded yet._\n")
+        parts.append(f"\n{_EMPTY_DECISION_LEDGER_MARKER}\n")
     return "\n".join(parts) + "\n"
+
+
+_EMPTY_DECISION_LEDGER_MARKER = "_No decisions recorded yet._"
+
+
+def is_empty_decision_ledger_text(text: str) -> bool:
+    """Detect the placeholder render of an empty :class:`DecisionLedger`.
+
+    ``_render_decision_ledger(DecisionLedger())`` produces exactly a title
+    heading plus the empty marker (e.g. ``# Decision Ledger\\n\\n_No decisions
+    recorded yet._``).  This render must never be persisted *as* another
+    artifact (W-11 stub-render defect: it clobbered ``gate-review:*``
+    verdicts).  Returns True only when the text consists solely of headings
+    and the empty-ledger marker — any real review/verdict content fails.
+    """
+    stripped = (text or "").strip()
+    if not stripped:
+        return False
+    lines = [line.strip() for line in stripped.splitlines() if line.strip()]
+    if _EMPTY_DECISION_LEDGER_MARKER not in lines:
+        return False
+    return all(
+        line == _EMPTY_DECISION_LEDGER_MARKER or line.startswith("#")
+        for line in lines
+    )
 
 
 def _render_dag(m: ImplementationDAG) -> str:
