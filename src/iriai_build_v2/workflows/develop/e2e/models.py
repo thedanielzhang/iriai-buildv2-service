@@ -68,6 +68,10 @@ class ProjectProfile(BaseModel):
     service_names: list[str] = Field(default_factory=list)
     service_languages: list[str] = Field(default_factory=list)
     service_test_cmds: list[str] = Field(default_factory=list)
+    # Item-10 (b): service names whose host-test suites carry critical=True
+    # verdicts (compose path criticality binding). Default [] = no suite is
+    # critical — byte-for-byte today's behavior.
+    critical_service_names: list[str] = Field(default_factory=list)
 
     # --- commit-hygiene strategy (P3). Empty => the studio eslint/gulp rule_grant
     #     default. "restage_autofix" = re-stage a formatter's own edits (black). ---
@@ -215,6 +219,11 @@ class E2EStatus(BaseModel):
     passed: int = 0
     failed: int = 0
     flaky: int = 0
+    # Item-10 (c): infra/'error' verdicts and skipped verdicts are now COUNTED
+    # (they were previously invisible). Additive fields with defaults — old
+    # rows validate unchanged.
+    errors: int = 0
+    skipped: int = 0
     open_regressions: list[str] = Field(default_factory=list)  # spec_ids
     preview_url: str = ""
     updated_at: str = Field(default_factory=_utcnow_iso)

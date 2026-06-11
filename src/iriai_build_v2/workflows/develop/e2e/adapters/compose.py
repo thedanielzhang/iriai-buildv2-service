@@ -194,6 +194,23 @@ def build_surfaces(profile: Any) -> list[Surface]:
     return surfaces
 
 
+def compose_critical_for(profile: Any):
+    """Item-10 (b): per-suite criticality predicate from the profile.
+
+    A suite (service) is critical iff it is listed in
+    ``profile.critical_service_names``. Empty list (the default) => no suite is
+    critical — today's behavior. Pure; unit-tested without Docker.
+    """
+    critical_names = {
+        str(n) for n in (getattr(profile, "critical_service_names", None) or [])
+    }
+
+    def _critical(suite: str) -> bool:
+        return suite in critical_names
+
+    return _critical
+
+
 def run_to_verdicts(
     run: Any, *, suite: str, source_commit: str = "", critical: bool = False
 ) -> list[E2EVerdictRecord]:
@@ -354,10 +371,16 @@ class ComposeAdapter:
         runner: Any = None,
         feature: Any = None,
         source_commit: str = "",
+        critical_for: Any = None,
     ) -> list[E2EVerdictRecord]:
         """Run the product's OWN unit tests on the HOST (vitest/pytest --junitxml)
         and parse the JUnit reports into verdicts. Index-aligned with
         ``service_names``; each cmd writes ``<checkout>/.e2e-junit-<i>.xml``.
+
+        ``critical_for`` (item-10 b): optional per-suite predicate
+        ``(suite_name) -> bool`` threaded into :func:`run_to_verdicts` so the
+        ``critical`` flag is structurally reachable on the compose path.
+        ``None`` (the default) => critical=False everywhere — today's behavior.
         """
         profile = instance.profile
         checkout = Path(instance.checkout_dir)
@@ -385,7 +408,10 @@ class ComposeAdapter:
                     global_errors=[f"{suite}: no JUnit report at {report_path.name}"]
                 )
             verdicts += run_to_verdicts(
-                parsed, suite=suite, source_commit=source_commit
+                parsed,
+                suite=suite,
+                source_commit=source_commit,
+                critical=bool(critical_for(suite)) if critical_for else False,
             )
         return verdicts
 
