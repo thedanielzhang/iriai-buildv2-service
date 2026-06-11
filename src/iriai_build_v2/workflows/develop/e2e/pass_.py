@@ -92,10 +92,19 @@ class E2EPassRefused(RuntimeError):
 TRIAGE_CLASSIFY_ENV = "IRIAI_E2E_TRIAGE_CLASSIFY"
 CRITICAL_BINDING_ENV = "IRIAI_E2E_CRITICAL_BINDING"
 BOUNDARY_REPAIR_ENV = "IRIAI_E2E_BOUNDARY_REPAIR"
+# ATTACH mode (operator ruling, kaya): the compose pass ATTACHES to the
+# operator's already-running dev stack (single host, fixed ports) instead of
+# clone + `compose up`. Default OFF = today's behavior byte-for-byte.
+ATTACH_ENV = "IRIAI_E2E_ATTACH"
 
 
 def _env_on(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def attach_enabled() -> bool:
+    """ATTACH mode flag (IRIAI_E2E_ATTACH, default OFF = clone + compose up)."""
+    return _env_on(ATTACH_ENV)
 
 
 def triage_classify_enabled() -> bool:
@@ -176,7 +185,8 @@ class PassSummary:
     detail: str = ""
     # Item-11 G4 (flat): "" = studio/non-browser-lane product (unchanged);
     # "not_built" = profile declares native_test_cmd but no configs yet;
-    # "ran" = declared compose browser lanes executed in this pass.
+    # "ran" = declared compose browser lanes executed in this pass;
+    # "skipped_attach" = ATTACH mode probed the running stack, lanes skipped.
     browser_lanes: str = ""
 
 
@@ -448,6 +458,92 @@ async def run_full_pass(
         await adapter.teardown(instance)
 
 
+async def _run_attach_pass(
+    checkpoint: SealedCheckpoint,
+    *,
+    registry: Any,
+    profile: ProjectProfile,
+    poster: Any,
+    on_log,
+    attach_project: str,
+) -> PassSummary:
+    """ATTACH-mode boot-smoke (IRIAI_E2E_ATTACH): probe the operator's RUNNING
+    stack instead of clone + compose-up.
+
+    The kaya operator ruling: the running dev stack (fixed ports, single host)
+    IS the e2e target — standing up a second stack would collide on ports, so
+    the pass probes the profile's 13 surfaces in place. Host unit tests and
+    browser lanes are LOUDLY skipped (nothing is checked out); the green
+    pointer therefore covers boot-smoke only, with the same
+    ``green_pointer_for`` oracle as the provisioned path. Returning a summary
+    (never raising) consumes the checkpoint cursor exactly once, like any
+    completed pass. Nothing is provisioned, so there is nothing to tear down.
+    """
+    from .adapters import Instance
+    from .adapters.compose import build_surfaces
+
+    summary = PassSummary(group_idx=checkpoint.group_idx)
+    label = f"group {checkpoint.group_idx}"
+    adapter = get_adapter("compose")
+    on_log(
+        f"ATTACH mode: probing running stack '{attach_project}' "
+        "(no compose up; host tests + browser lanes skipped)"
+    )
+    instance = Instance(
+        profile=profile,
+        checkout_dir=Path("."),
+        surfaces=build_surfaces(profile),
+    )
+    smokes = await adapter.smoke(instance, profile)
+    boot_failed = [s for s in smokes if s.status == "fail"]
+    any_up = any(s.status == "pass" for s in smokes)
+    summary.boot_smoke = "pass" if (any_up and not boot_failed) else "fail"
+    for s in smokes:
+        summary.lanes.append(LaneResult(
+            config=s.surface,
+            web_server_ok=(s.status == "pass"),
+            started=(s.status == "pass"),
+            detail=s.detail,
+            boot_error="" if s.status != "fail" else s.detail))
+    on_log(f"boot-smoke: {summary.boot_smoke} "
+           f"({sum(1 for s in smokes if s.status == 'pass')}/{len(smokes)} up)")
+    if profile.native_test_cmd:
+        summary.browser_lanes = "skipped_attach"
+        on_log("browser lanes: skipped_attach (ATTACH mode probes only — "
+               "green covers boot-smoke ONLY)")
+
+    if summary.boot_smoke == "fail":
+        failures = boot_failed or [
+            type("BS", (), {"surface": "attach",
+                            "detail": "no boot-smoke surfaces came up "
+                                      "(check profile.service_probe_targets)"})()
+        ]
+        await page_critical(
+            registry, poster=poster, checkpoint_label=label,
+            boot_smoke_failures=[
+                type("BS", (), {"surface": s.surface,
+                                "detail": (s.detail or "")[:300]})()
+                for s in failures])
+        on_log(f"  boot-smoke FAIL on {len(failures)} surface(s) (paged)")
+
+    gp = green_pointer_for(
+        checkpoint, boot_smoke=summary.boot_smoke,
+        open_critical_regressions=0,
+        **_strict_green_counts([]))
+    if gp:
+        await registry.put_green_pointer(gp)
+        summary.green = True
+    status = build_status(
+        checkpoint=checkpoint,
+        smokes=[type("S", (), {"status": s.status, "surface": s.surface})()
+                for s in smokes],
+        verdicts=[], green_pointer=gp, preview_url="",
+        browser_lanes=summary.browser_lanes)
+    await emit_status(registry, status, poster=poster)
+    summary.detail = f"attach boot={summary.boot_smoke} pass/fail=0/0"
+    return summary
+
+
 async def _run_compose_pass(
     checkpoint: SealedCheckpoint,
     *,
@@ -478,7 +574,13 @@ async def _run_compose_pass(
     slug = profile.compose_project_prefix or repo_key or "default"
 
     # Resource bound + single-stack mutex BEFORE standing anything up.
-    pf = compose_preflight(project_prefix=(profile.compose_project_prefix or "e2e"))
+    # ATTACH mode (IRIAI_E2E_ATTACH): the profile's exact project name is the
+    # attach TARGET — exempt from the mutex; other prefix-matches still refuse.
+    attach_project = (profile.compose_project_prefix or "") if attach_enabled() else ""
+    pf = compose_preflight(
+        project_prefix=(profile.compose_project_prefix or "e2e"),
+        attach_project=attach_project,
+    )
     if not pf.ok:
         # Item-11 G2/G3: a refusal is LOUD (durable blocker + status row) and
         # NON-ADVANCING (typed raise -> callers hold the cursor; the same sealed
@@ -512,6 +614,26 @@ async def _run_compose_pass(
                 green_pointer=None, preview_url="")
             await emit_status(registry, status, poster=poster)
         raise E2EPassRefused(detail)
+
+    if attach_project:
+        if not pf.attach_target_up:
+            # The operator's stack is expected to be running in attach mode —
+            # a down target is an environment surprise, never a license to
+            # stand up our own stack on its fixed ports. Loud, cursor held.
+            detail = (
+                f"ATTACH mode: target compose project '{attach_project}' is "
+                "not running (expected the operator's live stack)"
+            )
+            on_log(detail + " (cursor held; will retry this checkpoint)")
+            raise E2EPassRefused(detail)
+        return await _run_attach_pass(
+            checkpoint,
+            registry=registry,
+            profile=profile,
+            poster=poster,
+            on_log=on_log,
+            attach_project=attach_project,
+        )
 
     sub = CloneSubstrate(role="track", mode="automated", persist=False)
     on_log(f"compose provisioning @ group {checkpoint.group_idx} ...")
