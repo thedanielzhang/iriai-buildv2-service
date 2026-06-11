@@ -16,6 +16,7 @@ notarized DMG is available.
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -38,10 +39,34 @@ from .status import (
 from .substrate import CloneSubstrate
 from .triage import bind_specs_from_scenarios, native_results_to_verdicts
 
-LIVE_REPO_TMPL = (
+# Studio-default live-repo path template. Item-6: env-overridable via the SAME
+# variable e2e_cmd.py already honors (IRIAI_E2E_LIVE_REPO_TMPL); the default is
+# the previous literal byte-for-byte, so behavior is unchanged when unset.
+LIVE_REPO_TMPL = os.environ.get(
+    "IRIAI_E2E_LIVE_REPO_TMPL",
     "/Users/danielzhang/src/iriai/.iriai/features/"
-    "visual-studio-code-frontend-for-project-workflow-manager-{feature}/repos/{repo}"
+    "visual-studio-code-frontend-for-project-workflow-manager-{feature}/repos/{repo}",
 )
+
+REQUIRE_PROFILE_ENV = "IRIAI_E2E_REQUIRE_PROFILE"
+
+
+class E2EProfileRequiredError(RuntimeError):
+    """Item-6: a required ProjectProfile is missing or structurally invalid.
+
+    Raised (flag-gated, IRIAI_E2E_REQUIRE_PROFILE, default OFF) instead of
+    silently falling back to the hardcoded iriai-studio electron default — a
+    wrong-product e2e run or a confusing studio-path clone failure. The
+    develop-side auto-infer flow is untouched: inference is the designed path
+    there; this guard covers only the e2e pass/CLI resolution chain.
+    """
+
+
+def require_profile_enabled() -> bool:
+    """Item-6 flag (default OFF = today's studio-default fallback chain)."""
+    return os.environ.get(REQUIRE_PROFILE_ENV, "").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
 
 
 @dataclass
@@ -154,7 +179,25 @@ async def run_full_pass(
     commits = checkpoint.result_commits()
     studio_commit = commits.get("iriai-studio") or next(iter(commits.values()), "")
 
-    profile = profile or (await registry.get_profile() if registry else None) or _default_profile()
+    resolved_profile = profile or (await registry.get_profile() if registry else None)
+    if require_profile_enabled():
+        # Item-6 fail-fast: a missing or structurally-invalid profile is a
+        # loud typed error, NEVER the silent studio-default fallback.
+        if resolved_profile is None:
+            raise E2EProfileRequiredError(
+                f"no project-profile artifact for feature {feature_id!r} "
+                "(and no explicit profile was passed). Author and persist the "
+                "ProjectProfile (P6) or pass --profile-json; unset "
+                f"{REQUIRE_PROFILE_ENV} to allow the iriai-studio default."
+            )
+        alignment_errors = resolved_profile.alignment_errors()
+        if alignment_errors:
+            raise E2EProfileRequiredError(
+                f"project profile for feature {feature_id!r} is structurally "
+                f"invalid: {'; '.join(alignment_errors)}. Repair the persisted "
+                "profile (or the --profile-json override) before re-running."
+            )
+    profile = resolved_profile or _default_profile()
     if profile.adapter_id == "compose":
         # Compose-stack products (kaya) take a dedicated pass; the studio
         # browser/electron path below is left UNTOUCHED.
