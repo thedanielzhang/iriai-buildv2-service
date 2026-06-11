@@ -291,3 +291,38 @@ workflow phase-entry steps as they prove deterministic.
 **Trigger heuristic**: audit CODE when code meets a new reality; audit
 CONTENT when content is new. A fresh feature on a proven workflow is
 only the second.
+
+## P-14 — Per-task spec-amendment carrier (shipped-during-develop)
+**Mechanism**: an artifacts-table row per task at key
+`dag-task-amendments:{task_id}` holds operator/driver-authored MARKDOWN
+amendment blocks for that specific task (feature-scoped read via
+`runner.artifacts.get(key, feature=feature)` — the same machinery as the
+known-flaky ledger). `_task_amendments_section(runner, feature, task_id)`
+renders it as a "## Operator Spec Amendments for this task (BINDING — apply
+before the base spec where they conflict)" section; gated by
+`IRIAI_TASK_AMENDMENTS` (default ON — opposite of the flaky-ledger flag;
+amendments are binding operator directives, so suppression must be the
+opt-in). When a row exists but the flag is OFF, a LOUD warning fires and
+nothing is injected; when the row lacks a decision-ledger citation (regex
+`\b(DEC-|D-\d|DD-\d)`), a warning fires but the amendment is STILL injected —
+operator content is never silently dropped.
+**Injection point**: `_ImplementationPromptBuilder.build_prompt_context`
+(src/iriai_build_v2/workflows/develop/phases/implementation.py:10731, right
+after `_build_task_prompt_with_optional_sandbox_context` and BEFORE
+prompt-sha/materialization) — the single prompt chokepoint every
+dispatcher-mediated implementation attempt flows through: initial dispatch
+(`_run_task` → `_dispatch_task_attempt_via_runtime_dispatcher`), every retry
+attempt in the loop, strict-resume re-dispatches, and the enhancement stage
+(`_run_enh_task`); both the inline and the sandbox file-offload prompt
+shapes. Read FRESH on every build (no caching), so an amendment installed
+mid-run binds the very next attempt.
+**Restart/rebuild survival**: BY CONSTRUCTION — the amendment lives in the
+artifacts table (not process memory) and is re-read at every prompt build,
+so process restarts, resume re-dispatches, and DAG rebuilds re-carry it
+without any operator action.
+**Status**: SHIPPED on branch `wh/task-amendments-carrier`
+(tests/workflows/test_task_amendments.py).
+**First cargo**: the release-target reuse amendment for
+fds-s32-write-chokepoint installed at
+`dag-task-amendments:TASK-RCAN-01-BACKEND-SERVICES` (operator 14:4x
+directive).
