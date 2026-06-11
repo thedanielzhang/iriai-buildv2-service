@@ -58,7 +58,10 @@ ECONOMY_MODEL_OVERRIDES = {
     "package-implementer": BUDGET_TIERS["sonnet"],
     "bug-fixer": BUDGET_TIERS["sonnet"],
     "bug-reproducer": BUDGET_TIERS["sonnet"],
-    "root-cause-analyst": BUDGET_TIERS["sonnet"],
+    # root-cause-analyst is auto-consumed ANALYSIS, not generation: a wrong
+    # RCA misdirects entire repair waves, so the downshift costs more than it
+    # saves (analyst timesink finding, 2026-06-11).
+    "root-cause-analyst": BUDGET_TIERS["fable"],
     "documentation": BUDGET_TIERS["sonnet"],
     "deployer": BUDGET_TIERS["sonnet"],
     "release-manager": BUDGET_TIERS["sonnet"],
