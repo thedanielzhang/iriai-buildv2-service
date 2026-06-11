@@ -966,3 +966,88 @@ def test_all_export_includes_seven_moved_names() -> None:
         assert name in regroup_overlay_mod.__all__, (
             f"{name} missing from execution/regroup_overlay.py __all__"
         )
+
+
+def test_regroup_hard_barrier_authored_soft_suppresses_derived_label() -> None:
+    """Typed step-9 alignment: an authored ``hard=False`` overlay barrier
+    membership marks the task SOFT and suppresses the re-derived
+    text-heuristic label, mirroring ``_step9_hard_barriers`` (the typed
+    validator treats the overlay's own barriers as the primary authority and
+    soft barriers never reject)."""
+
+    from iriai_build_v2.workflows.develop.execution.regroup_overlay import (
+        _regroup_hard_barrier_by_task,
+    )
+
+    task_a = _build_simple_task("a", files=["src/foo.py"])
+    task_b = _build_simple_task("b", files=["src/bar.py"])
+    derived = DerivedDAGArtifact(
+        schema_version=1,
+        artifact_key="review:dag-regroup-draft:custom",
+        source_dag_key="dag",
+        base_dag_artifact_id=None,
+        base_dag_sha256="",
+        checkpointed_group=None,
+        group_idx_offset=None,
+        original_execution_order=[],
+        original_to_new_group_mapping={},
+        rollback_plan=[],
+        activation_contract=[],
+        activation_plan=[],
+        barriers=[
+            {"id": "lane-a", "hard": False, "task_ids": ["a"], "reason": "soft"},
+            {"id": "lane-b-hard", "hard": True, "task_ids": ["b"], "reason": "hard"},
+        ],
+        write_sets={},
+        speed_index={},
+        dag=_build_simple_dag([task_a, task_b]),
+    )
+
+    barriers = _regroup_hard_barrier_by_task(
+        derived,
+        task_definitions_by_id={"a": task_a, "b": task_b},
+    )
+    # "a" is authored soft -> suppressed entirely (no hard label).
+    assert "a" not in barriers
+    # "b" is authored hard -> the authored id wins over the derived label.
+    assert barriers["b"] == "lane-b-hard"
+
+
+def test_regroup_hard_barrier_no_authored_barriers_unchanged() -> None:
+    """With no authored overlay barriers the definitions branch behaves
+    exactly as before: every task keeps its re-derived semantic-lane label
+    (the stock-draft case — stock authors ``hard=True`` for every label, so
+    suppression never engages there either)."""
+
+    from iriai_build_v2.workflows.develop.execution.regroup_overlay import (
+        _regroup_hard_barrier_by_task,
+    )
+
+    task_a = _build_simple_task("a", files=["src/foo.py"])
+    task_b = _build_simple_task("b", files=["src/bar.py"])
+    derived = DerivedDAGArtifact(
+        schema_version=1,
+        artifact_key="review:dag-regroup-draft:custom",
+        source_dag_key="dag",
+        base_dag_artifact_id=None,
+        base_dag_sha256="",
+        checkpointed_group=None,
+        group_idx_offset=None,
+        original_execution_order=[],
+        original_to_new_group_mapping={},
+        rollback_plan=[],
+        activation_contract=[],
+        activation_plan=[],
+        barriers=[],
+        write_sets={},
+        speed_index={},
+        dag=_build_simple_dag([task_a, task_b]),
+    )
+
+    barriers = _regroup_hard_barrier_by_task(
+        derived,
+        task_definitions_by_id={"a": task_a, "b": task_b},
+    )
+    assert set(barriers.keys()) == {"a", "b"}
+    for task_id in ("a", "b"):
+        assert barriers[task_id]

@@ -891,10 +891,51 @@ def _regroup_hard_barrier_by_task(
     if task_definitions_by_id:
         from ..dag_regroup import _barrier_for_task, semantic_lane_for_task
 
-        return {
+        # Typed step-9 alignment (doc 09 § "Validation Algorithm"): the
+        # overlay's own authored ``barriers`` (with their ``hard`` flag) are
+        # the PRIMARY authority — exactly as the no-definitions branch below
+        # and ``regroup_overlay_validation._step9_hard_barriers`` already
+        # treat them. An authored ``hard=True`` membership wins outright; an
+        # authored ``hard=False`` membership marks the task SOFT and
+        # suppresses the re-derived text-heuristic label; tasks under no
+        # authored barrier keep the re-derived label (defense in depth —
+        # stock drafts author ``hard=True`` for every speed-index label, so
+        # their behaviour is unchanged).
+        authored_hard: dict[str, str] = {}
+        authored_soft: set[str] = set()
+        for idx, barrier in enumerate(parsed.barriers or []):
+            if not isinstance(barrier, dict):
+                continue
+            hard = barrier.get("hard", True)
+            is_soft = hard is False or str(hard).lower() in {"false", "0", "no", "off"}
+            barrier_id = str(
+                barrier.get("id")
+                or barrier.get("barrier_id")
+                or barrier.get("name")
+                or barrier.get("kind")
+                or f"barrier-{idx}"
+            )
+            for task_id in barrier.get("task_ids") or []:
+                task_key = str(task_id)
+                if not task_key:
+                    continue
+                if is_soft:
+                    authored_soft.add(task_key)
+                else:
+                    authored_hard.setdefault(task_key, barrier_id)
+        derived_labels = {
             task_id: _barrier_for_task(task, semantic_lane_for_task(task))
             for task_id, task in task_definitions_by_id.items()
         }
+        merged: dict[str, str] = {}
+        for task_id, label in derived_labels.items():
+            if task_id in authored_hard:
+                merged[task_id] = authored_hard[task_id]
+            elif task_id in authored_soft:
+                continue
+            else:
+                merged[task_id] = label
+        return merged
     for idx, barrier in enumerate(parsed.barriers or []):
         if not isinstance(barrier, dict):
             continue
