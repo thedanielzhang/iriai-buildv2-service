@@ -1450,17 +1450,27 @@ def _resolve_task_repo(request: ContractCompileRequest) -> RepoIdentity:
         return repo
 
     raw_repo_path = str(_task_attr(request.task, "repo_path", "") or "").strip()
+    if raw_repo_path and _is_absolute_like(raw_repo_path):
+        # N-17: the planning DAG path-resolution lane emits the absolute
+        # repos ROOT as repo_path (the root of ALL repos — zero repo
+        # information) while file_scope paths are repos-root-relative with
+        # the repo-name prefix. Treat the absolute value as unset and fall
+        # through to file_scope prefix derivation; derivation failure below
+        # stays loud, so never-guess is preserved.
+        logger.warning(
+            "contract compile: task %s repo_path %r is absolute (planning "
+            "interface N-17) — ignoring it and deriving the repo from "
+            "file_scope prefixes",
+            _task_attr(request.task, "id", "?"),
+            raw_repo_path,
+        )
+        raw_repo_path = ""
     if raw_repo_path:
         alias_prefix = _matching_alias_prefix(raw_repo_path, request.workspace_registry)
         if alias_prefix:
             _raise_worktree_alias_compile(
                 f"task repo_path {raw_repo_path!r} references alias {alias_prefix}",
                 path=raw_repo_path,
-            )
-        if _is_absolute_like(raw_repo_path):
-            _raise_compile(
-                "contract_invalid_path",
-                f"task repo_path {raw_repo_path!r} must not be absolute",
             )
         for repo in request.workspace_registry.repos:
             if _path_prefix_matches(raw_repo_path, _repo_prefixes(repo, "")):
@@ -1472,10 +1482,69 @@ def _resolve_task_repo(request: ContractCompileRequest) -> RepoIdentity:
 
     if len(request.workspace_registry.repos) == 1:
         return request.workspace_registry.repos[0]
+
+    derived = _derive_repo_from_file_scope(request)
+    if derived is not None:
+        logger.warning(
+            "contract compile: task %s repo derived from file_scope path "
+            "prefixes -> %s (N-17 planning interface fallback)",
+            _task_attr(request.task, "id", "?"),
+            derived.repo_name,
+        )
+        return derived
+
+    file_scope = _task_attr(request.task, "file_scope", None) or []
+    if not file_scope:
+        # Pure gate/probe tasks carry no files: the repo only anchors the
+        # contract's cwd formality — there is no write surface to mis-scope.
+        first = request.workspace_registry.repos[0]
+        logger.warning(
+            "contract compile: task %s has no file_scope and no resolvable "
+            "repo — anchoring to first registry repo %s (N-17 zero-file "
+            "fallback)",
+            _task_attr(request.task, "id", "?"),
+            first.repo_name,
+        )
+        return first
+
     _raise_compile(
         "contract_invalid_path",
         "task repo_id or repo_path is required when the registry has multiple repos",
     )
+
+
+def _derive_repo_from_file_scope(request: ContractCompileRequest) -> RepoIdentity | None:
+    """N-17 fallback: derive the task's repo from file_scope path prefixes.
+
+    A task's repo is where it WRITES: write actions (create/modify/delete)
+    vote first; read_only paths vote only when the task has no writes. The
+    unique top-voted repo wins; a tie or zero matches returns None so the
+    caller's loud failure is preserved (never-guess).
+    """
+    file_scope = _task_attr(request.task, "file_scope", None) or []
+    write_votes: dict[str, int] = {}
+    all_votes: dict[str, int] = {}
+    repos_by_name: dict[str, RepoIdentity] = {}
+    for entry in file_scope:
+        path = str(_item_attr(entry, "path", "") or "")
+        action = str(_item_attr(entry, "action", "") or "")
+        if not path:
+            continue
+        for repo in request.workspace_registry.repos:
+            if _path_prefix_matches(path, _repo_prefixes(repo, "")):
+                repos_by_name[repo.repo_name] = repo
+                all_votes[repo.repo_name] = all_votes.get(repo.repo_name, 0) + 1
+                if action in {"create", "modify", "delete"}:
+                    write_votes[repo.repo_name] = write_votes.get(repo.repo_name, 0) + 1
+                break
+    for votes in (write_votes, all_votes):
+        if not votes:
+            continue
+        ranked = sorted(votes.items(), key=lambda kv: (-kv[1], kv[0]))
+        if len(ranked) == 1 or ranked[0][1] > ranked[1][1]:
+            return repos_by_name[ranked[0][0]]
+        return None  # tie — stay loud
+    return None
 
 
 def _normalize_contract_path(

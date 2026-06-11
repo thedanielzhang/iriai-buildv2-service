@@ -732,6 +732,121 @@ def test_multi_repo_group_compile_requires_explicit_repo_identity(tmp_path: Path
     assert "repo_id or repo_path is required" in str(exc_info.value)
 
 
+def _multi_repo_registry(tmp_path: Path):
+    feature_root = tmp_path / "workspace" / ".iriai" / "features" / "slice-03" / "repos"
+    repos = [
+        _repo_identity(feature_root, name="supply-chain", repo_id="repo-sc"),
+        _repo_identity(feature_root, name="shared_libs", repo_id="repo-libs"),
+    ]
+    registry, _ = _registry(tmp_path, repos=repos)
+    return registry, feature_root
+
+
+def _compile_one(registry, task):
+    return ContractCompiler().compile_group(
+        ContractGroupCompileRequest(
+            feature_id=FEATURE_ID,
+            dag_sha256=DAG_SHA,
+            source_dag_artifact_id=42,
+            source_dag_sha256=SOURCE_DAG_SHA,
+            group_idx=78,
+            tasks=[task],
+            all_task_ids=[task.id],
+            workspace_registry=registry,
+        )
+    )
+
+
+def test_n17_absolute_repo_path_single_repo_registry_resolves(tmp_path: Path) -> None:
+    # The live kaya shape: monorepo registry (one repo), planning emitted the
+    # absolute repos ROOT as repo_path on every task.
+    feature_root = tmp_path / "workspace" / ".iriai" / "features" / "slice-03" / "repos"
+    registry, _ = _registry(
+        tmp_path, repos=[_repo_identity(feature_root, name="repos", repo_id="repo-mono")]
+    )
+    task = _task(
+        task_id="TASK-N17-0",
+        repo_path=str(feature_root),  # absolute — zero repo info
+        file_scope=[_scope("supply-chain/app/svc/thing.py", "create")],
+        acceptance_criteria=[SimpleNamespace(description="Build the thing.")],
+    )
+    [contract] = _compile_one(registry, task)
+    assert contract.repo_id == "repo-mono"
+
+
+def test_n17_absolute_repo_path_derives_repo_from_write_prefixes(tmp_path: Path) -> None:
+    registry, feature_root = _multi_repo_registry(tmp_path)
+    task = _task(
+        task_id="TASK-N17-1",
+        repo_path=str(feature_root),  # absolute repos root — zero repo info
+        file_scope=[
+            _scope("supply-chain/app/svc/thing.py", "create"),
+            _scope("supply-chain/tests/test_thing.py", "read_only"),
+        ],
+        acceptance_criteria=[SimpleNamespace(description="Build the thing.")],
+    )
+    [contract] = _compile_one(registry, task)
+    assert contract.repo_id == "repo-sc"
+
+
+def test_n17_empty_repo_path_multi_repo_derives_from_prefixes(tmp_path: Path) -> None:
+    registry, _ = _multi_repo_registry(tmp_path)
+    task = _task(
+        task_id="TASK-N17-2",
+        repo_path="",
+        file_scope=[
+            _scope("shared_libs/kaya_db/models/x.py", "modify"),
+            _scope("shared_libs/kaya_db/models/y.py", "read_only"),
+        ],
+        acceptance_criteria=[SimpleNamespace(description="Update models.")],
+    )
+    [contract] = _compile_one(registry, task)
+    assert contract.repo_id == "repo-libs"
+
+
+def test_n17_write_tie_stays_loud(tmp_path: Path) -> None:
+    registry, _ = _multi_repo_registry(tmp_path)
+    task = _task(
+        task_id="TASK-N17-3",
+        repo_path="",
+        file_scope=[
+            _scope("supply-chain/app/a.py", "create"),
+            _scope("shared_libs/kaya_db/b.py", "create"),
+        ],
+        acceptance_criteria=[SimpleNamespace(description="Split me.")],
+    )
+    with pytest.raises(ContractCompileError) as exc_info:
+        _compile_one(registry, task)
+    assert exc_info.value.failure_type == "contract_invalid_path"
+
+
+def test_n17_read_only_votes_break_write_tie_absence(tmp_path: Path) -> None:
+    registry, _ = _multi_repo_registry(tmp_path)
+    task = _task(
+        task_id="TASK-N17-4",
+        repo_path="",
+        file_scope=[
+            _scope("supply-chain/app/a.py", "read_only"),
+            _scope("supply-chain/app/b.py", "read_only"),
+        ],
+        acceptance_criteria=[SimpleNamespace(description="Observe only.")],
+    )
+    [contract] = _compile_one(registry, task)
+    assert contract.repo_id == "repo-sc"
+
+
+def test_n17_zero_file_task_anchors_to_first_registry_repo(tmp_path: Path) -> None:
+    registry, _ = _multi_repo_registry(tmp_path)
+    task = _task(
+        task_id="TASK-N17-5",
+        repo_path="",
+        file_scope=[],
+        acceptance_criteria=[SimpleNamespace(description="Pure gate task.")],
+    )
+    [contract] = _compile_one(registry, task)
+    assert contract.repo_id == "repo-sc"
+
+
 def test_multi_repo_group_compile_accepts_repaired_repo_path(tmp_path: Path) -> None:
     feature_root = tmp_path / "workspace" / ".iriai" / "features" / "slice-03" / "repos"
     repos = [
