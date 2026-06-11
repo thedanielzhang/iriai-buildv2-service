@@ -4133,10 +4133,31 @@ async def interview_gate_review(
                     prior_decisions=prior_decisions,
                 )
                 if not revision_result.ok:
-                    raise RuntimeError(
-                        "Gate review targeted revision failed: "
-                        + _format_targeted_revision_failures(revision_result)
-                    )
+                    # W-14 already-applied tolerance: a stale persisted review
+                    # (re-ingested prior-cycle verdict) re-executes a plan whose
+                    # fixes already landed — every reviser correctly produces a
+                    # no-op and the patch guard correctly rejects it. When ALL
+                    # failures are no-op rejections, the requested state already
+                    # holds: proceed to recompile + re-present (the re-review
+                    # verifies the artifact; a lazy-reviser no-op on a genuine
+                    # request resurfaces there). Any other failure still raises.
+                    all_noop = all(
+                        "made no changes" in (getattr(f, "reason", "") or "")
+                        for f in revision_result.failed
+                    ) and bool(revision_result.failed)
+                    if all_noop:
+                        logger.warning(
+                            "interview_gate_review: prior revision plan produced "
+                            "ONLY no-op patches (%s) — treating as already-applied "
+                            "(stale persisted plan; W-14) and proceeding to "
+                            "re-present",
+                            _format_targeted_revision_failures(revision_result),
+                        )
+                    else:
+                        raise RuntimeError(
+                            "Gate review targeted revision failed: "
+                            + _format_targeted_revision_failures(revision_result)
+                        )
                 # Re-compile with revisions applied
                 compiled_text = await compile_artifacts(
                     runner, feature, phase_name,
