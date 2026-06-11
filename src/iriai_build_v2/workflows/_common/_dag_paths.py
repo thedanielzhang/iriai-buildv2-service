@@ -511,6 +511,27 @@ def apply_path_resolution(
                 original in planned or (joined and joined in planned)
             )
             if not in_planned:
+                # READ-ONLY-class reference pointer with ZERO on-disk basename
+                # matches: nothing exists to confuse it with and it is never an
+                # edit target — a corpus/doc citation the planner put in
+                # file_scope (e.g. docs/submittal-prd/*). Leave the path
+                # untouched with a WARN instead of failing the slice. Read
+                # scopes WITH matches still raise (picking context wrong is
+                # real); modify scopes are never relaxed.
+                if (
+                    repos_root
+                    and action in ("read_only", "read")
+                    and (find_basename_matches or (
+                        lambda name: count_basename_matches(repos_root, name)
+                    ))(posixpath.basename(original)) == 0
+                ):
+                    logger.warning(
+                        "DAG path resolver backstop: %s:%s=%r is a read-only "
+                        "reference with zero on-disk basename matches — leaving "
+                        "unresolved (non-fatal pointer, not an edit target)",
+                        d.task_id, d.field, d.original,
+                    )
+                    continue
                 genuinely_ambiguous.append(d)
                 continue
             if repos_root:
