@@ -1,10 +1,112 @@
 from __future__ import annotations
 
+import logging
 from typing import Any, Generic, Literal, TypeVar
 
 from pydantic import BaseModel, Field, model_validator
 
 T = TypeVar("T", bound=BaseModel)
+
+logger = logging.getLogger(__name__)
+
+
+# ── Strict verdict-disposition normalization (item 3, shared helpers) ────────
+# Pure, dependency-free helpers shared by the develop gate path
+# (phases/implementation.py) and the verification lens layer
+# (execution/verification.py) — verification.py must not back-import from
+# implementation.py, so the shared vocabulary lives here with the models it
+# normalizes. Only consulted when IRIAI_STRICT_VERDICT_DISPOSITION is enabled
+# by the callers; these functions themselves are flag-agnostic.
+
+# Off-vocabulary severity aliases → canonical {blocker, major, minor, nit}.
+# Anything NOT in the canonical set and NOT aliased is treated as BLOCKING
+# (fail-closed): an unrecognized severity must never silently defer a finding.
+SEVERITY_NORMALIZATION_ALIASES = {
+    "critical": "blocker",
+    "crit": "blocker",
+    "p0": "blocker",
+    "sev0": "blocker",
+    "sev-0": "blocker",
+    "s0": "blocker",
+    "high": "major",
+    "severe": "major",
+    "important": "major",
+    "p1": "major",
+    "sev1": "major",
+    "sev-1": "major",
+    "s1": "major",
+    "medium": "minor",
+    "moderate": "minor",
+    "p2": "minor",
+    "p3": "minor",
+    "low": "nit",
+    "trivial": "nit",
+    "info": "nit",
+    "informational": "nit",
+    "suggestion": "nit",
+    "cosmetic": "nit",
+    "style": "nit",
+    "note": "nit",
+    "nitpick": "nit",
+}
+CANONICAL_SEVERITY_VOCABULARY = frozenset({"blocker", "major", "minor", "nit", ""})
+# Recognized non-failing check results (normalized via .strip().upper()).
+PASSING_CHECK_RESULTS = frozenset({
+    "PASS", "PASSED", "OK", "SATISFIED", "NOT-NEEDED", "NOT_NEEDED",
+    "NOT NEEDED", "N/A", "NA", "SKIP", "SKIPPED", "",
+})
+
+
+def normalize_severity_strict(severity: str, *, context: str = "") -> str:
+    """Normalize a free-text severity to the canonical vocabulary (strict mode).
+
+    Case/whitespace variants of canonical values normalize with a WARN only
+    when the vocabulary actually changes; off-vocab values map via the alias
+    table (WARN); unknown values are fail-closed to ``blocker`` so they are
+    never silently treated as deferrable.
+    """
+    raw = severity or ""
+    lowered = raw.strip().lower()
+    if lowered in CANONICAL_SEVERITY_VOCABULARY:
+        if lowered != raw:
+            logger.warning(
+                "Strict verdict disposition: normalized severity %r -> %r%s",
+                raw, lowered, f" ({context})" if context else "",
+            )
+        return lowered
+    mapped = SEVERITY_NORMALIZATION_ALIASES.get(lowered)
+    if mapped is not None:
+        logger.warning(
+            "Strict verdict disposition: off-vocabulary severity %r normalized "
+            "to %r%s",
+            raw, mapped, f" ({context})" if context else "",
+        )
+        return mapped
+    logger.warning(
+        "Strict verdict disposition: UNRECOGNIZED severity %r treated as "
+        "'blocker' (fail-closed)%s",
+        raw, f" ({context})" if context else "",
+    )
+    return "blocker"
+
+
+def check_result_failed_strict(result: str, *, context: str = "") -> bool:
+    """Fail-closed check-result evaluation for strict mode.
+
+    FAIL/FAILED (any case/whitespace) fail; recognized passing vocabulary
+    passes; anything unrecognized is treated as FAIL with a loud warning.
+    """
+    normalized = (result or "").strip().upper()
+    if normalized.startswith("FAIL"):
+        return True
+    if normalized in PASSING_CHECK_RESULTS:
+        return False
+    logger.warning(
+        "Strict verdict disposition: unrecognized check result %r treated as "
+        "FAIL (fail-closed)%s",
+        result, f" ({context})" if context else "",
+    )
+    return True
 
 
 # ── Citation model ───────────────────────────────────────────────────────────
@@ -1145,6 +1247,11 @@ class FindingRecord(BaseModel):
     cycle_introduced: int = 0
     cycle_resolved: int = 0
     fix_attempts: list[str] = Field(default_factory=list)
+    # Repo-tree content digest at finding creation (item 4): under
+    # IRIAI_LEDGER_FAIL_LOUD, resolve-by-absence requires the current tree
+    # digest to DIFFER from this one (file-change evidence). Optional and
+    # parse-compatible with pre-existing ledgers (empty = no evidence).
+    tree_digest: str = ""
 
 
 class FindingLedger(BaseModel):

@@ -314,7 +314,9 @@ from ....models.outputs import (
     TaskFileScope,
     TestPlan,
     Verdict,
+    check_result_failed_strict,
     envelope_done,
+    normalize_severity_strict,
 )
 from ....models.state import BuildState
 from ....roles import (
@@ -901,6 +903,13 @@ VERIFY_RETRIES = 2
 WARN_AFTER_CYCLES = 3
 BLOCKING_SEVERITIES = frozenset({"blocker", "major"})
 DAG_EXPANDED_VERIFY_ENV = "IRIAI_DAG_EXPANDED_VERIFY"
+# Item-3 verdict hardening (develop-readiness program): severity/result
+# normalization + approved=false coherence re-ask. Default OFF.
+STRICT_VERDICT_DISPOSITION_ENV = "IRIAI_STRICT_VERDICT_DISPOSITION"
+# Item-4 ledger/backlog fail-loud (quarantine + typed quiesce). Default OFF.
+LEDGER_FAIL_LOUD_ENV = "IRIAI_LEDGER_FAIL_LOUD"
+# Item-5 develop-side planning-contract AC waivers. Default OFF.
+DEVELOP_CONTRACT_AC_WAIVERS_ENV = "IRIAI_DEVELOP_CONTRACT_AC_WAIVERS"
 DAG_PARALLEL_REPAIR_ENV = "IRIAI_DAG_PARALLEL_REPAIR"
 DAG_PREFLIGHT_REPAIR_ENV = "IRIAI_DAG_PREFLIGHT_REPAIR"
 DAG_AUTO_RESOLVE_CONTRADICTIONS_ENV = "IRIAI_DAG_AUTO_RESOLVE_CONTRADICTIONS"
@@ -2944,7 +2953,18 @@ def _task_contract_prompt_block(contract: Any | None) -> str:
         sections.extend(["", "Contract acceptance criteria:"])
         for criterion in criteria[:30]:
             if isinstance(criterion, dict):
-                sections.append(f"- `{criterion.get('id', '')}` {criterion.get('text', '')}")
+                # Item-5: planning-contract-waived ACs (must_pass=False) stay
+                # visible but are explicitly marked non-binding.
+                waived_suffix = (
+                    " [WAIVED — operator-approved planning-contract waiver; "
+                    "do not enforce]"
+                    if criterion.get("must_pass") is False
+                    else ""
+                )
+                sections.append(
+                    f"- `{criterion.get('id', '')}` {criterion.get('text', '')}"
+                    f"{waived_suffix}"
+                )
         if len(criteria) > 30:
             sections.append(f"- ... {len(criteria) - 30} more")
     sections.append(
@@ -7786,6 +7806,36 @@ async def _checkpoint_durable_merge_queue_group(
             detail=detail,
             routed_failure=_route(detail, cause="checkpoint_declined"),
         )
+
+    # Item-1 (P0-1): flag-gated born-adopted adoption-record upsert. The
+    # queue-driven seal projects `dag-group:{idx}` via the coordinator's
+    # checkpoint projector and BYPASSES `_project_dag_group_checkpoint`, so
+    # this success exit is the second (and only other) seal family that must
+    # upsert the record. Flag OFF (default) is an unconditional no-op; flag
+    # ON fails loud (typed route, idempotent checkpoint re-run) rather than
+    # leaving a sealed group without a strict-resume marker.
+    from .born_adopted import upsert_born_adopted_record_at_seal
+
+    born_adopted_error = await upsert_born_adopted_record_at_seal(
+        runner,
+        feature,
+        group_idx=group_idx,
+        dag_sha256=dag_sha256,
+        checkpoint_body="",
+        commit_hash=str(merge_result.result_commit or ""),
+    )
+    if born_adopted_error:
+        detail = (
+            "born-adopted adoption-record upsert failed after durable merge "
+            f"queue group {group_idx} checkpoint: {born_adopted_error}"
+        )
+        return _MergeQueueCheckpointResult(
+            group_idx=group_idx,
+            checkpointed=False,
+            detail=detail,
+            routed_failure=_route(detail, cause="born_adopted_upsert_failed"),
+        )
+
     return _MergeQueueCheckpointResult(
         group_idx=group_idx,
         checkpointed=True,
@@ -12429,6 +12479,113 @@ async def _load_test_plan_section(
     return f"\n\n## Test Plan\n\n{body}"
 
 
+def _develop_contract_waivers_enabled() -> bool:
+    """Item-5 flag (IRIAI_DEVELOP_CONTRACT_AC_WAIVERS, default OFF).
+
+    OFF preserves today's behavior exactly: the catalog loader never reads
+    planning contracts, no entry carries a waived marker, and every external
+    AC compiles must_pass=True with byte-identical digests.
+    """
+    return os.environ.get(DEVELOP_CONTRACT_AC_WAIVERS_ENV, "").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+async def _load_planning_contract_waived_ac_ids(
+    runner: WorkflowRunner,
+    feature: Feature,
+    slug: str,
+) -> list[str]:
+    """Read waived_ac_ids from the persisted per-SF planning contract.
+
+    The fefd8f8 planning-side compiler persists SubfeaturePlanningContract at
+    ``dag-contract:{slug}`` with first-class ``waived_ac_ids`` (waivers
+    recorded/approved at the DAG gate). Missing or unparseable contracts are
+    WARN-skipped — a planning contract is optional input here, never a
+    contract-compile blocker.
+    """
+    raw = await runner.artifacts.get(f"dag-contract:{slug}", feature=feature)
+    if not raw:
+        return []
+    try:
+        payload = json.loads(str(raw))
+    except Exception as exc:
+        logger.warning(
+            "Could not parse planning contract dag-contract:%s for AC waivers "
+            "(%s) — no waivers applied for this subfeature",
+            slug, exc,
+        )
+        return []
+    ids = payload.get("waived_ac_ids") if isinstance(payload, dict) else None
+    if not isinstance(ids, list):
+        return []
+    return [str(ac_id).strip() for ac_id in ids if str(ac_id).strip()]
+
+
+async def _load_all_planning_contract_waivers(
+    runner: WorkflowRunner,
+    feature: Feature,
+    decomposition: SubfeatureDecomposition | None = None,
+) -> dict[str, list[str]]:
+    """Map subfeature slug -> waived_ac_ids across all planning contracts."""
+    if decomposition is None:
+        decomp_raw = await runner.artifacts.get("decomposition", feature=feature)
+        if not decomp_raw:
+            return {}
+        try:
+            decomposition = SubfeatureDecomposition.model_validate_json(str(decomp_raw))
+        except Exception:
+            try:
+                decomposition = SubfeatureDecomposition.model_validate(
+                    json.loads(str(decomp_raw))
+                )
+            except Exception:
+                logger.warning("Could not parse decomposition for contract waivers")
+                return {}
+    waivers: dict[str, list[str]] = {}
+    for sf in decomposition.subfeatures:
+        slug = (sf.slug or "").strip()
+        if not slug:
+            continue
+        waived = await _load_planning_contract_waived_ac_ids(runner, feature, slug)
+        if waived:
+            waivers[slug] = waived
+    return waivers
+
+
+def _apply_contract_waivers_to_entries(
+    entries: list[dict[str, Any]],
+    waived_ac_ids: list[str],
+    slug: str,
+) -> list[dict[str, Any]]:
+    """Mark catalog entries matching contract-waived AC ids (WARN each).
+
+    Marking is additive metadata only — the contract compiler
+    (task_contracts._external_acceptance_criteria_by_id) turns the marker into
+    must_pass=False and the gate compiler makes citing gates non-blocking.
+    """
+    waived_normalized = {w.casefold() for w in waived_ac_ids}
+    matched: set[str] = set()
+    for entry in entries:
+        raw_id = str(entry.get("id") or "").strip()
+        if raw_id and raw_id.casefold() in waived_normalized:
+            entry["waived"] = True
+            entry["waiver_source"] = f"dag-contract:{slug}"
+            matched.add(raw_id.casefold())
+            logger.warning(
+                "AC waiver applied: %s (source: dag-contract:%s waived_ac_ids) "
+                "— external AC will compile with must_pass=False",
+                raw_id, slug,
+            )
+    for missing in sorted(waived_normalized - matched):
+        logger.warning(
+            "AC waiver recorded on dag-contract:%s has no matching test-plan "
+            "AC entry: %s (nothing to waive in the develop catalog)",
+            slug, missing,
+        )
+    return entries
+
+
 async def _load_external_acceptance_criteria_catalog(
     runner: WorkflowRunner,
     feature: Feature,
@@ -12446,6 +12603,7 @@ async def _load_external_acceptance_criteria_catalog(
             logger.warning("Could not parse decomposition for contract test-plan catalog")
             return []
 
+    apply_waivers = _develop_contract_waivers_enabled()
     catalog: list[dict[str, Any]] = []
     for sf in decomposition.subfeatures:
         slug = (sf.slug or "").strip()
@@ -12454,7 +12612,14 @@ async def _load_external_acceptance_criteria_catalog(
         raw_plan = await runner.artifacts.get(f"test-plan:{slug}", feature=feature)
         if not raw_plan:
             continue
-        catalog.extend(_test_plan_acceptance_criteria_entries(raw_plan, slug))
+        entries = _test_plan_acceptance_criteria_entries(raw_plan, slug)
+        if apply_waivers:
+            waived = await _load_planning_contract_waived_ac_ids(
+                runner, feature, slug,
+            )
+            if waived:
+                entries = _apply_contract_waivers_to_entries(entries, waived, slug)
+        catalog.extend(entries)
     return catalog
 
 
@@ -14753,8 +14918,14 @@ class ImplementationPhase(Phase):
                             f"them in your verdict — they are intentionally deferred.\n\n"
                             f"{deferred}\n"
                         )
-                except Exception:
-                    pass
+                except Exception as exc:
+                    # Item-4: never silently drop the deferred-items context
+                    # from the gate handover — name the artifact loudly.
+                    logger.warning(
+                        "Failed to parse 'enhancement-backlog' for the gate "
+                        "handover deferred-issues section: %s",
+                        exc,
+                    )
 
             contradiction_decisions = await _format_contradiction_decisions_context(
                 runner,
@@ -14842,8 +15013,16 @@ class ImplementationPhase(Phase):
                     logger.info("Suppressed %d duplicate findings from code_reviewer", len(_suppressed))
                 review_verdict, _enhancements = _partition_verdict(review_verdict, "code_reviewer", "post-dag-gate")
                 await _append_enhancements(runner, feature, _enhancements)
-                ledger = _update_ledger(ledger, review_verdict, "code_reviewer", cycle)
+                ledger = _update_ledger(ledger, review_verdict, "code_reviewer", cycle, current_tree_digest=post_dag_gate_tree_digest)
                 await _save_ledger(runner, feature, ledger)
+
+            review_verdict = await _coherence_reask_if_incoherent(
+                runner, feature, review_verdict,
+                base_actor=reviewer, runtime=gate_runtime,
+                source="code_reviewer", phase_name=self.name,
+                feature_root=feature_root,
+                lane_id="post-dag:code-review-coherence",
+            )
 
             if _is_approved(review_verdict):
                 await runner.artifacts.put(
@@ -14923,8 +15102,16 @@ class ImplementationPhase(Phase):
                     logger.info("Suppressed %d duplicate findings from security_auditor", len(_suppressed))
                 security_verdict, _enhancements = _partition_verdict(security_verdict, "security_auditor", "post-dag-gate")
                 await _append_enhancements(runner, feature, _enhancements)
-                ledger = _update_ledger(ledger, security_verdict, "security_auditor", cycle)
+                ledger = _update_ledger(ledger, security_verdict, "security_auditor", cycle, current_tree_digest=post_dag_gate_tree_digest)
                 await _save_ledger(runner, feature, ledger)
+
+            security_verdict = await _coherence_reask_if_incoherent(
+                runner, feature, security_verdict,
+                base_actor=security_auditor, runtime=gate_runtime,
+                source="security_auditor", phase_name=self.name,
+                feature_root=feature_root,
+                lane_id="post-dag:security-coherence",
+            )
 
             if _is_approved(security_verdict):
                 await runner.artifacts.put(
@@ -15096,8 +15283,16 @@ class ImplementationPhase(Phase):
                     logger.info("Suppressed %d duplicate findings from qa_engineer", len(_suppressed))
                 qa_verdict, _enhancements = _partition_verdict(qa_verdict, "qa_engineer", "post-dag-gate")
                 await _append_enhancements(runner, feature, _enhancements)
-                ledger = _update_ledger(ledger, qa_verdict, "qa_engineer", cycle)
+                ledger = _update_ledger(ledger, qa_verdict, "qa_engineer", cycle, current_tree_digest=post_dag_gate_tree_digest)
                 await _save_ledger(runner, feature, ledger)
+
+            qa_verdict = await _coherence_reask_if_incoherent(
+                runner, feature, qa_verdict,
+                base_actor=qa_engineer, runtime=gate_runtime,
+                source="qa_engineer", phase_name=self.name,
+                feature_root=feature_root,
+                lane_id="post-dag:qa-coherence",
+            )
 
             if _is_approved(qa_verdict):
                 await runner.artifacts.put("dag-gate:qa", "approved", feature=feature)
@@ -15179,8 +15374,16 @@ class ImplementationPhase(Phase):
                     logger.info("Suppressed %d duplicate findings from integration_tester", len(_suppressed))
                 integration_verdict, _enhancements = _partition_verdict(integration_verdict, "integration_tester", "post-dag-gate")
                 await _append_enhancements(runner, feature, _enhancements)
-                ledger = _update_ledger(ledger, integration_verdict, "integration_tester", cycle)
+                ledger = _update_ledger(ledger, integration_verdict, "integration_tester", cycle, current_tree_digest=post_dag_gate_tree_digest)
                 await _save_ledger(runner, feature, ledger)
+
+            integration_verdict = await _coherence_reask_if_incoherent(
+                runner, feature, integration_verdict,
+                base_actor=integration_tester, runtime=gate_runtime,
+                source="integration_tester", phase_name=self.name,
+                feature_root=feature_root,
+                lane_id="post-dag:integration-coherence",
+            )
 
             if _is_approved(integration_verdict):
                 await runner.artifacts.put(
@@ -15275,8 +15478,16 @@ class ImplementationPhase(Phase):
                     logger.info("Suppressed %d duplicate findings from verifier", len(_suppressed))
                 verifier_verdict, _enhancements = _partition_verdict(verifier_verdict, "verifier", "post-dag-gate")
                 await _append_enhancements(runner, feature, _enhancements)
-                ledger = _update_ledger(ledger, verifier_verdict, "verifier", cycle)
+                ledger = _update_ledger(ledger, verifier_verdict, "verifier", cycle, current_tree_digest=post_dag_gate_tree_digest)
                 await _save_ledger(runner, feature, ledger)
+
+            verifier_verdict = await _coherence_reask_if_incoherent(
+                runner, feature, verifier_verdict,
+                base_actor=verifier, runtime=gate_runtime,
+                source="verifier", phase_name=self.name,
+                feature_root=feature_root,
+                lane_id="post-dag:verifier-coherence",
+            )
 
             if _is_approved(verifier_verdict):
                 await runner.artifacts.put(
@@ -20731,6 +20942,31 @@ async def _implement_dag(
             getattr(adoption_record, "completed_checkpoint_range", None),
             start_group,
         )
+        # Item-1 bundled P2 fix (audit: "adoption-boundary resume drops
+        # pre-boundary results"): the checkpoint-reload loop below starts at
+        # ``start_group``, so groups before the adoption boundary never reach
+        # ``all_results``/handover and their context is dropped on every
+        # resume. Flag-gated best-effort reload of the pre-boundary sealed
+        # results (flag OFF = today's behavior exactly; failures only warn —
+        # the adoption record already attests the range completed).
+        from .born_adopted import (
+            born_adopted_resume_enabled,
+            load_pre_boundary_checkpoint_results,
+        )
+
+        if start_group > 0 and born_adopted_resume_enabled():
+            pre_boundary_results = await load_pre_boundary_checkpoint_results(
+                runner,
+                feature,
+                start_group=start_group,
+            )
+            for r_data in pre_boundary_results:
+                try:
+                    result = ImplementationResult.model_validate(r_data)
+                    all_results.append(result)
+                    handover.record_success(result)
+                except Exception:
+                    pass
 
     for g_idx in range(start_group, len(dag.execution_order)):
         group_task_ids = list(dag.execution_order[g_idx])
@@ -21675,6 +21911,7 @@ async def _implement_dag(
                 prefix = f"{repo_prefix}/" if repo_prefix else ""
                 inline_prompt = (
                     _build_task_prompt(t, repo_prefix=prefix, contract=task_contract)
+                    + await _project_constraints_prompt_block(runner, feature)
                     + task_handover_context
                 )
 
@@ -23113,6 +23350,7 @@ async def _run_enhancement_group(
             prefix = f"{repo_prefix}/" if repo_prefix else ""
             inline_prompt = (
                 _build_task_prompt(t, repo_prefix=prefix, contract=task_contract)
+                + await _project_constraints_prompt_block(runner, feature)
                 + handover_context
             )
 
@@ -24293,6 +24531,29 @@ async def _project_dag_group_checkpoint(
         )
         return False, f"{type(exc).__name__}: {exc}"
 
+    # Item-1 (P0-1): flag-gated born-adopted adoption-record upsert at the
+    # group-checkpoint seal chokepoint — every seal path flows through this
+    # function (main seal, resume re-projection, merge-queue recovery), so
+    # the strict resume gate always finds a valid marker for features born
+    # under the control plane. Flag OFF (default) is an unconditional no-op;
+    # flag ON fails loud on upsert failure so a later strict resume never
+    # discovers a missing/stale marker the hard way.
+    from .born_adopted import upsert_born_adopted_record_at_seal
+
+    born_adopted_error = await upsert_born_adopted_record_at_seal(
+        runner,
+        feature,
+        group_idx=group_idx,
+        dag_sha256=dag_sha256,
+        checkpoint_body=body,
+        commit_hash=str(checkpoint.get("commit_hash") or ""),
+    )
+    if born_adopted_error:
+        return False, (
+            "born-adopted adoption-record upsert failed at group "
+            f"{group_idx} seal: {born_adopted_error}"
+        )
+
     if getattr(store, "test_mirror_group_checkpoint_to_artifacts", False):
         await runner.artifacts.put(projection_key, body, feature=feature)
     return True, ""
@@ -25011,6 +25272,37 @@ async def _verify(
         except Exception:
             pass
 
+    # Item-5 (flag ON): surface planning-contract AC waivers to the group
+    # verifier so a waived AC's absence is never reported (or enforced) as a
+    # blocking finding. WARN-logged per waiver — no silent waivers.
+    if _develop_contract_waivers_enabled():
+        try:
+            contract_waivers = await _load_all_planning_contract_waivers(
+                runner, feature,
+            )
+        except Exception as exc:  # noqa: BLE001 — advisory context only
+            logger.warning("Could not load planning-contract AC waivers: %s", exc)
+            contract_waivers = {}
+        if contract_waivers:
+            waiver_lines = []
+            for slug, ac_ids in sorted(contract_waivers.items()):
+                for ac_id in ac_ids:
+                    logger.warning(
+                        "Group verification honoring AC waiver: %s "
+                        "(source: dag-contract:%s)",
+                        ac_id, slug,
+                    )
+                    waiver_lines.append(
+                        f"- `{ac_id}` (source: dag-contract:{slug})"
+                    )
+            known_issues += (
+                "\n\n## Waived Acceptance Criteria (operator-approved planning-"
+                "contract waivers — do NOT enforce these or report their "
+                "absence as findings)\n"
+                + "\n".join(waiver_lines)
+                + "\n"
+            )
+
     contradiction_decisions = await _format_contradiction_decisions_context(
         runner,
         feature,
@@ -25315,6 +25607,91 @@ def _get_feature_root(runner: WorkflowRunner, feature: Feature) -> Path | None:
     return root if root.exists() else None
 
 
+# --------------------------------------------------------------------------- #
+# Project constraints prompt injection (readiness item 7 — R2 kaya-interim a).
+# ONE generic, flag-gated (default OFF) injection point: when the PLANNING-
+# authored `project-constraints` store artifact exists, its content is appended
+# as a binding section to every develop agent prompt (implementer/enhancement
+# dispatch inline prompts + every context-package consumer: verify, lenses,
+# gates, RCA). The workflow code stays project-agnostic — all project-specific
+# content lives in the artifact, never here.
+# --------------------------------------------------------------------------- #
+
+PROJECT_CONSTRAINTS_KEY = "project-constraints"
+PROJECT_CONSTRAINTS_PROMPT_ENV = "IRIAI_PROJECT_CONSTRAINTS_PROMPT"
+_PROJECT_CONSTRAINTS_HEADING = "## Project Operating Constraints (BINDING)"
+# Per-feature memo of NON-EMPTY blocks only (the artifact is a sealed planning
+# output; absence and read errors are never cached so a later authoring or a
+# transient store failure self-heals without a restart).
+_PROJECT_CONSTRAINTS_BLOCK_CACHE: dict[str, str] = {}
+
+
+def _project_constraints_prompt_enabled() -> bool:
+    return _env_flag_enabled(PROJECT_CONSTRAINTS_PROMPT_ENV, default=False)
+
+
+def _project_constraints_text_from_raw(raw: Any) -> str:
+    """Normalize the artifact value to markdown text ('' when unusable).
+
+    Accepts a plain markdown string, a JSON-encoded string, or a dict carrying
+    the text under `content`/`markdown`/`text` (flat primitives only — never a
+    nested model agents must populate).
+    """
+    if raw is None:
+        return ""
+    value: Any = raw
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped.startswith(("{", "[", '"')):
+            try:
+                value = json.loads(stripped)
+            except (ValueError, TypeError):
+                return value
+        else:
+            return value
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        for key in ("content", "markdown", "text"):
+            text = value.get(key)
+            if isinstance(text, str) and text.strip():
+                return text
+    return ""
+
+
+async def _project_constraints_prompt_block(
+    runner: WorkflowRunner, feature: Feature
+) -> str:
+    """The binding constraints prompt block, or '' (flag OFF / absent / error).
+
+    Flag OFF (the default) returns '' unconditionally — prompts are
+    byte-for-byte today's. Errors degrade to '' with a warning: the artifact is
+    optional planning output, not a required service.
+    """
+    if not _project_constraints_prompt_enabled():
+        return ""
+    cached = _PROJECT_CONSTRAINTS_BLOCK_CACHE.get(feature.id)
+    if cached is not None:
+        return cached
+    artifacts = getattr(runner, "artifacts", None)
+    if artifacts is None:
+        return ""
+    try:
+        raw = await artifacts.get(PROJECT_CONSTRAINTS_KEY, feature=feature)
+    except Exception:  # noqa: BLE001 - optional artifact; degrade loud-but-soft
+        logger.warning(
+            "project-constraints artifact read failed; injecting nothing",
+            exc_info=True,
+        )
+        return ""
+    text = _project_constraints_text_from_raw(raw).strip()
+    if not text:
+        return ""
+    block = f"\n\n{_PROJECT_CONSTRAINTS_HEADING}\n\n{text}\n"
+    _PROJECT_CONSTRAINTS_BLOCK_CACHE[feature.id] = block
+    return block
+
+
 async def _build_prompt_context_package(
     runner: WorkflowRunner,
     feature: Feature,
@@ -25324,6 +25701,17 @@ async def _build_prompt_context_package(
     intro_lines: list[str],
     sections: list[tuple[str, str, str]],
 ) -> ContextPackage | None:
+    constraints_block = await _project_constraints_prompt_block(runner, feature)
+    all_sections = list(sections)
+    if constraints_block.strip():
+        all_sections.insert(
+            0,
+            (
+                "project-constraints",
+                "Project Operating Constraints (binding)",
+                constraints_block.strip(),
+            ),
+        )
     return await build_context_package(
         runner,
         feature,
@@ -25338,7 +25726,7 @@ async def _build_prompt_context_package(
                 content=content,
                 file_name=f"{file_stem}-{key}.md",
             )
-            for key, label, content in sections
+            for key, label, content in all_sections
             if content.strip()
         ],
     )
@@ -38080,10 +38468,39 @@ def _collect_files(results: list[object]) -> list[str]:
     return _dedupe_preserving_order(files)
 
 
+def _strict_verdict_disposition_enabled() -> bool:
+    """Item-3 flag (IRIAI_STRICT_VERDICT_DISPOSITION, default OFF).
+
+    OFF preserves today's behavior exactly: exact case-sensitive severity
+    membership, exact ``== "FAIL"`` check results, no coherence re-ask.
+    """
+    return os.environ.get(STRICT_VERDICT_DISPOSITION_ENV, "").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+# Shared strict-mode normalization vocabulary + helpers live in
+# models/outputs.py (verification.py needs them too and must not back-import
+# from this module). Thin module-level aliases keep call sites readable.
+_normalize_severity = normalize_severity_strict
+_check_result_failed_strict = check_result_failed_strict
+
+
 def _is_approved(verdict: object) -> bool:
     """Approve if no blocker/major findings exist, regardless of agent opinion."""
     if not isinstance(verdict, Verdict):
         return False
+    if _strict_verdict_disposition_enabled():
+        for c in verdict.concerns:
+            if _normalize_severity(c.severity, context="concern") in BLOCKING_SEVERITIES:
+                return False
+        for g in verdict.gaps:
+            if _normalize_severity(g.severity, context="gap") in BLOCKING_SEVERITIES:
+                return False
+        for ch in verdict.checks:
+            if _check_result_failed_strict(ch.result, context=f"check:{ch.criterion}"):
+                return False
+        return True
     for c in verdict.concerns:
         if c.severity in BLOCKING_SEVERITIES:
             return False
@@ -38096,7 +38513,226 @@ def _is_approved(verdict: object) -> bool:
     return True
 
 
+async def _coherence_reask_if_incoherent(
+    runner: WorkflowRunner,
+    feature: Feature,
+    verdict: object,
+    *,
+    base_actor: AgentActor,
+    runtime: str | None,
+    source: str,
+    phase_name: str,
+    feature_root: Path | None,
+    lane_id: str,
+) -> object:
+    """Item-3 strict mode: approved=false coherence re-ask (gate-as-interview).
+
+    When a gate verdict says ``approved=False`` but contains no blocking
+    findings and no failing checks (so ``_is_approved`` would auto-approve and
+    silently park the disposition), do ONE bounded re-ask to the SAME reviewer
+    through the existing diagnostic-ask channel: restate the blocking findings
+    with canonical severities, or confirm approval. If the re-ask is STILL
+    incoherent, a synthetic blocker concern is appended so the gate takes the
+    existing not-approved branch — an approved=False disposition is never
+    silently approved. No-op unless IRIAI_STRICT_VERDICT_DISPOSITION is set.
+    """
+    if not _strict_verdict_disposition_enabled():
+        return verdict
+    if not isinstance(verdict, Verdict):
+        return verdict
+    if verdict.approved or not _is_approved(verdict):
+        return verdict
+    logger.warning(
+        "Strict verdict disposition: %s verdict has approved=false but no "
+        "blocker/major findings — running ONE coherence re-ask",
+        source,
+    )
+    reask_prompt = (
+        "Your previous verdict for this gate set approved=false but contained "
+        "NO blocker or major findings and NO failing checks, so the disposition "
+        "is incoherent.\n\n"
+        f"Your previous summary was:\n{verdict.summary}\n\n"
+        "Respond with a corrected verdict, exactly one of:\n"
+        "1. If something genuinely blocks approval: restate the blocking "
+        "finding(s) as concerns/gaps with canonical severities (blocker or "
+        "major) and keep approved=false.\n"
+        "2. If nothing blocks approval: confirm by returning approved=true.\n\n"
+        "Severity vocabulary is exactly: blocker | major | minor | nit."
+    )
+    try:
+        reasked = await _run_bound_diagnostic_ask(
+            runner,
+            feature,
+            base_actor=base_actor,
+            suffix="coherence",
+            runtime=runtime,
+            prompt=reask_prompt,
+            output_type=Verdict,
+            phase_name=phase_name,
+            feature_root=feature_root,
+            lane_id=lane_id,
+        )
+    except Exception as exc:  # noqa: BLE001 — fail-closed, never fail-open
+        logger.warning(
+            "Strict verdict disposition: coherence re-ask for %s failed (%s) — "
+            "treating original approved=false disposition as blocking",
+            source, exc,
+        )
+        reasked = None
+    if isinstance(reasked, Verdict):
+        if reasked.approved and _is_approved(reasked):
+            logger.warning(
+                "Strict verdict disposition: %s reviewer confirmed approval on "
+                "coherence re-ask",
+                source,
+            )
+            return reasked
+        if not _is_approved(reasked):
+            logger.warning(
+                "Strict verdict disposition: %s reviewer restated blocking "
+                "findings on coherence re-ask",
+                source,
+            )
+            return reasked
+        verdict = reasked
+    # Still incoherent (approved=False with no blocking findings) or the
+    # re-ask failed/was unparseable: fail closed via a synthetic blocker so the
+    # existing not-approved branch (_diagnose_and_fix / quiesce) handles it.
+    logger.warning(
+        "Strict verdict disposition: %s verdict remained incoherent after the "
+        "coherence re-ask — appending synthetic blocker (fail-closed)",
+        source,
+    )
+    synthetic = Issue(
+        severity="blocker",
+        description=(
+            "Strict verdict disposition: reviewer returned approved=false "
+            "without any blocker/major finding, and did not confirm approval "
+            f"on the coherence re-ask. Original summary: {verdict.summary}"
+        ),
+    )
+    return verdict.model_copy(update={"concerns": [*verdict.concerns, synthetic]})
+
+
 # ── Finding ledger ──────────────────────────────────────────────────────────
+
+
+def _ledger_fail_loud_enabled() -> bool:
+    """Item-4 flag (IRIAI_LEDGER_FAIL_LOUD, default OFF).
+
+    OFF preserves today's behavior exactly: a corrupt finding-ledger or
+    enhancement-backlog row silently resets the accumulated state to empty
+    (and the next put overwrites it), resolve-by-absence needs no evidence,
+    and gap suppression has no location guard.
+    """
+    return os.environ.get(LEDGER_FAIL_LOUD_ENV, "").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+def _append_operator_actions_entry(
+    runner: WorkflowRunner, *, title: str, why: str, commands: str, verify: str,
+) -> None:
+    """Prepend a [PENDING] entry to <workspace>/.iriai/OPERATOR-ACTIONS.md.
+
+    Best-effort by design: the durable workflow-blocker artifact is the
+    primary fail-loud channel; this entry is the driver/operator-visible
+    escalation queue (newest first, per the runbook format). Failures here
+    only WARN — they must never mask the quiesce itself.
+    """
+    try:
+        workspace_mgr = runner.services.get("workspace_manager")
+        base = Path(getattr(workspace_mgr, "_base", "") or "") if workspace_mgr else None
+        if not base or not (base / ".iriai").is_dir():
+            logger.warning(
+                "OPERATOR-ACTIONS entry skipped (no workspace .iriai dir): %s",
+                title,
+            )
+            return
+        path = base / ".iriai" / "OPERATOR-ACTIONS.md"
+        from datetime import datetime as _datetime
+
+        ts = _datetime.now().strftime("%Y-%m-%d %H:%M")
+        entry = (
+            f"## [PENDING] {ts} — {title}\n"
+            f"URGENCY: blocking-now (workflow quiesced)\n"
+            f"COMMANDS: {commands}\n"
+            f"WHY: {why}\n"
+            f"VERIFY: {verify}\n"
+            f"RESOLVED:\n\n"
+        )
+        existing = path.read_text(encoding="utf-8") if path.exists() else ""
+        path.write_text(entry + existing, encoding="utf-8")
+    except Exception as exc:  # noqa: BLE001 — never mask the quiesce
+        logger.warning("Failed to write OPERATOR-ACTIONS entry %r: %s", title, exc)
+
+
+async def _quarantine_and_quiesce_corrupt_row(
+    runner: WorkflowRunner,
+    feature: Feature,
+    *,
+    artifact_key: str,
+    raw: object,
+    parse_error: Exception,
+) -> None:
+    """Item-4 fail-loud path for a corrupt durable review-state row.
+
+    Quarantines the corrupt row under a sibling key (never PUTs over it),
+    writes a deterministic workflow-blocker marker, files an OPERATOR-ACTIONS
+    entry, and raises WorkflowQuiesced (typed quiesce). Exit is ONLY through
+    existing channels: the operator repairs/deletes the corrupt row (the
+    quarantine copy preserves it) and restarts the workflow.
+    """
+    raw_text = str(raw)
+    quarantine_key = f"{artifact_key}-quarantine"
+    reason = (
+        f"Corrupt {artifact_key!r} row (parse failure: {parse_error}); "
+        f"row length={len(raw_text)}, prefix={raw_text[:120]!r}. The row was "
+        f"NOT overwritten; a copy is quarantined at {quarantine_key!r}. "
+        "Repair or delete the corrupt row, then resume the workflow."
+    )
+    logger.error("Ledger fail-loud: %s", reason)
+    await runner.artifacts.put(
+        quarantine_key,
+        json.dumps({
+            "source_key": artifact_key,
+            "parse_error": str(parse_error),
+            "row_length": len(raw_text),
+            "raw": raw_text,
+        }, sort_keys=True),
+        feature=feature,
+    )
+    await runner.artifacts.put(
+        f"workflow-blocker:{artifact_key}",
+        json.dumps({
+            "source": artifact_key,
+            "reason": reason,
+            "deterministic_workflow_blocker": True,
+            "operator_required": True,
+        }, indent=2, sort_keys=True),
+        feature=feature,
+    )
+    _append_operator_actions_entry(
+        runner,
+        title=f"Repair corrupt {artifact_key} artifact row (workflow quiesced)",
+        why=reason,
+        commands=(
+            f"Inspect the latest {artifact_key!r} row in the artifact store; "
+            f"restore valid JSON (quarantine copy at {quarantine_key!r}), then "
+            "resume the workflow."
+        ),
+        verify=f"workflow resumes past the {artifact_key} load without re-quiescing",
+    )
+    raise WorkflowQuiesced(
+        phase_name="implementation",
+        reason=reason,
+        metadata={
+            "terminal_state": "workflow_blocked",
+            "deterministic_workflow_blocker": True,
+            "operator_required": True,
+            "source": artifact_key,
+        },
+    )
 
 
 async def _load_ledger(
@@ -38107,7 +38743,12 @@ async def _load_ledger(
     if raw:
         try:
             return FindingLedger.model_validate_json(raw)
-        except Exception:
+        except Exception as exc:
+            if _ledger_fail_loud_enabled():
+                await _quarantine_and_quiesce_corrupt_row(
+                    runner, feature,
+                    artifact_key="finding-ledger", raw=raw, parse_error=exc,
+                )
             logger.warning("Failed to parse finding ledger — starting fresh")
     return FindingLedger()
 
@@ -38158,11 +38799,20 @@ def _dedup_findings(
         if not is_dup:
             new_concerns.append(c)
 
+    gap_location_guard = _ledger_fail_loud_enabled()
     new_gaps = []
     for g in verdict.gaps:
         is_dup = False
         for r in resolved:
             if _text_overlap(g.description, r.description) > 0.5:
+                # Item-4 (flag ON): gap suppression requires a location match.
+                # Gaps carry no file path, so the category is the only
+                # location-ish key — require a non-empty exact match instead
+                # of suppressing on text overlap alone.
+                if gap_location_guard and not (
+                    g.category and g.category == r.category
+                ):
+                    continue
                 is_dup = True
                 suppressed.append(r)
                 break
@@ -38178,6 +38828,7 @@ def _dedup_findings(
 
 def _update_ledger(
     ledger: FindingLedger, verdict: Verdict, source: str, cycle: int,
+    *, current_tree_digest: str = "",
 ) -> FindingLedger:
     """Add new findings from a verdict, mark resolved ones.
 
@@ -38189,12 +38840,32 @@ def _update_ledger(
     current_descs |= {g.description for g in verdict.gaps}
 
     # Mark previously-open findings from this source as resolved
-    # if they no longer appear in the current verdict
+    # if they no longer appear in the current verdict.
+    # Item-4 (flag ON): resolve-by-absence additionally requires file-change
+    # evidence — the repo tree digest recorded when the finding was created
+    # must differ from the current one (i.e. SOMETHING changed since the
+    # finding was filed). Reviewer omission alone (same tree, or no digest
+    # evidence available at either end) keeps the finding open.
+    require_change_evidence = _ledger_fail_loud_enabled()
     for f in ledger.findings:
         if f.source == source and f.status == "open":
             if not any(
                 _text_overlap(f.description, d) > 0.5 for d in current_descs
             ):
+                if require_change_evidence and not (
+                    f.tree_digest
+                    and current_tree_digest
+                    and f.tree_digest != current_tree_digest
+                ):
+                    logger.warning(
+                        "Ledger fail-loud: NOT auto-resolving %s (%s) — "
+                        "reviewer omission without file-change evidence "
+                        "(finding digest=%s, current digest=%s)",
+                        f.id, f.source,
+                        (f.tree_digest or "<none>")[:12],
+                        (current_tree_digest or "<none>")[:12],
+                    )
+                    continue
                 f.status = "resolved"
                 f.cycle_resolved = cycle
 
@@ -38213,6 +38884,7 @@ def _update_ledger(
                 severity=c.severity,
                 status="open",
                 cycle_introduced=cycle,
+                tree_digest=current_tree_digest,
             ))
             next_id += 1
 
@@ -38226,6 +38898,7 @@ def _update_ledger(
                 category=g.category,
                 status="open",
                 cycle_introduced=cycle,
+                tree_digest=current_tree_digest,
             ))
             next_id += 1
 
@@ -38240,18 +38913,53 @@ def _partition_verdict(
     verdict: Verdict, source: str, task_context: str = "",
 ) -> tuple[Verdict, list[EnhancementItem]]:
     """Split a verdict into blocking-only and non-blocking enhancement items."""
-    blocking_concerns = [
-        c for c in verdict.concerns if c.severity in BLOCKING_SEVERITIES
-    ]
-    non_blocking_concerns = [
-        c for c in verdict.concerns if c.severity not in BLOCKING_SEVERITIES
-    ]
-    blocking_gaps = [
-        g for g in verdict.gaps if g.severity in BLOCKING_SEVERITIES
-    ]
-    non_blocking_gaps = [
-        g for g in verdict.gaps if g.severity not in BLOCKING_SEVERITIES
-    ]
+    if _strict_verdict_disposition_enabled():
+        # Strict mode: partition on NORMALIZED severities so case-variant or
+        # off-vocabulary blocking severities ("Blocker", "critical") are never
+        # silently parked in the enhancement backlog.
+        def _blocking(severity: str, kind: str) -> bool:
+            return (
+                _normalize_severity(severity, context=f"{source}:{kind}")
+                in BLOCKING_SEVERITIES
+            )
+
+        blocking_concerns = [
+            c for c in verdict.concerns if _blocking(c.severity, "concern")
+        ]
+        non_blocking_concerns = [
+            c for c in verdict.concerns if not _blocking(c.severity, "concern")
+        ]
+        blocking_gaps = [
+            g for g in verdict.gaps if _blocking(g.severity, "gap")
+        ]
+        non_blocking_gaps = [
+            g for g in verdict.gaps if not _blocking(g.severity, "gap")
+        ]
+        non_blocking_concerns = [
+            c.model_copy(update={
+                "severity": _normalize_severity(c.severity, context=f"{source}:concern"),
+            })
+            for c in non_blocking_concerns
+        ]
+        non_blocking_gaps = [
+            g.model_copy(update={
+                "severity": _normalize_severity(g.severity, context=f"{source}:gap"),
+            })
+            for g in non_blocking_gaps
+        ]
+    else:
+        blocking_concerns = [
+            c for c in verdict.concerns if c.severity in BLOCKING_SEVERITIES
+        ]
+        non_blocking_concerns = [
+            c for c in verdict.concerns if c.severity not in BLOCKING_SEVERITIES
+        ]
+        blocking_gaps = [
+            g for g in verdict.gaps if g.severity in BLOCKING_SEVERITIES
+        ]
+        non_blocking_gaps = [
+            g for g in verdict.gaps if g.severity not in BLOCKING_SEVERITIES
+        ]
 
     blocking_verdict = verdict.model_copy(update={
         "concerns": blocking_concerns,
@@ -38291,7 +38999,15 @@ async def _append_enhancements(
     if raw:
         try:
             backlog = EnhancementBacklog.model_validate_json(raw)
-        except Exception:
+        except Exception as exc:
+            if _ledger_fail_loud_enabled():
+                # Item-4: never PUT a fresh backlog over a corrupt row —
+                # quarantine + typed quiesce instead of a silent wipe.
+                await _quarantine_and_quiesce_corrupt_row(
+                    runner, feature,
+                    artifact_key="enhancement-backlog", raw=raw,
+                    parse_error=exc,
+                )
             backlog = EnhancementBacklog()
     else:
         backlog = EnhancementBacklog()

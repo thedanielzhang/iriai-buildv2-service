@@ -48,6 +48,18 @@ def is_structurally_valid(profile: ProjectProfile) -> bool:
         return False
     if profile.project_kind == "library":
         return True  # no runnable surface required
+    if profile.adapter_id == "compose":
+        # Compose-lane validity arm (readiness item 8 / P6): a compose-stack
+        # product is brought up via its OWN compose file and probed through the
+        # per-service ``service_probe_targets`` (adapters/compose.build_surfaces)
+        # — it never has a single ``start_cmd``/``ready_probe_kind``. Without
+        # this arm a hand-authored compose profile is rejected as "structurally
+        # incomplete" forever (perpetual cache-miss → agentic inference re-runs
+        # over the reviewed artifact). Additive: non-compose arms are unchanged.
+        return bool(
+            profile.compose_file
+            and any(t for t in profile.service_probe_targets)
+        )
     # any runnable kind needs a way to come up + be probed
     if not (profile.start_cmd or profile.native_test_cmd):
         return False

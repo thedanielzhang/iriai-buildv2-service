@@ -10,6 +10,7 @@ or persist records.
 from __future__ import annotations
 
 import hashlib
+import logging
 import re
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, Literal, Sequence, TypeAlias
@@ -23,6 +24,8 @@ from iriai_build_v2.workflows.develop.execution.workspace_authority import (
     stable_digest,
 )
 
+
+logger = logging.getLogger(__name__)
 
 JsonValue: TypeAlias = (
     str | int | float | bool | None | dict[str, Any] | list[Any]
@@ -1119,6 +1122,20 @@ def _external_acceptance_criteria_by_id(
             or "external_acceptance_criteria"
         )
         source_ordinal = _coerce_int(entry.get("source_ordinal"), 100_000 + ordinal)
+        # Item-5: planning-contract AC waivers. The catalog loader (flag-gated,
+        # IRIAI_DEVELOP_CONTRACT_AC_WAIVERS) marks waived entries; an unmarked
+        # catalog (the default) compiles must_pass=True with byte-identical
+        # digests. Every waiver application is WARN-logged with its source —
+        # no silent waivers (fefd8f8 discipline).
+        waived = bool(entry.get("waived"))
+        must_pass = not waived
+        if waived:
+            logger.warning(
+                "contract AC waiver honored: %s compiled with must_pass=False "
+                "(source: %s)",
+                raw_id,
+                str(entry.get("waiver_source") or source),
+            )
         digest = stable_digest(
             {
                 "id": criterion_id,
@@ -1126,7 +1143,7 @@ def _external_acceptance_criteria_by_id(
                 "source_field": source,
                 "source_ordinal": source_ordinal,
                 "text": text,
-                "must_pass": True,
+                "must_pass": must_pass,
             }
         )
         criterion = AcceptanceCriterionSpec(
@@ -1135,7 +1152,7 @@ def _external_acceptance_criteria_by_id(
             source_field=source,
             source_ordinal=source_ordinal,
             text=text,
-            must_pass=True,
+            must_pass=must_pass,
             digest=digest,
         )
         existing = criteria.get(criterion_id)
@@ -1285,13 +1302,32 @@ def _compile_verification_gates(
                 f"{task_id} verification gate references unknown criterion {raw_id!r}",
             )
         gate_digest_seed = stable_digest({"criterion_id": criterion_id, "digest": criterion.digest})
+        # Item-5: a gate citing a planning-contract-waived AC (must_pass=False)
+        # is kept VISIBLE but non-blocking — never a hard model_verifier gate,
+        # never silently dropped. WARN-logged per application (no silent
+        # waivers). Default path (no waivers marked) is byte-identical.
+        gate_waived = not criterion.must_pass
+        if gate_waived:
+            logger.warning(
+                "contract AC waiver honored: %s verification gate for %s "
+                "compiled non-blocking (blocks_merge=False, "
+                "blocks_checkpoint=False)",
+                task_id,
+                criterion_id,
+            )
         gates.append(
             VerificationGateSpec(
                 id=f"gate:{task_id}:model_verifier:{gate_digest_seed[:10]}",
                 gate_kind="model_verifier",
-                name=f"Verify {criterion_id}",
+                name=(
+                    f"Verify {criterion_id} (waived)"
+                    if gate_waived
+                    else f"Verify {criterion_id}"
+                ),
                 source="task_verification",
                 criterion_ids=[criterion_id],
+                blocks_merge=not gate_waived,
+                blocks_checkpoint=not gate_waived,
                 digest="",
             )
         )

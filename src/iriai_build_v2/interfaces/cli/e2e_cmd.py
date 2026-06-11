@@ -95,6 +95,17 @@ async def _open_live(feature: str):
         # the real feature row already exists (INSERT ... ON CONFLICT DO NOTHING).
         return await open_scratch_registry(LIVE_DSN, feat)
     except Exception as exc:  # noqa: BLE001
+        from ...workflows.develop.e2e.pass_ import require_profile_enabled
+
+        if require_profile_enabled():
+            # Item-6 fail-fast: degrading registry->None would silently route
+            # the pass to the studio-default profile downstream. With the
+            # strict-profile flag ON that degradation is forbidden.
+            raise click.ClickException(
+                f"registry unavailable: {exc} — IRIAI_E2E_REQUIRE_PROFILE is "
+                "set, so the silent no-registry/studio-default degradation is "
+                "disabled. Fix DB connectivity (IRIAI_E2E_DSN) and retry."
+            ) from exc
         click.echo(f"[warn] registry unavailable: {exc}")
         return None, None
 
@@ -112,11 +123,36 @@ def _load_profile_json(path: str):
 
 async def _resolve_profile(profile_json: str | None, registry):
     """Profile precedence: ``--profile-json`` -> persisted registry profile ->
-    the iriai-studio electron default (so a profile-absent studio run is unchanged)."""
+    the iriai-studio electron default (so a profile-absent studio run is unchanged).
+
+    Item-6 (IRIAI_E2E_REQUIRE_PROFILE, default OFF): with the flag ON a
+    missing/invalid profile raises a loud typed error instead of silently
+    using the studio default.
+    """
+    from ...workflows.develop.e2e.pass_ import (
+        REQUIRE_PROFILE_ENV,
+        require_profile_enabled,
+    )
+
     if profile_json:
-        return _load_profile_json(profile_json)
-    return (await registry.get_profile() if registry else None) \
-        or _default_electron_profile()
+        resolved = _load_profile_json(profile_json)
+    else:
+        resolved = await registry.get_profile() if registry else None
+    if require_profile_enabled():
+        if resolved is None:
+            raise click.ClickException(
+                "no project-profile artifact for this feature (and no "
+                "--profile-json override). Author and persist the "
+                "ProjectProfile (P6) or pass --profile-json; unset "
+                f"{REQUIRE_PROFILE_ENV} to allow the iriai-studio default."
+            )
+        alignment_errors = resolved.alignment_errors()
+        if alignment_errors:
+            raise click.ClickException(
+                "project profile is structurally invalid: "
+                + "; ".join(alignment_errors)
+            )
+    return resolved or _default_electron_profile()
 
 
 async def _preview(

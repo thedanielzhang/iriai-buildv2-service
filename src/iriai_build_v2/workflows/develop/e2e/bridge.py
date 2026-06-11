@@ -49,6 +49,63 @@ class BridgeResult:
     backlog_size: int = 0
 
 
+class E2EBacklogCorruptError(RuntimeError):
+    """A corrupt ``enhancement-backlog`` row was found by the e2e bridge.
+
+    Raised (item-4, IRIAI_LEDGER_FAIL_LOUD) AFTER the corrupt row has been
+    quarantined under ``enhancement-backlog-quarantine`` — the e2e pass fails
+    loudly and non-destructively instead of dying on an anonymous
+    ValidationError. The develop-side reader of the same key quiesces through
+    its own typed path; both readers preserve the corrupt row for repair.
+    """
+
+
+def _ledger_fail_loud_enabled() -> bool:
+    """Item-4 flag (IRIAI_LEDGER_FAIL_LOUD, default OFF = today's raw raise)."""
+    import os
+
+    return os.environ.get("IRIAI_LEDGER_FAIL_LOUD", "").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+async def _load_backlog_or_quarantine(registry: Any, raw: Any) -> EnhancementBacklog:
+    """Parse the backlog row; on corruption (flag ON) quarantine + typed error.
+
+    Flag OFF preserves today's behavior exactly: the parse error propagates
+    raw (non-destructive crash). Flag ON: the corrupt row is copied to
+    ``enhancement-backlog-quarantine`` (never overwritten in place) and a
+    typed ``E2EBacklogCorruptError`` names the key and the repair path.
+    """
+    try:
+        return _load_backlog(raw)
+    except Exception as exc:  # noqa: BLE001 — both branches re-raise
+        if not _ledger_fail_loud_enabled():
+            raise
+        raw_text = raw if isinstance(raw, str) else repr(raw)
+        try:
+            await registry.put_raw(
+                f"{ENHANCEMENT_BACKLOG_KEY}-quarantine",
+                {
+                    "source_key": ENHANCEMENT_BACKLOG_KEY,
+                    "parse_error": str(exc),
+                    "row_length": len(raw_text),
+                    "raw": raw_text,
+                },
+            )
+        except Exception as quarantine_exc:  # noqa: BLE001
+            raise E2EBacklogCorruptError(
+                f"corrupt '{ENHANCEMENT_BACKLOG_KEY}' row ({exc}); quarantine "
+                f"write ALSO failed ({quarantine_exc}) — repair the row "
+                "manually before re-running the e2e pass"
+            ) from exc
+        raise E2EBacklogCorruptError(
+            f"corrupt '{ENHANCEMENT_BACKLOG_KEY}' row ({exc}); the row was "
+            f"quarantined at '{ENHANCEMENT_BACKLOG_KEY}-quarantine' and NOT "
+            "overwritten — repair or delete it, then re-run the e2e pass"
+        ) from exc
+
+
 def _finding_description(
     verdict: E2EVerdictRecord, spec: E2ESpecRecord | None, checkpoint_label: str
 ) -> str:
@@ -70,7 +127,7 @@ async def bridge_findings(
     """Append non-critical regressions to the backlog (deduped). Critical ones
     are returned for the operator page (handled by status.py), NOT backlogged."""
     raw = await registry.get_raw(ENHANCEMENT_BACKLOG_KEY)
-    backlog = _load_backlog(raw)
+    backlog = await _load_backlog_or_quarantine(registry, raw)
     existing = [it.description for it in backlog.items]
     result = BridgeResult()
 
@@ -131,7 +188,7 @@ async def bridge_build_failures(
     the same Jaccard dedupe as ``bridge_findings``.
     """
     raw = await registry.get_raw(ENHANCEMENT_BACKLOG_KEY)
-    backlog = _load_backlog(raw)
+    backlog = await _load_backlog_or_quarantine(registry, raw)
     existing = [it.description for it in backlog.items]
     result = BridgeResult()
     for f in failures:
