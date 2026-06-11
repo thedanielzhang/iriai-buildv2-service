@@ -140,6 +140,19 @@ class SandboxIsolationError(SandboxCaptureError):
 _SANDBOX_COMMAND_TIMEOUT_ENV = "IRIAI_SANDBOX_COMMAND_TIMEOUT_S"
 _DEFAULT_SANDBOX_COMMAND_TIMEOUT_S = 1200.0  # 20 min — generous for large --no-local clones
 
+# Fast local clone: when source and destination are on the same filesystem,
+# use `git clone --local` (hardlinked objects, near-instant) instead of
+# `git clone --no-local` (full object copy). Disabled by setting
+# IRIAI_SANDBOX_LOCAL_CLONE=0.  Automatically falls back to --no-local when
+# the cross-filesystem guard triggers (different st_dev values).
+_SANDBOX_LOCAL_CLONE_ENV = "IRIAI_SANDBOX_LOCAL_CLONE"
+
+# Sandbox reuse on retry: when enabled, the sandbox idempotency key omits the
+# attempt number so that retries of the same task (same DAG sha, group, repos,
+# commits, and contracts) reattach to the existing sandbox instead of cloning
+# anew.  Off by default; enable with IRIAI_SANDBOX_REUSE_ON_RETRY=1.
+_SANDBOX_REUSE_ON_RETRY_ENV = "IRIAI_SANDBOX_REUSE_ON_RETRY"
+
 
 def _sandbox_command_timeout_s() -> float:
     """Hard timeout for a single sandbox subprocess (git) command.
@@ -158,6 +171,64 @@ def _sandbox_command_timeout_s() -> float:
     if 0 < value < 1e9:
         return value
     return _DEFAULT_SANDBOX_COMMAND_TIMEOUT_S
+
+
+def _sandbox_local_clone_enabled() -> bool:
+    """Return True when fast same-filesystem cloning is allowed (default on).
+
+    Set ``IRIAI_SANDBOX_LOCAL_CLONE=0`` to force ``--no-local`` unconditionally
+    (e.g. when the source is a worktree on a different volume)."""
+    raw = os.environ.get(_SANDBOX_LOCAL_CLONE_ENV, "1")
+    return str(raw).strip() not in ("0", "false", "False", "FALSE", "no", "No", "NO")
+
+
+def _sandbox_reuse_on_retry_enabled() -> bool:
+    """Return True when retry sandbox reuse is enabled (default off).
+
+    Set ``IRIAI_SANDBOX_REUSE_ON_RETRY=1`` to allow same-content retries to
+    reattach to the existing sandbox instead of paying a full clone."""
+    raw = os.environ.get(_SANDBOX_REUSE_ON_RETRY_ENV, "0")
+    return str(raw).strip() in ("1", "true", "True", "TRUE", "yes", "Yes", "YES")
+
+
+def _same_filesystem(path_a: Path, path_b: Path) -> bool:
+    """Return True when *path_a* and *path_b* reside on the same filesystem.
+
+    Uses ``os.stat().st_dev`` on the nearest existing ancestor of each path so
+    that the check works even before sandbox directories are created.  A stat
+    failure (permission error, race) is treated conservatively as False so the
+    caller falls back to the safe ``--no-local`` clone."""
+    def _dev(p: Path) -> int | None:
+        candidate = p
+        for _ in range(64):  # bound the ascent
+            try:
+                return os.stat(candidate).st_dev
+            except (OSError, PermissionError):
+                parent = candidate.parent
+                if parent == candidate:
+                    return None
+                candidate = parent
+        return None  # pragma: no cover
+
+    dev_a = _dev(path_a)
+    dev_b = _dev(path_b)
+    if dev_a is None or dev_b is None:
+        return False
+    return dev_a == dev_b
+
+
+def _git_clone_args(source: Path, dest: Path) -> list[str]:
+    """Return ``git clone`` argument list for *source* → *dest*.
+
+    Selects ``--local`` (hardlinked objects, near-instant on same-volume APFS)
+    when ``IRIAI_SANDBOX_LOCAL_CLONE`` is enabled AND source and dest are on
+    the same filesystem; otherwise falls back to the original ``--no-local``
+    (safe, full object copy across any filesystem boundary)."""
+    if _sandbox_local_clone_enabled() and _same_filesystem(source, dest):
+        clone_flag = "--local"
+    else:
+        clone_flag = "--no-local"
+    return ["clone", clone_flag, str(source), str(dest)]
 
 
 class SandboxReleaseError(SandboxError):
@@ -277,11 +348,10 @@ class SandboxSpec(_SandboxModel):
 
     @property
     def idempotency_key(self) -> str:
-        seed = {
+        seed: dict[str, Any] = {
             "feature_id": self.feature_id,
             "dag_sha256": self.dag_sha256,
             "group_idx": self.group_idx,
-            "attempt_no": self.attempt_no,
             "mode": self.mode,
             "repo_ids": sorted(self.repo_ids),
             "base_commits": {
@@ -290,6 +360,13 @@ class SandboxSpec(_SandboxModel):
             },
             "contract_ids": sorted(self.contract_ids),
         }
+        # When IRIAI_SANDBOX_REUSE_ON_RETRY is off (default) include attempt_no
+        # in the key so each attempt gets a fresh sandbox (previous behaviour).
+        # When enabled, the key is content-digest-only: same task/dag/repos/
+        # commits/contracts on a retry reattaches to the existing sandbox
+        # instead of paying a full clone + provisioning.
+        if not _sandbox_reuse_on_retry_enabled():
+            seed["attempt_no"] = self.attempt_no
         return f"idem:sandbox:{_stable_digest(seed)}"
 
 
@@ -580,10 +657,14 @@ class SandboxRunner:
                     # froze the entire asyncio loop (no watchdog/Slack/other
                     # workflow could run) — the bridge "hang". to_thread keeps the
                     # loop responsive; the per-command timeout bounds a wedged git.
+                    # When source and dest are on the same filesystem,
+                    # _git_clone_args() selects --local (hardlinked objects,
+                    # near-instant) instead of --no-local; falls back automatically
+                    # across filesystem boundaries or when IRIAI_SANDBOX_LOCAL_CLONE=0.
                     await asyncio.to_thread(
                         self._git_text,
                         sandbox_root,
-                        ["clone", "--no-local", str(source_resolved), str(repo_root)],
+                        _git_clone_args(source_resolved, repo_root),
                     )
                     self._git_text(repo_root, ["checkout", "--detach", base_commit])
                     # Restore gitignored dependencies (e.g. node_modules) so
