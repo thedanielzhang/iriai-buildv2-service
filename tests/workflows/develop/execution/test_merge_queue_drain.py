@@ -588,6 +588,81 @@ async def test_post_apply_gate_decision_rejects_conflict_markers(
     assert "app" in decision.verdict_payload["rejected_repo_ids"]
 
 
+@pytest.mark.asyncio
+async def test_post_apply_gate_decision_warns_not_fails_on_whitespace_only(
+    tmp_path: Path,
+) -> None:
+    """Whitespace-only `diff --check` findings are WARN, not merge_conflict (M-4).
+
+    An implementer patch carrying trailing whitespace / a blank line at EOF is
+    NOT a merge conflict — failing the lane as `merge_conflict` mis-routes the
+    retry implementer ("your patch conflicts") and it regenerates the same
+    whitespace. The gate must approve, recording the findings in the verdict
+    payload.
+    """
+    repo = tmp_path / "app"
+    _init_repo(repo)
+    # Staged trailing whitespace + new blank line at EOF — the exact state
+    # `git apply --index` leaves behind for a whitespace-carrying patch.
+    (repo / "README.md").write_text("init\ntrailing here   \n\n\n")
+    _git(repo, "add", "README.md")
+    check = subprocess.run(
+        ["git", "diff", "--check", "HEAD"], cwd=repo, capture_output=True, text=True
+    )
+    assert check.returncode != 0, "precondition: --check must flag the whitespace"
+
+    item = SimpleNamespace(
+        repo_targets=[SimpleNamespace(repo_id="app", repo_path=str(repo))]
+    )
+    decision = await impl._merge_queue_post_apply_gate_decision(item)
+    assert decision.approved is True
+    assert decision.verdict_payload["whitespace_warning_repo_ids"] == ["app"]
+    assert "trailing whitespace" in (
+        decision.verdict_payload["whitespace_warnings"]["app"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_post_apply_gate_decision_still_rejects_conflict_among_whitespace(
+    tmp_path: Path,
+) -> None:
+    """A real conflict marker still rejects even when whitespace findings coexist."""
+    repo = tmp_path / "app"
+    _init_repo(repo)
+    (repo / "README.md").write_text(
+        "init\ntrailing here   \n<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> branch\n"
+    )
+    _git(repo, "add", "README.md")
+
+    item = SimpleNamespace(
+        repo_targets=[SimpleNamespace(repo_id="app", repo_path=str(repo))]
+    )
+    decision = await impl._merge_queue_post_apply_gate_decision(item)
+    assert decision.approved is False
+    assert decision.failure_class == "merge_conflict"
+    assert "app" in decision.verdict_payload["rejected_repo_ids"]
+
+
+def test_diff_check_findings_whitespace_only_classifier() -> None:
+    """The `--check` output classifier fails closed on anything non-whitespace."""
+    ws = (
+        "a.txt:2: trailing whitespace.\n"
+        "+foo   \n"
+        "a.txt:3: new blank line at EOF.\n"
+    )
+    assert impl._diff_check_findings_whitespace_only(ws) is True
+    # A leftover conflict marker is never whitespace-only.
+    assert impl._diff_check_findings_whitespace_only(
+        "a.txt:2: leftover conflict marker\n"
+    ) is False
+    assert impl._diff_check_findings_whitespace_only(
+        ws + "a.txt:5: leftover conflict marker\n"
+    ) is False
+    # Empty / unparseable output (non-zero exit with no findings) fails closed.
+    assert impl._diff_check_findings_whitespace_only("") is False
+    assert impl._diff_check_findings_whitespace_only("fatal: bad revision\n") is False
+
+
 # ── raised worker exception: fails one lane, does not strand siblings ────────
 
 
