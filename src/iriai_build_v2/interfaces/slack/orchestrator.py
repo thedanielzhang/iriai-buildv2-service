@@ -1587,6 +1587,25 @@ class SlackWorkflowOrchestrator:
         workspace_manager = WorkspaceManager(base_path=workspace_path)
 
         ws = Workspace(id="main", path=workspace_path)
+        services = {
+            "feedback": self._env.feedback_service,
+            "preview": self._env.preview_service,
+            "playwright": self._env.playwright_service,
+            "artifact_mirror": self._env.artifact_mirror,
+            "workspace_manager": workspace_manager,
+            "tunnel": self._tunnel,
+            "slack_adapter": self._adapter,
+            "autonomous_remainder": self._autonomous_remainder,
+            "runtime_policy": resolved_runtime_policy,
+            "pool": getattr(self._env, "pool", None),
+        }
+        # Readiness item-2: flag-gated default CHK-boundary operator gate
+        # (IRIAI_DAG_QUIESCE_OPERATOR_GATE, default OFF = no-op = today).
+        from ...workflows.develop.execution.quiesce_gate import (
+            register_default_dag_quiesce_hook,
+        )
+
+        register_default_dag_quiesce_hook(services)
         runner = TrackedWorkflowRunner(
             feature_store=self._env.feature_store,
             agent_runtime=agent_runtime,
@@ -1598,18 +1617,7 @@ class SlackWorkflowOrchestrator:
             context_provider=self._env.context_provider,
             workspaces={"main": ws},
             budget=self._budget,
-            services={
-                "feedback": self._env.feedback_service,
-                "preview": self._env.preview_service,
-                "playwright": self._env.playwright_service,
-                "artifact_mirror": self._env.artifact_mirror,
-                "workspace_manager": workspace_manager,
-                "tunnel": self._tunnel,
-                "slack_adapter": self._adapter,
-                "autonomous_remainder": self._autonomous_remainder,
-                "runtime_policy": resolved_runtime_policy,
-                "pool": getattr(self._env, "pool", None),
-            },
+            services=services,
         )
         runner._slack_streamer = streamer  # type: ignore[attr-defined]
         return agent_runtime, runner

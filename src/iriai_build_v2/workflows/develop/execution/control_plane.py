@@ -72,8 +72,10 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "DAG_QUIESCE_AFTER_GROUP_ENV",
+    "DAG_QUIESCE_GROUP_INDEXES_ENV",
     "DEFAULT_DAG_QUIESCE_AFTER_GROUP",
     "_dag_quiesce_after_group",
+    "_dag_quiesce_group_indexes",
     "_is_workflow_blocker_text",
     "_quiesce_marker_matches",
     "_workflow_blocker_text",
@@ -97,6 +99,57 @@ Moved byte-for-byte from ``workflows/develop/phases/implementation.py``
 group 45, so the default quiesce point is one group BEFORE the regroup
 window opens.
 """
+
+
+DAG_QUIESCE_GROUP_INDEXES_ENV = "IRIAI_QUIESCE_GROUP_INDEXES"
+"""Readiness item-2 (P0-2/P-9): LIST env of group indexes AFTER which the DAG
+dispatch loop quiesces (e.g. ``"3,7,12"`` quiesces before groups 4, 8 and 13).
+
+Replaces the single-index env *default* on the dispatch path: with NEITHER env
+set the dispatch loop no longer inherits the prior feature's leftover
+``DEFAULT_DAG_QUIESCE_AFTER_GROUP = 44`` (the audit group-44 finding) — empty
+default = no quiesce. An EXPLICITLY-set ``IRIAI_DAG_QUIESCE_AFTER_GROUP`` is
+still honored (single-boundary back-compat) when the list env is unset.
+"""
+
+
+def _dag_quiesce_group_indexes() -> set[int]:
+    """The SET of group indexes after which group dispatch quiesces.
+
+    Precedence:
+    1. ``IRIAI_QUIESCE_GROUP_INDEXES`` set (even to ``""``): parse the comma
+       list; invalid tokens are WARN-skipped (never silently re-defaulted).
+    2. Legacy ``IRIAI_DAG_QUIESCE_AFTER_GROUP`` EXPLICITLY set (non-blank):
+       delegate to :func:`_dag_quiesce_after_group` (off-vocab values like
+       ``"off"`` still mean "disabled" there).
+    3. Neither set: EMPTY — the implicit group-44 default is intentionally
+       NOT inherited (it was a prior feature's leftover; see the env doc).
+    """
+    raw = os.environ.get(DAG_QUIESCE_GROUP_INDEXES_ENV)
+    if raw is not None:
+        indexes: set[int] = set()
+        invalid: list[str] = []
+        for token in raw.split(","):
+            token = token.strip()
+            if not token:
+                continue
+            try:
+                indexes.add(int(token))
+            except ValueError:
+                invalid.append(token)
+        if invalid:
+            logger.warning(
+                "Invalid %s token(s) %r ignored; using indexes %s",
+                DAG_QUIESCE_GROUP_INDEXES_ENV,
+                invalid,
+                sorted(indexes),
+            )
+        return indexes
+    legacy_raw = os.environ.get(DAG_QUIESCE_AFTER_GROUP_ENV)
+    if legacy_raw is not None and legacy_raw.strip():
+        legacy = _dag_quiesce_after_group()
+        return {legacy} if legacy is not None else set()
+    return set()
 
 
 def _dag_quiesce_after_group() -> int | None:

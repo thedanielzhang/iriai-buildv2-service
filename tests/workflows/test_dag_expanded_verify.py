@@ -11227,6 +11227,8 @@ async def test_artifact_repair_update_rejects_active_dag_key(tmp_path):
 @pytest.mark.asyncio
 async def test_quiesce_hook_runs_after_group_44_before_group_45(monkeypatch):
     monkeypatch.delenv(implementation_module.DAG_QUIESCE_AFTER_GROUP_ENV, raising=False)
+    # Readiness item-2: the implicit group-44 default is gone; list the boundary.
+    monkeypatch.setenv(implementation_module.DAG_QUIESCE_GROUP_INDEXES_ENV, "44")
     feature = SimpleNamespace(id="feat-quiesce", slug="quiesce", metadata={})
     dag = ImplementationDAG(
         tasks=[
@@ -11284,6 +11286,8 @@ async def test_quiesce_hook_runs_after_group_44_before_group_45(monkeypatch):
 @pytest.mark.asyncio
 async def test_implement_dag_quiesce_returns_terminal_state_without_dispatch(monkeypatch):
     monkeypatch.delenv(implementation_module.DAG_QUIESCE_AFTER_GROUP_ENV, raising=False)
+    # Readiness item-2: the implicit group-44 default is gone; list the boundary.
+    monkeypatch.setenv(implementation_module.DAG_QUIESCE_GROUP_INDEXES_ENV, "44")
     feature = SimpleNamespace(id="feat-quiesce-blocked", slug="quiesce-blocked", metadata={})
     dag = ImplementationDAG(
         tasks=[
@@ -11352,6 +11356,8 @@ async def test_implement_dag_quiesce_returns_terminal_state_without_dispatch(mon
 @pytest.mark.asyncio
 async def test_quiesce_marker_with_stale_identity_runs_hook_again(monkeypatch):
     monkeypatch.delenv(implementation_module.DAG_QUIESCE_AFTER_GROUP_ENV, raising=False)
+    # Readiness item-2: the implicit group-44 default is gone; list the boundary.
+    monkeypatch.setenv(implementation_module.DAG_QUIESCE_GROUP_INDEXES_ENV, "44")
     feature = SimpleNamespace(id="feat-quiesce-stale", slug="quiesce-stale", metadata={})
     dag = ImplementationDAG(
         tasks=[ImplementationTask(id="TASK-45", name="Task 45", description="Task 45")],
