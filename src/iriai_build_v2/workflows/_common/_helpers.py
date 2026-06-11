@@ -236,6 +236,31 @@ def _gate_review_is_approved(review_text: str) -> bool:
     return False
 
 
+def _gate_review_is_clamped_approval(review_text: str) -> bool:
+    """W-15: detect persisted verdicts whose approved bool was validator-clamped.
+
+    Until the W-15 fix, ``ReviewOutcome._revisions_override_approval`` forced
+    ``approved=False`` whenever ``new_decisions`` was non-empty — making it
+    structurally impossible to persist an approval that also recorded
+    decisions.  A persisted JSON verdict with ``approved`` false, ZERO
+    revision requests and at least one recorded decision is exactly that
+    clamp shape: nothing in it is actionable (rejections carry requests; the
+    zero-request path dead-ends at "revisions will not run"), so the verdict
+    is an approval-with-decisions whose bool the validator overwrote.
+    Markdown/legacy reviews never match.
+    """
+    try:
+        data = json.loads(review_text)
+    except (json.JSONDecodeError, TypeError):
+        return False
+    if not isinstance(data, dict) or data.get("approved") is not False:
+        return False
+    plan = data.get("revision_plan")
+    if not isinstance(plan, dict) or plan.get("requests"):
+        return False
+    return bool(plan.get("new_decisions"))
+
+
 def _is_placeholder_gate_review_text(text: str) -> bool:
     """True when a gate-review artifact holds the empty decision-ledger stub.
 
@@ -4041,7 +4066,43 @@ async def interview_gate_review(
     )
 
     # ── Fast-path: prior gate review already approved ──
-    if prior_review_text and compiled_text and _gate_review_is_approved(prior_review_text):
+    _clamped_approval = (
+        prior_review_text
+        and compiled_text
+        and not _gate_review_is_approved(prior_review_text)
+        and _gate_review_is_clamped_approval(prior_review_text)
+    )
+    if prior_review_text and compiled_text and (
+        _gate_review_is_approved(prior_review_text) or _clamped_approval
+    ):
+        if _clamped_approval:
+            logger.warning(
+                "interview_gate_review: W-15 — persisted %s verdict is a "
+                "validator-clamped approval (approved=false with ZERO revision "
+                "requests and recorded decisions); treating as approved and "
+                "ingesting its decisions",
+                gate_review_key,
+            )
+            clamped_decisions = (
+                json.loads(prior_review_text).get("revision_plan") or {}
+            ).get("new_decisions") or []
+            if clamped_decisions:
+                await refresh_decision_ledger(
+                    runner,
+                    feature,
+                    ledger_key=GLOBAL_DECISIONS_KEY,
+                    label="Global Decision Ledger",
+                    source_phase="plan-review",
+                    artifact_kind=artifact_prefix,
+                    statements=clamped_decisions,
+                    applies_to=artifact_applies_to(artifact_prefix),
+                )
+                await rebuild_canonical_decisions(
+                    runner,
+                    feature,
+                    phase_name=phase_name,
+                    decomposition=decomposition,
+                )
         logger.info(
             "interview_gate_review: found prior approved gate review for %s — "
             "skipping new gate interview",
@@ -4342,6 +4403,25 @@ async def interview_gate_review(
         )
 
         if outcome.approved:
+            # W-15: approval may legitimately carry recorded decisions
+            # (closure rulings, riders) — ingest them; they are not revisions.
+            if outcome.revision_plan.new_decisions:
+                await refresh_decision_ledger(
+                    runner,
+                    feature,
+                    ledger_key=GLOBAL_DECISIONS_KEY,
+                    label="Global Decision Ledger",
+                    source_phase="plan-review",
+                    artifact_kind=artifact_prefix,
+                    statements=outcome.revision_plan.new_decisions,
+                    applies_to=artifact_applies_to(artifact_prefix),
+                )
+                await rebuild_canonical_decisions(
+                    runner,
+                    feature,
+                    phase_name=phase_name,
+                    decomposition=decomposition,
+                )
             break
 
         # ── Fallback: extract revision plan from gate review file ──
@@ -4457,6 +4537,19 @@ async def interview_gate_review(
         updated_review = _read_artifact_file(runner, feature, gate_review_key)
         if updated_review:
             prior_review_text = updated_review
+
+        # W-15 hardening: a not-approved cycle with ZERO actionable requests
+        # (even after extraction) has nothing to revise — re-present for an
+        # explicit verdict instead of driving the convergence assert and
+        # targeted_revision with an empty plan.
+        if not outcome.revision_plan.requests:
+            logger.warning(
+                "interview_gate_review: %s cycle ended not-approved with zero "
+                "actionable revision requests — re-presenting for an explicit "
+                "verdict instead of running an empty revision wave",
+                artifact_prefix,
+            )
+            continue
 
         # Execute targeted revisions
         _assert_gate_requests_are_converging(

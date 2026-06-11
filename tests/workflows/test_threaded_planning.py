@@ -19661,6 +19661,72 @@ def test_gate_review_legacy_markdown_outcome_line_still_approved():
     assert _gate_review_is_approved(md) is True
 
 
+# ── W-15: validator-clamped approvals (approved=false + decisions, no requests) ──
+
+
+def test_w15_validator_allows_approval_with_decisions():
+    from iriai_build_v2.models.outputs import ReviewOutcome, RevisionPlan
+
+    outcome = ReviewOutcome(
+        approved=True,
+        revision_plan=RevisionPlan(new_decisions=["GF-005 closed as verified-resolved"]),
+        complete=True,
+    )
+    assert outcome.approved is True
+
+
+def test_w15_validator_still_clamps_approval_with_requests():
+    from iriai_build_v2.models.outputs import ReviewOutcome, RevisionPlan, RevisionRequest
+
+    outcome = ReviewOutcome(
+        approved=True,
+        revision_plan=RevisionPlan(
+            requests=[RevisionRequest(description="fix X", reasoning="broken")],
+            new_decisions=["D-1"],
+        ),
+    )
+    assert outcome.approved is False
+
+
+def test_w15_clamped_approval_shape_detected():
+    from iriai_build_v2.workflows._common._helpers import _gate_review_is_clamped_approval
+
+    text = (
+        '{"approved": false, "revision_plan": {"requests": [], '
+        '"new_decisions": ["GF-005 closed"], "complete": true}, "complete": true}'
+    )
+    assert _gate_review_is_clamped_approval(text) is True
+
+
+def test_w15_clamped_approval_requires_decisions():
+    from iriai_build_v2.workflows._common._helpers import _gate_review_is_clamped_approval
+
+    text = '{"approved": false, "revision_plan": {"requests": [], "new_decisions": []}}'
+    assert _gate_review_is_clamped_approval(text) is False
+
+
+def test_w15_clamped_approval_rejects_verdicts_with_requests():
+    from iriai_build_v2.workflows._common._helpers import _gate_review_is_clamped_approval
+
+    text = (
+        '{"approved": false, "revision_plan": {"requests": [{"description": "fix",'
+        ' "reasoning": "r"}], "new_decisions": ["D-1"]}}'
+    )
+    assert _gate_review_is_clamped_approval(text) is False
+
+
+def test_w15_clamped_approval_ignores_markdown_and_true_verdicts():
+    from iriai_build_v2.workflows._common._helpers import _gate_review_is_clamped_approval
+
+    assert _gate_review_is_clamped_approval("# Gate Review\nOutcome: approved\n") is False
+    assert (
+        _gate_review_is_clamped_approval(
+            '{"approved": true, "revision_plan": {"requests": [], "new_decisions": ["D-1"]}}'
+        )
+        is False
+    )
+
+
 # ---------------------------------------------------------------------------
 # T-1 contract-compiler defect regressions (L1-L4 + data-driven waivers)
 # ---------------------------------------------------------------------------

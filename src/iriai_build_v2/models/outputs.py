@@ -658,15 +658,19 @@ class ReviewOutcome(BaseModel):
 
     @model_validator(mode="after")
     def _revisions_override_approval(self) -> ReviewOutcome:
-        """If revision_plan has changes, approved must be False.
+        """If revision_plan has actionable requests, approved must be False.
 
         Agents sometimes set approved=True after discussing changes with the
         user, conflating 'user agreed changes are needed' with 'user approves
         the artifact as-is'.  Revisions always take priority.
+
+        W-15: only ``requests`` veto approval. ``new_decisions`` are decisions
+        captured during the review (closure rulings, ledger blocks, riders) and
+        are fully compatible with approval — clamping on them made it
+        structurally impossible to persist an approval that also recorded
+        decisions, silently burning gate cycles.
         """
-        if self.approved and (
-            self.revision_plan.requests or self.revision_plan.new_decisions
-        ):
+        if self.approved and self.revision_plan.requests:
             self.approved = False
         return self
 
