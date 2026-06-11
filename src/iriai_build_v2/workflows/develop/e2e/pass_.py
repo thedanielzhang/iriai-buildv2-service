@@ -69,6 +69,22 @@ def require_profile_enabled() -> bool:
     )
 
 
+class E2EPassRefused(RuntimeError):
+    """Item-11 G2: the compose preflight refused the pass — NOTHING ran.
+
+    Raised instead of returning a normal PassSummary so callers can never
+    mistake "the pass was refused" for "the pass ran": ``poll_once`` and the CLI
+    ``--once`` path hold the cursor (the SAME sealed checkpoint is retried on
+    the next poll once mutex/disk pressure clears), mirroring how the item-6
+    typed profile error already propagates past the cursor write.
+
+    UN-GATED bug-fix class (with regression tests): the raise lives ONLY in the
+    compose-preflight branch of ``_run_compose_pass`` — the studio path can
+    never hit it — and the prior behavior (silently consuming a sealed
+    checkpoint that was never tested) is a defect, not a behavior to preserve.
+    """
+
+
 @dataclass
 class LaneResult:
     config: str
@@ -104,6 +120,10 @@ class PassSummary:
     green: bool = False
     preview_url: str = ""
     detail: str = ""
+    # Item-11 G4 (flat): "" = studio/non-browser-lane product (unchanged);
+    # "not_built" = profile declares native_test_cmd but no configs yet;
+    # "ran" = declared compose browser lanes executed in this pass.
+    browser_lanes: str = ""
 
 
 def _live_repo(feature: str, repo_key: str) -> str:
@@ -381,10 +401,38 @@ async def _run_compose_pass(
     # Resource bound + single-stack mutex BEFORE standing anything up.
     pf = compose_preflight(project_prefix=(profile.compose_project_prefix or "e2e"))
     if not pf.ok:
-        summary.boot_smoke = "fail"
-        summary.detail = f"compose preflight refused: {pf.reason}"
-        on_log(summary.detail)
-        return summary  # nothing was brought up — no teardown, no false green
+        # Item-11 G2/G3: a refusal is LOUD (durable blocker + status row) and
+        # NON-ADVANCING (typed raise -> callers hold the cursor; the same sealed
+        # checkpoint is retried next poll). Nothing was brought up — no teardown,
+        # no false green, and the checkpoint is NOT consumed.
+        detail = f"compose preflight refused: {pf.reason}"
+        on_log(detail + " (cursor held; will retry this checkpoint)")
+        if registry is not None:
+            from .registry import BLOCKER_KEY  # deferred — mirror local imports
+
+            # Page once per (checkpoint, reason): the 10s poll loop retries the
+            # SAME checkpoint, so dedupe against the existing blocker row to
+            # avoid page-spam while still re-paging on a NEW reason/checkpoint.
+            prior = await registry.get_raw(BLOCKER_KEY) or {}
+            already_paged = prior.get("checkpoint") == label and any(
+                b.get("kind") == "boot_smoke"
+                and b.get("surface") == "compose-preflight"
+                and b.get("detail") == detail
+                for b in prior.get("blockers", [])
+            )
+            if not already_paged:
+                await page_critical(
+                    registry, poster=poster, checkpoint_label=label,
+                    boot_smoke_failures=[
+                        type("BS", (), {"surface": "compose-preflight",
+                                        "detail": detail})()
+                    ])
+            # Durable e2e-status row (card itself is digest-deduped).
+            status = build_status(
+                checkpoint=checkpoint, smokes=[], verdicts=[],
+                green_pointer=None, preview_url="")
+            await emit_status(registry, status, poster=poster)
+        raise E2EPassRefused(detail)
 
     sub = CloneSubstrate(role="track", mode="automated", persist=False)
     on_log(f"compose provisioning @ group {checkpoint.group_idx} ...")
@@ -446,6 +494,57 @@ async def _run_compose_pass(
                 elif v.status in ("fail", "error"):
                     summary.failed += 1
                 await registry.put_verdict(v)
+
+        # Item 11a (G1/G4): declared browser/Playwright lanes against the LIVE
+        # stack. Activation is double-gated by PROFILE CONTENT ONLY (no env
+        # flag): native_test_cmd set AND native_test_configs non-empty. The arm
+        # lives only in this compose branch — the studio path is untouched — and
+        # kaya's profile keeps the lanes dormant (configs=[]) until the STEP-13
+        # harness authors a playwright config and the profile is re-persisted.
+        stack_boot_smoke = summary.boot_smoke  # pre-lane value — keeps the
+        # stack-boot paging message below honest about WHAT failed.
+        lane_boot_failed: list[LaneResult] = []
+        if profile.native_test_cmd:
+            if not profile.native_test_configs:
+                # G4 green semantics (kaya profile notes (4)): "browser lanes
+                # not yet built" is NOT "passed" — a loud, distinguishable
+                # status, never silence. Boot+host green stays green while the
+                # lanes are profile-gated (the documented contract).
+                summary.browser_lanes = "not_built"
+                on_log(
+                    "browser lanes: not_built (native_test_cmd declared, no "
+                    "configs yet — green covers boot-smoke + host tests ONLY)")
+            elif summary.boot_smoke == "pass":
+                from .adapters.compose import run_to_verdicts
+
+                summary.browser_lanes = "ran"
+                for cfg in profile.native_test_configs:
+                    on_log(f"running browser lane {cfg} ...")
+                    nr = await adapter.run_native_config(instance, cfg)
+                    run = nr.result
+                    boot_error = lane_boot_error(run, nr.stderr_tail)
+                    lr = LaneResult(
+                        config=cfg, web_server_ok=run.web_server_ok,
+                        passed=run.passed, failed=run.failed, flaky=run.flaky,
+                        started=run.started, detail=run.summary(),
+                        boot_error=boot_error)
+                    summary.lanes.append(lr)
+                    summary.passed += run.passed
+                    summary.failed += run.failed
+                    summary.flaky += run.flaky
+                    if lr.boot_failed:
+                        lane_boot_failed.append(lr)
+                    verdicts = run_to_verdicts(run, suite=cfg, source_commit=commit)
+                    for v in verdicts:
+                        await registry.put_verdict(v)
+                    all_verdicts.extend(verdicts)
+                    on_log(f"  {cfg}: {lr.detail}")
+                if lane_boot_failed:
+                    # Mirrors the studio rule: a lane whose harness never came
+                    # up is a boot-smoke failure (honest infra error, never a
+                    # zero-test green) — blocks green, bridged + paged below.
+                    summary.boot_smoke = "fail"
+
         summary.spec_count = len(all_verdicts)
         summary.open_regressions = [v.spec_id for v in all_verdicts if v.status == "fail"]
 
@@ -455,7 +554,23 @@ async def _run_compose_pass(
             {}, checkpoint_label=label)
         summary.backlog_appended = len(br.appended)
 
-        if summary.boot_smoke == "fail":
+        if lane_boot_failed:
+            bf = await bridge_build_failures(
+                registry,
+                [LaneBuildFailure(lane=lr.config, error=lr.boot_error[:500])
+                 for lr in lane_boot_failed],
+                checkpoint_label=label)
+            summary.backlog_appended += len(bf.appended)
+            await page_critical(
+                registry, poster=poster, checkpoint_label=label,
+                boot_smoke_failures=[
+                    type("BS", (), {"surface": lr.config,
+                                    "detail": lr.boot_error[:300]})()
+                    for lr in lane_boot_failed])
+            on_log(f"  browser-lane boot FAIL on {len(lane_boot_failed)} "
+                   f"lane(s); backlog+={len(bf.appended)} (paged)")
+
+        if stack_boot_smoke == "fail":
             # Page on any boot fail — failed services OR an empty-surfaces profile
             # (no service came up), so a misconfig is a loud honest failure.
             failures = boot_failed or [
@@ -481,10 +596,13 @@ async def _run_compose_pass(
             checkpoint=checkpoint,
             smokes=[type("S", (), {"status": s.status, "surface": s.surface})()
                     for s in smokes],
-            verdicts=all_verdicts, green_pointer=gp, preview_url="")
+            verdicts=all_verdicts, green_pointer=gp, preview_url="",
+            browser_lanes=summary.browser_lanes)
         await emit_status(registry, status, poster=poster)
         summary.detail = (f"compose boot={summary.boot_smoke} "
                           f"pass/fail={summary.passed}/{summary.failed}")
+        if summary.browser_lanes:
+            summary.detail += f" browser_lanes={summary.browser_lanes}"
         return summary
     finally:
         if instance is not None:

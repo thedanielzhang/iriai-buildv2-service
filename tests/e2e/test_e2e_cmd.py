@@ -72,3 +72,66 @@ def test_resolve_profile_precedence(tmp_path):
 def test_live_repo_path_uses_template(monkeypatch):
     monkeypatch.setattr(e2e_cmd, "_LIVE_REPO_TMPL", "/scratch/{feature}/repos/{repo}")
     assert e2e_cmd._live_repo_path("featX", "kaya-main") == "/scratch/featX/repos/kaya-main"
+
+
+def _wire_once(monkeypatch, *, pass_behavior):
+    """Wire the `e2e --once` path with a fake checkpoint/preflight/pass."""
+    from iriai_build_v2.workflows.develop.e2e import checkpoint as cp_mod
+    from iriai_build_v2.workflows.develop.e2e import pass_ as pass_mod
+    from iriai_build_v2.workflows.develop.e2e import runner_loop as rl
+    from iriai_build_v2.workflows.develop.e2e.checkpoint import (
+        RepoCheckpoint,
+        SealedCheckpoint,
+    )
+
+    cursor_writes: list = []
+
+    class _OnceReg:
+        async def put_cursor(self, c):
+            cursor_writes.append(c)
+
+    async def fake_open_live(feature):
+        return None, _OnceReg()
+
+    cp = SealedCheckpoint(
+        feature_id="f", group_idx=9,
+        repos=[RepoCheckpoint(repo_id="r", repo_path="/x/kaya-main",
+                              result_commit="c9")])
+
+    async def fake_fetch(feature, *, dsn=None, max_group_idx=None):
+        return cp
+
+    monkeypatch.setattr(e2e_cmd, "_open_live", fake_open_live)
+    monkeypatch.setattr(cp_mod, "fetch_latest_sealed_checkpoint", fake_fetch)
+    monkeypatch.setattr(
+        rl, "host_preflight",
+        lambda **k: rl.Preflight(True, 0.0, 8.0, 100.0))
+    monkeypatch.setattr(pass_mod, "run_full_pass", pass_behavior)
+    return cursor_writes
+
+
+def test_e2e_once_refused_pass_does_not_write_cursor(monkeypatch):
+    # Item-11 G2: a refused compose preflight raises E2EPassRefused — the CLI
+    # --once path must NOT consume the sealed checkpoint (no put_cursor).
+    from iriai_build_v2.workflows.develop.e2e.pass_ import E2EPassRefused
+
+    async def refused_pass(*a, **kw):
+        raise E2EPassRefused("compose preflight refused: single-stack mutex")
+
+    cursor_writes = _wire_once(monkeypatch, pass_behavior=refused_pass)
+    asyncio.run(e2e_cmd._e2e("f", loop=False, do_pass=True))
+    assert cursor_writes == []  # cursor held — re-run retries the SAME checkpoint
+
+
+def test_e2e_once_normal_pass_still_writes_cursor(monkeypatch):
+    # Regression guard for the fix: the normal path keeps advancing the cursor.
+    from iriai_build_v2.workflows.develop.e2e.pass_ import PassSummary
+
+    async def ok_pass(cp, **kw):
+        return PassSummary(group_idx=cp.group_idx, boot_smoke="pass")
+
+    cursor_writes = _wire_once(monkeypatch, pass_behavior=ok_pass)
+    asyncio.run(e2e_cmd._e2e("f", loop=False, do_pass=True))
+    assert len(cursor_writes) == 1
+    assert cursor_writes[0].group_idx == 9
+    assert cursor_writes[0].last_processed_commit == "c9"

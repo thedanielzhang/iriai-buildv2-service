@@ -217,6 +217,11 @@ class E2EStatus(BaseModel):
     flaky: int = 0
     open_regressions: list[str] = Field(default_factory=list)  # spec_ids
     preview_url: str = ""
+    # Item-11 G4 green-semantics flag (flat, additive). "" = not a browser-lane
+    # product / studio path (unchanged); "not_built" = the profile declares a
+    # native_test_cmd but no configs yet (kaya harness-first gating — explicitly
+    # NOT "passed"); "ran" = declared browser lanes executed in this pass.
+    browser_lanes: str = ""
     updated_at: str = Field(default_factory=_utcnow_iso)
 
 
