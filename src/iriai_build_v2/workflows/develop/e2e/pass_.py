@@ -110,6 +110,20 @@ def _scenario_critical_for(sc: Any) -> tuple[bool, str]:
     return False, ""
 
 
+def _strict_green_counts(verdicts: list[Any]) -> dict[str, int]:
+    """Item-10 (c): counts the strict green oracle blocks on (kwargs for
+    ``green_pointer_for``; ignored there unless IRIAI_E2E_STRICT_GREEN is ON)."""
+    return {
+        "open_failures": sum(
+            1 for v in verdicts
+            if v.status == "fail"
+            and v.failure_class not in ("flaky", "intended_change")
+        ),
+        "open_errors": sum(1 for v in verdicts if v.status == "error"),
+        "open_skipped": sum(1 for v in verdicts if v.status == "skipped"),
+    }
+
+
 @dataclass
 class LaneResult:
     config: str
@@ -396,7 +410,8 @@ async def run_full_pass(
                        f"--checkpoint {checkpoint.group_idx}")
         summary.preview_url = preview_url
         gp = green_pointer_for(checkpoint, boot_smoke=summary.boot_smoke,
-                               open_critical_regressions=len(br.critical))
+                               open_critical_regressions=len(br.critical),
+                               **_strict_green_counts(all_verdicts))
         if gp:
             await registry.put_green_pointer(gp)
             summary.green = True
@@ -558,7 +573,8 @@ async def _run_compose_pass(
 
         gp = green_pointer_for(
             checkpoint, boot_smoke=summary.boot_smoke,
-            open_critical_regressions=len(br.critical))
+            open_critical_regressions=len(br.critical),
+            **_strict_green_counts(all_verdicts))
         if gp:
             await registry.put_green_pointer(gp)
             summary.green = True
