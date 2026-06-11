@@ -960,3 +960,215 @@ class TestTemplatePermissionNormalization:
         summary = manifest["permission_normalization"]["repos"]["app"]
         assert "mode" not in summary
         assert "paths_changed" in summary
+
+
+# ---------------------------------------------------------------------------
+# 8. Venv console-script path rewrite (N-23: staging-path shebangs dangle)
+# ---------------------------------------------------------------------------
+
+def _make_fake_venv(package_root: Path, embedded_prefix: str) -> None:
+    """Fake ``python3 -m venv`` output at ``<package_root>/.venv``.
+
+    Text console scripts (pip/pytest) whose shebang embeds *embedded_prefix*
+    (the venv's absolute location at creation time, exactly like real venv
+    console scripts), a NUL-containing binary launcher, an interpreter
+    symlink, and a ``pyvenv.cfg`` that also embeds the path.
+    """
+    bin_dir = package_root / ".venv" / "bin"
+    bin_dir.mkdir(parents=True)
+    shebang = f"#!{embedded_prefix}/.venv/bin/python3\n"
+    for script in ("pip", "pytest"):
+        (bin_dir / script).write_text(
+            shebang + "# -*- coding: utf-8 -*-\nimport sys\n", encoding="utf-8"
+        )
+        (bin_dir / script).chmod(0o755)
+    (bin_dir / "launcher.bin").write_bytes(
+        b"\x7fELF\x00\x01" + embedded_prefix.encode("utf-8") + b"\x00"
+    )
+    (bin_dir / "python3").symlink_to("/usr/bin/true")
+    (package_root / ".venv" / "pyvenv.cfg").write_text(
+        "home = /opt/pyenv/versions/3.12.0/bin\n"
+        f"command = /opt/pyenv/versions/3.12.0/bin/python3 -m venv "
+        f"{embedded_prefix}/.venv\n",
+        encoding="utf-8",
+    )
+
+
+def _fake_venv_provision(monkeypatch: pytest.MonkeyPatch) -> list[Path]:
+    """Monkeypatch dependency provisioning to lay down one fake venv.
+
+    Mirrors the real pip path: the venv is created IN the repo root the
+    provisioner is handed (the template build's staging repo), so its
+    embedded absolute path is the staging path.
+    """
+    provisioned_roots: list[Path] = []
+
+    def fake(self, repo_root, source_root):
+        pkg = Path(repo_root) / "ai-service"
+        pkg.mkdir(exist_ok=True)
+        _make_fake_venv(pkg, str(pkg))
+        provisioned_roots.append(Path(repo_root))
+        return [
+            sandbox_module.ProvisionResult(
+                rel_path="ai-service", manager="pip", ok=True
+            )
+        ]
+
+    monkeypatch.setattr(SandboxRunner, "_provision_sandbox_dependencies", fake)
+    return provisioned_roots
+
+
+class TestVenvPathRewrite:
+    def test_helper_rewrites_text_scripts_and_pyvenv_cfg_only(
+        self, tmp_path: Path
+    ) -> None:
+        repo = tmp_path / "repo"
+        pkg = repo / "ai-service"
+        _make_fake_venv(pkg, str(pkg))
+        binary_before = (pkg / ".venv" / "bin" / "launcher.bin").read_bytes()
+        runner = runner_for(tmp_path, repo)
+
+        new_repo = "/sandboxes/attempt-654/repo"
+        count = runner._rewrite_venv_path_references(
+            repo, old_prefix=str(repo), new_prefix=new_repo
+        )
+
+        assert count == 3  # pip + pytest + pyvenv.cfg
+        for script in ("pip", "pytest"):
+            content = (pkg / ".venv" / "bin" / script).read_text(encoding="utf-8")
+            assert content.startswith(
+                f"#!{new_repo}/ai-service/.venv/bin/python3\n"
+            )
+            assert str(repo) not in content
+            mode = (pkg / ".venv" / "bin" / script).stat().st_mode
+            assert mode & stat.S_IXUSR  # executable bit preserved
+        cfg = (pkg / ".venv" / "pyvenv.cfg").read_text(encoding="utf-8")
+        assert f"{new_repo}/ai-service/.venv" in cfg
+        assert str(repo) not in cfg
+        # Binary and symlink are never touched.
+        assert (pkg / ".venv" / "bin" / "launcher.bin").read_bytes() == binary_before
+        python3 = pkg / ".venv" / "bin" / "python3"
+        assert python3.is_symlink()
+        assert os.readlink(python3) == "/usr/bin/true"
+
+    def test_helper_noop_when_prefixes_match(self, tmp_path: Path) -> None:
+        repo = tmp_path / "repo"
+        _make_fake_venv(repo / "ai-service", str(repo / "ai-service"))
+        runner = runner_for(tmp_path, repo)
+        assert (
+            runner._rewrite_venv_path_references(
+                repo, old_prefix=str(repo), new_prefix=str(repo)
+            )
+            == 0
+        )
+
+    def test_template_publish_rewrites_staging_to_final_path(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Pass 1: at publish, staging-path shebangs become final-path."""
+        monkeypatch.setenv("IRIAI_SANDBOX_TEMPLATE_COW", "1")
+        monkeypatch.setenv("IRIAI_SANDBOX_TEMPLATE_PERMS", "0")
+        source = tmp_path / "canonical" / "app"
+        base = init_repo(source)
+        runner = runner_for(tmp_path, source)
+        provisioned_roots = _fake_venv_provision(monkeypatch)
+        template_dir = template_feature_dir(tmp_path) / "cafe0123deadbeef"
+        template_dir.parent.mkdir(parents=True)
+
+        repo_dir = runner._build_sandbox_template(
+            template_dir=template_dir,
+            digest="cafe0123deadbeef",
+            repo_id="app",
+            source_resolved=source.resolve(),
+            base_commit=base,
+        )
+
+        assert repo_dir == template_dir / "repo"
+        assert len(provisioned_roots) == 1
+        venv_bin = repo_dir / "ai-service" / ".venv" / "bin"
+        for script in ("pip", "pytest"):
+            content = (venv_bin / script).read_text(encoding="utf-8")
+            assert content.startswith(
+                f"#!{template_dir}/repo/ai-service/.venv/bin/python3\n"
+            )
+            assert ".staging-" not in content
+        cfg = (repo_dir / "ai-service" / ".venv" / "pyvenv.cfg").read_text(
+            encoding="utf-8"
+        )
+        assert ".staging-" not in cfg
+        # Binary keeps its (now-stale) staging bytes: proof it was untouched.
+        assert b".staging-" in (venv_bin / "launcher.bin").read_bytes()
+        assert (venv_bin / "python3").is_symlink()
+
+    def test_clone_rewrites_template_path_to_attempt_path(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Pass 2: each clone's scripts target the clone, never the template."""
+        if not _clonefile_supported(tmp_path):
+            pytest.skip("APFS clonefile (cp -c) unsupported on this volume")
+        monkeypatch.setenv("IRIAI_SANDBOX_TEMPLATE_COW", "1")
+        monkeypatch.setenv("IRIAI_SANDBOX_TEMPLATE_PERMS", "0")
+        source = tmp_path / "canonical" / "app"
+        base = init_repo(source)
+        runner = runner_for(tmp_path, source)
+        _fake_venv_provision(monkeypatch)
+
+        lease = run(runner.allocate(spec_for(base)))
+
+        repo_root = Path(lease.repo_roots["app"])
+        digests = [p for p in template_feature_dir(tmp_path).iterdir() if p.is_dir()]
+        assert len(digests) == 1
+        template_repo = digests[0] / "repo"
+        for script in ("pip", "pytest"):
+            content = (
+                repo_root / "ai-service" / ".venv" / "bin" / script
+            ).read_text(encoding="utf-8")
+            assert content.startswith(
+                f"#!{repo_root}/ai-service/.venv/bin/python3\n"
+            )
+            # Cross-contamination guard: never points at the template's venv.
+            assert str(template_repo) not in content
+            assert ".staging-" not in content
+            # The TEMPLATE's own script still targets the template.
+            template_content = (
+                template_repo / "ai-service" / ".venv" / "bin" / script
+            ).read_text(encoding="utf-8")
+            assert template_content.startswith(
+                f"#!{template_repo}/ai-service/.venv/bin/python3\n"
+            )
+        assert (repo_root / "ai-service" / ".venv" / "bin" / "python3").is_symlink()
+
+    def test_publish_rewrite_failure_falls_back_to_legacy(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A rewrite failure must never publish the template; loud fallback."""
+        monkeypatch.setenv("IRIAI_SANDBOX_TEMPLATE_COW", "1")
+        source = tmp_path / "canonical" / "app"
+        base = init_repo(source)
+        runner = runner_for(tmp_path, source)
+
+        def boom(self, repo_root, *, old_prefix, new_prefix):
+            raise sandbox_module.SandboxError("venv path rewrite exploded")
+
+        monkeypatch.setattr(SandboxRunner, "_rewrite_venv_path_references", boom)
+
+        with caplog.at_level("WARNING"):
+            lease = run(runner.allocate(spec_for(base)))
+
+        assert any(
+            "sandbox template build FAILED" in rec.getMessage()
+            and "falling back to legacy provisioning" in rec.getMessage()
+            for rec in caplog.records
+        )
+        feature_templates = template_feature_dir(tmp_path)
+        published = (
+            [p for p in feature_templates.iterdir() if p.is_dir()]
+            if feature_templates.exists()
+            else []
+        )
+        assert published == []  # never publish a template with dangling tooling
+        repo_root = Path(lease.repo_roots["app"])
+        assert git(repo_root, "rev-parse", "HEAD") == base
