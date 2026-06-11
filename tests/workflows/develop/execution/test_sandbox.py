@@ -359,6 +359,11 @@ def test_allocation_normalizes_clone_permissions_for_agent_group(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
+    # Pin template-time normalization OFF: this test asserts the FULL
+    # per-clone sweep's manifest internals (paths_changed); with the flag ON a
+    # template clone spot-verifies instead (covered in
+    # test_sandbox_template_cow.py).
+    monkeypatch.setenv("IRIAI_SANDBOX_TEMPLATE_PERMS", "0")
     monkeypatch.setattr(
         sandbox_module,
         "_agent_shared_group",
@@ -397,6 +402,9 @@ def test_allocation_permission_normalization_skips_symlink_targets(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
+    # Pin template-time normalization OFF: asserts the FULL per-clone sweep's
+    # symlinks_skipped counter (template clones spot-verify instead).
+    monkeypatch.setenv("IRIAI_SANDBOX_TEMPLATE_PERMS", "0")
     monkeypatch.setattr(
         sandbox_module,
         "_agent_shared_group",
