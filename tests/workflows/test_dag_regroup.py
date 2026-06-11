@@ -2885,3 +2885,50 @@ async def test_status_reports_rollback_blocked_without_dag_group_45(monkeypatch)
 
     assert result["dag_group_45_exists"] is False
     assert result["rollback_blocked"] is True
+
+
+@pytest.mark.asyncio
+async def test_typed_overlay_offset_probe_error_fails_closed(monkeypatch):
+    """WM-2: a probe ERROR raises (fail closed) instead of returning None —
+    None means "provably no active overlay row", never "lookup errored".
+    A transient DB error while an overlay is active must not silently
+    dispatch the base execution order."""
+
+    class _BrokenStore:
+        pass
+
+    class _Runner:
+        pass
+
+    monkeypatch.setattr(
+        implementation_module,
+        "_execution_control_store_for_runner",
+        lambda runner: _BrokenStore(),
+    )
+
+    class _FailingConn:
+        def __call__(self, store):
+            return self
+
+        async def __aenter__(self):
+            raise ConnectionError("transient db failure")
+
+        async def __aexit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(
+        implementation_module, "_merge_queue_connection", _FailingConn()
+    )
+    sleeps: list[float] = []
+
+    async def _fast_sleep(s):
+        sleeps.append(s)
+
+    import asyncio as _asyncio_mod
+    monkeypatch.setattr(_asyncio_mod, "sleep", _fast_sleep)
+
+    with pytest.raises(RuntimeError, match="fail-closed"):
+        await implementation_module._typed_regroup_active_overlay_offset(
+            _Runner(), "feat-123"
+        )
+    assert len(sleeps) == 3  # three bounded retries before the raise

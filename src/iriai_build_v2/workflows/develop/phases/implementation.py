@@ -20626,10 +20626,10 @@ async def _typed_regroup_active_overlay_offset(
     probe errors — i.e. ``None`` means "no typed regroup overlay is in play",
     so a feature with no typed overlay keeps its legacy / non-overlay behavior
     EXACTLY (the gating then falls back to the legacy ``DAG_REGROUP_FROM_GROUP``
-    constant). A transient DB error must not block dispatch, so an error here
-    is treated as "not present" — the typed resolver's own fail-closed path
-    (:func:`_resolve_active_regroup_typed_overlay`) still quiesces if a typed
-    overlay genuinely exists but cannot be proven safe.
+    constant). A PROBE ERROR, by contrast, FAILS CLOSED (WM-2): after a short
+    bounded retry it raises rather than defaulting to the base order — a
+    transient DB error while an overlay is active must never silently
+    dispatch base groups.
     """
 
     if RegroupOverlayResolver is None or RegroupOverlayStore is None:
@@ -20639,21 +20639,40 @@ async def _typed_regroup_active_overlay_offset(
     store = _execution_control_store_for_runner(runner)
     if store is None:
         return None
-    try:
-        async with _merge_queue_connection(store) as conn:
-            offset = await conn.fetchval(
-                "SELECT group_idx_offset FROM execution_regroup_overlays "
-                "WHERE feature_id = $1 AND status = 'active' LIMIT 1",
+    # WM-2 (overlay index-space audit): a PROBE ERROR must FAIL CLOSED. The
+    # old behavior returned None ("no overlay in play") on any exception —
+    # one transient DB error while an overlay is ACTIVE would silently
+    # dispatch the BASE execution order (resume scan, quiesce skip, wrong
+    # groups). None remains the answer ONLY when the query proves no active
+    # row exists; an unprovable state retries briefly and then raises loudly.
+    import asyncio  # local import — module convention avoids top-level asyncio
+
+    last_exc: Exception | None = None
+    for attempt in range(3):
+        try:
+            async with _merge_queue_connection(store) as conn:
+                offset = await conn.fetchval(
+                    "SELECT group_idx_offset FROM execution_regroup_overlays "
+                    "WHERE feature_id = $1 AND status = 'active' LIMIT 1",
+                    feature_id,
+                )
+                return None if offset is None else int(offset)
+        except Exception as exc:  # noqa: BLE001 - retried, then raised (fail closed)
+            last_exc = exc
+            logger.warning(
+                "Typed regroup active-overlay offset probe failed for feature "
+                "%s (attempt %d/3): %s",
                 feature_id,
+                attempt + 1,
+                exc,
             )
-            return None if offset is None else int(offset)
-    except Exception:  # noqa: BLE001 - probe failure → treat as not present.
-        logger.debug(
-            "Typed regroup active-overlay offset probe failed for feature %s",
-            feature_id,
-            exc_info=True,
-        )
-        return None
+            await asyncio.sleep(0.5 * (attempt + 1))
+    raise RuntimeError(
+        "typed regroup active-overlay offset probe failed after 3 attempts "
+        f"for feature {feature_id}; refusing to fall back to the base "
+        "execution order while an overlay activation may exist (WM-2 "
+        "fail-closed)"
+    ) from last_exc
 
 
 async def _resolve_active_regroup_legacy_marker(
