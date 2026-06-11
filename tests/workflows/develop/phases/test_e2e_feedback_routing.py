@@ -411,3 +411,92 @@ def test_verify_and_fix_group_new_params_default_to_today():
     sig = inspect.signature(impl._verify_and_fix_group)
     assert sig.parameters["max_retries"].default is None  # None => VERIFY_RETRIES
     assert sig.parameters["verify_key_stage_prefix"].default == ""  # '' => same keys
+
+
+# ── WM-4: the wave re-projection preserves the checkpoint's ORIGINAL sha ────
+#
+# On approval the wave re-projects dag-group:{N} (+ commit/gate proofs)
+# through _verify_and_fix_group's checkpoint path with the dag_sha256 it was
+# given. Pre-fix the wave passed the LOOP's sha — the EFFECTIVE sha once a
+# regroup overlay is active — over a group sealed under the BASE sha,
+# breaking the quiesce-marker prior_checkpoint_sha256 identity (boundary
+# re-fires) and rollback freshness (post-rollback the proofs match neither
+# base nor any accepted sha → group re-runs from scratch). The wave must
+# thread the checkpoint BODY's own sha, mirroring
+# _ensure_dag_group_checkpoint_projection_for_resume.
+
+
+def test_wave_preserves_checkpoint_body_sha_on_reprojection(monkeypatch):
+    monkeypatch.setenv(REPAIR_FLAG, "1")
+    captured: dict[str, Any] = {}
+
+    async def fake_verify(runner, feature, group_idx, group_tasks, results,
+                          all_results, handover, feature_root, impl_runtime,
+                          review_runtime, rca_runtime=None, **kwargs):
+        captured.update(kwargs, group_idx=group_idx)
+        return True, ""
+
+    async def fake_event(*a, **k):
+        return None
+
+    monkeypatch.setattr(impl, "_verify_and_fix_group", fake_verify)
+    monkeypatch.setattr(impl, "_log_feature_event", fake_event)
+    runner = FakeRunner(FakeArtifacts({
+        "enhancement-backlog": json.dumps({"items": [
+            {"source": "e2e_regression", "severity": "major", "description": "x"},
+        ]}),
+        # group 0 was sealed under the BASE sha (pre-overlay).
+        "dag-group:0": json.dumps({"results": [], "dag_sha256": "base-sha"}),
+    }))
+
+    class _Dag:
+        execution_order = [["t1"], ["t2"]]
+        tasks: list[Any] = []
+
+    # The loop dispatches under the EFFECTIVE sha (regroup overlay active).
+    out = asyncio.run(impl._maybe_run_e2e_boundary_repair_wave(
+        runner, _feature(), _Dag(), group_idx=1, tasks_by_id={},
+        all_results=[], handover=impl.HandoverDoc(), dag_sha256="effective-sha",
+    ))
+    assert out == ""
+    assert captured["group_idx"] == 0
+    # WM-4: the re-projection identity is the checkpoint body's OWN sha —
+    # never the loop's effective sha.
+    assert captured["dag_sha256"] == "base-sha"
+
+
+def test_wave_falls_back_to_loop_sha_when_body_has_none(monkeypatch):
+    """No overlay / legacy body without its own sha: the loop sha is the
+    correct identity — behavior unchanged (the body sha equals the loop sha
+    whenever no overlay is active)."""
+    monkeypatch.setenv(REPAIR_FLAG, "1")
+    captured: dict[str, Any] = {}
+
+    async def fake_verify(runner, feature, group_idx, group_tasks, results,
+                          all_results, handover, feature_root, impl_runtime,
+                          review_runtime, rca_runtime=None, **kwargs):
+        captured.update(kwargs, group_idx=group_idx)
+        return True, ""
+
+    async def fake_event(*a, **k):
+        return None
+
+    monkeypatch.setattr(impl, "_verify_and_fix_group", fake_verify)
+    monkeypatch.setattr(impl, "_log_feature_event", fake_event)
+    runner = FakeRunner(FakeArtifacts({
+        "enhancement-backlog": json.dumps({"items": [
+            {"source": "e2e_regression", "severity": "major", "description": "y"},
+        ]}),
+        "dag-group:0": json.dumps({"results": []}),  # no body sha
+    }))
+
+    class _Dag:
+        execution_order = [["t1"], ["t2"]]
+        tasks: list[Any] = []
+
+    out = asyncio.run(impl._maybe_run_e2e_boundary_repair_wave(
+        runner, _feature(), _Dag(), group_idx=1, tasks_by_id={},
+        all_results=[], handover=impl.HandoverDoc(), dag_sha256="loop-sha",
+    ))
+    assert out == ""
+    assert captured["dag_sha256"] == "loop-sha"

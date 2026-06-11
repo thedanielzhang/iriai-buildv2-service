@@ -2887,48 +2887,215 @@ async def test_status_reports_rollback_blocked_without_dag_group_45(monkeypatch)
     assert result["rollback_blocked"] is True
 
 
+# ── WM-2: the typed active-overlay offset probe fails CLOSED on lookup error ─
+#
+# Pre-fix, a transient DB error in `_typed_regroup_active_overlay_offset`
+# returned None ("no overlay"), which made `regroup_in_play=False` and the
+# whole run resume/dispatch on the BASE execution order while a typed overlay
+# was ACTIVE (silent divergence — wrong groups dispatch). The probe now
+# retries a bounded number of times and then raises
+# `RegroupOverlayProbeError`; `_implement_dag` converts that into a loud
+# fail-closed quiesce. A lookup that SUCCEEDS and proves no active row exists
+# still returns None — the legacy / non-overlay base path is preserved
+# exactly.
+
+
+class _ProbeFailingConn:
+    """A bare 'connection' whose lookup always errors (transient DB fault)."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def fetchval(self, *args, **kwargs):
+        self.calls += 1
+        raise RuntimeError("transient SELECT failure")
+
+
+class _ProbeNoRowConn:
+    """A bare 'connection' whose lookup SUCCEEDS and finds no active row."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def fetchval(self, *args, **kwargs):
+        self.calls += 1
+        return None
+
+
+def _probe_runner(conn) -> SimpleNamespace:
+    """A runner whose execution-control store yields *conn* as a bare pool.
+
+    `_merge_queue_connection` yields `store._pool` directly when it has no
+    `acquire` — so the fake conn is what the probe's SELECT runs against.
+    """
+
+    store = SimpleNamespace(
+        _pool=conn,
+        put_task_contract=lambda *a, **k: None,
+    )
+    return SimpleNamespace(
+        services={"execution_control_store": store},
+        artifacts=None,
+    )
+
+
+def _force_typed_modules_present(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make the Slice 09 module-availability gate pass without Postgres."""
+
+    monkeypatch.setattr(
+        implementation_module, "RegroupOverlayResolver", object()
+    )
+    monkeypatch.setattr(
+        implementation_module, "RegroupOverlayStore", object()
+    )
+
+
 @pytest.mark.asyncio
-async def test_typed_overlay_offset_probe_error_fails_closed(monkeypatch):
-    """WM-2: a probe ERROR raises (fail closed) instead of returning None —
-    None means "provably no active overlay row", never "lookup errored".
-    A transient DB error while an overlay is active must not silently
-    dispatch the base execution order."""
+async def test_typed_overlay_offset_probe_error_raises_fail_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """WM-2: a lookup ERROR raises after the bounded retry budget — it must
+    NEVER be reported as "no overlay" (the base-order default)."""
 
-    class _BrokenStore:
-        pass
+    _force_typed_modules_present(monkeypatch)
+    monkeypatch.setattr(
+        implementation_module, "_TYPED_REGROUP_PROBE_RETRY_DELAY_SECONDS", 0
+    )
+    conn = _ProbeFailingConn()
+    with pytest.raises(
+        implementation_module.RegroupOverlayProbeError
+    ) as exc_info:
+        await implementation_module._typed_regroup_active_overlay_offset(
+            _probe_runner(conn), "feat-probe-error"
+        )
+    # Bounded retry: every attempt in the budget ran before the raise.
+    assert conn.calls == implementation_module._TYPED_REGROUP_PROBE_ATTEMPTS
+    assert "fail closed" in str(exc_info.value)
+    assert "feat-probe-error" in str(exc_info.value)
 
-    class _Runner:
-        pass
+
+@pytest.mark.asyncio
+async def test_typed_overlay_offset_probe_no_row_still_returns_base_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """WM-2 companion: a lookup that SUCCEEDS and proves no active row exists
+    still returns None — a feature with no typed overlay keeps the legacy /
+    non-overlay base behavior EXACTLY (no spurious raise)."""
+
+    _force_typed_modules_present(monkeypatch)
+    conn = _ProbeNoRowConn()
+    probed = await implementation_module._typed_regroup_active_overlay_offset(
+        _probe_runner(conn), "feat-no-row"
+    )
+    assert probed is None
+    assert conn.calls == 1  # success on the first attempt — no retries
+
+
+@pytest.mark.asyncio
+async def test_typed_overlay_offset_probe_structural_absence_returns_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Structural absence (no store / no pool / no feature id) keeps the
+    pre-WM-2 legacy fallback (None) — it is NOT the transient-error case."""
+
+    _force_typed_modules_present(monkeypatch)
+    # No execution-control store at all.
+    runner = SimpleNamespace(services={}, artifacts=None, feature_store=None)
+    assert (
+        await implementation_module._typed_regroup_active_overlay_offset(
+            runner, "feat-storeless"
+        )
+        is None
+    )
+    # A store with no database pool.
+    no_pool_runner = SimpleNamespace(
+        services={
+            "execution_control_store": SimpleNamespace(
+                put_task_contract=lambda *a, **k: None
+            )
+        },
+        artifacts=None,
+    )
+    assert (
+        await implementation_module._typed_regroup_active_overlay_offset(
+            no_pool_runner, "feat-poolless"
+        )
+        is None
+    )
+    # No feature id.
+    assert (
+        await implementation_module._typed_regroup_active_overlay_offset(
+            _probe_runner(_ProbeNoRowConn()), ""
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_implement_dag_quiesces_on_offset_probe_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """WM-2 caller contract: `_implement_dag` converts the probe raise into a
+    loud fail-closed quiesce — it must NOT swallow it and resume/dispatch on
+    the BASE execution order."""
+
+    async def _raise_probe_error(*_args, **_kwargs):
+        raise implementation_module.RegroupOverlayProbeError(
+            "typed regroup active-overlay lookup errored"
+        )
 
     monkeypatch.setattr(
         implementation_module,
-        "_execution_control_store_for_runner",
-        lambda runner: _BrokenStore(),
+        "_typed_regroup_active_overlay_offset",
+        _raise_probe_error,
     )
 
-    class _FailingConn:
-        def __call__(self, store):
-            return self
+    class _FakeArtifacts:
+        async def get(self, key, *, feature=None):
+            return ""
 
-        async def __aenter__(self):
-            raise ConnectionError("transient db failure")
+        async def put(self, key, value, *, feature=None):
+            return None
 
-        async def __aexit__(self, *exc):
-            return False
-
-    monkeypatch.setattr(
-        implementation_module, "_merge_queue_connection", _FailingConn()
+    runner = SimpleNamespace(
+        artifacts=_FakeArtifacts(), services={}, feature_store=None
     )
-    sleeps: list[float] = []
+    feature = SimpleNamespace(
+        id="feat-probe-quiesce", slug="probe-quiesce", metadata={}
+    )
+    outcome = await implementation_module._implement_dag(
+        runner, feature, _small_dag(2)
+    )
+    assert outcome.terminal_state == "quiesced"
+    assert "lookup errored" in outcome.failure
+    assert outcome.implementation_text == ""
 
-    async def _fast_sleep(s):
-        sleeps.append(s)
 
-    import asyncio as _asyncio_mod
-    monkeypatch.setattr(_asyncio_mod, "sleep", _fast_sleep)
+@pytest.mark.asyncio
+async def test_typed_resolver_double_fault_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """WM-2 compounding fault: when the typed resolver errors AND the
+    follow-up active-row existence probe ALSO errors, overlay state is
+    UNKNOWN — the resolver must quiesce fail-closed, never defer to the
+    legacy path (which returns the BASE dag for groups below the legacy
+    offset)."""
 
-    with pytest.raises(RuntimeError, match="fail-closed"):
-        await implementation_module._typed_regroup_active_overlay_offset(
-            _Runner(), "feat-123"
-        )
-    assert len(sleeps) == 3  # three bounded retries before the raise
+    conn = _ProbeFailingConn()
+    runner = _probe_runner(conn)
+    feature = SimpleNamespace(id="feat-double-fault", slug="double-fault")
+    if (
+        implementation_module.RegroupOverlayResolver is None
+        or implementation_module.RegroupOverlayStore is None
+    ):
+        pytest.skip("Slice 09 typed overlay modules unavailable")
+    result = await implementation_module._resolve_active_regroup_typed_overlay(
+        runner, feature, _small_dag(3), group_idx=1
+    )
+    # Pre-fix this returned None (defer to legacy → BASE dag for group 1).
+    assert result is not None
+    effective_dag, failure, observation = result
+    assert effective_dag is None
+    assert "could not be read" in failure
+    assert observation["reason"] == "regroup_invalid_resolver_error"
+    assert observation["active_overlay_probe"] == "probe_error"
