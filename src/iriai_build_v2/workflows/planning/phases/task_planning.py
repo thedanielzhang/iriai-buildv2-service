@@ -618,6 +618,60 @@ async def _load_planning_waivers(
     return waived
 
 
+DAG_PACKING_ENVELOPE_KEY = "dag-packing-envelope"
+
+
+async def _load_dag_packing_envelope_section(
+    runner: WorkflowRunner,
+    feature: Feature,
+) -> str:
+    """Load the operator-pinned DAG packing envelope and render it as a
+    delimited prompt section for the task-planning authoring/review agents.
+
+    The ``dag-packing-envelope`` store key is written only by the operator/
+    driver through the artifact-store path; key presence is the opt-in —
+    there is no env flag (same pattern as ``planning-waivers:{slug}``).
+    When present, the text is injected verbatim into the slice-planner,
+    workstream-planner, and DAG integration-review prompts so the first
+    authored draft fits the operator's packing targets instead of needing
+    an oversized-draft revision round.
+
+    Tolerant loader: missing/unreadable/invalid (non-string or blank) →
+    ``""`` with a debug log; present → INFO log.
+    """
+    try:
+        text = await runner.artifacts.get(DAG_PACKING_ENVELOPE_KEY, feature=feature)
+    except Exception:
+        logger.debug(
+            "dag packing envelope key %s unavailable",
+            DAG_PACKING_ENVELOPE_KEY,
+            exc_info=True,
+        )
+        return ""
+    if not isinstance(text, str) or not text.strip():
+        logger.debug(
+            "no dag packing envelope recorded at %s",
+            DAG_PACKING_ENVELOPE_KEY,
+        )
+        return ""
+    body = text.strip()
+    logger.info(
+        "dag packing envelope store key %s active (%d chars) — injecting "
+        "operator-pinned packing constraints into task-planning prompts",
+        DAG_PACKING_ENVELOPE_KEY,
+        len(body),
+    )
+    return (
+        "## DAG Packing Envelope (operator-pinned)\n"
+        "The operator pinned the packing envelope below for this feature's "
+        "implementation DAG. Treat it as binding sizing/topology guidance — "
+        "it overrides default granularity heuristics. Author (and review) "
+        "the DAG to fit it on the first pass.\n\n"
+        f"{body}\n\n"
+        "(End of operator-pinned DAG packing envelope.)\n\n"
+    )
+
+
 async def _load_migrated_test_plan_sidecar_ac_ids(
     runner: WorkflowRunner,
     feature: Feature,
@@ -6018,6 +6072,9 @@ class TaskPlanningPhase(Phase):
             artifact_prefix="dag",
             broad_key="dag:strategy",
             review_key_suffix="dag",
+            extra_prompt_section=await _load_dag_packing_envelope_section(
+                runner, feature
+            ),
         )
 
         if review.needs_revision:
@@ -6322,6 +6379,9 @@ class TaskPlanningPhase(Phase):
             decomposition,
         )
         plan_text = await runner.artifacts.get("plan", feature=feature) or ""
+        packing_envelope_section = await _load_dag_packing_envelope_section(
+            runner, feature
+        )
 
         ws_decomp: WorkstreamDecomposition = await runner.run(
             Ask(
@@ -6333,6 +6393,7 @@ class TaskPlanningPhase(Phase):
                     "Produce execution rounds — workstreams in the same round can run in "
                     "parallel. A workstream enters a round only when all its depends_on "
                     "workstreams are in earlier rounds.\n\n"
+                    + packing_envelope_section
                     + (
                         f"Read the context index first: `{context_package.index_path}`\n"
                         f"Then read the context manifest: `{context_package.manifest_path}`\n"
@@ -7236,6 +7297,9 @@ class TaskPlanningPhase(Phase):
                 "before emitting it.\n\n"
                 f"{repo_catalog.strip()}\n\n"
             )
+        packing_envelope_section = await _load_dag_packing_envelope_section(
+            runner, feature
+        )
         slice_note = ""
         if slice_info is not None:
             owned_ac_ids = self._slice_owned_acceptance_ids(slice_info)
@@ -7287,6 +7351,7 @@ class TaskPlanningPhase(Phase):
             f"Peer context mode: {mode_label}\n"
             f"Workstream depends on: {workstream.depends_on or ['none']}\n\n"
             f"{repo_catalog_section}"
+            f"{packing_envelope_section}"
             f"{slice_note}"
             f"{repair_note}"
             "Create tasks ONLY for the target subfeature. Every task.subfeature_id MUST be the "

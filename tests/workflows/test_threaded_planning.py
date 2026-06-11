@@ -19693,3 +19693,153 @@ async def test_validate_verification_gates_coverage_honors_store_key_waivers(tmp
         tasks,
     )
     assert result.uncovered_ac_ids == []
+
+
+# ── DAG packing envelope (operator-pinned) prompt injection ──
+
+
+def _packing_envelope_planner_fixture(monkeypatch):
+    """Shared decomposition/workstream/slice fixture for the dag-packing-envelope
+    prompt-injection tests; stubs the heavy context builders."""
+    decomposition = SubfeatureDecomposition(
+        subfeatures=[
+            Subfeature(
+                id="SF-1",
+                slug="pack-env-target",
+                name="Pack Env Target",
+                description="PET",
+            ),
+        ],
+        complete=True,
+    )
+    workstream = Workstream(
+        id="WS-A",
+        name="Pack Env WS",
+        subfeature_slugs=["pack-env-target"],
+        rationale="packing scope",
+        depends_on=[],
+    )
+    slice_info = task_planning_module.TaskPlanningSlice(
+        slice_id="slice-1",
+        title="Pack env slice",
+        step_ids=["STEP-1"],
+        requirement_ids=["REQ-1"],
+        acceptance_criterion_ids=["AC-pack-env-target-1"],
+        owned_acceptance_criterion_ids=["AC-pack-env-target-1"],
+        strict_acceptance_criteria=True,
+    )
+
+    async def _fake_package(self, *args, **kwargs):
+        del self, args, kwargs
+        return None
+
+    async def _fake_context(self, *args, **kwargs):
+        del self, args, kwargs
+        return ""
+
+    monkeypatch.setattr(
+        TaskPlanningPhase,
+        "_build_subfeature_task_context_package",
+        _fake_package,
+    )
+    monkeypatch.setattr(
+        TaskPlanningPhase,
+        "_build_subfeature_task_context",
+        _fake_context,
+    )
+    return decomposition, workstream, slice_info
+
+
+@pytest.mark.asyncio
+async def test_dag_packing_envelope_loader_tolerant_and_active(caplog):
+    """The dag-packing-envelope store key is the opt-in: missing/blank/non-string/
+    erroring store -> empty section (debug-level no-op); present -> delimited
+    operator-pinned section with the verbatim body, INFO-logged."""
+    import logging
+
+    feature = SimpleNamespace(id="feat-pack-env-loader", metadata={})
+
+    # Missing key -> no-op.
+    runner = SimpleNamespace(artifacts=_SimpleCompileArtifacts({}))
+    assert await task_planning_module._load_dag_packing_envelope_section(runner, feature) == ""
+
+    # Blank and non-string values -> no-op.
+    runner.artifacts.store["dag-packing-envelope"] = "   \n"
+    assert await task_planning_module._load_dag_packing_envelope_section(runner, feature) == ""
+    runner.artifacts.store["dag-packing-envelope"] = {"not": "a-string"}
+    assert await task_planning_module._load_dag_packing_envelope_section(runner, feature) == ""
+
+    # Store access errors (including runners without .artifacts) -> no-op.
+    assert (
+        await task_planning_module._load_dag_packing_envelope_section(
+            SimpleNamespace(), feature
+        )
+        == ""
+    )
+
+    # Present -> delimited section with verbatim body + INFO log.
+    body = "TARGET 45-55 tasks via STEP packing; 5-8 CHK-aligned groups."
+    runner.artifacts.store["dag-packing-envelope"] = body
+    with caplog.at_level(logging.INFO):
+        section = await task_planning_module._load_dag_packing_envelope_section(
+            runner, feature
+        )
+    assert "## DAG Packing Envelope (operator-pinned)" in section
+    assert body in section
+    assert "(End of operator-pinned DAG packing envelope.)" in section
+    assert any(
+        "dag packing envelope store key dag-packing-envelope active" in record.message
+        for record in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_slice_planner_prompt_injects_packing_envelope_when_key_present(monkeypatch):
+    """When the dag-packing-envelope key exists, the slice-planner prompt carries
+    the operator-pinned section verbatim."""
+    decomposition, workstream, slice_info = _packing_envelope_planner_fixture(monkeypatch)
+    feature = SimpleNamespace(id="feat-pack-env-present", metadata={})
+    body = "TARGET 45-55 tasks total; never >10 groups; harness-first e2e."
+    runner = SimpleNamespace(
+        artifacts=_SimpleCompileArtifacts({"dag-packing-envelope": body}),
+    )
+
+    prompt, package = await TaskPlanningPhase()._build_subfeature_task_prompt(
+        runner,
+        feature,
+        decomposition,
+        workstream,
+        decomposition.subfeatures[0],
+        {},
+        direct_peer_only=True,
+        mode_label="target-only",
+        slice_info=slice_info,
+    )
+
+    assert package is None
+    assert "## DAG Packing Envelope (operator-pinned)" in prompt
+    assert body in prompt
+
+
+@pytest.mark.asyncio
+async def test_slice_planner_prompt_omits_packing_envelope_when_key_absent(monkeypatch):
+    """No dag-packing-envelope key -> the prompt has no packing-envelope section
+    (key presence is the only opt-in; no env flag)."""
+    decomposition, workstream, slice_info = _packing_envelope_planner_fixture(monkeypatch)
+    feature = SimpleNamespace(id="feat-pack-env-absent", metadata={})
+    runner = SimpleNamespace(artifacts=_SimpleCompileArtifacts({}))
+
+    prompt, package = await TaskPlanningPhase()._build_subfeature_task_prompt(
+        runner,
+        feature,
+        decomposition,
+        workstream,
+        decomposition.subfeatures[0],
+        {},
+        direct_peer_only=True,
+        mode_label="target-only",
+        slice_info=slice_info,
+    )
+
+    assert package is None
+    assert "DAG Packing Envelope" not in prompt

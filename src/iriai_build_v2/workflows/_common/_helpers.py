@@ -1462,6 +1462,7 @@ async def integration_review(
     use_cached_review: bool = True,
     responder: Actor | None = None,
     prefer_local_artifacts: bool = False,
+    extra_prompt_section: str = "",
 ) -> IntegrationReview:
     """Run lead's integration review interview.
 
@@ -1471,6 +1472,10 @@ async def integration_review(
     Guarantees: when ``needs_revision`` is True, ``revision_instructions``
     is a non-empty dict with valid target ids. If the agent's structured
     output is incomplete, a follow-up extraction call fills in the gap.
+
+    ``extra_prompt_section`` (optional, already-formatted markdown) is
+    appended to the reviewer's initial prompt — e.g. operator-pinned review
+    constraints such as the DAG packing envelope.
     """
     from ...models.outputs import Envelope, IntegrationReview, envelope_done
     from .._common import HostedInterview
@@ -1650,6 +1655,7 @@ async def integration_review(
                         "consistency. I may have some questions.\n\n"
                         f"Available {target_label} for revision_instructions: "
                         f"{', '.join(valid_targets)}\n\n"
+                        + (extra_prompt_section or "")
                         + (
                             f"Read the context index first: `{context_package.index_path}`\n"
                             f"Then read the context manifest: `{context_package.manifest_path}`"
