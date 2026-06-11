@@ -11019,6 +11019,25 @@ async def _context_layer_request_for_dispatch(
         repo_prefix=repo_prefix,
     )
     changed_paths = [span.path for span in spans]
+    # N-21: the budget must accommodate the task's OWN file_scope — packed
+    # DAG tasks legitimately exceed the 12-file default (TASK-FDS-S1-01
+    # carries 19), and a budget below the task's declared scope rejects
+    # the request outright (models.py max_files validator) instead of
+    # paging context. Never truncate the task's declared scope.
+    scope_file_count = len({span.path for span in spans} | set(changed_paths))
+    max_files_floor = int(os.environ.get("IRIAI_CONTEXT_LAYER_MAX_FILES", "0") or 0)
+    default_budget = ContextLayerBudget()
+    effective_max_files = max(default_budget.max_files, max_files_floor, scope_file_count)
+    if effective_max_files > default_budget.max_files:
+        logger.warning(
+            "context layer budget raised for task %s: max_files %d -> %d "
+            "(task file_scope=%d, env floor=%d)",
+            task.id,
+            default_budget.max_files,
+            effective_max_files,
+            scope_file_count,
+            max_files_floor,
+        )
     request = ContextLayerRequest(
         feature_id=str(getattr(feature, "id", "")),
         source_dag_artifact_id=source_dag_artifact_id,
@@ -11031,7 +11050,7 @@ async def _context_layer_request_for_dispatch(
         changed_paths=changed_paths,
         include_governance=True,
         require_complete=True,
-        budget=ContextLayerBudget(),
+        budget=ContextLayerBudget(max_files=effective_max_files),
     )
     return request, [repo]
 

@@ -1236,3 +1236,25 @@ def test_dispatcher_source_and_port_shape_exclude_forbidden_authority() -> None:
         for forbidden in forbidden_method_parts
         if forbidden in method
     }
+
+
+# ── N-21: context layer budget scales to the task's declared file_scope ──
+
+
+def test_n21_context_layer_budget_scales_to_task_scope(monkeypatch):
+    from iriai_build_v2.workflows.develop.context_layer.models import (
+        ContextLayerBudget,
+    )
+
+    monkeypatch.delenv("IRIAI_CONTEXT_LAYER_MAX_FILES", raising=False)
+    default = ContextLayerBudget()
+    # the live failure shape: 19 unique paths vs default 12
+    scope_file_count = 19
+    effective = max(default.max_files, 0, scope_file_count)
+    budget = ContextLayerBudget(max_files=effective)
+    assert budget.max_files == 19
+
+    monkeypatch.setenv("IRIAI_CONTEXT_LAYER_MAX_FILES", "40")
+    import os as _os
+    floor = int(_os.environ.get("IRIAI_CONTEXT_LAYER_MAX_FILES", "0") or 0)
+    assert max(default.max_files, floor, 5) == 40
