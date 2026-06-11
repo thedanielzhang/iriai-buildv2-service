@@ -15,12 +15,24 @@ noise), or a real ``SlackAdapter.post_blocks`` poster in production. The
 from __future__ import annotations
 
 import hashlib
+import os
 from typing import Any, Awaitable, Callable
 
 from .models import E2EGreenPointer, E2EStatus, E2EVerdictRecord
 from .registry import BLOCKER_KEY, STATUS_KEY
 
 CARD_DIGEST_KEY = "e2e-status-card-digest"
+
+# Item-10 (c): strict green oracle — test failures, infra 'error' verdicts and
+# skipped verdicts COUNT AGAINST green. Default OFF = today's oracle byte-for-
+# byte (boot-smoke pass + zero open CRITICAL regressions only).
+STRICT_GREEN_ENV = "IRIAI_E2E_STRICT_GREEN"
+
+
+def strict_green_enabled() -> bool:
+    return os.environ.get(STRICT_GREEN_ENV, "").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
 
 Poster = Callable[[list[dict], str], Awaitable[None]]
 
@@ -65,7 +77,13 @@ def build_status(
         v.spec_id for v in verdicts
         if v.status == "fail" and v.failure_class == "regression"
     ]
+    # Item-10 (c): infra 'error' and 'skipped' verdicts were counted NOWHERE —
+    # always populate the (additive, default-0) fields so they are visible.
+    errors = sum(1 for v in verdicts if v.status == "error")
+    skipped = sum(1 for v in verdicts if v.status == "skipped")
     return E2EStatus(
+        errors=errors,
+        skipped=skipped,
         latest_checkpoint=(f"group {checkpoint.group_idx}" if checkpoint else ""),
         latest_checkpoint_commit=(next(iter(commits.values()), "") if commits else ""),
         latest_green_checkpoint=(
@@ -91,6 +109,12 @@ def material_digest(status: E2EStatus) -> str:
     # digest (and its dedupe history) is byte-for-byte unchanged.
     if getattr(status, "browser_lanes", ""):
         fields.append(status.browser_lanes)
+
+    if strict_green_enabled():
+        # Item-10 (c): under the strict oracle, error/skipped changes are
+        # material (they flip green) so they must re-post the card. Flag OFF
+        # keeps the digest payload byte-identical to today.
+        fields += [status.errors, status.skipped]
     payload = "|".join(str(x) for x in fields)
     return hashlib.sha256(payload.encode()).hexdigest()
 
@@ -179,16 +203,31 @@ async def page_critical(
 
 
 def green_pointer_for(
-    checkpoint: Any, *, boot_smoke: str, open_critical_regressions: int
+    checkpoint: Any,
+    *,
+    boot_smoke: str,
+    open_critical_regressions: int,
+    open_failures: int = 0,
+    open_errors: int = 0,
+    open_skipped: int = 0,
 ) -> E2EGreenPointer | None:
     """Green = boot-smoke pass + no open CRITICAL regressions (matches alert tier).
 
     NOT "zero failures ever" — deferred non-critical items must not make
     latest-green perpetually empty.
+
+    Item-10 (c) strict oracle (``IRIAI_E2E_STRICT_GREEN``, default OFF): green
+    ADDITIONALLY requires zero open test failures (any non-flaky/non-intended
+    fail — with criticality unbound the critical count is structurally 0, so
+    without this no test failure ever blocks green), zero infra 'error'
+    verdicts and zero skipped verdicts. The new kwargs default to 0, so
+    existing callers and the flag-OFF path are byte-for-byte today.
     """
-    if boot_smoke == "pass" and open_critical_regressions == 0 and checkpoint:
-        return E2EGreenPointer(
-            group_idx=checkpoint.group_idx,
-            result_commits=checkpoint.result_commits(),
-        )
-    return None
+    if not (boot_smoke == "pass" and open_critical_regressions == 0 and checkpoint):
+        return None
+    if strict_green_enabled() and (open_failures or open_errors or open_skipped):
+        return None
+    return E2EGreenPointer(
+        group_idx=checkpoint.group_idx,
+        result_commits=checkpoint.result_commits(),
+    )

@@ -37,7 +37,11 @@ from .status import (
     page_critical,
 )
 from .substrate import CloneSubstrate
-from .triage import bind_specs_from_scenarios, native_results_to_verdicts
+from .triage import (
+    bind_specs_from_scenarios,
+    classify_verdicts,
+    native_results_to_verdicts,
+)
 
 # Studio-default live-repo path template. Item-6: env-overridable via the SAME
 # variable e2e_cmd.py already honors (IRIAI_E2E_LIVE_REPO_TMPL); the default is
@@ -83,6 +87,56 @@ class E2EPassRefused(RuntimeError):
     never hit it — and the prior behavior (silently consuming a sealed
     checkpoint that was never tested) is a defect, not a behavior to preserve.
     """
+
+# ── Item-10 (R3 e2e feedback routing) flags — ALL default OFF = today ─────────
+TRIAGE_CLASSIFY_ENV = "IRIAI_E2E_TRIAGE_CLASSIFY"
+CRITICAL_BINDING_ENV = "IRIAI_E2E_CRITICAL_BINDING"
+BOUNDARY_REPAIR_ENV = "IRIAI_E2E_BOUNDARY_REPAIR"
+
+
+def _env_on(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def triage_classify_enabled() -> bool:
+    """Item-10 (a): wire triage.classify into both pass paths (default OFF)."""
+    return _env_on(TRIAGE_CLASSIFY_ENV)
+
+
+def critical_binding_enabled() -> bool:
+    """Item-10 (b): bind spec/suite criticality (test-plan p0 scenarios on the
+    studio path; profile.critical_service_names on the compose path). Default
+    OFF = critical structurally always False, exactly today."""
+    return _env_on(CRITICAL_BINDING_ENV)
+
+
+def boundary_repair_enabled() -> bool:
+    """Item-10 tier-ii: when ON, e2e regressions bridge to the enhancement
+    backlog at severity='major' so the develop-side boundary repair wave can
+    pick them up. Default OFF = severity='minor' end-of-DAG, exactly today."""
+    return _env_on(BOUNDARY_REPAIR_ENV)
+
+
+def _scenario_critical_for(sc: Any) -> tuple[bool, str]:
+    """Test-plan p0 scenarios are critical (item-10 b, studio bind path)."""
+    priority = str(getattr(sc, "priority", "") or "").strip().lower()
+    if priority == "p0":
+        return True, "test-plan p0 scenario"
+    return False, ""
+
+
+def _strict_green_counts(verdicts: list[Any]) -> dict[str, int]:
+    """Item-10 (c): counts the strict green oracle blocks on (kwargs for
+    ``green_pointer_for``; ignored there unless IRIAI_E2E_STRICT_GREEN is ON)."""
+    return {
+        "open_failures": sum(
+            1 for v in verdicts
+            if v.status == "fail"
+            and v.failure_class not in ("flaky", "intended_change")
+        ),
+        "open_errors": sum(1 for v in verdicts if v.status == "error"),
+        "open_skipped": sum(1 for v in verdicts if v.status == "skipped"),
+    }
 
 
 @dataclass
@@ -277,8 +331,12 @@ async def run_full_pass(
             if a.verification_method in {"e2e", "visual", "integration"})
         specs = bind_specs_from_scenarios(
             tp.test_scenarios, ac_by_id, adapter_id=profile.adapter_id,
-            author_commit=studio_commit, source_commit=studio_commit)
+            author_commit=studio_commit, source_commit=studio_commit,
+            critical_for=(
+                _scenario_critical_for if critical_binding_enabled() else None
+            ))
         summary.spec_count = len(specs)
+        specs_by_id = {s.spec_id: s for s in specs}
 
         # run every webview lane (each self-boots its harness)
         all_verdicts = []
@@ -300,6 +358,14 @@ async def run_full_pass(
             verdicts = native_results_to_verdicts(
                 [_spec_for_test(t, profile.adapter_id, studio_commit) for t in run.tests],
                 run.tests, source_commit=studio_commit)
+            if triage_classify_enabled():
+                # Item-10 (a): principled failure_class via triage.classify —
+                # plain fails with unchanged/unbound assertions become
+                # 'regression' instead of the invisible ''.
+                verdicts = classify_verdicts(verdicts, specs_by_id, ac_by_id)
+                on_log(
+                    f"  triage.classify: {sum(1 for v in verdicts if v.failure_class == 'regression')}"
+                    f" regression(s) in lane {cfg}")
             for v in verdicts:
                 await registry.put_verdict(v)
             all_verdicts.extend(verdicts)
@@ -324,8 +390,20 @@ async def run_full_pass(
 
         br = await bridge_findings(
             registry, [v for v in all_verdicts if v.failure_class == "regression"],
-            {s.spec_id: s for s in specs}, checkpoint_label=label)
+            {s.spec_id: s for s in specs}, checkpoint_label=label,
+            # Item-10 tier-ii: with boundary repair ON, regressions are major
+            # (picked up by the next-group-boundary repair wave); OFF = minor
+            # end-of-DAG, exactly today.
+            severity="major" if boundary_repair_enabled() else "minor")
         summary.backlog_appended = len(br.appended)
+        if br.critical:
+            # Item-10 tier-i: critical regressions PAGE (non-deduped) — they
+            # never reach the backlog. Structurally unreachable until
+            # criticality is bound (IRIAI_E2E_CRITICAL_BINDING).
+            await page_critical(
+                registry, poster=poster, checkpoint_label=label,
+                critical_regressions=br.critical)
+            on_log(f"  paged {len(br.critical)} critical regression(s)")
 
         # Build/boot failures -> precise backlog finding (deduped) + a NON-deduped
         # operator page (the critical tier), and they keep latest-green from
@@ -351,7 +429,8 @@ async def run_full_pass(
                        f"--checkpoint {checkpoint.group_idx}")
         summary.preview_url = preview_url
         gp = green_pointer_for(checkpoint, boot_smoke=summary.boot_smoke,
-                               open_critical_regressions=len(br.critical))
+                               open_critical_regressions=len(br.critical),
+                               **_strict_green_counts(all_verdicts))
         if gp:
             await registry.put_green_pointer(gp)
             summary.green = True
@@ -487,7 +566,25 @@ async def _run_compose_pass(
         # test failures.
         all_verdicts = []
         if summary.boot_smoke == "pass":
-            all_verdicts = await adapter.run(instance, [], source_commit=commit)
+            critical_for = None
+            if critical_binding_enabled():
+                # Item-10 (b): per-suite criticality from
+                # profile.critical_service_names (empty list = no-op).
+                from .adapters.compose import compose_critical_for
+
+                critical_for = compose_critical_for(profile)
+            # Pass the kwarg only when bound — keeps duck-typed adapters
+            # without the new parameter working (flag OFF = today's call).
+            if critical_for is not None:
+                all_verdicts = await adapter.run(
+                    instance, [], source_commit=commit, critical_for=critical_for)
+            else:
+                all_verdicts = await adapter.run(instance, [], source_commit=commit)
+            if triage_classify_enabled():
+                # Item-10 (a): same principled classifier as the studio path
+                # (compose JUnit fails are already 'regression'; this keeps the
+                # green-wash guard authoritative once specs are bound).
+                all_verdicts = classify_verdicts(all_verdicts, {}, {})
             for v in all_verdicts:
                 if v.status == "pass":
                     summary.passed += 1
@@ -551,8 +648,15 @@ async def _run_compose_pass(
         br = await bridge_findings(
             registry,
             [v for v in all_verdicts if v.failure_class == "regression"],
-            {}, checkpoint_label=label)
+            {}, checkpoint_label=label,
+            severity="major" if boundary_repair_enabled() else "minor")
         summary.backlog_appended = len(br.appended)
+        if br.critical:
+            # Item-10 tier-i: critical regressions PAGE (see studio path note).
+            await page_critical(
+                registry, poster=poster, checkpoint_label=label,
+                critical_regressions=br.critical)
+            on_log(f"  paged {len(br.critical)} critical regression(s)")
 
         if lane_boot_failed:
             bf = await bridge_build_failures(
@@ -588,7 +692,8 @@ async def _run_compose_pass(
 
         gp = green_pointer_for(
             checkpoint, boot_smoke=summary.boot_smoke,
-            open_critical_regressions=len(br.critical))
+            open_critical_regressions=len(br.critical),
+            **_strict_green_counts(all_verdicts))
         if gp:
             await registry.put_green_pointer(gp)
             summary.green = True

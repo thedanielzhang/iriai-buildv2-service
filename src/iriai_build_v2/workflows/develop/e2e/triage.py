@@ -163,6 +163,49 @@ class ClassifyResult:
         return self.failure_class == "regression"
 
 
+def classify_verdicts(
+    verdicts: list[E2EVerdictRecord],
+    specs_by_id: dict[str, E2ESpecRecord],
+    ac_by_id: dict[str, Any],
+) -> list[E2EVerdictRecord]:
+    """Item-10 (a): run :func:`classify` over a pass's verdicts.
+
+    Principled failure_class assignment for BOTH pass paths (studio native +
+    compose JUnit) instead of the JUnit-only default: a plain ``fail`` with
+    unchanged (or unbound) assertions is a ``regression`` — the spec has no
+    license to relax; ``flaky`` is preserved (classify's quarantine branch);
+    ``error``/``infra`` and non-fail verdicts pass through untouched.
+    Pure + deterministic; callers flag-gate the invocation
+    (``IRIAI_E2E_TRIAGE_CLASSIFY``, default OFF = today's behavior).
+    """
+    out: list[E2EVerdictRecord] = []
+    for v in verdicts:
+        if v.status != "fail":
+            out.append(v)
+            continue
+        spec = specs_by_id.get(v.spec_id)
+        author_digests = dict(spec.author_assertion_digests) if spec else {}
+        linked = list(spec.linked_ac_ids) if spec else []
+        current_digests = compute_author_assertion_digests(
+            [ac_by_id[a] for a in linked if a in ac_by_id]
+        )
+        result = classify(
+            author_digests,
+            current_digests,
+            "fail",
+            flaky=(v.failure_class == "flaky"),
+        )
+        out.append(
+            v.model_copy(
+                update={
+                    "failure_class": result.failure_class or v.failure_class,
+                    "changed_ac_ids": result.changed_ac_ids or v.changed_ac_ids,
+                }
+            )
+        )
+    return out
+
+
 def classify(
     author_digests: dict[str, str],
     current_digests: dict[str, str],
