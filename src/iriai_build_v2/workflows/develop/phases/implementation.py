@@ -7786,6 +7786,36 @@ async def _checkpoint_durable_merge_queue_group(
             detail=detail,
             routed_failure=_route(detail, cause="checkpoint_declined"),
         )
+
+    # Item-1 (P0-1): flag-gated born-adopted adoption-record upsert. The
+    # queue-driven seal projects `dag-group:{idx}` via the coordinator's
+    # checkpoint projector and BYPASSES `_project_dag_group_checkpoint`, so
+    # this success exit is the second (and only other) seal family that must
+    # upsert the record. Flag OFF (default) is an unconditional no-op; flag
+    # ON fails loud (typed route, idempotent checkpoint re-run) rather than
+    # leaving a sealed group without a strict-resume marker.
+    from .born_adopted import upsert_born_adopted_record_at_seal
+
+    born_adopted_error = await upsert_born_adopted_record_at_seal(
+        runner,
+        feature,
+        group_idx=group_idx,
+        dag_sha256=dag_sha256,
+        checkpoint_body="",
+        commit_hash=str(merge_result.result_commit or ""),
+    )
+    if born_adopted_error:
+        detail = (
+            "born-adopted adoption-record upsert failed after durable merge "
+            f"queue group {group_idx} checkpoint: {born_adopted_error}"
+        )
+        return _MergeQueueCheckpointResult(
+            group_idx=group_idx,
+            checkpointed=False,
+            detail=detail,
+            routed_failure=_route(detail, cause="born_adopted_upsert_failed"),
+        )
+
     return _MergeQueueCheckpointResult(
         group_idx=group_idx,
         checkpointed=True,
@@ -20731,6 +20761,31 @@ async def _implement_dag(
             getattr(adoption_record, "completed_checkpoint_range", None),
             start_group,
         )
+        # Item-1 bundled P2 fix (audit: "adoption-boundary resume drops
+        # pre-boundary results"): the checkpoint-reload loop below starts at
+        # ``start_group``, so groups before the adoption boundary never reach
+        # ``all_results``/handover and their context is dropped on every
+        # resume. Flag-gated best-effort reload of the pre-boundary sealed
+        # results (flag OFF = today's behavior exactly; failures only warn —
+        # the adoption record already attests the range completed).
+        from .born_adopted import (
+            born_adopted_resume_enabled,
+            load_pre_boundary_checkpoint_results,
+        )
+
+        if start_group > 0 and born_adopted_resume_enabled():
+            pre_boundary_results = await load_pre_boundary_checkpoint_results(
+                runner,
+                feature,
+                start_group=start_group,
+            )
+            for r_data in pre_boundary_results:
+                try:
+                    result = ImplementationResult.model_validate(r_data)
+                    all_results.append(result)
+                    handover.record_success(result)
+                except Exception:
+                    pass
 
     for g_idx in range(start_group, len(dag.execution_order)):
         group_task_ids = list(dag.execution_order[g_idx])
@@ -24292,6 +24347,29 @@ async def _project_dag_group_checkpoint(
             "Failed to project dag-group checkpoint %s", projection_key, exc_info=True,
         )
         return False, f"{type(exc).__name__}: {exc}"
+
+    # Item-1 (P0-1): flag-gated born-adopted adoption-record upsert at the
+    # group-checkpoint seal chokepoint — every seal path flows through this
+    # function (main seal, resume re-projection, merge-queue recovery), so
+    # the strict resume gate always finds a valid marker for features born
+    # under the control plane. Flag OFF (default) is an unconditional no-op;
+    # flag ON fails loud on upsert failure so a later strict resume never
+    # discovers a missing/stale marker the hard way.
+    from .born_adopted import upsert_born_adopted_record_at_seal
+
+    born_adopted_error = await upsert_born_adopted_record_at_seal(
+        runner,
+        feature,
+        group_idx=group_idx,
+        dag_sha256=dag_sha256,
+        checkpoint_body=body,
+        commit_hash=str(checkpoint.get("commit_hash") or ""),
+    )
+    if born_adopted_error:
+        return False, (
+            "born-adopted adoption-record upsert failed at group "
+            f"{group_idx} seal: {born_adopted_error}"
+        )
 
     if getattr(store, "test_mirror_group_checkpoint_to_artifacts", False):
         await runner.artifacts.put(projection_key, body, feature=feature)
