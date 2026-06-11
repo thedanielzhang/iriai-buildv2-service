@@ -23,6 +23,7 @@ remains the compatibility payload for artifact consumers; the typed
 
 from __future__ import annotations
 
+import os
 from datetime import datetime
 from typing import Any, Literal
 
@@ -891,16 +892,26 @@ def _regroup_hard_barrier_by_task(
     if task_definitions_by_id:
         from ..dag_regroup import _barrier_for_task, semantic_lane_for_task
 
-        # Typed step-9 alignment (doc 09 § "Validation Algorithm"): the
-        # overlay's own authored ``barriers`` (with their ``hard`` flag) are
-        # the PRIMARY authority — exactly as the no-definitions branch below
-        # and ``regroup_overlay_validation._step9_hard_barriers`` already
-        # treat them. An authored ``hard=True`` membership wins outright; an
-        # authored ``hard=False`` membership marks the task SOFT and
-        # suppresses the re-derived text-heuristic label; tasks under no
-        # authored barrier keep the re-derived label (defense in depth —
-        # stock drafts author ``hard=True`` for every speed-index label, so
-        # their behaviour is unchanged).
+        derived_labels = {
+            task_id: _barrier_for_task(task, semantic_lane_for_task(task))
+            for task_id, task in task_definitions_by_id.items()
+        }
+        # DEFAULT: pure re-derivation from task text. This is deliberately
+        # lie-proof — a candidate cannot neutralize barrier checking by
+        # authoring its own barrier metadata (pinned by
+        # test_regroup_validator_rejects_lied_cross_barrier_metadata).
+        #
+        # IRIAI_DAG_REGROUP_AUTHORED_SOFT_BARRIERS=1 (operator/driver lever,
+        # set only in a driver-controlled activation environment): align with
+        # the typed validator's step-9 semantics instead, where the overlay's
+        # authored ``barriers`` are the primary authority (doc 09): authored
+        # ``hard=True`` wins, authored ``hard=False`` suppresses the derived
+        # label, underived tasks keep the derived label. Stock drafts author
+        # ``hard=True`` for every label, so they behave identically under
+        # either mode. (Added for the 5b280bb4 13:1x greedy-packing ruling:
+        # the text-trigger labels are iriai semantics, not kaya's.)
+        if os.environ.get("IRIAI_DAG_REGROUP_AUTHORED_SOFT_BARRIERS", "0") != "1":
+            return derived_labels
         authored_hard: dict[str, str] = {}
         authored_soft: set[str] = set()
         for idx, barrier in enumerate(parsed.barriers or []):
@@ -923,10 +934,6 @@ def _regroup_hard_barrier_by_task(
                     authored_soft.add(task_key)
                 else:
                     authored_hard.setdefault(task_key, barrier_id)
-        derived_labels = {
-            task_id: _barrier_for_task(task, semantic_lane_for_task(task))
-            for task_id, task in task_definitions_by_id.items()
-        }
         merged: dict[str, str] = {}
         for task_id, label in derived_labels.items():
             if task_id in authored_hard:

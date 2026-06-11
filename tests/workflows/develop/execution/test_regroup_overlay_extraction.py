@@ -968,13 +968,16 @@ def test_all_export_includes_seven_moved_names() -> None:
         )
 
 
-def test_regroup_hard_barrier_authored_soft_suppresses_derived_label() -> None:
+def test_regroup_hard_barrier_authored_soft_suppresses_derived_label(monkeypatch) -> None:
     """Typed step-9 alignment: an authored ``hard=False`` overlay barrier
     membership marks the task SOFT and suppresses the re-derived
     text-heuristic label, mirroring ``_step9_hard_barriers`` (the typed
     validator treats the overlay's own barriers as the primary authority and
-    soft barriers never reject)."""
+    soft barriers never reject). Gated behind
+    IRIAI_DAG_REGROUP_AUTHORED_SOFT_BARRIERS=1 — the default path stays
+    lie-proof (test_regroup_validator_rejects_lied_cross_barrier_metadata)."""
 
+    monkeypatch.setenv("IRIAI_DAG_REGROUP_AUTHORED_SOFT_BARRIERS", "1")
     from iriai_build_v2.workflows.develop.execution.regroup_overlay import (
         _regroup_hard_barrier_by_task,
     )
