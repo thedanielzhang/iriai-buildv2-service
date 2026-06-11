@@ -21730,6 +21730,7 @@ async def _implement_dag(
                 prefix = f"{repo_prefix}/" if repo_prefix else ""
                 inline_prompt = (
                     _build_task_prompt(t, repo_prefix=prefix, contract=task_contract)
+                    + await _project_constraints_prompt_block(runner, feature)
                     + task_handover_context
                 )
 
@@ -23168,6 +23169,7 @@ async def _run_enhancement_group(
             prefix = f"{repo_prefix}/" if repo_prefix else ""
             inline_prompt = (
                 _build_task_prompt(t, repo_prefix=prefix, contract=task_contract)
+                + await _project_constraints_prompt_block(runner, feature)
                 + handover_context
             )
 
@@ -25393,6 +25395,91 @@ def _get_feature_root(runner: WorkflowRunner, feature: Feature) -> Path | None:
     return root if root.exists() else None
 
 
+# --------------------------------------------------------------------------- #
+# Project constraints prompt injection (readiness item 7 — R2 kaya-interim a).
+# ONE generic, flag-gated (default OFF) injection point: when the PLANNING-
+# authored `project-constraints` store artifact exists, its content is appended
+# as a binding section to every develop agent prompt (implementer/enhancement
+# dispatch inline prompts + every context-package consumer: verify, lenses,
+# gates, RCA). The workflow code stays project-agnostic — all project-specific
+# content lives in the artifact, never here.
+# --------------------------------------------------------------------------- #
+
+PROJECT_CONSTRAINTS_KEY = "project-constraints"
+PROJECT_CONSTRAINTS_PROMPT_ENV = "IRIAI_PROJECT_CONSTRAINTS_PROMPT"
+_PROJECT_CONSTRAINTS_HEADING = "## Project Operating Constraints (BINDING)"
+# Per-feature memo of NON-EMPTY blocks only (the artifact is a sealed planning
+# output; absence and read errors are never cached so a later authoring or a
+# transient store failure self-heals without a restart).
+_PROJECT_CONSTRAINTS_BLOCK_CACHE: dict[str, str] = {}
+
+
+def _project_constraints_prompt_enabled() -> bool:
+    return _env_flag_enabled(PROJECT_CONSTRAINTS_PROMPT_ENV, default=False)
+
+
+def _project_constraints_text_from_raw(raw: Any) -> str:
+    """Normalize the artifact value to markdown text ('' when unusable).
+
+    Accepts a plain markdown string, a JSON-encoded string, or a dict carrying
+    the text under `content`/`markdown`/`text` (flat primitives only — never a
+    nested model agents must populate).
+    """
+    if raw is None:
+        return ""
+    value: Any = raw
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped.startswith(("{", "[", '"')):
+            try:
+                value = json.loads(stripped)
+            except (ValueError, TypeError):
+                return value
+        else:
+            return value
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        for key in ("content", "markdown", "text"):
+            text = value.get(key)
+            if isinstance(text, str) and text.strip():
+                return text
+    return ""
+
+
+async def _project_constraints_prompt_block(
+    runner: WorkflowRunner, feature: Feature
+) -> str:
+    """The binding constraints prompt block, or '' (flag OFF / absent / error).
+
+    Flag OFF (the default) returns '' unconditionally — prompts are
+    byte-for-byte today's. Errors degrade to '' with a warning: the artifact is
+    optional planning output, not a required service.
+    """
+    if not _project_constraints_prompt_enabled():
+        return ""
+    cached = _PROJECT_CONSTRAINTS_BLOCK_CACHE.get(feature.id)
+    if cached is not None:
+        return cached
+    artifacts = getattr(runner, "artifacts", None)
+    if artifacts is None:
+        return ""
+    try:
+        raw = await artifacts.get(PROJECT_CONSTRAINTS_KEY, feature=feature)
+    except Exception:  # noqa: BLE001 - optional artifact; degrade loud-but-soft
+        logger.warning(
+            "project-constraints artifact read failed; injecting nothing",
+            exc_info=True,
+        )
+        return ""
+    text = _project_constraints_text_from_raw(raw).strip()
+    if not text:
+        return ""
+    block = f"\n\n{_PROJECT_CONSTRAINTS_HEADING}\n\n{text}\n"
+    _PROJECT_CONSTRAINTS_BLOCK_CACHE[feature.id] = block
+    return block
+
+
 async def _build_prompt_context_package(
     runner: WorkflowRunner,
     feature: Feature,
@@ -25402,6 +25489,17 @@ async def _build_prompt_context_package(
     intro_lines: list[str],
     sections: list[tuple[str, str, str]],
 ) -> ContextPackage | None:
+    constraints_block = await _project_constraints_prompt_block(runner, feature)
+    all_sections = list(sections)
+    if constraints_block.strip():
+        all_sections.insert(
+            0,
+            (
+                "project-constraints",
+                "Project Operating Constraints (binding)",
+                constraints_block.strip(),
+            ),
+        )
     return await build_context_package(
         runner,
         feature,
@@ -25416,7 +25514,7 @@ async def _build_prompt_context_package(
                 content=content,
                 file_name=f"{file_stem}-{key}.md",
             )
-            for key, label, content in sections
+            for key, label, content in all_sections
             if content.strip()
         ],
     )
