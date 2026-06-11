@@ -464,6 +464,72 @@ def test_backstop_read_only_unplanned_path_with_basename_matches_still_raises():
         )
 
 
+def test_backstop_extra_planned_grounds_cross_subfeature_modify():
+    # N-8 (resume49): a MODIFY of a file an EARLIER subfeature's DAG creates
+    # (every SF appends to S1's router) — not in THIS fragment's planned set,
+    # zero on-disk basename matches. extra_planned supplies the upstream
+    # planned paths and the modify-class conversion applies.
+    dag = _dag(_task("M", file_scope=[(CANON, "modify")], repo_path=""))
+    res = DagPathResolution(
+        decisions=[_ambiguous("M", "file_scope[0].path", CANON)], ambiguous_count=1,
+    )
+    apply_path_resolution(
+        dag, res, repos_root="/repos", exists=lambda p: False,
+        find_basename_matches=lambda name: 0,
+        extra_planned={CANON},
+    )
+    assert res.decisions[0].decision == "create_ok"
+
+
+def test_backstop_extra_planned_modify_with_basename_matches_still_raises():
+    # The never-guess rule survives extra_planned: existing same-basename
+    # files on disk keep a cross-SF modify ambiguous.
+    dag = _dag(_task("M", file_scope=[(CANON, "modify")], repo_path=""))
+    res = DagPathResolution(
+        decisions=[_ambiguous("M", "file_scope[0].path", CANON)], ambiguous_count=1,
+    )
+    with pytest.raises(AmbiguousDagPath):
+        apply_path_resolution(
+            dag, res, repos_root="/repos", exists=lambda p: False,
+            find_basename_matches=lambda name: 2,
+            extra_planned={CANON},
+        )
+
+
+def test_backstop_create_class_grounds_via_workspace_root():
+    # Workspace-level deliverable (authored-not-executed migration doc under
+    # docs/): the parent never exists under repos_root, but exists under the
+    # WORKSPACE base — grounded via the workspace_root fallback.
+    doc = "docs/submittal-prd/slices/migrations/S2-foo.NEVER-EXECUTE.sql"
+    dag = _dag(_task("C", file_scope=[(doc, "create")], repo_path=""))
+    res = DagPathResolution(
+        decisions=[_ambiguous("C", "file_scope[0].path", doc)], ambiguous_count=1,
+    )
+    apply_path_resolution(
+        dag, res, repos_root="/repos",
+        exists=lambda p: p == "/ws/docs/submittal-prd",
+        find_basename_matches=lambda name: 0,
+        workspace_root="/ws",
+    )
+    assert res.decisions[0].decision == "create_ok"
+
+
+def test_backstop_create_class_wholly_novel_tree_still_raises_with_workspace_root():
+    # The conservative typo-guard survives: no ancestor within two levels
+    # exists under EITHER root -> still ambiguous.
+    doc = "totally/new/tree/depth/file.sql"
+    dag = _dag(_task("C", file_scope=[(doc, "create")], repo_path=""))
+    res = DagPathResolution(
+        decisions=[_ambiguous("C", "file_scope[0].path", doc)], ambiguous_count=1,
+    )
+    with pytest.raises(AmbiguousDagPath):
+        apply_path_resolution(
+            dag, res, repos_root="/repos", exists=lambda p: False,
+            find_basename_matches=lambda name: 0,
+            workspace_root="/ws",
+        )
+
+
 def test_backstop_skips_stale_ambiguous_decision():
     # Persisted resolution reused after a re-plan: the decision's entry no
     # longer exists in the DAG -> skipped (no raise), nothing converted.

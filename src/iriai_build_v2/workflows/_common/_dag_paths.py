@@ -42,6 +42,23 @@ def feature_repos_root(runner: Any, feature: Any) -> str:
     return str(root) if root.exists() else ""
 
 
+def feature_workspace_root(runner: Any, feature: Any) -> str:
+    """Absolute workspace base directory, or "".
+
+    Some planned deliverables live at the WORKSPACE level rather than inside
+    any per-repo checkout (e.g. authored-not-executed migration documents
+    under the feature's ``docs/`` tree). Grounding such create-class entries
+    needs the workspace base, which never appears under ``repos_root``."""
+    services = getattr(runner, "services", None)
+    getter = getattr(services, "get", None) if services is not None else None
+    wm = getter("workspace_manager") if callable(getter) else None
+    base = getattr(wm, "_base", None) if wm is not None else None
+    if not base:
+        return ""
+    root = Path(base)
+    return str(root) if root.exists() else ""
+
+
 def _normalize_planned_path(path: str) -> str:
     """Comparison-time normalization for planned-new-file matching (never used
     to rewrite stored paths): backslashes -> '/', strip whitespace and a
@@ -94,6 +111,7 @@ def _create_parent_grounded(
     planned: set[str],
     *,
     exists: Callable[[str], bool],
+    workspace_root: str = "",
 ) -> bool:
     """CREATE-class grounding: the parent directory resolves — it EXISTS under
     either join, or it is ITSELF created by the fragment (another planned-new
@@ -134,6 +152,22 @@ def _create_parent_grounded(
                 if not ancestor:
                     break
                 if exists(os.path.join(repos_root, ancestor)):
+                    return True
+    if workspace_root:
+        # Workspace-level deliverable (e.g. an authored-not-executed migration
+        # document under the feature's docs/ tree): the location never exists
+        # under repos_root, but the same parent/ancestor walk against the
+        # WORKSPACE base grounds it. Same conservatism: parent exists, or the
+        # nearest existing ancestor sits at most two levels above it.
+        for parent in parents:
+            if exists(os.path.join(workspace_root, parent)):
+                return True
+            ancestor = parent
+            for _ in range(2):
+                ancestor = posixpath.dirname(ancestor)
+                if not ancestor:
+                    break
+                if exists(os.path.join(workspace_root, ancestor)):
                     return True
     return False
 
@@ -186,6 +220,8 @@ def build_dag_path_resolver_prompt(
     dag: ImplementationDAG,
     unresolved: list[dict[str, str]],
     repos_root: str,
+    *,
+    extra_planned: set[str] | None = None,
 ) -> str:
     """Shared resolver prompt (planning seam + execution migration).
 
@@ -206,10 +242,11 @@ def build_dag_path_resolver_prompt(
         }
         for entry in unresolved
     ]
-    planned_new = sorted(planned_new_file_paths(dag))
+    planned_new = sorted(planned_new_file_paths(dag) | (extra_planned or set()))
     planned_section = (
-        "PLANNED NEW FILES (action `create` — authored by THIS plan; do not "
-        "expect them on disk):\n"
+        "PLANNED NEW FILES (action `create` — authored by THIS plan OR by an "
+        "earlier subfeature's plan in the same feature; do not expect them on "
+        "disk):\n"
         f"```json\n{json.dumps(planned_new, indent=2)}\n```\n"
         "DISPOSITION RULES — branch on each candidate's `action`:\n"
         "- `create` entries: the file is authored by this plan, so 'not on "
@@ -408,6 +445,8 @@ def apply_path_resolution(
     repos_root: str = "",
     exists: Callable[[str], bool] = os.path.exists,
     find_basename_matches: Callable[[str], int] | None = None,
+    extra_planned: set[str] | None = None,
+    workspace_root: str = "",
 ) -> tuple[ImplementationDAG, list[DagPathRewrite]]:
     """Apply the resolver's ``correct`` decisions to the DAG (pure, deterministic).
 
@@ -462,7 +501,7 @@ def apply_path_resolution(
         if (d.decision or "").strip().lower() == "ambiguous"
     ]
     if ambiguous:
-        planned = planned_new_file_paths(dag)
+        planned = planned_new_file_paths(dag) | (extra_planned or set())
         entries = _entry_index(dag)
         genuinely_ambiguous = []
         for d in ambiguous:
@@ -490,6 +529,7 @@ def apply_path_resolution(
                     not repos_root
                     or _create_parent_grounded(
                         repos_root, repo_path, d.original, planned, exists=exists,
+                        workspace_root=workspace_root,
                     )
                 )
                 if still_missing and grounded:

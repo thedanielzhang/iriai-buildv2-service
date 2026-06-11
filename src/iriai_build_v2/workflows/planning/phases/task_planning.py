@@ -95,7 +95,9 @@ from ..._common._dag_paths import (
     dag_path_canonicalization_enabled,
     dag_path_rewrites_to_records,
     feature_repos_root,
+    feature_workspace_root,
     find_retired_backend_path_references,
+    planned_new_file_paths,
     resolution_covers_unresolved,
     unresolved_dag_paths,
 )
@@ -2035,6 +2037,7 @@ class TaskPlanningPhase(Phase):
         # Applied AFTER the atomic rebuild below so the rebuild never wipes
         # them; idempotent (pure set-union) across normalize passes.
         augments = await _load_slice_contract_augments(runner, feature, manifest.slug)
+        augments = cls._resolve_step_keyed_augments(augments, manifest)
         unknown_augment_slice_ids = sorted(
             set(augments) - {slice_info.slice_id for slice_info in manifest.slices}
         )
@@ -3592,6 +3595,65 @@ class TaskPlanningPhase(Phase):
                 ),
             }
         )
+
+    @classmethod
+    def _resolve_step_keyed_augments(
+        cls,
+        augments: dict[str, SliceContractAugment],
+        manifest: TaskPlanningSliceManifest,
+    ) -> dict[str, SliceContractAugment]:
+        """Resolve STEP-keyed augment entries to their owning manifest slices.
+
+        Augment keys may be manifest slice ids (applied verbatim) or plan step
+        ids (``STEP-N``): steps are the stable pre-manifest vocabulary, so an
+        augments key can be authored BEFORE the slicer has decided how steps
+        group into slices. Each step key is resolved to the manifest slice
+        whose ``step_ids`` contains it and set-unioned into that slice's
+        effective augment (merging with any direct slice-keyed entry). A step
+        key no manifest slice owns raises — an operator pin that cannot land
+        anywhere must fail loud, never drop silently."""
+        step_keys = [key for key in augments if key.upper().startswith("STEP-")]
+        if not step_keys:
+            return augments
+        step_owner = {
+            step_id: slice_info.slice_id
+            for slice_info in manifest.slices
+            for step_id in slice_info.step_ids
+        }
+        resolved = {key: value for key, value in augments.items() if key not in step_keys}
+        for key in step_keys:
+            owner = step_owner.get(key)
+            if owner is None:
+                raise RuntimeError(
+                    f"operator slice-contract augments for {manifest.slug} target "
+                    f"step {key!r} which no manifest slice owns; manifest steps: "
+                    f"{sorted(step_owner)}. Fix the dag-slice-augments store key "
+                    "before re-running."
+                )
+            addition = augments[key]
+            existing = resolved.get(owner)
+            if existing is None:
+                resolved[owner] = addition
+            else:
+                resolved[owner] = SliceContractAugment(
+                    add_step_ids=existing.add_step_ids
+                    + [s for s in addition.add_step_ids if s not in existing.add_step_ids],
+                    add_step_titles=existing.add_step_titles
+                    + [t for t in addition.add_step_titles if t not in existing.add_step_titles],
+                    add_requirement_ids=sorted(
+                        set(existing.add_requirement_ids) | set(addition.add_requirement_ids)
+                    ),
+                    add_journey_ids=sorted(
+                        set(existing.add_journey_ids) | set(addition.add_journey_ids)
+                    ),
+                )
+            logger.info(
+                "slice contract augment key %s resolved to owning slice %s/%s",
+                key,
+                manifest.slug,
+                owner,
+            )
+        return resolved
 
     @classmethod
     def _apply_slice_contract_augment(
@@ -5476,6 +5538,59 @@ class TaskPlanningPhase(Phase):
         return feature_repos_root(runner, feature)
 
     @classmethod
+    async def _load_upstream_planned_file_paths(
+        cls,
+        runner: WorkflowRunner,
+        feature: Feature,
+        exclude_slug: str,
+    ) -> set[str]:
+        """NET-NEW file paths planned by OTHER subfeatures' persisted fragments.
+
+        Subfeatures legitimately modify files an EARLIER subfeature's DAG
+        creates (every SF appends endpoints to S1's router file). Those paths
+        do not exist on disk during planning and are invisible to the current
+        fragment's own planned-new set, so the resolver flags them ambiguous
+        (N-8, resume49: handoff slice-1/2 + settings slice-7 all failed on
+        S1's submittal_management.py). Aggregate the create-action paths of
+        every persisted sibling fragment so cross-SF dependencies ground the
+        same way intra-fragment ones do. Tolerant: any missing/unparseable
+        manifest or fragment narrows the set (old behavior), never raises."""
+        planned: set[str] = set()
+        try:
+            decomp_text = await runner.artifacts.get("decomposition", feature=feature) or ""
+            decomposition = SubfeatureDecomposition.model_validate(_json.loads(decomp_text))
+        except Exception:
+            logger.debug("upstream planned-paths: decomposition unavailable", exc_info=True)
+            return planned
+        for subfeature in getattr(decomposition, "subfeatures", []) or []:
+            slug = getattr(subfeature, "slug", "")
+            if not slug or slug == exclude_slug:
+                continue
+            try:
+                manifest = await cls._load_slice_manifest(runner, feature, slug)
+            except Exception:
+                continue
+            if manifest is None:
+                continue
+            for slice_info in manifest.slices:
+                fragment_key = cls._slice_fragment_key(slug, slice_info.slice_id)
+                try:
+                    fragment_text = await runner.artifacts.get(fragment_key, feature=feature)
+                    if not fragment_text:
+                        continue
+                    fragment = ImplementationDAG.model_validate_json(fragment_text)
+                except Exception:
+                    continue
+                planned |= planned_new_file_paths(fragment)
+        if planned:
+            logger.info(
+                "upstream planned-paths for %s: %d cross-subfeature planned file form(s)",
+                exclude_slug,
+                len(planned),
+            )
+        return planned
+
+    @classmethod
     async def _resolve_dag_paths_for_persistence(
         cls,
         runner: WorkflowRunner,
@@ -5509,6 +5624,12 @@ class TaskPlanningPhase(Phase):
             # Existence-prepass skip: every path already resolves on disk.
             return dag, [], []
 
+        exclude_slug = resolution_key.split(":", 1)[0]
+        extra_planned = await cls._load_upstream_planned_file_paths(
+            runner, feature, exclude_slug,
+        )
+        workspace_root = feature_workspace_root(runner, feature)
+
         resolution = await cls._load_or_dispatch_path_resolution(
             runner,
             feature,
@@ -5517,11 +5638,14 @@ class TaskPlanningPhase(Phase):
             context=context,
             resolution_key=resolution_key,
             repos_root=repos_root,
+            extra_planned=extra_planned,
         )
 
         try:
             corrected, rewrites = apply_path_resolution(
                 dag, resolution, repos_root=repos_root,
+                extra_planned=extra_planned,
+                workspace_root=workspace_root,
             )
         except AmbiguousDagPath as exc:
             logger.warning(
@@ -5551,6 +5675,7 @@ class TaskPlanningPhase(Phase):
         context: str,
         resolution_key: str,
         repos_root: str,
+        extra_planned: set[str] | None = None,
     ) -> DagPathResolution:
         """Return the persisted resolution (replay-stable) or dispatch the agent once."""
         artifact_key = f"dag-path-resolution:{resolution_key}"
@@ -5584,7 +5709,9 @@ class TaskPlanningPhase(Phase):
             role=dag_path_resolver_role,
             context_keys=[],
         )
-        prompt = build_dag_path_resolver_prompt(dag, unresolved, repos_root)
+        prompt = build_dag_path_resolver_prompt(
+            dag, unresolved, repos_root, extra_planned=extra_planned,
+        )
         await _clear_agent_session(runner, actor, feature)
         resolution: DagPathResolution = await runner.run(
             Ask(

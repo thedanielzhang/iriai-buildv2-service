@@ -19629,6 +19629,76 @@ async def test_reconciliation_loader_falls_back_on_degenerate_sidecar(tmp_path, 
     )
 
 
+def _step_keyed_manifest() -> "task_planning_module.TaskPlanningSliceManifest":
+    slices = [
+        task_planning_module.TaskPlanningSlice(
+            slice_id="slice-1", step_ids=["STEP-1", "STEP-2", "STEP-3"],
+        ),
+        task_planning_module.TaskPlanningSlice(
+            slice_id="slice-2", step_ids=["STEP-4", "STEP-5"],
+        ),
+    ]
+    return task_planning_module.TaskPlanningSliceManifest(
+        slug="stepkey",
+        slices=slices,
+        statuses=[
+            task_planning_module.SlicePlanningStatus(slice_id=s.slice_id) for s in slices
+        ],
+        attempts=[],
+        derivation_version=task_planning_module._SLICE_MANIFEST_DERIVATION_VERSION,
+        plan_digest="d1",
+        test_plan_digest="d2",
+    )
+
+
+def test_step_keyed_augments_resolve_to_owning_slice():
+    """STEP-keyed augment entries resolve to the manifest slice owning the
+    step — authorable BEFORE the slicer decides how steps group — and merge
+    with any direct slice-keyed entry for the same slice."""
+    manifest = _step_keyed_manifest()
+    augments = {
+        "STEP-2": task_planning_module.SliceContractAugment(
+            add_requirement_ids=["REQ-30", "REQ-31"],
+        ),
+        "STEP-5": task_planning_module.SliceContractAugment(
+            add_requirement_ids=["REQ-40"], add_step_ids=["STEP-13"],
+        ),
+        "slice-2": task_planning_module.SliceContractAugment(
+            add_requirement_ids=["REQ-41"],
+        ),
+    }
+    resolved = TaskPlanningPhase._resolve_step_keyed_augments(augments, manifest)
+    assert set(resolved) == {"slice-1", "slice-2"}
+    assert resolved["slice-1"].add_requirement_ids == ["REQ-30", "REQ-31"]
+    assert resolved["slice-2"].add_requirement_ids == ["REQ-40", "REQ-41"]
+    assert resolved["slice-2"].add_step_ids == ["STEP-13"]
+
+
+def test_step_keyed_augments_unknown_step_raises():
+    """A step key no manifest slice owns is an operator pin that cannot land —
+    fail loud, never drop silently."""
+    manifest = _step_keyed_manifest()
+    augments = {
+        "STEP-99": task_planning_module.SliceContractAugment(
+            add_requirement_ids=["REQ-1"],
+        ),
+    }
+    with pytest.raises(RuntimeError, match="STEP-99"):
+        TaskPlanningPhase._resolve_step_keyed_augments(augments, manifest)
+
+
+def test_slice_keyed_augments_pass_through_unchanged():
+    manifest = _step_keyed_manifest()
+    augments = {
+        "slice-1": task_planning_module.SliceContractAugment(
+            add_requirement_ids=["REQ-7"],
+        ),
+    }
+    assert (
+        TaskPlanningPhase._resolve_step_keyed_augments(augments, manifest) is augments
+    )
+
+
 @pytest.mark.asyncio
 async def test_sidecar_path_admits_plan_local_and_ledger_decision_ids(tmp_path):
     """L3: the sidecar compile path must admit plan-cited decision ids the
