@@ -146,18 +146,47 @@ async def test_run_full_pass_dispatches_to_compose_branch(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_compose_preflight_refuse_is_honest_skip(monkeypatch):
+async def test_compose_preflight_refuse_raises_typed_and_is_loud(monkeypatch):
+    # Item-11 G2/G3: refusal raises E2EPassRefused (so callers hold the cursor)
+    # + writes a durable e2e-blocker row + pages, instead of a silent summary.
+    from iriai_build_v2.workflows.develop.e2e.registry import BLOCKER_KEY
+    from iriai_build_v2.workflows.develop.e2e.status import CapturingPoster
+
     adapter = FakeComposeAdapter(smokes=[], verdicts=[])
     _wire(monkeypatch, adapter, preflight_ok=False)
     reg = FakeRegistry(_profile())
-    out = await run_full_pass(_checkpoint(), feature_id="f", registry=reg,
-                              live_dsn="x", profile=_profile())
-    assert out.boot_smoke == "fail"
-    assert out.green is False
-    assert "preflight refused" in out.detail
+    poster = CapturingPoster()
+    with pytest.raises(pass_mod.E2EPassRefused) as ei:
+        await run_full_pass(_checkpoint(), feature_id="f", registry=reg,
+                            live_dsn="x", profile=_profile(), poster=poster)
+    assert "preflight refused" in str(ei.value)
     # Nothing was stood up: no substrate, no green pointer.
     assert FakeSubstrate.constructed == 0
     assert reg.green is None
+    # Durable visibility: blocker row + page card + status row.
+    blocker = reg.raw[BLOCKER_KEY]
+    assert blocker["checkpoint"] == "group 5"
+    assert blocker["blockers"][0]["surface"] == "compose-preflight"
+    assert any("BLOCKER" in text for _blocks, text in poster.cards)
+    assert reg.status is not None
+
+
+@pytest.mark.asyncio
+async def test_compose_preflight_refuse_page_dedupes_on_retry(monkeypatch):
+    # The 10s poll loop retries the SAME checkpoint: the second refusal for the
+    # same (checkpoint, reason) must NOT page again (no page-spam).
+    adapter = FakeComposeAdapter(smokes=[], verdicts=[])
+    _wire(monkeypatch, adapter, preflight_ok=False)
+    from iriai_build_v2.workflows.develop.e2e.status import CapturingPoster
+
+    reg = FakeRegistry(_profile())
+    poster = CapturingPoster()
+    for _ in range(2):
+        with pytest.raises(pass_mod.E2EPassRefused):
+            await run_full_pass(_checkpoint(), feature_id="f", registry=reg,
+                                live_dsn="x", profile=_profile(), poster=poster)
+    blocker_cards = [t for _b, t in poster.cards if "BLOCKER" in t]
+    assert len(blocker_cards) == 1  # paged once, deduped on retry
 
 
 @pytest.mark.asyncio

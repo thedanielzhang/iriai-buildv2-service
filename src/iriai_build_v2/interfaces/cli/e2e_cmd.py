@@ -216,7 +216,7 @@ async def _e2e(
 ) -> None:
     from ...workflows.develop.e2e.checkpoint import fetch_latest_sealed_checkpoint
     from ...workflows.develop.e2e.models import E2ETrackCursor
-    from ...workflows.develop.e2e.pass_ import run_full_pass
+    from ...workflows.develop.e2e.pass_ import E2EPassRefused, run_full_pass
     from ...workflows.develop.e2e.runner_loop import AsyncE2ETrack, host_preflight
 
     pool, registry = await _open_live(feature)
@@ -251,9 +251,15 @@ async def _e2e(
             click.echo(f"preflight abort (resource-bounded): {pf.reason}")
             return
         click.echo(f"running integrated e2e pass @ group {cp.group_idx} ...")
-        s = await run_full_pass(cp, feature_id=feature, registry=registry,
-                                live_dsn=LIVE_DSN, profile=override_profile,
-                                on_log=lambda m: click.echo("  " + m))
+        try:
+            s = await run_full_pass(cp, feature_id=feature, registry=registry,
+                                    live_dsn=LIVE_DSN, profile=override_profile,
+                                    on_log=lambda m: click.echo("  " + m))
+        except E2EPassRefused as exc:
+            # Item-11 G2: a refused pass must NOT consume the sealed checkpoint
+            # — no cursor write; the next run retries the SAME checkpoint.
+            click.echo(f"[refused] {exc} (cursor NOT advanced; re-run to retry)")
+            return
         click.echo(f"PASS @ group {s.group_idx}: {s.detail}")
         click.echo(f"  green={s.green} preview_url='{s.preview_url}' "
                    f"backlog+={s.backlog_appended} open_reds={len(s.open_regressions)}")

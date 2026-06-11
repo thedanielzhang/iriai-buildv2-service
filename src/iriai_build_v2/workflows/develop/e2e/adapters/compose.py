@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import json
 import os
 import re
 import shlex
@@ -30,10 +31,13 @@ import yaml
 
 from ..models import BootSmoke, E2ESpecRecord, E2EVerdictRecord, ProjectProfile
 from . import Instance, Surface, probe_surface, register_adapter
+from .browser import NativeRun
 from .junit_report import parse_junit_xml
+from .playwright_report import PwRunResult, parse_playwright_json
 
 _COMPOSE_UP_TIMEOUT_S = float(os.environ.get("IRIAI_E2E_COMPOSE_UP_TIMEOUT_S", "1800"))
 _HOST_TEST_TIMEOUT_S = float(os.environ.get("IRIAI_E2E_HOST_TEST_TIMEOUT_S", "1200"))
+_NATIVE_LANE_TIMEOUT_S = float(os.environ.get("IRIAI_E2E_COMPOSE_LANE_TIMEOUT_S", "900"))
 
 
 class ComposeAdapterError(RuntimeError):
@@ -194,6 +198,37 @@ def build_surfaces(profile: Any) -> list[Surface]:
     return surfaces
 
 
+def parse_env_file(path: Path) -> dict[str, str]:
+    """Pure: parse a dotenv-style file into {KEY: value}.
+
+    Supports ``KEY=value``, optional ``export `` prefix, blank/comment lines,
+    and single/double-quoted values. Values are returned as-is otherwise (no
+    interpolation). Used to resolve the profile's Auth0 test-account env KEY
+    NAMES against the provision-injected secret env file — key names only ever
+    appear in profiles/logs; the VALUES stay in process env (item 11a).
+    """
+    out: dict[str, str] = {}
+    try:
+        text = Path(path).read_text(errors="replace")
+    except OSError:
+        return out
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):].lstrip()
+        key, _, value = line.partition("=")
+        key = key.strip()
+        if not key or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+            value = value[1:-1]
+        out[key] = value
+    return out
+
+
 def run_to_verdicts(
     run: Any, *, suite: str, source_commit: str = "", critical: bool = False
 ) -> list[E2EVerdictRecord]:
@@ -322,6 +357,10 @@ class ComposeAdapter:
         )
         instance.substrate = substrate
         instance.notes = project
+        # Item 11a: stash the injected secret env-file PATH (never its contents)
+        # so run_native_config can resolve the profile's Auth0 test-account env
+        # KEY NAMES at lane time.
+        instance.secret_env_file = str(env_file)
         return instance
 
     async def seed(self, instance: Instance, profile: ProjectProfile) -> None:
@@ -389,6 +428,60 @@ class ComposeAdapter:
             )
         return verdicts
 
+    async def run_native_config(
+        self,
+        instance: Instance,
+        config: str,
+        *,
+        timeout: float = _NATIVE_LANE_TIMEOUT_S,
+    ) -> NativeRun:
+        """Item 11a: run ONE declared browser/Playwright lane against the LIVE
+        compose stack (fixed ports already up) — ``{native_test_cmd}
+        --config=<cfg> --reporter=json`` in the compose checkout, parsed via the
+        existing Playwright JSON report machinery.
+
+        Auth0 test-account credentials are injected by RESOLVING the profile's
+        ``e2e_test_account_user_key``/``pass_key`` (env KEY NAMES, never values)
+        from the provision-injected secret env file; values are placed in the
+        subprocess env only — never logged, never persisted.
+        """
+        profile = instance.profile
+        checkout = Path(instance.checkout_dir)
+        report = checkout / f".e2e-pw-{_sanitize(Path(config).stem)}.json"
+        with contextlib.suppress(OSError):
+            report.unlink()
+        env = {
+            **os.environ,
+            **instance.env,
+            "PLAYWRIGHT_JSON_OUTPUT_NAME": str(report),
+            "CI": "1",
+        }
+        secret_env_file = str(getattr(instance, "secret_env_file", "") or "")
+        secrets = parse_env_file(Path(secret_env_file)) if secret_env_file else {}
+        for key_name in (
+            profile.e2e_test_account_user_key,
+            profile.e2e_test_account_pass_key,
+        ):
+            if key_name and key_name in secrets:
+                env[key_name] = secrets[key_name]
+        cmd = profile.native_test_cmd or "npx playwright test"
+        argv = [*shlex.split(cmd), f"--config={config}", "--reporter=json"]
+        rc, _out, err = await _run(argv, cwd=checkout, timeout=timeout, env=env)
+        data: dict[str, Any] = {}
+        if report.exists():
+            with contextlib.suppress(Exception):
+                data = json.loads(report.read_text(errors="replace"))
+        result = (
+            parse_playwright_json(data)
+            if data
+            else PwRunResult(
+                global_errors=[f"no JSON report produced (rc={rc})"],
+                web_server_ok=False,
+            )
+        )
+        return NativeRun(config=config, result=result, returncode=rc,
+                         stderr_tail=err[-2000:], report_path=str(report))
+
     async def teardown(self, instance: Instance) -> None:
         # The substrate owns `docker compose down -v` (registered at provision)
         # + rmtree; calling it here covers the in-process success/failure paths.
@@ -398,11 +491,13 @@ class ComposeAdapter:
 
 
 async def _run(
-    argv: list[str], *, cwd: Path | None = None, timeout: float
+    argv: list[str], *, cwd: Path | None = None, timeout: float,
+    env: dict[str, str] | None = None,
 ) -> tuple[int, str, str]:
     proc = await asyncio.create_subprocess_exec(
         *argv,
         cwd=str(cwd) if cwd else None,
+        env=env,  # None => inherit (unchanged behavior for existing callers)
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )

@@ -191,7 +191,18 @@ class AsyncE2ETrack:
             return result
 
         if self.pass_fn is not None:
-            await self.pass_fn(cp)
+            from .pass_ import E2EPassRefused  # deferred — keep the poller import-light
+
+            try:
+                await self.pass_fn(cp)
+            except E2EPassRefused as exc:
+                # Item-11 G2: a refused pass NEVER consumes the checkpoint — the
+                # cursor is held so the next poll retries the SAME sealed
+                # checkpoint once mutex/disk pressure clears (self-coalescing
+                # prevents backlog pileup). Mirrors the host_preflight abort
+                # above, which also returns before the cursor write.
+                result.skipped_reason = f"pass refused (cursor held): {exc}"
+                return result
             result.did_pass = True
 
         if self.registry is not None:

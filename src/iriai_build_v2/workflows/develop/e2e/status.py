@@ -53,6 +53,7 @@ def build_status(
     verdicts: list[E2EVerdictRecord],
     green_pointer: E2EGreenPointer | None = None,
     preview_url: str = "",
+    browser_lanes: str = "",
 ) -> E2EStatus:
     commits = checkpoint.result_commits() if checkpoint else {}
     passed = sum(1 for v in verdicts if v.status == "pass" and v.failure_class != "flaky")
@@ -76,34 +77,43 @@ def build_status(
         flaky=flaky,
         open_regressions=open_regressions,
         preview_url=preview_url,
+        browser_lanes=browser_lanes,
     )
 
 
 def material_digest(status: E2EStatus) -> str:
-    payload = "|".join(
-        str(x) for x in (
-            status.latest_checkpoint_commit, status.boot_smoke, status.passed,
-            status.failed, status.flaky, sorted(status.open_regressions),
-            status.latest_green_checkpoint,
-        )
-    )
+    fields = [
+        status.latest_checkpoint_commit, status.boot_smoke, status.passed,
+        status.failed, status.flaky, sorted(status.open_regressions),
+        status.latest_green_checkpoint,
+    ]
+    # Item-11 G4: include browser_lanes ONLY when non-empty so the studio card
+    # digest (and its dedupe history) is byte-for-byte unchanged.
+    if getattr(status, "browser_lanes", ""):
+        fields.append(status.browser_lanes)
+    payload = "|".join(str(x) for x in fields)
     return hashlib.sha256(payload.encode()).hexdigest()
 
 
 def status_blocks(status: E2EStatus) -> list[dict]:
+    fields = [
+        {"type": "mrkdwn", "text": f"*Latest:* {status.latest_checkpoint}"},
+        {"type": "mrkdwn", "text": f"*Green:* {status.latest_green_checkpoint or '—'}"},
+        {"type": "mrkdwn", "text": f"*Boot-smoke:* {status.boot_smoke}"},
+        {"type": "mrkdwn",
+         "text": f"*Pass/Fail/Flaky:* {status.passed}/{status.failed}/{status.flaky}"},
+        {"type": "mrkdwn",
+         "text": f"*Open regressions:* {len(status.open_regressions)}"},
+        {"type": "mrkdwn", "text": f"*Preview:* {status.preview_url or '—'}"},
+    ]
+    # Item-11 G4: shown ONLY when set, so the studio card layout is unchanged.
+    if getattr(status, "browser_lanes", ""):
+        fields.append(
+            {"type": "mrkdwn", "text": f"*Browser lanes:* {status.browser_lanes}"})
     return [
         {"type": "header",
          "text": {"type": "plain_text", "text": "e2e status"}},
-        {"type": "section", "fields": [
-            {"type": "mrkdwn", "text": f"*Latest:* {status.latest_checkpoint}"},
-            {"type": "mrkdwn", "text": f"*Green:* {status.latest_green_checkpoint or '—'}"},
-            {"type": "mrkdwn", "text": f"*Boot-smoke:* {status.boot_smoke}"},
-            {"type": "mrkdwn",
-             "text": f"*Pass/Fail/Flaky:* {status.passed}/{status.failed}/{status.flaky}"},
-            {"type": "mrkdwn",
-             "text": f"*Open regressions:* {len(status.open_regressions)}"},
-            {"type": "mrkdwn", "text": f"*Preview:* {status.preview_url or '—'}"},
-        ]},
+        {"type": "section", "fields": fields},
     ]
 
 

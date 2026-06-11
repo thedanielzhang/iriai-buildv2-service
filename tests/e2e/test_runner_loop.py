@@ -94,5 +94,40 @@ async def test_preflight_abort_skips_pass(monkeypatch):
     assert ran == []  # heavy pass did NOT run
 
 
+@pytest.mark.asyncio
+async def test_refused_pass_holds_cursor_and_retries():
+    # Item-11 G2: E2EPassRefused -> the cursor is NOT written; the next poll
+    # retries the SAME checkpoint (no silent consumption of a sealed
+    # checkpoint), and a later successful pass advances it normally.
+    from iriai_build_v2.workflows.develop.e2e.pass_ import E2EPassRefused
+
+    reg = FakeRegistry()
+    attempts = []
+    refuse = {"on": True}
+
+    async def pass_fn(cp):
+        attempts.append(cp.group_idx)
+        if refuse["on"]:
+            raise E2EPassRefused("compose preflight refused: single-stack mutex")
+
+    t = ScriptedTrack(feature_id="f", live_dsn="x", registry=reg, pass_fn=pass_fn)
+    t.scripted = [_cp(79, "c79"), _cp(79, "c79"), _cp(79, "c79")]
+
+    r1 = await t.poll_once()
+    assert r1.advanced and not r1.did_pass
+    assert "pass refused (cursor held)" in r1.skipped_reason
+    assert reg.cursor is None  # checkpoint NOT consumed
+
+    r2 = await t.poll_once()  # still refused -> retried the SAME checkpoint
+    assert "pass refused (cursor held)" in r2.skipped_reason
+    assert reg.cursor is None
+    assert attempts == [79, 79]
+
+    refuse["on"] = False  # pressure cleared -> pass runs, cursor advances
+    r3 = await t.poll_once()
+    assert r3.did_pass
+    assert reg.cursor.group_idx == 79 and reg.cursor.last_processed_commit == "c79"
+
+
 async def _noop():
     return None
