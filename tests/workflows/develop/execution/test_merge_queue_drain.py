@@ -30,6 +30,7 @@ repo / base commit. They skip when no Postgres is reachable. Coverage:
 from __future__ import annotations
 
 import json
+import logging
 import subprocess
 import uuid
 from pathlib import Path
@@ -38,6 +39,7 @@ from types import SimpleNamespace
 import pytest
 
 from iriai_build_v2.execution_control import ExecutionControlStore
+from iriai_build_v2.workflows.develop.execution import failure_router
 from iriai_build_v2.execution_control.merge_queue_store import (
     MergeQueueError as MergeQueueStoreError,
     MergeQueueItemCreate,
@@ -661,6 +663,192 @@ def test_diff_check_findings_whitespace_only_classifier() -> None:
     # Empty / unparseable output (non-zero exit with no findings) fails closed.
     assert impl._diff_check_findings_whitespace_only("") is False
     assert impl._diff_check_findings_whitespace_only("fatal: bad revision\n") is False
+
+
+# ── W-L lockfile-consistency ratchet (runbook §16) ───────────────────────────
+
+
+_PNPM_REFUSAL = (
+    "ERR_PNPM_OUTDATED_LOCKFILE  Cannot install with \"frozen-lockfile\" "
+    "because pnpm-lock.yaml is not up to date with spend-client/package.json"
+)
+
+
+def _init_pnpm_repo(path: Path) -> str:
+    """A pnpm-workspace repo with manifest + lockfile committed at HEAD."""
+    _init_repo(path)
+    (path / "pnpm-workspace.yaml").write_text("packages:\n  - 'spend-client'\n")
+    (path / "pnpm-lock.yaml").write_text("lockfileVersion: '9.0'\n")
+    (path / "package.json").write_text('{"name": "root", "private": true}\n')
+    _git(path, "add", ".")
+    _git(path, "commit", "-q", "-m", "pnpm scaffolding")
+    return _git(path, "rev-parse", "HEAD").strip()
+
+
+def _pnpm_recorder(monkeypatch, *, rc: int, output: str) -> list[Path]:
+    """Mock the pnpm subprocess helper; returns the recorded call list."""
+    calls: list[Path] = []
+
+    async def _fake(repo_path: Path) -> tuple[int, str]:
+        calls.append(repo_path)
+        return rc, output
+
+    monkeypatch.setattr(impl, "_run_pnpm_frozen_lockfile_check", _fake)
+    return calls
+
+
+@pytest.mark.asyncio
+async def test_post_apply_gate_rejects_stale_lockfile_on_manifest_touch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A package.json-touching merge with a stale pnpm-lock.yaml is REJECTED.
+
+    The g0 incident class: a harness task adds a dependency to a workspace
+    package.json without regenerating pnpm-lock.yaml; pnpm's frozen-lockfile
+    dry refusal (rc != 0) must reject the lane with the typed reason
+    ``lockfile_inconsistent`` listing the offending importer paths.
+    """
+    monkeypatch.delenv(impl.MERGE_LOCKFILE_CHECK_ENV, raising=False)
+    repo = tmp_path / "app"
+    _init_pnpm_repo(repo)
+    # The applied-and-STAGED state `git apply --index` leaves behind: a
+    # manifest edit with NO matching lockfile regeneration.
+    (repo / "package.json").write_text(
+        '{"name": "root", "devDependencies": {"@playwright/test": "^1.0.0"}}\n'
+    )
+    _git(repo, "add", "package.json")
+    calls = _pnpm_recorder(monkeypatch, rc=1, output=_PNPM_REFUSAL)
+
+    item = SimpleNamespace(
+        repo_targets=[SimpleNamespace(repo_id="app", repo_path=str(repo))]
+    )
+    decision = await impl._merge_queue_post_apply_gate_decision(item)
+    assert calls == [repo]
+    assert decision.approved is False
+    assert decision.failure_class == "lockfile_inconsistent"
+    assert decision.verdict_payload["gate"] == "merge_queue_post_apply_lockfile_check"
+    assert decision.verdict_payload["reason"] == "lockfile_inconsistent"
+    assert decision.verdict_payload["rejected_repo_ids"] == ["app"]
+    # The offending importer path from pnpm's refusal is surfaced.
+    assert "spend-client/package.json" in decision.detail
+    assert "spend-client/package.json" in (
+        decision.verdict_payload["lockfile_findings"]["app"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_post_apply_gate_passes_consistent_lockfile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A manifest+lockfile-consistent merge passes the lockfile step (rc 0)."""
+    monkeypatch.delenv(impl.MERGE_LOCKFILE_CHECK_ENV, raising=False)
+    repo = tmp_path / "app"
+    _init_pnpm_repo(repo)
+    (repo / "package.json").write_text(
+        '{"name": "root", "devDependencies": {"@playwright/test": "^1.0.0"}}\n'
+    )
+    (repo / "pnpm-lock.yaml").write_text(
+        "lockfileVersion: '9.0'\n# regenerated alongside the manifest\n"
+    )
+    _git(repo, "add", "package.json", "pnpm-lock.yaml")
+    calls = _pnpm_recorder(monkeypatch, rc=0, output="Lockfile is up to date")
+
+    item = SimpleNamespace(
+        repo_targets=[SimpleNamespace(repo_id="app", repo_path=str(repo))]
+    )
+    decision = await impl._merge_queue_post_apply_gate_decision(item)
+    assert calls == [repo]
+    assert decision.approved is True
+
+
+@pytest.mark.asyncio
+async def test_post_apply_gate_lockfile_check_skipped_without_manifest_touch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A non-package.json patch skips the check entirely — ZERO pnpm calls."""
+    monkeypatch.delenv(impl.MERGE_LOCKFILE_CHECK_ENV, raising=False)
+    repo = tmp_path / "app"
+    _init_pnpm_repo(repo)
+    (repo / "README.md").write_text("init\nclean applied change\n")
+    _git(repo, "add", "README.md")
+    calls = _pnpm_recorder(monkeypatch, rc=1, output=_PNPM_REFUSAL)
+
+    item = SimpleNamespace(
+        repo_targets=[SimpleNamespace(repo_id="app", repo_path=str(repo))]
+    )
+    decision = await impl._merge_queue_post_apply_gate_decision(item)
+    assert calls == []
+    assert decision.approved is True
+
+
+@pytest.mark.asyncio
+async def test_post_apply_gate_lockfile_check_skipped_in_non_pnpm_repo(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A package.json touch in a NON-pnpm repo never invokes pnpm.
+
+    No pnpm-workspace.yaml / pnpm-lock.yaml at the repo root means no
+    frozen-lockfile contract to enforce (npm has no cheap refusal-only
+    mode, so the gate is pnpm-only by design).
+    """
+    monkeypatch.delenv(impl.MERGE_LOCKFILE_CHECK_ENV, raising=False)
+    repo = tmp_path / "app"
+    _init_repo(repo)
+    (repo / "package.json").write_text('{"name": "plain-npm"}\n')
+    _git(repo, "add", "package.json")
+    calls = _pnpm_recorder(monkeypatch, rc=1, output=_PNPM_REFUSAL)
+
+    item = SimpleNamespace(
+        repo_targets=[SimpleNamespace(repo_id="app", repo_path=str(repo))]
+    )
+    decision = await impl._merge_queue_post_apply_gate_decision(item)
+    assert calls == []
+    assert decision.approved is True
+
+
+@pytest.mark.asyncio
+async def test_post_apply_gate_lockfile_flag_off_warns_and_proceeds(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Flag OFF: a package.json-touching merge proceeds with a LOUD WARN.
+
+    ``IRIAI_MERGE_LOCKFILE_CHECK=0`` disables the pnpm refusal (zero pnpm
+    invocations) but the gate still detects the manifest touch and warns
+    loudly — never a silent skip.
+    """
+    monkeypatch.setenv(impl.MERGE_LOCKFILE_CHECK_ENV, "0")
+    repo = tmp_path / "app"
+    _init_pnpm_repo(repo)
+    (repo / "package.json").write_text('{"name": "root", "private": false}\n')
+    _git(repo, "add", "package.json")
+    calls = _pnpm_recorder(monkeypatch, rc=1, output=_PNPM_REFUSAL)
+
+    item = SimpleNamespace(
+        repo_targets=[SimpleNamespace(repo_id="app", repo_path=str(repo))]
+    )
+    with caplog.at_level(logging.WARNING):
+        decision = await impl._merge_queue_post_apply_gate_decision(item)
+    assert calls == []
+    assert decision.approved is True
+    warn_text = "\n".join(
+        r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING
+    )
+    assert impl.MERGE_LOCKFILE_CHECK_ENV in warn_text
+    assert "DISABLED" in warn_text
+
+
+def test_lockfile_inconsistent_maps_to_a_known_router_pair() -> None:
+    """The drain maps `lockfile_inconsistent` to a real route-table pair.
+
+    An unmapped class falls back to ("unknown", "unclassified") and the
+    router quiesces it; the lockfile rejection must instead route to the
+    commit-hygiene repair (regenerate the lockfile in-tree).
+    """
+    pair = impl._MERGE_QUEUE_DRAIN_FAILURE_PAIRS["lockfile_inconsistent"]
+    assert pair == ("commit_hygiene", "commit_hook_failed")
+    assert pair in failure_router.ROUTE_TABLE
 
 
 # ── raised worker exception: fails one lane, does not strand siblings ────────

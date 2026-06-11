@@ -923,6 +923,13 @@ DEFAULT_AGENT_SHARED_GROUP = "iriai-agents"
 CONTRADICTION_DECISIONS_KEY = "contradiction-decisions"
 KNOWN_FLAKY_LEDGER_ENV = "IRIAI_KNOWN_FLAKY_LEDGER"
 KNOWN_FLAKY_LEDGER_ARTIFACT_KEY = "known-flaky-tests"
+# W-L lockfile-consistency ratchet (runbook §16): deterministic merge-lane
+# gate step that rejects a lane whose applied tree touches a package.json
+# manifest in a pnpm repo without a consistent pnpm-lock.yaml. Default ON.
+# Turning it OFF logs a LOUD warning per offending lane (no silent
+# degradation) — an inconsistent lockfile breaks every later sandbox
+# provision on `pnpm install --frozen-lockfile`.
+MERGE_LOCKFILE_CHECK_ENV = "IRIAI_MERGE_LOCKFILE_CHECK"
 # Per-task spec-amendment carrier (operator directive P-14). NOTE: default ON —
 # the OPPOSITE of the flaky-ledger flag — because amendments are operator-
 # authored binding directives; requiring a flag flip to honor them would be
@@ -6446,8 +6453,9 @@ def _commit_hygiene_recovery_feedback(
 # produce these classes — `apply_candidate` emits `merge_conflict` /
 # `stale_projection` / `contract_violation` / `checkpoint_contradiction`;
 # `run_required_gates` emits `verifier_provider` / `verifier_context` /
-# `checkpoint_contradiction`; `commit_and_prove_clean` emits `commit_hygiene` /
-# `checkpoint_contradiction`. `sandbox_isolation` / `worktree_alias` /
+# `checkpoint_contradiction` plus the deterministic post-apply gate's own
+# `merge_conflict` / `lockfile_inconsistent`; `commit_and_prove_clean` emits
+# `commit_hygiene` / `checkpoint_contradiction`. `sandbox_isolation` / `worktree_alias` /
 # `acl_workability` are NOT reachable from the drain path (they are workspace /
 # sandbox classes routed before enqueue), so they are intentionally absent.
 _MERGE_QUEUE_DRAIN_FAILURE_PAIRS: dict[str, tuple[str, str]] = {
@@ -6461,6 +6469,15 @@ _MERGE_QUEUE_DRAIN_FAILURE_PAIRS: dict[str, tuple[str, str]] = {
     ),
     "verifier_provider": ("verifier_provider", "verifier_provider_crash"),
     "verifier_context": ("verifier_context", "verifier_context_stale"),
+    # W-L lockfile ratchet: the post-apply gate emits `lockfile_inconsistent`
+    # when the applied tree touches package.json without a consistent
+    # pnpm-lock.yaml. The Slice 07 router's typed `FailureClass` Literal has
+    # no lockfile class; the commit-hygiene repair route is the correct fixer
+    # (regenerate the lockfile in-tree alongside the manifest change), so the
+    # queue-level class maps onto that existing route-table pair. The original
+    # `lockfile_inconsistent` typed reason still rides verbatim in the lane's
+    # `last_error` and the gate verdict payload (`reason` field).
+    "lockfile_inconsistent": ("commit_hygiene", "commit_hook_failed"),
 }
 
 
@@ -6631,6 +6648,48 @@ def _diff_check_findings_whitespace_only(output: str) -> bool:
     )
 
 
+def _merge_lockfile_check_enabled() -> bool:
+    """W-L lockfile-consistency ratchet flag (default ON)."""
+    return _env_flag_enabled(MERGE_LOCKFILE_CHECK_ENV, default=True)
+
+
+# Importer-path extraction from pnpm's frozen-lockfile refusal output, e.g.
+# `ERR_PNPM_OUTDATED_LOCKFILE  Cannot install with "frozen-lockfile" because
+# pnpm-lock.yaml is not up to date with spend-client/package.json`. Matches
+# every `<path>/package.json` (or bare `package.json`) token so multi-importer
+# refusals list every offender.
+_PNPM_LOCKFILE_IMPORTER_RE = re.compile(r"[^\s\"',()]*package\.json")
+
+
+async def _run_pnpm_frozen_lockfile_check(repo_path: Path) -> tuple[int, str]:
+    """Run pnpm's cheap frozen-lockfile dry refusal in *repo_path*.
+
+    ``pnpm install --frozen-lockfile --lockfile-only`` (~1s) refuses
+    (rc != 0, ``ERR_PNPM_OUTDATED_LOCKFILE``) when pnpm-lock.yaml is not up
+    to date with the workspace's package.json manifests, WITHOUT installing
+    node_modules and WITHOUT mutating the lockfile (``--frozen-lockfile``
+    never writes). Returns ``(returncode, combined stdout+stderr)``.
+    Module-level (looked up via the module global) so tests can monkeypatch
+    the subprocess away.
+    """
+    proc = await _asyncio.create_subprocess_exec(
+        "pnpm",
+        "install",
+        "--frozen-lockfile",
+        "--lockfile-only",
+        cwd=str(repo_path),
+        stdout=_asyncio.subprocess.PIPE,
+        stderr=_asyncio.subprocess.PIPE,
+    )
+    stdout_b, stderr_b = await proc.communicate()
+    output = (
+        stdout_b.decode(errors="replace")
+        + "\n"
+        + stderr_b.decode(errors="replace")
+    ).strip()
+    return int(proc.returncode or 0), output
+
+
 async def _merge_queue_post_apply_gate_decision(
     item: Any,
 ) -> Any:
@@ -6672,6 +6731,14 @@ async def _merge_queue_post_apply_gate_decision(
     at EOF, indent classes) are NOT classified `merge_conflict` — they are
     WARN-logged and surfaced in the approved verdict payload. Conflict markers
     and any other non-whitespace finding reject exactly as before.
+
+    W-L lockfile-consistency ratchet (runbook §16): after the diff-check
+    step approves, a second deterministic step rejects (typed reason
+    `lockfile_inconsistent`) when the applied tree touches any package.json
+    manifest in a pnpm repo whose pnpm-lock.yaml is not consistent —
+    verified via pnpm's cheap frozen-lockfile dry refusal. Flag-gated
+    default-ON via ``IRIAI_MERGE_LOCKFILE_CHECK``; with the flag OFF a
+    package.json-touching merge proceeds with a LOUD warning.
     """
 
     rejected_repos: list[str] = []
@@ -6723,6 +6790,96 @@ async def _merge_queue_post_apply_gate_decision(
                 "rejected_repo_ids": sorted(rejected_repos),
             },
         )
+
+    # W-L lockfile-consistency ratchet (runbook §16). Incident: a group-0
+    # harness task added "@playwright/test" to spend-client/package.json
+    # WITHOUT regenerating pnpm-lock.yaml; per-task verify PASSED it anyway
+    # and every post-g0 sandbox provision then failed on `pnpm install
+    # --frozen-lockfile` until the driver hand-regenerated the lockfile.
+    # This deterministic step closes that class at the merge lane: when the
+    # applied tree touches any package.json in a pnpm repo (pnpm-workspace.
+    # yaml or pnpm-lock.yaml at the repo root), pnpm's frozen-lockfile dry
+    # refusal (`pnpm install --frozen-lockfile --lockfile-only`, ~1s, never
+    # mutates the tree) must pass, else the lane rejects with the typed
+    # reason `lockfile_inconsistent` listing the offending importer paths.
+    # npm gets NO equivalent step: npm has no cheap refusal-only mode
+    # (`npm ci` performs a full install and `npm install --package-lock-only`
+    # REWRITES package-lock.json instead of refusing), so this gate is
+    # pnpm-only. `git diff --name-only HEAD` mirrors the diff-check rev-arg
+    # above: `apply_candidate` STAGES via `git apply --index`, so HEAD-vs-
+    # (index+worktree) is the applied patch's exact file list.
+    lockfile_rejected: dict[str, str] = {}
+    for target in getattr(item, "repo_targets", []) or []:
+        repo_path = Path(target.repo_path)
+        if not (
+            (repo_path / "pnpm-workspace.yaml").is_file()
+            or (repo_path / "pnpm-lock.yaml").is_file()
+        ):
+            continue
+        names = await merge_queue_git_service.run_git(
+            repo_path, "diff", "--name-only", "HEAD", check=False
+        )
+        if names.ok:
+            touched_manifests = [
+                line.strip()
+                for line in names.stdout.splitlines()
+                if line.strip()
+                and line.strip().split("/")[-1] == "package.json"
+            ]
+        else:
+            # Fail toward checking: an unreadable changed-file list must not
+            # silently skip the ratchet — run the pnpm refusal and let a
+            # consistent lockfile pass it.
+            touched_manifests = ["<git diff --name-only HEAD failed>"]
+        if not touched_manifests:
+            continue
+        if not _merge_lockfile_check_enabled():
+            logger.warning(
+                "merge-queue lockfile gate: %s is OFF — repo %s merge "
+                "touches package.json manifest(s) %s but the pnpm "
+                "frozen-lockfile consistency check is DISABLED and the "
+                "merge is proceeding UNCHECKED. An inconsistent "
+                "pnpm-lock.yaml breaks every later sandbox provision on "
+                "`pnpm install --frozen-lockfile` (runbook §16 ratchet).",
+                MERGE_LOCKFILE_CHECK_ENV,
+                target.repo_id,
+                touched_manifests,
+            )
+            continue
+        rc, pnpm_output = await _run_pnpm_frozen_lockfile_check(repo_path)
+        if rc == 0:
+            continue
+        importers = sorted(set(_PNPM_LOCKFILE_IMPORTER_RE.findall(pnpm_output)))
+        lockfile_rejected[target.repo_id] = (
+            "touched manifests: "
+            + ", ".join(touched_manifests[:20])
+            + "; offending importers: "
+            + (", ".join(importers[:20]) or "<unparsed from pnpm output>")
+            + "; pnpm: "
+            + pnpm_output[:1500]
+        )
+    if lockfile_rejected:
+        return MergeQueueGateDecision(
+            approved=False,
+            failure_class="lockfile_inconsistent",
+            detail=(
+                "post-apply pnpm frozen-lockfile check failed — the merged "
+                "tree touches package.json without a consistent "
+                f"pnpm-lock.yaml in repos {sorted(lockfile_rejected)}; "
+                "regenerate the lockfile alongside the manifest change. "
+                + " | ".join(
+                    f"[{rid}] {msg[:600]}"
+                    for rid, msg in sorted(lockfile_rejected.items())
+                )
+            )[:4000],
+            verdict_payload={
+                "gate": "merge_queue_post_apply_lockfile_check",
+                "reason": "lockfile_inconsistent",
+                "rejected_repo_ids": sorted(lockfile_rejected),
+                "lockfile_findings": lockfile_rejected,
+            },
+        )
+
     verdict_payload: dict[str, Any] = {"gate": "merge_queue_post_apply_diff_check"}
     if whitespace_warned:
         verdict_payload["whitespace_warning_repo_ids"] = sorted(whitespace_warned)
@@ -25866,7 +26023,13 @@ async def _verify(
         "2. Files listed as modified were actually changed\n"
         "3. The changes align with the described summary\n"
         "4. The code compiles, imports correctly, and passes any existing tests for these files\n"
-        "5. Implementation matches the upstream specs in the referenced context files\n\n"
+        "5. Implementation matches the upstream specs in the referenced context files\n"
+        "6. Lockfile consistency: a change touching any package.json without "
+        "its lockfile (e.g. pnpm-lock.yaml) regenerated in the same change "
+        "is an AUTOMATIC BLOCKER — verify via the frozen-lockfile dry "
+        "refusal (`pnpm install --frozen-lockfile --lockfile-only` in the "
+        "repo root must exit 0); a stale lockfile breaks every later "
+        "sandbox provision\n\n"
         "This is a per-group verification, not a full QA pass."
         + await _known_flaky_ledger_section(runner, feature)
                         + _verifier_evidence_transcription_section()
