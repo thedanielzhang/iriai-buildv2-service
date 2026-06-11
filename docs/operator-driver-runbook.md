@@ -347,3 +347,30 @@ At each CHK quiesce boundary the DRIVER (or its dedicated migration worker — n
 3. VERIFY: run the existence/verification probes the plans specify for that CHK before clearing the boundary; probe evidence goes in the OPERATOR-ACTIONS entry, which the driver marks DONE-by-driver (the entry is a record, not a request).
 4. The implementation-agent prohibition is UNCHANGED: coding agents never execute migrations; only the driver/its migration worker does, at quiesce boundaries only.
 5. The readiness item-2 quiesce hook fires and files the entry as designed, but the driver self-clears it after apply+verify instead of waiting on an operator query; batch all migrations ready at a boundary together.
+
+## 16. Healing doctrine — healable, not self-healing (added 2026-06-10)
+The WORKFLOW must be maximally HEALABLE; it must never be SELF-HEALING.
+Healing (diagnosis + repair of orchestrator defects) belongs to the
+driver/analyst layer, because: (a) a sick system cannot be trusted to
+assess its own sickness — the worst defect classes are failures of
+self-assessment (format-blind verdicts, silent fallbacks); (b) repair is
+self-modification and requires a governance loop OUTSIDE the thing being
+fixed (driver judgment, code-first discipline, tests, operator
+checkpoints, analyst verification); (c) healing happens when the
+workflow is down, when only an external agent can act.
+Division of labor:
+- IN THE WORKFLOW (code): everything that makes failure cheap to find
+  and safe to park — fail-loud guards, typed quiesces, blocked artifacts
+  carrying their own diagnosis, heartbeats, digest-pinned checkpoints —
+  plus deterministic, judgment-free self-checks (dry-run validators,
+  schema round-trips, path prepasses) as built-in phase-entry steps.
+- IN THIS RUNBOOK (agents): diagnosis, repair, the failure-class
+  taxonomy, and pre-phase class audits — judgment work triggered by
+  context the workflow cannot perceive.
+THE RATCHET RULE (generalizes the code-first amendment): every heal MUST
+leave behind a mechanized detector or validator that moves into the
+workflow. Judgment handles each novel class exactly once; machinery owns
+it forever after. A heal without its ratchet artifact is not closed.
+RCA RULE: every RCA ends with one bounded generalization pass — grep the
+failed mechanism's other call sites and the failure class's signature
+across the same subsystem — before the fix is considered scoped.
