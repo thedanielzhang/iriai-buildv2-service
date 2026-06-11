@@ -5026,17 +5026,41 @@ class TaskPlanningPhase(Phase):
     ) -> TestPlan | None:
         if not hasattr(runner, "artifacts"):
             return None
+        sidecar = None
         try:
             sidecar = await load_structured_artifact(runner, feature, f"test-plan:{slug}")
-            if sidecar is not None:
-                return sidecar.content
         except Exception:
             logger.debug("Unable to load structured test plan for %s", slug, exc_info=True)
+        if sidecar is not None and any(
+            criterion.id for criterion in sidecar.content.acceptance_criteria
+        ):
+            return sidecar.content
         try:
             text = await runner.artifacts.get(f"test-plan:{slug}", feature=feature) or ""
         except Exception:
-            return None
-        return cls._parse_test_plan(text)
+            return sidecar.content if sidecar is not None else None
+        parsed = cls._parse_test_plan(text)
+        if sidecar is None:
+            return parsed
+        parsed_ac_count = sum(
+            1
+            for criterion in (parsed.acceptance_criteria if parsed is not None else [])
+            if criterion.id
+        )
+        if parsed_ac_count == 0:
+            return sidecar.content
+        # Degenerate migrated sidecar (zero acceptance criteria while the
+        # markdown twin defines some): an empty canonical AC universe would
+        # refuse every owned-AC reconciliation and fail the slice — the same
+        # class the contract compile path already guards against.
+        logger.warning(
+            "DEGENERATE test-plan sidecar for %s in owned-AC reconciliation: "
+            "sidecar yields 0 acceptance criteria while the markdown twin "
+            "defines %d — reconciling against the markdown twin instead",
+            slug,
+            parsed_ac_count,
+        )
+        return parsed
 
     @classmethod
     def _test_plan_criterion_reference_content(
@@ -6587,6 +6611,16 @@ class TaskPlanningPhase(Phase):
                     for criterion in (test_plan_sidecar.content.acceptance_criteria if test_plan_sidecar is not None else [])
                     if criterion.id
                 ]
+                if not ac_ids:
+                    # Degenerate migrated sidecar guard: list the markdown
+                    # twin's AC universe rather than reporting zero ACs.
+                    twin_text = (
+                        await runner.artifacts.get(
+                            f"test-plan:{subfeature.slug}", feature=feature
+                        )
+                        or ""
+                    )
+                    ac_ids = sorted(_extract_ac_ids(twin_text))
                 trace_tokens = sorted(
                     {
                         *(

@@ -19500,6 +19500,136 @@ async def test_degenerate_migrated_test_plan_sidecar_falls_back_to_markdown(tmp_
 
 
 @pytest.mark.asyncio
+async def test_reconciliation_loader_falls_back_on_degenerate_sidecar(tmp_path, caplog):
+    """The owned-AC reconciliation loader must apply the same degenerate-sidecar
+    guard as the contract compile path: a structured sidecar with 0 acceptance
+    criteria while the markdown twin defines some falls back to the markdown
+    parse instead of presenting an empty canonical AC universe (which refuses
+    every reconciliation and fails the slice)."""
+    import logging
+
+    from iriai_build_v2.services.artifacts import structured_artifact_key
+
+    feature = SimpleNamespace(id="feat-reconcile-degenerate-sidecar", metadata={})
+    mirror = _TestMirror(tmp_path / "features")
+    decomposition = SubfeatureDecomposition(
+        subfeatures=[
+            Subfeature(id="SF-1", slug="degen", name="Degen", description="Degen"),
+        ],
+        complete=True,
+    )
+    runner = SimpleNamespace(
+        artifacts=_SimpleCompileArtifacts(
+            {
+                "decomposition": decomposition.model_dump_json(indent=2),
+                "prd:degen": """
+## Requirements
+
+| ID | Category | Priority | Description |
+| --- | --- | --- | --- |
+| REQ-1 | functional | must | Bootstrap works |
+""".strip(),
+                "design:degen": """
+## Verifiable States
+
+| Component ID | State | Visual Description |
+| --- | --- | --- |
+| CMP-1 | ready | Ready state is visible |
+""".strip(),
+                "plan:degen": """
+## Implementation Steps
+
+### STEP-1: Bootstrap
+
+- **Requirement refs.** REQ-1
+- **Decision refs.** D-SF1-P1
+- **Verifiable state refs.** CMP-1#ready
+- **AC refs.** AC-degen-1
+""".strip(),
+                "system-design:degen": SystemDesign(
+                    title="Degen System Design",
+                    overview="Degen system overview",
+                    complete=True,
+                ).model_dump_json(indent=2),
+                "test-plan:degen": """
+## Acceptance Criteria
+
+- **AC-degen-1** — Bootstrap works.
+  - linked_requirement: `REQ-1`
+  - verification_method: `integration`
+  - pass_condition: bootstrap works
+""".strip(),
+                "decisions:degen": _decision_ledger_text(
+                    DecisionRecord(
+                        id="D-101",
+                        aliases=["D-SF1-P1"],
+                        statement="Bootstrap uses the canonical startup contract.",
+                        source_phase="subfeature",
+                        subfeature_slug="degen",
+                    ),
+                ),
+                "decisions": "",
+                "decisions:broad": "",
+            }
+        ),
+        services={"artifact_mirror": mirror},
+    )
+
+    status = await TaskPlanningPhase._ensure_planning_sidecar_migration(
+        runner,
+        feature,
+        decomposition,
+    )
+    assert status.subfeatures["degen"].migration_state == "migrated"
+
+    # Healthy sidecar: the structured content is preferred, no warning.
+    test_plan = await TaskPlanningPhase._load_test_plan_model_for_reconciliation(
+        runner,
+        feature,
+        "degen",
+    )
+    assert test_plan is not None
+    assert [criterion.id for criterion in test_plan.acceptance_criteria] == ["AC-degen-1"]
+
+    # Corrupt the structured sidecar into the degenerate shape (0 ACs) while
+    # the markdown twin still defines 1 — the loader must fall back loudly.
+    sidecar_key = structured_artifact_key("test-plan:degen")
+    payload = json.loads(runner.artifacts.store[sidecar_key])
+    payload["content"]["acceptance_criteria"] = []
+    runner.artifacts.store[sidecar_key] = json.dumps(payload)
+
+    with caplog.at_level(logging.WARNING):
+        test_plan = await TaskPlanningPhase._load_test_plan_model_for_reconciliation(
+            runner,
+            feature,
+            "degen",
+        )
+    assert test_plan is not None
+    assert [criterion.id for criterion in test_plan.acceptance_criteria] == ["AC-degen-1"]
+    assert any(
+        "DEGENERATE test-plan sidecar for degen in owned-AC reconciliation" in record.message
+        for record in caplog.records
+    )
+
+    # Degenerate sidecar AND a markdown twin with no extractable ACs: keep the
+    # sidecar content (prior behavior), no markdown override.
+    caplog.clear()
+    runner.artifacts.store["test-plan:degen"] = "## Overview\n\nNo ACs here."
+    with caplog.at_level(logging.WARNING):
+        test_plan = await TaskPlanningPhase._load_test_plan_model_for_reconciliation(
+            runner,
+            feature,
+            "degen",
+        )
+    assert test_plan is not None
+    assert list(test_plan.acceptance_criteria) == []
+    assert not any(
+        "DEGENERATE test-plan sidecar for degen in owned-AC reconciliation" in record.message
+        for record in caplog.records
+    )
+
+
+@pytest.mark.asyncio
 async def test_sidecar_path_admits_plan_local_and_ledger_decision_ids(tmp_path):
     """L3: the sidecar compile path must admit plan-cited decision ids the
     same way the markdown path does (plan-local ids + feature/global decision
