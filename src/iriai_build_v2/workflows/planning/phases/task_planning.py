@@ -1271,7 +1271,32 @@ class TaskPlanningPhase(Phase):
         if await cls._load_subfeature_planning_index(runner, feature, slug) is None:
             return False
         for artifact_key in cls._subfeature_source_keys(slug):
-            if await load_structured_artifact(runner, feature, artifact_key) is None:
+            sidecar = await load_structured_artifact(runner, feature, artifact_key)
+            if sidecar is None:
+                return False
+            # STALENESS: a sidecar is a projection of its source markdown.
+            # Sanctioned direct-update patches (the T-1 ownership lane) write
+            # the markdown; a sidecar generated from an older source would
+            # silently feed pre-patch content to slice derivation forever
+            # (resume51: the settings AC-ownership patch reached the contract
+            # but never the plan sidecar -> slices owned 0 ACs). source_hash
+            # exists exactly for this — mismatch means re-backfill the slug.
+            try:
+                current_text = await load_source_artifact_text(runner, feature, artifact_key)
+            except Exception:
+                continue
+            if not current_text.strip():
+                continue
+            current_hash = hashlib.sha256(current_text.encode("utf-8")).hexdigest()
+            if current_hash != sidecar.meta.source_hash:
+                logger.warning(
+                    "planning sidecar for %s is STALE (source markdown changed "
+                    "since backfill: %s != %s) — re-backfilling %s",
+                    artifact_key,
+                    current_hash[:12],
+                    (sidecar.meta.source_hash or "")[:12],
+                    slug,
+                )
                 return False
         return True
 
