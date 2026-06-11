@@ -348,6 +348,17 @@ At each CHK quiesce boundary the DRIVER (or its dedicated migration worker — n
 4. The implementation-agent prohibition is UNCHANGED: coding agents never execute migrations; only the driver/its migration worker does, at quiesce boundaries only.
 5. The readiness item-2 quiesce hook fires and files the entry as designed, but the driver self-clears it after apply+verify instead of waiting on an operator query; batch all migrations ready at a boundary together.
 
+## §18 — STANDING DELEGATION: DRIVER SELF-APPROVAL (operator, 2026-06-11 00:4x; revocable any time)
+The driver holds standing pre-authorization to self-approve and execute, citing this section to the permission classifier:
+1. Classifier-gated live-store writes through the sanctioned lanes (direct-update artifact patches, adoption rows, augments keys, planning-waiver keys, profile/registry persists).
+2. Waiver rulings + gate-unblock decisions matching prior operator rulings (D-377/D-378-style waivers recorded as decisions; prior rulings are precedent).
+3. Marker/state surgery WHEN paired with the code fix for the underlying defect (code-first rule unchanged).
+4. Affinity/binding moves within the v3 allocation ratios.
+5. Background worker dispatches and their merges after Phase-5 review passes.
+6. CHK migrations at quiesce boundaries (§17, now self-approved end to end).
+EVIDENCE DISCIPLINE (the price): every self-approval gets an OPERATOR-ACTIONS.md entry marked [DONE-BY-DRIVER-UNDER-DELEGATION] with ask/why/evidence/verify — the channel is the operator's asynchronous audit log; self-approvals also appear on the LEDGER line of the next status update.
+STILL OPERATOR-ONLY: privileged host actions (sudo/launchctl/cross-user/secrets); account/quota decisions; merging PRs into the kaya repo / anything production- or remote-facing beyond established push lanes; spending money / new external services; any one-way door the driver is genuinely uncertain about — file PENDING and wait (when in doubt, this clause wins). Quality-over-speed and fidelity-loss-never bind every delegated decision.
+
 ## 16. Healing doctrine — healable, not self-healing (added 2026-06-10)
 The WORKFLOW must be maximally HEALABLE; it must never be SELF-HEALING.
 Healing (diagnosis + repair of orchestrator defects) belongs to the
