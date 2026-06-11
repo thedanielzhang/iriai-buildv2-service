@@ -923,6 +923,12 @@ DEFAULT_AGENT_SHARED_GROUP = "iriai-agents"
 CONTRADICTION_DECISIONS_KEY = "contradiction-decisions"
 KNOWN_FLAKY_LEDGER_ENV = "IRIAI_KNOWN_FLAKY_LEDGER"
 KNOWN_FLAKY_LEDGER_ARTIFACT_KEY = "known-flaky-tests"
+# Per-task spec-amendment carrier (operator directive P-14). NOTE: default ON —
+# the OPPOSITE of the flaky-ledger flag — because amendments are operator-
+# authored binding directives; requiring a flag flip to honor them would be
+# silent degradation.
+TASK_AMENDMENTS_ENV = "IRIAI_TASK_AMENDMENTS"
+TASK_AMENDMENTS_KEY_PREFIX = "dag-task-amendments"
 CONTRADICTION_DECISION_CURRENT_PACK_MAX_CHARS = int(
     os.environ.get("IRIAI_CONTRADICTION_DECISION_CURRENT_PACK_MAX_CHARS", "120000")
 )
@@ -10714,6 +10720,16 @@ class _ImplementationPromptBuilder:
             context_base=context_base,
             context_read_base=context_read_base,
             log_label=self._log_label,
+        )
+        # P-14 per-task spec-amendment carrier. Appended HERE — the single
+        # prompt chokepoint every dispatcher-mediated implementation attempt
+        # flows through (initial, retry, strict-resume re-dispatch, and the
+        # enhancement stage; both the inline and the sandbox file-offload
+        # prompt shapes) — and BEFORE prompt_sha/materialization so the
+        # amendment is part of the persisted dispatched prompt. Read fresh
+        # per attempt: amendments installed mid-run bind the next attempt.
+        prompt += await _task_amendments_section(
+            self._runner, self._feature, self._task.id
         )
         context_paths: list[str] = []
         context_sha_material: list[str] = []
@@ -25436,6 +25452,80 @@ async def _known_flaky_ledger_section(
     section = "\n\n" + _KNOWN_FLAKY_TRIAGE_INSTRUCTION + raw + "\n"
     _KNOWN_FLAKY_LEDGER_CACHE[feature_key] = section
     return section
+
+
+def _task_amendments_enabled() -> bool:
+    # Default ON — the opposite of `_known_flaky_ledger_enabled` (see the
+    # TASK_AMENDMENTS_ENV constant note).
+    return _env_flag_enabled(TASK_AMENDMENTS_ENV, default=True)
+
+
+def _task_amendments_artifact_key(task_id: str) -> str:
+    return f"{TASK_AMENDMENTS_KEY_PREFIX}:{task_id}"
+
+
+_TASK_AMENDMENTS_HEADER = (
+    "## Operator Spec Amendments for this task "
+    "(BINDING — apply before the base spec where they conflict)"
+)
+
+# Deliberately simple decision-ledger citation probe: any `DEC-`, `D-<digit>`,
+# or `DD-<digit>` token counts as a citation (covers DEC-123, D-1/D-GR-style
+# numbered rulings, DD-12 design decisions). It is a LINT, not a gate —
+# operator-authored content is warned about but never dropped for failing it.
+_TASK_AMENDMENT_CITATION_RE = re.compile(r"\b(DEC-|D-\d|DD-\d)")
+
+
+async def _task_amendments_section(
+    runner: WorkflowRunner,
+    feature: Feature,
+    task_id: str,
+) -> str:
+    """Operator-authored per-task spec-amendment prompt section (P-14).
+
+    Reads the ``dag-task-amendments:{task_id}`` artifact FRESH on every call
+    (deliberately NO caching — an operator can install or revise an amendment
+    mid-run between dispatch attempts and the very next attempt must carry
+    it). Returns "" when no amendment artifact exists for *task_id*.
+
+    When an amendment EXISTS but ``IRIAI_TASK_AMENDMENTS`` is disabled, a
+    LOUD warning is logged (an operator-authored binding directive is being
+    suppressed) and "" is returned. A missing decision-ledger citation also
+    warns but the amendment is STILL injected — operator content is never
+    silently dropped.
+    """
+    artifacts = getattr(runner, "artifacts", None)
+    if artifacts is None:
+        return ""
+    key = _task_amendments_artifact_key(task_id)
+    try:
+        raw = await artifacts.get(key, feature=feature) or ""
+    except Exception:
+        logger.debug("Failed to load %s artifact", key, exc_info=True)
+        raw = ""
+    text = str(raw).strip()
+    if not text:
+        return ""
+    if not _task_amendments_enabled():
+        logger.warning(
+            "Operator-authored spec amendment exists at '%s' but %s is "
+            "disabled — the amendment is NOT being injected into task %s "
+            "dispatch prompts. Re-enable %s (default ON) to honor it.",
+            key,
+            TASK_AMENDMENTS_ENV,
+            task_id,
+            TASK_AMENDMENTS_ENV,
+        )
+        return ""
+    if not _TASK_AMENDMENT_CITATION_RE.search(text):
+        logger.warning(
+            "Spec amendment '%s' for task %s lacks a decision-ledger "
+            "citation (no DEC-/D-<n>/DD-<n> reference found) — injecting it "
+            "anyway; operator content is never silently dropped.",
+            key,
+            task_id,
+        )
+    return "\n\n" + _TASK_AMENDMENTS_HEADER + "\n\n" + text + "\n"
 
 
 async def _verify(
