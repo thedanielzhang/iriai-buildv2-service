@@ -291,3 +291,91 @@ async def test_compose_provision_failure_tears_down(monkeypatch):
     assert out.green is False
     assert "provision failed" in out.detail
     assert created and created[0].torn is True  # substrate down -v + rmtree ran
+
+
+# ── ATTACH mode (IRIAI_E2E_ATTACH) ───────────────────────────────────────────
+
+
+def test_compose_preflight_attach_exempts_exact_project_only():
+    # The exact attach target does not trip the mutex; another prefix-matching
+    # project still refuses; attach_target_up reports the target's presence.
+    pf = rl.compose_preflight(
+        project_prefix="docker",
+        running_projects=["docker"],
+        attach_project="docker",
+    )
+    assert pf.ok and pf.attach_target_up
+    pf2 = rl.compose_preflight(
+        project_prefix="docker",
+        running_projects=["docker", "docker_run42"],
+        attach_project="docker",
+    )
+    assert not pf2.ok and pf2.attach_target_up
+    assert "docker_run42" in pf2.reason
+    # No attach_project (flag off): byte-for-byte today's behavior.
+    pf3 = rl.compose_preflight(
+        project_prefix="docker", running_projects=["docker"],
+    )
+    assert not pf3.ok and not pf3.attach_target_up
+
+
+def _wire_attach(monkeypatch, adapter, *, target_up=True):
+    monkeypatch.setattr(pass_mod, "CloneSubstrate", FakeSubstrate)
+    monkeypatch.setattr(pass_mod, "get_adapter", lambda _id: adapter)
+    monkeypatch.setattr(
+        rl, "compose_preflight",
+        lambda **k: rl.ComposePreflight(
+            ok=True, free_disk_gb=100.0, attach_target_up=target_up),
+    )
+    monkeypatch.setenv("IRIAI_E2E_ATTACH", "1")
+    FakeSubstrate.constructed = 0
+
+
+@pytest.mark.asyncio
+async def test_attach_pass_probes_without_provisioning(monkeypatch):
+    # ATTACH: probes ride the real smoke() oracle; no substrate, no provision,
+    # no host tests; green pointer on all-pass; summary returned (cursor
+    # consumed by the caller exactly like any completed pass).
+    smokes = [
+        type("BS", (), {"status": "pass", "surface": "svc-a", "detail": ""})(),
+        type("BS", (), {"status": "pass", "surface": "svc-b", "detail": ""})(),
+    ]
+    adapter = FakeComposeAdapter(smokes=smokes, verdicts=[])
+    _wire_attach(monkeypatch, adapter, target_up=True)
+    reg = FakeRegistry(_profile())
+    out = await run_full_pass(_checkpoint(), feature_id="f", registry=reg,
+                              live_dsn="x", profile=_profile())
+    assert out.boot_smoke == "pass"
+    assert FakeSubstrate.constructed == 0          # nothing cloned
+    assert adapter.ran is False                    # host tests skipped
+    assert adapter.torn is False                   # nothing to tear down
+    assert reg.green is not None                   # boot-smoke green pointer
+    assert out.detail.startswith("attach boot=pass")
+
+
+@pytest.mark.asyncio
+async def test_attach_pass_boot_fail_pages_and_no_green(monkeypatch):
+    smokes = [
+        type("BS", (), {"status": "fail", "surface": "svc-a",
+                        "detail": "HTTP 000"})(),
+    ]
+    adapter = FakeComposeAdapter(smokes=smokes, verdicts=[])
+    _wire_attach(monkeypatch, adapter, target_up=True)
+    reg = FakeRegistry(_profile())
+    out = await run_full_pass(_checkpoint(), feature_id="f", registry=reg,
+                              live_dsn="x", profile=_profile())
+    assert out.boot_smoke == "fail"
+    assert reg.green is None
+    assert FakeSubstrate.constructed == 0
+
+
+@pytest.mark.asyncio
+async def test_attach_target_down_refuses_and_holds_cursor(monkeypatch):
+    adapter = FakeComposeAdapter(smokes=[], verdicts=[])
+    _wire_attach(monkeypatch, adapter, target_up=False)
+    reg = FakeRegistry(_profile())
+    with pytest.raises(pass_mod.E2EPassRefused) as ei:
+        await run_full_pass(_checkpoint(), feature_id="f", registry=reg,
+                            live_dsn="x", profile=_profile())
+    assert "not running" in str(ei.value)
+    assert FakeSubstrate.constructed == 0

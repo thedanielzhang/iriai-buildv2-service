@@ -70,6 +70,10 @@ class ComposePreflight:
     free_disk_gb: float
     running_projects: list[str] = field(default_factory=list)
     reason: str = ""
+    # ATTACH mode (IRIAI_E2E_ATTACH): True iff the requested ``attach_project``
+    # was seen running. Appended with a default so every existing constructor
+    # call (tests included) is unchanged.
+    attach_target_up: bool = False
 
 
 def _running_compose_projects() -> list[str]:
@@ -92,6 +96,7 @@ def compose_preflight(
     project_prefix: str = "e2e",
     scratch_dir: str = "/tmp",
     running_projects: list[str] | None = None,
+    attach_project: str = "",
 ) -> ComposePreflight:
     """Compose-specific preflight: higher disk floor + single-stack mutex.
 
@@ -99,6 +104,13 @@ def compose_preflight(
     e2e compose project (name starting with ``project_prefix``) is already up —
     only ONE e2e stack runs at a time, so a pass never stacks ~15 more containers
     onto a host already running one. ``running_projects`` is injectable for tests.
+
+    ATTACH mode (``attach_project`` non-empty, set under IRIAI_E2E_ATTACH): a
+    running project whose name is EXACTLY ``attach_project`` is the attach
+    TARGET, not a competing e2e stack, so it does not count toward the mutex;
+    any OTHER prefix-matching project still refuses. ``attach_target_up``
+    reports whether the target was seen running. Default ``""`` is byte-for-byte
+    today's behavior.
     """
     free_disk_gb = shutil.disk_usage(scratch_dir).free / (1024 ** 3)
     projects = (
@@ -106,7 +118,12 @@ def compose_preflight(
         if running_projects is not None
         else _running_compose_projects()
     )
-    e2e_up = [p for p in projects if p.startswith(project_prefix)]
+    e2e_up = [
+        p for p in projects
+        if p.startswith(project_prefix)
+        and not (attach_project and p == attach_project)
+    ]
+    attach_target_up = bool(attach_project) and attach_project in projects
     reasons = []
     if free_disk_gb < _MIN_COMPOSE_DISK_GB:
         reasons.append(f"free_disk {free_disk_gb:.0f}GB < {_MIN_COMPOSE_DISK_GB}")
@@ -114,7 +131,10 @@ def compose_preflight(
         reasons.append(
             f"single-stack mutex: e2e compose project(s) already up: {e2e_up}"
         )
-    return ComposePreflight(not reasons, free_disk_gb, e2e_up, "; ".join(reasons))
+    return ComposePreflight(
+        not reasons, free_disk_gb, e2e_up, "; ".join(reasons),
+        attach_target_up=attach_target_up,
+    )
 
 
 def _free_mem_gb() -> float:
