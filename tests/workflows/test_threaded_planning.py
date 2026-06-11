@@ -19505,3 +19505,191 @@ Implements REQ-2.
         "coverage waiver applied: AC-wvr-9 (source: contract)" in record.message
         for record in caplog.records
     )
+
+
+def _store_waiver_fixture_artifacts(extra_unowned_ac: bool = False) -> dict[str, str]:
+    """Shared plan/prd/test-plan fixture for the planning-waivers store-key tests.
+
+    AC-wvr-9 is always unowned; with ``extra_unowned_ac`` AC-wvr-8 is also
+    defined unowned (for the contract+store union test).
+    """
+    extra_ac = (
+        """
+- **AC-wvr-8** — Another superseded behavior with no owner.
+  - verification_method: `manual`
+  - pass_condition: superseded
+"""
+        if extra_unowned_ac
+        else ""
+    )
+    return {
+        "plan:wvr": """
+## Implementation Steps
+
+### STEP-1 — Producer
+
+Implements REQ-1.
+
+- **AC refs.** AC-wvr-1
+
+### STEP-2 — Consumer
+
+Implements REQ-2.
+
+- **AC refs.** AC-wvr-3
+""".strip(),
+        "prd:wvr": "## Requirements\n\nREQ-1\nProducer.\n\nREQ-2\nConsumer.\n",
+        "design:wvr": "",
+        "system-design:wvr": "",
+        "test-plan:wvr": f"""
+## Acceptance Criteria
+
+- **AC-wvr-1** — Producer behavior.
+  - linked_requirement: `REQ-1`
+  - verification_method: `unit`
+  - pass_condition: producer behavior holds
+
+- **AC-wvr-3** — Consumer behavior.
+  - linked_requirement: `REQ-2`
+  - verification_method: `unit`
+  - pass_condition: consumer behavior holds
+{extra_ac}
+- **AC-wvr-9** — Superseded behavior with no owner.
+  - verification_method: `manual`
+  - pass_condition: superseded
+""".strip(),
+        "decisions:wvr": "",
+        "decisions": "",
+        "decisions:broad": "",
+    }
+
+
+@pytest.mark.asyncio
+async def test_store_key_waiver_bootstraps_compile_without_prior_contract(tmp_path, caplog):
+    """W: the `planning-waivers:{slug}` store key must waive coverage on its
+    own — with NO dag-contract row persisted yet (the bootstrap chicken-and-egg
+    case) — and be loudly logged with source "store"."""
+    import logging
+
+    feature = SimpleNamespace(id="feat-w-store-waiver", metadata={})
+    mirror = _TestMirror(tmp_path / "features")
+    runner = SimpleNamespace(
+        artifacts=_SimpleCompileArtifacts(_store_waiver_fixture_artifacts()),
+        services={"artifact_mirror": mirror},
+    )
+
+    # Missing key = no-op: the compile still fails closed on AC-wvr-9.
+    with pytest.raises(task_planning_module.PlanningContractError):
+        await TaskPlanningPhase._compile_subfeature_planning_contract(runner, feature, "wvr")
+
+    # Invalid JSON at the key is tolerated as a no-op too.
+    runner.artifacts.store["planning-waivers:wvr"] = "not-json{"
+    with pytest.raises(task_planning_module.PlanningContractError):
+        await TaskPlanningPhase._compile_subfeature_planning_contract(runner, feature, "wvr")
+
+    runner.artifacts.store["planning-waivers:wvr"] = json.dumps(
+        {
+            "waived_ac_ids": ["AC-wvr-9"],
+            "decisions": ["D-377"],
+            "reason": "operator ruling",
+        }
+    )
+    with caplog.at_level(logging.INFO):
+        contract = await TaskPlanningPhase._compile_subfeature_planning_contract(
+            runner,
+            feature,
+            "wvr",
+        )
+
+    assert contract.waived_ac_ids == ["AC-wvr-9"]
+    assert any(
+        "coverage waiver applied: AC-wvr-9 (source: store)" in record.message
+        for record in caplog.records
+    )
+    assert any(
+        "planning waivers store key planning-waivers:wvr active" in record.message
+        and "AC-wvr-9" in record.message
+        and "D-377" in record.message
+        for record in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_store_key_waivers_union_with_contract_waivers(tmp_path, caplog):
+    """W: store-key waivers are ADDITIVE with prior-contract waived_ac_ids —
+    both sources apply, each logged with its own source."""
+    import logging
+
+    feature = SimpleNamespace(id="feat-w-union-waiver", metadata={})
+    mirror = _TestMirror(tmp_path / "features")
+    runner = SimpleNamespace(
+        artifacts=_SimpleCompileArtifacts(_store_waiver_fixture_artifacts(extra_unowned_ac=True)),
+        services={"artifact_mirror": mirror},
+    )
+    prior = task_planning_module.SubfeaturePlanningContract(
+        slug="wvr",
+        waived_ac_ids=["AC-wvr-8"],
+    )
+    runner.artifacts.store["dag-contract:wvr"] = prior.model_dump_json(indent=2)
+    # Contract waiver alone is not enough — AC-wvr-9 still uncovered.
+    with pytest.raises(task_planning_module.PlanningContractError):
+        await TaskPlanningPhase._compile_subfeature_planning_contract(runner, feature, "wvr")
+
+    runner.artifacts.store["planning-waivers:wvr"] = json.dumps(
+        {"waived_ac_ids": ["AC-wvr-9"], "decisions": ["D-378"], "reason": "operator ruling"}
+    )
+    with caplog.at_level(logging.WARNING):
+        contract = await TaskPlanningPhase._compile_subfeature_planning_contract(
+            runner,
+            feature,
+            "wvr",
+        )
+
+    assert contract.waived_ac_ids == ["AC-wvr-8", "AC-wvr-9"]
+    assert any(
+        "coverage waiver applied: AC-wvr-8 (source: contract)" in record.message
+        for record in caplog.records
+    )
+    assert any(
+        "coverage waiver applied: AC-wvr-9 (source: store)" in record.message
+        for record in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_validate_verification_gates_coverage_honors_store_key_waivers(tmp_path):
+    """W: the post-decomposition gates-coverage lint must also honor the
+    `planning-waivers:{slug}` store key (third call site)."""
+    feature = SimpleNamespace(id="feat-w-lint-waiver", metadata={})
+    mirror = _TestMirror(tmp_path / "features")
+    store = _store_waiver_fixture_artifacts()
+    runner = SimpleNamespace(
+        artifacts=_SimpleCompileArtifacts(store),
+        services={"artifact_mirror": mirror},
+    )
+    tasks = [
+        ImplementationTask(
+            id="T-1",
+            name="Producer task",
+            description="Producer",
+            verification_gates=["AC-wvr-1", "AC-wvr-3"],
+        )
+    ]
+    result = await task_planning_module._validate_verification_gates_coverage(
+        runner,
+        feature,
+        "wvr",
+        tasks,
+    )
+    assert result.uncovered_ac_ids == ["AC-wvr-9"]
+
+    runner.artifacts.store["planning-waivers:wvr"] = json.dumps(
+        {"waived_ac_ids": ["AC-wvr-9"], "decisions": ["D-377"], "reason": "operator ruling"}
+    )
+    result = await task_planning_module._validate_verification_gates_coverage(
+        runner,
+        feature,
+        "wvr",
+        tasks,
+    )
+    assert result.uncovered_ac_ids == []

@@ -522,14 +522,18 @@ def _effective_coverage_ids_for_task_planning(
     slug: str,
     canonical_ac_ids: set[str],
     contract_waived_ac_ids: Iterable[str] | None = None,
+    store_waived_ac_ids: Iterable[str] | None = None,
 ) -> tuple[set[str], dict[str, str]]:
     """Resolve the effective (coverage-audited) AC universe for a subfeature.
 
-    Waivers come from two additive sources, both logged loudly (no silent
+    Waivers come from three additive sources, all logged loudly (no silent
     waivers):
-    - the hardcoded builtin map (backend-foundation-setup only), and
+    - the hardcoded builtin map (backend-foundation-setup only),
     - ``waived_ac_ids`` recorded on the persisted per-SF planning contract
-      (data-driven waivers approved at the DAG gate).
+      (data-driven waivers approved at the DAG gate), and
+    - the dedicated ``planning-waivers:{slug}`` store key (operator-approved
+      waivers written through the artifact-store path; bootstraps waivers
+      when no contract row exists yet — see ``_load_planning_waivers``).
     """
     waived: dict[str, str] = {}
     waiver_sources: dict[str, str] = {}
@@ -542,6 +546,12 @@ def _effective_coverage_ids_for_task_planning(
         if ac_id in canonical_ac_ids and ac_id not in waived:
             waived[ac_id] = "waived via planning-contract waived_ac_ids (recorded at the DAG gate)"
             waiver_sources[ac_id] = "contract"
+    for ac_id in store_waived_ac_ids or []:
+        if ac_id in canonical_ac_ids and ac_id not in waived:
+            waived[ac_id] = (
+                f"waived via planning-waivers:{slug} store key (operator-approved waiver)"
+            )
+            waiver_sources[ac_id] = "store"
     for ac_id in sorted(waived):
         logger.warning(
             "coverage waiver applied: %s (source: %s) — %s [%s]",
@@ -551,6 +561,61 @@ def _effective_coverage_ids_for_task_planning(
             slug,
         )
     return set(canonical_ac_ids) - set(waived), waived
+
+
+async def _load_planning_waivers(
+    runner: WorkflowRunner,
+    feature: Feature,
+    slug: str,
+) -> list[str]:
+    """Load operator-approved AC waivers from the ``planning-waivers:{slug}``
+    store key (a SECOND additive waiver source alongside the prior-contract
+    ``waived_ac_ids``).
+
+    This bootstraps waivers when no dag-contract row exists yet: contracts
+    only persist after a successful compile, but the compile fails closed on
+    exactly the unwaived ACs (chicken-and-egg). The key is written through
+    the artifact-store path by the operator/driver only — its existence is
+    the opt-in; there is no env flag.
+
+    Expected value: JSON ``{"waived_ac_ids": ["AC-x"], "decisions": ["D-377"],
+    "reason": "..."}``. Tolerant loader: missing/invalid → ``[]`` with a
+    debug log; non-empty → INFO log listing ids + decisions.
+    """
+    key = f"planning-waivers:{slug}"
+    try:
+        text = await runner.artifacts.get(key, feature=feature)
+    except Exception:
+        logger.debug("planning waivers key %s unavailable", key, exc_info=True)
+        return []
+    if not text:
+        logger.debug("no planning waivers recorded at %s", key)
+        return []
+    try:
+        payload = _json.loads(text)
+    except Exception:
+        logger.debug("planning waivers at %s are not valid JSON; ignoring", key, exc_info=True)
+        return []
+    if not isinstance(payload, dict) or not isinstance(payload.get("waived_ac_ids"), list):
+        logger.debug(
+            "planning waivers at %s lack a waived_ac_ids list; ignoring",
+            key,
+        )
+        return []
+    waived = [ac_id for ac_id in payload["waived_ac_ids"] if isinstance(ac_id, str) and ac_id]
+    if waived:
+        decisions = payload.get("decisions")
+        decision_ids = (
+            [str(decision) for decision in decisions] if isinstance(decisions, list) else []
+        )
+        logger.info(
+            "planning waivers store key %s active: %s (decisions: %s; reason: %s)",
+            key,
+            ", ".join(waived),
+            ", ".join(decision_ids) or "none",
+            payload.get("reason") or "none",
+        )
+    return waived
 
 
 async def _load_migrated_test_plan_sidecar_ac_ids(
@@ -643,6 +708,7 @@ async def _validate_verification_gates_coverage(
             "Planning contract for %s has stale canonical_ac_ids; using test-plan sidecar AC universe for verification gate validation",
             slug,
         )
+    store_waived_ac_ids = await _load_planning_waivers(runner, feature, slug)
     waived_ac_ids = (
         {ac_id: "contract waiver" for ac_id in contract.waived_ac_ids}
         if contract_matches_canonical_ac_ids
@@ -650,8 +716,23 @@ async def _validate_verification_gates_coverage(
             slug,
             real_ac_ids,
             contract.waived_ac_ids if contract is not None else None,
+            store_waived_ac_ids=store_waived_ac_ids,
         )[1]
     )
+    if contract_matches_canonical_ac_ids:
+        # The contract fast-path bypasses the effective-coverage resolver;
+        # union the store-key waivers in here too (additive, loudly logged).
+        for ac_id in store_waived_ac_ids:
+            if ac_id in real_ac_ids and ac_id not in waived_ac_ids:
+                waived_ac_ids[ac_id] = (
+                    f"waived via planning-waivers:{slug} store key (operator-approved waiver)"
+                )
+                logger.warning(
+                    "coverage waiver applied: %s (source: store) — %s [%s]",
+                    ac_id,
+                    waived_ac_ids[ac_id],
+                    slug,
+                )
     effective_ac_ids = set(real_ac_ids) - set(waived_ac_ids)
     if waived_ac_ids:
         logger.info(
@@ -2498,10 +2579,12 @@ class TaskPlanningPhase(Phase):
             }
 
         prior_contract = await cls._load_subfeature_planning_contract(runner, feature, slug)
+        store_waived_ac_ids = await _load_planning_waivers(runner, feature, slug)
         effective_ac_ids, waived_map = _effective_coverage_ids_for_task_planning(
             slug,
             set(canonical_ac_ids),
             prior_contract.waived_ac_ids if prior_contract is not None else None,
+            store_waived_ac_ids=store_waived_ac_ids,
         )
         normalized_prd = cls._normalize_artifact_markdown(target_texts.get("prd", ""), f"prd:{slug}")
         normalized_design = cls._normalize_artifact_markdown(target_texts.get("design", ""), f"design:{slug}")
@@ -3737,10 +3820,12 @@ class TaskPlanningPhase(Phase):
             if criterion.id
         ]
         prior_contract = await cls._load_subfeature_planning_contract(runner, feature, slug)
+        store_waived_ac_ids = await _load_planning_waivers(runner, feature, slug)
         _effective_ac_ids, waived_map = _effective_coverage_ids_for_task_planning(
             slug,
             set(canonical_ac_ids),
             prior_contract.waived_ac_ids if prior_contract is not None else None,
+            store_waived_ac_ids=store_waived_ac_ids,
         )
         global_obligation_candidate_step_ids: dict[str, list[str]] = {}
         step_chunk_to_slice_input = {
