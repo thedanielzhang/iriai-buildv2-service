@@ -32,12 +32,14 @@ from __future__ import annotations
 import json
 import subprocess
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from iriai_build_v2.execution_control import ExecutionControlStore
+from iriai_build_v2.execution_control.atomic_landing import InFlightAdoptionRecord
 from iriai_build_v2.execution_control.merge_queue_store import (
     MergeQueueItemCreate,
     MergeQueueStore,
@@ -1175,6 +1177,42 @@ async def test_pre_p1_fix_empty_results_body_is_rejected_by_the_freshness_gate(
     ) is False
 
 
+def _strict_adoption_marker(
+    feature,
+    *,
+    completed_range: tuple[int, int],
+    next_group: int,
+) -> str:
+    """A valid execution-control adoption marker body for resume fixtures.
+
+    The strict resume guard (``_execution_control_adoption_record_for_resume``,
+    src/iriai_build_v2/workflows/develop/phases/implementation.py:2516, applied
+    by the ``_implement_dag`` dispatch gate ~:21080) refuses to dispatch any
+    feature with existing ``dag-group:*`` checkpoint state unless the artifact
+    ``execution-control-adoption:{feature_id}`` holds a valid
+    ``InFlightAdoptionRecord``. This mirrors the production writer
+    ``adopt_in_flight_feature`` (src/iriai_build_v2/execution_control/
+    adoption.py:348-372), which constructs an ``InFlightAdoptionRecord``
+    (src/iriai_build_v2/execution_control/atomic_landing.py:742) and persists
+    ``record.model_dump_json()`` under ``adoption_marker_artifact_key``
+    (src/iriai_build_v2/execution_control/adoption.py:156 →
+    ``execution-control-adoption:{feature_id}``). Same helper shape as
+    tests/workflows/test_dag_regroup.py::_strict_adoption_marker.
+    """
+    return InFlightAdoptionRecord(
+        feature_id=str(feature.id),
+        candidate_commit="candidate-commit",
+        deploy_artifact_id="deploy-artifact",
+        legacy_root_dag_artifact_id=42,
+        legacy_root_dag_sha256="f" * 64,
+        completed_checkpoint_range=completed_range,
+        next_effective_group_idx=next_group,
+        projection_digest="p" * 64,
+        adopted_at=datetime(2026, 5, 28, 12, 0, tzinfo=timezone.utc),
+        pre_adoption_baseline={"test": "sealed"},
+    ).model_dump_json()
+
+
 @pytest.mark.asyncio
 async def test_implement_dag_resume_skips_a_queue_checkpointed_group(
     mq_conn, tmp_path: Path
@@ -1248,6 +1286,16 @@ async def test_implement_dag_resume_skips_a_queue_checkpointed_group(
         impl.ImplementationResult(
             task_id="TASK-1", summary="implemented task one", status="completed"
         ).model_dump_json(),
+        feature=feature,
+    )
+
+    # The strict resume guard (see _strict_adoption_marker) blocks any feature
+    # with pre-existing `dag-group:*` checkpoints unless a valid adoption
+    # marker exists; mirror the production writer's key + body for the seeded
+    # single fully-checkpointed group 0 (range 0..0, resume at group 1).
+    await runner.artifacts.put(
+        f"execution-control-adoption:{feature.id}",
+        _strict_adoption_marker(feature, completed_range=(0, 0), next_group=1),
         feature=feature,
     )
 
@@ -1566,6 +1614,16 @@ async def test_implement_dag_resume_skips_a_non_lexically_sorted_queue_group(
             ).model_dump_json(),
             feature=feature,
         )
+
+    # The strict resume guard (see _strict_adoption_marker) blocks any feature
+    # with pre-existing `dag-group:*` checkpoints unless a valid adoption
+    # marker exists; mirror the production writer's key + body for the seeded
+    # single fully-checkpointed group 0 (range 0..0, resume at group 1).
+    await runner.artifacts.put(
+        f"execution-control-adoption:{feature.id}",
+        _strict_adoption_marker(feature, completed_range=(0, 0), next_group=1),
+        feature=feature,
+    )
 
     # RESUME: drive the REAL `_implement_dag`. The non-lexically-sorted
     # queue-checkpointed group must be skipped — no task is ever dispatched.
