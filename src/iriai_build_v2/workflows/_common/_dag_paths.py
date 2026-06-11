@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
+import posixpath
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -11,6 +13,8 @@ from ...models.outputs import (
     ImplementationDAG,
     ImplementationTask,
 )
+
+logger = logging.getLogger(__name__)
 
 
 DAG_PATH_CANONICALIZATION_ENV = "IRIAI_DAG_PATH_CANONICALIZATION"
@@ -38,6 +42,131 @@ def feature_repos_root(runner: Any, feature: Any) -> str:
     return str(root) if root.exists() else ""
 
 
+def _normalize_planned_path(path: str) -> str:
+    """Comparison-time normalization for planned-new-file matching (never used
+    to rewrite stored paths): backslashes -> '/', strip whitespace and a
+    leading './'."""
+    normalized = (path or "").strip().replace("\\", "/")
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    return normalized
+
+
+def planned_new_file_paths(dag: ImplementationDAG) -> set[str]:
+    """Every NET-NEW file this DAG/fragment plans to author itself.
+
+    The set is built from all ``create``-action ``file_scope`` paths across the
+    DAG, in BOTH prefix conventions (the raw ``path`` value and the
+    ``<repo_path>/<path>`` join) since the DAG mixes conventions. A
+    non-existing path in this set is expected — the plan creates it — so the
+    resolver must treat it as ``create_ok``, never ``ambiguous``."""
+    planned: set[str] = set()
+    for task in dag.tasks:
+        repo_path = _normalize_planned_path(task.repo_path or "")
+        for _field, path, action in _file_scope_path_fields(task):
+            if action != "create":
+                continue
+            normalized = _normalize_planned_path(path)
+            if not normalized:
+                continue
+            planned.add(normalized)
+            if repo_path:
+                planned.add(f"{repo_path}/{normalized}")
+    return planned
+
+
+def _entry_index(
+    dag: ImplementationDAG,
+) -> dict[tuple[str, str], tuple[str, str, str]]:
+    """{(task_id, field_key): (action, path, repo_path)} for every ``file_scope``
+    entry — the disposition (CREATE vs MODIFY class) lookup for the backstop."""
+    index: dict[tuple[str, str], tuple[str, str, str]] = {}
+    for task in dag.tasks:
+        for field, path, action in _file_scope_path_fields(task):
+            index[(task.id, field)] = (action, path, task.repo_path or "")
+    return index
+
+
+def _create_parent_grounded(
+    repos_root: str,
+    repo_path: str,
+    path: str,
+    planned: set[str],
+    *,
+    exists: Callable[[str], bool],
+) -> bool:
+    """CREATE-class grounding: the parent directory resolves — it EXISTS under
+    either join, or it is ITSELF created by the fragment (another planned-new
+    file, not this entry, lives in or under it). A solo new file in a solo new
+    directory with no on-disk parent stays UNgrounded (conservative fail-safe).
+
+    With ``repos_root`` unavailable (pure/unit mode) the on-disk half is
+    skipped and only the fragment-created half applies; callers in that mode
+    treat create-class entries permissively (the prepass already established
+    the file does not exist)."""
+    normalized = _normalize_planned_path(path)
+    repo_norm = _normalize_planned_path(repo_path or "")
+    self_forms = {normalized}
+    if repo_norm:
+        self_forms.add(f"{repo_norm}/{normalized}")
+    parents = {posixpath.dirname(form) for form in self_forms}
+    parents.discard("")
+    # Fragment-created parent: a DIFFERENT planned-new file at or under it.
+    for candidate in planned - self_forms:
+        candidate_dir = posixpath.dirname(candidate)
+        for parent in parents:
+            if candidate_dir == parent or candidate_dir.startswith(parent + "/"):
+                return True
+    if repos_root:
+        for parent in parents:
+            if exists(os.path.join(repos_root, parent)):
+                return True
+    return False
+
+
+_BASENAME_SCAN_PRUNE_DIRS = frozenset({
+    ".git", "node_modules", "dist", "build", "out", ".venv", "venv",
+    "__pycache__", ".next", ".turbo", "coverage", "vendor", ".cache",
+})
+
+
+def count_basename_matches(repos_root: str, basename: str) -> int:
+    """Count existing files under ``repos_root`` named ``basename`` (pruned
+    walk, early exit after 2 — only zero/nonzero matters to the backstop)."""
+    if not repos_root or not basename:
+        return 0
+    matches = 0
+    for dirpath, dirnames, filenames in os.walk(repos_root):
+        dirnames[:] = [d for d in dirnames if d not in _BASENAME_SCAN_PRUNE_DIRS]
+        if basename in filenames:
+            matches += 1
+            if matches >= 2:
+                return matches
+    return matches
+
+
+def resolution_covers_unresolved(
+    resolution: DagPathResolution,
+    unresolved: list[dict[str, str]],
+) -> bool:
+    """True when every CURRENT unresolved entry has a decision addressing it
+    (same task_id + field, same recorded original path).
+
+    Resume gate: a persisted ``dag-path-resolution`` artifact is replay-stable
+    ONLY for the fragment it was produced for. After a slice re-plan the new
+    fragment's entries differ; reusing the stale resolution would silently skip
+    resolution of the new paths. Callers re-dispatch when this returns False."""
+    have = {
+        (d.task_id, d.field, _normalize_planned_path(getattr(d, "original", "") or ""))
+        for d in resolution.decisions
+    }
+    return all(
+        (entry["task_id"], entry["field"], _normalize_planned_path(entry["path"]))
+        in have
+        for entry in unresolved
+    )
+
+
 def build_dag_path_resolver_prompt(
     dag: ImplementationDAG,
     unresolved: list[dict[str, str]],
@@ -62,6 +191,32 @@ def build_dag_path_resolver_prompt(
         }
         for entry in unresolved
     ]
+    planned_new = sorted(planned_new_file_paths(dag))
+    planned_section = (
+        "PLANNED NEW FILES (action `create` — authored by THIS plan; do not "
+        "expect them on disk):\n"
+        f"```json\n{json.dumps(planned_new, indent=2)}\n```\n"
+        "DISPOSITION RULES — branch on each candidate's `action`:\n"
+        "- `create` entries: the file is authored by this plan, so 'not on "
+        "disk' is EXPECTED and is never by itself grounds for `ambiguous`. "
+        "Instead validate that (a) the path does NOT already exist, and (b) "
+        "its PARENT DIRECTORY resolves: the directory exists under either "
+        "join, or the plan itself creates it (other planned new files live in "
+        "or under it). When both hold return `create_ok`, NOT `ambiguous` — "
+        "even though the file does not exist yet. If the parent location is a "
+        "phantom (no such directory anywhere and the plan does not create "
+        "it), Glob for the intended real location and return `correct` with "
+        "evidence, else `ambiguous`.\n"
+        "- `modify`/`read_only`/`read` entries: must resolve to a real, "
+        "uniquely-located file on disk (current rules below). ONE exception: "
+        "when the path EXACTLY matches a planned new file above it is an "
+        "intra-plan dependency (a later task touching a file an earlier task "
+        "creates) — return `create_ok` ONLY IF no same-basename file exists "
+        "anywhere under repos_root. If one or more same-basename files DO "
+        "exist on disk, the citation may mean one of those existing files: "
+        "return `ambiguous`, NEVER guess between an existing file and the "
+        "planned new one.\n\n"
+    ) if planned_new else ""
     return (
         "Resolve these implementation-DAG task paths against the REAL repository "
         f"checkouts under `{repos_root}`.\n\n"
@@ -74,6 +229,7 @@ def build_dag_path_resolver_prompt(
         "the actual file by name (a basename Glob like `**/<filename>` is the most "
         "reliable way to find where it truly lives).\n\n"
         f"repos_root: {repos_root}\n\n"
+        f"{planned_section}"
         "UNRESOLVED candidate paths (JSON):\n"
         f"```json\n{json.dumps(candidates, indent=2)}\n```\n\n"
         "For EACH entry return exactly one DagPathDecision (copy task_id and field "
@@ -83,8 +239,10 @@ def build_dag_path_resolver_prompt(
         "`resolved`; if it was repo-internal, keep it repo-internal) plus "
         "`evidence` (the Glob/Grep hit). Return `keep` when the path is already "
         "correct (it resolves under one of the two joins); `create_ok` for a "
-        "legitimate NEW file whose target DIRECTORY is a real location; "
-        "`ambiguous` when you cannot find a unique match — NEVER guess. "
+        "legitimate NEW file whose target directory is a real location or is "
+        "created by this plan (follow the DISPOSITION RULES above when "
+        "present); `ambiguous` when you cannot find a unique answer — NEVER "
+        "guess. "
         "Set corrected_count and ambiguous_count accordingly."
     )
 
@@ -232,6 +390,9 @@ def apply_path_resolution(
     resolution: DagPathResolution,
     *,
     raise_on_ambiguous: bool = True,
+    repos_root: str = "",
+    exists: Callable[[str], bool] = os.path.exists,
+    find_basename_matches: Callable[[str], int] | None = None,
 ) -> tuple[ImplementationDAG, list[DagPathRewrite]]:
     """Apply the resolver's ``correct`` decisions to the DAG (pure, deterministic).
 
@@ -247,6 +408,33 @@ def apply_path_resolution(
         The one-time migration uses this so an unresolved sibling cannot block
         re-persisting the corrected phantom.
 
+    Deterministic disposition-branch backstop (BEFORE any raise), keyed on the
+    flagged entry's OWN ``file_scope`` action:
+
+      - CREATE-class entries (``action == "create"``): "not on disk" is
+        expected — the plan authors the file. Convert ``ambiguous`` ->
+        ``create_ok`` (WARN, path untouched) when the path does NOT exist and
+        its PARENT DIRECTORY is grounded: it exists under either join, or the
+        fragment itself creates it (another planned-new file lives in/under
+        it — see :func:`planned_new_file_paths` / :func:`_create_parent_grounded`).
+        With ``repos_root`` unavailable the fs half is skipped and create-class
+        entries convert permissively (the prepass already established
+        non-existence at flag time).
+      - MODIFY-class entries (everything else): must uniquely resolve against
+        the repo. NEVER converted when one or more same-basename files exist
+        on disk (the true-ambiguity subcase — the citation may mean an
+        existing file). Converted ONLY when the path exactly matches a
+        planned-new ``create`` path of the same fragment AND zero on-disk
+        basename matches exist (checked via ``find_basename_matches`` /
+        :func:`count_basename_matches` when ``repos_root`` is provided).
+      - STALE decisions (no current entry at (task_id, field), or the recorded
+        ``original`` no longer matches the live path — e.g. a persisted
+        resolution reused after a slice re-plan) are logged and SKIPPED, never
+        raised: there is nothing left to guard.
+
+    Anything else stays genuinely ambiguous and still raises (the 199-attempt
+    repair-loop caution stays binding — we never guess).
+
     Decisions are matched first by (task_id, field_key) for ``file_scope`` entries
     and then by VALUE for ``files[]`` entries: any ``files[]`` value equal to a
     corrected ``file_scope`` ``original`` is rewritten to the same ``resolved``
@@ -254,13 +442,85 @@ def apply_path_resolution(
     fully corrected. Every rewrite is idempotent — only applied when the current
     value still equals the recorded ``original``."""
     decisions = {(d.task_id, d.field): d for d in resolution.decisions}
-    if raise_on_ambiguous:
-        ambiguous = [
-            d for d in resolution.decisions
-            if (d.decision or "").strip().lower() == "ambiguous"
-        ]
-        if ambiguous:
-            raise AmbiguousDagPath(ambiguous)
+    ambiguous = [
+        d for d in resolution.decisions
+        if (d.decision or "").strip().lower() == "ambiguous"
+    ]
+    if ambiguous:
+        planned = planned_new_file_paths(dag)
+        entries = _entry_index(dag)
+        genuinely_ambiguous = []
+        for d in ambiguous:
+            entry = entries.get((d.task_id, d.field))
+            original = _normalize_planned_path(getattr(d, "original", "") or "")
+            if entry is None or _normalize_planned_path(entry[1]) != original:
+                # Stale decision: the entry it judged no longer exists in this
+                # DAG (e.g. persisted resolution reused after a re-plan).
+                logger.warning(
+                    "DAG path resolver backstop: skipping STALE ambiguous "
+                    "decision %s:%s=%r (no matching current file_scope entry)",
+                    d.task_id, d.field, d.original,
+                )
+                continue
+            action, _entry_path, repo_path = entry
+            repo_norm = _normalize_planned_path(repo_path)
+            if action == "create":
+                # CREATE-class: ambiguity checks do not apply; validate
+                # not-exists + grounded parent instead (fs half only when
+                # repos_root is available).
+                still_missing = not repos_root or not _path_resolves(
+                    repos_root, repo_path, d.original, exists=exists,
+                )
+                grounded = (
+                    not repos_root
+                    or _create_parent_grounded(
+                        repos_root, repo_path, d.original, planned, exists=exists,
+                    )
+                )
+                if still_missing and grounded:
+                    logger.warning(
+                        "DAG path resolver backstop: %s:%s=%r is a planned NEW file "
+                        "created by this DAG itself — auto-converting ambiguous -> "
+                        "create_ok (path left untouched)",
+                        d.task_id, d.field, d.original,
+                    )
+                    d.decision = "create_ok"
+                else:
+                    genuinely_ambiguous.append(d)
+                continue
+            # MODIFY-class: convert ONLY for an exact planned-new match with
+            # zero on-disk basename matches; never when existing same-basename
+            # candidates exist (the citation may mean one of them).
+            joined = f"{repo_norm}/{original}" if repo_norm and original else ""
+            in_planned = bool(original) and (
+                original in planned or (joined and joined in planned)
+            )
+            if not in_planned:
+                genuinely_ambiguous.append(d)
+                continue
+            if repos_root:
+                counter = find_basename_matches or (
+                    lambda name: count_basename_matches(repos_root, name)
+                )
+                if counter(posixpath.basename(original)) > 0:
+                    logger.warning(
+                        "DAG path resolver backstop: %s:%s=%r matches a planned "
+                        "NEW file but same-basename files exist on disk — "
+                        "keeping ambiguous (never guess between an existing "
+                        "file and a planned one)",
+                        d.task_id, d.field, d.original,
+                    )
+                    genuinely_ambiguous.append(d)
+                    continue
+            logger.warning(
+                "DAG path resolver backstop: %s:%s=%r is a planned NEW file "
+                "created by this DAG itself — auto-converting ambiguous -> "
+                "create_ok (path left untouched)",
+                d.task_id, d.field, d.original,
+            )
+            d.decision = "create_ok"
+        if genuinely_ambiguous and raise_on_ambiguous:
+            raise AmbiguousDagPath(genuinely_ambiguous)
 
     rewrites: list[DagPathRewrite] = []
 

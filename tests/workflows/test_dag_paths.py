@@ -12,7 +12,10 @@ from iriai_build_v2.models.outputs import (
 from iriai_build_v2.workflows._common._dag_paths import (
     AmbiguousDagPath,
     apply_path_resolution,
+    build_dag_path_resolver_prompt,
     dag_path_agentic_resolver_enabled,
+    planned_new_file_paths,
+    resolution_covers_unresolved,
     unresolved_dag_paths,
 )
 
@@ -227,6 +230,242 @@ def test_prepass_ignores_legacy_files_list():
         dag, "/repos", exists=lambda p: p == abs_canon, isdir=lambda p: False,
     )
     assert out == []  # only file_scope is considered, legacy files[] ignored
+
+
+NEW_MODEL = "shared_libs/kaya_db/kaya_db/models/submittals/submittal_record.py"
+
+
+def test_backstop_converts_fragment_created_ambiguous_to_create_ok(caplog):
+    # N-4 regression: TASK-1 creates the file; TASK-3 reads it; the resolver
+    # flagged BOTH ambiguous ("not on disk"). The deterministic backstop must
+    # convert both (path matches a create-action path in the SAME fragment),
+    # WARN, and NOT raise — paths untouched.
+    dag = _dag(
+        _task("TASK-1", file_scope=[(NEW_MODEL, "create")], repo_path=""),
+        _task("TASK-3", file_scope=[(NEW_MODEL, "read_only")], repo_path=""),
+    )
+    res = DagPathResolution(decisions=[
+        DagPathDecision(task_id="TASK-1", field="file_scope[0].path",
+                        original=NEW_MODEL, decision="ambiguous",
+                        evidence="parent dir does not exist"),
+        DagPathDecision(task_id="TASK-3", field="file_scope[0].path",
+                        original=NEW_MODEL, decision="ambiguous",
+                        evidence="Read-only path is not an existing file"),
+    ], ambiguous_count=2)
+    with caplog.at_level("WARNING", logger="iriai_build_v2.workflows._common._dag_paths"):
+        new_dag, rewrites = apply_path_resolution(dag, res)  # default raise_on_ambiguous=True
+    assert rewrites == []
+    assert new_dag.tasks[0].file_scope[0].path == NEW_MODEL
+    assert new_dag.tasks[1].file_scope[0].path == NEW_MODEL
+    warn = [r for r in caplog.records if "planned NEW file" in r.getMessage()]
+    assert len(warn) == 2 and all(r.levelname == "WARNING" for r in warn)
+
+
+def test_backstop_matches_repo_path_joined_convention():
+    # create entry is repo-internal (repo_path join) while the ambiguous read
+    # scope cites the repo-prefixed form — exact match across both conventions.
+    internal = "tests/submittals/test_share_link_defaults.py"
+    prefixed = "supply-chain/tests/submittals/test_share_link_defaults.py"
+    dag = _dag(
+        _task("C", file_scope=[(internal, "create")], repo_path="supply-chain"),
+        _task("R", file_scope=[(prefixed, "read_only")], repo_path=""),
+    )
+    assert prefixed in planned_new_file_paths(dag)
+    res = DagPathResolution(decisions=[DagPathDecision(
+        task_id="R", field="file_scope[0].path",
+        original=prefixed, decision="ambiguous",
+    )], ambiguous_count=1)
+    new_dag, rewrites = apply_path_resolution(dag, res)  # must not raise
+    assert rewrites == [] and new_dag.tasks[1].file_scope[0].path == prefixed
+
+
+def test_backstop_genuinely_unknown_path_still_raises():
+    # Nothing in the DAG creates this path -> the 199-loop fail-safe stays.
+    dag = _dag(
+        _task("C", file_scope=[(NEW_MODEL, "create")], repo_path=""),
+        _task("R", file_scope=[("totally/unknown/elsewhere.py", "modify")], repo_path=""),
+    )
+    res = DagPathResolution(decisions=[DagPathDecision(
+        task_id="R", field="file_scope[0].path",
+        original="totally/unknown/elsewhere.py", decision="ambiguous",
+    )], ambiguous_count=1)
+    with pytest.raises(AmbiguousDagPath) as exc_info:
+        apply_path_resolution(dag, res)
+    assert "totally/unknown/elsewhere.py" in str(exc_info.value)
+
+
+def test_backstop_mixed_converts_planned_raises_unknown():
+    dag = _dag(
+        _task("C", file_scope=[(NEW_MODEL, "create")], repo_path=""),
+        _task("R", file_scope=[
+            (NEW_MODEL, "read_only"),
+            ("totally/unknown/elsewhere.py", "modify"),
+        ], repo_path=""),
+    )
+    res = DagPathResolution(decisions=[
+        DagPathDecision(task_id="R", field="file_scope[0].path",
+                        original=NEW_MODEL, decision="ambiguous"),
+        DagPathDecision(task_id="R", field="file_scope[1].path",
+                        original="totally/unknown/elsewhere.py", decision="ambiguous"),
+    ], ambiguous_count=2)
+    with pytest.raises(AmbiguousDagPath) as exc_info:
+        apply_path_resolution(dag, res)
+    # only the genuinely-unknown path remains in the raise
+    assert "totally/unknown" in str(exc_info.value)
+    assert NEW_MODEL not in str(exc_info.value)
+
+
+def test_prompt_contains_planned_new_file_set_and_instruction():
+    dag = _dag(
+        _task("TASK-1", file_scope=[(NEW_MODEL, "create")], repo_path=""),
+        _task("TASK-3", file_scope=[(NEW_MODEL, "read_only")], repo_path=""),
+    )
+    unresolved = unresolved_dag_paths(dag, "/repos", exists=lambda p: False)
+    prompt = build_dag_path_resolver_prompt(dag, unresolved, "/repos")
+    assert "PLANNED NEW FILES" in prompt
+    assert NEW_MODEL in prompt
+    assert "create_ok" in prompt and "NOT `ambiguous`" in prompt
+
+
+def test_prompt_omits_planned_section_when_no_creates():
+    dag = _dag(_task(file_scope=[(PHANTOM, "modify")]))
+    unresolved = unresolved_dag_paths(dag, "/repos", exists=lambda p: False)
+    prompt = build_dag_path_resolver_prompt(dag, unresolved, "/repos")
+    assert "PLANNED NEW FILES" not in prompt
+
+
+# ---- CREATE-vs-MODIFY disposition branch (operator-analysis refinement) ----
+
+E2E_SETUP = "spend-client/e2e/global-setup.ts"
+E2E_SPEC = "spend-client/e2e/submittals.spec.ts"
+
+
+def _ambiguous(task_id, field, original):
+    return DagPathDecision(
+        task_id=task_id, field=field, original=original, decision="ambiguous",
+    )
+
+
+def test_backstop_create_class_converts_when_parent_dir_exists_on_disk():
+    # spend-client/playwright.config.ts case: parent dir is real, file is new.
+    path = "spend-client/playwright.config.ts"
+    dag = _dag(_task("C", file_scope=[(path, "create")], repo_path=""))
+    res = DagPathResolution(
+        decisions=[_ambiguous("C", "file_scope[0].path", path)], ambiguous_count=1,
+    )
+    new_dag, rewrites = apply_path_resolution(
+        dag, res, repos_root="/repos",
+        exists=lambda p: p == "/repos/spend-client",
+    )
+    assert rewrites == [] and new_dag.tasks[0].file_scope[0].path == path
+    assert res.decisions[0].decision == "create_ok"
+
+
+def test_backstop_create_class_converts_when_parent_created_by_fragment():
+    # global-setup.ts CREATE-class: parent e2e/ is not on disk but a sibling
+    # planned-new spec grounds it; same-basename matches elsewhere are
+    # irrelevant for create-class (ambiguity checks apply only to modify).
+    dag = _dag(
+        _task("C", file_scope=[(E2E_SETUP, "create"), (E2E_SPEC, "create")], repo_path=""),
+    )
+    res = DagPathResolution(
+        decisions=[_ambiguous("C", "file_scope[0].path", E2E_SETUP)], ambiguous_count=1,
+    )
+    apply_path_resolution(
+        dag, res, repos_root="/repos", exists=lambda p: False,
+        find_basename_matches=lambda name: 3,  # must NOT bite for create-class
+    )
+    assert res.decisions[0].decision == "create_ok"
+
+
+def test_backstop_create_class_phantom_parent_still_raises():
+    # Solo new file in a directory that neither exists nor is created by the
+    # fragment -> conservative fail-safe (never guess a location).
+    path = "phantom-repo/lib/widget.py"
+    dag = _dag(_task("C", file_scope=[(path, "create")], repo_path=""))
+    res = DagPathResolution(
+        decisions=[_ambiguous("C", "file_scope[0].path", path)], ambiguous_count=1,
+    )
+    with pytest.raises(AmbiguousDagPath):
+        apply_path_resolution(dag, res, repos_root="/repos", exists=lambda p: False)
+
+
+def test_backstop_modify_class_with_basename_matches_still_raises():
+    # global-setup.ts TRUE-ambiguity subcase: a MODIFY entry whose path matches
+    # a planned-new file but with 3 same-basename files on disk must STILL
+    # flag — never guess between an existing file and a planned one.
+    dag = _dag(
+        _task("C", file_scope=[(E2E_SETUP, "create")], repo_path=""),
+        _task("M", file_scope=[(E2E_SETUP, "modify")], repo_path=""),
+    )
+    res = DagPathResolution(
+        decisions=[_ambiguous("M", "file_scope[0].path", E2E_SETUP)], ambiguous_count=1,
+    )
+    with pytest.raises(AmbiguousDagPath) as exc_info:
+        apply_path_resolution(
+            dag, res, repos_root="/repos",
+            exists=lambda p: p == "/repos/spend-client",
+            find_basename_matches=lambda name: 3,
+        )
+    assert E2E_SETUP in str(exc_info.value)
+
+
+def test_backstop_modify_class_zero_basename_matches_converts():
+    # Intra-fragment dependency: a later MODIFY of a file the fragment creates,
+    # with NO same-basename candidates on disk, is unambiguous -> create_ok.
+    dag = _dag(
+        _task("C", file_scope=[(NEW_MODEL, "create")], repo_path=""),
+        _task("M", file_scope=[(NEW_MODEL, "modify")], repo_path=""),
+    )
+    res = DagPathResolution(
+        decisions=[_ambiguous("M", "file_scope[0].path", NEW_MODEL)], ambiguous_count=1,
+    )
+    apply_path_resolution(
+        dag, res, repos_root="/repos", exists=lambda p: False,
+        find_basename_matches=lambda name: 0,
+    )
+    assert res.decisions[0].decision == "create_ok"
+
+
+def test_backstop_skips_stale_ambiguous_decision():
+    # Persisted resolution reused after a re-plan: the decision's entry no
+    # longer exists in the DAG -> skipped (no raise), nothing converted.
+    dag = _dag(_task(file_scope=[(CANON, "modify")]))
+    res = DagPathResolution(
+        decisions=[_ambiguous("T-OLD", "file_scope[0].path", PHANTOM)],
+        ambiguous_count=1,
+    )
+    new_dag, rewrites = apply_path_resolution(dag, res)  # must not raise
+    assert rewrites == []
+    assert res.decisions[0].decision == "ambiguous"  # left as-is, just skipped
+
+
+def test_resolution_covers_unresolved_gate():
+    unresolved = [
+        {"task_id": "T1", "field": "file_scope[0].path", "path": PHANTOM, "action": "modify"},
+    ]
+    covering = DagPathResolution(decisions=[DagPathDecision(
+        task_id="T1", field="file_scope[0].path", original=PHANTOM, decision="keep",
+    )])
+    stale = DagPathResolution(decisions=[DagPathDecision(
+        task_id="T-OLD", field="file_scope[0].path", original="other.py", decision="ambiguous",
+    )])
+    assert resolution_covers_unresolved(covering, unresolved) is True
+    assert resolution_covers_unresolved(stale, unresolved) is False
+    assert resolution_covers_unresolved(stale, []) is True  # nothing to cover
+
+
+def test_prompt_branches_disposition_rules_per_action():
+    dag = _dag(
+        _task("C", file_scope=[(E2E_SETUP, "create")], repo_path=""),
+        _task("M", file_scope=[(E2E_SETUP, "modify")], repo_path=""),
+    )
+    unresolved = unresolved_dag_paths(dag, "/repos", exists=lambda p: False)
+    prompt = build_dag_path_resolver_prompt(dag, unresolved, "/repos")
+    assert "DISPOSITION RULES" in prompt
+    assert "PARENT DIRECTORY" in prompt        # create-class validation
+    assert "same-basename" in prompt           # modify-class exception bound
+    assert "NEVER guess" in prompt
 
 
 def test_agentic_resolver_enabled_default_on(monkeypatch):

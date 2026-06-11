@@ -96,6 +96,7 @@ from ..._common._dag_paths import (
     dag_path_rewrites_to_records,
     feature_repos_root,
     find_retired_backend_path_references,
+    resolution_covers_unresolved,
     unresolved_dag_paths,
 )
 
@@ -4642,6 +4643,17 @@ class TaskPlanningPhase(Phase):
         return f"dag-fragment:{slug}:{slice_id}"
 
     @staticmethod
+    def _slice_fragment_raw_key(slug: str, slice_id: str) -> str:
+        """PRE-validation checkpoint of the planner's slice fragment.
+
+        Persisted the moment the slice planner returns, BEFORE
+        ``_validate_slice_fragment`` — so a validation-stage failure (e.g. a
+        defective path resolver) never drops the planned fragment. Resume
+        adopts it by re-running validation (path resolution onward) instead of
+        re-planning the slice."""
+        return f"dag-fragment-raw:{slug}:{slice_id}"
+
+    @staticmethod
     def _slice_attempt_key(slug: str, slice_id: str, mode_label: str, attempt: int) -> str:
         return f"dag-fragment-attempt:{slug}:{slice_id}:{mode_label}:{attempt}"
 
@@ -4730,8 +4742,19 @@ class TaskPlanningPhase(Phase):
         cls,
         slice_info: TaskPlanningSlice,
         tasks: list[ImplementationTask],
+        feature_requirement_universe: set[str] | None = None,
     ) -> list[str]:
+        """Validate per-task traceability against the slice contract.
+
+        ``feature_requirement_universe``: when provided, an out-of-slice
+        requirement id that DOES exist in the feature-wide universe is ACCEPTED
+        with a WARN (a cross-slice citation, not a coverage claim — the AC
+        coverage audit is unaffected); ids in NO universe still fail."""
         errors: list[str] = []
+        normalized_feature_universe = {
+            _normalize_id_numeric_segments(requirement_id)
+            for requirement_id in (feature_requirement_universe or set())
+        }
         require_requirement_ids = bool(slice_info.requirement_ids)
         require_journey_ids = bool(slice_info.journey_ids)
         required_reference_sources = set(slice_info.required_reference_sources)
@@ -4752,9 +4775,23 @@ class TaskPlanningPhase(Phase):
                     f"{task.id} references step_ids {task.step_ids} outside slice {slice_info.step_ids}"
                 )
             if slice_info.requirement_ids and not set(task.requirement_ids).issubset(set(slice_info.requirement_ids)):
-                errors.append(
-                    f"{task.id} references requirement_ids {task.requirement_ids} outside slice {slice_info.requirement_ids}"
-                )
+                out_of_slice = sorted(set(task.requirement_ids) - set(slice_info.requirement_ids))
+                feature_valid = [
+                    requirement_id
+                    for requirement_id in out_of_slice
+                    if _normalize_id_numeric_segments(requirement_id) in normalized_feature_universe
+                ]
+                nowhere_valid = sorted(set(out_of_slice) - set(feature_valid))
+                if feature_valid:
+                    logger.warning(
+                        "%s cites out-of-slice but feature-valid requirement_ids %s "
+                        "(cross-slice citation accepted; slice scope %s)",
+                        task.id, feature_valid, slice_info.requirement_ids,
+                    )
+                if nowhere_valid:
+                    errors.append(
+                        f"{task.id} references requirement_ids {nowhere_valid} outside slice {slice_info.requirement_ids}"
+                    )
             if slice_info.journey_ids and not set(task.journey_ids).issubset(set(slice_info.journey_ids)):
                 errors.append(
                     f"{task.id} references journey_ids {task.journey_ids} outside slice {slice_info.journey_ids}"
@@ -5082,7 +5119,19 @@ class TaskPlanningPhase(Phase):
             slice_info,
             context_package,
         )
-        traceability_errors = cls._slice_traceability_errors(slice_info, normalized.tasks)
+        contract = (
+            await cls._load_subfeature_planning_contract(runner, feature, slug)
+            if hasattr(runner, "artifacts")
+            else None
+        )
+        feature_requirement_universe = (
+            set(contract.requirement_universe) if contract is not None else set()
+        )
+        traceability_errors = cls._slice_traceability_errors(
+            slice_info,
+            normalized.tasks,
+            feature_requirement_universe=feature_requirement_universe,
+        )
         if traceability_errors:
             return None, "; ".join(traceability_errors), True
         normalized, _path_rewrites, path_errors = await cls._resolve_dag_paths_for_persistence(
@@ -5235,7 +5284,9 @@ class TaskPlanningPhase(Phase):
         )
 
         try:
-            corrected, rewrites = apply_path_resolution(dag, resolution)
+            corrected, rewrites = apply_path_resolution(
+                dag, resolution, repos_root=repos_root,
+            )
         except AmbiguousDagPath as exc:
             logger.warning(
                 "%s: agentic DAG path resolution is ambiguous (non-retryable): %s",
@@ -5270,13 +5321,26 @@ class TaskPlanningPhase(Phase):
         existing = await get_existing_artifact(runner, feature, artifact_key)
         if existing:
             try:
-                return DagPathResolution.model_validate_json(existing)
+                persisted = DagPathResolution.model_validate_json(existing)
             except Exception:
                 logger.warning(
                     "%s: persisted %s is not valid DagPathResolution JSON; re-dispatching",
                     context,
                     artifact_key,
                     exc_info=True,
+                )
+            else:
+                # Replay-stable ONLY for the fragment it was produced for: a
+                # stale resolution (e.g. after a slice re-plan) that does not
+                # cover the CURRENT unresolved set would silently skip the new
+                # paths — re-dispatch instead.
+                if resolution_covers_unresolved(persisted, unresolved):
+                    return persisted
+                logger.warning(
+                    "%s: persisted %s does not cover the current unresolved "
+                    "path set (stale after re-plan); re-dispatching the resolver",
+                    context,
+                    artifact_key,
                 )
 
         actor = AgentActor(
@@ -6633,6 +6697,15 @@ class TaskPlanningPhase(Phase):
             )
 
         slice_dag = self._build_subfeature_dag(dag, sf_tasks)
+        # Checkpoint the raw fragment BEFORE validation: a validation-stage
+        # failure must never drop the planned fragment (resume adopts it and
+        # re-runs validation/path-resolution only — no slice re-planning).
+        await self._put_artifact(
+            runner,
+            feature,
+            self._slice_fragment_raw_key(subfeature.slug, slice_info.slice_id),
+            slice_dag.model_dump_json(indent=2),
+        )
         validated_dag, validation_error, retryable = await self._validate_slice_fragment(
             runner,
             feature,
@@ -6749,6 +6822,13 @@ class TaskPlanningPhase(Phase):
                 context_package=context_package,
             )
 
+        # Same pre-validation checkpoint as _plan_slice (repair path).
+        await self._put_artifact(
+            runner,
+            feature,
+            self._slice_fragment_raw_key(subfeature.slug, slice_info.slice_id),
+            dag.model_dump_json(indent=2),
+        )
         validated_dag, validation_error, retryable = await self._validate_slice_fragment(
             runner,
             feature,
@@ -6842,6 +6922,50 @@ class TaskPlanningPhase(Phase):
                     await self._delete_artifact_key(runner, feature, fragment_key)
                     status.status = "pending"
                     status.last_error = f"existing fragment {fragment_key} is invalid"
+            if status.status != "completed":
+                # Resume adoption of the PRE-validation checkpoint: a fragment
+                # whose validation failed (e.g. defective path resolver) was
+                # never persisted under dag-fragment:, but its raw form is.
+                # Re-run validation (path resolution onward) only — slice
+                # re-planning stays the fallback when this also fails.
+                raw_key = self._slice_fragment_raw_key(slug, slice_info.slice_id)
+                raw_text = await runner.artifacts.get(raw_key, feature=feature)
+                if raw_text:
+                    try:
+                        raw_fragment = ImplementationDAG.model_validate_json(raw_text)
+                        adopted, adoption_error, _retryable = await self._validate_slice_fragment(
+                            runner,
+                            feature,
+                            slug,
+                            slice_info,
+                            raw_fragment,
+                        )
+                        if adopted is not None:
+                            await self._put_artifact(
+                                runner,
+                                feature,
+                                fragment_key,
+                                adopted.model_dump_json(indent=2),
+                            )
+                            status.status = "completed"
+                            status.last_error = ""
+                            logger.warning(
+                                "Slice %s/%s: adopted raw fragment %s on resume "
+                                "(validation re-run only; no re-plan)",
+                                slug, slice_info.slice_id, raw_key,
+                            )
+                            continue
+                        status.last_error = (
+                            f"raw fragment {raw_key} failed validation: "
+                            f"{adoption_error or 'unknown validation error'}"
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Slice %s/%s: raw fragment %s is invalid; falling "
+                            "back to re-planning",
+                            slug, slice_info.slice_id, raw_key,
+                            exc_info=True,
+                        )
             if status.status != "completed":
                 status.status = "pending"
         await self._save_slice_manifest(runner, feature, manifest)

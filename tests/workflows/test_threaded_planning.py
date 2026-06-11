@@ -1816,6 +1816,111 @@ async def test_task_planning_requirement_reconciliation_does_not_mask_out_of_sco
     assert retryable is True
 
 
+def _contract_runner(slug: str, requirement_universe: list[str]) -> SimpleNamespace:
+    contract = task_planning_module.SubfeaturePlanningContract(
+        slug=slug,
+        requirement_universe=requirement_universe,
+    )
+
+    class _Artifacts:
+        async def get(self, key: str, *, feature):
+            del feature
+            if key == f"dag-contract:{slug}":
+                return contract.model_dump_json()
+            return ""
+
+        async def put(self, key: str, value: str, *, feature):
+            del key, value, feature
+
+    return SimpleNamespace(artifacts=_Artifacts())
+
+
+@pytest.mark.asyncio
+async def test_task_planning_accepts_out_of_slice_but_feature_valid_requirement_ref(caplog):
+    # N-5 regression: TASK-FDS-S34-2 cited ['REQ-12','REQ-26'] in a slice scoped
+    # to ['REQ-12']; REQ-26 exists in the feature-wide requirement universe so
+    # the cross-slice citation must be WARN-accepted, not rejected.
+    slice_info = task_planning_module.TaskPlanningSlice(
+        slice_id="slice-3-4",
+        step_ids=["STEP-1"],
+        requirement_ids=["REQ-12"],
+        acceptance_criterion_ids=[],
+        strict_acceptance_criteria=False,
+    )
+    dag = ImplementationDAG(
+        tasks=[
+            _valid_task(
+                task_id="TASK-FDS-S34-2",
+                slug="accounts",
+                step_ids=["STEP-1"],
+                requirement_ids=["REQ-12", "REQ-26"],
+            )
+        ],
+        execution_order=[["TASK-FDS-S34-2"]],
+        requirement_coverage={"REQ-12": ["TASK-FDS-S34-2"]},
+        complete=True,
+    )
+
+    with caplog.at_level("WARNING"):
+        validated, validation_error, retryable = await TaskPlanningPhase._validate_slice_fragment(
+            _contract_runner("accounts", ["REQ-12", "REQ-26"]),
+            SimpleNamespace(id="feat", metadata={}),
+            "accounts",
+            slice_info,
+            dag,
+        )
+
+    assert validation_error is None
+    assert validated is not None
+    assert retryable is False
+    assert any(
+        "feature-valid requirement_ids" in record.getMessage()
+        and "REQ-26" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_task_planning_nowhere_valid_requirement_ref_still_fails():
+    # An id in NO universe (not slice, not feature) fails exactly as before,
+    # even when the feature contract is loadable.
+    slice_info = task_planning_module.TaskPlanningSlice(
+        slice_id="slice-3-4",
+        step_ids=["STEP-1"],
+        requirement_ids=["REQ-12"],
+        acceptance_criterion_ids=[],
+        strict_acceptance_criteria=False,
+    )
+    dag = ImplementationDAG(
+        tasks=[
+            _valid_task(
+                task_id="TASK-FDS-S34-2",
+                slug="accounts",
+                step_ids=["STEP-1"],
+                requirement_ids=["REQ-12", "REQ-26", "REQ-999"],
+            )
+        ],
+        execution_order=[["TASK-FDS-S34-2"]],
+        requirement_coverage={"REQ-12": ["TASK-FDS-S34-2"]},
+        complete=True,
+    )
+
+    validated, validation_error, retryable = await TaskPlanningPhase._validate_slice_fragment(
+        _contract_runner("accounts", ["REQ-12", "REQ-26"]),
+        SimpleNamespace(id="feat", metadata={}),
+        "accounts",
+        slice_info,
+        dag,
+    )
+
+    assert validated is None
+    assert "outside slice" in (validation_error or "")
+    assert "REQ-999" in (validation_error or "")
+    # the feature-valid REQ-26 must NOT be part of the failure
+    assert "REQ-26" not in (validation_error or "")
+    assert retryable is True
+
+
 @pytest.mark.asyncio
 async def test_task_planning_requires_journey_ids_and_reference_source_completeness():
     slice_info = task_planning_module.TaskPlanningSlice(
@@ -6746,6 +6851,109 @@ async def test_task_planning_preflights_context_budget_before_launch(tmp_path, m
     attempt_text = runner.artifacts.store["dag-fragment-attempt:accounts:slice-1:all-workstream-peers:1"]
     assert "Estimated context bytes" in attempt_text
     assert "peer" in attempt_text
+    # The raw pre-validation checkpoint is persisted alongside the canonical
+    # fragment (resume adopts it when validation failed before persistence).
+    assert "dag-fragment-raw:accounts:slice-1" in runner.artifacts.store
+
+
+@pytest.mark.asyncio
+async def test_task_planning_resume_adopts_raw_fragment_without_replanning(tmp_path):
+    # N-4 resume requirement: when validation failed BEFORE the canonical
+    # dag-fragment: artifact was persisted (the defective-resolver incident),
+    # resume must adopt the raw pre-validation checkpoint by re-running
+    # validation (path resolution onward) only — never re-dispatch the slice
+    # planner agent.
+    feature = SimpleNamespace(id="feat-task-plan-raw-adopt", metadata={})
+    mirror = _TestMirror(tmp_path / "features")
+    decomposition = _decomposition()
+    workstream = Workstream(
+        id="WS-1",
+        name="Accounts",
+        subfeature_slugs=["accounts", "billing"],
+        rationale="Shared planning context",
+        depends_on=[],
+    )
+    sf_upstream = {
+        "accounts": {
+            "plan": "### STEP-1: Accounts\n\nREQ-accounts\n",
+            "prd": "REQ-accounts",
+            "design": "Accounts design",
+            "system-design": "Accounts system design",
+            "test-plan": "## Acceptance Criteria\n\n- AC-accounts-1\n",
+        },
+        "billing": {
+            "plan": "### STEP-1: Billing\n\nREQ-billing\n",
+            "prd": "REQ-billing",
+            "design": "Billing design",
+            "system-design": "Billing system design",
+            "test-plan": "## Acceptance Criteria\n\n- AC-billing-1\n",
+        },
+    }
+
+    raw_fragment = ImplementationDAG(
+        tasks=[
+            _valid_task(
+                task_id="T-accounts-1",
+                slug="accounts",
+                verification_gates=["AC-accounts-1"],
+            )
+        ],
+        execution_order=[["T-accounts-1"]],
+        requirement_coverage={"REQ-accounts": ["T-accounts-1"]},
+        complete=True,
+    )
+
+    class _Artifacts:
+        def __init__(self) -> None:
+            self.store = {
+                "prd:billing": sf_upstream["billing"]["prd"],
+                "design:billing": sf_upstream["billing"]["design"],
+                "plan:billing": sf_upstream["billing"]["plan"],
+                "test-plan:billing": sf_upstream["billing"]["test-plan"],
+                "test-plan:accounts": sf_upstream["accounts"]["test-plan"],
+                "decisions:accounts": "",
+                "decisions:broad": "",
+                "decisions:global": "",
+                "decisions": "",
+                # The incident state: raw checkpoint present, canonical absent.
+                "dag-fragment-raw:accounts:slice-1": raw_fragment.model_dump_json(indent=2),
+            }
+
+        async def get(self, key: str, *, feature):
+            del feature
+            return self.store.get(key, "")
+
+        async def put(self, key: str, value: str, *, feature):
+            del feature
+            self.store[key] = value
+
+    class _Runner:
+        def __init__(self) -> None:
+            self.artifacts = _Artifacts()
+            self.services = {"artifact_mirror": mirror}
+
+        async def run(self, task, feature, phase_name):
+            raise AssertionError(
+                "slice planner must NOT be re-dispatched when a raw fragment "
+                f"is adoptable (dispatched {task.actor.name})"
+            )
+
+    runner = _Runner()
+    failure = await TaskPlanningPhase()._decompose_subfeature(
+        runner,
+        feature,
+        decomposition,
+        workstream,
+        "accounts",
+        sf_upstream,
+    )
+
+    assert failure is None
+    assert "dag-fragment:accounts:slice-1" in runner.artifacts.store
+    adopted = ImplementationDAG.model_validate_json(
+        runner.artifacts.store["dag-fragment:accounts:slice-1"]
+    )
+    assert [task.id for task in adopted.tasks] == ["T-accounts-1"]
 
 
 @pytest.mark.asyncio
