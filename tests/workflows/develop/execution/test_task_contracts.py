@@ -835,6 +835,38 @@ def test_n17_read_only_votes_break_write_tie_absence(tmp_path: Path) -> None:
     assert contract.repo_id == "repo-sc"
 
 
+def test_n17b_legacy_files_widening_fails_by_default(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.delenv("IRIAI_CONTRACT_LEGACY_FILES_TOLERANT", raising=False)
+    registry, _ = _registry(tmp_path)
+    task = _task(
+        task_id="TASK-N17B-1",
+        repo_path="app",
+        file_scope=[_scope("src/new_service.py", "create")],
+        files=["src/new_service.py", "src/context_reader.py"],
+        acceptance_criteria=[SimpleNamespace(description="Build it.")],
+    )
+    with pytest.raises(ContractCompileError) as exc_info:
+        _compile_one(registry, task)
+    assert exc_info.value.failure_type == "contract_scope_conflict"
+    assert "widens non-empty file_scope" in str(exc_info.value)
+
+
+def test_n17b_legacy_files_widening_tolerated_under_flag(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("IRIAI_CONTRACT_LEGACY_FILES_TOLERANT", "1")
+    registry, _ = _registry(tmp_path)
+    task = _task(
+        task_id="TASK-N17B-2",
+        repo_path="app",
+        file_scope=[_scope("src/new_service.py", "create")],
+        files=["src/new_service.py", "src/context_reader.py"],
+        acceptance_criteria=[SimpleNamespace(description="Build it.")],
+    )
+    [contract] = _compile_one(registry, task)
+    # the extra context path gained NO write authority
+    rule_paths = {rule.path for rule in contract.allowed_paths}
+    assert "src/context_reader.py" not in rule_paths
+
+
 def test_n17_zero_file_task_anchors_to_first_registry_repo(tmp_path: Path) -> None:
     registry, _ = _multi_repo_registry(tmp_path)
     task = _task(

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import re
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, Literal, Sequence, TypeAlias
@@ -429,11 +430,24 @@ class ContractCompiler:
             )
             compile_warnings.extend(warnings)
             if warnings:
-                _raise_compile(
-                    "contract_scope_conflict",
-                    "; ".join(warnings),
-                    warnings=compile_warnings,
-                )
+                if _legacy_files_widening_tolerated():
+                    # N-17b: the planning lane emits legacy `files` =
+                    # file_scope paths + read-context extras. The extras are
+                    # NEVER added to allowed_paths (zero write authority), so
+                    # the contract scope is not widened — tolerate with a
+                    # loud WARN instead of failing the group.
+                    logger.warning(
+                        "contract compile: legacy files extras tolerated "
+                        "under IRIAI_CONTRACT_LEGACY_FILES_TOLERANT=1 "
+                        "(no write authority granted): %s",
+                        "; ".join(warnings),
+                    )
+                else:
+                    _raise_compile(
+                        "contract_scope_conflict",
+                        "; ".join(warnings),
+                        warnings=compile_warnings,
+                    )
             allowed_paths.extend(legacy_allowed)
 
         for idx, entry in enumerate(_request_manifest_entries(request, "forbidden_files")):
@@ -1218,6 +1232,16 @@ def _coerce_int(value: Any, default: int) -> int:
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+def _legacy_files_widening_tolerated() -> bool:
+    """N-17b flag (IRIAI_CONTRACT_LEGACY_FILES_TOLERANT, default OFF).
+
+    ON: legacy ``files`` entries outside the writable file_scope log a WARN
+    instead of failing the group compile. They still grant NO write
+    authority either way; the flag only controls fatality.
+    """
+    return os.environ.get("IRIAI_CONTRACT_LEGACY_FILES_TOLERANT", "") == "1"
 
 
 def _compile_legacy_files(
