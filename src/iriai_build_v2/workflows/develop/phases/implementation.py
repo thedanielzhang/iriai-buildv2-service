@@ -875,8 +875,10 @@ from ..execution.post_dag_gates import (
 # delegation + compatibility wrapper exports per doc 11 § "PR 11.12".
 from ..execution.control_plane import (
     DAG_QUIESCE_AFTER_GROUP_ENV,
+    DAG_QUIESCE_GROUP_INDEXES_ENV,
     DEFAULT_DAG_QUIESCE_AFTER_GROUP,
     _dag_quiesce_after_group,
+    _dag_quiesce_group_indexes,
     _is_workflow_blocker_text,
     _quiesce_marker_matches,
     _workflow_blocker_text,
@@ -20151,8 +20153,14 @@ async def _maybe_quiesce_before_group_dispatch(
     *,
     group_idx: int,
 ) -> str:
-    after_group = _dag_quiesce_after_group()
-    if after_group is None or group_idx != after_group + 1:
+    # Readiness item-2 (P0-2/P-9): MULTI-index boundaries. Quiesce before
+    # ``group_idx`` iff ``group_idx - 1`` is a listed boundary. Marker key,
+    # identity payload and the complete+identity re-entry guard below are
+    # already per-boundary, so every listed boundary is independently
+    # idempotent across resume.
+    quiesce_indexes = _dag_quiesce_group_indexes()
+    after_group = group_idx - 1
+    if after_group not in quiesce_indexes:
         return ""
 
     marker_key = f"dag-quiesce:g{after_group}-before-g{group_idx}"
@@ -20225,6 +20233,20 @@ async def _maybe_quiesce_before_group_dispatch(
     services = getattr(runner, "services", {}) or {}
     hook = services.get("dag_quiesce_hook") or services.get("quiesce_hook")
     hook_result: Any = None
+    if not callable(hook):
+        # Item-2 fail-loud guard: a LISTED boundary with no registered hook is
+        # the audit's silent-degradation instance — the marker below is stamped
+        # complete and dispatch CONTINUES (today-parity), but never silently.
+        logger.warning(
+            "DAG quiesce boundary g%d->g%d is listed (%s) but NO dag_quiesce_hook "
+            "is registered — marker %s will be stamped complete and dispatch will "
+            "CONTINUE. Set IRIAI_DAG_QUIESCE_OPERATOR_GATE=1 (and restart) to "
+            "register the default operator-gate hook.",
+            after_group,
+            group_idx,
+            DAG_QUIESCE_GROUP_INDEXES_ENV,
+            marker_key,
+        )
     if callable(hook):
         try:
             hook_result = hook(

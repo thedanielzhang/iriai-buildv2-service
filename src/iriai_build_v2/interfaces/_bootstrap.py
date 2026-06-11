@@ -189,6 +189,23 @@ def build_runner(
         )
     resolved_runtime_policy = normalize_runtime_policy(runtime_policy)
 
+    services = {
+        "feedback": env.feedback_service,
+        "preview": env.preview_service,
+        "playwright": env.playwright_service,
+        "artifact_mirror": env.artifact_mirror,
+        "public_dashboard": env.public_dashboard,
+        "workspace_manager": env.workspace_manager,
+        "runtime_policy": resolved_runtime_policy,
+    }
+    # Readiness item-2: flag-gated default CHK-boundary operator gate
+    # (IRIAI_DAG_QUIESCE_OPERATOR_GATE, default OFF = no-op = today).
+    from ..workflows.develop.execution.quiesce_gate import (
+        register_default_dag_quiesce_hook,
+    )
+
+    register_default_dag_quiesce_hook(services)
+
     return TrackedWorkflowRunner(
         feature_store=env.feature_store,
         agent_runtime=agent_runtime,
@@ -198,15 +215,7 @@ def build_runner(
         sessions=env.sessions,
         context_provider=env.context_provider,
         workspaces={"main": env.workspace},
-        services={
-            "feedback": env.feedback_service,
-            "preview": env.preview_service,
-            "playwright": env.playwright_service,
-            "artifact_mirror": env.artifact_mirror,
-            "public_dashboard": env.public_dashboard,
-            "workspace_manager": env.workspace_manager,
-            "runtime_policy": resolved_runtime_policy,
-        },
+        services=services,
     )
 
 
