@@ -910,6 +910,8 @@ DAG_WORKSPACE_PERMISSION_REPAIR_ENV = "IRIAI_DAG_WORKSPACE_PERMISSION_REPAIR"
 AGENT_SHARED_GROUP_ENV = "IRIAI_AGENT_SHARED_GROUP"
 DEFAULT_AGENT_SHARED_GROUP = "iriai-agents"
 CONTRADICTION_DECISIONS_KEY = "contradiction-decisions"
+KNOWN_FLAKY_LEDGER_ENV = "IRIAI_KNOWN_FLAKY_LEDGER"
+KNOWN_FLAKY_LEDGER_ARTIFACT_KEY = "known-flaky-tests"
 CONTRADICTION_DECISION_CURRENT_PACK_MAX_CHARS = int(
     os.environ.get("IRIAI_CONTRADICTION_DECISION_CURRENT_PACK_MAX_CHARS", "120000")
 )
@@ -15081,6 +15083,7 @@ class ImplementationPhase(Phase):
                         "top-to-bottom and cite AC-ids in any failures you report. "
                         "Cross-check implementation against the full upstream "
                         "artifacts in your context."
+                        + await _known_flaky_ledger_section(runner, feature)
                     ),
                     output_type=Verdict,
                     phase_name=self.name,
@@ -15162,6 +15165,7 @@ class ImplementationPhase(Phase):
                         "conditions. When a Test Plan section is provided above, "
                         "run through its test_scenarios and edge_cases lists; for "
                         "any failure, cite the AC-id in your verdict."
+                        + await _known_flaky_ledger_section(runner, feature)
                     ),
                     output_type=Verdict,
                     phase_name=self.name,
@@ -15258,6 +15262,7 @@ class ImplementationPhase(Phase):
                         "- Execute API endpoints or CLI commands and verify responses.\n"
                         "- Capture terminal output as evidence where appropriate.\n\n"
                         "Every journey must produce evidence of working correctly."
+                        + await _known_flaky_ledger_section(runner, feature)
                     ),
                     output_type=Verdict,
                     phase_name=self.name,
@@ -24959,6 +24964,82 @@ async def _record_dag_group_commit_proof(
     )
 
 
+def _known_flaky_ledger_enabled() -> bool:
+    return _env_flag_enabled(KNOWN_FLAKY_LEDGER_ENV, default=False)
+
+
+_KNOWN_FLAKY_TRIAGE_INSTRUCTION = (
+    "## Known-Flaky Test Ledger (triage discipline)\n\n"
+    "The ledger below lists tests with KNOWN flaky baseline failures (e.g. "
+    "live-DB nondeterminism). Apply this triage discipline to test failures:\n"
+    "- A failing test that is ON the ledger is NOT an automatic blocker. "
+    "Before blocking on it, confirm it is a genuine REGRESSION (not a flake) "
+    "via the stash-diff method: stash (or otherwise temporarily remove) the "
+    "change under verification, re-run the failing test on clean HEAD, then "
+    "restore the change. It only counts as a regression if the failure is "
+    "ABSENT on clean HEAD and present only with the change applied.\n"
+    "- NEVER name-match a failure against this ledger as an excuse to pass "
+    "it. Only tests explicitly listed below get the flake-triage path; "
+    "genuinely NEW failures (not listed) remain automatic blockers.\n"
+    "- Ledger drift — a listed test that now consistently passes, or fails "
+    "in a clearly different way than the ledger describes — must be "
+    "REPORTED in your verdict (concern or suggestion), never silently "
+    "absorbed.\n\n"
+    "### Ledger content\n\n"
+)
+
+# Memoized resolved ledger section per feature.id. A hit is cached; a miss is
+# NOT cached (so an operator can stage the ledger mid-run), but the missing-
+# artifact WARN fires only once per feature to avoid log spam.
+_KNOWN_FLAKY_LEDGER_CACHE: dict[str, str] = {}
+_KNOWN_FLAKY_LEDGER_WARNED: set[str] = set()
+
+
+async def _known_flaky_ledger_section(
+    runner: WorkflowRunner,
+    feature: Feature,
+) -> str:
+    """Flag-gated known-flaky-tests prompt section for verification roles.
+
+    Returns "" unless ``IRIAI_KNOWN_FLAKY_LEDGER=1`` AND the
+    ``known-flaky-tests`` store artifact exists for *feature* — so with the
+    flag off (the default) every prompt is byte-identical to before.
+    """
+    if not _known_flaky_ledger_enabled():
+        return ""
+    feature_key = str(feature.id)
+    cached = _KNOWN_FLAKY_LEDGER_CACHE.get(feature_key)
+    if cached is not None:
+        return cached
+    raw = ""
+    try:
+        raw = await runner.artifacts.get(
+            KNOWN_FLAKY_LEDGER_ARTIFACT_KEY, feature=feature
+        ) or ""
+    except Exception:
+        logger.debug(
+            "Failed to load %s artifact", KNOWN_FLAKY_LEDGER_ARTIFACT_KEY,
+            exc_info=True,
+        )
+        raw = ""
+    raw = raw.strip()
+    if not raw:
+        if feature_key not in _KNOWN_FLAKY_LEDGER_WARNED:
+            _KNOWN_FLAKY_LEDGER_WARNED.add(feature_key)
+            logger.warning(
+                "%s=1 but no '%s' artifact exists for feature %s — "
+                "known-flaky triage injection is a no-op until the ledger "
+                "artifact is staged.",
+                KNOWN_FLAKY_LEDGER_ENV,
+                KNOWN_FLAKY_LEDGER_ARTIFACT_KEY,
+                feature_key,
+            )
+        return ""
+    section = "\n\n" + _KNOWN_FLAKY_TRIAGE_INSTRUCTION + raw + "\n"
+    _KNOWN_FLAKY_LEDGER_CACHE[feature_key] = section
+    return section
+
+
 async def _verify(
     runner: WorkflowRunner,
     feature: Feature,
@@ -25048,6 +25129,7 @@ async def _verify(
         "4. The code compiles, imports correctly, and passes any existing tests for these files\n"
         "5. Implementation matches the upstream specs in the referenced context files\n\n"
         "This is a per-group verification, not a full QA pass."
+        + await _known_flaky_ledger_section(runner, feature)
     )
 
     async with _diagnostic_actor_context(
@@ -25154,6 +25236,7 @@ async def _verify_enhancements(
                     f"- Any existing test fails after the changes\n"
                     f"- A fix introduces a new bug or breaks an import\n"
                     f"- The implementer skipped items that are clearly still broken"
+                    + await _known_flaky_ledger_section(runner, feature)
                 ),
                 output_type=Verdict,
             ),
@@ -34526,6 +34609,7 @@ async def _run_expanded_dag_verify_lenses(
         ],
     )
     context_prompt = _context_package_prompt(context)
+    known_flaky_section = await _known_flaky_ledger_section(runner, feature)
 
     async def _run_lens(spec: DagVerifyLensSpec) -> tuple[DagVerifyLensSpec, Verdict | None, str | None]:
         artifact_key = f"dag-repair-lens:g{group_idx}:{spec.slug}:retry-{retry_label}"
@@ -34541,6 +34625,7 @@ async def _run_expanded_dag_verify_lenses(
             "issues that should be fixed before this group checkpoints. Put lower "
             "severity observations in suggestions unless they invalidate the current "
             "group. Lens approval is advisory and cannot checkpoint the group."
+            + known_flaky_section
         )
         try:
             verdict = await _run_bound_diagnostic_ask(
@@ -37935,6 +38020,7 @@ async def _run_regression(
     # integration-regression gate below so AC-id traceability is symmetric
     # across both post-fix checks.
     test_plan_section = await _load_test_plan_section(runner, feature)
+    known_flaky_section = await _known_flaky_ledger_section(runner, feature)
     regression_verdict: Verdict = await runner.run(
         Ask(
             actor=actor_builder(
@@ -37953,6 +38039,7 @@ async def _run_regression(
                 "Focus on downstream consumers and integration points. "
                 "When a Test Plan section is provided above, cite AC-ids for any "
                 "regressions you identify against specific acceptance criteria."
+                + known_flaky_section
             ),
             output_type=Verdict,
         ),
@@ -37999,6 +38086,7 @@ async def _run_regression(
                     "work correctly after the bug fix changes. When a Test "
                     "Plan section is provided above, cite AC-ids for any "
                     "regressions you find."
+                    + known_flaky_section
                 ),
                 output_type=Verdict,
             ),
