@@ -121,6 +121,20 @@ def _create_parent_grounded(
         for parent in parents:
             if exists(os.path.join(repos_root, parent)):
                 return True
+        # Nearest-existing-ancestor (mkdir -p semantics): creating a file
+        # implicitly creates its directory chain, so a create-class entry whose
+        # nearest EXISTING ancestor sits at most two levels above the parent is
+        # grounded (e.g. new supply-chain/tests/submittals/ under the existing
+        # supply-chain/tests/). Deeper orphans stay ungrounded — a wholly novel
+        # tree is exactly the typo class the conservative fail-safe exists for.
+        for parent in parents:
+            ancestor = parent
+            for _ in range(2):
+                ancestor = posixpath.dirname(ancestor)
+                if not ancestor:
+                    break
+                if exists(os.path.join(repos_root, ancestor)):
+                    return True
     return False
 
 
