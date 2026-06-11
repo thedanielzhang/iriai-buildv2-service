@@ -18255,6 +18255,8 @@ async def _verify_and_fix_group(
     dag_sha256: str = "",
     contracts_by_task_id: dict[str, Any] | None = None,
     workspace_snapshots: list[Any] | None = None,
+    max_retries: int | None = None,
+    verify_key_stage_prefix: str = "",
 ) -> tuple[bool, str]:
     """Verify a group's implementation and fix issues via RCA → fix → re-verify.
 
@@ -18268,8 +18270,23 @@ async def _verify_and_fix_group(
     When *fix_context* is provided it is injected into the fix agent's prompt
     so it has additional context about what needs to be fixed (e.g. the
     original enhancement items for the enhancement group).
+
+    Item-10 (R3 tier-ii boundary repair waves): *max_retries* overrides the
+    module-level ``VERIFY_RETRIES`` budget (``None`` = VERIFY_RETRIES, exactly
+    today — waves pass their OWN ``IRIAI_E2E_REPAIR_RETRIES`` budget, never
+    sharing group verification's). *verify_key_stage_prefix* namespaces every
+    in-loop ``dag-verify:g{N}:<stage>`` projection key (waves pass
+    ``"e2e-wave-{k}:"`` so their rows never collide with the group's original
+    ``initial``/``retry-*`` rows). Default ``""`` = byte-identical keys.
     """
     import json as _json
+
+    effective_retries = (
+        VERIFY_RETRIES if max_retries is None else max(0, int(max_retries))
+    )
+
+    def _vkey(stage: str) -> str:
+        return f"dag-verify:g{group_idx}:{verify_key_stage_prefix}{stage}"
 
     _do_verify = verify_fn or _verify
     dag_review_runtime = (
@@ -18360,7 +18377,7 @@ async def _verify_and_fix_group(
                 "result_count": len(results),
             },
         )
-        current_verify_projection_key = f"dag-verify:g{group_idx}:initial"
+        current_verify_projection_key = _vkey("initial")
         initial_preflight_failed = False
         try:
             if verify_fn is None:
@@ -18493,7 +18510,7 @@ async def _verify_and_fix_group(
         return False, initial_workflow_blocker
 
     # ── RCA → fix → re-verify loop ───────────────────────────────────
-    for retry in range(VERIFY_RETRIES):
+    for retry in range(effective_retries):
         if _is_approved(verdict):
             break
 
@@ -18532,9 +18549,9 @@ async def _verify_and_fix_group(
             source_verdict_key = (
                 initial_verdict_key
                 if retry == 0 and initial_verdict_key
-                else f"dag-verify:g{group_idx}:initial"
+                else _vkey("initial")
                 if retry == 0
-                else f"dag-verify:g{group_idx}:retry-{retry - 1}"
+                else _vkey(f"retry-{retry - 1}")
             )
             direct_route = _classify_dag_direct_repair_route(verdict)
             if direct_route.route != _NORMAL_VERIFY_ROUTE:
@@ -18572,7 +18589,7 @@ async def _verify_and_fix_group(
                         ),
                         dag_sha256=dag_sha256,
                     )
-                    current_verify_projection_key = f"dag-verify:g{group_idx}:retry-{retry}"
+                    current_verify_projection_key = _vkey(f"retry-{retry}")
                     await _put_dag_verify_artifact(
                         runner,
                         feature,
@@ -18612,7 +18629,7 @@ async def _verify_and_fix_group(
                         retry,
                         direct_route.route,
                     )
-                    current_verify_projection_key = f"dag-verify:g{group_idx}:retry-{retry}"
+                    current_verify_projection_key = _vkey(f"retry-{retry}")
                     await _put_dag_verify_artifact(
                         runner,
                         feature,
@@ -18701,7 +18718,7 @@ async def _verify_and_fix_group(
             )
             if authority_gate.blocked_verdict is not None:
                 verdict = authority_gate.blocked_verdict
-                current_verify_projection_key = f"dag-verify:g{group_idx}:retry-{retry}"
+                current_verify_projection_key = _vkey(f"retry-{retry}")
                 final_lens_verdicts: list[tuple[object, Verdict]] = []
                 final_lens_failures: list[dict[str, Any]] = []
                 final_raw_verifier_verdict = verdict
@@ -18764,7 +18781,7 @@ async def _verify_and_fix_group(
         if retry > 0:
             prior_ctx = (
                 f"\n\n## Prior Verify Attempt\n"
-                f"This is retry {retry + 1}/{VERIFY_RETRIES}. "
+                f"This is retry {retry + 1}/{effective_retries}. "
                 f"The previous fix attempt did not resolve the issue.\n"
             )
 
@@ -18828,7 +18845,7 @@ async def _verify_and_fix_group(
                     group_idx=group_idx,
                     stage=f"retry-{retry}",
                 )
-                current_verify_projection_key = f"dag-verify:g{group_idx}:retry-{retry}"
+                current_verify_projection_key = _vkey(f"retry-{retry}")
                 final_lens_verdicts: list[tuple[object, Verdict]] = []
                 final_lens_failures: list[dict[str, Any]] = []
                 final_raw_verifier_verdict = verdict
@@ -19050,7 +19067,7 @@ async def _verify_and_fix_group(
                         exc,
                         runtime=dag_final_review_runtime,
                         dag_sha256=dag_sha256,
-                        projection_key=f"dag-verify:g{group_idx}:retry-{retry}",
+                        projection_key=_vkey(f"retry-{retry}"),
                     )
                 logger.info(
                     "DAG group verify finished group=%d attempt=retry-%d approved=%s",
@@ -19073,7 +19090,7 @@ async def _verify_and_fix_group(
                         "authority_repair": authority_repair,
                     },
                 )
-                current_verify_projection_key = f"dag-verify:g{group_idx}:retry-{retry}"
+                current_verify_projection_key = _vkey(f"retry-{retry}")
                 final_lens_verdicts: list[tuple[object, Verdict]] = []
                 final_lens_failures: list[dict[str, Any]] = []
                 final_raw_verifier_verdict = verdict
@@ -19544,7 +19561,7 @@ async def _verify_and_fix_group(
             ],
         )
         fix_prompt = (
-            f"Verification failed (attempt {retry + 1}/{VERIFY_RETRIES}). "
+            f"Verification failed (attempt {retry + 1}/{effective_retries}). "
             "Read the referenced context carefully, then fix the issues.\n\n"
             f"{_context_package_prompt(fix_context_package)}"
             "## Instructions\n"
@@ -19685,7 +19702,7 @@ async def _verify_and_fix_group(
                     retry=retry,
                     problems=remaining,
                 )
-                current_verify_projection_key = f"dag-verify:g{group_idx}:retry-{retry}"
+                current_verify_projection_key = _vkey(f"retry-{retry}")
                 await _put_dag_verify_artifact(
                     runner,
                     feature,
@@ -19742,7 +19759,7 @@ async def _verify_and_fix_group(
                 group_idx=group_idx,
                 stage=f"retry-{retry}",
             )
-            current_verify_projection_key = f"dag-verify:g{group_idx}:retry-{retry}"
+            current_verify_projection_key = _vkey(f"retry-{retry}")
             await _put_dag_verify_artifact(
                 runner,
                 feature,
@@ -19816,7 +19833,7 @@ async def _verify_and_fix_group(
                 "parallel_repair": False,
             },
         )
-        current_verify_projection_key = f"dag-verify:g{group_idx}:retry-{retry}"
+        current_verify_projection_key = _vkey(f"retry-{retry}")
         preflight_verdict = None
         retry_preflight_failed = False
         try:
@@ -19996,7 +20013,7 @@ async def _verify_and_fix_group(
             await _put_dag_verify_artifact(
                 runner,
                 feature,
-                f"dag-verify:g{group_idx}:checkpoint-commit",
+                _vkey("checkpoint-commit"),
                 verdict,
                 group_idx=group_idx,
                 dag_sha256=dag_sha256,
@@ -20025,7 +20042,7 @@ async def _verify_and_fix_group(
                         if direct_route.operator_required
                         else "selected"
                     ),
-                    source_verdict_key=f"dag-verify:g{group_idx}:checkpoint-commit",
+                    source_verdict_key=_vkey("checkpoint-commit"),
                     guardrail_decision=(
                         "operator/worktree blocker detected after verifier approval"
                         if direct_route.operator_required
@@ -20076,7 +20093,7 @@ async def _verify_and_fix_group(
             group_idx,
             group_tasks,
             dag_sha256=dag_sha256,
-            projection_key=current_verify_projection_key or f"dag-verify:g{group_idx}:checkpoint",
+            projection_key=current_verify_projection_key or _vkey("checkpoint"),
             commit_hash=commit_hash,
             checkpoint_results=checkpoint_results,
             feature_root=feature_root,
@@ -21095,6 +21112,47 @@ async def _implement_dag(
                 failure=quiesce_failure,
                 handover=handover,
                 terminal_state="quiesced",
+            )
+
+        # ── Item-10 (R3) tier-i: e2e critical blocker → fail-loud quiesce ──
+        # (IRIAI_E2E_CRITICAL_QUIESCE, default OFF). Marker + OPERATOR-ACTIONS
+        # entry are written by the helper; exit via existing channels only.
+        e2e_quiesce_failure = await _maybe_quiesce_on_e2e_critical(
+            runner, feature, group_idx=group_idx,
+        )
+        if e2e_quiesce_failure:
+            impl_text = "\n\n".join(to_str(r) for r in all_results)
+            return DagExecutionOutcome(
+                implementation_text=impl_text,
+                failure=e2e_quiesce_failure,
+                handover=handover,
+                terminal_state="quiesced",
+            )
+
+        # ── Item-10 (R3) tier-ii: e2e boundary repair wave ──────────────
+        # (IRIAI_E2E_BOUNDARY_REPAIR, default OFF). Feeds async e2e majors
+        # into the last sealed group's RCA→fix→re-verify loop; NO DAG
+        # mutation. Returns non-empty only for workflow-blocker/operator-
+        # required failures — a non-converged wave is non-blocking.
+        e2e_wave_failure = await _maybe_run_e2e_boundary_repair_wave(
+            runner, feature, dag,
+            group_idx=group_idx,
+            tasks_by_id=tasks_by_id,
+            all_results=all_results,
+            handover=handover,
+            dag_sha256=dag_sha256,
+        )
+        if e2e_wave_failure:
+            impl_text = "\n\n".join(to_str(r) for r in all_results)
+            return DagExecutionOutcome(
+                implementation_text=impl_text,
+                failure=e2e_wave_failure,
+                handover=handover,
+                terminal_state=(
+                    "workflow_blocked"
+                    if _is_workflow_blocker_text(e2e_wave_failure)
+                    else "quiesced"
+                ),
             )
 
         # Slice 09e-1b P3-D re-gating: the dispatch loop reaches the EFFECTIVE
@@ -38861,6 +38919,331 @@ async def _enforce_e2e_run_gate(
             "source": "e2e-run-gate",
         },
     )
+
+
+_E2E_CRITICAL_QUIESCE_ENV = "IRIAI_E2E_CRITICAL_QUIESCE"
+_E2E_BOUNDARY_REPAIR_ENV = "IRIAI_E2E_BOUNDARY_REPAIR"
+_E2E_REPAIR_RETRIES_ENV = "IRIAI_E2E_REPAIR_RETRIES"
+_E2E_BLOCKER_HANDLED_KEY = "e2e-blocker-handled"
+_E2E_WAVE_LEDGER_KEY = "e2e-wave-ledger"
+# Enhancement-backlog sources written by the e2e bridge (e2e/bridge.py).
+_E2E_BACKLOG_SOURCES = ("e2e_regression", "e2e_preview_build")
+
+
+def _e2e_repair_retries() -> int:
+    """Item-10 tier-ii wave budget (IRIAI_E2E_REPAIR_RETRIES, default 1).
+
+    Operator rider (binding): e2e repair waves get their OWN bounded retry
+    budget — NEVER shared with group verification's ``VERIFY_RETRIES``. One
+    RCA→fix→re-verify cycle per boundary is the sensible default: findings
+    that persist get the NEXT boundary's wave instead of burning the live
+    boundary on retries.
+    """
+    raw = os.environ.get(_E2E_REPAIR_RETRIES_ENV, "").strip()
+    try:
+        value = int(raw) if raw else 1
+    except ValueError:
+        logger.warning(
+            "Invalid %s=%r — using default 1", _E2E_REPAIR_RETRIES_ENV, raw,
+        )
+        value = 1
+    return max(0, value)
+
+
+async def _maybe_quiesce_on_e2e_critical(
+    runner: WorkflowRunner, feature: Feature, *, group_idx: int,
+) -> str:
+    """Item-10 tier-i (IRIAI_E2E_CRITICAL_QUIESCE, default OFF): auto-quiesce
+    before the next group dispatch when a NEW ``e2e-blocker`` artifact exists.
+
+    The e2e track already PAGES on critical (status.page_critical writes
+    ``e2e-blocker`` + a non-deduped card); this hook makes the develop loop
+    honor it. Fail-loud per the driver-compatibility rider: durable
+    ``workflow-blocker:e2e-critical`` marker + OPERATOR-ACTIONS entry (item-4
+    machinery), exit ONLY via existing channels — the returned failure routes
+    through the existing boundary-quiesce DagExecutionOutcome path
+    (terminal_state='quiesced'); the handled-digest artifact means an operator
+    RESTART resumes past the same blocker (operator decides resume, R3).
+    """
+    if not _e2e_env_on(_E2E_CRITICAL_QUIESCE_ENV):
+        return ""
+    raw = await runner.artifacts.get(_E2E_BLOCKER_KEY, feature=feature)
+    if not raw:
+        return ""
+    digest = hashlib.sha256(str(raw).encode("utf-8")).hexdigest()
+    handled_raw = await runner.artifacts.get(
+        _E2E_BLOCKER_HANDLED_KEY, feature=feature,
+    )
+    handled = _json_object_from_text(handled_raw) if handled_raw else {}
+    if handled.get("digest") == digest:
+        return ""
+    blocker = _json_object_from_text(raw)
+    blocker_bits = "; ".join(
+        f"{b.get('kind', '?')}:{b.get('spec_id') or b.get('surface') or '?'}"
+        for b in list(blocker.get("blockers") or [])[:10]
+        if isinstance(b, dict)
+    )
+    reason = (
+        "e2e CRITICAL blocker detected before dispatching group "
+        f"{group_idx}: checkpoint={blocker.get('checkpoint') or '?'} "
+        f"[{blocker_bits or 'see e2e-blocker artifact'}]. Dispatch quiesced "
+        "(IRIAI_E2E_CRITICAL_QUIESCE). Operator decides resume: address the "
+        "blocker (or accept it) and restart the workflow — the blocker digest "
+        "is recorded as handled, so restart resumes past THIS blocker."
+    )
+    logger.error("e2e tier-i quiesce: %s", reason)
+    await runner.artifacts.put(
+        "workflow-blocker:e2e-critical",
+        json.dumps({
+            "source": "e2e-critical-quiesce",
+            "reason": reason,
+            "blocker_digest": digest,
+            "before_group_idx": group_idx,
+            "deterministic_workflow_blocker": True,
+            "operator_required": True,
+        }, indent=2, sort_keys=True),
+        feature=feature,
+    )
+    _append_operator_actions_entry(
+        runner,
+        title="e2e CRITICAL blocker — dispatch quiesced before next group",
+        why=reason,
+        commands=(
+            "Inspect the 'e2e-blocker' artifact (and the paged Slack card); "
+            "fix the critical regression / boot failure or accept it, then "
+            "restart the workflow."
+        ),
+        verify=(
+            f"workflow dispatches group {group_idx} without re-quiescing on "
+            "the same e2e-blocker digest"
+        ),
+    )
+    await runner.artifacts.put(
+        _E2E_BLOCKER_HANDLED_KEY,
+        json.dumps({"digest": digest, "group_idx": group_idx}, sort_keys=True),
+        feature=feature,
+    )
+    await _log_feature_event(
+        runner,
+        feature.id,
+        "e2e_critical_quiesce",
+        "implementation",
+        content=f"before-g{group_idx}",
+        metadata={"before_group_idx": group_idx, "blocker_digest": digest},
+    )
+    return reason
+
+
+def _e2e_wave_candidates(
+    backlog_items: list[Any], consumed_descriptions: set[str],
+) -> list[Any]:
+    """Item-10 tier-ii feed: e2e-sourced severity-major backlog rows not yet
+    consumed by a prior wave (pure; unit-tested)."""
+    return [
+        it for it in backlog_items
+        if str(getattr(it, "source", "")) in _E2E_BACKLOG_SOURCES
+        and str(getattr(it, "severity", "")).strip().lower() == "major"
+        and str(getattr(it, "description", "")) not in consumed_descriptions
+    ]
+
+
+def _build_e2e_wave_verdict(items: list[Any]) -> Verdict:
+    """Synthetic not-approved Verdict carrying the e2e majors as concerns
+    (verbatim descriptions + file refs render straight into the fix prompt)."""
+    concerns = [
+        Issue(
+            severity="major",
+            description=str(getattr(it, "description", "")),
+            file=str(getattr(it, "file", "") or ""),
+            line=int(getattr(it, "line", 0) or 0),
+        )
+        for it in items
+    ]
+    return Verdict(
+        approved=False,
+        summary=(
+            f"e2e boundary repair wave: {len(items)} asynchronously-arrived "
+            "major e2e finding(s) against the sealed checkpoint must be "
+            "repaired before the next group dispatches."
+        ),
+        concerns=concerns,
+    )
+
+
+async def _maybe_run_e2e_boundary_repair_wave(
+    runner: WorkflowRunner,
+    feature: Feature,
+    dag: ImplementationDAG,
+    *,
+    group_idx: int,
+    tasks_by_id: dict[str, ImplementationTask],
+    all_results: list[object],
+    handover: HandoverDoc,
+    dag_sha256: str,
+) -> str:
+    """Item-10 tier-ii (IRIAI_E2E_BOUNDARY_REPAIR, default OFF): repair wave at
+    the group boundary feeding async e2e majors into _verify_and_fix_group.
+
+    NO DAG mutation, no new task ids: the wave re-enters the EXISTING
+    RCA→fix→re-verify loop for the last SEALED group (N = group_idx-1) with a
+    synthetic initial verdict, a wave-namespaced projection-key prefix
+    (``e2e-wave-{k}:`` — never collides with the group's original rows) and its
+    OWN retry budget (IRIAI_E2E_REPAIR_RETRIES). On approval the loop's
+    existing checkpoint path RE-PROJECTS ``dag-group:{N}`` (append-only,
+    latest-wins, same key + dag_sha256) so group N+1 dispatches against
+    repaired code. A non-converged wave is NON-blocking: items are recorded as
+    attempted in the durable e2e-wave-ledger (no boundary re-feed loop) and
+    remain in the enhancement backlog for end-of-DAG; only workflow-blocker /
+    operator-required failures propagate.
+    """
+    if not _e2e_env_on(_E2E_BOUNDARY_REPAIR_ENV):
+        return ""
+    if group_idx <= 0:
+        return ""
+    prior_idx = group_idx - 1
+    backlog_raw = await runner.artifacts.get("enhancement-backlog", feature=feature)
+    if not backlog_raw:
+        return ""
+    try:
+        backlog = EnhancementBacklog.model_validate_json(backlog_raw)
+    except Exception:
+        logger.warning(
+            "e2e boundary wave: unparseable enhancement-backlog row — skipping "
+            "(the item-4 fail-loud reader owns corrupt-row handling)",
+        )
+        return ""
+    ledger_raw = await runner.artifacts.get(_E2E_WAVE_LEDGER_KEY, feature=feature)
+    ledger = _json_object_from_text(ledger_raw) if ledger_raw else {}
+    consumed = {str(d) for d in (ledger.get("consumed") or [])}
+    waves = list(ledger.get("waves") or [])
+    items = _e2e_wave_candidates(backlog.items, consumed)
+    if not items:
+        return ""
+    checkpoint_raw = await runner.artifacts.get(
+        f"dag-group:{prior_idx}", feature=feature,
+    )
+    if not checkpoint_raw:
+        logger.warning(
+            "e2e boundary wave: no dag-group:%d checkpoint to repair against — "
+            "skipping (%d candidate finding(s) stay in the backlog)",
+            prior_idx, len(items),
+        )
+        return ""
+    data = _json_object_from_text(checkpoint_raw)
+    group_task_ids = (
+        list(dag.execution_order[prior_idx])
+        if prior_idx < len(dag.execution_order) else []
+    )
+    group_tasks = [tasks_by_id[tid] for tid in group_task_ids if tid in tasks_by_id]
+    results: list[object] = []
+    for r_data in data.get("results", []):
+        try:
+            results.append(ImplementationResult.model_validate(r_data))
+        except Exception:
+            pass
+    wave_idx = len(waves)
+    wave_key = f"dag-verify:g{prior_idx}:e2e-wave-{wave_idx}"
+    budget = _e2e_repair_retries()
+    synthetic = _build_e2e_wave_verdict(items)
+    fix_context = (
+        "Asynchronously-arrived e2e findings against the sealed checkpoint "
+        f"for group {prior_idx} (from the e2e track's enhancement-backlog "
+        "bridge; evidence labels reference e2e checkpoints):\n"
+        + "\n".join(
+            f"- [{it.severity}] {it.description}"
+            + (f" (file: `{it.file}`)" if it.file else "")
+            + (f" [context: {it.task_context}]" if it.task_context else "")
+            for it in items
+        )
+    )
+    runtime_policy = _runner_runtime_policy(runner)
+    impl_runtime, review_runtime = _dag_group_runtime_pair(prior_idx, runtime_policy)
+    rca_runtime = _dag_repair_runtime_for(
+        "dag-rca", _diagnostic_runtime_for_policy(runtime_policy),
+    )
+    workspace_mgr = runner.services.get("workspace_manager")
+    feature_root = (
+        Path(workspace_mgr._base) / ".iriai" / "features" / feature.slug / "repos"
+        if workspace_mgr
+        else None
+    )
+    logger.warning(
+        "e2e boundary repair wave %d: feeding %d major e2e finding(s) into "
+        "group %d repair before dispatching group %d (budget=%d, key=%s)",
+        wave_idx, len(items), prior_idx, group_idx, budget, wave_key,
+    )
+    await _log_feature_event(
+        runner,
+        feature.id,
+        "e2e_boundary_wave_start",
+        "implementation",
+        content=f"g{prior_idx}:e2e-wave-{wave_idx}",
+        metadata={
+            "group_idx": prior_idx,
+            "before_group_idx": group_idx,
+            "wave_idx": wave_idx,
+            "item_count": len(items),
+            "budget": budget,
+            "verdict_key": wave_key,
+        },
+    )
+    approved, failure = await _verify_and_fix_group(
+        runner, feature, prior_idx, group_tasks,
+        results, all_results, handover, feature_root,
+        impl_runtime, review_runtime, rca_runtime,
+        fix_context=fix_context,
+        known_task_ids=set(tasks_by_id),
+        initial_verdict=synthetic,
+        initial_verdict_key=wave_key,
+        dag_sha256=dag_sha256,
+        contracts_by_task_id={},
+        max_retries=budget,
+        verify_key_stage_prefix=f"e2e-wave-{wave_idx}:",
+    )
+    consumed.update(str(getattr(it, "description", "")) for it in items)
+    waves.append({
+        "wave_idx": wave_idx,
+        "group_idx": prior_idx,
+        "before_group_idx": group_idx,
+        "approved": bool(approved),
+        "item_count": len(items),
+        "verdict_key": wave_key,
+        "budget": budget,
+        "completed_at": time.time(),
+    })
+    await runner.artifacts.put(
+        _E2E_WAVE_LEDGER_KEY,
+        json.dumps({"consumed": sorted(consumed), "waves": waves}, indent=2),
+        feature=feature,
+    )
+    await _log_feature_event(
+        runner,
+        feature.id,
+        "e2e_boundary_wave_complete",
+        "implementation",
+        content=f"g{prior_idx}:e2e-wave-{wave_idx}:{'approved' if approved else 'failed'}",
+        metadata={
+            "group_idx": prior_idx,
+            "wave_idx": wave_idx,
+            "approved": bool(approved),
+        },
+    )
+    if approved:
+        logger.warning(
+            "e2e boundary wave %d REPAIRED group %d: dag-group:%d re-projected "
+            "(latest-wins) — group %d dispatches against repaired code",
+            wave_idx, prior_idx, prior_idx, group_idx,
+        )
+        return ""
+    if _is_workflow_blocker_text(failure) or _OPERATOR_REQUIRED_MARKER in failure:
+        return failure
+    logger.error(
+        "e2e boundary wave %d did NOT converge within its budget (%d): %s — "
+        "items recorded as attempted in %s and remain in the enhancement "
+        "backlog for end-of-DAG; dispatch continues",
+        wave_idx, budget, (failure or "")[:300], _E2E_WAVE_LEDGER_KEY,
+    )
+    return ""
 
 
 async def _load_ledger(
