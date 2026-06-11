@@ -15292,6 +15292,7 @@ class ImplementationPhase(Phase):
                         "Cross-check implementation against the full upstream "
                         "artifacts in your context."
                         + await _known_flaky_ledger_section(runner, feature)
+                        + _verifier_evidence_transcription_section()
                     ),
                     output_type=Verdict,
                     phase_name=self.name,
@@ -15382,6 +15383,7 @@ class ImplementationPhase(Phase):
                         "run through its test_scenarios and edge_cases lists; for "
                         "any failure, cite the AC-id in your verdict."
                         + await _known_flaky_ledger_section(runner, feature)
+                        + _verifier_evidence_transcription_section()
                     ),
                     output_type=Verdict,
                     phase_name=self.name,
@@ -15487,6 +15489,7 @@ class ImplementationPhase(Phase):
                         "- Capture terminal output as evidence where appropriate.\n\n"
                         "Every journey must produce evidence of working correctly."
                         + await _known_flaky_ledger_section(runner, feature)
+                        + _verifier_evidence_transcription_section()
                     ),
                     output_type=Verdict,
                     phase_name=self.name,
@@ -25334,6 +25337,35 @@ def _known_flaky_ledger_enabled() -> bool:
     return _env_flag_enabled(KNOWN_FLAKY_LEDGER_ENV, default=False)
 
 
+VERIFIER_EVIDENCE_TRANSCRIPTION_ENV = "IRIAI_VERIFIER_EVIDENCE_TRANSCRIPTION"
+
+_VERIFIER_EVIDENCE_TRANSCRIPTION_INSTRUCTION = (
+    "## Failure-evidence transcription (required)\n\n"
+    "Downstream repair/root-cause agents consume ONLY the text of your "
+    "verdict concerns — they cannot see your terminal output. For EVERY "
+    "test failure you report as a concern, transcribe the evidence into "
+    "the concern text itself:\n"
+    "- the exact failing test id(s) (full pytest nodeids / spec names),\n"
+    "- the exact command you ran,\n"
+    "- the decisive failure output lines (assertion message, error class, "
+    "the relevant traceback frame) — quoted verbatim, trimmed to the "
+    "meaningful lines, never paraphrased.\n"
+    "A concern that says a test failed without carrying its nodeid and "
+    "verbatim failure lines is incomplete evidence.\n"
+)
+
+
+def _verifier_evidence_transcription_section() -> str:
+    """Flag-gated evidence-transcription instruction for verification roles.
+
+    Returns "" unless ``IRIAI_VERIFIER_EVIDENCE_TRANSCRIPTION=1`` — with the
+    flag off (the default) every prompt is byte-identical to before.
+    """
+    if not _env_flag_enabled(VERIFIER_EVIDENCE_TRANSCRIPTION_ENV, default=False):
+        return ""
+    return "\n\n" + _VERIFIER_EVIDENCE_TRANSCRIPTION_INSTRUCTION
+
+
 _KNOWN_FLAKY_TRIAGE_INSTRUCTION = (
     "## Known-Flaky Test Ledger (triage discipline)\n\n"
     "The ledger below lists tests with KNOWN flaky baseline failures (e.g. "
@@ -25527,6 +25559,7 @@ async def _verify(
         "5. Implementation matches the upstream specs in the referenced context files\n\n"
         "This is a per-group verification, not a full QA pass."
         + await _known_flaky_ledger_section(runner, feature)
+                        + _verifier_evidence_transcription_section()
     )
 
     async with _diagnostic_actor_context(
@@ -25634,6 +25667,7 @@ async def _verify_enhancements(
                     f"- A fix introduces a new bug or breaks an import\n"
                     f"- The implementer skipped items that are clearly still broken"
                     + await _known_flaky_ledger_section(runner, feature)
+                        + _verifier_evidence_transcription_section()
                 ),
                 output_type=Verdict,
             ),
@@ -35133,6 +35167,7 @@ async def _run_expanded_dag_verify_lenses(
             "severity observations in suggestions unless they invalidate the current "
             "group. Lens approval is advisory and cannot checkpoint the group."
             + known_flaky_section
+                + _verifier_evidence_transcription_section()
         )
         try:
             verdict = await _run_bound_diagnostic_ask(
@@ -38547,6 +38582,7 @@ async def _run_regression(
                 "When a Test Plan section is provided above, cite AC-ids for any "
                 "regressions you identify against specific acceptance criteria."
                 + known_flaky_section
+                + _verifier_evidence_transcription_section()
             ),
             output_type=Verdict,
         ),
@@ -38594,6 +38630,7 @@ async def _run_regression(
                     "Plan section is provided above, cite AC-ids for any "
                     "regressions you find."
                     + known_flaky_section
+                + _verifier_evidence_transcription_section()
                 ),
                 output_type=Verdict,
             ),

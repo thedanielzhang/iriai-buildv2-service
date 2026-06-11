@@ -338,3 +338,24 @@ async def test_expanded_verify_lenses_inject_ledger(monkeypatch):
     for _lane, prompt in captured:
         assert MARKER in prompt
         assert LEDGER_BODY.strip() in prompt
+
+
+def test_verifier_evidence_transcription_flag_off_is_empty(monkeypatch):
+    monkeypatch.delenv(
+        implementation_module.VERIFIER_EVIDENCE_TRANSCRIPTION_ENV, raising=False
+    )
+    assert implementation_module._verifier_evidence_transcription_section() == ""
+    monkeypatch.setenv(
+        implementation_module.VERIFIER_EVIDENCE_TRANSCRIPTION_ENV, "0"
+    )
+    assert implementation_module._verifier_evidence_transcription_section() == ""
+
+
+def test_verifier_evidence_transcription_flag_on_injects_instruction(monkeypatch):
+    monkeypatch.setenv(
+        implementation_module.VERIFIER_EVIDENCE_TRANSCRIPTION_ENV, "1"
+    )
+    section = implementation_module._verifier_evidence_transcription_section()
+    assert "Failure-evidence transcription" in section
+    assert "nodeids" in section
+    assert "verbatim" in section
