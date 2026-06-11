@@ -1254,6 +1254,39 @@ def _verifier_compatibility_link_payload(
 def _verdict_effectively_approved(verdict: Verdict) -> bool:
     if not verdict.approved:
         return False
+    import os as _os
+
+    if _os.environ.get("IRIAI_STRICT_VERDICT_DISPOSITION", "").strip().lower() in (
+        "1", "true", "yes", "on",
+    ):
+        # Item-3 strict mode: use the same normalized severity membership as
+        # the gate path (closes the intra-repo inconsistency where this
+        # function uppercased check results but kept unnormalized severities).
+        # Shared helpers live in models.outputs (this module must not
+        # back-import from phases.implementation).
+        from iriai_build_v2.models.outputs import (
+            check_result_failed_strict,
+            normalize_severity_strict,
+        )
+
+        if any(
+            normalize_severity_strict(issue.severity, context="lens-concern")
+            in BLOCKING_SEVERITIES
+            for issue in verdict.concerns
+        ):
+            return False
+        if any(
+            normalize_severity_strict(gap.severity, context="lens-gap")
+            in BLOCKING_SEVERITIES
+            for gap in verdict.gaps
+        ):
+            return False
+        if any(
+            check_result_failed_strict(check.result, context="lens-check")
+            for check in verdict.checks
+        ):
+            return False
+        return True
     if any(issue.severity in BLOCKING_SEVERITIES for issue in verdict.concerns):
         return False
     if any(gap.severity in BLOCKING_SEVERITIES for gap in verdict.gaps):

@@ -314,7 +314,9 @@ from ....models.outputs import (
     TaskFileScope,
     TestPlan,
     Verdict,
+    check_result_failed_strict,
     envelope_done,
+    normalize_severity_strict,
 )
 from ....models.state import BuildState
 from ....roles import (
@@ -901,6 +903,13 @@ VERIFY_RETRIES = 2
 WARN_AFTER_CYCLES = 3
 BLOCKING_SEVERITIES = frozenset({"blocker", "major"})
 DAG_EXPANDED_VERIFY_ENV = "IRIAI_DAG_EXPANDED_VERIFY"
+# Item-3 verdict hardening (develop-readiness program): severity/result
+# normalization + approved=false coherence re-ask. Default OFF.
+STRICT_VERDICT_DISPOSITION_ENV = "IRIAI_STRICT_VERDICT_DISPOSITION"
+# Item-4 ledger/backlog fail-loud (quarantine + typed quiesce). Default OFF.
+LEDGER_FAIL_LOUD_ENV = "IRIAI_LEDGER_FAIL_LOUD"
+# Item-5 develop-side planning-contract AC waivers. Default OFF.
+DEVELOP_CONTRACT_AC_WAIVERS_ENV = "IRIAI_DEVELOP_CONTRACT_AC_WAIVERS"
 DAG_PARALLEL_REPAIR_ENV = "IRIAI_DAG_PARALLEL_REPAIR"
 DAG_PREFLIGHT_REPAIR_ENV = "IRIAI_DAG_PREFLIGHT_REPAIR"
 DAG_AUTO_RESOLVE_CONTRADICTIONS_ENV = "IRIAI_DAG_AUTO_RESOLVE_CONTRADICTIONS"
@@ -14875,6 +14884,14 @@ class ImplementationPhase(Phase):
                 ledger = _update_ledger(ledger, review_verdict, "code_reviewer", cycle)
                 await _save_ledger(runner, feature, ledger)
 
+            review_verdict = await _coherence_reask_if_incoherent(
+                runner, feature, review_verdict,
+                base_actor=reviewer, runtime=gate_runtime,
+                source="code_reviewer", phase_name=self.name,
+                feature_root=feature_root,
+                lane_id="post-dag:code-review-coherence",
+            )
+
             if _is_approved(review_verdict):
                 await runner.artifacts.put(
                     "dag-gate:code-review", "approved", feature=feature
@@ -14955,6 +14972,14 @@ class ImplementationPhase(Phase):
                 await _append_enhancements(runner, feature, _enhancements)
                 ledger = _update_ledger(ledger, security_verdict, "security_auditor", cycle)
                 await _save_ledger(runner, feature, ledger)
+
+            security_verdict = await _coherence_reask_if_incoherent(
+                runner, feature, security_verdict,
+                base_actor=security_auditor, runtime=gate_runtime,
+                source="security_auditor", phase_name=self.name,
+                feature_root=feature_root,
+                lane_id="post-dag:security-coherence",
+            )
 
             if _is_approved(security_verdict):
                 await runner.artifacts.put(
@@ -15129,6 +15154,14 @@ class ImplementationPhase(Phase):
                 ledger = _update_ledger(ledger, qa_verdict, "qa_engineer", cycle)
                 await _save_ledger(runner, feature, ledger)
 
+            qa_verdict = await _coherence_reask_if_incoherent(
+                runner, feature, qa_verdict,
+                base_actor=qa_engineer, runtime=gate_runtime,
+                source="qa_engineer", phase_name=self.name,
+                feature_root=feature_root,
+                lane_id="post-dag:qa-coherence",
+            )
+
             if _is_approved(qa_verdict):
                 await runner.artifacts.put("dag-gate:qa", "approved", feature=feature)
                 await _record_post_dag_gate_proof(
@@ -15211,6 +15244,14 @@ class ImplementationPhase(Phase):
                 await _append_enhancements(runner, feature, _enhancements)
                 ledger = _update_ledger(ledger, integration_verdict, "integration_tester", cycle)
                 await _save_ledger(runner, feature, ledger)
+
+            integration_verdict = await _coherence_reask_if_incoherent(
+                runner, feature, integration_verdict,
+                base_actor=integration_tester, runtime=gate_runtime,
+                source="integration_tester", phase_name=self.name,
+                feature_root=feature_root,
+                lane_id="post-dag:integration-coherence",
+            )
 
             if _is_approved(integration_verdict):
                 await runner.artifacts.put(
@@ -15307,6 +15348,14 @@ class ImplementationPhase(Phase):
                 await _append_enhancements(runner, feature, _enhancements)
                 ledger = _update_ledger(ledger, verifier_verdict, "verifier", cycle)
                 await _save_ledger(runner, feature, ledger)
+
+            verifier_verdict = await _coherence_reask_if_incoherent(
+                runner, feature, verifier_verdict,
+                base_actor=verifier, runtime=gate_runtime,
+                source="verifier", phase_name=self.name,
+                feature_root=feature_root,
+                lane_id="post-dag:verifier-coherence",
+            )
 
             if _is_approved(verifier_verdict):
                 await runner.artifacts.put(
@@ -38256,10 +38305,39 @@ def _collect_files(results: list[object]) -> list[str]:
     return _dedupe_preserving_order(files)
 
 
+def _strict_verdict_disposition_enabled() -> bool:
+    """Item-3 flag (IRIAI_STRICT_VERDICT_DISPOSITION, default OFF).
+
+    OFF preserves today's behavior exactly: exact case-sensitive severity
+    membership, exact ``== "FAIL"`` check results, no coherence re-ask.
+    """
+    return os.environ.get(STRICT_VERDICT_DISPOSITION_ENV, "").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+# Shared strict-mode normalization vocabulary + helpers live in
+# models/outputs.py (verification.py needs them too and must not back-import
+# from this module). Thin module-level aliases keep call sites readable.
+_normalize_severity = normalize_severity_strict
+_check_result_failed_strict = check_result_failed_strict
+
+
 def _is_approved(verdict: object) -> bool:
     """Approve if no blocker/major findings exist, regardless of agent opinion."""
     if not isinstance(verdict, Verdict):
         return False
+    if _strict_verdict_disposition_enabled():
+        for c in verdict.concerns:
+            if _normalize_severity(c.severity, context="concern") in BLOCKING_SEVERITIES:
+                return False
+        for g in verdict.gaps:
+            if _normalize_severity(g.severity, context="gap") in BLOCKING_SEVERITIES:
+                return False
+        for ch in verdict.checks:
+            if _check_result_failed_strict(ch.result, context=f"check:{ch.criterion}"):
+                return False
+        return True
     for c in verdict.concerns:
         if c.severity in BLOCKING_SEVERITIES:
             return False
@@ -38270,6 +38348,107 @@ def _is_approved(verdict: object) -> bool:
         if ch.result == "FAIL":
             return False
     return True
+
+
+async def _coherence_reask_if_incoherent(
+    runner: WorkflowRunner,
+    feature: Feature,
+    verdict: object,
+    *,
+    base_actor: AgentActor,
+    runtime: str | None,
+    source: str,
+    phase_name: str,
+    feature_root: Path | None,
+    lane_id: str,
+) -> object:
+    """Item-3 strict mode: approved=false coherence re-ask (gate-as-interview).
+
+    When a gate verdict says ``approved=False`` but contains no blocking
+    findings and no failing checks (so ``_is_approved`` would auto-approve and
+    silently park the disposition), do ONE bounded re-ask to the SAME reviewer
+    through the existing diagnostic-ask channel: restate the blocking findings
+    with canonical severities, or confirm approval. If the re-ask is STILL
+    incoherent, a synthetic blocker concern is appended so the gate takes the
+    existing not-approved branch — an approved=False disposition is never
+    silently approved. No-op unless IRIAI_STRICT_VERDICT_DISPOSITION is set.
+    """
+    if not _strict_verdict_disposition_enabled():
+        return verdict
+    if not isinstance(verdict, Verdict):
+        return verdict
+    if verdict.approved or not _is_approved(verdict):
+        return verdict
+    logger.warning(
+        "Strict verdict disposition: %s verdict has approved=false but no "
+        "blocker/major findings — running ONE coherence re-ask",
+        source,
+    )
+    reask_prompt = (
+        "Your previous verdict for this gate set approved=false but contained "
+        "NO blocker or major findings and NO failing checks, so the disposition "
+        "is incoherent.\n\n"
+        f"Your previous summary was:\n{verdict.summary}\n\n"
+        "Respond with a corrected verdict, exactly one of:\n"
+        "1. If something genuinely blocks approval: restate the blocking "
+        "finding(s) as concerns/gaps with canonical severities (blocker or "
+        "major) and keep approved=false.\n"
+        "2. If nothing blocks approval: confirm by returning approved=true.\n\n"
+        "Severity vocabulary is exactly: blocker | major | minor | nit."
+    )
+    try:
+        reasked = await _run_bound_diagnostic_ask(
+            runner,
+            feature,
+            base_actor=base_actor,
+            suffix="coherence",
+            runtime=runtime,
+            prompt=reask_prompt,
+            output_type=Verdict,
+            phase_name=phase_name,
+            feature_root=feature_root,
+            lane_id=lane_id,
+        )
+    except Exception as exc:  # noqa: BLE001 — fail-closed, never fail-open
+        logger.warning(
+            "Strict verdict disposition: coherence re-ask for %s failed (%s) — "
+            "treating original approved=false disposition as blocking",
+            source, exc,
+        )
+        reasked = None
+    if isinstance(reasked, Verdict):
+        if reasked.approved and _is_approved(reasked):
+            logger.warning(
+                "Strict verdict disposition: %s reviewer confirmed approval on "
+                "coherence re-ask",
+                source,
+            )
+            return reasked
+        if not _is_approved(reasked):
+            logger.warning(
+                "Strict verdict disposition: %s reviewer restated blocking "
+                "findings on coherence re-ask",
+                source,
+            )
+            return reasked
+        verdict = reasked
+    # Still incoherent (approved=False with no blocking findings) or the
+    # re-ask failed/was unparseable: fail closed via a synthetic blocker so the
+    # existing not-approved branch (_diagnose_and_fix / quiesce) handles it.
+    logger.warning(
+        "Strict verdict disposition: %s verdict remained incoherent after the "
+        "coherence re-ask — appending synthetic blocker (fail-closed)",
+        source,
+    )
+    synthetic = Issue(
+        severity="blocker",
+        description=(
+            "Strict verdict disposition: reviewer returned approved=false "
+            "without any blocker/major finding, and did not confirm approval "
+            f"on the coherence re-ask. Original summary: {verdict.summary}"
+        ),
+    )
+    return verdict.model_copy(update={"concerns": [*verdict.concerns, synthetic]})
 
 
 # ── Finding ledger ──────────────────────────────────────────────────────────
@@ -38416,18 +38595,53 @@ def _partition_verdict(
     verdict: Verdict, source: str, task_context: str = "",
 ) -> tuple[Verdict, list[EnhancementItem]]:
     """Split a verdict into blocking-only and non-blocking enhancement items."""
-    blocking_concerns = [
-        c for c in verdict.concerns if c.severity in BLOCKING_SEVERITIES
-    ]
-    non_blocking_concerns = [
-        c for c in verdict.concerns if c.severity not in BLOCKING_SEVERITIES
-    ]
-    blocking_gaps = [
-        g for g in verdict.gaps if g.severity in BLOCKING_SEVERITIES
-    ]
-    non_blocking_gaps = [
-        g for g in verdict.gaps if g.severity not in BLOCKING_SEVERITIES
-    ]
+    if _strict_verdict_disposition_enabled():
+        # Strict mode: partition on NORMALIZED severities so case-variant or
+        # off-vocabulary blocking severities ("Blocker", "critical") are never
+        # silently parked in the enhancement backlog.
+        def _blocking(severity: str, kind: str) -> bool:
+            return (
+                _normalize_severity(severity, context=f"{source}:{kind}")
+                in BLOCKING_SEVERITIES
+            )
+
+        blocking_concerns = [
+            c for c in verdict.concerns if _blocking(c.severity, "concern")
+        ]
+        non_blocking_concerns = [
+            c for c in verdict.concerns if not _blocking(c.severity, "concern")
+        ]
+        blocking_gaps = [
+            g for g in verdict.gaps if _blocking(g.severity, "gap")
+        ]
+        non_blocking_gaps = [
+            g for g in verdict.gaps if not _blocking(g.severity, "gap")
+        ]
+        non_blocking_concerns = [
+            c.model_copy(update={
+                "severity": _normalize_severity(c.severity, context=f"{source}:concern"),
+            })
+            for c in non_blocking_concerns
+        ]
+        non_blocking_gaps = [
+            g.model_copy(update={
+                "severity": _normalize_severity(g.severity, context=f"{source}:gap"),
+            })
+            for g in non_blocking_gaps
+        ]
+    else:
+        blocking_concerns = [
+            c for c in verdict.concerns if c.severity in BLOCKING_SEVERITIES
+        ]
+        non_blocking_concerns = [
+            c for c in verdict.concerns if c.severity not in BLOCKING_SEVERITIES
+        ]
+        blocking_gaps = [
+            g for g in verdict.gaps if g.severity in BLOCKING_SEVERITIES
+        ]
+        non_blocking_gaps = [
+            g for g in verdict.gaps if g.severity not in BLOCKING_SEVERITIES
+        ]
 
     blocking_verdict = verdict.model_copy(update={
         "concerns": blocking_concerns,
