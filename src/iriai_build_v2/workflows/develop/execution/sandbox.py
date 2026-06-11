@@ -3662,6 +3662,24 @@ class SandboxRunner:
                 json.dumps(template_manifest, indent=2, sort_keys=True) + "\n",
                 encoding="utf-8",
             )
+            # N-23: venv console-script shebangs (and pyvenv.cfg) embed the
+            # ABSOLUTE staging path; after the atomic rename below those
+            # interpreters would dangle.  Rewrite staging -> final path NOW
+            # (immediately before publish).  Any rewrite failure raises into
+            # the except below: the template is NOT published and the task
+            # falls back to legacy provisioning (never hand out a template
+            # with dangling tooling).
+            rewritten = self._rewrite_venv_path_references(
+                staging_repo, old_prefix=str(staging), new_prefix=str(template_dir)
+            )
+            logger.info(
+                "sandbox template publish: rewrote %d venv script/config "
+                "file(s) (staging path -> %s) for repo %s digest %s",
+                rewritten,
+                template_dir,
+                repo_id,
+                digest,
+            )
             if template_dir.exists():  # incomplete leftover from a crash
                 shutil.rmtree(template_dir)
             os.rename(staging, template_dir)
@@ -3779,6 +3797,24 @@ class SandboxRunner:
             # copies .git wholesale): verify git works and pin the commit.
             self._git_text(repo_root, ["status", "--porcelain=v1"])
             self._git_text(repo_root, ["checkout", "--detach", base_commit])
+            # N-23: venv console-script shebangs (and pyvenv.cfg) in the clone
+            # still point at the TEMPLATE's repo dir.  Required even after the
+            # publish-time rewrite — a clone whose console scripts target the
+            # template's interpreter would cross-contaminate (pip installs
+            # would land in the template).  Rewrite template -> attempt path;
+            # any failure raises into the except below (loud WARN + legacy
+            # fallback — never hand out a sandbox with dangling tooling).
+            rewritten = self._rewrite_venv_path_references(
+                repo_root, old_prefix=str(template_repo), new_prefix=str(repo_root)
+            )
+            logger.info(
+                "sandbox clone provisioning: rewrote %d venv script/config "
+                "file(s) (template path -> %s) for repo %s (feature %s)",
+                rewritten,
+                repo_root,
+                repo_id,
+                feature_slug,
+            )
             return template_repo
         except Exception as exc:
             logger.warning(
@@ -3790,6 +3826,76 @@ class SandboxRunner:
             )
             shutil.rmtree(repo_root, ignore_errors=True)
             return None
+
+    @staticmethod
+    def _iter_venv_dirs(repo_root: Path) -> list[Path]:
+        """All ``.venv`` dirs under *repo_root* (any package-root depth).
+
+        Prunes ``.git``/``node_modules`` (and never descends INTO a found
+        ``.venv``) so the walk stays cheap on large monorepos.
+        """
+        venv_dirs: list[Path] = []
+        for dirpath, dirnames, _filenames in os.walk(repo_root):
+            if ".venv" in dirnames:
+                venv_dirs.append(Path(dirpath) / ".venv")
+            dirnames[:] = [
+                d for d in dirnames if d not in {".git", "node_modules", ".venv"}
+            ]
+        return venv_dirs
+
+    def _rewrite_venv_path_references(
+        self, repo_root: Path, *, old_prefix: str, new_prefix: str
+    ) -> int:
+        """Rewrite absolute venv paths baked into console scripts (N-23).
+
+        ``python3 -m venv`` embeds the venv's ABSOLUTE path in every console
+        script shebang under ``.venv/bin`` (pip, pytest, every entry point)
+        and in ``pyvenv.cfg``.  Template builds provision venvs in a staging
+        dir, so after the atomic publish rename — and again after each
+        clonefile — those paths dangle (or worse, point at the template,
+        cross-contaminating pip installs).  This rewrites *old_prefix* ->
+        *new_prefix* in every TEXT file directly under each ``.venv/bin``
+        plus the venv's ``pyvenv.cfg``.  Symlinks (e.g. ``bin/python``) and
+        binaries (NUL-containing, grep ``-I`` equivalent) are never touched.
+
+        Returns the number of files rewritten.  Raises :class:`SandboxError`
+        on any read/write failure so callers treat the template/clone as
+        failed and fall back to legacy provisioning.
+        """
+        if old_prefix == new_prefix:
+            return 0
+        old_bytes = old_prefix.encode("utf-8")
+        new_bytes = new_prefix.encode("utf-8")
+        rewritten = 0
+        for venv_dir in self._iter_venv_dirs(repo_root):
+            candidates: list[Path] = []
+            bin_dir = venv_dir / "bin"
+            if bin_dir.is_dir():
+                candidates.extend(sorted(bin_dir.iterdir()))
+            pyvenv_cfg = venv_dir / "pyvenv.cfg"
+            if pyvenv_cfg.exists():
+                candidates.append(pyvenv_cfg)
+            for path in candidates:
+                if path.is_symlink() or not path.is_file():
+                    continue  # bin/python interpreter symlinks etc.
+                try:
+                    data = path.read_bytes()
+                except OSError as exc:
+                    raise SandboxError(
+                        f"venv path rewrite: cannot read {path}: {exc}"
+                    ) from exc
+                if b"\x00" in data[:8192]:
+                    continue  # binary (compiled launcher); never touch
+                if old_bytes not in data:
+                    continue
+                try:
+                    path.write_bytes(data.replace(old_bytes, new_bytes))
+                except OSError as exc:
+                    raise SandboxError(
+                        f"venv path rewrite: cannot write {path}: {exc}"
+                    ) from exc
+                rewritten += 1
+        return rewritten
 
     def _provision_sandbox_dependencies(
         self, repo_root: Path, source_root: Path
