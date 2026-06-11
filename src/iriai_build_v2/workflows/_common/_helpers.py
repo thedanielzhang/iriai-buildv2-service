@@ -39,6 +39,24 @@ SYSTEM_DESIGN_BATCH_SIZE = 1
 MAX_BATCH_REQUESTS = 4
 COMPILE_HIERARCHICAL_THRESHOLD = 250_000
 COMPILE_CLUSTER_TARGET_BYTES = 120_000
+# ── Parallel compile guardrails (active ONLY on the flag-gated parallel
+# path — the sequential default is untouched).  See
+# docs/compile-parallelism-resumability-design.md §4.3/§5.3.
+# Max-pieces cap: the deterministic tail's integration cost rises with piece
+# COUNT (offset chain links + cross-piece refs), so the parallel path never
+# dispatches more pieces than this — it COARSENS (merges clusters) instead.
+COMPILE_MAX_PIECES = 8
+# Cross-ref-density coarsening threshold: when two clusters exchange more
+# than this many cross-cluster `Sx CMP-n` references, they are MERGED so the
+# refs become intra-cluster (resolved by that cluster's own merge) instead
+# of cross-piece contracts the tail must keep consistent.
+COMPILE_CROSS_REF_DENSITY_MAX = 8
+# Bounded peak concurrency: deliberately conservative (well below develop's
+# 4-14 policy_cap) because each concurrent compile is an expensive ephemeral
+# CLI client emitting very large outputs on the operator's shared usage pool
+# (the live run has crashed on "out of extra usage").
+_COMPILE_CONCURRENCY_DEFAULT = 2
+_COMPILE_CONCURRENCY_MAX = 8
 _COMPILED_ARTIFACT_CACHE: dict[tuple[str, str], str] = {}
 _MAX_SAME_DIGEST_GATE_ATTEMPTS = 2
 _PUBLIC_EXHIBIT_REFRESH_ARTIFACT_KEYS = {
@@ -2699,6 +2717,265 @@ async def _compile_piece_reuse(
     return cached
 
 
+# ── Compile-phase parallelism helpers (additive, flag-gated) ─────────────
+#
+# The parallelism half of docs/compile-parallelism-resumability-design.md
+# (§4.3 guardrails, §5 dispatch).  EVERYTHING here is active only when the
+# parallel flag is on; with the flag off (the default) the sequential
+# cluster / bundle loops in ``compile_artifacts`` run byte-identically to
+# today.  Parallelism is at the CLUSTER level (a piece = a byte-bounded
+# group of WHOLE subfeatures), never finer, so the deterministic tail stays
+# a pure-code offset precompute + concat.
+
+
+def _compile_parallel_enabled() -> bool:
+    """Operator switch for parallel compile (default OFF).
+
+    Read from the environment at call time (not import time) so a restart
+    can dial parallelism up/down without a code change — the design's
+    Phase-3 "dynamic scaling on restart".
+    """
+    return os.environ.get("IRIAI_COMPILE_PARALLEL", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _compile_concurrency() -> int:
+    """Bounded peak concurrency for parallel compile pieces.
+
+    ``IRIAI_COMPILE_CONCURRENCY`` overrides the conservative default of
+    {_COMPILE_CONCURRENCY_DEFAULT}; values are clamped to
+    [1, {_COMPILE_CONCURRENCY_MAX}] — the cap is an UPPER bound only (fewer
+    pieces just run fewer concurrent calls), and it can never be widened
+    past the clamp (mirrors develop's "metrics may only shrink, never widen
+    past the cap" rule).
+    """
+    raw = os.environ.get("IRIAI_COMPILE_CONCURRENCY", "").strip()
+    if not raw:
+        return _COMPILE_CONCURRENCY_DEFAULT
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning(
+            "IRIAI_COMPILE_CONCURRENCY=%r is not an integer — using the "
+            "default of %d",
+            raw,
+            _COMPILE_CONCURRENCY_DEFAULT,
+        )
+        return _COMPILE_CONCURRENCY_DEFAULT
+    if value < 1:
+        logger.warning(
+            "IRIAI_COMPILE_CONCURRENCY=%d below minimum — clamped to 1", value
+        )
+        return 1
+    if value > _COMPILE_CONCURRENCY_MAX:
+        logger.warning(
+            "IRIAI_COMPILE_CONCURRENCY=%d above the hard cap — clamped to %d "
+            "(each concurrent compile is an expensive ephemeral CLI client "
+            "on the shared usage pool)",
+            value,
+            _COMPILE_CONCURRENCY_MAX,
+        )
+        return _COMPILE_CONCURRENCY_MAX
+    return value
+
+
+def _compile_piece_actor(actor: Any, piece_label: str) -> Any:
+    """Distinct-named copy of the compiler actor for ONE parallel piece.
+
+    Parallel safety: the same ``AgentActor`` must not appear in multiple
+    parallel tasks (``session_key = "{actor.name}:{feature.id}"`` would
+    collide — validated by the runner).  Each concurrent piece therefore
+    gets a copy sharing the SAME ``Role`` (including the compile-scratch
+    metadata already applied by ``_compile_scratch_actor``) under a
+    distinct name — the established actor-per-unit pattern (e.g.
+    ``summarizer-{sf_slug}``).  ``model_copy`` preserves the concrete actor
+    subclass and every other field.
+    """
+    base_name = getattr(actor, "name", "") or "compiler"
+    new_name = f"{base_name}-{piece_label}"
+    model_copy = getattr(actor, "model_copy", None)
+    if callable(model_copy):
+        return model_copy(update={"name": new_name})
+    # Non-pydantic actor (defensive): construct a plain AgentActor sharing
+    # the same role/context, per the design's derivation.
+    return AgentActor(
+        name=new_name,
+        role=actor.role,
+        context_keys=list(getattr(actor, "context_keys", []) or []),
+    )
+
+
+# Cross-subfeature reference: an owning prefix token immediately before a
+# `CMP-n` id (e.g. `S2 CMP-17`, `S3a CMP-4`).  Deliberately BROADER than the
+# offset-math `_cross_prefix_re` (this one also matches letter-suffixed
+# prefixes like `S3a`/`S3b`) — this regex only MEASURES density to decide
+# coarsening; it never feeds the offset arithmetic.
+_CROSS_SF_REF_PREFIX_RE = re.compile(r"\b([A-Za-z]+\d+[a-z]?)\s+CMP-\d+")
+
+
+def _cross_ref_owner_chunk(prefix: str, slug_to_chunk: dict[str, int]) -> int | None:
+    """Map an `Sx`-style owning prefix to the chunk owning that subfeature.
+
+    A slug owns a prefix when it equals the lowercased prefix or starts
+    with it as a separated leading token (``s2`` ↔ ``s2-shared-links``).
+    Unmappable prefixes are ignored (return None).
+    """
+    p = prefix.lower()
+    for slug, chunk_idx in slug_to_chunk.items():
+        sl = slug.lower()
+        if sl == p or sl.startswith(p + "-") or sl.startswith(p + "_"):
+            return chunk_idx
+    return None
+
+
+def _coarsen_chunks_for_parallel(
+    chunks: list[list[tuple[Any, str]]],
+    *,
+    max_pieces: int | None = None,
+    cross_ref_max: int | None = None,
+) -> list[list[tuple[Any, str]]]:
+    """Guardrail against over-parallelization (design §4.3) — parallel path only.
+
+    Two coarsening passes, both of which only ever MERGE clusters (never
+    split below a whole subfeature, never drop/duplicate a member — the
+    task-set is preserved exactly, mirroring the regroup overlay's
+    fail-closed rule):
+
+    1. Cross-ref-density coarsening: count cross-cluster ``Sx CMP-n``
+       references between each pair of clusters; while any pair exceeds
+       ``cross_ref_max``, merge the worst-offending pair so those refs
+       become INTRA-cluster (resolved by that cluster's own merge) instead
+       of cross-piece contracts for the deterministic tail.
+    2. Max-pieces cap: while more than ``max_pieces`` clusters remain,
+       merge the adjacent pair with the smallest combined byte size.
+
+    For the compile, integration cost rises with piece COUNT, not piece
+    size — so a conflict makes us coarsen (fewer, bigger pieces), the
+    inverse of develop shrinking a wave.  Deterministic: same input chunks
+    produce the same output chunks.
+    """
+    if max_pieces is None:
+        max_pieces = COMPILE_MAX_PIECES
+    if cross_ref_max is None:
+        cross_ref_max = COMPILE_CROSS_REF_DENSITY_MAX
+    chunks = [list(c) for c in chunks]
+
+    def _pair_counts(
+        current: list[list[tuple[Any, str]]],
+    ) -> dict[tuple[int, int], int]:
+        slug_to_chunk: dict[str, int] = {}
+        for ci, chunk in enumerate(current):
+            for s, _t in chunk:
+                slug = getattr(s, "slug", "") or ""
+                if slug:
+                    slug_to_chunk.setdefault(slug, ci)
+        counts: dict[tuple[int, int], int] = {}
+        for ci, chunk in enumerate(current):
+            for _s, text in chunk:
+                for m in _CROSS_SF_REF_PREFIX_RE.finditer(text or ""):
+                    owner = _cross_ref_owner_chunk(m.group(1), slug_to_chunk)
+                    if owner is None or owner == ci:
+                        continue
+                    key = (min(ci, owner), max(ci, owner))
+                    counts[key] = counts.get(key, 0) + 1
+        return counts
+
+    # Pass 1 — cross-ref-density coarsening (bounded: each merge reduces the
+    # piece count by one, so at most len(chunks)-1 iterations).
+    for _ in range(max(0, len(chunks) - 1)):
+        if len(chunks) <= 1:
+            break
+        offenders = {
+            pair: n
+            for pair, n in _pair_counts(chunks).items()
+            if n > cross_ref_max
+        }
+        if not offenders:
+            break
+        # Deterministic pick: highest count, then lowest pair indices.
+        (i, j) = max(offenders, key=lambda k: (offenders[k], -k[0], -k[1]))
+        logger.info(
+            "parallel compile: coarsening — merging cluster %d + %d "
+            "(%d cross-piece refs > %d): heavily cross-referencing "
+            "subfeatures stay in one piece",
+            i + 1,
+            j + 1,
+            offenders[(i, j)],
+            cross_ref_max,
+        )
+        chunks = (
+            chunks[:i]
+            + [chunks[i] + chunks[j]]
+            + chunks[i + 1 : j]
+            + chunks[j + 1 :]
+        )
+
+    # Pass 2 — max-pieces cap.
+    while len(chunks) > max(1, max_pieces):
+        sizes = [
+            sum(len((t or "").encode("utf-8")) for _s, t in c) for c in chunks
+        ]
+        k = min(
+            range(len(chunks) - 1), key=lambda x: sizes[x] + sizes[x + 1]
+        )
+        logger.info(
+            "parallel compile: coarsening — merging adjacent clusters "
+            "%d + %d to respect COMPILE_MAX_PIECES=%d",
+            k + 1,
+            k + 2,
+            max_pieces,
+        )
+        chunks = chunks[:k] + [chunks[k] + chunks[k + 1]] + chunks[k + 2 :]
+    return chunks
+
+
+async def _compile_parallel_gather(
+    *,
+    labels: list[str],
+    coros: list[Awaitable[Any]],
+    concurrency: int,
+) -> list[Any]:
+    """Semaphore-bounded ``asyncio.gather`` for compile pieces (design §5.3/§5.4).
+
+    Results are returned in input order (gather preserves order; the
+    deterministic concat re-imposes the canonical Part-1..n order).  Pieces
+    are gathered with ``return_exceptions=True`` so one piece's guard raise
+    is surfaced PER PIECE (which piece, what failed) instead of crashing the
+    whole gather opaquely; a composed error naming every failed piece is
+    then re-raised.  Successful pieces have already written their outputs +
+    markers, so a retry reuses them — never silently uses partial results.
+    """
+    import asyncio as _asyncio
+
+    sem = _asyncio.Semaphore(max(1, int(concurrency)))
+
+    async def _bounded(coro: Awaitable[Any]) -> Any:
+        async with sem:
+            return await coro
+
+    results = await _asyncio.gather(
+        *(_bounded(c) for c in coros), return_exceptions=True
+    )
+    failures = [
+        (label, res)
+        for label, res in zip(labels, results, strict=False)
+        if isinstance(res, BaseException)
+    ]
+    if failures:
+        for label, res in failures:
+            logger.error("parallel compile piece %s FAILED: %s", label, res)
+        raise RuntimeError(
+            f"Parallel compile: {len(failures)}/{len(results)} piece(s) "
+            "FAILED — "
+            + "; ".join(f"{label}: {res}" for label, res in failures)
+        ) from failures[0][1]
+    return list(results)
+
+
 async def compile_artifacts(
     runner: WorkflowRunner,
     feature: Feature,
@@ -2712,6 +2989,7 @@ async def compile_artifacts(
     compiled_transform: Callable[[str], Awaitable[str]] | None = None,
     deterministic_final_merge: bool = False,
     incremental_compile: bool = False,
+    parallel_compile: bool = False,
 ) -> str:
     """Compile per-subfeature artifacts into a single final artifact.
 
@@ -2735,6 +3013,21 @@ async def compile_artifacts(
     deterministic_final_merge`` (the deterministic path is the only one with
     bounded, non-lossy pieces worth caching).  The deterministic concat +
     final whole-union guard ALWAYS run (never cached).
+
+    When ``parallel_compile`` is True OR ``IRIAI_COMPILE_PARALLEL`` is set
+    (BOTH default off — byte-for-byte current behavior otherwise), AND
+    ``deterministic_final_merge`` is True, the independent per-piece LLM
+    calls (cluster compiles in Stage A; per-bundle re-emits in Stage D,
+    whose global offsets are precomputed and order-independent) are
+    dispatched concurrently under a semaphore
+    (``IRIAI_COMPILE_CONCURRENCY``, default 2, clamped ≤ 8), with the §4.3
+    guardrails: cluster count capped at ``COMPILE_MAX_PIECES`` and
+    cross-ref-dense clusters COARSENED (merged) before dispatch.  Every
+    piece keeps its own ``_assert_compile_complete`` guard; the
+    deterministic concat + always-on final whole-union guard are unchanged.
+    Parallelism on the non-deterministic (legacy regroup) path is
+    deliberately not offered — its final merge is a single LLM call with no
+    independent pieces.
     """
     from pathlib import Path
 
@@ -2763,6 +3056,23 @@ async def compile_artifacts(
     # (runtimes/claude_pool.py _validate_pool_scratch_write_manifest).
     scratch_dir = _compile_intermediate_scratch_dir(feature.id)
     compiler_actor = _compile_scratch_actor(compiler_actor, scratch_dir)
+
+    # Parallel piece dispatch (flag-gated, default OFF).  Only meaningful on
+    # the deterministic path: its cluster compiles are independent by
+    # construction and its per-bundle offsets are precomputed (order-
+    # independent).  The env switch lets the operator dial parallelism
+    # up/down on a restart without a code change (design Phase 3).
+    parallel_enabled = (
+        parallel_compile or _compile_parallel_enabled()
+    ) and deterministic_final_merge
+    if parallel_enabled:
+        logger.info(
+            "compile %s: parallel piece dispatch ENABLED (concurrency cap "
+            "%d, max pieces %d)",
+            artifact_prefix,
+            _compile_concurrency(),
+            COMPILE_MAX_PIECES,
+        )
 
     sf_sources: list[tuple[Any, str]] = []
     for sf in decomposition.subfeatures:
@@ -2834,10 +3144,15 @@ async def compile_artifacts(
         source_count: int,
         legacy_output_path: Path | None = None,
         mirror_path: Path | None = None,
+        actor: Actor | None = None,
     ) -> str:
+        # ``actor`` is only passed by the parallel piece dispatch (a
+        # distinct-named per-piece copy of the compiler actor); every
+        # sequential caller leaves it None → the shared compiler actor,
+        # exactly as today.
         await runner.run(
             Ask(
-                actor=compiler_actor,
+                actor=actor if actor is not None else compiler_actor,
                 prompt=(
                     f"Compile the following {source_count} {artifact_prefix} source bundle(s) into a single unified document.\n\n"
                     "Rules:\n"
@@ -2914,7 +3229,144 @@ async def compile_artifacts(
             return scratch_path
 
         intermediate_sources: list[tuple[Any, str]] = []
-        for idx, chunk in enumerate(chunks, start=1):
+
+        # ── PARALLEL cluster stage (flag-gated; sequential loop below is the
+        # untouched default).  Each cluster's inputs are a DISJOINT set of
+        # whole subfeatures (broad/decomposition are excluded from cluster
+        # sources), so the cluster compiles are independent and only need
+        # bounded fan-out.  The §4.3 guardrails (max-pieces cap +
+        # cross-ref-density coarsening) run on the chunk split first; every
+        # piece keeps the same reuse slot + completeness guard as the
+        # sequential body, and each concurrent piece uses a distinct-named
+        # actor copy (parallel-safety: unique session_key per piece).
+        async def _compile_cluster_piece_parallel(
+            idx: int, chunk: list[tuple[Any, str]]
+        ) -> str:
+            chunk_sources_path = (
+                feature_dir / f"compile-sources-{artifact_prefix}-chunk-{idx}.md"
+            )
+            chunk_output_name = (
+                f"compile-intermediate-{artifact_prefix}-chunk-{idx}.md"
+            )
+            chunk_output_path = scratch_dir / chunk_output_name
+            chunk_legacy_output_path = feature_dir / chunk_output_name
+            chunk_src_text = _render_source_bundle(
+                f"{artifact_prefix}-chunk-{idx}",
+                include_broad=False,
+                include_decomposition=False,
+                sources=chunk,
+            )
+            chunk_sources_path.write_text(chunk_src_text, encoding="utf-8")
+
+            member_slugs = [getattr(s, "slug", "") for s, _ in chunk]
+            expected = set(member_slugs)
+            cluster_src_digest = ""
+            cluster_piece_slug = ""
+            intermediate_text = None
+            if incremental_compile and deterministic_final_merge:
+                cluster_src_digest = _cluster_piece_digest(
+                    artifact_prefix=artifact_prefix,
+                    member_slugs=member_slugs,
+                    member_source_texts=[t for _s, t in chunk],
+                )
+                cluster_piece_slug = _cluster_piece_slug(member_slugs)
+                intermediate_text = await _compile_piece_reuse(
+                    runner,
+                    feature,
+                    artifact_prefix=f"{artifact_prefix}-chunk-{idx}",
+                    piece_slug=cluster_piece_slug,
+                    src_digest=cluster_src_digest,
+                    output_path=_reuse_probe_path(
+                        chunk_output_path, chunk_legacy_output_path
+                    ),
+                    sources_text=chunk_src_text,
+                    stage_label=f"cluster-{idx}",
+                    real_slugs=real_slugs,
+                    expected_slugs=expected,
+                )
+
+            if intermediate_text is None:  # cache miss → compile this piece
+                intermediate_text = await _run_compile_prompt(
+                    stage_label=f"cluster-{idx}",
+                    sources_path=chunk_sources_path,
+                    output_path=chunk_output_path,
+                    source_count=len(chunk),
+                    legacy_output_path=chunk_legacy_output_path,
+                    actor=_compile_piece_actor(compiler_actor, f"piece-{idx}"),
+                )
+                intermediate_text, injected_slugs = _inject_missing_sf_markers(
+                    intermediate_text,
+                    expected_slugs=expected & real_slugs,
+                )
+                if injected_slugs:
+                    logger.warning(
+                        "compile %s-chunk-%d (stage=cluster-%d): normalized "
+                        "header-form provenance into <!-- SF: --> markers "
+                        "for %s (compiler omitted the comment form)",
+                        artifact_prefix,
+                        idx,
+                        idx,
+                        injected_slugs,
+                    )
+                    chunk_output_path.write_text(
+                        intermediate_text, encoding="utf-8"
+                    )
+                # Per-cluster completeness guard — identical to the
+                # sequential body: runs on EVERY parallel piece, so a piece
+                # that lost content fails loud before it can reach the tail.
+                _assert_compile_complete(
+                    sources_text=chunk_src_text,
+                    compiled_text=intermediate_text,
+                    artifact_prefix=f"{artifact_prefix}-chunk-{idx}",
+                    stage_label=f"cluster-{idx}",
+                    expected_slugs=expected,
+                    real_slugs=real_slugs,
+                )
+                if incremental_compile and deterministic_final_merge:
+                    await runner.artifacts.put(
+                        f"compile-piece:{artifact_prefix}-chunk-{idx}:"
+                        f"{cluster_piece_slug}:{cluster_src_digest}",
+                        "complete",
+                        feature=feature,
+                    )
+            return intermediate_text
+
+        sequential_chunks = chunks
+        if parallel_enabled and len(chunks) > 1:
+            chunks = _coarsen_chunks_for_parallel(chunks)
+            concurrency = _compile_concurrency()
+            logger.info(
+                "compile %s: dispatching %d cluster piece(s) in parallel "
+                "(concurrency %d)",
+                artifact_prefix,
+                len(chunks),
+                concurrency,
+            )
+            cluster_texts = await _compile_parallel_gather(
+                labels=[
+                    f"{artifact_prefix}-cluster-{i}"
+                    for i in range(1, len(chunks) + 1)
+                ],
+                coros=[
+                    _compile_cluster_piece_parallel(i, c)
+                    for i, c in enumerate(chunks, start=1)
+                ],
+                concurrency=concurrency,
+            )
+            for idx, intermediate_text in enumerate(cluster_texts, start=1):
+                intermediate_sources.append(
+                    (
+                        type(
+                            "Intermediate",
+                            (),
+                            {"name": f"Cluster {idx}", "slug": f"cluster-{idx}"},
+                        )(),
+                        intermediate_text,
+                    )
+                )
+            sequential_chunks = []  # parallel path handled every piece
+
+        for idx, chunk in enumerate(sequential_chunks, start=1):
             chunk_sources_path = feature_dir / f"compile-sources-{artifact_prefix}-chunk-{idx}.md"
             chunk_output_name = f"compile-intermediate-{artifact_prefix}-chunk-{idx}.md"
             chunk_output_path = scratch_dir / chunk_output_name
@@ -3173,7 +3625,144 @@ async def compile_artifacts(
                 _acc += _max_local_cmp(_b_text)
 
             bundle_outputs: list[str] = []
-            for b_idx, (b_obj, b_text) in enumerate(final_sources, start=1):
+
+            # ── PARALLEL per-bundle re-emit (flag-gated; sequential loop
+            # below is the untouched default).  The offset precompute above
+            # made every bundle's global offset known up front, so the
+            # re-emits are fully order-independent: they can run under a
+            # bounded gather in any order and the deterministic concat
+            # re-imposes the canonical Part-1..n order.  Each piece keeps
+            # the same reuse slot + per-bundle backstop guard as the
+            # sequential body and uses a distinct-named actor copy.
+            async def _reemit_bundle_piece_parallel(
+                b_idx: int, b_text: str
+            ) -> str:
+                bundle_src_path = (
+                    feature_dir
+                    / f"compile-sources-{artifact_prefix}-finalbundle-{b_idx}.md"
+                )
+                bundle_out_name = (
+                    f"compile-intermediate-{artifact_prefix}-finalbundle-{b_idx}.md"
+                )
+                bundle_out_path = scratch_dir / bundle_out_name
+                bundle_legacy_out_path = feature_dir / bundle_out_name
+                bundle_src_path.write_text(b_text, encoding="utf-8")
+                running_offset = bundle_offsets[b_idx - 1]
+
+                bundle_src_digest = ""
+                bundle_piece_slug = ""
+                bundle_compiled = None
+                if incremental_compile:  # deterministic path implied here
+                    bundle_member_slugs = sorted(
+                        _distinct_sf_markers(b_text) & real_slugs
+                    )
+                    bundle_src_digest = _final_bundle_piece_digest(
+                        artifact_prefix=artifact_prefix,
+                        bundle_text=b_text,
+                        offset=running_offset,
+                    )
+                    bundle_piece_slug = _final_bundle_piece_slug(
+                        bundle_member_slugs
+                    )
+                    bundle_compiled = await _compile_piece_reuse(
+                        runner,
+                        feature,
+                        artifact_prefix=f"{artifact_prefix}-finalbundle-{b_idx}",
+                        piece_slug=bundle_piece_slug,
+                        src_digest=bundle_src_digest,
+                        output_path=_reuse_probe_path(
+                            bundle_out_path, bundle_legacy_out_path
+                        ),
+                        sources_text=b_text,
+                        stage_label=f"final-bundle-{b_idx}",
+                        real_slugs=real_slugs,
+                        expected_slugs=None,  # b_text carries <!-- SF: --> markers
+                    )
+
+                if bundle_compiled is None:  # cache miss → re-emit this piece
+                    await runner.run(
+                        Ask(
+                            actor=_compile_piece_actor(
+                                compiler_actor, f"piece-{b_idx}"
+                            ),
+                            prompt=(
+                                f"You are assembling part {b_idx} of {len(final_sources)} "
+                                f"of the final unified {artifact_prefix} document.\n\n"
+                                f"This bundle (`{bundle_src_path}`) is an ALREADY-MERGED, "
+                                "non-overlapping intermediate. Re-emit it VERBATIM and IN "
+                                "FULL — preserve every section, component, journey, "
+                                "decision, gap, state, and citation. Do NOT summarize, "
+                                "drop, or stub anything.\n\n"
+                                "ID renumbering (deterministic global sequence):\n"
+                                f"- Add a GLOBAL OFFSET of +{running_offset} to every "
+                                "LOCAL `CMP-n` id that THIS bundle OWNS "
+                                f"(so this bundle's CMP-1 becomes CMP-{running_offset + 1}, "
+                                "etc.). Handle singles, `/`-groups (`CMP-7/8`), and "
+                                "`..`-ranges (`CMP-1..13`).\n"
+                                "- Do NOT offset CROSS-BUNDLE references to components "
+                                "OWNED BY ANOTHER bundle — those are written with an owning "
+                                "subfeature prefix (e.g. `S2 CMP-17`, `S4 CMP-8`) in this "
+                                "bundle's crosswalk. Leave every such cross-bundle "
+                                "reference EXACTLY as written.\n"
+                                "- Preserve all `<!-- SF: {slug} -->` provenance markers.\n\n"
+                                f"**Read the bundle from:** `{bundle_src_path}`\n"
+                                f"**Write the renumbered bundle (bodies only, no global "
+                                f"document frame/preamble) to:** `{bundle_out_path}`\n"
+                            ),
+                        ),
+                        feature,
+                        phase_name=phase_name,
+                    )
+                    bundle_compiled = _read_compile_output(
+                        bundle_out_path,
+                        bundle_legacy_out_path,
+                        stage_label=f"final-bundle-{b_idx}",
+                    )
+                    # Per-bundle backstop — identical to the sequential body.
+                    _assert_compile_complete(
+                        sources_text=b_text,
+                        compiled_text=bundle_compiled,
+                        artifact_prefix=f"{artifact_prefix}-finalbundle-{b_idx}",
+                        stage_label=f"final-bundle-{b_idx}",
+                        real_slugs=real_slugs,
+                    )
+                    if incremental_compile:
+                        await runner.artifacts.put(
+                            f"compile-piece:{artifact_prefix}-finalbundle-{b_idx}:"
+                            f"{bundle_piece_slug}:{bundle_src_digest}",
+                            "complete",
+                            feature=feature,
+                        )
+                return bundle_compiled
+
+            sequential_final_sources = list(enumerate(final_sources, start=1))
+            if parallel_enabled and len(final_sources) > 1:
+                concurrency = _compile_concurrency()
+                logger.info(
+                    "compile %s: dispatching %d final-bundle re-emit(s) in "
+                    "parallel (concurrency %d)",
+                    artifact_prefix,
+                    len(final_sources),
+                    concurrency,
+                )
+                bundle_outputs = list(
+                    await _compile_parallel_gather(
+                        labels=[
+                            f"{artifact_prefix}-finalbundle-{i}"
+                            for i in range(1, len(final_sources) + 1)
+                        ],
+                        coros=[
+                            _reemit_bundle_piece_parallel(i, b_text)
+                            for i, (_b_obj, b_text) in enumerate(
+                                final_sources, start=1
+                            )
+                        ],
+                        concurrency=concurrency,
+                    )
+                )
+                sequential_final_sources = []  # parallel path handled every piece
+
+            for b_idx, (b_obj, b_text) in sequential_final_sources:
                 bundle_src_path = (
                     feature_dir
                     / f"compile-sources-{artifact_prefix}-finalbundle-{b_idx}.md"

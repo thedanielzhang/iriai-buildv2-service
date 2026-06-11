@@ -13973,6 +13973,376 @@ async def test_legacy_callers_unchanged_when_flag_off(monkeypatch, tmp_path):
     assert out_on == out_off
 
 
+# ── Parallel compile (flag-gated) — design §4.3/§5 ───────────────────────
+
+
+def _record_compile_actor_names(runner):
+    """Wrap ``runner.run`` to record each dispatched task's actor name."""
+    actor_names: list[str] = []
+    orig = runner.run
+
+    async def _wrapped(task, feature, phase_name):
+        actor_names.append(getattr(getattr(task, "actor", None), "name", ""))
+        return await orig(task, feature, phase_name)
+
+    runner.run = _wrapped
+    return actor_names
+
+
+def _instrument_compile_concurrency(runner, delay=0.02):
+    """Wrap ``runner.run`` to track peak in-flight concurrent compile calls."""
+    import asyncio
+
+    state = {"inflight": 0, "peak": 0}
+    orig = runner.run
+
+    async def _wrapped(task, feature, phase_name):
+        state["inflight"] += 1
+        state["peak"] = max(state["peak"], state["inflight"])
+        try:
+            await asyncio.sleep(delay)
+            return await orig(task, feature, phase_name)
+        finally:
+            state["inflight"] -= 1
+
+    runner.run = _wrapped
+    return state
+
+
+def test_compile_parallel_enabled_env(monkeypatch):
+    """Operator env switch: default OFF; common truthy spellings turn it on."""
+    from iriai_build_v2.workflows._common._helpers import _compile_parallel_enabled
+
+    monkeypatch.delenv("IRIAI_COMPILE_PARALLEL", raising=False)
+    assert _compile_parallel_enabled() is False
+    for truthy in ("1", "true", "TRUE", "yes", "on"):
+        monkeypatch.setenv("IRIAI_COMPILE_PARALLEL", truthy)
+        assert _compile_parallel_enabled() is True
+    for falsy in ("0", "false", "off", "", "  "):
+        monkeypatch.setenv("IRIAI_COMPILE_PARALLEL", falsy)
+        assert _compile_parallel_enabled() is False
+
+
+def test_compile_concurrency_env_parsing(monkeypatch):
+    """Concurrency cap: conservative default, env-overridable, hard-clamped."""
+    from iriai_build_v2.workflows._common._helpers import _compile_concurrency
+
+    monkeypatch.delenv("IRIAI_COMPILE_CONCURRENCY", raising=False)
+    assert _compile_concurrency() == 2  # conservative default (design §5.3)
+    monkeypatch.setenv("IRIAI_COMPILE_CONCURRENCY", "4")
+    assert _compile_concurrency() == 4
+    monkeypatch.setenv("IRIAI_COMPILE_CONCURRENCY", "0")
+    assert _compile_concurrency() == 1  # clamped to minimum
+    monkeypatch.setenv("IRIAI_COMPILE_CONCURRENCY", "99")
+    assert _compile_concurrency() == 8  # clamped to the hard cap
+    monkeypatch.setenv("IRIAI_COMPILE_CONCURRENCY", "junk")
+    assert _compile_concurrency() == 2  # unparseable → default
+
+
+def test_compile_piece_actor_derivation():
+    """Per-piece actor: distinct name (unique session_key), SAME Role object,
+    concrete actor subclass preserved, original actor untouched."""
+    from iriai_build_v2.workflows._common._helpers import _compile_piece_actor
+
+    piece = _compile_piece_actor(lead_architect_reviewer, "piece-3")
+    assert piece.name == f"{lead_architect_reviewer.name}-piece-3"
+    assert piece.role is lead_architect_reviewer.role
+    assert type(piece) is type(lead_architect_reviewer)
+    assert piece.context_keys == lead_architect_reviewer.context_keys
+    # Original untouched (model_copy, not mutation).
+    assert lead_architect_reviewer.name == "lead-architect-reviewer"
+
+    # Defensive fallback for a non-pydantic actor object.
+    plain = SimpleNamespace(
+        name="fake-compiler",
+        role=lead_architect_reviewer.role,
+        context_keys=["project"],
+    )
+    piece2 = _compile_piece_actor(plain, "piece-1")
+    assert piece2.name == "fake-compiler-piece-1"
+    assert piece2.role is lead_architect_reviewer.role
+
+
+def test_coarsen_chunks_max_pieces_cap():
+    """§4.3 guardrail: never more than ``max_pieces`` pieces — extra chunks
+    are MERGED (coarsened), and the member set/order is preserved exactly
+    (task-set preservation, fail-closed)."""
+    from iriai_build_v2.workflows._common._helpers import (
+        _coarsen_chunks_for_parallel,
+    )
+
+    chunks = [
+        [(SimpleNamespace(slug=f"sf-{i}"), f"body {i}\n" * (i + 1))]
+        for i in range(10)
+    ]
+    out = _coarsen_chunks_for_parallel(chunks, max_pieces=8, cross_ref_max=8)
+    assert len(out) == 8
+    flattened = [s.slug for chunk in out for s, _t in chunk]
+    assert flattened == [f"sf-{i}" for i in range(10)]  # nothing lost/reordered
+
+
+def test_coarsen_chunks_cross_ref_density_merges_offenders():
+    """§4.3 guardrail: clusters exchanging more than the threshold of
+    cross-cluster ``Sx CMP-n`` refs are merged so the refs become
+    intra-cluster; under-threshold pairs are left alone."""
+    from iriai_build_v2.workflows._common._helpers import (
+        _coarsen_chunks_for_parallel,
+        _cross_ref_owner_chunk,
+    )
+
+    heavy_refs = "see S1 CMP-3 and S1 CMP-4\n" * 5  # 10 refs to s1-core
+    chunks = [
+        [(SimpleNamespace(slug="s1-core"), "#### A (CMP-1)\n")],
+        [(SimpleNamespace(slug="s2-ui"), "#### B (CMP-1)\n" + heavy_refs)],
+        [(SimpleNamespace(slug="s3-api"), "#### C (CMP-1)\nno refs\n")],
+    ]
+    out = _coarsen_chunks_for_parallel(chunks, max_pieces=8, cross_ref_max=8)
+    assert len(out) == 2  # s1-core + s2-ui merged; s3-api untouched
+    assert [s.slug for s, _t in out[0]] == ["s1-core", "s2-ui"]
+    assert [s.slug for s, _t in out[1]] == ["s3-api"]
+
+    # Below the threshold → no merge.
+    light = [
+        [(SimpleNamespace(slug="s1-core"), "#### A (CMP-1)\n")],
+        [(SimpleNamespace(slug="s2-ui"), "#### B (CMP-1)\nsee S1 CMP-3\n")],
+    ]
+    assert len(_coarsen_chunks_for_parallel(light, max_pieces=8, cross_ref_max=8)) == 2
+
+    # The density regex maps letter-suffixed prefixes (S3a) — the known
+    # offset-regex gap does NOT apply to the coarsening measurement.
+    assert _cross_ref_owner_chunk("S3a", {"s3a-foo": 2, "s3-bar": 1}) == 2
+    assert _cross_ref_owner_chunk("S3", {"s3a-foo": 2, "s3-bar": 1}) == 1
+    assert _cross_ref_owner_chunk("S9", {"s3a-foo": 2}) is None
+
+
+@pytest.mark.asyncio
+async def test_compile_parallel_gather_unit():
+    """§5.3/§5.4: gather preserves input order, bounds concurrency with a
+    semaphore, and composes per-piece failures into one error naming every
+    failed piece."""
+    import asyncio
+
+    from iriai_build_v2.workflows._common._helpers import (
+        _compile_parallel_gather,
+    )
+
+    state = {"inflight": 0, "peak": 0}
+
+    async def _piece(i):
+        state["inflight"] += 1
+        state["peak"] = max(state["peak"], state["inflight"])
+        await asyncio.sleep(0.01)
+        state["inflight"] -= 1
+        return i
+
+    results = await _compile_parallel_gather(
+        labels=[f"p{i}" for i in range(5)],
+        coros=[_piece(i) for i in range(5)],
+        concurrency=2,
+    )
+    assert results == [0, 1, 2, 3, 4]
+    assert state["peak"] == 2  # bounded AND actually concurrent
+
+    async def _boom(label):
+        raise RuntimeError(f"guard failed {label}")
+
+    async def _ok():
+        return "ok"
+
+    with pytest.raises(RuntimeError) as excinfo:
+        await _compile_parallel_gather(
+            labels=["a", "b", "c"],
+            coros=[_boom("a"), _ok(), _boom("c")],
+            concurrency=2,
+        )
+    msg = str(excinfo.value)
+    assert "2/3" in msg
+    assert "a: guard failed a" in msg
+    assert "c: guard failed c" in msg
+
+
+@pytest.mark.asyncio
+async def test_parallel_compile_produces_identical_output_and_distinct_actors(
+    monkeypatch, tmp_path
+):
+    """The parallel path (param-gated here) produces BYTE-IDENTICAL output to
+    the sequential default, and every concurrent piece runs under a
+    distinct-named actor copy (parallel safety: unique session_key)."""
+    monkeypatch.setattr(
+        "iriai_build_v2.workflows._common._helpers.COMPILE_HIERARCHICAL_THRESHOLD", 500
+    )
+    monkeypatch.setattr(
+        "iriai_build_v2.workflows._common._helpers.COMPILE_CLUSTER_TARGET_BYTES", 300
+    )
+
+    # Sequential baseline (separate scratch so the parallel run cannot reuse).
+    monkeypatch.setenv(
+        "IRIAI_COMPILE_INTERMEDIATE_DIR", str(tmp_path / "scratch-seq")
+    )
+    feat_a, decomp_a, runner_a, calls_a = _build_incremental_compile_runner(
+        tmp_path / "seq"
+    )
+    names_a = _record_compile_actor_names(runner_a)
+    out_seq = await _run_incremental_compile(feat_a, decomp_a, runner_a)
+    assert calls_a
+    # Sequential default: every call uses the single shared compiler actor.
+    assert all(n == "lead-architect-reviewer" for n in names_a), names_a
+
+    # Parallel run (explicit param opt-in; env left unset).
+    monkeypatch.setenv(
+        "IRIAI_COMPILE_INTERMEDIATE_DIR", str(tmp_path / "scratch-par")
+    )
+    feat_b, decomp_b, runner_b, calls_b = _build_incremental_compile_runner(
+        tmp_path / "par"
+    )
+    names_b = _record_compile_actor_names(runner_b)
+    out_par = await compile_artifacts(
+        runner_b,
+        feat_b,
+        "plan-review",
+        compiler_actor=lead_architect_reviewer,
+        decomposition=decomp_b,
+        artifact_prefix="plan",
+        broad_key="plan:broad",
+        final_key="plan",
+        deterministic_final_merge=True,
+        incremental_compile=True,
+        parallel_compile=True,
+    )
+
+    assert out_par == out_seq  # byte-identical compiled artifact
+    assert len(calls_b) == len(calls_a)  # same piece set compiled
+    # Every parallel piece used a distinct-named per-piece actor copy
+    # (4 clusters + 4 bundles → piece-1..4 used once per stage).
+    assert all("-piece-" in n for n in names_b), names_b
+    assert len(set(names_b)) == 4
+    assert len(names_b) == 8
+
+
+@pytest.mark.asyncio
+async def test_parallel_compile_bounds_concurrency(monkeypatch, tmp_path):
+    """Peak in-flight compile calls never exceed IRIAI_COMPILE_CONCURRENCY,
+    and with more pieces than the cap the dispatch is actually concurrent
+    (peak == cap, not 1)."""
+    monkeypatch.setattr(
+        "iriai_build_v2.workflows._common._helpers.COMPILE_HIERARCHICAL_THRESHOLD", 500
+    )
+    monkeypatch.setattr(
+        "iriai_build_v2.workflows._common._helpers.COMPILE_CLUSTER_TARGET_BYTES", 300
+    )
+    monkeypatch.setenv("IRIAI_COMPILE_PARALLEL", "1")
+    monkeypatch.setenv("IRIAI_COMPILE_CONCURRENCY", "2")
+
+    feature, decomposition, runner, calls = _build_incremental_compile_runner(
+        tmp_path
+    )
+    state = _instrument_compile_concurrency(runner)
+    await _run_incremental_compile(feature, decomposition, runner)
+
+    assert calls  # pieces were compiled
+    assert state["peak"] == 2, state
+
+
+@pytest.mark.asyncio
+async def test_parallel_compile_composed_error_names_failed_piece(
+    monkeypatch, tmp_path
+):
+    """One piece's guard failure surfaces as a composed parallel-compile
+    error NAMING the failed piece — never an opaque gather crash, never a
+    silently-poisoned concat."""
+    monkeypatch.setattr(
+        "iriai_build_v2.workflows._common._helpers.COMPILE_HIERARCHICAL_THRESHOLD", 500
+    )
+    monkeypatch.setattr(
+        "iriai_build_v2.workflows._common._helpers.COMPILE_CLUSTER_TARGET_BYTES", 300
+    )
+    monkeypatch.setenv("IRIAI_COMPILE_PARALLEL", "1")
+
+    feature, decomposition, runner, _calls = _build_incremental_compile_runner(
+        tmp_path
+    )
+    orig = runner.run
+
+    async def _sabotage_cluster_2(task, feature_, phase_name):
+        res = await orig(task, feature_, phase_name)
+        if "Stage: cluster-2" in task.prompt:
+            paths = re.findall(r"`([^`]+)`", task.prompt)
+            out = Path(paths[-1])
+            # Drop every SF provenance marker → the per-piece guard must fail.
+            out.write_text(
+                re.sub(r"<!--\s*SF:[^>]*-->\n?", "", out.read_text(encoding="utf-8")),
+                encoding="utf-8",
+            )
+        return res
+
+    runner.run = _sabotage_cluster_2
+
+    with pytest.raises(RuntimeError) as excinfo:
+        await _run_incremental_compile(feature, decomposition, runner)
+    msg = str(excinfo.value)
+    assert "Parallel compile" in msg
+    assert "plan-cluster-2" in msg
+
+
+@pytest.mark.asyncio
+async def test_parallel_compile_composes_with_piece_reuse(monkeypatch, tmp_path):
+    """Parallelism + resumability compose (design §6.3 driver 3): a second
+    parallel run over unchanged sources reuses every piece (zero LLM calls)
+    and re-runs only the deterministic concat — identical output."""
+    monkeypatch.setattr(
+        "iriai_build_v2.workflows._common._helpers.COMPILE_HIERARCHICAL_THRESHOLD", 500
+    )
+    monkeypatch.setattr(
+        "iriai_build_v2.workflows._common._helpers.COMPILE_CLUSTER_TARGET_BYTES", 300
+    )
+    monkeypatch.setenv("IRIAI_COMPILE_PARALLEL", "1")
+
+    feature, decomposition, runner, calls = _build_incremental_compile_runner(
+        tmp_path
+    )
+    first = await _run_incremental_compile(feature, decomposition, runner)
+    assert calls
+
+    calls.clear()
+    second = await _run_incremental_compile(feature, decomposition, runner)
+    assert calls == [], f"expected zero LLM calls on parallel reuse, got {calls}"
+    assert second == first
+
+
+@pytest.mark.asyncio
+async def test_parallel_env_flag_inert_without_deterministic_merge(
+    monkeypatch, tmp_path
+):
+    """Gating: the parallel flag only applies to the deterministic path —
+    with ``deterministic_final_merge=False`` (legacy pm/design path) even an
+    enabled env flag changes NOTHING (sequential, shared actor)."""
+    monkeypatch.setattr(
+        "iriai_build_v2.workflows._common._helpers.COMPILE_HIERARCHICAL_THRESHOLD", 500
+    )
+    monkeypatch.setattr(
+        "iriai_build_v2.workflows._common._helpers.COMPILE_CLUSTER_TARGET_BYTES", 300
+    )
+    monkeypatch.setenv("IRIAI_COMPILE_PARALLEL", "1")
+
+    feature, decomposition, runner, calls = _build_incremental_compile_runner(
+        tmp_path
+    )
+    names = _record_compile_actor_names(runner)
+    await compile_artifacts(
+        runner,
+        feature,
+        "plan-review",
+        compiler_actor=lead_architect_reviewer,
+        decomposition=decomposition,
+        artifact_prefix="plan",
+        broad_key="plan:broad",
+        final_key="plan",
+        # deterministic_final_merge defaults False — legacy path.
+    )
+    assert calls
+    assert all("-piece-" not in n for n in names), names
+
+
 @pytest.mark.asyncio
 async def test_broad_reconciliation_revisions_apply_in_fixed_order(monkeypatch):
     state = BuildState()
