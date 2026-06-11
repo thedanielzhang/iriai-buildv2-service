@@ -586,8 +586,7 @@ def apply_path_resolution(
                         # unrelated same-basename files elsewhere on disk do not
                         # make a verbatim planned-path citation ambiguous. It is
                         # never an edit target — leave the path untouched
-                        # (non-fatal pointer). Modify scopes keep the
-                        # never-guess rule below.
+                        # (non-fatal pointer).
                         logger.warning(
                             "DAG path resolver backstop: %s:%s=%r is a read-only "
                             "reference exactly matching a planned NEW file created "
@@ -596,14 +595,25 @@ def apply_path_resolution(
                             d.task_id, d.field, d.original,
                         )
                         continue
+                    # MODIFY-class exact-planned-match: the same exact-path
+                    # argument applies — the multi-segment citation matches a
+                    # planned create verbatim and nothing exists AT that path
+                    # (the prepass established non-existence), so same-basename
+                    # files elsewhere are not plausible referents. The old
+                    # zero-basename-match demand structurally refused every
+                    # generic filename (S1's models __init__.py: an upstream-
+                    # planned hotspot every SF appends to could NEVER pass —
+                    # resume54 round-3 block). Paths NOT in the planned set
+                    # keep the never-guess rule unchanged.
                     logger.warning(
-                        "DAG path resolver backstop: %s:%s=%r matches a planned "
-                        "NEW file but same-basename files exist on disk — "
-                        "keeping ambiguous (never guess between an existing "
-                        "file and a planned one)",
+                        "DAG path resolver backstop: %s:%s=%r exactly matches a "
+                        "planned NEW file (same-basename files exist elsewhere, "
+                        "but nothing exists at the cited path itself) — "
+                        "auto-converting ambiguous -> create_ok (path left "
+                        "untouched)",
                         d.task_id, d.field, d.original,
                     )
-                    genuinely_ambiguous.append(d)
+                    d.decision = "create_ok"
                     continue
             logger.warning(
                 "DAG path resolver backstop: %s:%s=%r is a planned NEW file "

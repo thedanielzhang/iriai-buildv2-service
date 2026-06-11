@@ -5635,8 +5635,14 @@ class TaskPlanningPhase(Phase):
             return planned
         for subfeature in getattr(decomposition, "subfeatures", []) or []:
             slug = getattr(subfeature, "slug", "")
-            if not slug or slug == exclude_slug:
+            if not slug:
                 continue
+            # The CURRENT slug is included deliberately: sibling SLICES of the
+            # same subfeature create files later slices modify (S3a slice-1
+            # creates internal_review_service.py, slice-3 modifies it —
+            # resume54 round-3 block), and planned_new_file_paths(dag) only
+            # sees the CURRENT fragment. Persisted sibling fragments fill the
+            # gap; the current fragment's own creates dedupe harmlessly.
             try:
                 manifest = await cls._load_slice_manifest(runner, feature, slug)
             except Exception:

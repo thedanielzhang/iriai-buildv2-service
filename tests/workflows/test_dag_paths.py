@@ -390,10 +390,13 @@ def test_backstop_create_class_phantom_parent_still_raises():
         apply_path_resolution(dag, res, repos_root="/repos", exists=lambda p: False)
 
 
-def test_backstop_modify_class_with_basename_matches_still_raises():
-    # global-setup.ts TRUE-ambiguity subcase: a MODIFY entry whose path matches
-    # a planned-new file but with 3 same-basename files on disk must STILL
-    # flag — never guess between an existing file and a planned one.
+def test_backstop_modify_class_with_basename_matches_converts_for_exact_planned_match():
+    # N-13 (supersedes the never-guess reading for EXACT planned matches): a
+    # MODIFY citing the verbatim multi-segment path of a planned-new file
+    # converts even with same-basename files elsewhere — nothing exists AT
+    # the cited path, so other files are not plausible referents. Generic
+    # basenames (S1's models __init__.py appender hotspot) could never pass
+    # a zero-match demand.
     dag = _dag(
         _task("C", file_scope=[(E2E_SETUP, "create")], repo_path=""),
         _task("M", file_scope=[(E2E_SETUP, "modify")], repo_path=""),
@@ -401,13 +404,13 @@ def test_backstop_modify_class_with_basename_matches_still_raises():
     res = DagPathResolution(
         decisions=[_ambiguous("M", "file_scope[0].path", E2E_SETUP)], ambiguous_count=1,
     )
-    with pytest.raises(AmbiguousDagPath) as exc_info:
-        apply_path_resolution(
-            dag, res, repos_root="/repos",
-            exists=lambda p: p == "/repos/spend-client",
-            find_basename_matches=lambda name: 3,
-        )
-    assert E2E_SETUP in str(exc_info.value)
+    apply_path_resolution(
+        dag, res, repos_root="/repos",
+        exists=lambda p: p == "/repos/spend-client",
+        find_basename_matches=lambda name: 3,
+    )
+    assert res.decisions[0].decision == "create_ok"
+    assert dag.tasks[1].file_scope[0].path == E2E_SETUP
 
 
 def test_backstop_modify_class_zero_basename_matches_converts():
@@ -481,18 +484,31 @@ def test_backstop_extra_planned_grounds_cross_subfeature_modify():
     assert res.decisions[0].decision == "create_ok"
 
 
-def test_backstop_extra_planned_modify_with_basename_matches_still_raises():
-    # The never-guess rule survives extra_planned: existing same-basename
-    # files on disk keep a cross-SF modify ambiguous.
+def test_backstop_extra_planned_modify_with_basename_matches_converts():
+    # N-13: exact cross-SF planned match converts despite same-basename files
+    # elsewhere (the cited path itself does not exist — prepass-established).
     dag = _dag(_task("M", file_scope=[(CANON, "modify")], repo_path=""))
     res = DagPathResolution(
         decisions=[_ambiguous("M", "file_scope[0].path", CANON)], ambiguous_count=1,
+    )
+    apply_path_resolution(
+        dag, res, repos_root="/repos", exists=lambda p: False,
+        find_basename_matches=lambda name: 2,
+        extra_planned={CANON},
+    )
+    assert res.decisions[0].decision == "create_ok"
+
+
+def test_backstop_unplanned_modify_with_basename_matches_still_raises():
+    # The never-guess rule is UNCHANGED for paths not in any planned set.
+    dag = _dag(_task("M", file_scope=[(PHANTOM, "modify")], repo_path=""))
+    res = DagPathResolution(
+        decisions=[_ambiguous("M", "file_scope[0].path", PHANTOM)], ambiguous_count=1,
     )
     with pytest.raises(AmbiguousDagPath):
         apply_path_resolution(
             dag, res, repos_root="/repos", exists=lambda p: False,
             find_basename_matches=lambda name: 2,
-            extra_planned={CANON},
         )
 
 
