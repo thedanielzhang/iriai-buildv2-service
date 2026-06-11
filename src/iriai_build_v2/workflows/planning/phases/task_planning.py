@@ -5654,6 +5654,16 @@ class TaskPlanningPhase(Phase):
                 try:
                     fragment_text = await runner.artifacts.get(fragment_key, feature=feature)
                     if not fragment_text:
+                        # A sibling slice whose RESOLUTION failed still leaves
+                        # its raw fragment behind — its planned creates are
+                        # real authored intent (resume55: slice-2 modifies
+                        # submittal_decision.py that failed sibling slice-1
+                        # creates; both blocked each other).
+                        fragment_text = await runner.artifacts.get(
+                            f"dag-fragment-raw:{slug}:{slice_info.slice_id}",
+                            feature=feature,
+                        )
+                    if not fragment_text:
                         continue
                     fragment = ImplementationDAG.model_validate_json(fragment_text)
                 except Exception:

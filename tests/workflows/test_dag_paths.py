@@ -499,6 +499,46 @@ def test_backstop_extra_planned_modify_with_basename_matches_converts():
     assert res.decisions[0].decision == "create_ok"
 
 
+def test_backstop_single_segment_near_miss_corrects_to_unique_planned_path():
+    # N-14: a citation one phantom segment away from exactly ONE planned path
+    # (models/knowledge/submittals/__init__.py vs the planned
+    # models/submittals/__init__.py) auto-corrects via `correct` mechanics.
+    planned = "shared_libs/kaya_db/kaya_db/models/submittals/__init__.py"
+    typo = "shared_libs/kaya_db/kaya_db/models/knowledge/submittals/__init__.py"
+    dag = _dag(
+        _task("C", file_scope=[(planned, "create")], repo_path=""),
+        _task("M", file_scope=[(typo, "modify")], repo_path=""),
+    )
+    res = DagPathResolution(
+        decisions=[_ambiguous("M", "file_scope[0].path", typo)], ambiguous_count=1,
+    )
+    corrected, rewrites = apply_path_resolution(
+        dag, res, repos_root="/repos", exists=lambda p: False,
+        find_basename_matches=lambda name: 5,
+    )
+    assert res.decisions[0].decision == "correct"
+    assert res.decisions[0].resolved == planned
+    assert corrected.tasks[1].file_scope[0].path == planned
+    assert rewrites
+
+
+def test_backstop_near_miss_with_two_candidates_stays_ambiguous():
+    typo = "a/x/b/f.py"
+    dag = _dag(
+        _task("C1", file_scope=[("a/b/f.py", "create")], repo_path=""),
+        _task("C2", file_scope=[("a/x/f.py", "create")], repo_path=""),
+        _task("M", file_scope=[(typo, "modify")], repo_path=""),
+    )
+    res = DagPathResolution(
+        decisions=[_ambiguous("M", "file_scope[0].path", typo)], ambiguous_count=1,
+    )
+    with pytest.raises(AmbiguousDagPath):
+        apply_path_resolution(
+            dag, res, repos_root="/repos", exists=lambda p: False,
+            find_basename_matches=lambda name: 0,
+        )
+
+
 def test_backstop_unplanned_modify_with_basename_matches_still_raises():
     # The never-guess rule is UNCHANGED for paths not in any planned set.
     dag = _dag(_task("M", file_scope=[(PHANTOM, "modify")], repo_path=""))

@@ -92,6 +92,30 @@ def planned_new_file_paths(dag: ImplementationDAG) -> set[str]:
     return planned
 
 
+def _single_segment_edit_match(original: str, planned: set[str]) -> str | None:
+    """The UNIQUE planned path reachable from ``original`` by removing exactly
+    one directory segment from either side, or None.
+
+    Authors occasionally insert a phantom segment into an otherwise-exact
+    planned-path citation (``models/knowledge/submittals/__init__.py`` for the
+    planned ``models/submittals/__init__.py``). A single-edit match with
+    exactly ONE candidate is deterministic; anything else stays ambiguous —
+    we never guess between candidates."""
+    def _one_removed(path: str) -> set[str]:
+        parts = path.split("/")
+        if len(parts) < 2:
+            return set()
+        return {
+            "/".join(parts[:i] + parts[i + 1:])
+            for i in range(len(parts) - 1)  # never remove the basename
+        }
+    candidates = {p for p in _one_removed(original) if p in planned}
+    candidates |= {p for p in planned if original in _one_removed(p)}
+    if len(candidates) == 1:
+        return next(iter(candidates))
+    return None
+
+
 def _entry_index(
     dag: ImplementationDAG,
 ) -> dict[tuple[str, str], tuple[str, str, str]]:
@@ -551,6 +575,30 @@ def apply_path_resolution(
                 original in planned or (joined and joined in planned)
             )
             if not in_planned:
+                # NEAR-MISS of a planned path: a citation one phantom segment
+                # away from exactly ONE planned-new file is a deterministic
+                # author typo (resume55: models/knowledge/submittals/__init__
+                # for the planned models/submittals/__init__) — rewrite via
+                # the normal `correct` mechanics. Multiple candidates stay
+                # ambiguous (never guess between candidates).
+                near_miss = _single_segment_edit_match(original, planned)
+                if near_miss is None and repo_norm:
+                    joined_guess = _single_segment_edit_match(
+                        f"{repo_norm}/{original}", planned
+                    )
+                    if joined_guess and joined_guess.startswith(repo_norm + "/"):
+                        near_miss = joined_guess[len(repo_norm) + 1:]
+                if near_miss is not None:
+                    logger.warning(
+                        "DAG path resolver backstop: %s:%s=%r is a single-"
+                        "segment near-miss of the unique planned NEW file %r — "
+                        "auto-correcting",
+                        d.task_id, d.field, d.original, near_miss,
+                    )
+                    d.decision = "correct"
+                    d.resolved = near_miss
+                    decisions[(d.task_id, d.field)] = d
+                    continue
                 # READ-ONLY-class reference pointer with ZERO on-disk basename
                 # matches: nothing exists to confuse it with and it is never an
                 # edit target — a corpus/doc citation the planner put in
