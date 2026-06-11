@@ -313,7 +313,17 @@ class ContractCompiler:
             _raise_compile("contract_invalid_task", "task id is required")
 
         repo = _resolve_task_repo(request)
-        repo_path = str(_task_attr(request.task, "repo_path", "") or repo.workspace_relative_path or repo.repo_name)
+        # N-18 fix 3: _resolve_task_repo (N-17) already ignores an absolute
+        # task.repo_path and returns the resolved repo.  But the contract field
+        # was still set from the raw task value, so the compiled contract
+        # carried e.g. "/Users/.../repos" which later fails the sandbox
+        # "repo_path mismatch" check at dispatch.  The contract's repo_path
+        # must always be the RESOLVED repo's workspace_relative_path so that
+        # _normalize_dispatch_repo_path can match it to the registry.
+        raw_task_repo_path = str(_task_attr(request.task, "repo_path", "") or "").strip()
+        if raw_task_repo_path and _is_absolute_like(raw_task_repo_path):
+            raw_task_repo_path = ""
+        repo_path = raw_task_repo_path or repo.workspace_relative_path or repo.repo_name
         context = _PathContext(
             repo=repo,
             registry=request.workspace_registry,
