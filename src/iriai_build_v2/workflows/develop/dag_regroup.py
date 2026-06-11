@@ -52,6 +52,7 @@ import re
 import statistics
 import subprocess
 import time
+import warnings
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -164,6 +165,30 @@ def _task_text(task: ImplementationTask) -> str:
     return " ".join(str(part).lower() for part in parts if part)
 
 
+def _effective_repo_path(task: ImplementationTask) -> str:
+    """Return the task's repo_path, treating absolute paths as unset (N-17 tolerance).
+
+    Absolute ``repo_path`` values (e.g. ``/Users/.../repos``) arise when the agent
+    writes the full workspace-local path instead of a bare relative name.  They are
+    invalid for path-prefixing — a ``Users/...`` top-level directory would poison the
+    cross-repo barrier and commit-risk heuristics.  Per the N-17 tolerance pattern:
+    treat absolute as unset with a loud warning so the rest of the regroup pipeline
+    degrades gracefully rather than producing corrupted write-sets.
+    """
+    raw = str(task.repo_path or "").strip()
+    if not raw:
+        return ""
+    if raw.startswith("/"):
+        warnings.warn(
+            f"task {task.id!r}: repo_path {raw!r} is absolute — treating as unset "
+            "(N-17: absolute repo_path is invalid for write-set path-prefixing; "
+            "fix the DAG task definition to use a bare relative repo name)",
+            stacklevel=4,
+        )
+        return ""
+    return raw
+
+
 def _task_paths(task: ImplementationTask) -> list[str]:
     paths: list[str] = []
     for path in task.files:
@@ -173,9 +198,43 @@ def _task_paths(task: ImplementationTask) -> list[str]:
         action = str(scope.action or "").lower()
         if action and action != "read_only" and str(scope.path).strip():
             paths.append(str(scope.path).strip())
-    if task.repo_path and paths:
-        return sorted({path if "/" in path else f"{task.repo_path}/{path}" for path in paths})
+    repo_path = _effective_repo_path(task)
+    if repo_path and paths:
+        return sorted({path if "/" in path else f"{repo_path}/{path}" for path in paths})
     return sorted(set(paths))
+
+
+def _task_write_paths_for_overlay(task: ImplementationTask) -> set[str]:
+    """Write-paths for the overlay ``write_sets``, mirroring ``_task_declared_write_paths``.
+
+    Unlike ``_task_paths`` (which is used for barrier/commit-risk heuristics and
+    must NOT add a ``Users/`` top-level variant), this helper mirrors the validator's
+    ``_task_declared_write_paths`` dual-add semantics exactly, so the builder's
+    ``write_sets`` is always a superset of what the validator expects.
+
+    Per the N-17 tolerance pattern, an absolute ``repo_path`` is treated as unset
+    (same as ``_effective_repo_path``), which means for DAGs where repo_path was
+    blanked or is absolute, the builder and validator both see zero prefix — no
+    mismatch, no step-10 reject.
+    """
+    paths: set[str] = set()
+    repo_path = _effective_repo_path(task)  # "" for absolute (N-17)
+
+    def _add(raw: str) -> None:
+        p = str(raw or "").strip()
+        if not p:
+            return
+        paths.add(p)
+        if repo_path and not p.startswith(f"{repo_path}/"):
+            paths.add(f"{repo_path}/{p.lstrip('/')}")
+
+    for path in task.files:
+        _add(path)
+    for scope in task.file_scope:
+        action = str(scope.action or "").strip().lower()
+        if action and action != "read_only":
+            _add(scope.path)
+    return paths
 
 
 def semantic_lane_for_task(task: ImplementationTask) -> str:
@@ -420,10 +479,14 @@ def build_staged_regroup(
         for group_idx, group in enumerate(original_order)
         for task_id in group
     }
+    # WB-1: use dual-add semantics (mirrors validator's _task_declared_write_paths)
+    # so write_sets is always a superset of what validate_overlay step 10 expects.
+    # Absolute repo_path is treated as unset per the N-17 tolerance pattern —
+    # _task_paths is NOT changed (it drives barrier/commit-risk heuristics).
     write_sets = {
-        task_id: _task_paths(task)
+        task_id: sorted(_task_write_paths_for_overlay(task))
         for task_id, task in tasks_by_id.items()
-        if _task_paths(task)
+        if _task_write_paths_for_overlay(task)
     }
     remaining_dependencies = {
         task_id: set(_dependencies_within_remaining(task, remaining_ids))
@@ -773,6 +836,7 @@ def derived_artifact_to_regroup_overlay(
     # point, exactly as the 09c-1 activation test's ``_valid_overlay`` does it.
     from .execution.regroup_overlay_validation import (
         _canonical_overlay_sha,
+        _normalize_overlay,
         _task_definition_fingerprint,
     )
 
@@ -987,17 +1051,20 @@ def derived_artifact_to_regroup_overlay(
         overlay_sha256=_SHA_PLACEHOLDER,
         validation_digest=_SHA_PLACEHOLDER,
     )
-    # Stamp the canonical overlay sha — it is a single-pass fixed point because
-    # ``_canonical_overlay_sha`` excludes both ``overlay_sha256`` and
-    # ``activation_contract.required_overlay_sha256`` from the hashed body. The
-    # contract's ``required_overlay_sha256`` is set to the same value so step 11
-    # of ``validate_overlay`` (``required_overlay_sha256 == overlay_sha256``)
-    # passes. ``validation_digest`` stays the placeholder.
-    canonical_sha = _canonical_overlay_sha(draft_overlay)
-    return draft_overlay.model_copy(
+    # WB-2: normalize BEFORE stamping the canonical sha so that the sha matches
+    # what validate_overlay step 1 will compute.  The builder orders waves by
+    # sort_key; _normalize_overlay re-sorts within-wave task ids lexicographically
+    # and is idempotent — running it here makes the sha a normalization fixed-point
+    # so step 11 (required_overlay_sha256 == overlay_sha256 after re-normalizing)
+    # passes.  The placeholder overlay_sha256 / required_overlay_sha256 are
+    # excluded from the hashed body so this is still a single-pass fixed point.
+    normalized_overlay = _normalize_overlay(draft_overlay)
+    # _normalize_overlay already recomputes and stamps overlay_sha256; extract it
+    # and set the required_overlay_sha256 self-reference to the same value.
+    canonical_sha = normalized_overlay.overlay_sha256
+    return normalized_overlay.model_copy(
         update={
-            "overlay_sha256": canonical_sha,
-            "activation_contract": activation_contract.model_copy(
+            "activation_contract": normalized_overlay.activation_contract.model_copy(
                 update={"required_overlay_sha256": canonical_sha}
             ),
         }

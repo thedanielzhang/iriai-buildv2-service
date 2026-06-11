@@ -60,6 +60,7 @@ The 13 steps (doc 09 § "Validation Algorithm", numbered exactly):
 
 from __future__ import annotations
 
+import warnings
 from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, Field
@@ -1092,10 +1093,27 @@ def _task_declared_write_paths(task: ImplementationTask) -> set[str]:
     ``files`` plus every non-``read_only`` ``file_scope`` path, and for each, a
     ``repo_path``-prefixed variant when the task carries a ``repo_path``. Read
     paths do not contribute (they are not authoritative *writes*).
+
+    N-17 tolerance: an absolute ``repo_path`` (starts with ``/``) is treated as
+    unset with a loud warning — absolute paths arise when the agent writes the
+    full workspace-local path instead of a bare relative repo name and would
+    produce a ``Users/…`` top-level directory as a path prefix, corrupting the
+    write-set.  Treating absolute as unset degrades gracefully: the builder's
+    ``_task_write_paths_for_overlay`` applies the same rule, so both sides see
+    zero prefix and step-10 cannot reject on a spurious missing prefix variant.
     """
 
     paths: set[str] = set()
-    repo_path = str(task.repo_path or "").strip().strip("/")
+    raw_repo = str(task.repo_path or "").strip()
+    if raw_repo.startswith("/"):
+        warnings.warn(
+            f"task {task.id!r}: repo_path {raw_repo!r} is absolute — treating as "
+            "unset for write-set computation (N-17: fix the DAG task definition to "
+            "use a bare relative repo name)",
+            stacklevel=3,
+        )
+        raw_repo = ""
+    repo_path = raw_repo.strip("/")
 
     def _add(raw: str) -> None:
         path = str(raw or "").strip()
