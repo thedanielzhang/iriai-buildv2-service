@@ -14,6 +14,7 @@ import asyncpg
 import pytest
 import pytest_asyncio
 
+from iriai_build_v2.execution_control.atomic_landing import InFlightAdoptionRecord
 from iriai_build_v2.models.outputs import ImplementationDAG, ImplementationResult, ImplementationTask
 from iriai_build_v2.workflows.develop import dag_regroup
 from iriai_build_v2.workflows.develop.phases import implementation as implementation_module
@@ -21,6 +22,41 @@ from iriai_build_v2.workflows.develop.phases import implementation as implementa
 
 def _empty_groups(count: int) -> list[list[str]]:
     return [[] for _ in range(count)]
+
+
+def _strict_adoption_marker(
+    feature,
+    *,
+    completed_range: tuple[int, int],
+    next_group: int,
+) -> str:
+    """A valid execution-control adoption marker body for resume fixtures.
+
+    The strict resume guard (``_execution_control_adoption_record_for_resume``,
+    src/iriai_build_v2/workflows/develop/phases/implementation.py:2510) refuses
+    to dispatch any feature with existing ``dag-group:*`` checkpoint state
+    unless the artifact ``execution-control-adoption:{feature_id}`` holds a
+    valid ``InFlightAdoptionRecord``. This mirrors the production writer
+    ``adopt_in_flight_feature`` (src/iriai_build_v2/execution_control/
+    adoption.py:348-372), which constructs an ``InFlightAdoptionRecord``
+    (src/iriai_build_v2/execution_control/atomic_landing.py:742) and persists
+    ``record.model_dump_json()`` under ``adoption_marker_artifact_key``
+    (src/iriai_build_v2/execution_control/adoption.py:156 →
+    ``execution-control-adoption:{feature_id}``). Same helper shape as
+    tests/workflows/test_dag_expanded_verify.py::_strict_adoption_marker.
+    """
+    return InFlightAdoptionRecord(
+        feature_id=str(feature.id),
+        candidate_commit="candidate-commit",
+        deploy_artifact_id="deploy-artifact",
+        legacy_root_dag_artifact_id=42,
+        legacy_root_dag_sha256="f" * 64,
+        completed_checkpoint_range=completed_range,
+        next_effective_group_idx=next_group,
+        projection_digest="p" * 64,
+        adopted_at=datetime(2026, 5, 28, 12, 0, tzinfo=timezone.utc),
+        pre_adoption_baseline={"test": "sealed"},
+    ).model_dump_json()
 
 
 # ── Real-Postgres fixtures for the rewired CLI suite (Slice 09e-1b) ─────────
@@ -1546,6 +1582,16 @@ async def test_implement_dag_dispatches_regrouped_first_wave(monkeypatch):
                     f"dag-group:{idx}": json.dumps({"group_idx": idx, "results": []})
                     for idx in range(45)
                 },
+                # The strict resume guard (implementation.py:2510 + dispatch
+                # gate ~:20988) blocks any feature with pre-existing
+                # dag-group:* checkpoints unless a valid adoption marker
+                # exists; mirror the production writer's key + body (see
+                # _strict_adoption_marker above) for the seeded 0..44 range.
+                f"execution-control-adoption:{feature.id}": _strict_adoption_marker(
+                    feature,
+                    completed_range=(0, 44),
+                    next_group=45,
+                ),
                 dag_regroup.CANONICAL_KEY: canonical_text,
                 dag_regroup.ACTIVE_KEY: json.dumps({
                     "status": "active",
@@ -1631,6 +1677,21 @@ async def test_implement_dag_dispatches_regrouped_first_wave(monkeypatch):
         "_dispatch_task_attempt_via_runtime_dispatcher",
         _fake_dispatch,
     )
+    # `_run_task` resolves a workspace-authority repo binding before invoking
+    # the (stubbed) dispatcher; this test has no workspace manager/registry, so
+    # stub the binding the same way test_dag_expanded_verify.py does for its
+    # `_implement_dag` dispatch test (sandbox binding correctness is covered by
+    # the workspace-authority adapter suite).
+    monkeypatch.setattr(
+        implementation_module,
+        "_resolve_task_dispatch_repo_binding",
+        lambda **_kwargs: implementation_module._TaskDispatchRepoBinding(
+            repo_id="",
+            repo_path="",
+            ws_path="",
+            source="test",
+        ),
+    )
     monkeypatch.setattr(
         implementation_module, "_dag_group_checkpoint_is_fresh", _fake_checkpoint_fresh
     )
@@ -1713,6 +1774,15 @@ async def test_implement_dag_resume_scans_expanded_regroup_checkpoints(monkeypat
                     f"dag-group:{idx}": json.dumps({"group_idx": idx, "results": []})
                     for idx in range(48)
                 },
+                # Strict resume guard (see _strict_adoption_marker): valid
+                # adoption marker covering the fully checkpointed expanded
+                # regroup range 0..47, resuming at the first post-baseline
+                # group (48 == effective group count → nothing to dispatch).
+                f"execution-control-adoption:{feature.id}": _strict_adoption_marker(
+                    feature,
+                    completed_range=(0, 47),
+                    next_group=48,
+                ),
                 dag_regroup.CANONICAL_KEY: canonical_text,
                 dag_regroup.ACTIVE_KEY: json.dumps({
                     "status": "active",
