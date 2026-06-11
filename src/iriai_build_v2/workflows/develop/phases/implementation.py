@@ -15528,6 +15528,12 @@ class ImplementationPhase(Phase):
                 cycle += 1
                 continue
 
+            # ── Step 7.5: e2e end-of-run green gate (item-10 d) ──────────
+            # Flag-gated (IRIAI_E2E_RUN_GATE, default OFF). Requires e2e green
+            # or an explicit operator waiver; an ABSENT e2e-status ("track
+            # never ran") fails loud via typed quiesce — never silently green.
+            await _enforce_e2e_run_gate(runner, feature, phase_name=self.name)
+
             # ── Push clones back to source repos ───────────────────────
             if await _post_dag_gate_is_fresh(
                 runner,
@@ -38731,6 +38737,128 @@ async def _quarantine_and_quiesce_corrupt_row(
             "deterministic_workflow_blocker": True,
             "operator_required": True,
             "source": artifact_key,
+        },
+    )
+
+
+# ── Item-10 (R3): e2e end-of-run green gate + three-tier boundary routing ───
+#
+# Artifact keys mirror e2e/registry.py (STATUS_KEY/GREEN_KEY/BLOCKER_KEY/
+# ENHANCEMENT_BACKLOG_KEY) — inlined literals to avoid importing the e2e
+# registry module (asyncpg/storage deps) into this hot module.
+_E2E_STATUS_KEY = "e2e-status"
+_E2E_GREEN_KEY = "e2e-green-checkpoint"
+_E2E_BLOCKER_KEY = "e2e-blocker"
+_E2E_RUN_GATE_ENV = "IRIAI_E2E_RUN_GATE"
+_E2E_RUN_GATE_WAIVER_KEY = "e2e-run-gate-waiver"
+
+
+def _e2e_env_on(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _e2e_run_gate_enabled() -> bool:
+    """Item-10 (d) flag (IRIAI_E2E_RUN_GATE, default OFF = no gate, today)."""
+    return _e2e_env_on(_E2E_RUN_GATE_ENV)
+
+
+async def _enforce_e2e_run_gate(
+    runner: WorkflowRunner, feature: Feature, *, phase_name: str,
+) -> None:
+    """Item-10 (d): post-DAG end-of-run gate — e2e green or explicit waiver.
+
+    Fail-loud semantics (flag ON): an ABSENT ``e2e-status`` row means the async
+    e2e track NEVER RAN for this feature — previously indistinguishable from
+    silently-green-pending — and a present-but-red status (no green checkpoint
+    pointer, or latest boot-smoke fail) is equally blocking. Both write a
+    durable ``workflow-blocker:e2e-run-gate`` marker + an OPERATOR-ACTIONS
+    entry and raise a typed ``WorkflowQuiesced`` (operator_required). Exit is
+    ONLY via existing channels: the operator either gets the track green and
+    restarts, or writes a non-empty ``e2e-run-gate-waiver`` artifact (the
+    explicit waiver) and restarts. Flag OFF: unconditional no-op.
+    """
+    if not _e2e_run_gate_enabled():
+        return
+    waiver = await runner.artifacts.get(_E2E_RUN_GATE_WAIVER_KEY, feature=feature)
+    if waiver:
+        logger.warning(
+            "e2e run gate WAIVED by operator artifact %r: %s",
+            _E2E_RUN_GATE_WAIVER_KEY,
+            str(waiver)[:200],
+        )
+        await runner.artifacts.put("dag-gate:e2e-run", "waived", feature=feature)
+        return
+
+    status_raw = await runner.artifacts.get(_E2E_STATUS_KEY, feature=feature)
+    green_raw = await runner.artifacts.get(_E2E_GREEN_KEY, feature=feature)
+    failure_reason = ""
+    if not status_raw:
+        failure_reason = (
+            f"ABSENT {_E2E_STATUS_KEY!r} artifact: the async e2e track NEVER "
+            "RAN for this feature (a refused/crashed pass writes nothing). "
+            "'Never ran' is not green."
+        )
+    else:
+        status_obj = _json_object_from_text(status_raw)
+        boot_smoke = str(status_obj.get("boot_smoke", ""))
+        open_regressions = list(status_obj.get("open_regressions") or [])
+        if not green_raw:
+            failure_reason = (
+                "e2e-status present but NO green checkpoint pointer "
+                f"({_E2E_GREEN_KEY!r} absent): latest="
+                f"{status_obj.get('latest_checkpoint') or '?'} boot_smoke="
+                f"{boot_smoke or '?'} failed={status_obj.get('failed')} "
+                f"errors={status_obj.get('errors')} "
+                f"open_regressions={open_regressions[:10]}"
+            )
+        elif boot_smoke != "pass":
+            failure_reason = (
+                "latest e2e-status boot_smoke is "
+                f"{boot_smoke or 'missing'!r} (green pointer exists but the "
+                f"newest checkpoint {status_obj.get('latest_checkpoint') or '?'} "
+                "is red)"
+            )
+    if not failure_reason:
+        logger.info("e2e run gate PASSED: green checkpoint present + boot-smoke pass")
+        await runner.artifacts.put("dag-gate:e2e-run", "approved", feature=feature)
+        return
+
+    reason = (
+        f"e2e end-of-run green gate FAILED: {failure_reason} Get the e2e track "
+        "green (iriai-build-v2 e2e --feature <id> --once) and restart, or write "
+        f"a non-empty {_E2E_RUN_GATE_WAIVER_KEY!r} artifact to waive explicitly."
+    )
+    logger.error("e2e run gate: %s", reason)
+    await runner.artifacts.put(
+        "workflow-blocker:e2e-run-gate",
+        json.dumps({
+            "source": "e2e-run-gate",
+            "reason": reason,
+            "deterministic_workflow_blocker": True,
+            "operator_required": True,
+            "waiver_key": _E2E_RUN_GATE_WAIVER_KEY,
+        }, indent=2, sort_keys=True),
+        feature=feature,
+    )
+    _append_operator_actions_entry(
+        runner,
+        title="e2e end-of-run green gate failed (workflow quiesced)",
+        why=reason,
+        commands=(
+            "Run the e2e track to green for this feature, OR write a non-empty "
+            f"{_E2E_RUN_GATE_WAIVER_KEY!r} artifact (explicit waiver); then "
+            "restart the workflow."
+        ),
+        verify="workflow resumes past the post-DAG e2e run gate without re-quiescing",
+    )
+    raise WorkflowQuiesced(
+        phase_name=phase_name,
+        reason=reason,
+        metadata={
+            "terminal_state": "workflow_blocked",
+            "deterministic_workflow_blocker": True,
+            "operator_required": True,
+            "source": "e2e-run-gate",
         },
     )
 

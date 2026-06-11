@@ -526,8 +526,13 @@ async def _run_compose_pass(
                 from .adapters.compose import compose_critical_for
 
                 critical_for = compose_critical_for(profile)
-            all_verdicts = await adapter.run(
-                instance, [], source_commit=commit, critical_for=critical_for)
+            # Pass the kwarg only when bound — keeps duck-typed adapters
+            # without the new parameter working (flag OFF = today's call).
+            if critical_for is not None:
+                all_verdicts = await adapter.run(
+                    instance, [], source_commit=commit, critical_for=critical_for)
+            else:
+                all_verdicts = await adapter.run(instance, [], source_commit=commit)
             if triage_classify_enabled():
                 # Item-10 (a): same principled classifier as the studio path
                 # (compose JUnit fails are already 'regression'; this keeps the
