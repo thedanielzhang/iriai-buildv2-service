@@ -2051,3 +2051,33 @@ def test_reject_symlink_escapes_keeps_strictness_when_git_unavailable(tmp_path: 
     runner = sandbox_module.SandboxRunner.__new__(sandbox_module.SandboxRunner)
     with pytest.raises(sandbox_module.SandboxIsolationError, match="symlink escape"):
         runner._reject_symlink_escapes(repo, [])
+
+
+def test_provision_pip_installs_underscore_dev_requirements(tmp_path: Path) -> None:
+    """N-22: repos that pin dev/test deps in requirements_dev.txt (underscore —
+    the kaya convention, carrying pytest-asyncio/kaya_test) get them installed;
+    the hyphen-only list left sandbox venvs unable to collect any service
+    suite (ModuleNotFoundError: pytest_asyncio at conftest import)."""
+    source = tmp_path / "src"
+    source.mkdir()
+    repo_root = tmp_path / "repo"
+    backend = repo_root / "api"
+    backend.mkdir(parents=True)
+    (backend / "requirements.txt").write_text("flask\n", encoding="utf-8")
+    (backend / "requirements_dev.txt").write_text(
+        "pytest-asyncio==0.23.6\n", encoding="utf-8"
+    )
+    runner, captured = _profiled_runner(
+        tmp_path, source, package_roots=["api"], package_managers=["pip"]
+    )
+
+    results = runner._provision_sandbox_dependencies(repo_root, source)
+
+    pip = str(backend / ".venv" / "bin" / "pip")
+    assert [argv for _, argv in captured] == [
+        ["python3", "-m", "venv", ".venv"],
+        [pip, "install", "-r", "requirements.txt"],
+        [pip, "install", "-r", "requirements_dev.txt"],
+        [pip, "install", "pytest", "mypy", "black"],
+    ]
+    assert results[0].ok and results[0].manager == "pip"

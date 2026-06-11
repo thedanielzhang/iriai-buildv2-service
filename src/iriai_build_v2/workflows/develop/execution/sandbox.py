@@ -3724,7 +3724,18 @@ class SandboxRunner:
                         detail=_command_failure_detail(result),
                     )
             pip = str(venv_dir / "bin" / "pip")
-            for req in ("requirements.txt", "requirements-dev.txt"):
+            # N-22: dev-requirements filename varies by repo convention —
+            # kaya pins its test deps (pytest-asyncio, kaya_test, …) in
+            # requirements_dev.txt (underscore); the hyphen-only list left
+            # every sandbox venv unable to even COLLECT the service suites
+            # (ModuleNotFoundError: pytest_asyncio at conftest import).
+            for req in (
+                "requirements.txt",
+                "requirements-dev.txt",
+                "requirements_dev.txt",
+                "requirements-test.txt",
+                "requirements_test.txt",
+            ):
                 if (dest / req).is_file():
                     cmd = f"{pip} install -r {req}"
                     result = self._run_command(dest, [pip, "install", "-r", req])
