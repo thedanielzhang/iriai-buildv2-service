@@ -2468,7 +2468,12 @@ class TaskPlanningPhase(Phase):
     def _expand_shorthand_id_list(cls, raw_value: str) -> list[str]:
         values: list[str] = []
         last_full_id = ""
-        for raw_part in raw_value.split(","):
+        # Duplicate metadata lines (e.g. two '- **AC refs.**' lines under one
+        # step) reach here joined with '\n' by the metadata map — each line is
+        # an additional id list, so newlines separate exactly like commas.
+        # Comma-only splitting produced fused ids ('AC-s5-42\nAC-s5-32') that
+        # poison owned-AC sets downstream (resume53 slice-3 coverage block).
+        for raw_part in re.split(r"[,\n]", raw_value):
             token = cls._strip_markdown_ticks(raw_part).strip()
             if not token:
                 continue

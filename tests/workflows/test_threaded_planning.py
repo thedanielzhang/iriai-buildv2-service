@@ -20090,6 +20090,22 @@ async def test_load_target_texts_degenerate_test_plan_uses_markdown_twin(tmp_pat
     )
 
 
+def test_expand_shorthand_id_list_splits_newline_joined_duplicate_lines():
+    """N-12: two '- **AC refs.**' lines under one step arrive '\\n'-joined from
+    the metadata map; comma-only splitting fused the boundary ids into one
+    malformed token ('AC-s5-42\\nAC-s5-32') that poisoned owned-AC sets."""
+    result = TaskPlanningPhase._expand_shorthand_id_list(
+        "AC-s5-42\nAC-s5-32, AC-s5-39, AC-s5-42"
+    )
+    assert result == ["AC-s5-42", "AC-s5-32", "AC-s5-39", "AC-s5-42"]
+    # shorthand continuation still works per segment
+    assert TaskPlanningPhase._expand_shorthand_id_list("AC-x-1, -2\nAC-y-7, -8") == [
+        "AC-x-1", "AC-x-2", "AC-y-7", "AC-y-8",
+    ]
+    from iriai_build_v2.workflows.planning._sidecars import _expand_shorthand_id_list
+    assert _expand_shorthand_id_list("REQ-9\nREQ-1, REQ-2") == ["REQ-9", "REQ-1", "REQ-2"]
+
+
 def test_test_plan_parser_accepts_all_live_definition_forms():
     """N-11: AC definitions appear in four live forms; a form the sidecar
     parser misses births a DEGENERATE sidecar (0 ACs) that poisons every

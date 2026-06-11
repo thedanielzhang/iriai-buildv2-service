@@ -285,7 +285,9 @@ def _parse_markdown_bullets(section_text: str) -> list[str]:
 def _expand_shorthand_id_list(raw_value: str) -> list[str]:
     values: list[str] = []
     last_full_id = ""
-    for raw_part in raw_value.split(","):
+    # Newlines separate like commas: duplicate metadata lines for one label
+    # arrive '\n'-joined from the metadata map (see task_planning's twin).
+    for raw_part in re.split(r"[,\n]", raw_value):
         token = _strip_markdown_ticks(raw_part).strip()
         if not token:
             continue
