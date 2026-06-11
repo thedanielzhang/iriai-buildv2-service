@@ -4870,6 +4870,29 @@ class TaskPlanningPhase(Phase):
                 )
             else:
                 target_texts[prefix] = await runner.artifacts.get(artifact_key, feature=feature) or ""
+        if migrated and not _extract_ac_ids(target_texts.get("test-plan", "")):
+            # W-13 (resume50, settings): a degenerate migrated test-plan sidecar
+            # renders 0 acceptance criteria into the slice-planner excerpts, so
+            # planners never see (or cite) the AC universe — the same L2 class
+            # the contract compile path and the owned-AC reconciliation already
+            # guard against. Use the raw markdown twin when it defines ACs.
+            # Contract digests are unaffected (the degenerate contract branch
+            # loads raw texts itself) and manifest digests never pass through
+            # this loader.
+            try:
+                twin_text = await runner.artifacts.get(f"test-plan:{slug}", feature=feature) or ""
+            except Exception:
+                twin_text = ""
+            twin_ac_count = len(_extract_ac_ids(twin_text))
+            if twin_ac_count:
+                logger.warning(
+                    "DEGENERATE test-plan sidecar for %s in slice-context loading: "
+                    "rendered text defines 0 acceptance criteria while the markdown "
+                    "twin defines %d — using the markdown twin for planner excerpts",
+                    slug,
+                    twin_ac_count,
+                )
+                target_texts["test-plan"] = twin_text
         return target_texts
 
     @classmethod

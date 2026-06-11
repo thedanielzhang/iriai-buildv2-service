@@ -19999,6 +19999,97 @@ async def test_reconciliation_loader_falls_back_on_degenerate_sidecar(tmp_path, 
     )
 
 
+@pytest.mark.asyncio
+async def test_load_target_texts_degenerate_test_plan_uses_markdown_twin(tmp_path, caplog):
+    """W-13 guard: for a migrated SF whose loaded test-plan text defines 0 ACs
+    while the raw markdown twin defines some, the slice-context loader must
+    feed planners the markdown twin (loud WARN), not the degenerate render."""
+    import logging
+
+    feature = SimpleNamespace(id="feat-w13-degenerate-context", metadata={})
+    mirror = _TestMirror(tmp_path / "features")
+    decomposition = SubfeatureDecomposition(
+        subfeatures=[
+            Subfeature(id="SF-1", slug="degen", name="Degen", description="Degen"),
+        ],
+        complete=True,
+    )
+    runner = SimpleNamespace(
+        artifacts=_SimpleCompileArtifacts(
+            {
+                "decomposition": decomposition.model_dump_json(indent=2),
+                "prd:degen": """
+## Requirements
+
+| ID | Category | Priority | Description |
+| --- | --- | --- | --- |
+| REQ-1 | functional | must | Bootstrap works |
+""".strip(),
+                "design:degen": """
+## Verifiable States
+
+| Component ID | State | Visual Description |
+| --- | --- | --- |
+| CMP-1 | ready | Ready state is visible |
+""".strip(),
+                "plan:degen": """
+## Implementation Steps
+
+### STEP-1: Bootstrap
+
+- **Requirement refs.** REQ-1
+- **Decision refs.** D-SF1-P1
+- **Verifiable state refs.** CMP-1#ready
+- **AC refs.** AC-degen-1
+""".strip(),
+                "system-design:degen": SystemDesign(
+                    title="Degen System Design",
+                    overview="Degen system overview",
+                    complete=True,
+                ).model_dump_json(indent=2),
+                "test-plan:degen": """
+## Acceptance Criteria
+
+- **AC-degen-1** — Bootstrap works.
+  - linked_requirement: `REQ-1`
+  - verification_method: `integration`
+  - pass_condition: bootstrap works
+""".strip(),
+                "decisions:degen": _decision_ledger_text(
+                    DecisionRecord(
+                        id="D-101",
+                        aliases=["D-SF1-P1"],
+                        statement="Bootstrap uses the canonical startup contract.",
+                        source_phase="subfeature",
+                        subfeature_slug="degen",
+                    ),
+                ),
+                "decisions": "",
+                "decisions:broad": "",
+            }
+        ),
+        services={"artifact_mirror": mirror},
+    )
+    status = await TaskPlanningPhase._ensure_planning_sidecar_migration(
+        runner, feature, decomposition,
+    )
+    assert status.subfeatures["degen"].migration_state == "migrated"
+
+    from iriai_build_v2.services.artifacts import structured_artifact_key
+    sidecar_key = structured_artifact_key("test-plan:degen")
+    payload = json.loads(runner.artifacts.store[sidecar_key])
+    payload["content"]["acceptance_criteria"] = []
+    runner.artifacts.store[sidecar_key] = json.dumps(payload)
+
+    with caplog.at_level(logging.WARNING):
+        texts = await TaskPlanningPhase._load_target_texts(runner, feature, "degen", {})
+    assert "AC-degen-1" in texts["test-plan"]
+    assert any(
+        "DEGENERATE test-plan sidecar for degen in slice-context loading" in r.message
+        for r in caplog.records
+    )
+
+
 def _step_keyed_manifest() -> "task_planning_module.TaskPlanningSliceManifest":
     slices = [
         task_planning_module.TaskPlanningSlice(
