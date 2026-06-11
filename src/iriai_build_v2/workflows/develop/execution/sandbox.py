@@ -9,6 +9,7 @@ slice landing first.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import logging
@@ -19,6 +20,7 @@ import stat
 import subprocess
 import tempfile
 import threading
+import weakref
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
@@ -115,6 +117,108 @@ _ALLOCATION_LOCKS: dict[str, asyncio.Lock] = {}
 def _allocation_lock_for_feature(feature_slug: str) -> asyncio.Lock:
     with _ALLOCATION_LOCKS_GUARD:
         return _ALLOCATION_LOCKS.setdefault(feature_slug, asyncio.Lock())
+
+
+# Parallel sandbox provisioning (IRIAI_SANDBOX_PARALLEL_PROVISION, default ON):
+# narrow the allocation lock from per-feature to per-sandbox-root so a wave of
+# N tasks provisions concurrently (wave prep = max(single task), not sum).
+#
+# Lock-scope audit (what the wide per-feature lock actually guarded):
+#   1. SAME-ROOT atomicity — the manifest-exists reconciliation, mkdir, clone,
+#      and manifest write for one sandbox_root must not interleave with a
+#      concurrent allocate of the SAME root. PRESERVED: the per-root lock keeps
+#      the whole allocate body serialized per root.
+#   2. Cross-root shared ancestors (.../sandboxes/gN) — created with
+#      mkdir(parents=True, exist_ok=True), which is race-safe; no lock needed.
+#   3. SandboxRunner in-memory registries (_leases_by_key/_specs_by_sandbox) —
+#      per-instance (the wave path builds one SandboxRunner per task), mutated
+#      atomically between awaits on a single event loop; no lock needed.
+#   4. Durable store rows — distinct idempotency keys write distinct rows; the
+#      store provides its own transactionality. (Even today the
+#      _existing_lease_for_key check runs BEFORE the lock, so the wide lock
+#      never provided cross-key dedup atomicity.)
+#   5. Source-repo reads (rev-parse, clone --local/--no-local, node_modules CoW
+#      copy) — read-only on the source; concurrent-safe.
+#   6. Package-manager installs — pnpm store / npm cacache / pip cache carry
+#      their own concurrency control.
+# Setting IRIAI_SANDBOX_PARALLEL_PROVISION=0 restores the wide per-feature
+# lock verbatim.
+_SANDBOX_PARALLEL_PROVISION_ENV = "IRIAI_SANDBOX_PARALLEL_PROVISION"
+
+# Optional bound on concurrently-provisioning sandboxes (clone + dependency
+# install). Unset (default) means no extra bound — effective concurrency is
+# the wave width, since each wave task issues exactly one allocate. Set a
+# positive integer to cap host load (disk/network/package-manager pressure).
+_SANDBOX_PROVISION_CONCURRENCY_ENV = "IRIAI_SANDBOX_PROVISION_CONCURRENCY"
+
+_PROVISION_SEMAPHORES_GUARD = threading.Lock()
+# Per-event-loop (asyncio primitives must not cross loops) and per-limit so a
+# mid-flight env change can't strand waiters on a differently-sized semaphore.
+_PROVISION_SEMAPHORES: "weakref.WeakKeyDictionary[Any, dict[int, asyncio.Semaphore]]" = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _sandbox_parallel_provision_enabled() -> bool:
+    """True when per-sandbox-root allocation locking is enabled (default on).
+
+    Set ``IRIAI_SANDBOX_PARALLEL_PROVISION=0`` to restore the wide per-feature
+    allocation lock verbatim (serial wave provisioning)."""
+    raw = os.environ.get(_SANDBOX_PARALLEL_PROVISION_ENV, "1")
+    return str(raw).strip() not in ("0", "false", "False", "FALSE", "no", "No", "NO")
+
+
+def _allocation_lock_for_sandbox_root(
+    feature_slug: str, sandbox_root: Path
+) -> asyncio.Lock:
+    # NUL-joined key cannot collide with a bare feature_slug key (slugs are
+    # alphanumeric-dash), so per-root and per-feature locks share the registry
+    # without aliasing.
+    key = f"{feature_slug}\x00{sandbox_root}"
+    with _ALLOCATION_LOCKS_GUARD:
+        return _ALLOCATION_LOCKS.setdefault(key, asyncio.Lock())
+
+
+def _allocation_lock_for_allocate(
+    feature_slug: str, sandbox_root: Path
+) -> asyncio.Lock:
+    """Select the allocate() serialization lock per the parallel-provision flag."""
+    if _sandbox_parallel_provision_enabled():
+        return _allocation_lock_for_sandbox_root(feature_slug, sandbox_root)
+    return _allocation_lock_for_feature(feature_slug)
+
+
+def _provision_concurrency_limit() -> int | None:
+    raw = os.environ.get(_SANDBOX_PROVISION_CONCURRENCY_ENV)
+    if raw is None or not str(raw).strip():
+        return None
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+def _provision_concurrency_gate() -> Any:
+    """Async context manager bounding concurrent clone+install sections.
+
+    Returns a no-op context when ``IRIAI_SANDBOX_PROVISION_CONCURRENCY`` is
+    unset/invalid (default: bounded only by the wave width). Must be called
+    from a running event loop."""
+    limit = _provision_concurrency_limit()
+    if limit is None:
+        return contextlib.nullcontext()
+    loop = asyncio.get_running_loop()
+    with _PROVISION_SEMAPHORES_GUARD:
+        per_loop = _PROVISION_SEMAPHORES.get(loop)
+        if per_loop is None:
+            per_loop = {}
+            _PROVISION_SEMAPHORES[loop] = per_loop
+        semaphore = per_loop.get(limit)
+        if semaphore is None:
+            semaphore = asyncio.Semaphore(limit)
+            per_loop[limit] = semaphore
+    return semaphore
 
 
 class SandboxError(RuntimeError):
@@ -577,7 +681,9 @@ class SandboxRunner:
         feature_slug = _slugify(spec.feature_id)
         sandbox_id = self._sandbox_id(spec)
         sandbox_root = self._sandbox_root(spec)
-        lock = _allocation_lock_for_feature(feature_slug)
+        # Per-sandbox-root lock by default (wave provisions in parallel);
+        # IRIAI_SANDBOX_PARALLEL_PROVISION=0 restores the wide per-feature lock.
+        lock = _allocation_lock_for_allocate(feature_slug, sandbox_root)
 
         async with lock:
             self._validate_sandbox_allocation_path(sandbox_root)
@@ -634,72 +740,78 @@ class SandboxRunner:
             provisioning_failures: dict[str, list[dict[str, Any]]] = {}
 
             try:
-                for repo_id in spec.repo_ids:
-                    source_root = await self._source_root_for_repo(repo_id)
-                    self._validate_source_root(repo_id, source_root)
-                    source_resolved = source_root.resolve(strict=True)
-                    source_roots[repo_id] = str(source_resolved)
-                    blocked_roots.append(str(source_resolved))
-                    base_commit = spec.base_commits.get(repo_id) or self._git_text(
-                        source_resolved,
-                        ["rev-parse", "HEAD"],
-                    ).strip()
-                    base_commits[repo_id] = base_commit
+                # Bound concurrent heavy provisioning (clone + dependency
+                # install) across parallel allocates when
+                # IRIAI_SANDBOX_PROVISION_CONCURRENCY is set; no-op otherwise.
+                # Failure routing is unchanged: an exception inside the gate
+                # propagates to the except below exactly as before.
+                async with _provision_concurrency_gate():
+                    for repo_id in spec.repo_ids:
+                        source_root = await self._source_root_for_repo(repo_id)
+                        self._validate_source_root(repo_id, source_root)
+                        source_resolved = source_root.resolve(strict=True)
+                        source_roots[repo_id] = str(source_resolved)
+                        blocked_roots.append(str(source_resolved))
+                        base_commit = spec.base_commits.get(repo_id) or self._git_text(
+                            source_resolved,
+                            ["rev-parse", "HEAD"],
+                        ).strip()
+                        base_commits[repo_id] = base_commit
 
-                    repo_root = sandbox_root / "repos" / _slugify(repo_id)
-                    if repo_root.exists():
-                        raise SandboxAllocationError(
-                            f"repo destination already exists before manifest: {repo_root}"
+                        repo_root = sandbox_root / "repos" / _slugify(repo_id)
+                        if repo_root.exists():
+                            raise SandboxAllocationError(
+                                f"repo destination already exists before manifest: {repo_root}"
+                            )
+                        repo_root.parent.mkdir(parents=True, exist_ok=True)
+                        # Run the clone off the event loop. `git clone --no-local` of
+                        # a large repo takes minutes (or wedges); calling it inline
+                        # froze the entire asyncio loop (no watchdog/Slack/other
+                        # workflow could run) — the bridge "hang". to_thread keeps the
+                        # loop responsive; the per-command timeout bounds a wedged git.
+                        # When source and dest are on the same filesystem,
+                        # _git_clone_args() selects --local (hardlinked objects,
+                        # near-instant) instead of --no-local; falls back automatically
+                        # across filesystem boundaries or when IRIAI_SANDBOX_LOCAL_CLONE=0.
+                        await asyncio.to_thread(
+                            self._git_text,
+                            sandbox_root,
+                            _git_clone_args(source_resolved, repo_root),
                         )
-                    repo_root.parent.mkdir(parents=True, exist_ok=True)
-                    # Run the clone off the event loop. `git clone --no-local` of
-                    # a large repo takes minutes (or wedges); calling it inline
-                    # froze the entire asyncio loop (no watchdog/Slack/other
-                    # workflow could run) — the bridge "hang". to_thread keeps the
-                    # loop responsive; the per-command timeout bounds a wedged git.
-                    # When source and dest are on the same filesystem,
-                    # _git_clone_args() selects --local (hardlinked objects,
-                    # near-instant) instead of --no-local; falls back automatically
-                    # across filesystem boundaries or when IRIAI_SANDBOX_LOCAL_CLONE=0.
-                    await asyncio.to_thread(
-                        self._git_text,
-                        sandbox_root,
-                        _git_clone_args(source_resolved, repo_root),
-                    )
-                    self._git_text(repo_root, ["checkout", "--detach", base_commit])
-                    # Restore gitignored dependencies (e.g. node_modules) so
-                    # in-sandbox tooling (tsc/tsgo/Playwright) can self-verify.
-                    # Off the event loop like the clone above: an APFS CoW copy
-                    # is fast but an npm-ci fallback can be slow.
-                    prov_results = await asyncio.to_thread(
-                        self._provision_sandbox_dependencies,
-                        repo_root,
-                        source_resolved,
-                    )
-                    repo_failures = [
-                        r.as_dict()
-                        for r in prov_results
-                        if not r.ok and not r.best_effort
-                    ]
-                    if repo_failures:
-                        provisioning_failures[repo_id] = repo_failures
-                    self._validate_repo_root(
-                        repo_root,
-                        sandbox_root=sandbox_root,
-                        expected_commit=base_commit,
-                    )
-                    permission_normalization[repo_id] = (
-                        self._normalize_sandbox_repo_permissions(
+                        self._git_text(repo_root, ["checkout", "--detach", base_commit])
+                        # Restore gitignored dependencies (e.g. node_modules) so
+                        # in-sandbox tooling (tsc/tsgo/Playwright) can self-verify.
+                        # Off the event loop like the clone above: an APFS CoW copy
+                        # is fast but an npm-ci fallback can be slow.
+                        prov_results = await asyncio.to_thread(
+                            self._provision_sandbox_dependencies,
+                            repo_root,
+                            source_resolved,
+                        )
+                        repo_failures = [
+                            r.as_dict()
+                            for r in prov_results
+                            if not r.ok and not r.best_effort
+                        ]
+                        if repo_failures:
+                            provisioning_failures[repo_id] = repo_failures
+                        self._validate_repo_root(
                             repo_root,
                             sandbox_root=sandbox_root,
+                            expected_commit=base_commit,
                         )
-                    )
-                    self._validate_repo_root(
-                        repo_root,
-                        sandbox_root=sandbox_root,
-                        expected_commit=base_commit,
-                    )
-                    repo_roots[repo_id] = str(repo_root.resolve(strict=True))
+                        permission_normalization[repo_id] = (
+                            self._normalize_sandbox_repo_permissions(
+                                repo_root,
+                                sandbox_root=sandbox_root,
+                            )
+                        )
+                        self._validate_repo_root(
+                            repo_root,
+                            sandbox_root=sandbox_root,
+                            expected_commit=base_commit,
+                        )
+                        repo_roots[repo_id] = str(repo_root.resolve(strict=True))
             except Exception as exc:
                 if not manifest_path.exists():
                     shutil.rmtree(sandbox_root, ignore_errors=True)
