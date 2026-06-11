@@ -1995,3 +1995,59 @@ def test_allocate_records_and_surfaces_empty_provisioning_when_clean(
     binding = run(runner.bind_runtime(lease, "codex"))
     rwb = binding.role_metadata["runtime_workspace_binding"]
     assert rwb["provisioning"]["repos"] == {}
+
+
+# ── D1: gitignored provisioning symlinks are exempt from the escape guard ──
+
+
+def _escape_guard_repo(tmp_path: Path) -> Path:
+    repo = tmp_path / "guard-repo"
+    init_repo(repo)
+    return repo
+
+
+def test_reject_symlink_escapes_exempts_gitignored_venv(tmp_path: Path) -> None:
+    repo = _escape_guard_repo(tmp_path)
+    (repo / ".gitignore").write_text(".venv/\n", encoding="utf-8")
+    git(repo, "add", ".gitignore")
+    git(repo, "commit", "-qm", "ignore venv")
+    venv_bin = repo / "ai-service" / ".venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    outside = tmp_path / "python3.11"
+    outside.write_text("#!interpreter\n", encoding="utf-8")
+    try:
+        os.symlink(outside, venv_bin / "python3")
+    except OSError as exc:
+        pytest.skip(f"symlinks unavailable: {exc}")
+    # gitignore only covers top-level .venv/ — cover nested too
+    (repo / ".gitignore").write_text(".venv/\n**/.venv/\n", encoding="utf-8")
+    runner = sandbox_module.SandboxRunner.__new__(sandbox_module.SandboxRunner)
+    runner._reject_symlink_escapes(repo, [])  # must NOT raise
+
+
+def test_reject_symlink_escapes_still_raises_for_tracked_space_links(tmp_path: Path) -> None:
+    repo = _escape_guard_repo(tmp_path)
+    outside = tmp_path / "secret.txt"
+    outside.write_text("outside\n", encoding="utf-8")
+    try:
+        os.symlink(outside, repo / "escape-link")
+    except OSError as exc:
+        pytest.skip(f"symlinks unavailable: {exc}")
+    runner = sandbox_module.SandboxRunner.__new__(sandbox_module.SandboxRunner)
+    with pytest.raises(sandbox_module.SandboxIsolationError, match="symlink escape"):
+        runner._reject_symlink_escapes(repo, [])
+
+
+def test_reject_symlink_escapes_keeps_strictness_when_git_unavailable(tmp_path: Path) -> None:
+    # not a git repo at all -> check-ignore fails -> nothing exempt
+    repo = tmp_path / "no-git-repo"
+    (repo / ".venv" / "bin").mkdir(parents=True)
+    outside = tmp_path / "interp"
+    outside.write_text("x", encoding="utf-8")
+    try:
+        os.symlink(outside, repo / ".venv" / "bin" / "python3")
+    except OSError as exc:
+        pytest.skip(f"symlinks unavailable: {exc}")
+    runner = sandbox_module.SandboxRunner.__new__(sandbox_module.SandboxRunner)
+    with pytest.raises(sandbox_module.SandboxIsolationError, match="symlink escape"):
+        runner._reject_symlink_escapes(repo, [])

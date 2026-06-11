@@ -2725,6 +2725,7 @@ class SandboxRunner:
         blocked_roots: Sequence[Path],
     ) -> None:
         repo_resolved = repo_root.resolve(strict=True)
+        suspects: list[Path] = []
         for current, dirnames, filenames in os.walk(repo_root, topdown=True, followlinks=False):
             dirnames[:] = [name for name in dirnames if name != ".git"]
             for name in [*dirnames, *filenames]:
@@ -2732,14 +2733,66 @@ class SandboxRunner:
                 if not path.is_symlink():
                     continue
                 target = path.resolve(strict=False)
-                if not _is_relative_to(target, repo_resolved):
-                    raise SandboxIsolationError(
-                        f"symlink escape in sandbox repo: {_repo_rel(repo_root, path)} -> {target}"
-                    )
-                if any(_is_relative_to(target, blocked) for blocked in blocked_roots):
-                    raise SandboxIsolationError(
-                        f"symlink resolves into blocked root: {_repo_rel(repo_root, path)}"
-                    )
+                if not _is_relative_to(target, repo_resolved) or any(
+                    _is_relative_to(target, blocked) for blocked in blocked_roots
+                ):
+                    suspects.append(path)
+        if not suspects:
+            return
+        # Sandbox provisioning itself creates gitignored artifacts that
+        # legitimately symlink outside the repo (per-service venvs:
+        # .venv/bin/python -> the interpreter). A gitignored symlink can
+        # never be part of a captured patch, so it is exempt; any
+        # non-ignored escaping symlink (e.g. one an agent created in
+        # tracked space) still fails loudly.
+        ignored = self._gitignored_paths(repo_root, suspects)
+        for path in suspects:
+            if path in ignored:
+                logger.warning(
+                    "sandbox symlink escape exempted (gitignored provisioning "
+                    "artifact): %s -> %s",
+                    _repo_rel(repo_root, path),
+                    path.resolve(strict=False),
+                )
+                continue
+            target = path.resolve(strict=False)
+            if not _is_relative_to(target, repo_resolved):
+                raise SandboxIsolationError(
+                    f"symlink escape in sandbox repo: {_repo_rel(repo_root, path)} -> {target}"
+                )
+            raise SandboxIsolationError(
+                f"symlink resolves into blocked root: {_repo_rel(repo_root, path)}"
+            )
+
+    def _gitignored_paths(self, repo_root: Path, paths: Sequence[Path]) -> set[Path]:
+        """Return the subset of *paths* that git ignores in *repo_root*.
+
+        Conservative on failure: if git cannot answer (not a repo, git
+        missing), NOTHING is exempt and the symlink-escape guard keeps its
+        full strictness.
+        """
+        if not paths:
+            return set()
+        try:
+            rels = [str(path.relative_to(repo_root)) for path in paths]
+            proc = subprocess.run(
+                ["git", "-C", str(repo_root), "check-ignore", "--stdin", "-z"],
+                input="\0".join(rels) + "\0",
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+        except Exception:
+            logger.warning(
+                "git check-ignore failed for symlink-escape exemption — "
+                "keeping full guard strictness",
+                exc_info=True,
+            )
+            return set()
+        if proc.returncode not in (0, 1):  # 1 = no paths ignored
+            return set()
+        ignored_rels = {item for item in proc.stdout.split("\0") if item}
+        return {repo_root / rel for rel in ignored_rels}
 
     def _validate_changed_path(
         self,
