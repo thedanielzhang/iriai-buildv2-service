@@ -297,6 +297,30 @@ _TEMPLATE_LOCKFILE_GLOBS = ("requirements*.txt",)
 # `cp -c -R` from an older template can never lose its source mid-copy.
 _TEMPLATE_PRUNE_GRACE_S = 3600.0
 
+# Template-time permission normalization (IRIAI_SANDBOX_TEMPLATE_PERMS,
+# default ON).  APFS clonefile(2) preserves ownership and modes, so running
+# the group/mode normalization sweep ONCE on the template at build time means
+# every clonefile copy already carries correct permissions; the per-clone full
+# tree walk (lstat/chown/chmod over an ~8GB tree, minutes per sandbox)
+# downgrades to a cheap bounded spot-verify.  ANY spot-verify mismatch falls
+# back to the FULL sweep with a loud WARNING — never a silent skip into wrong
+# permissions.  Set =0 to restore today's full per-clone sweep byte-identically
+# (no template-time normalization, no marker, full sweep on every clone).
+_SANDBOX_TEMPLATE_PERMS_ENV = "IRIAI_SANDBOX_TEMPLATE_PERMS"
+# Marker stamped NEXT TO the template repo dir (sibling of the template
+# manifest, never inside the repo working tree) before the atomic publish
+# rename; records the normalization params for provenance.  Absent marker
+# (template built before this change, or with the flag off) => the clone runs
+# the full per-clone sweep exactly as before.
+_TEMPLATE_PERMS_MARKER_NAME = ".iriai-template-permissions-normalized"
+_TEMPLATE_PERMS_SCHEMA_VERSION = "sandbox-template-perms-v1"
+# Spot-verify sampling bounds: repo root + .git/.venv/node_modules (when
+# present) + up to this many sorted top-level dirs/files, plus a shallow
+# sample inside each sampled dir.  O(dozens) of lstats vs the full walk.
+_TEMPLATE_PERMS_SPOT_DIR_SAMPLES = 8
+_TEMPLATE_PERMS_SPOT_FILE_SAMPLES = 4
+_TEMPLATE_PERMS_SPOT_CHILD_SAMPLES = 2
+
 
 def _sandbox_command_timeout_s() -> float:
     """Hard timeout for a single sandbox subprocess (git) command.
@@ -381,6 +405,16 @@ def _sandbox_template_cow_enabled() -> bool:
     Set ``IRIAI_SANDBOX_TEMPLATE_COW=0`` to restore the legacy per-task full
     clone + dependency-install provisioning path verbatim."""
     raw = os.environ.get(_SANDBOX_TEMPLATE_COW_ENV, "1")
+    return str(raw).strip() not in ("0", "false", "False", "FALSE", "no", "No", "NO")
+
+
+def _sandbox_template_perms_enabled() -> bool:
+    """Return True when template-time permission normalization is on (default).
+
+    Set ``IRIAI_SANDBOX_TEMPLATE_PERMS=0`` to restore the legacy full
+    per-clone permission sweep byte-identically (no template-time
+    normalization, no marker, full sweep on every clone)."""
+    raw = os.environ.get(_SANDBOX_TEMPLATE_PERMS_ENV, "1")
     return str(raw).strip() not in ("0", "false", "False", "FALSE", "no", "No", "NO")
 
 
@@ -885,9 +919,10 @@ class SandboxRunner:
                             expected_commit=base_commit,
                         )
                         permission_normalization[repo_id] = (
-                            self._normalize_sandbox_repo_permissions(
+                            self._normalize_clone_permissions_post_provision(
                                 repo_root,
                                 sandbox_root=sandbox_root,
+                                template_repo=provisioned_from_template,
                             )
                         )
                         self._validate_repo_root(
@@ -2924,6 +2959,189 @@ class SandboxRunner:
 
         return summary
 
+    def _normalize_clone_permissions_post_provision(
+        self,
+        repo_root: Path,
+        *,
+        sandbox_root: Path,
+        template_repo: Path | None,
+    ) -> dict[str, Any]:
+        """Dispatch post-provision permission handling for one sandbox repo.
+
+        Clones provisioned from a template that was permission-normalized at
+        build time (marker present, same group params, flag ON) get a cheap
+        bounded spot-verify — clonefile(2) preserves ownership/modes, so the
+        full lstat/chown/chmod tree walk is redundant.  EVERY other path
+        (flag off, legacy provisioning, pre-marker template, marker unreadable,
+        normalization params changed since the template was built) runs the
+        full sweep byte-identically to today.
+        """
+        if template_repo is None or not _sandbox_template_perms_enabled():
+            return self._normalize_sandbox_repo_permissions(
+                repo_root,
+                sandbox_root=sandbox_root,
+            )
+        marker_path = template_repo.parent / _TEMPLATE_PERMS_MARKER_NAME
+        try:
+            marker = json.loads(marker_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            # Template predates template-time normalization (or marker is
+            # unreadable): the clone's permissions are unproven — full sweep.
+            return self._normalize_sandbox_repo_permissions(
+                repo_root,
+                sandbox_root=sandbox_root,
+            )
+        group_name, shared_gid = _agent_shared_group()
+        if (
+            marker.get("schema_version") != _TEMPLATE_PERMS_SCHEMA_VERSION
+            or marker.get("agent_shared_group") != group_name
+            or marker.get("agent_shared_gid") != shared_gid
+        ):
+            logger.warning(
+                "sandbox template permission marker %s does not match current "
+                "normalization params (group=%s gid=%s); running the FULL "
+                "permission sweep on %s",
+                marker_path,
+                group_name,
+                shared_gid,
+                repo_root,
+            )
+            summary = self._normalize_sandbox_repo_permissions(
+                repo_root,
+                sandbox_root=sandbox_root,
+            )
+            summary["spot_verify_fallback"] = "template marker params mismatch"
+            return summary
+        return self._spot_verify_sandbox_repo_permissions(
+            repo_root,
+            sandbox_root=sandbox_root,
+            group_name=group_name,
+            shared_gid=shared_gid,
+        )
+
+    def _spot_verify_sandbox_repo_permissions(
+        self,
+        repo_root: Path,
+        *,
+        sandbox_root: Path,
+        group_name: str,
+        shared_gid: int | None,
+    ) -> dict[str, Any]:
+        """Bounded spot-verify of a clone-from-normalized-template's perms.
+
+        Stats the repo root, ``.git``/``.venv``/``node_modules`` (when
+        present), a sorted sample of top-level dirs/files, and a shallow
+        sample inside each sampled dir — O(dozens) of lstats instead of the
+        full-tree walk.  ANY mismatch (wrong group, missing group write,
+        directory missing group exec/setgid) or stat error logs a loud
+        WARNING and falls back to the FULL normalization sweep; it never
+        silently skips into wrong permissions.
+        """
+        repo_resolved = repo_root.resolve(strict=True)
+        sandbox_resolved = sandbox_root.resolve(strict=False)
+        if not _is_relative_to(repo_resolved, sandbox_resolved):
+            raise SandboxAllocationError(
+                f"sandbox repo permission spot-verify escapes sandbox: {repo_root}"
+            )
+
+        def _mismatch(path: Path) -> str | None:
+            st = path.lstat()
+            if stat.S_ISLNK(st.st_mode):
+                return None
+            mode = stat.S_IMODE(st.st_mode)
+            if shared_gid is not None and st.st_gid != shared_gid:
+                return (
+                    f"{path} has gid {st.st_gid}, expected {group_name} "
+                    f"({shared_gid})"
+                )
+            if stat.S_ISDIR(st.st_mode):
+                wanted = stat.S_IRGRP | stat.S_IWGRP | stat.S_IXGRP | stat.S_ISGID
+                if (mode & wanted) != wanted:
+                    return (
+                        f"directory {path} mode {oct(mode)} is missing group "
+                        "rwx/setgid"
+                    )
+            elif stat.S_ISREG(st.st_mode):
+                wanted = stat.S_IRGRP | stat.S_IWGRP
+                if (mode & wanted) != wanted:
+                    return f"file {path} mode {oct(mode)} is missing group rw"
+            return None
+
+        def _sample_children(
+            dir_path: Path, *, dir_limit: int, file_limit: int
+        ) -> tuple[list[Path], list[Path]]:
+            sampled_dirs: list[Path] = []
+            sampled_files: list[Path] = []
+            with os.scandir(dir_path) as entries:
+                for entry in sorted(entries, key=lambda e: e.name):
+                    if entry.is_symlink():
+                        continue
+                    if entry.is_dir(follow_symlinks=False):
+                        if len(sampled_dirs) < dir_limit:
+                            sampled_dirs.append(Path(entry.path))
+                    elif entry.is_file(follow_symlinks=False):
+                        if len(sampled_files) < file_limit:
+                            sampled_files.append(Path(entry.path))
+                    if (
+                        len(sampled_dirs) >= dir_limit
+                        and len(sampled_files) >= file_limit
+                    ):
+                        break
+            return sampled_dirs, sampled_files
+
+        failure: str | None = None
+        paths_verified = 0
+        try:
+            candidates: list[Path] = [repo_root]
+            top_dirs, top_files = _sample_children(
+                repo_root,
+                dir_limit=_TEMPLATE_PERMS_SPOT_DIR_SAMPLES,
+                file_limit=_TEMPLATE_PERMS_SPOT_FILE_SAMPLES,
+            )
+            # Always sample the dependency/.git subtrees: they dominate the
+            # tree and are exactly where wrong perms would strand the agent.
+            for special in (".git", ".venv", "node_modules"):
+                special_path = repo_root / special
+                if special_path.is_dir() and special_path not in top_dirs:
+                    top_dirs.append(special_path)
+            candidates.extend(top_dirs)
+            candidates.extend(top_files)
+            for top_dir in top_dirs:
+                child_dirs, child_files = _sample_children(
+                    top_dir,
+                    dir_limit=_TEMPLATE_PERMS_SPOT_CHILD_SAMPLES,
+                    file_limit=_TEMPLATE_PERMS_SPOT_CHILD_SAMPLES,
+                )
+                candidates.extend(child_dirs)
+                candidates.extend(child_files)
+            for candidate in candidates:
+                failure = _mismatch(candidate)
+                if failure is not None:
+                    break
+                paths_verified += 1
+        except OSError as exc:
+            failure = f"spot-verify stat failed: {exc}"
+
+        if failure is None:
+            return {
+                "mode": "template_spot_verify",
+                "agent_shared_group": group_name,
+                "agent_shared_gid": shared_gid,
+                "paths_verified": paths_verified,
+            }
+        logger.warning(
+            "sandbox clone permission spot-verify FAILED for %s (%s); falling "
+            "back to the FULL permission normalization sweep",
+            repo_root,
+            failure,
+        )
+        summary = self._normalize_sandbox_repo_permissions(
+            repo_root,
+            sandbox_root=sandbox_root,
+        )
+        summary["spot_verify_fallback"] = failure
+        return summary
+
     def _git_dir_from_marker(self, repo_root: Path, git_marker: Path) -> Path:
         if git_marker.is_dir():
             return git_marker
@@ -3400,6 +3618,35 @@ class SandboxRunner:
                 )
                 shutil.rmtree(staging, ignore_errors=True)
                 return None
+            if _sandbox_template_perms_enabled():
+                # Normalize permissions ONCE here (clonefile preserves
+                # ownership/modes, so every clone inherits them) and stamp the
+                # provenance marker BEFORE the atomic publish rename.  A
+                # normalization failure raises into the except below: the
+                # template is not cached and the task falls back to legacy
+                # provisioning, whose full per-clone sweep is unchanged.
+                group_name, shared_gid = _agent_shared_group()
+                perms_summary = self._normalize_sandbox_repo_permissions(
+                    staging_repo,
+                    sandbox_root=staging,
+                )
+                (staging / _TEMPLATE_PERMS_MARKER_NAME).write_text(
+                    json.dumps(
+                        {
+                            "schema_version": _TEMPLATE_PERMS_SCHEMA_VERSION,
+                            "digest": digest,
+                            "repo_id": repo_id,
+                            "agent_shared_group": group_name,
+                            "agent_shared_gid": shared_gid,
+                            "normalized_at": _isoformat(_utc_now(self._clock)),
+                            "summary": perms_summary,
+                        },
+                        indent=2,
+                        sort_keys=True,
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
             template_manifest = {
                 "schema_version": _TEMPLATE_SCHEMA_VERSION,
                 "digest": digest,
@@ -3480,12 +3727,21 @@ class SandboxRunner:
                 f"template {source} and sandbox {dest} are on different "
                 "filesystems; clonefile cannot cross volumes"
             )
+        cp_args = ["cp", "-c", "-R"]
+        if _sandbox_template_perms_enabled():
+            # Template-time permission normalization relies on the clone
+            # INHERITING the template's group + group-write bits; plain
+            # `cp -R` masks created modes with the umask (022 strips g+w), so
+            # preserve attributes explicitly.  Gated on the flag so
+            # IRIAI_SANDBOX_TEMPLATE_PERMS=0 keeps today's clone byte-identical
+            # (the full per-clone sweep re-normalizes either way).
+            cp_args.append("-p")
         result = self._run_command(
-            dest.parent, ["cp", "-c", "-R", str(source), str(dest)]
+            dest.parent, [*cp_args, str(source), str(dest)]
         )
         if result.returncode != 0:
             raise SandboxError(
-                f"cp -c -R {source} -> {dest} failed: "
+                f"{' '.join(cp_args)} {source} -> {dest} failed: "
                 f"{_command_failure_detail(result)}"
             )
 
@@ -3497,16 +3753,18 @@ class SandboxRunner:
         source_resolved: Path,
         base_commit: str,
         repo_root: Path,
-    ) -> bool:
+    ) -> Path | None:
         """Fast path: provision ``repo_root`` by clonefiling a feature template.
 
-        Returns True when ``repo_root`` is a fully-provisioned, independent
-        git worktree at ``base_commit``.  Returns False (after a loud WARNING
-        and removing any partial ``repo_root``) on ANY failure so the caller
-        runs the legacy full-provisioning path verbatim.
+        Returns the template repo dir (truthy) when ``repo_root`` is a
+        fully-provisioned, independent git worktree at ``base_commit`` — the
+        caller uses it to locate the template's permission-normalization
+        marker.  Returns None (falsy; after a loud WARNING and removing any
+        partial ``repo_root``) on ANY failure so the caller runs the legacy
+        full-provisioning path verbatim.
         """
         if not _sandbox_template_cow_enabled():
-            return False
+            return None
         try:
             template_repo = self._ensure_sandbox_template(
                 feature_slug=feature_slug,
@@ -3515,13 +3773,13 @@ class SandboxRunner:
                 base_commit=base_commit,
             )
             if template_repo is None:
-                return False  # already warned at the failure site
+                return None  # already warned at the failure site
             self._clonefile_tree(template_repo, repo_root)
             # The clone must be a valid INDEPENDENT git worktree (clonefile
             # copies .git wholesale): verify git works and pin the commit.
             self._git_text(repo_root, ["status", "--porcelain=v1"])
             self._git_text(repo_root, ["checkout", "--detach", base_commit])
-            return True
+            return template_repo
         except Exception as exc:
             logger.warning(
                 "sandbox template clonefile provisioning FAILED for repo %s "
@@ -3531,7 +3789,7 @@ class SandboxRunner:
                 exc,
             )
             shutil.rmtree(repo_root, ignore_errors=True)
-            return False
+            return None
 
     def _provision_sandbox_dependencies(
         self, repo_root: Path, source_root: Path

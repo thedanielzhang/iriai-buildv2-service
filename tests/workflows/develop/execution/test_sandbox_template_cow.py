@@ -16,8 +16,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import shutil
+import stat
 import subprocess
 import threading
 import time
@@ -31,6 +33,7 @@ from iriai_build_v2.workflows.develop.execution.sandbox import (
     SandboxRunner,
     SandboxSpec,
     _sandbox_template_cow_enabled,
+    _sandbox_template_perms_enabled,
     _sandbox_template_wait_s,
 )
 
@@ -670,3 +673,290 @@ class TestSingleFlightTemplateBuild:
             publisher.join(timeout=10)
 
         assert result == template_dir / "repo"
+
+
+# ---------------------------------------------------------------------------
+# 8. Template-time permission normalization
+#    (wm/template-permission-normalization, IRIAI_SANDBOX_TEMPLATE_PERMS)
+# ---------------------------------------------------------------------------
+
+_PERMS_MARKER_NAME = ".iriai-template-permissions-normalized"
+
+
+def _count_full_sweeps(monkeypatch: pytest.MonkeyPatch) -> list[Path]:
+    """Wrap the full permission sweep so tests can count tree walks."""
+    calls: list[Path] = []
+    original = SandboxRunner._normalize_sandbox_repo_permissions
+
+    def counting(self, repo_root, *, sandbox_root):
+        calls.append(Path(repo_root))
+        return original(self, repo_root, sandbox_root=sandbox_root)
+
+    monkeypatch.setattr(
+        SandboxRunner, "_normalize_sandbox_repo_permissions", counting
+    )
+    return calls
+
+
+class TestTemplatePermsFlag:
+    def test_default_on(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("IRIAI_SANDBOX_TEMPLATE_PERMS", raising=False)
+        assert _sandbox_template_perms_enabled() is True
+
+    def test_disabled_by_zero(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("IRIAI_SANDBOX_TEMPLATE_PERMS", "0")
+        assert _sandbox_template_perms_enabled() is False
+
+    def test_disabled_by_false(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("IRIAI_SANDBOX_TEMPLATE_PERMS", "false")
+        assert _sandbox_template_perms_enabled() is False
+
+    def test_enabled_by_one(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("IRIAI_SANDBOX_TEMPLATE_PERMS", "1")
+        assert _sandbox_template_perms_enabled() is True
+
+
+class TestTemplatePermissionNormalization:
+    @pytest.fixture(autouse=True)
+    def _require_clonefile(self, tmp_path: Path) -> None:
+        if not _clonefile_supported(tmp_path):
+            pytest.skip("APFS clonefile (cp -c) unsupported on this volume")
+
+    @pytest.fixture(autouse=True)
+    def _own_gid_group(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(
+            sandbox_module,
+            "_agent_shared_group",
+            lambda: ("test-agents", os.getgid()),
+        )
+
+    def test_template_build_stamps_marker_and_normalized_perms(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("IRIAI_SANDBOX_TEMPLATE_COW", "1")
+        monkeypatch.setenv("IRIAI_SANDBOX_TEMPLATE_PERMS", "1")
+        source = tmp_path / "canonical" / "app"
+        init_repo(source)
+        (source / "src" / "nested").mkdir(parents=True)
+        (source / "src" / "nested" / "mod.py").write_text(
+            "value = 1\n", encoding="utf-8"
+        )
+        git(source, "add", ".")
+        git(source, "commit", "-qm", "nested")
+        base = git(source, "rev-parse", "HEAD")
+        runner = runner_for(tmp_path, source)
+
+        lease = run(runner.allocate(spec_for(base)))
+
+        digests = [
+            p for p in template_feature_dir(tmp_path).iterdir() if p.is_dir()
+        ]
+        assert len(digests) == 1
+        marker_path = digests[0] / _PERMS_MARKER_NAME
+        assert marker_path.is_file()
+        marker = json.loads(marker_path.read_text(encoding="utf-8"))
+        assert marker["schema_version"] == "sandbox-template-perms-v1"
+        assert marker["repo_id"] == "app"
+        assert marker["agent_shared_group"] == "test-agents"
+        assert marker["agent_shared_gid"] == os.getgid()
+        assert marker["summary"]["paths_changed"] > 0
+
+        # The TEMPLATE tree itself is normalized (group + g+ws dirs, g+w files).
+        template_repo = digests[0] / "repo"
+        for directory in [template_repo, template_repo / "src", template_repo / ".git"]:
+            mode = directory.stat().st_mode
+            assert mode & stat.S_IWGRP
+            assert mode & stat.S_IXGRP
+            assert mode & stat.S_ISGID
+            assert directory.stat().st_gid == os.getgid()
+        tracked = template_repo / "tracked.txt"
+        assert tracked.stat().st_mode & stat.S_IWGRP
+
+        # The clonefile copy inherits the normalized perms end-to-end.
+        repo = Path(lease.repo_roots["app"])
+        for directory in [repo, repo / "src", repo / "src" / "nested", repo / ".git"]:
+            mode = directory.stat().st_mode
+            assert mode & stat.S_IWGRP
+            assert mode & stat.S_IXGRP
+            assert mode & stat.S_ISGID
+            assert directory.stat().st_gid == os.getgid()
+        assert (repo / "tracked.txt").stat().st_mode & stat.S_IWGRP
+        manifest = json.loads(
+            (Path(lease.root) / "sandbox-manifest.json").read_text()
+        )
+        summary = manifest["permission_normalization"]["repos"]["app"]
+        assert summary["mode"] == "template_spot_verify"
+
+    def test_clone_from_marked_template_spot_verifies_only(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("IRIAI_SANDBOX_TEMPLATE_COW", "1")
+        monkeypatch.setenv("IRIAI_SANDBOX_TEMPLATE_PERMS", "1")
+        source = tmp_path / "canonical" / "app"
+        base = init_repo(source)
+        runner = runner_for(tmp_path, source)
+        sweep_calls = _count_full_sweeps(monkeypatch)
+
+        lease_a = run(runner.allocate(spec_for(base, group_idx=1, attempt_no=0)))
+        lease_b = run(runner.allocate(spec_for(base, group_idx=2, attempt_no=0)))
+
+        # Exactly ONE full tree walk total — at template build time, inside the
+        # template staging dir.  NEITHER per-task clone walked its tree.
+        assert len(sweep_calls) == 1
+        assert sweep_calls[0].is_relative_to(template_feature_dir(tmp_path))
+        for lease in (lease_a, lease_b):
+            assert not sweep_calls[0].is_relative_to(Path(lease.root))
+            manifest = json.loads(
+                (Path(lease.root) / "sandbox-manifest.json").read_text()
+            )
+            summary = manifest["permission_normalization"]["repos"]["app"]
+            assert summary["mode"] == "template_spot_verify"
+            assert summary["agent_shared_gid"] == os.getgid()
+            assert 0 < summary["paths_verified"] <= 80
+
+    def test_spot_verify_mismatch_falls_back_to_full_sweep_with_warn(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        monkeypatch.setenv("IRIAI_SANDBOX_TEMPLATE_COW", "1")
+        monkeypatch.setenv("IRIAI_SANDBOX_TEMPLATE_PERMS", "1")
+        source = tmp_path / "canonical" / "app"
+        base = init_repo(source)
+        runner = runner_for(tmp_path, source)
+
+        original_clone = SandboxRunner._clonefile_tree
+
+        def breaking_clone(self, src, dest):
+            original_clone(self, src, dest)
+            # Simulate perms lost between template and clone: a top-level
+            # file the spot-verify samples loses its group bits.
+            (dest / "tracked.txt").chmod(0o600)
+
+        monkeypatch.setattr(SandboxRunner, "_clonefile_tree", breaking_clone)
+
+        with caplog.at_level(logging.WARNING):
+            lease = run(runner.allocate(spec_for(base)))
+
+        assert "spot-verify FAILED" in caplog.text
+        manifest = json.loads(
+            (Path(lease.root) / "sandbox-manifest.json").read_text()
+        )
+        summary = manifest["permission_normalization"]["repos"]["app"]
+        assert "tracked.txt" in summary["spot_verify_fallback"]
+        assert summary["paths_changed"] >= 1  # full sweep ran and repaired it
+        repo = Path(lease.repo_roots["app"])
+        assert (repo / "tracked.txt").stat().st_mode & stat.S_IWGRP
+
+    def test_marker_params_mismatch_runs_full_sweep(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        monkeypatch.setenv("IRIAI_SANDBOX_TEMPLATE_COW", "1")
+        monkeypatch.setenv("IRIAI_SANDBOX_TEMPLATE_PERMS", "1")
+        source = tmp_path / "canonical" / "app"
+        base = init_repo(source)
+        runner = runner_for(tmp_path, source)
+        run(runner.allocate(spec_for(base, group_idx=1, attempt_no=0)))
+
+        # The shared group changes after the template was built: the marker no
+        # longer proves the right normalization — full sweep, loudly.
+        monkeypatch.setattr(
+            sandbox_module,
+            "_agent_shared_group",
+            lambda: ("other-agents", os.getgid()),
+        )
+        sweep_calls = _count_full_sweeps(monkeypatch)
+        with caplog.at_level(logging.WARNING):
+            lease = run(runner.allocate(spec_for(base, group_idx=2, attempt_no=0)))
+
+        assert "does not match current normalization params" in caplog.text
+        assert len(sweep_calls) == 1
+        assert sweep_calls[0] == Path(lease.repo_roots["app"])
+        manifest = json.loads(
+            (Path(lease.root) / "sandbox-manifest.json").read_text()
+        )
+        summary = manifest["permission_normalization"]["repos"]["app"]
+        assert summary["spot_verify_fallback"] == "template marker params mismatch"
+
+    def test_missing_marker_runs_full_sweep(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A template built before this change (no marker) keeps legacy sweeps."""
+        monkeypatch.setenv("IRIAI_SANDBOX_TEMPLATE_COW", "1")
+        monkeypatch.setenv("IRIAI_SANDBOX_TEMPLATE_PERMS", "1")
+        source = tmp_path / "canonical" / "app"
+        base = init_repo(source)
+        runner = runner_for(tmp_path, source)
+        run(runner.allocate(spec_for(base, group_idx=1, attempt_no=0)))
+        for digest in template_feature_dir(tmp_path).iterdir():
+            marker = digest / _PERMS_MARKER_NAME
+            if marker.is_file():
+                marker.unlink()
+
+        sweep_calls = _count_full_sweeps(monkeypatch)
+        lease = run(runner.allocate(spec_for(base, group_idx=2, attempt_no=0)))
+
+        assert len(sweep_calls) == 1
+        assert sweep_calls[0] == Path(lease.repo_roots["app"])
+        manifest = json.loads(
+            (Path(lease.root) / "sandbox-manifest.json").read_text()
+        )
+        summary = manifest["permission_normalization"]["repos"]["app"]
+        assert "mode" not in summary
+        assert "spot_verify_fallback" not in summary
+        assert "paths_changed" in summary
+
+    def test_flag_off_restores_full_per_clone_sweep(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("IRIAI_SANDBOX_TEMPLATE_COW", "1")
+        monkeypatch.setenv("IRIAI_SANDBOX_TEMPLATE_PERMS", "0")
+        source = tmp_path / "canonical" / "app"
+        base = init_repo(source)
+        runner = runner_for(tmp_path, source)
+        sweep_calls = _count_full_sweeps(monkeypatch)
+
+        lease = run(runner.allocate(spec_for(base)))
+
+        # No template-time normalization, no marker; the one and only sweep ran
+        # on the per-task clone — today's behaviour byte-identically.
+        digests = [
+            p for p in template_feature_dir(tmp_path).iterdir() if p.is_dir()
+        ]
+        assert len(digests) == 1
+        assert not (digests[0] / _PERMS_MARKER_NAME).exists()
+        assert len(sweep_calls) == 1
+        assert sweep_calls[0] == Path(lease.repo_roots["app"])
+        manifest = json.loads(
+            (Path(lease.root) / "sandbox-manifest.json").read_text()
+        )
+        summary = manifest["permission_normalization"]["repos"]["app"]
+        assert "mode" not in summary
+        assert "spot_verify_fallback" not in summary
+        assert "paths_changed" in summary
+
+    def test_legacy_provisioning_keeps_full_sweep(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("IRIAI_SANDBOX_TEMPLATE_COW", "0")
+        monkeypatch.setenv("IRIAI_SANDBOX_TEMPLATE_PERMS", "1")
+        source = tmp_path / "canonical" / "app"
+        base = init_repo(source)
+        runner = runner_for(tmp_path, source)
+        sweep_calls = _count_full_sweeps(monkeypatch)
+
+        lease = run(runner.allocate(spec_for(base)))
+
+        assert not template_feature_dir(tmp_path).exists()
+        assert len(sweep_calls) == 1
+        assert sweep_calls[0] == Path(lease.repo_roots["app"])
+        manifest = json.loads(
+            (Path(lease.root) / "sandbox-manifest.json").read_text()
+        )
+        summary = manifest["permission_normalization"]["repos"]["app"]
+        assert "mode" not in summary
+        assert "paths_changed" in summary
