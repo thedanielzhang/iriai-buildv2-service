@@ -605,7 +605,7 @@ def apply_path_resolution(
                 # file_scope (e.g. docs/submittal-prd/*). Leave the path
                 # untouched with a WARN instead of failing the slice. Read
                 # scopes WITH matches still raise (picking context wrong is
-                # real); modify scopes are never relaxed.
+                # real).
                 if (
                     repos_root
                     and action in ("read_only", "read")
@@ -619,6 +619,34 @@ def apply_path_resolution(
                         "unresolved (non-fatal pointer, not an edit target)",
                         d.task_id, d.field, d.original,
                     )
+                    continue
+                # MODIFY with ZERO basename matches anywhere and a grounded
+                # parent: there is nothing on disk this citation could mean,
+                # so it cannot be a modify of an existing file — it is a
+                # net-new file with a mislabeled disposition (resume56:
+                # store/use-revision-count.query.ts, a new query hook marked
+                # modify). Grounding keeps the typo-guard: a wholly novel
+                # tree still raises.
+                if (
+                    repos_root
+                    and action == "modify"
+                    and (find_basename_matches or (
+                        lambda name: count_basename_matches(repos_root, name)
+                    ))(posixpath.basename(original)) == 0
+                    and _create_parent_grounded(
+                        repos_root, repo_path, d.original, planned, exists=exists,
+                        workspace_root=workspace_root,
+                    )
+                ):
+                    logger.warning(
+                        "DAG path resolver backstop: %s:%s=%r is a modify with "
+                        "zero on-disk basename matches and a grounded parent — "
+                        "net-new file with a mislabeled disposition; "
+                        "auto-converting ambiguous -> create_ok (path left "
+                        "untouched)",
+                        d.task_id, d.field, d.original,
+                    )
+                    d.decision = "create_ok"
                     continue
                 genuinely_ambiguous.append(d)
                 continue

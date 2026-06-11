@@ -539,6 +539,36 @@ def test_backstop_near_miss_with_two_candidates_stays_ambiguous():
         )
 
 
+def test_backstop_unplanned_modify_zero_matches_grounded_parent_converts():
+    # N-15: a modify whose basename matches NOTHING on disk cannot be a
+    # modify of an existing file — net-new with a mislabeled disposition;
+    # converts when the parent grounds.
+    path = "spend-client/app/store/use-revision-count.query.ts"
+    dag = _dag(_task("M", file_scope=[(path, "modify")], repo_path=""))
+    res = DagPathResolution(
+        decisions=[_ambiguous("M", "file_scope[0].path", path)], ambiguous_count=1,
+    )
+    apply_path_resolution(
+        dag, res, repos_root="/repos",
+        exists=lambda p: p == "/repos/spend-client/app/store",
+        find_basename_matches=lambda name: 0,
+    )
+    assert res.decisions[0].decision == "create_ok"
+
+
+def test_backstop_unplanned_modify_zero_matches_ungrounded_still_raises():
+    path = "totally/new/tree/depth/use-thing.query.ts"
+    dag = _dag(_task("M", file_scope=[(path, "modify")], repo_path=""))
+    res = DagPathResolution(
+        decisions=[_ambiguous("M", "file_scope[0].path", path)], ambiguous_count=1,
+    )
+    with pytest.raises(AmbiguousDagPath):
+        apply_path_resolution(
+            dag, res, repos_root="/repos", exists=lambda p: False,
+            find_basename_matches=lambda name: 0,
+        )
+
+
 def test_backstop_unplanned_modify_with_basename_matches_still_raises():
     # The never-guess rule is UNCHANGED for paths not in any planned set.
     dag = _dag(_task("M", file_scope=[(PHANTOM, "modify")], repo_path=""))
