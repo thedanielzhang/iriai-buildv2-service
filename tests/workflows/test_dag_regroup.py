@@ -1022,6 +1022,259 @@ def test_regroup_validator_rejects_stale_base_hash():
     assert validation[0]["actual_base_dag_sha256"] == "stale"
 
 
+# ── WB-1: absolute repo_path normalization tests ────────────────────────────
+
+def test_wb1_absolute_repo_path_treated_as_unset_in_task_paths():
+    """_task_paths treats absolute repo_path as unset (N-17 tolerance).
+
+    When a task carries an absolute repo_path (e.g. /Users/.../repos), it must
+    be treated as unset so it does not produce a ``Users/...`` top-level
+    directory prefix in the write-set that would poison barrier and commit-risk
+    heuristics and cause the validator's step-10 to reject.
+    """
+    import warnings
+
+    task_abs = ImplementationTask(
+        id="TASK-ABS",
+        name="Absolute path task",
+        description="task with absolute repo_path",
+        files=["src/service.py"],
+        file_scope=[{"path": "src/service.py", "action": "modify"}],
+        repo_path="/Users/someone/workspaces/kaya-main/.iriai/.../repos",
+    )
+    task_rel = ImplementationTask(
+        id="TASK-REL",
+        name="Relative path task",
+        description="task with no repo_path",
+        files=["src/service.py"],
+        file_scope=[{"path": "src/service.py", "action": "modify"}],
+    )
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        paths_abs = dag_regroup._task_paths(task_abs)
+        assert any("absolute" in str(w.message).lower() for w in caught), (
+            "_task_paths must warn when repo_path is absolute"
+        )
+
+    paths_rel = dag_regroup._task_paths(task_rel)
+
+    # Absolute repo_path → same result as no repo_path (just the bare path)
+    assert paths_abs == paths_rel, (
+        "_task_paths with absolute repo_path must equal _task_paths with no repo_path; "
+        f"got abs={paths_abs} rel={paths_rel}"
+    )
+    # Must NOT contain the stripped absolute prefix as a top-level dir
+    assert not any(p.startswith("Users/") for p in paths_abs), (
+        "paths must not gain a Users/ top-level prefix when repo_path is absolute"
+    )
+
+
+def test_wb1_absolute_repo_path_write_sets_superset_of_validator():
+    """Builder write_sets with absolute repo_path pass validate_overlay step 10.
+
+    When tasks have absolute repo_path, the builder's _task_write_paths_for_overlay
+    (which treats absolute as unset) must produce write_sets that are a superset of
+    what _task_declared_write_paths (the validator) expects — so step 10
+    (dag_regroup_write_set_removes_authoritative_path) does not reject.
+    """
+    from iriai_build_v2.workflows.develop.execution.regroup_overlay_validation import (
+        _task_declared_write_paths,
+    )
+
+    abs_path = "/Users/danielzhang/src/kaya/kaya-main/.iriai/.../repos"
+    task = ImplementationTask(
+        id="TASK-WB1",
+        name="WB1 task",
+        description="absolute repo_path task",
+        files=["shared_libs/kaya_db/kaya_db/permissions.py"],
+        file_scope=[{"path": "supply-chain/app/config/permissions.py", "action": "modify"}],
+        repo_path=abs_path,
+    )
+
+    import warnings
+    with warnings.catch_warnings(record=True):
+        warnings.simplefilter("always")
+        builder_paths = dag_regroup._task_write_paths_for_overlay(task)
+        declared_paths = _task_declared_write_paths(task)
+
+    # The overlay write_set (builder) must be a superset of the declared paths (validator).
+    # With N-17 applied to both, both see repo_path="" and produce identical bare paths.
+    assert declared_paths.issubset(builder_paths), (
+        f"Validator declared paths {declared_paths} are not a subset of "
+        f"builder write_paths {builder_paths}: step 10 would reject"
+    )
+    # Neither should contain the stripped 'Users/...' prefix
+    all_paths = builder_paths | declared_paths
+    assert not any(p.startswith("Users/") for p in all_paths), (
+        "No path should start with Users/ when repo_path is absolute"
+    )
+
+
+def test_wb1_build_staged_regroup_write_sets_pass_step10_with_absolute_repo_path():
+    """build_staged_regroup write_sets pass validate_overlay step 10 when tasks
+    have absolute repo_path (regression test for the live DAG 2248266 pattern).
+    """
+    from iriai_build_v2.workflows.develop.execution.regroup_overlay_validation import (
+        _task_declared_write_paths,
+    )
+    import warnings
+
+    abs_path = "/Users/danielzhang/src/kaya/kaya-main/.iriai/.../repos"
+    base = ImplementationDAG(
+        tasks=[
+            ImplementationTask(
+                id="TASK-PERMS",
+                name="Permissions",
+                description="add permission rows",
+                files=["supply-chain/app/config/permissions.py"],
+                file_scope=[{"path": "supply-chain/app/config/permissions.py", "action": "modify"}],
+                repo_path=abs_path,
+            ),
+            ImplementationTask(
+                id="TASK-ROUTER",
+                name="Router",
+                description="add router endpoints",
+                files=["supply-chain/app/supply_chain/api/v2/routers/knowledge/submittal_management.py"],
+                file_scope=[{"path": "supply-chain/app/supply_chain/api/v2/routers/knowledge/submittal_management.py", "action": "modify"}],
+                repo_path=abs_path,
+            ),
+        ],
+        execution_order=[*_empty_groups(45), ["TASK-PERMS"], ["TASK-ROUTER"]],
+        complete=True,
+    )
+
+    with warnings.catch_warnings(record=True):
+        warnings.simplefilter("always")
+        candidate = dag_regroup.build_staged_regroup(
+            base,
+            base_dag_artifact_id=1,
+            base_dag_sha256=_base_hash(base),
+            from_group=45,
+            to_group=46,
+        )
+
+    # For each task, builder write_sets must be a superset of declared paths.
+    tasks_by_id = {t.id: t for t in base.tasks}
+    for task_id, overlay_paths in candidate.write_sets.items():
+        task = tasks_by_id[task_id]
+        with warnings.catch_warnings(record=True):
+            warnings.simplefilter("always")
+            declared = _task_declared_write_paths(task)
+        overlay_set = set(overlay_paths)
+        assert declared.issubset(overlay_set), (
+            f"task {task_id}: validator declared {declared - overlay_set} not covered "
+            f"by builder write_sets {overlay_set} — step 10 would reject"
+        )
+
+
+# ── WB-2: conversion sha normalization tests ────────────────────────────────
+
+def test_wb2_derived_artifact_to_regroup_overlay_sha_is_normalization_fixed_point():
+    """derived_artifact_to_regroup_overlay produces a sha that matches after renormalization.
+
+    The builder orders waves by sort_key (not lexicographically). If the sha is
+    stamped BEFORE normalize_overlay re-sorts within-wave task ids, step 11
+    (required_overlay_sha256 == overlay_sha256 after renormalization) rejects.
+    WB-2 fix: normalize first, stamp sha from the normalized form.
+    """
+    from iriai_build_v2.workflows.develop.execution.regroup_overlay_validation import (
+        _canonical_overlay_sha,
+        _normalize_overlay,
+    )
+
+    # Build a DAG where sort_key ordering != lex ordering to force a non-trivial wave.
+    base = ImplementationDAG(
+        tasks=[
+            ImplementationTask(
+                id="ZZZZZ-UI",
+                name="Z-named UI task",
+                description="small ui polish",
+                files=["frontend/ui.tsx"],
+            ),
+            ImplementationTask(
+                id="AAAA-UI",
+                name="A-named UI task",
+                description="other ui work",
+                files=["frontend/other.tsx"],
+            ),
+        ],
+        execution_order=[*_empty_groups(45), ["ZZZZZ-UI", "AAAA-UI"]],
+        complete=True,
+    )
+    candidate = dag_regroup.build_staged_regroup(
+        base,
+        base_dag_artifact_id=1,
+        base_dag_sha256=_base_hash(base),
+        from_group=45,
+        to_group=45,
+    )
+
+    overlay = dag_regroup.derived_artifact_to_regroup_overlay(
+        candidate,
+        base,
+        feature_id="wb2-test",
+    )
+
+    # After renormalization the sha must not change (fixed-point invariant)
+    renormalized = _normalize_overlay(overlay)
+    assert renormalized.overlay_sha256 == overlay.overlay_sha256, (
+        "WB-2: overlay_sha256 is not a normalization fixed-point — step 11 would "
+        f"reject. pre={overlay.overlay_sha256!r} post={renormalized.overlay_sha256!r}"
+    )
+    # required_overlay_sha256 must equal overlay_sha256
+    assert overlay.activation_contract.required_overlay_sha256 == overlay.overlay_sha256, (
+        "WB-2: activation_contract.required_overlay_sha256 must equal overlay_sha256"
+    )
+
+
+def test_wb2_sha_fixed_point_with_sort_key_ordered_wave():
+    """When sort_key order differs from lex order, WB-2 fix keeps sha fixed-point."""
+    from iriai_build_v2.workflows.develop.execution.regroup_overlay_validation import (
+        _normalize_overlay,
+    )
+
+    # Tasks named so that sort_key order (by barrier/lane/cost) differs from lex order.
+    # BACKEND task has higher priority (lane rank 0 for artifacts) → sorts first by sort_key
+    # even though "ZFRONTEND" < "ABACKEND" in reverse-lex might flip.
+    base = ImplementationDAG(
+        tasks=[
+            ImplementationTask(
+                id="ZFRONTEND-UI",
+                name="Z frontend task",
+                description="small ui polish",
+                files=["frontend/zzz.tsx"],
+            ),
+            ImplementationTask(
+                id="ABACKEND-ART",
+                name="A backend artifact",
+                description="artifact backend foundation work items",
+                files=["backend/aaa-artifacts.py"],
+            ),
+        ],
+        execution_order=[*_empty_groups(45), ["ZFRONTEND-UI"], ["ABACKEND-ART"]],
+        complete=True,
+    )
+    base_sha = _base_hash(base)
+    candidate = dag_regroup.build_staged_regroup(
+        base,
+        base_dag_artifact_id=99,
+        base_dag_sha256=base_sha,
+        from_group=45,
+        to_group=46,
+    )
+    overlay = dag_regroup.derived_artifact_to_regroup_overlay(
+        candidate,
+        base,
+        feature_id="wb2-sort-key-test",
+    )
+
+    renormalized = _normalize_overlay(overlay)
+    assert renormalized.overlay_sha256 == overlay.overlay_sha256, (
+        "WB-2: overlay sha changed after renormalization (sort_key vs lex order mismatch)"
+    )
+
+
 @pytest.mark.asyncio
 async def test_executor_applies_persisted_active_regroup_marker():
     base = _base_dag()
