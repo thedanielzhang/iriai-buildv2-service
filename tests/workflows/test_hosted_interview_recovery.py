@@ -684,6 +684,91 @@ async def test_ensure_gate_verdict_persisted_replaces_stub_everywhere(tmp_path: 
 
 
 @pytest.mark.asyncio
+async def test_ensure_gate_verdict_persisted_overwrites_contradicting_stale_verdict(
+    tmp_path: Path,
+):
+    """W-11b: a stale real ``approved=false`` JSON verdict in the DB row,
+    mirror, and staging (the previous cycle's verdict, re-ingested over the
+    new approval) is overwritten by the authoritative in-process outcome."""
+    import json as _json
+
+    from iriai_build_v2.models.outputs import ReviewOutcome
+    from iriai_build_v2.workflows._common._helpers import (
+        _ensure_gate_verdict_persisted,
+        _gate_review_is_approved,
+    )
+
+    feature = SimpleNamespace(id="feat-gate-stale", name="Feature")
+    artifacts = _ArtifactStore()
+    mirror = ArtifactMirror(tmp_path)
+    runner = SimpleNamespace(
+        artifacts=artifacts,
+        services={"hosting": _Hosting(), "artifact_mirror": mirror},
+    )
+
+    stale = _json.dumps(
+        {"approved": False, "revision_plan": "Fix AC-3 coverage.", "complete": True},
+        indent=2,
+    )
+    await artifacts.put("gate-review:plan", stale, feature=feature)
+    final_path = mirror.feature_dir(feature.id) / "reviews" / "plan-gate-review.md"
+    final_path.parent.mkdir(parents=True, exist_ok=True)
+    final_path.write_text(stale, encoding="utf-8")
+    staging_path = (
+        mirror.feature_dir(feature.id) / ".staging" / "reviews" / "plan-gate-review.md"
+    )
+    staging_path.parent.mkdir(parents=True, exist_ok=True)
+    staging_path.write_text(stale, encoding="utf-8")
+
+    outcome = ReviewOutcome(approved=True, complete=True)
+    await _ensure_gate_verdict_persisted(
+        runner, feature, gate_review_key="gate-review:plan", outcome=outcome
+    )
+
+    stored = await artifacts.get("gate-review:plan", feature=feature)
+    assert _json.loads(stored)["approved"] is True
+    assert _gate_review_is_approved(stored) is True
+    assert _json.loads(final_path.read_text(encoding="utf-8"))["approved"] is True
+    assert not staging_path.exists()  # stale contradicting draft no longer shadows
+
+
+@pytest.mark.asyncio
+async def test_ensure_gate_verdict_persisted_keeps_matching_verdict(tmp_path: Path):
+    """A stored JSON verdict whose ``approved`` MATCHES the in-process outcome
+    is left byte-identical (richer stored JSON must not be replaced)."""
+    import json as _json
+
+    from iriai_build_v2.models.outputs import ReviewOutcome
+    from iriai_build_v2.workflows._common._helpers import _ensure_gate_verdict_persisted
+
+    feature = SimpleNamespace(id="feat-gate-match", name="Feature")
+    artifacts = _ArtifactStore()
+    mirror = ArtifactMirror(tmp_path)
+    runner = SimpleNamespace(
+        artifacts=artifacts,
+        services={"hosting": _Hosting(), "artifact_mirror": mirror},
+    )
+
+    matching = _json.dumps(
+        {"approved": True, "notes": "Richer verdict from the reviewer."}, indent=2
+    )
+    await artifacts.put("gate-review:plan", matching, feature=feature)
+    final_path = mirror.feature_dir(feature.id) / "reviews" / "plan-gate-review.md"
+    final_path.parent.mkdir(parents=True, exist_ok=True)
+    final_path.write_text(matching, encoding="utf-8")
+
+    await _ensure_gate_verdict_persisted(
+        runner,
+        feature,
+        gate_review_key="gate-review:plan",
+        outcome=ReviewOutcome(approved=True, complete=True),
+    )
+
+    assert await artifacts.get("gate-review:plan", feature=feature) == matching
+    assert final_path.read_text(encoding="utf-8") == matching
+
+
+@pytest.mark.asyncio
 async def test_ensure_gate_verdict_persisted_never_overwrites_real_review(tmp_path: Path):
     """The backstop must not clobber a real reviewer-written gate review."""
     from iriai_build_v2.models.outputs import ReviewOutcome

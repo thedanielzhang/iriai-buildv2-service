@@ -232,6 +232,30 @@ def _is_placeholder_gate_review_text(text: str) -> bool:
     return is_empty_decision_ledger_text(text)
 
 
+def _stored_verdict_contradicts_outcome(text: str, outcome: Any) -> bool:
+    """True when *text* is a JSON gate verdict whose ``approved`` value
+    contradicts the in-process *outcome*'s ``approved``.
+
+    W-11b stale-verdict defect: a reviews/ mirror (or DB row) can hold the
+    PREVIOUS cycle's real ``{"approved": false, ...}`` verdict — planted by a
+    prior persist or this backstop — and ``HostedInterview.on_done``'s
+    artifact resolution re-ingests it over the just-completed cycle's
+    approval.  Such content is not a placeholder, so the 0738a18 check
+    misses it.  Only verdict-shaped JSON objects carrying an ``approved``
+    key are eligible; markdown/prose reviews never match.
+    """
+    outcome_approved = getattr(outcome, "approved", None)
+    if not isinstance(outcome_approved, bool):
+        return False
+    try:
+        data = json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        return False
+    if not isinstance(data, dict) or "approved" not in data:
+        return False
+    return bool(data.get("approved")) is not outcome_approved
+
+
 async def _ensure_gate_verdict_persisted(
     runner: WorkflowRunner,
     feature: Feature,
@@ -266,18 +290,46 @@ async def _ensure_gate_verdict_persisted(
             "empty" if not (stored or "").strip() else "the empty-ledger placeholder stub",
         )
         await runner.artifacts.put(gate_review_key, verdict_json, feature=feature)
+    elif _stored_verdict_contradicts_outcome(stored, outcome):
+        logger.warning(
+            "interview_gate_review: %s stored verdict approved=%s contradicts "
+            "in-process outcome approved=%s — overwriting with the "
+            "authoritative outcome",
+            gate_review_key,
+            json.loads(stored).get("approved"),
+            getattr(outcome, "approved", None),
+        )
+        await runner.artifacts.put(gate_review_key, verdict_json, feature=feature)
 
     staging_path, final_path = _artifact_paths(runner, feature, gate_review_key)
     if final_path is not None:
         existing = final_path.read_text(encoding="utf-8") if final_path.exists() else ""
-        if not existing.strip() or _is_placeholder_gate_review_text(existing):
+        if (
+            not existing.strip()
+            or _is_placeholder_gate_review_text(existing)
+            or _stored_verdict_contradicts_outcome(existing, outcome)
+        ):
+            if _stored_verdict_contradicts_outcome(existing, outcome):
+                logger.warning(
+                    "interview_gate_review: mirror %s stored verdict approved=%s "
+                    "contradicts in-process outcome approved=%s — overwriting "
+                    "with the authoritative outcome",
+                    final_path,
+                    json.loads(existing).get("approved"),
+                    getattr(outcome, "approved", None),
+                )
             final_path.parent.mkdir(parents=True, exist_ok=True)
             final_path.write_text(verdict_json, encoding="utf-8")
     if staging_path is not None and staging_path.exists():
         staged = staging_path.read_text(encoding="utf-8")
-        if not staged.strip() or _is_placeholder_gate_review_text(staged):
-            # A clobbered/placeholder staging draft would shadow the final
-            # mirror on resume (get_resumable_artifact prefers newer staging).
+        if (
+            not staged.strip()
+            or _is_placeholder_gate_review_text(staged)
+            or _stored_verdict_contradicts_outcome(staged, outcome)
+        ):
+            # A clobbered/placeholder/stale-contradicting staging draft would
+            # shadow the final mirror on resume (get_resumable_artifact
+            # prefers newer staging).
             staging_path.unlink()
 
 
