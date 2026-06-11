@@ -37,6 +37,7 @@ from ..._runner import WorkflowQuiesced
 from .implementation import (
     DAG_REGROUP_ACTIVE_KEY,
     DAG_REGROUP_FROM_GROUP,
+    RegroupOverlayProbeError,
     WorkflowCommitError,
     _checkpoint_authorized_repo_sources,
     _commit_repos,
@@ -59,6 +60,7 @@ from .implementation import (
     _record_post_dag_gate_proof,
     _record_source_push_workflow_blocker,
     _resolve_active_regroup_before_group_dispatch,
+    _typed_regroup_active_overlay_offset,
 )
 
 logger = logging.getLogger(__name__)
@@ -164,15 +166,48 @@ async def _raise_if_dag_incomplete_before_post_test(
     ).hexdigest()
     regroup_overlay_applied = False
     active_marker = await runner.artifacts.get(DAG_REGROUP_ACTIVE_KEY, feature=feature)
+    # WM-1: the legacy ``dag-regroup-active:g45-g73`` marker is ONLY written
+    # for the offset-45 Studio compat flow. A TYPED overlay (activatable at
+    # ANY ``group_idx_offset``) is recorded in the
+    # ``execution_regroup_overlays`` row + a slug-keyed marker, so gating
+    # overlay resolution on the legacy key alone left a typed overlay
+    # invisible here: ``dag`` stayed BASE and the completion scan below
+    # demanded base-space ``dag-group:{0..N}`` coverage that effective waves
+    # can never produce — a deterministic ``post_test_blocked_dag_incomplete``
+    # deadlock. Mirror ``_implement_dag``'s 09e-1b re-gating: probe the typed
+    # active overlay first; fall back to the legacy key/offset only when the
+    # typed lookup proves nothing is active (Studio compat).
+    typed_regroup_offset: int | None = None
+    try:
+        typed_regroup_offset = await _typed_regroup_active_overlay_offset(
+            runner, str(getattr(feature, "id", "") or "")
+        )
+    except RegroupOverlayProbeError as exc:
+        # WM-2 fail-closed: overlay state is UNKNOWN — block loudly rather
+        # than scanning completion against the (possibly wrong) base order.
+        await _quiesce_post_test_workflow_blocker(
+            runner,
+            feature,
+            reason="post_test_blocked_dag_regroup_probe_error",
+            failure_class="stale_projection",
+            failure_type="dag_regroup_probe_error",
+            metadata={"error": str(exc)[:2000]},
+        )
+    regroup_offset = (
+        typed_regroup_offset
+        if typed_regroup_offset is not None
+        else DAG_REGROUP_FROM_GROUP
+    )
+    regroup_in_play = bool(active_marker) or typed_regroup_offset is not None
     boundary_checkpoint = await runner.artifacts.get(
-        f"dag-group:{DAG_REGROUP_FROM_GROUP}",
+        f"dag-group:{regroup_offset}",
         feature=feature,
     )
-    if active_marker:
+    if regroup_in_play:
         probe_group_idx = (
-            DAG_REGROUP_FROM_GROUP + 1
+            regroup_offset + 1
             if boundary_checkpoint
-            else DAG_REGROUP_FROM_GROUP
+            else regroup_offset
         )
         effective_dag, failure, observation = await _resolve_active_regroup_before_group_dispatch(
             runner,
@@ -191,6 +226,8 @@ async def _raise_if_dag_incomplete_before_post_test(
                     "failure": failure[:2000],
                     "observation": observation,
                     "active_marker_key": DAG_REGROUP_ACTIVE_KEY,
+                    "typed_regroup_offset": typed_regroup_offset,
+                    "regroup_offset": regroup_offset,
                 },
             )
         if effective_dag is not None:
@@ -300,7 +337,11 @@ async def _raise_if_dag_incomplete_before_post_test(
         except Exception:
             checkpoint = {}
         accepted_dag_sha256s = []
-        if regroup_overlay_applied and group_idx < DAG_REGROUP_FROM_GROUP:
+        # WM-1: groups BELOW the ACTIVE overlay's offset were sealed against
+        # the base dag_sha256 — accept it for exactly those groups (the typed
+        # offset when a typed overlay is active, else the legacy constant;
+        # mirrors _implement_dag's resume-scan accepted-sha gating).
+        if regroup_overlay_applied and group_idx < regroup_offset:
             accepted_dag_sha256s.append(base_dag_sha256)
         if not await _dag_group_checkpoint_is_fresh(
             runner,

@@ -3058,3 +3058,174 @@ async def test_republish_post_test_fixes_quiesces_when_notify_send_fails(
     assert delivery["status"] == "pending"
     failure = json.loads(artifacts.store["dag-runtime-failure:notify"])
     assert failure["failure_type"] == "post_test_notify_delivery_failed"
+
+
+# ── WM-1: the post-test DAG-completion guard resolves TYPED regroup overlays ─
+#
+# Pre-fix, `_raise_if_dag_incomplete_before_post_test` gated overlay
+# resolution ONLY on the legacy fixed `dag-regroup-active:g45-g73` marker, so
+# a TYPED overlay (activatable at any `group_idx_offset`, recorded in the
+# `execution_regroup_overlays` row — no legacy marker) was invisible: the
+# completion scan demanded BASE-space `dag-group:{0..N}` coverage that
+# effective waves can never produce — a deterministic
+# `post_test_blocked_dag_incomplete` deadlock. The guard now mirrors
+# `_implement_dag`'s 09e-1b re-gating: typed active-overlay lookup first,
+# legacy key/offset only as the Studio-compat fallback.
+
+
+def _typed_overlay_dags() -> tuple[ImplementationDAG, ImplementationDAG]:
+    """A 4-group BASE dag and its 2-wave EFFECTIVE order (offset=1)."""
+
+    tasks = [
+        ImplementationTask(id=f"TASK-{i}", name=f"Task {i}", description=f"Task {i}")
+        for i in range(4)
+    ]
+    base = ImplementationDAG(
+        tasks=tasks,
+        execution_order=[[t.id] for t in tasks],
+        complete=True,
+    )
+    effective = ImplementationDAG(
+        tasks=tasks,
+        execution_order=[["TASK-0"], ["TASK-1", "TASK-2", "TASK-3"]],
+        complete=True,
+    )
+    return base, effective
+
+
+@pytest.mark.asyncio
+async def test_post_test_completion_scan_uses_typed_overlay_effective_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """WM-1: with a typed from_group=1 overlay active (no legacy marker) and
+    effective-space `dag-group:{0,1}` sealed, the guard must NOT demand the
+    base 4-group coverage (`post_test_blocked_dag_incomplete`); it resolves
+    the effective order and proceeds to the next check (gates)."""
+
+    base, effective = _typed_overlay_dags()
+    artifacts = _Artifacts({
+        "dag": base.model_dump_json(),
+        # EFFECTIVE-space coverage only: 2 waves. Base groups 2..3 never exist.
+        "dag-group:0": '{"group_idx": 0, "results": []}',
+        "dag-group:1": '{"group_idx": 1, "results": []}',
+    })
+    runner = _runner(_FeatureStore(), artifacts)
+    probed: dict[str, object] = {}
+
+    async def _typed_offset(_runner, feature_id):
+        probed["feature_id"] = feature_id
+        return 1
+
+    async def _resolve(_runner, _feature, dag, *, group_idx):
+        probed["resolve_group_idx"] = group_idx
+        del dag
+        return effective, "", {"status": "applied"}
+
+    monkeypatch.setattr(
+        post_test_module, "_typed_regroup_active_overlay_offset", _typed_offset
+    )
+    monkeypatch.setattr(
+        post_test_module,
+        "_resolve_active_regroup_before_group_dispatch",
+        _resolve,
+    )
+
+    with pytest.raises(WorkflowQuiesced) as exc_info:
+        await post_test_module._raise_if_dag_incomplete_before_post_test(
+            runner, _feature()
+        )
+
+    # Pre-fix: reason == "post_test_blocked_dag_incomplete" (missing base
+    # dag-group:2..3). Post-fix the effective 2-wave coverage satisfies the
+    # completion scan and the guard proceeds to the post-DAG gate check.
+    assert exc_info.value.reason == "post_test_blocked_post_dag_gates_incomplete"
+    assert probed["feature_id"] == "feat-quiesce"
+    # dag-group:{offset=1} exists → the resolver is probed at offset+1,
+    # mirroring _implement_dag's boundary-checkpoint probe.
+    assert probed["resolve_group_idx"] == 2
+
+
+@pytest.mark.asyncio
+async def test_post_test_legacy_marker_fallback_keeps_studio_compat(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """WM-1 fallback: with NO typed overlay, a legacy g45-g73 marker still
+    resolves through the legacy offset (Studio compat) — the resolver is
+    probed at `DAG_REGROUP_FROM_GROUP`, exactly the pre-fix behavior."""
+
+    base, _effective = _typed_overlay_dags()
+    artifacts = _Artifacts({
+        "dag": base.model_dump_json(),
+        post_test_module.DAG_REGROUP_ACTIVE_KEY: '{"status": "active"}',
+        **{
+            f"dag-group:{idx}": json.dumps({"group_idx": idx, "results": []})
+            for idx in range(4)
+        },
+    })
+    runner = _runner(_FeatureStore(), artifacts)
+    probed: dict[str, object] = {}
+
+    async def _typed_offset(_runner, _feature_id):
+        return None  # the typed lookup PROVED no active typed overlay row
+
+    async def _resolve(_runner, _feature, dag, *, group_idx):
+        probed["resolve_group_idx"] = group_idx
+        return dag, "", {"status": "applied"}
+
+    monkeypatch.setattr(
+        post_test_module, "_typed_regroup_active_overlay_offset", _typed_offset
+    )
+    monkeypatch.setattr(
+        post_test_module,
+        "_resolve_active_regroup_before_group_dispatch",
+        _resolve,
+    )
+
+    with pytest.raises(WorkflowQuiesced) as exc_info:
+        await post_test_module._raise_if_dag_incomplete_before_post_test(
+            runner, _feature()
+        )
+
+    # Base coverage is complete → the guard proceeds to the gate check; the
+    # legacy resolution path ran with the legacy offset (no dag-group:45 →
+    # probe at the offset itself).
+    assert exc_info.value.reason == "post_test_blocked_post_dag_gates_incomplete"
+    assert probed["resolve_group_idx"] == post_test_module.DAG_REGROUP_FROM_GROUP
+
+
+@pytest.mark.asyncio
+async def test_post_test_typed_probe_error_blocks_loud(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """WM-2 caller contract in the post-test guard: a typed-overlay lookup
+    ERROR is a loud workflow blocker — never a silent fall-back to scanning
+    completion against the (possibly wrong) BASE order."""
+
+    base, _effective = _typed_overlay_dags()
+    artifacts = _Artifacts({
+        "dag": base.model_dump_json(),
+        **{
+            f"dag-group:{idx}": json.dumps({"group_idx": idx, "results": []})
+            for idx in range(4)
+        },
+    })
+    runner = _runner(_FeatureStore(), artifacts)
+
+    async def _probe_error(_runner, _feature_id):
+        raise implementation_module.RegroupOverlayProbeError(
+            "typed regroup active-overlay lookup errored"
+        )
+
+    monkeypatch.setattr(
+        post_test_module, "_typed_regroup_active_overlay_offset", _probe_error
+    )
+
+    with pytest.raises(WorkflowQuiesced) as exc_info:
+        await post_test_module._raise_if_dag_incomplete_before_post_test(
+            runner, _feature()
+        )
+
+    assert exc_info.value.reason == "post_test_blocked_dag_regroup_probe_error"
+    assert exc_info.value.metadata["deterministic_workflow_blocker"] is True
+    blocker = _post_test_workflow_blocker(artifacts, "dag_regroup_probe_error")
+    assert "lookup errored" in str(blocker["error"])

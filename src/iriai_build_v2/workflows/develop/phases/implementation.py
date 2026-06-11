@@ -20478,8 +20478,16 @@ async def _resolve_active_regroup_typed_overlay(
         active_exists = await _typed_regroup_active_overlay_probe(
             store, feature_id
         )
-        if not active_exists:
+        if active_exists is False:
+            # The follow-up probe SUCCEEDED and proved no active row exists —
+            # only then is deferring to the legacy path safe.
             return None
+        # active_exists is True (a typed overlay exists but could not be
+        # resolved) OR None (the probe itself errored — WM-2: state UNKNOWN,
+        # cannot prove no activation row exists). Both fail CLOSED: deferring
+        # to the legacy path here would return the BASE dag for
+        # group_idx < DAG_REGROUP_FROM_GROUP (silent base-order dispatch
+        # under an active overlay).
         return None, (
             "DAG dispatch paused before group "
             f"{group_idx}: typed regroup overlay state could not be read "
@@ -20488,6 +20496,9 @@ async def _resolve_active_regroup_typed_overlay(
             "applied": False,
             "reason": "regroup_invalid_resolver_error",
             "error": str(exc),
+            "active_overlay_probe": (
+                "active" if active_exists else "probe_error"
+            ),
         }
 
     if not resolution.has_typed_overlay:
@@ -20575,19 +20586,46 @@ async def _write_typed_regroup_observation(
     )
 
 
+# WM-2 bounded-retry-then-raise budget for the typed active-overlay probes.
+_TYPED_REGROUP_PROBE_ATTEMPTS = 3
+_TYPED_REGROUP_PROBE_RETRY_DELAY_SECONDS = 0.5
+
+
+class RegroupOverlayProbeError(RuntimeError):
+    """The typed regroup active-overlay lookup errored — overlay state UNKNOWN.
+
+    WM-2 fail-closed contract: when the ``execution_regroup_overlays`` lookup
+    errors, the caller cannot distinguish "no overlay is active" from "an
+    overlay IS active but the row could not be read". Returning the
+    no-overlay default would make resume/dispatch silently fall back to the
+    BASE execution order while an overlay is ACTIVE (wrong groups dispatch),
+    so the probe raises this instead. Callers must surface it as a loud
+    workflow stop (quiesce / workflow blocker), never swallow it.
+    """
+
+
 async def _typed_regroup_active_overlay_probe(
     store: Any, feature_id: str
-) -> bool:
+) -> bool | None:
     """Whether an ``active`` ``execution_regroup_overlays`` row exists.
 
     Used only after the resolver itself errored: it learns whether a typed
     overlay is present so the caller can decide between a fail-closed quiesce
     (a typed overlay exists but could not be proven safe) and deferring to the
-    legacy path (no typed overlay). Any error here is treated as "not present"
-    so a transient DB blip cannot block a feature that never had a typed
-    overlay.
+    legacy path (no typed overlay). Tri-state (WM-2): ``True`` — an active row
+    exists; ``False`` — the lookup SUCCEEDED and proved no active row exists;
+    ``None`` — the lookup itself ERRORED, so overlay state is UNKNOWN and the
+    caller must NOT defer to the legacy/base path (it cannot prove no
+    activation row exists).
+
+    A store with NO database pool is structural absence (the typed overlay
+    tables are not readable in this deployment at all) — that keeps the
+    pre-WM-2 defer-to-legacy semantics (``False``), exactly like a missing
+    store.
     """
 
+    if getattr(store, "_pool", None) is None:
+        return False
     try:
         async with _merge_queue_connection(store) as conn:
             found = await conn.fetchval(
@@ -20596,13 +20634,14 @@ async def _typed_regroup_active_overlay_probe(
                 feature_id,
             )
             return found is not None
-    except Exception:  # noqa: BLE001 - probe failure → treat as not present.
-        logger.debug(
-            "Typed regroup active-overlay probe failed for feature %s",
+    except Exception:  # noqa: BLE001 - probe errored → state UNKNOWN (None).
+        logger.warning(
+            "Typed regroup active-overlay probe failed for feature %s — "
+            "overlay state UNKNOWN",
             feature_id,
             exc_info=True,
         )
-        return False
+        return None
 
 
 async def _typed_regroup_active_overlay_offset(
@@ -20621,15 +20660,20 @@ async def _typed_regroup_active_overlay_offset(
     This is a bounded read-only probe — ``SELECT group_idx_offset`` from the
     single ``active`` ``execution_regroup_overlays`` row (the
     ``uniq_regroup_overlay_active`` partial unique index guarantees at most
-    one). Returns ``None`` when there is no active typed overlay, when the
-    Slice 09 modules / an execution-control store are unavailable, or when the
-    probe errors — i.e. ``None`` means "no typed regroup overlay is in play",
-    so a feature with no typed overlay keeps its legacy / non-overlay behavior
-    EXACTLY (the gating then falls back to the legacy ``DAG_REGROUP_FROM_GROUP``
-    constant). A transient DB error must not block dispatch, so an error here
-    is treated as "not present" — the typed resolver's own fail-closed path
-    (:func:`_resolve_active_regroup_typed_overlay`) still quiesces if a typed
-    overlay genuinely exists but cannot be proven safe.
+    one). Returns ``None`` ONLY when the lookup can prove no typed overlay is
+    in play: a successful SELECT that found no active row, or the structural
+    no-typed-overlay-infrastructure cases (Slice 09 modules absent / no
+    execution-control store / no feature id) — a feature with no typed overlay
+    keeps its legacy / non-overlay behavior EXACTLY (the gating then falls
+    back to the legacy ``DAG_REGROUP_FROM_GROUP`` constant).
+
+    WM-2 FAIL-CLOSED: a lookup ERROR is NOT "not present". When the SELECT
+    errors, an overlay may be ACTIVE and invisible — returning ``None`` here
+    previously made ``regroup_in_play=False`` and the whole run resume/
+    dispatch on the BASE execution order (silent divergence). The probe now
+    retries a bounded number of times and then raises
+    :class:`RegroupOverlayProbeError`; callers convert it into a loud
+    workflow stop (quiesce / workflow blocker).
     """
 
     if RegroupOverlayResolver is None or RegroupOverlayStore is None:
@@ -20639,21 +20683,42 @@ async def _typed_regroup_active_overlay_offset(
     store = _execution_control_store_for_runner(runner)
     if store is None:
         return None
-    try:
-        async with _merge_queue_connection(store) as conn:
-            offset = await conn.fetchval(
-                "SELECT group_idx_offset FROM execution_regroup_overlays "
-                "WHERE feature_id = $1 AND status = 'active' LIMIT 1",
-                feature_id,
-            )
-            return None if offset is None else int(offset)
-    except Exception:  # noqa: BLE001 - probe failure → treat as not present.
-        logger.debug(
-            "Typed regroup active-overlay offset probe failed for feature %s",
-            feature_id,
-            exc_info=True,
-        )
+    if getattr(store, "_pool", None) is None:
+        # Structural absence: a store with no database pool cannot read the
+        # typed overlay tables in this deployment at all — same legacy
+        # fallback as a missing store (NOT the WM-2 transient-error case).
         return None
+    last_exc: Exception | None = None
+    for attempt in range(_TYPED_REGROUP_PROBE_ATTEMPTS):
+        try:
+            async with _merge_queue_connection(store) as conn:
+                offset = await conn.fetchval(
+                    "SELECT group_idx_offset FROM execution_regroup_overlays "
+                    "WHERE feature_id = $1 AND status = 'active' LIMIT 1",
+                    feature_id,
+                )
+                return None if offset is None else int(offset)
+        except Exception as exc:  # noqa: BLE001 - retry, then fail CLOSED.
+            last_exc = exc
+            logger.warning(
+                "Typed regroup active-overlay offset probe failed for "
+                "feature %s (attempt %d/%d)",
+                feature_id,
+                attempt + 1,
+                _TYPED_REGROUP_PROBE_ATTEMPTS,
+                exc_info=True,
+            )
+            if attempt + 1 < _TYPED_REGROUP_PROBE_ATTEMPTS:
+                await _asyncio.sleep(
+                    _TYPED_REGROUP_PROBE_RETRY_DELAY_SECONDS * (attempt + 1)
+                )
+    raise RegroupOverlayProbeError(
+        "typed regroup active-overlay lookup errored after "
+        f"{_TYPED_REGROUP_PROBE_ATTEMPTS} attempt(s) for feature "
+        f"{feature_id} ({type(last_exc).__name__}: {last_exc}) — regroup "
+        "overlay state is UNKNOWN, so dispatch must fail closed rather than "
+        "fall back to the base execution order"
+    ) from last_exc
 
 
 async def _resolve_active_regroup_legacy_marker(
@@ -20944,16 +21009,33 @@ async def _implement_dag(
     # ANY ``group_idx_offset``, so the regroup dispatch gates must ALSO trigger
     # on an active TYPED overlay row and use ITS offset. ``typed_regroup_offset``
     # is the active typed overlay's ``group_idx_offset`` (or ``None`` — no typed
-    # overlay / Slice 09 modules or a store unavailable / a transient probe
-    # error). ``regroup_offset`` is the EFFECTIVE offset: the typed overlay's
+    # overlay / Slice 09 modules or a store unavailable; WM-2: a probe ERROR
+    # is NOT ``None`` — it raises and dispatch fails closed below, because a
+    # base-order fallback under an active-but-unreadable overlay silently
+    # dispatches the wrong groups). ``regroup_offset`` is the EFFECTIVE offset: the typed overlay's
     # offset when one is active, else the legacy ``DAG_REGROUP_FROM_GROUP``
     # constant — so a feature with no typed overlay keeps EXACTLY its legacy /
     # non-overlay behavior. ``regroup_in_play`` is true when a legacy marker OR
     # a typed overlay is present; when false, all three regroup gates below are
     # skipped and dispatch proceeds byte-for-byte as before.
-    typed_regroup_offset = await _typed_regroup_active_overlay_offset(
-        runner, str(getattr(feature, "id", "") or "")
-    )
+    try:
+        typed_regroup_offset = await _typed_regroup_active_overlay_offset(
+            runner, str(getattr(feature, "id", "") or "")
+        )
+    except RegroupOverlayProbeError as exc:
+        # WM-2 fail-closed: the overlay lookup errored after its retry
+        # budget, so regroup state is UNKNOWN. Quiesce loudly instead of
+        # resuming/dispatching on the BASE execution order — if an overlay
+        # is ACTIVE, the base order dispatches the wrong groups.
+        return DagExecutionOutcome(
+            implementation_text="",
+            failure=(
+                "DAG dispatch paused before resume/dispatch: "
+                f"{exc}"
+            ),
+            handover=handover,
+            terminal_state="quiesced",
+        )
     regroup_offset = (
         typed_regroup_offset
         if typed_regroup_offset is not None
@@ -39400,6 +39482,19 @@ async def _maybe_run_e2e_boundary_repair_wave(
         )
         return ""
     data = _json_object_from_text(checkpoint_raw)
+    # WM-4: the wave RE-PROJECTS dag-group:{prior_idx} (+ commit/gate proofs)
+    # on approval through _verify_and_fix_group's checkpoint path. That
+    # re-projection must preserve the sealed checkpoint's ORIGINAL identity —
+    # its own dag_sha256 — not the loop's CURRENT sha. With a regroup overlay
+    # active the loop sha is the EFFECTIVE sha while a pre-overlay group
+    # (e.g. g0) was sealed under the BASE sha; stamping the effective sha
+    # over it breaks the quiesce-marker prior_checkpoint_sha256 identity
+    # (boundary re-fires) and, after an overlay rollback, leaves proofs whose
+    # sha matches neither base nor any accepted set (group re-runs from
+    # scratch). Mirrors _ensure_dag_group_checkpoint_projection_for_resume,
+    # which re-projects with the proof/body sha. When no overlay is active
+    # the body sha equals the loop sha — behavior unchanged.
+    checkpoint_dag_sha256 = str(data.get("dag_sha256") or "") or dag_sha256
     group_task_ids = (
         list(dag.execution_order[prior_idx])
         if prior_idx < len(dag.execution_order) else []
@@ -39465,7 +39560,7 @@ async def _maybe_run_e2e_boundary_repair_wave(
         known_task_ids=set(tasks_by_id),
         initial_verdict=synthetic,
         initial_verdict_key=wave_key,
-        dag_sha256=dag_sha256,
+        dag_sha256=checkpoint_dag_sha256,
         contracts_by_task_id={},
         max_retries=budget,
         verify_key_stage_prefix=f"e2e-wave-{wave_idx}:",
