@@ -6592,6 +6592,45 @@ def _route_merge_queue_drain_failure(
     }
 
 
+# M-4: `git diff --check` whitespace finding classes (git ws.c
+# `whitespace_error_string` + diff.c blank-at-EOF). A finding header line is
+# `<path>:<line>: <message>`; whitespace messages end with a period, while the
+# conflict-marker finding is `leftover conflict marker` (no period). Only the
+# known whitespace classes are matched — anything else (including conflict
+# markers and unknown future messages) stays a hard failure (fail closed).
+_DIFF_CHECK_WHITESPACE_FINDING = re.compile(
+    r"^.+:\d+:\s*(?:"
+    r"trailing whitespace\."
+    r"|new blank line at EOF\."
+    r"|space before tab in indent\."
+    r"|indent with spaces\."
+    r"|tab in indent\."
+    r")\s*$"
+)
+
+
+def _diff_check_findings_whitespace_only(output: str) -> bool:
+    """True iff every `git diff --check` finding is a known whitespace class.
+
+    `git diff --check` prints one `<path>:<line>: <message>` header per
+    finding; whitespace findings (e.g. `trailing whitespace.`) may be followed
+    by the offending line echoed with a `+` prefix — echo lines are skipped.
+    Fails CLOSED: a non-zero exit with no parseable finding header (or any
+    header that is not a known whitespace class, e.g. `leftover conflict
+    marker`) returns False so the gate keeps rejecting exactly as before.
+    """
+    finding_lines = [
+        line
+        for line in output.splitlines()
+        if line.strip() and not line.startswith("+")
+    ]
+    if not finding_lines:
+        return False
+    return all(
+        _DIFF_CHECK_WHITESPACE_FINDING.match(line) for line in finding_lines
+    )
+
+
 async def _merge_queue_post_apply_gate_decision(
     item: Any,
 ) -> Any:
@@ -6628,9 +6667,15 @@ async def _merge_queue_post_apply_gate_decision(
     Returns a `MergeQueueGateDecision` (approved / rejected). A rejection
     carries `failure_class="merge_conflict"` so the drain routes it through the
     failure router as a merge conflict.
+
+    M-4: whitespace-only `--check` findings (trailing whitespace, blank line
+    at EOF, indent classes) are NOT classified `merge_conflict` — they are
+    WARN-logged and surfaced in the approved verdict payload. Conflict markers
+    and any other non-whitespace finding reject exactly as before.
     """
 
     rejected_repos: list[str] = []
+    whitespace_warned: dict[str, str] = {}
     for target in getattr(item, "repo_targets", []) or []:
         repo_path = Path(target.repo_path)
         # `HEAD` is required: `apply_candidate` stages the applied patch via
@@ -6640,24 +6685,51 @@ async def _merge_queue_post_apply_gate_decision(
         check = await merge_queue_git_service.run_git(
             repo_path, "diff", "--check", "HEAD", check=False
         )
-        if not check.ok:
-            rejected_repos.append(target.repo_id)
+        if check.ok:
+            continue
+        # M-4: whitespace-only findings (trailing whitespace / blank line at
+        # EOF / indent classes) are NOT merge conflicts — failing the lane as
+        # `merge_conflict` mis-routes the retry implementer, which is told its
+        # patch "conflicts" and will likely regenerate the same whitespace.
+        # Whitespace-only output is WARN-logged and recorded in the approved
+        # verdict payload instead of failing the lane. Real conflict markers
+        # (`leftover conflict marker`), any non-whitespace finding, and any
+        # git error (non-empty stderr / unparseable output) still reject
+        # exactly as before — fail closed, no guard weakening.
+        if not check.stderr.strip() and _diff_check_findings_whitespace_only(
+            check.stdout
+        ):
+            findings = check.stdout.strip()
+            whitespace_warned[target.repo_id] = findings[:2000]
+            logger.warning(
+                "merge-queue post-apply gate: whitespace-only `git diff "
+                "--check HEAD` findings in repo %s — WARN only, lane NOT "
+                "failed (M-4):\n%s",
+                target.repo_id,
+                findings,
+            )
+            continue
+        rejected_repos.append(target.repo_id)
     if rejected_repos:
         return MergeQueueGateDecision(
             approved=False,
             failure_class="merge_conflict",
             detail=(
                 "post-apply git diff --check HEAD found conflict markers or "
-                f"whitespace errors in repos {sorted(rejected_repos)}"
+                f"non-whitespace findings in repos {sorted(rejected_repos)}"
             ),
             verdict_payload={
                 "gate": "merge_queue_post_apply_diff_check",
                 "rejected_repo_ids": sorted(rejected_repos),
             },
         )
+    verdict_payload: dict[str, Any] = {"gate": "merge_queue_post_apply_diff_check"}
+    if whitespace_warned:
+        verdict_payload["whitespace_warning_repo_ids"] = sorted(whitespace_warned)
+        verdict_payload["whitespace_warnings"] = whitespace_warned
     return MergeQueueGateDecision(
         approved=True,
-        verdict_payload={"gate": "merge_queue_post_apply_diff_check"},
+        verdict_payload=verdict_payload,
     )
 
 
@@ -12648,10 +12720,34 @@ async def _load_external_acceptance_criteria_catalog(
         slug = (sf.slug or "").strip()
         if not slug:
             continue
-        raw_plan = await runner.artifacts.get(f"test-plan:{slug}", feature=feature)
-        if not raw_plan:
-            continue
-        entries = _test_plan_acceptance_criteria_entries(raw_plan, slug)
+        # M-3: prefer the structured test-plan artifact — the markdown
+        # `test-plan:{slug}` heading format drops `verification_method` and
+        # `pass_condition`, silently degrading contract-time verify quality.
+        entries: list[dict[str, Any]] = []
+        raw_structured = await runner.artifacts.get(
+            f"test-plan-structured:{slug}", feature=feature
+        )
+        if raw_structured:
+            structured_plan = _coerce_test_plan(raw_structured)
+            if structured_plan is not None:
+                entries = _structured_test_plan_acceptance_criteria_entries(
+                    structured_plan, source=f"test-plan-structured:{slug}"
+                )
+        if not entries:
+            raw_plan = await runner.artifacts.get(f"test-plan:{slug}", feature=feature)
+            if not raw_plan:
+                if raw_structured:
+                    logger.warning(
+                        "test-plan-structured:%s exists but could not be parsed "
+                        "and no markdown test-plan:%s fallback exists — no "
+                        "external ACs loaded for this slug",
+                        slug, slug,
+                    )
+                continue
+            entries = _test_plan_acceptance_criteria_entries(raw_plan, slug)
+            _warn_markdown_test_plan_fallback(
+                slug, entries, structured_present=bool(raw_structured)
+            )
         if apply_waivers:
             waived = await _load_planning_contract_waived_ac_ids(
                 runner, feature, slug,
@@ -12665,22 +12761,64 @@ async def _load_external_acceptance_criteria_catalog(
 def _test_plan_acceptance_criteria_entries(raw_plan: Any, slug: str) -> list[dict[str, Any]]:
     test_plan = _coerce_test_plan(raw_plan)
     if test_plan is not None:
-        entries: list[dict[str, Any]] = []
-        for ordinal, criterion in enumerate(test_plan.acceptance_criteria):
-            if not criterion.id:
-                continue
-            entries.append(
-                {
-                    "id": criterion.id,
-                    "description": criterion.description,
-                    "verification_method": criterion.verification_method,
-                    "pass_condition": criterion.pass_condition,
-                    "source": f"test-plan:{slug}",
-                    "source_ordinal": 100_000 + ordinal,
-                }
-            )
-        return entries
+        return _structured_test_plan_acceptance_criteria_entries(
+            test_plan, source=f"test-plan:{slug}"
+        )
     return _markdown_test_plan_acceptance_criteria_entries(str(raw_plan), slug)
+
+
+def _structured_test_plan_acceptance_criteria_entries(
+    test_plan: TestPlan, *, source: str
+) -> list[dict[str, Any]]:
+    """Catalog entries from a parsed ``TestPlan`` (carries method + pass cond)."""
+    entries: list[dict[str, Any]] = []
+    for ordinal, criterion in enumerate(test_plan.acceptance_criteria):
+        if not criterion.id:
+            continue
+        entries.append(
+            {
+                "id": criterion.id,
+                "description": criterion.description,
+                "verification_method": criterion.verification_method,
+                "pass_condition": criterion.pass_condition,
+                "source": source,
+                "source_ordinal": 100_000 + ordinal,
+            }
+        )
+    return entries
+
+
+def _warn_markdown_test_plan_fallback(
+    slug: str,
+    entries: list[dict[str, Any]],
+    *,
+    structured_present: bool,
+) -> None:
+    """Loud WARN when the contract AC catalog falls back to markdown (M-3).
+
+    Lists exactly which AC ids arrived without ``verification_method`` /
+    ``pass_condition`` so the degradation is never silent.
+    """
+    lost = sorted(
+        str(entry.get("id") or "")
+        for entry in entries
+        if not str(entry.get("verification_method") or "").strip()
+        or not str(entry.get("pass_condition") or "").strip()
+    )
+    reason = (
+        "test-plan-structured:%s exists but could not be parsed" % slug
+        if structured_present
+        else "no test-plan-structured:%s artifact exists" % slug
+    )
+    logger.warning(
+        "contract AC catalog fell back to markdown test-plan:%s (%s) — "
+        "%d/%d ACs lack verification_method/pass_condition in the contract: %s",
+        slug,
+        reason,
+        len(lost),
+        len(entries),
+        ", ".join(lost) if lost else "(none — markdown carried both fields)",
+    )
 
 
 def _coerce_test_plan(raw_plan: Any) -> TestPlan | None:
