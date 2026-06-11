@@ -30915,6 +30915,12 @@ def _dag_direct_workflow_repo_roots(repos_root: Path | None) -> list[Path]:
     direct_repos_dir = repos_root if repos_root.name == "repos" else repos_root / "repos"
     if not direct_repos_dir.exists():
         return []
+    # Monorepo shape (N-18 fix 1): the repos root ITSELF is a git repo (.git
+    # at repos/).  Per-child .git directories do not exist in this layout, so
+    # the child enumeration below returns [] and the ACL lane concludes there
+    # are zero candidates.  Return the repos dir itself as the single candidate.
+    if (direct_repos_dir / ".git").exists():
+        return [direct_repos_dir]
     repos: list[Path] = []
     try:
         children = sorted(direct_repos_dir.iterdir())
@@ -31493,6 +31499,14 @@ def _task_repo_prefixed_path(task: ImplementationTask, raw_path: str) -> str:
     if Path(normalized).expanduser().is_absolute():
         return normalized
     repo_path = str(task.repo_path or "").strip().strip("/")
+    # N-18 fix 2: planning emits absolute repo_path for monorepo tasks.
+    # strip("/") turns "/abs/path/repos" into "abs/path/repos" — a garbage
+    # relative prefix that produces invalid ACL targets like
+    # "Users/danielzhang/.../repos/supply-chain/…".  Ignore the field when the
+    # original value was absolute; file_scope paths are already repos-root-
+    # relative with the repo-name prefix (same N-17 tolerance applied here).
+    if repo_path and Path(str(task.repo_path or "")).expanduser().is_absolute():
+        repo_path = ""
     if repo_path and not normalized.startswith(f"{repo_path}/"):
         return f"{repo_path}/{normalized}"
     return normalized

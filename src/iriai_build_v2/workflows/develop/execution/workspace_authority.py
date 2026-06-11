@@ -1014,6 +1014,16 @@ class WorkspaceAuthority:
                     return None
                 current = current.parent
             return None
+        # N-18 fix 4: monorepo shape — .git lives at repo_parent itself, not
+        # inside a named child directory.  A relative file path like
+        # "supply-chain/tests/foo.py" has first-segment "supply-chain", but
+        # repo_parent/"supply-chain"/.git does not exist.  When the registry
+        # has exactly one repo with workspace_relative_path "." (indicating the
+        # entire repos root IS the repo), repo_parent is the candidate root.
+        # Mirror the same check _direct_repo_roots already performs so that
+        # file-path-derived candidates are consistent with directly-rooted ones.
+        if (repo_parent / ".git").exists():
+            return repo_parent.resolve(strict=False)
         parts = Path(text.strip("/")).parts
         if not parts:
             return None
