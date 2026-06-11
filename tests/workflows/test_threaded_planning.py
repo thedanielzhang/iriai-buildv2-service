@@ -6327,9 +6327,25 @@ async def test_task_planning_phase_resumes_compiled_artifact_at_gate_review(tmp_
     async def _fake_load(*args, **kwargs):
         return _decomposition()
 
+    # B4: the seal fail-loud guard only accepts gate output that is itself a
+    # valid ImplementationDAG when the per-slug rebuild cannot run (no
+    # dag:{slug} rows in this fixture).
+    approved_dag_json = ImplementationDAG(
+        tasks=[
+            _valid_task(
+                task_id="accounts-task-1",
+                slug="accounts",
+                requirement_ids=["REQ-1"],
+            )
+        ],
+        execution_order=[["accounts-task-1"]],
+        requirement_coverage={"REQ-1": ["accounts-task-1"]},
+        complete=True,
+    ).model_dump_json(indent=2)
+
     async def _fake_gate(*args, **kwargs):
         assert kwargs["artifact_prefix"] == "dag"
-        return "approved dag"
+        return approved_dag_json
 
     async def _boom(*args, **kwargs):
         raise AssertionError("TaskPlanningPhase should resume at gate review, not restart DAG planning")
@@ -6350,7 +6366,7 @@ async def test_task_planning_phase_resumes_compiled_artifact_at_gate_review(tmp_
     )
 
     result = await TaskPlanningPhase().execute(runner, feature, state)
-    assert result.dag == "approved dag"
+    assert result.dag == approved_dag_json
 
 
 @pytest.mark.asyncio
@@ -10909,8 +10925,23 @@ async def test_task_planning_phase_preserves_round_parallelism(monkeypatch):
     async def _fake_compile(*args, **kwargs):
         return "compiled dag"
 
+    # B4: gate output must be a valid ImplementationDAG for the seal to
+    # accept it when no dag:{slug} rows exist in this fixture.
+    approved_dag_json = ImplementationDAG(
+        tasks=[
+            _valid_task(
+                task_id="accounts-task-1",
+                slug="accounts",
+                requirement_ids=["REQ-1"],
+            )
+        ],
+        execution_order=[["accounts-task-1"]],
+        requirement_coverage={"REQ-1": ["accounts-task-1"]},
+        complete=True,
+    ).model_dump_json(indent=2)
+
     async def _fake_gate(*args, **kwargs):
-        return "approved dag"
+        return approved_dag_json
 
     monkeypatch.setattr(TaskPlanningPhase, "_load_decomposition", _fake_load_decomposition)
     monkeypatch.setattr(TaskPlanningPhase, "_get_or_create_workstreams", _fake_get_workstreams)
@@ -10932,7 +10963,7 @@ async def test_task_planning_phase_preserves_round_parallelism(monkeypatch):
     result = await TaskPlanningPhase().execute(runner, feature, state)
 
     assert max_active == 2
-    assert result.dag == "approved dag"
+    assert result.dag == approved_dag_json
 
 
 @pytest.mark.asyncio
@@ -11007,8 +11038,23 @@ async def test_task_planning_clears_stale_blocked_artifact_before_successful_ret
     async def _fake_compile(*args, **kwargs):
         return "compiled dag"
 
+    # B4: gate output must be a valid ImplementationDAG for the seal to
+    # accept it when no dag:{slug} rows exist in this fixture.
+    approved_dag_json = ImplementationDAG(
+        tasks=[
+            _valid_task(
+                task_id="accounts-task-1",
+                slug="accounts",
+                requirement_ids=["REQ-1"],
+            )
+        ],
+        execution_order=[["accounts-task-1"]],
+        requirement_coverage={"REQ-1": ["accounts-task-1"]},
+        complete=True,
+    ).model_dump_json(indent=2)
+
     async def _fake_gate(*args, **kwargs):
-        return "approved dag"
+        return approved_dag_json
 
     monkeypatch.setattr(TaskPlanningPhase, "_load_decomposition", _fake_load_decomposition)
     monkeypatch.setattr(TaskPlanningPhase, "_load_sf_upstream", _fake_load_upstream)
@@ -11028,7 +11074,7 @@ async def test_task_planning_clears_stale_blocked_artifact_before_successful_ret
 
     result = await TaskPlanningPhase().execute(runner, feature, state)
 
-    assert result.dag == "approved dag"
+    assert result.dag == approved_dag_json
     assert "task-planning-blocked" not in runner.artifacts.store
     assert not (
         Path(mirror.feature_dir(feature.id)) / "task-planning-blocked.md"
@@ -20051,3 +20097,336 @@ async def test_slice_planner_prompt_omits_packing_envelope_when_key_absent(monke
 
     assert package is None
     assert "DAG Packing Envelope" not in prompt
+
+
+# ── Tail pre-audit hardening (A1-A3 / B2-B4) ────────────────────────────────
+
+
+def _tail_preaudit_decomposition(slug: str = "kaya-substrate") -> SubfeatureDecomposition:
+    return SubfeatureDecomposition(
+        subfeatures=[
+            Subfeature(
+                id="SF-1",
+                slug=slug,
+                name="Foundation Dashboard Substrate",
+                description="Substrate",
+                requirement_ids=["R-1"],
+            )
+        ],
+        complete=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_root_dag_gate_transform_skips_sf14_surfaces_for_foreign_feature():
+    """B2: the studio-pinned SF-14 revisit surfaces must NOT be emitted (nor
+    required by validation) when the decomposition does not contain the
+    subfeature the pinned task ids belong to."""
+    feature = SimpleNamespace(id="feat-foreign-dag-gate", name="Kaya")
+    decomposition = _tail_preaudit_decomposition()
+    dag_row = ImplementationDAG(
+        tasks=[
+            _valid_task(
+                task_id="kaya-substrate-task-1",
+                slug="kaya-substrate",
+                requirement_ids=["REQ-1"],
+            )
+        ],
+        requirement_coverage={"REQ-1": ["kaya-substrate-task-1"]},
+        complete=True,
+    ).model_dump_json()
+    runner = SimpleNamespace(
+        artifacts=_SimpleCompileArtifacts({"dag:kaya-substrate": dag_row})
+    )
+
+    transformed = await TaskPlanningPhase._transform_compiled_dag_for_gate_review(
+        runner, feature, decomposition, "# Compiled DAG\n\nContent.\n"
+    )
+    transformed_again = await TaskPlanningPhase._transform_compiled_dag_for_gate_review(
+        runner, feature, decomposition, transformed
+    )
+
+    assert transformed == transformed_again
+    assert "SF-14 Revisit Checkpoints" not in transformed
+    assert "D-GR-DAG-1" not in transformed
+    assert "review-phase-views-slice-10-TASK-SF14-S10-default-variant" not in transformed
+    # The waiver surface is always present (B3), even when empty.
+    assert "## Contract Waivers (operator-approved)" in transformed
+    assert "_No contract waivers recorded._" in transformed
+    # Studio features keep the SF-14 requirement.
+    assert TaskPlanningPhase._sf14_surfaces_apply(decomposition) is False
+
+
+@pytest.mark.asyncio
+async def test_root_dag_gate_transform_injects_waivers_and_packing_envelope():
+    """B3: the gate reviewer must see the operator-pinned packing envelope and
+    the ACTIVE waiver set (dag-contract waived_ac_ids + planning-waivers store
+    keys) inside the generated, deterministic gate surfaces."""
+    feature = SimpleNamespace(id="feat-waiver-dag-gate", name="Kaya")
+    decomposition = _tail_preaudit_decomposition()
+    dag_row = ImplementationDAG(
+        tasks=[
+            _valid_task(
+                task_id="kaya-substrate-task-1",
+                slug="kaya-substrate",
+                requirement_ids=["REQ-1"],
+            )
+        ],
+        requirement_coverage={"REQ-1": ["kaya-substrate-task-1"]},
+        complete=True,
+    ).model_dump_json()
+    contract = task_planning_module.SubfeaturePlanningContract(
+        slug="kaya-substrate",
+        canonical_ac_ids=["AC-fds-1", "AC-fds-9"],
+        waived_ac_ids=["AC-fds-9"],
+    )
+    runner = SimpleNamespace(
+        artifacts=_SimpleCompileArtifacts(
+            {
+                "dag:kaya-substrate": dag_row,
+                "dag-contract:kaya-substrate": contract.model_dump_json(),
+                "planning-waivers:kaya-substrate": json.dumps(
+                    {"waived_ac_ids": ["AC-hrdd-39"], "decisions": ["D-377"]}
+                ),
+                "dag-packing-envelope": "## 1. Task budget: 45-55 tasks TOTAL",
+            }
+        )
+    )
+
+    transformed = await TaskPlanningPhase._transform_compiled_dag_for_gate_review(
+        runner, feature, decomposition, "# Compiled DAG\n\nContent.\n"
+    )
+    transformed_again = await TaskPlanningPhase._transform_compiled_dag_for_gate_review(
+        runner, feature, decomposition, transformed
+    )
+
+    assert transformed == transformed_again
+    assert "## Contract Waivers (operator-approved)" in transformed
+    assert "`AC-fds-9` (`kaya-substrate`) — source: dag-contract waived_ac_ids" in transformed
+    assert (
+        "`AC-hrdd-39` (`kaya-substrate`) — source: planning-waivers:kaya-substrate store key"
+        in transformed
+    )
+    assert "## DAG Packing Envelope (operator-pinned)" in transformed
+    assert "45-55 tasks TOTAL" in transformed
+
+
+@pytest.mark.asyncio
+async def test_persist_approved_root_dag_seal_fails_loud_on_markdown_fallback():
+    """B4: a seal-time rebuild failure must NOT silently persist gate markdown
+    under the executable 'dag' key — only approved_text that is itself valid
+    ImplementationDAG JSON may be persisted."""
+    feature = SimpleNamespace(id="feat-seal-loud", name="Kaya")
+    decomposition = _tail_preaudit_decomposition()
+    artifacts = _SimpleCompileArtifacts({})  # no dag:{slug} -> rebuild raises
+    runner = SimpleNamespace(artifacts=artifacts, services={})
+
+    with pytest.raises(RuntimeError, match="refusing to persist"):
+        await TaskPlanningPhase._persist_approved_root_implementation_dag(
+            runner,
+            feature,
+            decomposition,
+            approved_text="# Compiled DAG markdown\n\nNot JSON.",
+        )
+    assert "dag" not in artifacts.store
+
+    # Invalid JSON-looking text fails loud too.
+    with pytest.raises(RuntimeError, match="refusing to persist"):
+        await TaskPlanningPhase._persist_approved_root_implementation_dag(
+            runner,
+            feature,
+            decomposition,
+            approved_text='{"not": "an implementation dag"',
+        )
+    assert "dag" not in artifacts.store
+
+    # approved_text that IS a valid ImplementationDAG still persists.
+    valid_dag = ImplementationDAG(
+        tasks=[
+            _valid_task(
+                task_id="kaya-substrate-task-1",
+                slug="kaya-substrate",
+                requirement_ids=["REQ-1"],
+            )
+        ],
+        execution_order=[["kaya-substrate-task-1"]],
+        requirement_coverage={"REQ-1": ["kaya-substrate-task-1"]},
+        complete=True,
+    ).model_dump_json()
+    persisted = await TaskPlanningPhase._persist_approved_root_implementation_dag(
+        runner,
+        feature,
+        decomposition,
+        approved_text=valid_dag,
+    )
+    assert artifacts.store["dag"] == persisted
+    ImplementationDAG.model_validate_json(persisted)
+
+
+def _augment_plan_texts() -> tuple[str, str]:
+    plan_text = """
+## Implementation Steps
+
+### STEP-1: Substrate models
+
+REQ-1
+Create the substrate models.
+
+### STEP-2: Dashboard surface
+
+REQ-2
+Build the dashboard surface.
+""".strip()
+    test_plan_text = """
+## Acceptance Criteria
+
+- **AC-kaya-1** — Substrate criterion.
+  - linked_requirement: `REQ-1`
+  - verification_method: `integration`
+  - pass_condition: substrate works
+
+- **AC-kaya-2** — Dashboard criterion.
+  - linked_requirement: `REQ-2`
+  - verification_method: `integration`
+  - pass_condition: dashboard works
+""".strip()
+    return plan_text, test_plan_text
+
+
+def _augment_manifest_and_runner(augments_payload: str | None):
+    plan_text, test_plan_text = _augment_plan_texts()
+    manifest = _slice_manifest_with_current_digests(
+        slug="kayasub",
+        plan_text=plan_text,
+        test_plan_text=test_plan_text,
+        slices=[
+            task_planning_module.TaskPlanningSlice(
+                slice_id="slice-1",
+                title="Substrate models",
+                step_ids=["STEP-1"],
+                requirement_ids=["REQ-1"],
+            ),
+            task_planning_module.TaskPlanningSlice(
+                slice_id="slice-2",
+                title="Dashboard surface",
+                step_ids=["STEP-2"],
+                requirement_ids=["REQ-2"],
+            ),
+        ],
+        statuses=[
+            task_planning_module.SlicePlanningStatus(slice_id="slice-1"),
+            task_planning_module.SlicePlanningStatus(
+                slice_id="slice-2",
+                status="completed",
+                fragment_key="dag-fragment:kayasub:slice-2",
+            ),
+        ],
+    )
+    store = {
+        "plan:kayasub": plan_text,
+        "test-plan:kayasub": test_plan_text,
+        "dag-fragment:kayasub:slice-2": ImplementationDAG(
+            tasks=[
+                _valid_task(
+                    task_id="T-kayasub-2",
+                    slug="kayasub",
+                    step_ids=["STEP-2"],
+                    requirement_ids=["REQ-2"],
+                    verification_gates=["AC-kaya-2"],
+                )
+            ],
+            execution_order=[["T-kayasub-2"]],
+            complete=True,
+        ).model_dump_json(),
+    }
+    if augments_payload is not None:
+        store["dag-slice-augments:kayasub"] = augments_payload
+    artifacts = _SimpleCompileArtifacts(store)
+    runner = SimpleNamespace(artifacts=artifacts, services={})
+    return manifest, runner, artifacts
+
+
+@pytest.mark.asyncio
+async def test_normalize_pending_slice_manifest_applies_operator_slice_augments():
+    """A1/A2: operator-pinned dag-slice-augments:{slug} widen the named slice
+    contract additively (phantom step + orphan REQ), reopen the affected
+    slice, and survive the atomic-slice rebuild idempotently."""
+    feature = SimpleNamespace(id="feat-slice-augments", metadata={})
+    manifest, runner, artifacts = _augment_manifest_and_runner(
+        json.dumps(
+            {
+                "slices": {
+                    "slice-2": {
+                        "add_step_ids": ["STEP-13"],
+                        "add_step_titles": ["Playwright/Auth0 e2e harness"],
+                        "add_requirement_ids": ["REQ-30"],
+                    }
+                },
+                "decisions": ["D-246", "D-GATE-02"],
+                "reason": "phantom harness step + orphan REQ assignment",
+            }
+        )
+    )
+
+    await TaskPlanningPhase._normalize_pending_slice_manifest(runner, feature, manifest)
+
+    augmented = next(s for s in manifest.slices if s.slice_id == "slice-2")
+    assert "STEP-13" in augmented.step_ids
+    assert "STEP-2" in augmented.step_ids
+    assert "REQ-30" in augmented.requirement_ids
+    assert "REQ-2" in augmented.requirement_ids
+    assert "Playwright/Auth0 e2e harness" in augmented.step_titles
+    # The augmented slice reopened: stale fragment dropped, status pending.
+    status = next(s for s in manifest.statuses if s.slice_id == "slice-2")
+    assert status.status == "pending"
+    assert "dag-fragment:kayasub:slice-2" not in artifacts.store
+    # Untouched slice keeps its derived contract.
+    untouched = next(s for s in manifest.slices if s.slice_id == "slice-1")
+    assert untouched.step_ids == ["STEP-1"]
+
+    # Idempotent across passes: the atomic rebuild never wipes the augment.
+    before = [s.model_dump() for s in manifest.slices]
+    await TaskPlanningPhase._normalize_pending_slice_manifest(runner, feature, manifest)
+    assert [s.model_dump() for s in manifest.slices] == before
+
+
+@pytest.mark.asyncio
+async def test_slice_augments_fail_loud_on_unknown_slice_or_malformed_payload():
+    """A1/A2 fail-loud: a typo'd operator pin must never be silently dropped."""
+    feature = SimpleNamespace(id="feat-slice-augments-bad", metadata={})
+    manifest, runner, _artifacts = _augment_manifest_and_runner(
+        json.dumps({"slices": {"slice-9": {"add_step_ids": ["STEP-13"]}}})
+    )
+    with pytest.raises(RuntimeError, match="unknown slice id"):
+        await TaskPlanningPhase._normalize_pending_slice_manifest(
+            runner, feature, manifest
+        )
+
+    manifest2, runner2, _artifacts2 = _augment_manifest_and_runner("{not json")
+    with pytest.raises(RuntimeError, match="malformed"):
+        await TaskPlanningPhase._normalize_pending_slice_manifest(
+            runner2, feature, manifest2
+        )
+
+    manifest3, runner3, _artifacts3 = _augment_manifest_and_runner(
+        json.dumps({"no_slices_key": True})
+    )
+    with pytest.raises(RuntimeError, match="malformed"):
+        await TaskPlanningPhase._normalize_pending_slice_manifest(
+            runner3, feature, manifest3
+        )
+
+
+def test_effective_coverage_waivers_normalize_id_drift_and_skip_unmatched():
+    """A3: waiver ids with zero-pad/case drift resolve to the CANONICAL AC id
+    (so they persist into dag-contract waived_ac_ids); waivers matching no
+    canonical id are skipped loudly instead of silently vanishing."""
+    effective, waived = task_planning_module._effective_coverage_ids_for_task_planning(
+        "kaya-hrdd",
+        {"AC-hrdd-39", "AC-s5-43", "AC-keep-1"},
+        contract_waived_ac_ids=["AC-HRDD-039"],
+        store_waived_ac_ids=["AC-s5-43", "AC-nonexistent-7"],
+    )
+    assert effective == {"AC-keep-1"}
+    assert set(waived) == {"AC-hrdd-39", "AC-s5-43"}
+    assert "contract" in waived["AC-hrdd-39"] or "waived via" in waived["AC-hrdd-39"]

@@ -364,3 +364,63 @@ async def test_validate_slice_fragment_threads_resolver(tmp_path, monkeypatch):
     assert validated.tasks[0].file_scope[0].path == canon
     assert len(runner.run_calls) == 1
     assert runner.run_calls[0][0] == "dag-path-resolver-accounts:slice-1"
+
+
+# ── resume coverage gate: stale persisted resolution is re-dispatched ────────
+
+
+@pytest.mark.asyncio
+async def test_stale_persisted_resolution_redispatches_resolver(tmp_path, monkeypatch):
+    # A persisted dag-path-resolution that does NOT cover the current
+    # unresolved set (e.g. reused after a slice re-plan) must be ignored and
+    # the resolver re-dispatched — otherwise the new paths silently skip
+    # resolution.
+    monkeypatch.setenv("IRIAI_DAG_PATH_AGENTIC_RESOLVER", "1")
+    repo = "repo"
+    phantom = f"{repo}/src/phantom/Comp.tsx"
+    canon_rel = _write(tmp_path, repo, "src/real/browser/Comp.tsx")
+    canon = f"{repo}/{canon_rel}"
+    dag = _dag(_task(file_scope=[(phantom, "modify")], repo_path=repo))
+
+    fresh = DagPathResolution(
+        decisions=[
+            DagPathDecision(
+                task_id="T1",
+                field="file_scope[0].path",
+                original=phantom,
+                resolved=canon,
+                decision="correct",
+                evidence="glob",
+            )
+        ],
+        corrected_count=1,
+    )
+    runner = _Runner(str(tmp_path), resolution=fresh)
+    # Stale persisted resolution from a PREVIOUS fragment: different task/path.
+    stale = DagPathResolution(
+        decisions=[
+            DagPathDecision(
+                task_id="T-OLD",
+                field="file_scope[0].path",
+                original=f"{repo}/src/old/Gone.tsx",
+                decision="ambiguous",
+            )
+        ],
+        ambiguous_count=1,
+    )
+    runner.artifacts.store["dag-path-resolution:slug:slice-1"] = stale.model_dump_json()
+
+    corrected, records, errors = await TaskPlanningPhase._resolve_dag_paths_for_persistence(
+        runner,
+        _feature(),
+        dag,
+        context="slice test",
+        resolution_key="slug:slice-1",
+    )
+
+    assert len(runner.run_calls) == 1  # stale artifact NOT reused -> re-dispatch
+    assert errors == []
+    assert corrected.tasks[0].file_scope[0].path == canon
+    assert len(records) == 1
+    # the fresh resolution replaced the stale persisted artifact
+    assert "T-OLD" not in runner.artifacts.store["dag-path-resolution:slug:slice-1"]

@@ -538,21 +538,50 @@ def _effective_coverage_ids_for_task_planning(
     """
     waived: dict[str, str] = {}
     waiver_sources: dict[str, str] = {}
+    # Normalized (zero-pad + case drift tolerant) lookup so an operator-
+    # recorded waiver id like ``AC-HRDD-039`` still matches the canonical
+    # ``AC-hrdd-39``; the CANONICAL spelling is what gets recorded/persisted.
+    canonical_by_normalized = {
+        _normalize_id_numeric_segments(ac_id).casefold(): ac_id
+        for ac_id in canonical_ac_ids
+    }
+
+    def _canonical_waiver_id(ac_id: str, source: str) -> str | None:
+        resolved = canonical_by_normalized.get(
+            _normalize_id_numeric_segments(ac_id).casefold()
+        )
+        if resolved is None:
+            # Fail LOUD (not silent drop): a waiver that matches no canonical
+            # AC id never lands in the persisted contract's waived_ac_ids and
+            # develop would enforce the AC anyway. Surface it every compile.
+            logger.warning(
+                "coverage waiver %s (source: %s) matches NO canonical AC id "
+                "for %s — waiver NOT applied and NOT persisted; fix the id "
+                "(canonical universe has %d ids)",
+                ac_id,
+                source,
+                slug,
+                len(canonical_ac_ids),
+            )
+        return resolved
+
     if slug == _BFS_SLUG:
         for ac_id, reason in _BFS_EFFECTIVE_COVERAGE_WAIVERS.items():
             if ac_id in canonical_ac_ids:
                 waived[ac_id] = reason
                 waiver_sources[ac_id] = "builtin"
     for ac_id in contract_waived_ac_ids or []:
-        if ac_id in canonical_ac_ids and ac_id not in waived:
-            waived[ac_id] = "waived via planning-contract waived_ac_ids (recorded at the DAG gate)"
-            waiver_sources[ac_id] = "contract"
+        resolved = _canonical_waiver_id(ac_id, "contract")
+        if resolved is not None and resolved not in waived:
+            waived[resolved] = "waived via planning-contract waived_ac_ids (recorded at the DAG gate)"
+            waiver_sources[resolved] = "contract"
     for ac_id in store_waived_ac_ids or []:
-        if ac_id in canonical_ac_ids and ac_id not in waived:
-            waived[ac_id] = (
+        resolved = _canonical_waiver_id(ac_id, "store")
+        if resolved is not None and resolved not in waived:
+            waived[resolved] = (
                 f"waived via planning-waivers:{slug} store key (operator-approved waiver)"
             )
-            waiver_sources[ac_id] = "store"
+            waiver_sources[resolved] = "store"
     for ac_id in sorted(waived):
         logger.warning(
             "coverage waiver applied: %s (source: %s) — %s [%s]",
@@ -673,6 +702,77 @@ async def _load_dag_packing_envelope_section(
     )
 
 
+SLICE_CONTRACT_AUGMENTS_KEY_PREFIX = "dag-slice-augments"
+
+
+class SliceContractAugment(BaseModel):
+    """One operator-pinned ADDITIVE augment for a named task-planning slice.
+
+    Used to materialize scope the deterministic plan-derived partition cannot
+    see (e.g. a mandated step with no ``### STEP-x`` heading in the plan, or
+    PRD requirements cited by no step section). Strictly additive — augments
+    can only widen a slice's contract, never remove or replace ids."""
+
+    add_step_ids: list[str] = PydanticField(default_factory=list)
+    add_step_titles: list[str] = PydanticField(default_factory=list)
+    add_requirement_ids: list[str] = PydanticField(default_factory=list)
+    add_journey_ids: list[str] = PydanticField(default_factory=list)
+
+
+async def _load_slice_contract_augments(
+    runner: WorkflowRunner,
+    feature: Feature,
+    slug: str,
+) -> dict[str, SliceContractAugment]:
+    """Load operator-pinned slice-contract augments from the
+    ``dag-slice-augments:{slug}`` store key.
+
+    The key is written only by the operator/driver through the artifact-store
+    path; key presence is the opt-in — there is no env flag (same pattern as
+    ``planning-waivers:{slug}`` / ``dag-packing-envelope``). Expected value:
+    JSON ``{"slices": {"slice-5": {"add_step_ids": ["STEP-13"],
+    "add_requirement_ids": ["REQ-30"]}}, "decisions": ["D-246"],
+    "reason": "..."}``.
+
+    Missing/empty key → ``{}``. A PRESENT but malformed payload raises
+    RuntimeError: silently dropping an operator pin would burn a full
+    planning re-run before anyone noticed (no-silent-degradation)."""
+    key = f"{SLICE_CONTRACT_AUGMENTS_KEY_PREFIX}:{slug}"
+    try:
+        text = await runner.artifacts.get(key, feature=feature)
+    except Exception:
+        logger.debug("slice contract augments key %s unavailable", key, exc_info=True)
+        return {}
+    if not text or not text.strip():
+        return {}
+    try:
+        payload = _json.loads(text)
+        slices_payload = payload.get("slices") if isinstance(payload, dict) else None
+        if not isinstance(slices_payload, dict) or not slices_payload:
+            raise ValueError("payload must be an object with a non-empty 'slices' map")
+        augments = {
+            str(slice_id): SliceContractAugment.model_validate(augment)
+            for slice_id, augment in slices_payload.items()
+        }
+    except Exception as exc:
+        raise RuntimeError(
+            f"operator slice-contract augments at {key} are malformed and would "
+            f"be silently dropped: {exc}. Fix the store key (expected "
+            '{"slices": {"<slice-id>": {"add_step_ids": [...], '
+            '"add_requirement_ids": [...]}}}) or delete it.'
+        ) from exc
+    decisions = payload.get("decisions") if isinstance(payload, dict) else None
+    logger.info(
+        "slice contract augments store key %s active for slices %s "
+        "(decisions: %s; reason: %s)",
+        key,
+        ", ".join(sorted(augments)),
+        ", ".join(str(d) for d in decisions) if isinstance(decisions, list) else "none",
+        (payload.get("reason") if isinstance(payload, dict) else None) or "none",
+    )
+    return augments
+
+
 async def _load_migrated_test_plan_sidecar_ac_ids(
     runner: WorkflowRunner,
     feature: Feature,
@@ -777,15 +877,32 @@ async def _validate_verification_gates_coverage(
     if contract_matches_canonical_ac_ids:
         # The contract fast-path bypasses the effective-coverage resolver;
         # union the store-key waivers in here too (additive, loudly logged).
+        # Same normalized matching + loud-miss rule as the resolver path.
+        real_by_normalized = {
+            _normalize_id_numeric_segments(real_id).casefold(): real_id
+            for real_id in real_ac_ids
+        }
         for ac_id in store_waived_ac_ids:
-            if ac_id in real_ac_ids and ac_id not in waived_ac_ids:
-                waived_ac_ids[ac_id] = (
+            resolved = real_by_normalized.get(
+                _normalize_id_numeric_segments(ac_id).casefold()
+            )
+            if resolved is None:
+                logger.warning(
+                    "coverage waiver %s (source: store) matches NO canonical AC id "
+                    "for %s — waiver NOT applied; fix the id in planning-waivers:%s",
+                    ac_id,
+                    slug,
+                    slug,
+                )
+                continue
+            if resolved not in waived_ac_ids:
+                waived_ac_ids[resolved] = (
                     f"waived via planning-waivers:{slug} store key (operator-approved waiver)"
                 )
                 logger.warning(
                     "coverage waiver applied: %s (source: store) — %s [%s]",
-                    ac_id,
-                    waived_ac_ids[ac_id],
+                    resolved,
+                    waived_ac_ids[resolved],
                     slug,
                 )
     effective_ac_ids = set(real_ac_ids) - set(waived_ac_ids)
@@ -1911,6 +2028,24 @@ class TaskPlanningPhase(Phase):
             if "STEP-17" in atomic_by_step_id and "STEP-17" not in manifest_step_ids:
                 forced_step_ids["slice-4"] = list(_BFS_SLICE4_EXPANDED_STEPS)
 
+        # Operator-pinned ADDITIVE slice-contract augments (generic successor
+        # of the _BFS_SLUG forced-steps hardcode above): widen named slices
+        # with steps/requirements the deterministic partition cannot derive
+        # from the plan markdown (phantom mandated steps, orphan PRD REQs).
+        # Applied AFTER the atomic rebuild below so the rebuild never wipes
+        # them; idempotent (pure set-union) across normalize passes.
+        augments = await _load_slice_contract_augments(runner, feature, manifest.slug)
+        unknown_augment_slice_ids = sorted(
+            set(augments) - {slice_info.slice_id for slice_info in manifest.slices}
+        )
+        if unknown_augment_slice_ids:
+            raise RuntimeError(
+                f"operator slice-contract augments for {manifest.slug} target "
+                f"unknown slice id(s) {unknown_augment_slice_ids}; manifest has "
+                f"{sorted(slice_info.slice_id for slice_info in manifest.slices)}. "
+                "Fix the dag-slice-augments store key before re-running."
+            )
+
         manifest_changed = False
         semantic_changes = False
         normalized_slice_ids: set[str] = set()
@@ -1931,7 +2066,34 @@ class TaskPlanningPhase(Phase):
                 else:
                     source_slice = slice_info.model_copy(deep=True)
 
+            augment = augments.get(slice_info.slice_id)
+            if augment is not None and augment.add_step_ids:
+                missing_step_ids = [
+                    step_id
+                    for step_id in augment.add_step_ids
+                    if step_id not in source_slice.step_ids
+                ]
+                if missing_step_ids:
+                    # Step additions go through source_slice so the existing
+                    # reopen logic (step_ids changed -> fragment invalidated)
+                    # treats them exactly like the forced-step path.
+                    source_slice = source_slice.model_copy(
+                        update={"step_ids": source_slice.step_ids + missing_step_ids}
+                    )
+
             rebuilt_slice = cls._merge_atomic_slices_for_existing_slice(source_slice, atomic_by_step_id)
+            if augment is not None:
+                rebuilt_slice = cls._apply_slice_contract_augment(rebuilt_slice, augment)
+                if rebuilt_slice.model_dump() != slice_info.model_dump():
+                    logger.warning(
+                        "operator slice-contract augment applied to %s/%s: "
+                        "+steps %s, +requirements %s, +journeys %s",
+                        manifest.slug,
+                        slice_info.slice_id,
+                        augment.add_step_ids or "[]",
+                        augment.add_requirement_ids or "[]",
+                        augment.add_journey_ids or "[]",
+                    )
             slice_changed = rebuilt_slice.model_dump() != slice_info.model_dump()
             ownership_changed = (
                 set(cls._legacy_slice_owned_acceptance_ids(source_slice))
@@ -1939,8 +2101,15 @@ class TaskPlanningPhase(Phase):
                 or set(cls._slice_supporting_acceptance_ids(source_slice))
                 != set(rebuilt_slice.supporting_acceptance_criterion_ids)
             )
+            augment_widens_traceability = augment is not None and (
+                not set(augment.add_requirement_ids).issubset(set(slice_info.requirement_ids))
+                or not set(augment.add_journey_ids).issubset(set(slice_info.journey_ids))
+            )
             reopen_required = (
                 slice_info.step_ids != source_slice.step_ids
+                # A requirement/journey augment widens the slice's coverage
+                # obligation — an already-planned fragment cannot satisfy it.
+                or augment_widens_traceability
                 or (
                     ownership_changed
                     and bool(
@@ -3420,6 +3589,49 @@ class TaskPlanningPhase(Phase):
                         for atomic_slice in atomic_children
                         for source_family in atomic_slice.required_reference_sources
                     ],
+                ),
+            }
+        )
+
+    @classmethod
+    def _apply_slice_contract_augment(
+        cls,
+        slice_info: TaskPlanningSlice,
+        augment: SliceContractAugment,
+    ) -> TaskPlanningSlice:
+        """Apply one operator-pinned augment to a (rebuilt) slice — pure
+        additive union, deterministic and idempotent. Recomputes the slice
+        contract digest from the FINAL field values so contract-drift
+        detection sees the augmented scope."""
+        step_ids = list(slice_info.step_ids) + [
+            step_id for step_id in augment.add_step_ids if step_id not in slice_info.step_ids
+        ]
+        step_titles = list(slice_info.step_titles) + [
+            title for title in augment.add_step_titles if title not in slice_info.step_titles
+        ]
+        requirement_ids = sorted(set(slice_info.requirement_ids) | set(augment.add_requirement_ids))
+        journey_ids = sorted(set(slice_info.journey_ids) | set(augment.add_journey_ids))
+        if (
+            step_ids == slice_info.step_ids
+            and step_titles == slice_info.step_titles
+            and requirement_ids == slice_info.requirement_ids
+            and journey_ids == slice_info.journey_ids
+        ):
+            return slice_info
+        return slice_info.model_copy(
+            update={
+                "step_ids": step_ids,
+                "step_titles": step_titles,
+                "requirement_ids": requirement_ids,
+                "journey_ids": journey_ids,
+                "slice_contract_digest": cls._slice_contract_digest(
+                    step_ids=step_ids,
+                    requirement_ids=requirement_ids,
+                    journey_ids=journey_ids,
+                    owned_acceptance_criterion_ids=slice_info.owned_acceptance_criterion_ids,
+                    supporting_acceptance_criterion_ids=slice_info.supporting_acceptance_criterion_ids,
+                    global_obligation_ac_ids=slice_info.global_obligation_ac_ids,
+                    required_reference_sources=slice_info.required_reference_sources,
                 ),
             }
         )
@@ -5631,42 +5843,123 @@ class TaskPlanningPhase(Phase):
                 tasks = ", ".join(f"`{item}`" for item in task_ids) or "_no tasks_"
                 lines.append(f"- `{slug}` / `{local_requirement_id}` -> {tasks}")
 
+        # Contract waivers (operator-approved): surface the ACTIVE waiver set
+        # so the gate reviewer never files coverage findings against ACs the
+        # operator already waived (churn / digest-stall class).
         lines.extend(
             [
                 "",
-                "## SF-14 Revisit Checkpoints",
+                "## Contract Waivers (operator-approved)",
                 "",
-                "SF-14 / `review-phase-views` default-variant implementation is "
-                "explicitly linked to the gate-review revisit decision before "
-                "hardening the broader bugflow/Kanban variants.",
-                "",
-                "- Revisit anchors: `D-GR-DAG-1`, `REVISIT-bugflow-kanban`, `D-883`, `D-887`, `D-7`",
+                "Acceptance criteria listed below are operator-waived "
+                "(waivers-as-decisions) and EXCLUDED from coverage "
+                "obligations. Do NOT file findings demanding task coverage, "
+                "stub tasks, or verification_gates for them.",
                 "",
             ]
         )
-        for task_id in _SF14_DEFAULT_VARIANT_TASK_IDS:
+        waiver_rows: list[str] = []
+        for subfeature in decomposition.subfeatures:
+            slug = (subfeature.slug or "").strip()
+            if not slug:
+                continue
+            contract_waived: list[str] = []
+            contract_text = await runner.artifacts.get(
+                f"dag-contract:{slug}", feature=feature
+            )
+            if contract_text:
+                try:
+                    contract_waived = SubfeaturePlanningContract.model_validate_json(
+                        contract_text
+                    ).waived_ac_ids
+                except Exception:
+                    logger.debug(
+                        "dag-contract:%s unparsable while collecting gate waiver surfaces",
+                        slug,
+                        exc_info=True,
+                    )
+            store_waived = await _load_planning_waivers(runner, feature, slug)
+            for ac_id in sorted(set(contract_waived), key=cls._dag_gate_sort_key):
+                waiver_rows.append(f"- `{ac_id}` (`{slug}`) — source: dag-contract waived_ac_ids")
+            for ac_id in sorted(
+                set(store_waived) - set(contract_waived), key=cls._dag_gate_sort_key
+            ):
+                waiver_rows.append(
+                    f"- `{ac_id}` (`{slug}`) — source: planning-waivers:{slug} store key"
+                )
+        lines.extend(waiver_rows or ["- _No contract waivers recorded._"])
+
+        # Operator-pinned packing envelope: the reviewer must verify against
+        # the same envelope the authoring agents were given (5eaf2dc loader).
+        envelope_section = await _load_dag_packing_envelope_section(runner, feature)
+        if envelope_section:
+            lines.extend(["", envelope_section.rstrip()])
+
+        if cls._sf14_surfaces_apply(decomposition):
             lines.extend(
                 [
-                    f"- `{task_id}`",
-                    "  - revisit_checkpoint: D-GR-DAG-1",
-                    "  - revisit_note: Revisit `REVISIT-bugflow-kanban` and related "
-                    "`D-883`, `D-887`, `D-7` decisions before broadening beyond "
-                    "the default variant.",
+                    "",
+                    "## SF-14 Revisit Checkpoints",
+                    "",
+                    "SF-14 / `review-phase-views` default-variant implementation is "
+                    "explicitly linked to the gate-review revisit decision before "
+                    "hardening the broader bugflow/Kanban variants.",
+                    "",
+                    "- Revisit anchors: `D-GR-DAG-1`, `REVISIT-bugflow-kanban`, `D-883`, `D-887`, `D-7`",
+                    "",
                 ]
             )
+            for task_id in _SF14_DEFAULT_VARIANT_TASK_IDS:
+                lines.extend(
+                    [
+                        f"- `{task_id}`",
+                        "  - revisit_checkpoint: D-GR-DAG-1",
+                        "  - revisit_note: Revisit `REVISIT-bugflow-kanban` and related "
+                        "`D-883`, `D-887`, `D-7` decisions before broadening beyond "
+                        "the default variant.",
+                    ]
+                )
         lines.append(_ROOT_DAG_GATE_SURFACES_END)
         return "\n".join(lines).rstrip() + "\n"
 
     @classmethod
-    def _validate_root_dag_gate_surfaces(cls, compiled_text: str) -> None:
+    def _sf14_surfaces_apply(cls, decomposition: SubfeatureDecomposition) -> bool:
+        """The SF-14 revisit surfaces are pinned to PRIOR-FEATURE task ids;
+        emit/require them only when this feature's decomposition actually
+        contains the owning subfeature (derived from the pinned task-id
+        prefixes — no project tokens beyond the existing pins)."""
+        slugs = {
+            (subfeature.slug or "").strip()
+            for subfeature in decomposition.subfeatures
+        }
+        slugs.discard("")
+        return any(
+            task_id.startswith(slug + "-")
+            for slug in slugs
+            for task_id in _SF14_DEFAULT_VARIANT_TASK_IDS
+        )
+
+    @classmethod
+    def _validate_root_dag_gate_surfaces(
+        cls,
+        compiled_text: str,
+        *,
+        expect_sf14_surfaces: bool = True,
+    ) -> None:
         required_tokens = [
             "## Aggregated Requirement Coverage (feature-level)",
             "zero_uncovered:",
             "uncovered_feature_requirements",
-            "D-GR-DAG-1",
-            "REVISIT-bugflow-kanban",
-            *_SF14_DEFAULT_VARIANT_TASK_IDS,
+            "## Contract Waivers (operator-approved)",
         ]
+        if expect_sf14_surfaces:
+            required_tokens.extend(
+                [
+                    "D-GR-DAG-1",
+                    "REVISIT-bugflow-kanban",
+                    *_SF14_DEFAULT_VARIANT_TASK_IDS,
+                ]
+            )
         missing = [token for token in required_tokens if token not in compiled_text]
         if missing:
             raise RuntimeError(
@@ -5676,9 +5969,13 @@ class TaskPlanningPhase(Phase):
 
     @classmethod
     def _root_dag_header_scope(cls, compiled_text: str) -> str:
+        # Generic subfeature-boundary probes (first SF heading or SF marker of
+        # ANY slug) — the prior literal probes were prior-feature artifacts
+        # ('Cluster 1' / 'vscode-fork-shell') and degenerated to whole-doc
+        # scope on other features.
         markers = [
             marker
-            for token in ("\n## Subfeature: Cluster 1", "\n<!-- SF: vscode-fork-shell -->")
+            for token in ("\n## Subfeature:", "\n<!-- SF: ")
             if (marker := compiled_text.find(token)) >= 0
         ]
         if not markers:
@@ -5719,7 +6016,10 @@ class TaskPlanningPhase(Phase):
             decomposition,
         )
         transformed = base_text.rstrip() + "\n\n" + generated
-        cls._validate_root_dag_gate_surfaces(transformed)
+        cls._validate_root_dag_gate_surfaces(
+            transformed,
+            expect_sf14_surfaces=cls._sf14_surfaces_apply(decomposition),
+        )
         cls._validate_root_dag_header_consistency(transformed)
         return transformed
 
@@ -5937,18 +6237,34 @@ class TaskPlanningPhase(Phase):
                 decomposition,
             )
             dag_json = dag.model_dump_json(indent=2)
-        except RuntimeError:
+        except RuntimeError as exc:
             if approved_text is None:
                 raise
+            # The ONLY tolerated fallback is approved_text that is ITSELF a
+            # valid executable ImplementationDAG (e.g. resume from a sealed
+            # JSON artifact). Persisting gate MARKDOWN under the 'dag' key
+            # silently hands develop an unexecutable artifact — the single
+            # most expensive place to discover a planning defect. Fail loud.
             stripped = approved_text.strip()
+            dag_json = None
             if stripped.startswith("{"):
                 try:
                     dag = ImplementationDAG.model_validate_json(stripped)
                     dag_json = dag.model_dump_json(indent=2)
                 except Exception:
-                    dag_json = approved_text
-            else:
-                dag_json = approved_text
+                    dag_json = None
+            if dag_json is None:
+                raise RuntimeError(
+                    "Root DAG seal failed and the gate-approved text is not "
+                    "valid ImplementationDAG JSON — refusing to persist "
+                    "markdown as the executable 'dag' artifact. Fix the "
+                    f"underlying seal error and re-run: {exc}"
+                ) from exc
+            logger.warning(
+                "Root DAG rebuild failed (%s) — persisting the gate-approved "
+                "text, which IS valid ImplementationDAG JSON",
+                exc,
+            )
         put_artifact = getattr(runner.artifacts, "put", None)
         if callable(put_artifact):
             await put_artifact("dag", dag_json, feature=feature)
@@ -6039,6 +6355,12 @@ class TaskPlanningPhase(Phase):
                 context_keys=["project", "scope", "decomposition"],
                 compiled_transform=compiled_transform,
                 revision_plan_handler=revision_plan_handler,
+                # Lossless recompiles only: the free-merge path has truncated
+                # large compiles before (plan regroup S3a/S6 drop; design
+                # cycle-5 Bundle-2 drop) — same hardening as subfeature.py /
+                # plan_review.py call sites.
+                deterministic_final_merge=True,
+                incremental_compile=True,
             )
             # DB write now happens inside interview_gate_review() on approval.
             state.dag = await self._persist_approved_root_implementation_dag(
@@ -6188,6 +6510,12 @@ class TaskPlanningPhase(Phase):
             broad_key="dag:strategy",
             final_key="dag",
             compiled_transform=compiled_transform,
+            # Lossless merge: never let an LLM regroup/final-merge re-emit the
+            # whole DAG corpus (truncation incident class — see _helpers.py
+            # _assert_compile_complete notes); deterministic concatenation +
+            # per-source incremental reuse instead.
+            deterministic_final_merge=True,
+            incremental_compile=True,
         )
 
         # ── Step 6: Interview-Based Gate Review ──
@@ -6204,6 +6532,9 @@ class TaskPlanningPhase(Phase):
             context_keys=["project", "scope", "decomposition"],
             compiled_transform=compiled_transform,
             revision_plan_handler=revision_plan_handler,
+            # Lossless gate-cycle recompiles (same rationale as Step 5).
+            deterministic_final_merge=True,
+            incremental_compile=True,
         )
 
         # DB write now happens inside interview_gate_review() on approval.

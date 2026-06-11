@@ -14732,7 +14732,7 @@ async def _resolve_group_task_paths(
     # fix) even if some sibling `create` is uncertain. Ambiguous decisions are
     # left unchanged and logged — never guessed (that produced the 199-loop).
     corrected, rewrites = apply_path_resolution(
-        scoped, resolution, raise_on_ambiguous=False
+        scoped, resolution, raise_on_ambiguous=False, repos_root=repos_root
     )
     if not rewrites:
         return group_tasks

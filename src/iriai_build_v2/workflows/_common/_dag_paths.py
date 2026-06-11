@@ -127,6 +127,7 @@ def _create_parent_grounded(
 _BASENAME_SCAN_PRUNE_DIRS = frozenset({
     ".git", "node_modules", "dist", "build", "out", ".venv", "venv",
     "__pycache__", ".next", ".turbo", "coverage", "vendor", ".cache",
+    ".iriai",  # a checkout may embed workspace mirrors — never scan them
 })
 
 
