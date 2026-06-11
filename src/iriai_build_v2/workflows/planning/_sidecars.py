@@ -84,10 +84,34 @@ _PRD_JOURNEY_HEADING_PATTERN = re.compile(
     r"(?m)^#{3,4}\s+(?:Journey\s+)?(J-[A-Za-z0-9.-]+)(?:\s+\([^)]*\))?:\s*(.+)$"
 )
 _METADATA_LINE_PATTERN = re.compile(r"(?m)^\s*-\s+\*\*([^*]+)\*\*\s*(.+?)\s*$")
-_PLAIN_METADATA_LINE_PATTERN = re.compile(r"(?m)^\s*-\s+([A-Za-z][A-Za-z0-9_ /-]+):\s*(.+?)\s*$")
-_MARKDOWN_AC_BLOCK_PATTERN = re.compile(
-    r"(?ms)^\s*-\s+\*\*(AC-[A-Za-z0-9][A-Za-z0-9-]*)\*\*\s*[—-]\s*(.*?)\s*$"
+_PLAIN_METADATA_LINE_PATTERN = re.compile(
+    # Labels may be backticked (`linked_requirement`: ...) — several live test
+    # plans write metadata that way; un-backticked labels parse unchanged.
+    r"(?m)^\s*-\s+`?([A-Za-z][A-Za-z0-9_ /-]+)`?:\s*(.+?)\s*$"
 )
+_MARKDOWN_AC_BLOCK_PATTERN = re.compile(
+    # AC definitions appear BOTH as list items (`- **AC-x** — ...`) and as
+    # bold paragraphs (`**AC-x** — ...`, no leading bullet). The latter form
+    # parsed to ZERO acceptance criteria (the degenerate-sidecar family:
+    # 5 of 7 kaya test-plan sidecars) — the bullet is optional.
+    r"(?ms)^\s*(?:-\s+)?\*\*(AC-[A-Za-z0-9][A-Za-z0-9-]*)\*\*\s*[—-]\s*(.*?)\s*$"
+)
+# The full definition-form family observed across live test plans. Each yields
+# (id, single-line description); the parser merges matches across all forms and
+# dedups by id (first occurrence wins). A form missing from this list is the
+# degenerate-sidecar class: 0 parsed ACs while the markdown defines dozens.
+_MARKDOWN_AC_BLOCK_PATTERNS = [
+    # `- **AC-x** — desc` / `**AC-x** — desc` (dash outside the bold span)
+    _MARKDOWN_AC_BLOCK_PATTERN,
+    # `**AC-x — desc**` (dash INSIDE the bold span; trailing `· refs` ignored)
+    re.compile(
+        r"(?m)^\s*(?:-\s+)?\*\*(AC-[A-Za-z0-9][A-Za-z0-9-]*)\s+[—-]\s+(.*?)\*\*"
+    ),
+    # `### AC-x — desc` (heading-defined criteria)
+    re.compile(
+        r"(?m)^#{2,6}\s+(AC-[A-Za-z0-9][A-Za-z0-9-]*)\s*[—-]\s*(.*?)\s*$"
+    ),
+]
 _MARKDOWN_SCENARIO_HEADING_PATTERN = re.compile(r"(?m)^###\s+(.+?)\s*$")
 _BOLD_METADATA_SECTION_PATTERN = re.compile(
     r"(?ms)^(?:\s*-\s+)?\*\*([^*]+?)\s*(?::|\.)\*\*\s*(.*?)(?=^\s*(?:-\s+)?\*\*[^*]+?\s*(?::|\.)\*\*|\Z)"
@@ -1245,14 +1269,24 @@ def _parse_technical_plan_from_markdown(markdown: str, artifact_key: str) -> Tec
 def _parse_test_plan_from_markdown(markdown: str, artifact_key: str) -> TestPlan:
     section_text = _markdown_h2_body(markdown, "Acceptance Criteria")
     criteria: list[TestAcceptanceCriterion] = []
-    matches = list(_MARKDOWN_AC_BLOCK_PATTERN.finditer(section_text))
+    found: dict[str, tuple[int, str, str]] = {}
+    for pattern in _MARKDOWN_AC_BLOCK_PATTERNS:
+        for candidate in pattern.finditer(section_text):
+            candidate_id = _strip_markdown_inline_formatting(candidate.group(1).strip())
+            if candidate_id and candidate_id not in found:
+                found[candidate_id] = (
+                    candidate.start(),
+                    candidate_id,
+                    candidate.group(2),
+                )
+    matches = sorted(found.values())
     seen_criterion_ids: set[str] = set()
     for order, match in enumerate(matches, start=1):
-        block_start = match.start()
-        block_end = matches[order].start() if order < len(matches) else len(section_text)
+        block_start = match[0]
+        block_end = matches[order][0] if order < len(matches) else len(section_text)
         block = section_text[block_start:block_end]
         metadata = _parse_markdown_metadata_map(block)
-        criterion_id = _strip_markdown_inline_formatting(match.group(1).strip())
+        criterion_id = match[1]
         linked_journey_step_ids = sorted(
             {
                 token
@@ -1276,7 +1310,7 @@ def _parse_test_plan_from_markdown(markdown: str, artifact_key: str) -> TestPlan
         )
         criterion = TestAcceptanceCriterion(
             id=criterion_id,
-            description=match.group(2).strip(),
+            description=match[2].strip(),
             linked_requirement=metadata.get("linked_requirement", ""),
             verification_method=metadata.get("verification_method", ""),
             pass_condition=metadata.get("pass_condition", ""),

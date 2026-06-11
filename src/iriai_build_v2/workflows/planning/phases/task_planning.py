@@ -1298,6 +1298,24 @@ class TaskPlanningPhase(Phase):
                     slug,
                 )
                 return False
+            if (
+                artifact_key.startswith("test-plan:")
+                and not getattr(sidecar.content, "acceptance_criteria", None)
+                and _extract_ac_ids(current_text)
+            ):
+                # DEGENERATE sidecar from a parser-era gap (0 acceptance
+                # criteria while the source defines some): the source hash
+                # matches, so only this condition can trigger the re-backfill
+                # that the fixed parser now satisfies. Self-clearing — once
+                # regenerated with criteria, this branch never fires again.
+                logger.warning(
+                    "planning sidecar for %s is DEGENERATE (0 acceptance "
+                    "criteria; source defines %d) — re-backfilling %s",
+                    artifact_key,
+                    len(_extract_ac_ids(current_text)),
+                    slug,
+                )
+                return False
         return True
 
     @classmethod

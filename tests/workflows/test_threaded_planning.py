@@ -20090,6 +20090,40 @@ async def test_load_target_texts_degenerate_test_plan_uses_markdown_twin(tmp_pat
     )
 
 
+def test_test_plan_parser_accepts_all_live_definition_forms():
+    """N-11: AC definitions appear in four live forms; a form the sidecar
+    parser misses births a DEGENERATE sidecar (0 ACs) that poisons every
+    downstream consumer (contract, index slice_inputs, excerpts, reconcile)."""
+    from iriai_build_v2.workflows.planning._sidecars import _parse_test_plan_from_markdown
+
+    md = """
+## Acceptance Criteria
+
+- **AC-f-1** — bullet form, dash outside bold.
+  - linked_requirement: REQ-1
+  - pass_condition: bullet ok
+
+**AC-f-2** — paragraph form, dash outside bold.
+- `linked_requirement`: REQ-2
+- `pass_condition`: paragraph ok
+
+**AC-f-3 — dash inside the bold span** · `REQ-3`
+- pass_condition: inside-bold ok
+
+### AC-f-4 — heading-defined criterion
+- **Description:** heading form
+- pass_condition: heading ok
+""".strip()
+    tp = _parse_test_plan_from_markdown(md, "test-plan:forms")
+    ids = [c.id for c in tp.acceptance_criteria]
+    assert ids == ["AC-f-1", "AC-f-2", "AC-f-3", "AC-f-4"], ids
+    by_id = {c.id: c for c in tp.acceptance_criteria}
+    assert by_id["AC-f-1"].pass_condition == "bullet ok"
+    assert by_id["AC-f-2"].pass_condition == "paragraph ok"  # backticked labels
+    assert by_id["AC-f-3"].pass_condition == "inside-bold ok"
+    assert by_id["AC-f-4"].pass_condition == "heading ok"
+
+
 def _step_keyed_manifest() -> "task_planning_module.TaskPlanningSliceManifest":
     slices = [
         task_planning_module.TaskPlanningSlice(
