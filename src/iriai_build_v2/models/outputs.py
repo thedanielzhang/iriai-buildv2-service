@@ -1247,6 +1247,11 @@ class FindingRecord(BaseModel):
     cycle_introduced: int = 0
     cycle_resolved: int = 0
     fix_attempts: list[str] = Field(default_factory=list)
+    # Repo-tree content digest at finding creation (item 4): under
+    # IRIAI_LEDGER_FAIL_LOUD, resolve-by-absence requires the current tree
+    # digest to DIFFER from this one (file-change evidence). Optional and
+    # parse-compatible with pre-existing ledgers (empty = no evidence).
+    tree_digest: str = ""
 
 
 class FindingLedger(BaseModel):

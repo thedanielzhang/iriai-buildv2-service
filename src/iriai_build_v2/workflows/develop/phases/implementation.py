@@ -14792,8 +14792,14 @@ class ImplementationPhase(Phase):
                             f"them in your verdict — they are intentionally deferred.\n\n"
                             f"{deferred}\n"
                         )
-                except Exception:
-                    pass
+                except Exception as exc:
+                    # Item-4: never silently drop the deferred-items context
+                    # from the gate handover — name the artifact loudly.
+                    logger.warning(
+                        "Failed to parse 'enhancement-backlog' for the gate "
+                        "handover deferred-issues section: %s",
+                        exc,
+                    )
 
             contradiction_decisions = await _format_contradiction_decisions_context(
                 runner,
@@ -14881,7 +14887,7 @@ class ImplementationPhase(Phase):
                     logger.info("Suppressed %d duplicate findings from code_reviewer", len(_suppressed))
                 review_verdict, _enhancements = _partition_verdict(review_verdict, "code_reviewer", "post-dag-gate")
                 await _append_enhancements(runner, feature, _enhancements)
-                ledger = _update_ledger(ledger, review_verdict, "code_reviewer", cycle)
+                ledger = _update_ledger(ledger, review_verdict, "code_reviewer", cycle, current_tree_digest=post_dag_gate_tree_digest)
                 await _save_ledger(runner, feature, ledger)
 
             review_verdict = await _coherence_reask_if_incoherent(
@@ -14970,7 +14976,7 @@ class ImplementationPhase(Phase):
                     logger.info("Suppressed %d duplicate findings from security_auditor", len(_suppressed))
                 security_verdict, _enhancements = _partition_verdict(security_verdict, "security_auditor", "post-dag-gate")
                 await _append_enhancements(runner, feature, _enhancements)
-                ledger = _update_ledger(ledger, security_verdict, "security_auditor", cycle)
+                ledger = _update_ledger(ledger, security_verdict, "security_auditor", cycle, current_tree_digest=post_dag_gate_tree_digest)
                 await _save_ledger(runner, feature, ledger)
 
             security_verdict = await _coherence_reask_if_incoherent(
@@ -15151,7 +15157,7 @@ class ImplementationPhase(Phase):
                     logger.info("Suppressed %d duplicate findings from qa_engineer", len(_suppressed))
                 qa_verdict, _enhancements = _partition_verdict(qa_verdict, "qa_engineer", "post-dag-gate")
                 await _append_enhancements(runner, feature, _enhancements)
-                ledger = _update_ledger(ledger, qa_verdict, "qa_engineer", cycle)
+                ledger = _update_ledger(ledger, qa_verdict, "qa_engineer", cycle, current_tree_digest=post_dag_gate_tree_digest)
                 await _save_ledger(runner, feature, ledger)
 
             qa_verdict = await _coherence_reask_if_incoherent(
@@ -15242,7 +15248,7 @@ class ImplementationPhase(Phase):
                     logger.info("Suppressed %d duplicate findings from integration_tester", len(_suppressed))
                 integration_verdict, _enhancements = _partition_verdict(integration_verdict, "integration_tester", "post-dag-gate")
                 await _append_enhancements(runner, feature, _enhancements)
-                ledger = _update_ledger(ledger, integration_verdict, "integration_tester", cycle)
+                ledger = _update_ledger(ledger, integration_verdict, "integration_tester", cycle, current_tree_digest=post_dag_gate_tree_digest)
                 await _save_ledger(runner, feature, ledger)
 
             integration_verdict = await _coherence_reask_if_incoherent(
@@ -15346,7 +15352,7 @@ class ImplementationPhase(Phase):
                     logger.info("Suppressed %d duplicate findings from verifier", len(_suppressed))
                 verifier_verdict, _enhancements = _partition_verdict(verifier_verdict, "verifier", "post-dag-gate")
                 await _append_enhancements(runner, feature, _enhancements)
-                ledger = _update_ledger(ledger, verifier_verdict, "verifier", cycle)
+                ledger = _update_ledger(ledger, verifier_verdict, "verifier", cycle, current_tree_digest=post_dag_gate_tree_digest)
                 await _save_ledger(runner, feature, ledger)
 
             verifier_verdict = await _coherence_reask_if_incoherent(
@@ -38454,6 +38460,124 @@ async def _coherence_reask_if_incoherent(
 # ── Finding ledger ──────────────────────────────────────────────────────────
 
 
+def _ledger_fail_loud_enabled() -> bool:
+    """Item-4 flag (IRIAI_LEDGER_FAIL_LOUD, default OFF).
+
+    OFF preserves today's behavior exactly: a corrupt finding-ledger or
+    enhancement-backlog row silently resets the accumulated state to empty
+    (and the next put overwrites it), resolve-by-absence needs no evidence,
+    and gap suppression has no location guard.
+    """
+    return os.environ.get(LEDGER_FAIL_LOUD_ENV, "").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+def _append_operator_actions_entry(
+    runner: WorkflowRunner, *, title: str, why: str, commands: str, verify: str,
+) -> None:
+    """Prepend a [PENDING] entry to <workspace>/.iriai/OPERATOR-ACTIONS.md.
+
+    Best-effort by design: the durable workflow-blocker artifact is the
+    primary fail-loud channel; this entry is the driver/operator-visible
+    escalation queue (newest first, per the runbook format). Failures here
+    only WARN — they must never mask the quiesce itself.
+    """
+    try:
+        workspace_mgr = runner.services.get("workspace_manager")
+        base = Path(getattr(workspace_mgr, "_base", "") or "") if workspace_mgr else None
+        if not base or not (base / ".iriai").is_dir():
+            logger.warning(
+                "OPERATOR-ACTIONS entry skipped (no workspace .iriai dir): %s",
+                title,
+            )
+            return
+        path = base / ".iriai" / "OPERATOR-ACTIONS.md"
+        from datetime import datetime as _datetime
+
+        ts = _datetime.now().strftime("%Y-%m-%d %H:%M")
+        entry = (
+            f"## [PENDING] {ts} — {title}\n"
+            f"URGENCY: blocking-now (workflow quiesced)\n"
+            f"COMMANDS: {commands}\n"
+            f"WHY: {why}\n"
+            f"VERIFY: {verify}\n"
+            f"RESOLVED:\n\n"
+        )
+        existing = path.read_text(encoding="utf-8") if path.exists() else ""
+        path.write_text(entry + existing, encoding="utf-8")
+    except Exception as exc:  # noqa: BLE001 — never mask the quiesce
+        logger.warning("Failed to write OPERATOR-ACTIONS entry %r: %s", title, exc)
+
+
+async def _quarantine_and_quiesce_corrupt_row(
+    runner: WorkflowRunner,
+    feature: Feature,
+    *,
+    artifact_key: str,
+    raw: object,
+    parse_error: Exception,
+) -> None:
+    """Item-4 fail-loud path for a corrupt durable review-state row.
+
+    Quarantines the corrupt row under a sibling key (never PUTs over it),
+    writes a deterministic workflow-blocker marker, files an OPERATOR-ACTIONS
+    entry, and raises WorkflowQuiesced (typed quiesce). Exit is ONLY through
+    existing channels: the operator repairs/deletes the corrupt row (the
+    quarantine copy preserves it) and restarts the workflow.
+    """
+    raw_text = str(raw)
+    quarantine_key = f"{artifact_key}-quarantine"
+    reason = (
+        f"Corrupt {artifact_key!r} row (parse failure: {parse_error}); "
+        f"row length={len(raw_text)}, prefix={raw_text[:120]!r}. The row was "
+        f"NOT overwritten; a copy is quarantined at {quarantine_key!r}. "
+        "Repair or delete the corrupt row, then resume the workflow."
+    )
+    logger.error("Ledger fail-loud: %s", reason)
+    await runner.artifacts.put(
+        quarantine_key,
+        json.dumps({
+            "source_key": artifact_key,
+            "parse_error": str(parse_error),
+            "row_length": len(raw_text),
+            "raw": raw_text,
+        }, sort_keys=True),
+        feature=feature,
+    )
+    await runner.artifacts.put(
+        f"workflow-blocker:{artifact_key}",
+        json.dumps({
+            "source": artifact_key,
+            "reason": reason,
+            "deterministic_workflow_blocker": True,
+            "operator_required": True,
+        }, indent=2, sort_keys=True),
+        feature=feature,
+    )
+    _append_operator_actions_entry(
+        runner,
+        title=f"Repair corrupt {artifact_key} artifact row (workflow quiesced)",
+        why=reason,
+        commands=(
+            f"Inspect the latest {artifact_key!r} row in the artifact store; "
+            f"restore valid JSON (quarantine copy at {quarantine_key!r}), then "
+            "resume the workflow."
+        ),
+        verify=f"workflow resumes past the {artifact_key} load without re-quiescing",
+    )
+    raise WorkflowQuiesced(
+        phase_name="implementation",
+        reason=reason,
+        metadata={
+            "terminal_state": "workflow_blocked",
+            "deterministic_workflow_blocker": True,
+            "operator_required": True,
+            "source": artifact_key,
+        },
+    )
+
+
 async def _load_ledger(
     runner: WorkflowRunner, feature: Feature,
 ) -> FindingLedger:
@@ -38462,7 +38586,12 @@ async def _load_ledger(
     if raw:
         try:
             return FindingLedger.model_validate_json(raw)
-        except Exception:
+        except Exception as exc:
+            if _ledger_fail_loud_enabled():
+                await _quarantine_and_quiesce_corrupt_row(
+                    runner, feature,
+                    artifact_key="finding-ledger", raw=raw, parse_error=exc,
+                )
             logger.warning("Failed to parse finding ledger — starting fresh")
     return FindingLedger()
 
@@ -38513,11 +38642,20 @@ def _dedup_findings(
         if not is_dup:
             new_concerns.append(c)
 
+    gap_location_guard = _ledger_fail_loud_enabled()
     new_gaps = []
     for g in verdict.gaps:
         is_dup = False
         for r in resolved:
             if _text_overlap(g.description, r.description) > 0.5:
+                # Item-4 (flag ON): gap suppression requires a location match.
+                # Gaps carry no file path, so the category is the only
+                # location-ish key — require a non-empty exact match instead
+                # of suppressing on text overlap alone.
+                if gap_location_guard and not (
+                    g.category and g.category == r.category
+                ):
+                    continue
                 is_dup = True
                 suppressed.append(r)
                 break
@@ -38533,6 +38671,7 @@ def _dedup_findings(
 
 def _update_ledger(
     ledger: FindingLedger, verdict: Verdict, source: str, cycle: int,
+    *, current_tree_digest: str = "",
 ) -> FindingLedger:
     """Add new findings from a verdict, mark resolved ones.
 
@@ -38544,12 +38683,32 @@ def _update_ledger(
     current_descs |= {g.description for g in verdict.gaps}
 
     # Mark previously-open findings from this source as resolved
-    # if they no longer appear in the current verdict
+    # if they no longer appear in the current verdict.
+    # Item-4 (flag ON): resolve-by-absence additionally requires file-change
+    # evidence — the repo tree digest recorded when the finding was created
+    # must differ from the current one (i.e. SOMETHING changed since the
+    # finding was filed). Reviewer omission alone (same tree, or no digest
+    # evidence available at either end) keeps the finding open.
+    require_change_evidence = _ledger_fail_loud_enabled()
     for f in ledger.findings:
         if f.source == source and f.status == "open":
             if not any(
                 _text_overlap(f.description, d) > 0.5 for d in current_descs
             ):
+                if require_change_evidence and not (
+                    f.tree_digest
+                    and current_tree_digest
+                    and f.tree_digest != current_tree_digest
+                ):
+                    logger.warning(
+                        "Ledger fail-loud: NOT auto-resolving %s (%s) — "
+                        "reviewer omission without file-change evidence "
+                        "(finding digest=%s, current digest=%s)",
+                        f.id, f.source,
+                        (f.tree_digest or "<none>")[:12],
+                        (current_tree_digest or "<none>")[:12],
+                    )
+                    continue
                 f.status = "resolved"
                 f.cycle_resolved = cycle
 
@@ -38568,6 +38727,7 @@ def _update_ledger(
                 severity=c.severity,
                 status="open",
                 cycle_introduced=cycle,
+                tree_digest=current_tree_digest,
             ))
             next_id += 1
 
@@ -38581,6 +38741,7 @@ def _update_ledger(
                 category=g.category,
                 status="open",
                 cycle_introduced=cycle,
+                tree_digest=current_tree_digest,
             ))
             next_id += 1
 
@@ -38681,7 +38842,15 @@ async def _append_enhancements(
     if raw:
         try:
             backlog = EnhancementBacklog.model_validate_json(raw)
-        except Exception:
+        except Exception as exc:
+            if _ledger_fail_loud_enabled():
+                # Item-4: never PUT a fresh backlog over a corrupt row —
+                # quarantine + typed quiesce instead of a silent wipe.
+                await _quarantine_and_quiesce_corrupt_row(
+                    runner, feature,
+                    artifact_key="enhancement-backlog", raw=raw,
+                    parse_error=exc,
+                )
             backlog = EnhancementBacklog()
     else:
         backlog = EnhancementBacklog()
