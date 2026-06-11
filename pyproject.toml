@@ -29,3 +29,9 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/iriai_build_v2"]
+
+[tool.pytest.ini_options]
+# Healing-doctrine ratchet (runbook §16, 2026-06-10): a hung await must fail
+# loud, never park a suite for 40+ minutes (select_kqueue_control incident).
+timeout = 300
+timeout_method = "thread"
