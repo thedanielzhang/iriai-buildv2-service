@@ -427,6 +427,43 @@ def test_backstop_modify_class_zero_basename_matches_converts():
     assert res.decisions[0].decision == "create_ok"
 
 
+def test_backstop_read_only_planned_path_with_basename_matches_is_non_fatal():
+    # N-7 (resume48): a READ-ONLY reference exactly matching a path a sibling
+    # task CREATES (e2e/fixtures/auth.ts) must not be failed by unrelated
+    # same-basename files elsewhere on disk — non-fatal pointer, path and
+    # decision left untouched.
+    dag = _dag(
+        _task("C", file_scope=[(E2E_SETUP, "create")], repo_path=""),
+        _task("R", file_scope=[(E2E_SETUP, "read_only")], repo_path=""),
+    )
+    res = DagPathResolution(
+        decisions=[_ambiguous("R", "file_scope[0].path", E2E_SETUP)], ambiguous_count=1,
+    )
+    apply_path_resolution(
+        dag, res, repos_root="/repos",
+        exists=lambda p: p == "/repos/spend-client",
+        find_basename_matches=lambda name: 3,
+    )
+    # Not converted, not raised: a pointer, never an edit target.
+    assert res.decisions[0].decision == "ambiguous"
+    assert dag.tasks[1].file_scope[0].path == E2E_SETUP
+
+
+def test_backstop_read_only_unplanned_path_with_basename_matches_still_raises():
+    # The relaxation is ONLY for exact planned-new matches: a read-only entry
+    # NOT in the planned set with on-disk basename matches still raises
+    # (picking context wrong is real).
+    dag = _dag(_task("R", file_scope=[(PHANTOM, "read_only")], repo_path=""))
+    res = DagPathResolution(
+        decisions=[_ambiguous("R", "file_scope[0].path", PHANTOM)], ambiguous_count=1,
+    )
+    with pytest.raises(AmbiguousDagPath):
+        apply_path_resolution(
+            dag, res, repos_root="/repos", exists=lambda p: False,
+            find_basename_matches=lambda name: 2,
+        )
+
+
 def test_backstop_skips_stale_ambiguous_decision():
     # Persisted resolution reused after a re-plan: the decision's entry no
     # longer exists in the DAG -> skipped (no raise), nothing converted.

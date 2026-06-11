@@ -539,6 +539,23 @@ def apply_path_resolution(
                     lambda name: count_basename_matches(repos_root, name)
                 )
                 if counter(posixpath.basename(original)) > 0:
+                    if action in ("read_only", "read"):
+                        # READ-class citation that EXACTLY matches a planned-new
+                        # path of this DAG: the task reads a file a sibling task
+                        # creates. The exact full-path match is the intent;
+                        # unrelated same-basename files elsewhere on disk do not
+                        # make a verbatim planned-path citation ambiguous. It is
+                        # never an edit target — leave the path untouched
+                        # (non-fatal pointer). Modify scopes keep the
+                        # never-guess rule below.
+                        logger.warning(
+                            "DAG path resolver backstop: %s:%s=%r is a read-only "
+                            "reference exactly matching a planned NEW file created "
+                            "by this DAG itself — leaving unresolved (non-fatal "
+                            "pointer to a sibling-created file)",
+                            d.task_id, d.field, d.original,
+                        )
+                        continue
                     logger.warning(
                         "DAG path resolver backstop: %s:%s=%r matches a planned "
                         "NEW file but same-basename files exist on disk — "
