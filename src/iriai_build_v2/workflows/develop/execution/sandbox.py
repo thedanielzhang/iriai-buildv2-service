@@ -18,8 +18,10 @@ import re
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 import threading
+import time
 import weakref
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -257,6 +259,44 @@ _SANDBOX_LOCAL_CLONE_ENV = "IRIAI_SANDBOX_LOCAL_CLONE"
 # anew.  Off by default; enable with IRIAI_SANDBOX_REUSE_ON_RETRY=1.
 _SANDBOX_REUSE_ON_RETRY_ENV = "IRIAI_SANDBOX_REUSE_ON_RETRY"
 
+# Sandbox template + APFS clonefile provisioning: build ONE fully-provisioned
+# template (git clone + dependency install) per (feature, repo, digest) and
+# provision each task sandbox from it via `cp -c -R` (APFS clonefile(2):
+# seconds + CoW metadata instead of ~minutes + gigabytes per task).  The digest
+# keys the template by base commit sha + the content of every package lockfile
+# present in the source worktree's package roots, so a mid-run lockfile change
+# (implementer tasks CAN edit package.json/lockfiles) yields a new digest and
+# exactly one template rebuild at the next allocation.  Default ON; set
+# IRIAI_SANDBOX_TEMPLATE_COW=0 to restore the legacy full-provisioning path
+# verbatim.  ANY template/clonefile failure logs a loud WARNING and falls back
+# to the legacy path — never a corrupted sandbox.
+_SANDBOX_TEMPLATE_COW_ENV = "IRIAI_SANDBOX_TEMPLATE_COW"
+
+# How long a concurrent allocator waits (seconds) for another builder's
+# in-flight template build of the same digest before giving up and falling
+# back to legacy provisioning.  A builder lockdir older than twice this value
+# is treated as stale (crashed builder) and reclaimed.
+_SANDBOX_TEMPLATE_WAIT_ENV = "IRIAI_SANDBOX_TEMPLATE_BUILD_WAIT_S"
+_DEFAULT_SANDBOX_TEMPLATE_WAIT_S = 900.0
+
+_TEMPLATE_DIRNAME = "sandbox-template"
+_TEMPLATE_REPO_DIRNAME = "repo"
+_TEMPLATE_MANIFEST_NAME = "template-manifest.json"
+_TEMPLATE_SCHEMA_VERSION = "sandbox-template-v1"
+# Lockfiles hashed into the template digest, checked at the repo root and at
+# every profile package root (the exact set of roots provisioning touches).
+_TEMPLATE_LOCKFILE_NAMES = (
+    "pnpm-lock.yaml",
+    "package-lock.json",
+    "poetry.lock",
+    "uv.lock",
+)
+_TEMPLATE_LOCKFILE_GLOBS = ("requirements*.txt",)
+# Templates older than this (and not the one just built) are pruned after a
+# successful build.  Generous vs the seconds-scale clonefile so an in-flight
+# `cp -c -R` from an older template can never lose its source mid-copy.
+_TEMPLATE_PRUNE_GRACE_S = 3600.0
+
 
 def _sandbox_command_timeout_s() -> float:
     """Hard timeout for a single sandbox subprocess (git) command.
@@ -333,6 +373,29 @@ def _git_clone_args(source: Path, dest: Path) -> list[str]:
     else:
         clone_flag = "--no-local"
     return ["clone", clone_flag, str(source), str(dest)]
+
+
+def _sandbox_template_cow_enabled() -> bool:
+    """Return True when template + APFS clonefile provisioning is on (default).
+
+    Set ``IRIAI_SANDBOX_TEMPLATE_COW=0`` to restore the legacy per-task full
+    clone + dependency-install provisioning path verbatim."""
+    raw = os.environ.get(_SANDBOX_TEMPLATE_COW_ENV, "1")
+    return str(raw).strip() not in ("0", "false", "False", "FALSE", "no", "No", "NO")
+
+
+def _sandbox_template_wait_s() -> float:
+    """Seconds to wait on another builder's in-flight template build."""
+    raw = os.environ.get(_SANDBOX_TEMPLATE_WAIT_ENV)
+    if raw is None:
+        return _DEFAULT_SANDBOX_TEMPLATE_WAIT_S
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return _DEFAULT_SANDBOX_TEMPLATE_WAIT_S
+    if 0 < value < 1e9:
+        return value
+    return _DEFAULT_SANDBOX_TEMPLATE_WAIT_S
 
 
 class SandboxReleaseError(SandboxError):
@@ -764,30 +827,51 @@ class SandboxRunner:
                                 f"repo destination already exists before manifest: {repo_root}"
                             )
                         repo_root.parent.mkdir(parents=True, exist_ok=True)
-                        # Run the clone off the event loop. `git clone --no-local` of
-                        # a large repo takes minutes (or wedges); calling it inline
-                        # froze the entire asyncio loop (no watchdog/Slack/other
-                        # workflow could run) — the bridge "hang". to_thread keeps the
-                        # loop responsive; the per-command timeout bounds a wedged git.
-                        # When source and dest are on the same filesystem,
-                        # _git_clone_args() selects --local (hardlinked objects,
-                        # near-instant) instead of --no-local; falls back automatically
-                        # across filesystem boundaries or when IRIAI_SANDBOX_LOCAL_CLONE=0.
-                        await asyncio.to_thread(
-                            self._git_text,
-                            sandbox_root,
-                            _git_clone_args(source_resolved, repo_root),
+                        # Fast path (IRIAI_SANDBOX_TEMPLATE_COW, default ON): one
+                        # fully-provisioned template per (feature, repo, lockfile+
+                        # base-commit digest), per-task provisioning is an APFS
+                        # clonefile of it (~seconds, ~MB of CoW metadata).  Off the
+                        # event loop: a digest miss builds the template inline
+                        # (clone + dependency install).  ANY failure warns loudly
+                        # and falls through to the legacy path below.
+                        provisioned_from_template = await asyncio.to_thread(
+                            self._provision_repo_from_template,
+                            feature_slug=feature_slug,
+                            repo_id=repo_id,
+                            source_resolved=source_resolved,
+                            base_commit=base_commit,
+                            repo_root=repo_root,
                         )
-                        self._git_text(repo_root, ["checkout", "--detach", base_commit])
-                        # Restore gitignored dependencies (e.g. node_modules) so
-                        # in-sandbox tooling (tsc/tsgo/Playwright) can self-verify.
-                        # Off the event loop like the clone above: an APFS CoW copy
-                        # is fast but an npm-ci fallback can be slow.
-                        prov_results = await asyncio.to_thread(
-                            self._provision_sandbox_dependencies,
-                            repo_root,
-                            source_resolved,
-                        )
+                        if provisioned_from_template:
+                            # Templates are only published when every provisioning
+                            # result is failure-free, so the clone carries none.
+                            prov_results: list[ProvisionResult] = []
+                        else:
+                            # Legacy path — byte-identical to pre-template behaviour.
+                            # Run the clone off the event loop. `git clone --no-local` of
+                            # a large repo takes minutes (or wedges); calling it inline
+                            # froze the entire asyncio loop (no watchdog/Slack/other
+                            # workflow could run) — the bridge "hang". to_thread keeps the
+                            # loop responsive; the per-command timeout bounds a wedged git.
+                            # When source and dest are on the same filesystem,
+                            # _git_clone_args() selects --local (hardlinked objects,
+                            # near-instant) instead of --no-local; falls back automatically
+                            # across filesystem boundaries or when IRIAI_SANDBOX_LOCAL_CLONE=0.
+                            await asyncio.to_thread(
+                                self._git_text,
+                                sandbox_root,
+                                _git_clone_args(source_resolved, repo_root),
+                            )
+                            self._git_text(repo_root, ["checkout", "--detach", base_commit])
+                            # Restore gitignored dependencies (e.g. node_modules) so
+                            # in-sandbox tooling (tsc/tsgo/Playwright) can self-verify.
+                            # Off the event loop like the clone above: an APFS CoW copy
+                            # is fast but an npm-ci fallback can be slow.
+                            prov_results = await asyncio.to_thread(
+                                self._provision_sandbox_dependencies,
+                                repo_root,
+                                source_resolved,
+                            )
                         repo_failures = [
                             r.as_dict()
                             for r in prov_results
@@ -3117,6 +3201,337 @@ class SandboxRunner:
             (roots[i], managers[i] if i < len(managers) else "")
             for i in range(len(roots))
         ]
+
+    # -- Sandbox template + APFS clonefile provisioning -----------------------
+
+    def _template_lockfiles(self, source_root: Path) -> dict[str, str]:
+        """``{relpath: sha256}`` of every package lockfile in the worktree.
+
+        Scans the repo root plus every profile package root — exactly the set
+        of directories :meth:`_provision_sandbox_dependencies` provisions — for
+        ``pnpm-lock.yaml``/``package-lock.json``/``poetry.lock``/``uv.lock``
+        and ``requirements*.txt``.  Content hashes (not mtimes) so a mid-run
+        lockfile edit by an implementer task deterministically changes the
+        template digest at the next allocation.
+        """
+        candidates: list[Path] = [source_root]
+        for rel_path, _manager in self._profile_package_roots() or []:
+            rel = "" if rel_path in {"", "."} else rel_path
+            candidate = source_root if not rel else (source_root / rel)
+            if candidate.is_dir() and candidate not in candidates:
+                candidates.append(candidate)
+        lockfiles: dict[str, str] = {}
+        for directory in candidates:
+            found: list[Path] = [
+                directory / name
+                for name in _TEMPLATE_LOCKFILE_NAMES
+                if (directory / name).is_file()
+            ]
+            for pattern in _TEMPLATE_LOCKFILE_GLOBS:
+                found.extend(
+                    sorted(p for p in directory.glob(pattern) if p.is_file())
+                )
+            for path in found:
+                rel_key = path.relative_to(source_root).as_posix()
+                if rel_key in lockfiles:
+                    continue
+                lockfiles[rel_key] = hashlib.sha256(path.read_bytes()).hexdigest()
+        return lockfiles
+
+    def _template_digest(
+        self, repo_id: str, source_root: Path, base_commit: str
+    ) -> str:
+        seed = {
+            "schema": _TEMPLATE_SCHEMA_VERSION,
+            "repo_id": repo_id,
+            "base_commit": base_commit,
+            "lockfiles": self._template_lockfiles(source_root),
+        }
+        return _stable_digest(seed)[:16]
+
+    def _template_feature_dir(self, feature_slug: str) -> Path:
+        # Same .iriai tree (and therefore the same APFS volume) as the
+        # sandboxes — a hard requirement for clonefile(2).
+        return (
+            self.workspace_root
+            / ".iriai"
+            / "features"
+            / feature_slug
+            / _TEMPLATE_DIRNAME
+        )
+
+    def _template_is_complete(self, template_dir: Path) -> bool:
+        return (
+            (template_dir / _TEMPLATE_MANIFEST_NAME).is_file()
+            and (template_dir / _TEMPLATE_REPO_DIRNAME / ".git").exists()
+        )
+
+    def _ensure_sandbox_template(
+        self,
+        *,
+        feature_slug: str,
+        repo_id: str,
+        source_resolved: Path,
+        base_commit: str,
+    ) -> Path | None:
+        """Return the provisioned template repo dir for the current digest.
+
+        Builds it (single-flight: exactly one builder per digest, enforced by
+        an atomic ``os.mkdir`` lockdir that works across threads AND processes
+        — deliberately independent of the per-feature allocation lock, which a
+        sibling change is narrowing) when absent.  Concurrent allocators wait
+        for the in-flight build and reattach; on timeout/build failure they
+        return ``None`` so the caller falls back to legacy provisioning.
+        """
+        digest = self._template_digest(repo_id, source_resolved, base_commit)
+        template_dir = self._template_feature_dir(feature_slug) / digest
+        template_repo = template_dir / _TEMPLATE_REPO_DIRNAME
+        if self._template_is_complete(template_dir):
+            return template_repo
+
+        lock_dir = template_dir.with_name(template_dir.name + ".building")
+        lock_dir.parent.mkdir(parents=True, exist_ok=True)
+        stale_after_s = _sandbox_template_wait_s() * 2
+        try:
+            os.mkdir(lock_dir)
+        except FileExistsError:
+            try:
+                lock_age = time.time() - os.stat(lock_dir).st_mtime
+            except OSError:
+                lock_age = 0.0
+            if lock_age <= stale_after_s:
+                return self._wait_for_template_build(template_dir, lock_dir)
+            # A builder crashed mid-build: reclaim the (always-empty) lockdir
+            # and retry the build exactly once; on a lost race, wait instead.
+            logger.warning(
+                "sandbox template lockdir %s is stale (%.0fs old); reclaiming",
+                lock_dir,
+                lock_age,
+            )
+            try:
+                os.rmdir(lock_dir)
+                os.mkdir(lock_dir)
+            except OSError:
+                return self._wait_for_template_build(template_dir, lock_dir)
+        try:
+            # Double-check after winning the lock: the previous holder may have
+            # published the template between our exists-check and mkdir.
+            if self._template_is_complete(template_dir):
+                return template_repo
+            return self._build_sandbox_template(
+                template_dir=template_dir,
+                digest=digest,
+                repo_id=repo_id,
+                source_resolved=source_resolved,
+                base_commit=base_commit,
+            )
+        finally:
+            try:
+                os.rmdir(lock_dir)
+            except OSError:  # pragma: no cover - already reclaimed/removed.
+                pass
+
+    def _wait_for_template_build(
+        self, template_dir: Path, lock_dir: Path
+    ) -> Path | None:
+        """Wait for another builder's in-flight template build (or fall back)."""
+        deadline = time.monotonic() + _sandbox_template_wait_s()
+        while time.monotonic() < deadline:
+            if self._template_is_complete(template_dir):
+                return template_dir / _TEMPLATE_REPO_DIRNAME
+            if not lock_dir.exists():
+                # Builder finished: either the template was published or the
+                # build failed (in which case we fall back to legacy).
+                if self._template_is_complete(template_dir):
+                    return template_dir / _TEMPLATE_REPO_DIRNAME
+                logger.warning(
+                    "concurrent sandbox template build for %s ended without a "
+                    "usable template; falling back to legacy provisioning",
+                    template_dir,
+                )
+                return None
+            time.sleep(0.25)
+        logger.warning(
+            "timed out after %.0fs waiting for concurrent sandbox template "
+            "build %s; falling back to legacy provisioning",
+            _sandbox_template_wait_s(),
+            template_dir,
+        )
+        return None
+
+    def _build_sandbox_template(
+        self,
+        *,
+        template_dir: Path,
+        digest: str,
+        repo_id: str,
+        source_resolved: Path,
+        base_commit: str,
+    ) -> Path | None:
+        """Build + atomically publish one template (caller holds the lockdir).
+
+        Reuses the exact legacy provisioning code paths (``git clone`` via
+        :func:`_git_clone_args`, ``checkout --detach``, then
+        :meth:`_provision_sandbox_dependencies`) into a staging dir, then
+        ``os.rename``s it into place (atomic on the shared APFS volume).  A
+        template with any fatal (non-best-effort) provisioning failure is NOT
+        cached — the task falls back to legacy provisioning, which surfaces
+        the same failure onto the lease exactly as today.
+        """
+        staging = template_dir.with_name(template_dir.name + f".staging-{os.getpid()}")
+        try:
+            shutil.rmtree(staging, ignore_errors=True)
+            staging.mkdir(parents=True)
+            staging_repo = staging / _TEMPLATE_REPO_DIRNAME
+            self._git_text(staging, _git_clone_args(source_resolved, staging_repo))
+            self._git_text(staging_repo, ["checkout", "--detach", base_commit])
+            results = self._provision_sandbox_dependencies(
+                staging_repo, source_resolved
+            )
+            fatal = [r.as_dict() for r in results if not r.ok and not r.best_effort]
+            if fatal:
+                logger.warning(
+                    "sandbox template build for repo %s digest %s had fatal "
+                    "provisioning failures (%s); not caching the template — "
+                    "falling back to legacy provisioning",
+                    repo_id,
+                    digest,
+                    fatal,
+                )
+                shutil.rmtree(staging, ignore_errors=True)
+                return None
+            template_manifest = {
+                "schema_version": _TEMPLATE_SCHEMA_VERSION,
+                "digest": digest,
+                "repo_id": repo_id,
+                "base_commit": base_commit,
+                "source_root": str(source_resolved),
+                "lockfiles": self._template_lockfiles(source_resolved),
+                "provision_results": [r.as_dict() for r in results],
+                "owner": self.owner,
+                "built_at": _isoformat(_utc_now(self._clock)),
+            }
+            (staging / _TEMPLATE_MANIFEST_NAME).write_text(
+                json.dumps(template_manifest, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            if template_dir.exists():  # incomplete leftover from a crash
+                shutil.rmtree(template_dir)
+            os.rename(staging, template_dir)
+        except Exception as exc:
+            logger.warning(
+                "sandbox template build FAILED for repo %s digest %s (%s); "
+                "falling back to legacy provisioning",
+                repo_id,
+                digest,
+                exc,
+            )
+            shutil.rmtree(staging, ignore_errors=True)
+            return None
+        self._prune_stale_templates(template_dir.parent, keep=template_dir)
+        return template_dir / _TEMPLATE_REPO_DIRNAME
+
+    def _prune_stale_templates(self, feature_template_dir: Path, *, keep: Path) -> None:
+        """Best-effort removal of superseded template digests (disk hygiene).
+
+        Only prunes published templates (and orphaned staging dirs) older than
+        ``_TEMPLATE_PRUNE_GRACE_S`` — clonefile provisioning from a template
+        completes in seconds, so anything an hour old cannot be a live source.
+        Never raises.
+        """
+        try:
+            now = time.time()
+            for entry in feature_template_dir.iterdir():
+                if entry == keep or not entry.is_dir():
+                    continue
+                if entry.name.endswith(".building"):
+                    continue  # lockdirs are reclaimed by their own staleness path
+                try:
+                    age = now - entry.stat().st_mtime
+                except OSError:
+                    continue
+                if age <= _TEMPLATE_PRUNE_GRACE_S:
+                    continue
+                logger.info("pruning stale sandbox template %s", entry)
+                shutil.rmtree(entry, ignore_errors=True)
+        except Exception as exc:  # pragma: no cover - hygiene must never fail.
+            logger.warning(
+                "stale sandbox template pruning under %s failed: %s",
+                feature_template_dir,
+                exc,
+            )
+
+    def _clonefile_tree(self, source: Path, dest: Path) -> None:
+        """APFS clonefile copy of *source* dir to *dest* via ``cp -c -R``.
+
+        ``cp -c`` uses clonefile(2) and FAILS (no silent degradation) when the
+        target filesystem does not support cloning, so a non-APFS volume
+        surfaces as a SandboxError here and the caller falls back to legacy
+        provisioning.  Guards: macOS only, and source/dest must share a volume
+        (clonefile cannot cross filesystems).
+        """
+        if sys.platform != "darwin":
+            raise SandboxError(
+                "clonefile provisioning requires macOS (cp -c); "
+                f"platform is {sys.platform}"
+            )
+        if not _same_filesystem(source, dest.parent):
+            raise SandboxError(
+                f"template {source} and sandbox {dest} are on different "
+                "filesystems; clonefile cannot cross volumes"
+            )
+        result = self._run_command(
+            dest.parent, ["cp", "-c", "-R", str(source), str(dest)]
+        )
+        if result.returncode != 0:
+            raise SandboxError(
+                f"cp -c -R {source} -> {dest} failed: "
+                f"{_command_failure_detail(result)}"
+            )
+
+    def _provision_repo_from_template(
+        self,
+        *,
+        feature_slug: str,
+        repo_id: str,
+        source_resolved: Path,
+        base_commit: str,
+        repo_root: Path,
+    ) -> bool:
+        """Fast path: provision ``repo_root`` by clonefiling a feature template.
+
+        Returns True when ``repo_root`` is a fully-provisioned, independent
+        git worktree at ``base_commit``.  Returns False (after a loud WARNING
+        and removing any partial ``repo_root``) on ANY failure so the caller
+        runs the legacy full-provisioning path verbatim.
+        """
+        if not _sandbox_template_cow_enabled():
+            return False
+        try:
+            template_repo = self._ensure_sandbox_template(
+                feature_slug=feature_slug,
+                repo_id=repo_id,
+                source_resolved=source_resolved,
+                base_commit=base_commit,
+            )
+            if template_repo is None:
+                return False  # already warned at the failure site
+            self._clonefile_tree(template_repo, repo_root)
+            # The clone must be a valid INDEPENDENT git worktree (clonefile
+            # copies .git wholesale): verify git works and pin the commit.
+            self._git_text(repo_root, ["status", "--porcelain=v1"])
+            self._git_text(repo_root, ["checkout", "--detach", base_commit])
+            return True
+        except Exception as exc:
+            logger.warning(
+                "sandbox template clonefile provisioning FAILED for repo %s "
+                "(feature %s): %s; falling back to legacy full provisioning",
+                repo_id,
+                feature_slug,
+                exc,
+            )
+            shutil.rmtree(repo_root, ignore_errors=True)
+            return False
 
     def _provision_sandbox_dependencies(
         self, repo_root: Path, source_root: Path

@@ -31,6 +31,12 @@ from iriai_build_v2.workflows.develop.execution.sandbox import (
 
 _FLAG_ENV = "IRIAI_SANDBOX_PARALLEL_PROVISION"
 _CONCURRENCY_ENV = "IRIAI_SANDBOX_PROVISION_CONCURRENCY"
+# Template-CoW (default ON) satisfies the first per-task provisioning from a
+# single-flight template build and falls back to legacy on any failure. The
+# tests below intercept the legacy per-task `git clone` to pin W-D lock/gate
+# semantics, so they pin the template layer OFF; template behaviour itself is
+# covered by test_sandbox_template_cow.py.
+_TEMPLATE_ENV = "IRIAI_SANDBOX_TEMPLATE_COW"
 
 
 # ── Helpers (test_sandbox.py conventions) ────────────────────────────────
@@ -230,6 +236,7 @@ def test_sibling_allocate_proceeds_while_clone_in_flight_when_enabled(
 ) -> None:
     monkeypatch.delenv(_FLAG_ENV, raising=False)
     monkeypatch.delenv(_CONCURRENCY_ENV, raising=False)
+    monkeypatch.setenv(_TEMPLATE_ENV, "0")
     feature_id = "parallel-on-feature"
     source = tmp_path / "canonical" / "app"
     base = init_repo(source)
@@ -327,6 +334,7 @@ def test_provision_concurrency_one_serializes_heavy_sections(
 ) -> None:
     monkeypatch.delenv(_FLAG_ENV, raising=False)
     monkeypatch.setenv(_CONCURRENCY_ENV, "1")
+    monkeypatch.setenv(_TEMPLATE_ENV, "0")
     feature_id = "bounded-feature"
     source = tmp_path / "canonical" / "app"
     base = init_repo(source)
@@ -374,6 +382,7 @@ def test_provision_failure_releases_gate_and_spares_sibling(
     # gate (or its lock), the sibling could never finish.
     monkeypatch.delenv(_FLAG_ENV, raising=False)
     monkeypatch.setenv(_CONCURRENCY_ENV, "1")
+    monkeypatch.setenv(_TEMPLATE_ENV, "0")
     feature_id = "isolation-feature"
     source = tmp_path / "canonical" / "app"
     base = init_repo(source)
@@ -410,6 +419,7 @@ def test_parallel_failure_isolation_under_gather(
     """One task's provisioning failure must not cancel a parallel sibling."""
     monkeypatch.delenv(_FLAG_ENV, raising=False)
     monkeypatch.delenv(_CONCURRENCY_ENV, raising=False)
+    monkeypatch.setenv(_TEMPLATE_ENV, "0")
     feature_id = "gather-isolation-feature"
     source = tmp_path / "canonical" / "app"
     base = init_repo(source)

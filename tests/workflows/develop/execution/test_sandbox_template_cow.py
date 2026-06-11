@@ -1,0 +1,672 @@
+"""Tests for sandbox template + APFS clonefile provisioning (we/sandbox-template-cow).
+
+Covers:
+1. ``IRIAI_SANDBOX_TEMPLATE_COW`` flag reader (default ON, =0 legacy verbatim)
+2. Template digest computation (lockfiles + base commit) and rebuild-on-change
+3. Clonefile path selection + same-volume / non-darwin guards
+4. Loud fallback to legacy full provisioning on ANY template/clonefile failure
+5. Single-flight template build (one builder per digest; waiters reattach or
+   fall back; stale lockdir reclaim)
+6. Mid-run lockfile change -> new digest -> exactly one template rebuild
+7. Real end-to-end allocate() via clonefile against a tmp git repo (skips
+   cleanly when the volume does not support APFS clonefile)
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import shutil
+import subprocess
+import threading
+import time
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+import iriai_build_v2.workflows.develop.execution.sandbox as sandbox_module
+from iriai_build_v2.workflows.develop.execution.sandbox import (
+    SandboxRunner,
+    SandboxSpec,
+    _sandbox_template_cow_enabled,
+    _sandbox_template_wait_s,
+)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def run(coro):
+    return asyncio.run(coro)
+
+
+def git(cwd: Path, *args: str) -> str:
+    completed = subprocess.run(
+        ["git", *args],
+        cwd=str(cwd),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=True,
+    )
+    return completed.stdout.decode("utf-8").strip()
+
+
+def init_repo(path: Path) -> str:
+    path.mkdir(parents=True)
+    git(path, "init", "-q")
+    git(path, "config", "user.email", "sandbox@example.test")
+    git(path, "config", "user.name", "Sandbox Test")
+    (path / "tracked.txt").write_text("base\n", encoding="utf-8")
+    (path / "package-lock.json").write_text('{"v": 1}\n', encoding="utf-8")
+    git(path, "add", ".")
+    git(path, "commit", "-qm", "base")
+    return git(path, "rev-parse", "HEAD")
+
+
+def spec_for(base_commit: str, *, group_idx: int = 4, attempt_no: int = 2) -> SandboxSpec:
+    return SandboxSpec(
+        feature_id="Feature/One",
+        dag_sha256="dag-sha",
+        group_idx=group_idx,
+        attempt_no=attempt_no,
+        task_ids=["task-a"],
+        repo_ids=["app"],
+        base_snapshot_ids=[11],
+        base_commits={"app": base_commit},
+        mode="task",
+        writable_roots=[],
+        readonly_roots=[],
+        contract_ids=[7],
+    )
+
+
+def runner_for(tmp_path: Path, source: Path, **kwargs) -> SandboxRunner:
+    return SandboxRunner(
+        workspace_root=tmp_path,
+        repo_sources={"app": source},
+        allowed_source_roots=[tmp_path],
+        **kwargs,
+    )
+
+
+def template_feature_dir(tmp_path: Path) -> Path:
+    return tmp_path / ".iriai" / "features" / "feature-one" / "sandbox-template"
+
+
+def _clonefile_supported(tmp_path: Path) -> bool:
+    """True when `cp -c` (APFS clonefile) works on this volume."""
+    probe_src = tmp_path / "clonefile-probe-src"
+    probe_dst = tmp_path / "clonefile-probe-dst"
+    try:
+        probe_src.write_text("probe\n", encoding="utf-8")
+        result = subprocess.run(
+            ["cp", "-c", str(probe_src), str(probe_dst)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        return result.returncode == 0
+    except (OSError, ValueError):
+        return False
+    finally:
+        for probe in (probe_src, probe_dst):
+            try:
+                probe.unlink()
+            except OSError:
+                pass
+
+
+# ---------------------------------------------------------------------------
+# 1. Flag reader
+# ---------------------------------------------------------------------------
+
+class TestTemplateCowFlag:
+    def test_default_on(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("IRIAI_SANDBOX_TEMPLATE_COW", raising=False)
+        assert _sandbox_template_cow_enabled() is True
+
+    def test_disabled_by_zero(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("IRIAI_SANDBOX_TEMPLATE_COW", "0")
+        assert _sandbox_template_cow_enabled() is False
+
+    def test_disabled_by_false(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("IRIAI_SANDBOX_TEMPLATE_COW", "false")
+        assert _sandbox_template_cow_enabled() is False
+
+    def test_enabled_by_one(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("IRIAI_SANDBOX_TEMPLATE_COW", "1")
+        assert _sandbox_template_cow_enabled() is True
+
+    def test_wait_default_and_override(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("IRIAI_SANDBOX_TEMPLATE_BUILD_WAIT_S", raising=False)
+        assert _sandbox_template_wait_s() == 900.0
+        monkeypatch.setenv("IRIAI_SANDBOX_TEMPLATE_BUILD_WAIT_S", "5")
+        assert _sandbox_template_wait_s() == 5.0
+        monkeypatch.setenv("IRIAI_SANDBOX_TEMPLATE_BUILD_WAIT_S", "garbage")
+        assert _sandbox_template_wait_s() == 900.0
+
+
+# ---------------------------------------------------------------------------
+# 2. Digest computation
+# ---------------------------------------------------------------------------
+
+class TestTemplateDigest:
+    def test_deterministic(self, tmp_path: Path) -> None:
+        source = tmp_path / "src"
+        source.mkdir()
+        (source / "package-lock.json").write_text("{}", encoding="utf-8")
+        runner = runner_for(tmp_path, source)
+        d1 = runner._template_digest("app", source, "commit-a")
+        d2 = runner._template_digest("app", source, "commit-a")
+        assert d1 == d2
+        assert len(d1) == 16
+
+    def test_changes_on_lockfile_content_change(self, tmp_path: Path) -> None:
+        source = tmp_path / "src"
+        source.mkdir()
+        lock = source / "pnpm-lock.yaml"
+        lock.write_text("a: 1\n", encoding="utf-8")
+        runner = runner_for(tmp_path, source)
+        before = runner._template_digest("app", source, "commit-a")
+        lock.write_text("a: 2\n", encoding="utf-8")
+        after = runner._template_digest("app", source, "commit-a")
+        assert before != after
+
+    def test_changes_on_new_lockfile(self, tmp_path: Path) -> None:
+        source = tmp_path / "src"
+        source.mkdir()
+        runner = runner_for(tmp_path, source)
+        before = runner._template_digest("app", source, "commit-a")
+        (source / "uv.lock").write_text("lock\n", encoding="utf-8")
+        after = runner._template_digest("app", source, "commit-a")
+        assert before != after
+
+    def test_changes_on_base_commit_change(self, tmp_path: Path) -> None:
+        source = tmp_path / "src"
+        source.mkdir()
+        runner = runner_for(tmp_path, source)
+        assert runner._template_digest("app", source, "commit-a") != (
+            runner._template_digest("app", source, "commit-b")
+        )
+
+    def test_includes_repo_id(self, tmp_path: Path) -> None:
+        source = tmp_path / "src"
+        source.mkdir()
+        runner = runner_for(tmp_path, source)
+        assert runner._template_digest("app", source, "commit-a") != (
+            runner._template_digest("web", source, "commit-a")
+        )
+
+    def test_requirements_glob_is_hashed(self, tmp_path: Path) -> None:
+        source = tmp_path / "src"
+        source.mkdir()
+        (source / "requirements.txt").write_text("flask\n", encoding="utf-8")
+        (source / "requirements-dev.txt").write_text("pytest\n", encoding="utf-8")
+        runner = runner_for(tmp_path, source)
+        lockfiles = runner._template_lockfiles(source)
+        assert set(lockfiles) == {"requirements.txt", "requirements-dev.txt"}
+        before = runner._template_digest("app", source, "c")
+        (source / "requirements-dev.txt").write_text("pytest==9\n", encoding="utf-8")
+        assert runner._template_digest("app", source, "c") != before
+
+    def test_profile_package_roots_are_scanned(self, tmp_path: Path) -> None:
+        source = tmp_path / "src"
+        (source / "services" / "api").mkdir(parents=True)
+        (source / "services" / "api" / "poetry.lock").write_text("x\n", encoding="utf-8")
+        profile = SimpleNamespace(
+            package_roots=["services/api"], package_managers=["poetry"]
+        )
+        runner = runner_for(tmp_path, source, project_profile=profile)
+        lockfiles = runner._template_lockfiles(source)
+        assert "services/api/poetry.lock" in lockfiles
+        # No profile -> nested lockfile invisible (root-only scan)
+        runner_no_profile = runner_for(tmp_path, source)
+        assert "services/api/poetry.lock" not in (
+            runner_no_profile._template_lockfiles(source)
+        )
+
+
+# ---------------------------------------------------------------------------
+# 3+7. End-to-end clonefile allocation (real git repo on the test volume)
+# ---------------------------------------------------------------------------
+
+class TestClonefileAllocation:
+    @pytest.fixture(autouse=True)
+    def _require_clonefile(self, tmp_path: Path) -> None:
+        if not _clonefile_supported(tmp_path):
+            pytest.skip("APFS clonefile (cp -c) unsupported on this volume")
+
+    def test_allocate_provisions_via_template_clonefile(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("IRIAI_SANDBOX_TEMPLATE_COW", "1")
+        source = tmp_path / "canonical" / "app"
+        init_repo(source)
+        # Gitignored dependency dir to prove provisioning is baked in.
+        (source / ".gitignore").write_text("node_modules/\n", encoding="utf-8")
+        git(source, "add", ".gitignore")
+        git(source, "commit", "-qm", "ignore node_modules")
+        base = git(source, "rev-parse", "HEAD")
+        (source / "node_modules" / "left-pad").mkdir(parents=True)
+        (source / "node_modules" / "left-pad" / "index.js").write_text(
+            "module.exports = 1;\n", encoding="utf-8"
+        )
+        runner = runner_for(tmp_path, source)
+
+        legacy_provision_calls: list[Path] = []
+        original = SandboxRunner._provision_sandbox_dependencies
+
+        def counting(self, repo_root, source_root):
+            legacy_provision_calls.append(Path(repo_root))
+            return original(self, repo_root, source_root)
+
+        monkeypatch.setattr(
+            SandboxRunner, "_provision_sandbox_dependencies", counting
+        )
+
+        lease = run(runner.allocate(spec_for(base)))
+
+        # Template published with manifest, on the same volume as sandboxes.
+        feature_templates = template_feature_dir(tmp_path)
+        digests = [p for p in feature_templates.iterdir() if p.is_dir()]
+        assert len(digests) == 1
+        manifest = json.loads(
+            (digests[0] / "template-manifest.json").read_text(encoding="utf-8")
+        )
+        assert manifest["base_commit"] == base
+        assert manifest["repo_id"] == "app"
+        assert "package-lock.json" in manifest["lockfiles"]
+
+        # Dependency provisioning ran exactly ONCE (template build, into the
+        # staging dir that was atomically renamed to the digest dir), never in
+        # the per-task sandbox.
+        assert len(legacy_provision_calls) == 1
+        assert legacy_provision_calls[0].is_relative_to(feature_templates)
+        assert not legacy_provision_calls[0].is_relative_to(Path(lease.root))
+
+        # The sandbox repo is a valid INDEPENDENT git worktree at base.
+        repo_root = Path(lease.repo_roots["app"])
+        assert git(repo_root, "rev-parse", "HEAD") == base
+        assert git(repo_root, "status", "--porcelain=v1") == ""
+        assert (repo_root / "node_modules" / "left-pad" / "index.js").is_file()
+        # Independence: mutating the sandbox does not touch the template.
+        (repo_root / "tracked.txt").write_text("mutated\n", encoding="utf-8")
+        assert (
+            (digests[0] / "repo" / "tracked.txt").read_text(encoding="utf-8")
+            == "base\n"
+        )
+
+    def test_second_allocation_reuses_template_without_rebuild(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("IRIAI_SANDBOX_TEMPLATE_COW", "1")
+        source = tmp_path / "canonical" / "app"
+        base = init_repo(source)
+        runner = runner_for(tmp_path, source)
+
+        build_calls: list[str] = []
+        original = SandboxRunner._build_sandbox_template
+
+        def counting(self, **kwargs):
+            build_calls.append(kwargs["digest"])
+            return original(self, **kwargs)
+
+        monkeypatch.setattr(SandboxRunner, "_build_sandbox_template", counting)
+
+        lease_a = run(runner.allocate(spec_for(base, group_idx=1, attempt_no=0)))
+        lease_b = run(runner.allocate(spec_for(base, group_idx=2, attempt_no=0)))
+
+        assert len(build_calls) == 1  # one template build, two sandboxes
+        assert lease_a.sandbox_id != lease_b.sandbox_id
+        for lease in (lease_a, lease_b):
+            assert git(Path(lease.repo_roots["app"]), "rev-parse", "HEAD") == base
+
+    def test_mid_run_lockfile_change_triggers_one_rebuild(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Implementer tasks CAN modify lockfiles: the digest key handles it."""
+        monkeypatch.setenv("IRIAI_SANDBOX_TEMPLATE_COW", "1")
+        source = tmp_path / "canonical" / "app"
+        base = init_repo(source)
+        runner = runner_for(tmp_path, source)
+
+        build_calls: list[str] = []
+        original = SandboxRunner._build_sandbox_template
+
+        def counting(self, **kwargs):
+            build_calls.append(kwargs["digest"])
+            return original(self, **kwargs)
+
+        monkeypatch.setattr(SandboxRunner, "_build_sandbox_template", counting)
+
+        run(runner.allocate(spec_for(base, group_idx=1, attempt_no=0)))
+
+        # A merged implementer task bumps the lockfile -> new base commit too.
+        (source / "package-lock.json").write_text('{"v": 2}\n', encoding="utf-8")
+        git(source, "add", "package-lock.json")
+        git(source, "commit", "-qm", "bump lockfile")
+        new_base = git(source, "rev-parse", "HEAD")
+
+        lease = run(runner.allocate(spec_for(new_base, group_idx=2, attempt_no=0)))
+
+        assert len(build_calls) == 2
+        assert build_calls[0] != build_calls[1]
+        repo_root = Path(lease.repo_roots["app"])
+        assert git(repo_root, "rev-parse", "HEAD") == new_base
+        assert (
+            json.loads((repo_root / "package-lock.json").read_text(encoding="utf-8"))
+            == {"v": 2}
+        )
+        # Both templates exist (prune grace keeps recent digests).
+        digests = [p for p in template_feature_dir(tmp_path).iterdir() if p.is_dir()]
+        assert len(digests) == 2
+
+    def test_flag_off_restores_legacy_path_verbatim(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("IRIAI_SANDBOX_TEMPLATE_COW", "0")
+        source = tmp_path / "canonical" / "app"
+        base = init_repo(source)
+        runner = runner_for(tmp_path, source)
+
+        lease = run(runner.allocate(spec_for(base)))
+
+        assert not template_feature_dir(tmp_path).exists()
+        repo_root = Path(lease.repo_roots["app"])
+        assert git(repo_root, "rev-parse", "HEAD") == base
+
+    def test_prune_removes_old_digests_after_grace(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("IRIAI_SANDBOX_TEMPLATE_COW", "1")
+        source = tmp_path / "canonical" / "app"
+        base = init_repo(source)
+        runner = runner_for(tmp_path, source)
+        feature_templates = template_feature_dir(tmp_path)
+        stale = feature_templates / "0123456789abcdef"
+        (stale / "repo").mkdir(parents=True)
+        old = time.time() - 7200
+        os.utime(stale, (old, old))
+
+        run(runner.allocate(spec_for(base)))
+
+        assert not stale.exists()
+        live = [p for p in feature_templates.iterdir() if p.is_dir()]
+        assert len(live) == 1
+
+
+# ---------------------------------------------------------------------------
+# 4. Fallback on failure (loud WARN, legacy path, sandbox never corrupted)
+# ---------------------------------------------------------------------------
+
+class TestFallbackToLegacy:
+    def test_clonefile_failure_falls_back_to_legacy(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        monkeypatch.setenv("IRIAI_SANDBOX_TEMPLATE_COW", "1")
+        source = tmp_path / "canonical" / "app"
+        base = init_repo(source)
+        runner = runner_for(tmp_path, source)
+
+        def boom(self, src, dst):
+            raise sandbox_module.SandboxError("clonefile exploded")
+
+        monkeypatch.setattr(SandboxRunner, "_clonefile_tree", boom)
+
+        with caplog.at_level("WARNING"):
+            lease = run(runner.allocate(spec_for(base)))
+
+        assert any(
+            "falling back to legacy full provisioning" in rec.getMessage()
+            for rec in caplog.records
+        )
+        repo_root = Path(lease.repo_roots["app"])
+        assert git(repo_root, "rev-parse", "HEAD") == base
+        assert git(repo_root, "status", "--porcelain=v1") == ""
+
+    def test_template_build_failure_falls_back_to_legacy(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        monkeypatch.setenv("IRIAI_SANDBOX_TEMPLATE_COW", "1")
+        source = tmp_path / "canonical" / "app"
+        base = init_repo(source)
+        runner = runner_for(tmp_path, source)
+
+        def failing_build(self, **kwargs):
+            raise RuntimeError("disk full")
+
+        monkeypatch.setattr(SandboxRunner, "_build_sandbox_template", failing_build)
+
+        with caplog.at_level("WARNING"):
+            lease = run(runner.allocate(spec_for(base)))
+
+        assert any(
+            "falling back to legacy" in rec.getMessage() for rec in caplog.records
+        )
+        assert git(Path(lease.repo_roots["app"]), "rev-parse", "HEAD") == base
+
+    def test_fatal_provisioning_failure_is_not_cached_as_template(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A template with fatal provision failures must never be published;
+        the legacy path records the failure on the manifest exactly as today."""
+        monkeypatch.setenv("IRIAI_SANDBOX_TEMPLATE_COW", "1")
+        source = tmp_path / "canonical" / "app"
+        base = init_repo(source)
+        profile = SimpleNamespace(package_roots=["."], package_managers=["bogus-mgr"])
+        runner = runner_for(tmp_path, source, project_profile=profile)
+
+        with caplog.at_level("WARNING"):
+            lease = run(runner.allocate(spec_for(base)))
+
+        assert any(
+            "not caching the template" in rec.getMessage() for rec in caplog.records
+        )
+        feature_templates = template_feature_dir(tmp_path)
+        published = (
+            [p for p in feature_templates.iterdir() if p.is_dir()]
+            if feature_templates.exists()
+            else []
+        )
+        assert published == []
+        manifest = json.loads(
+            (Path(lease.root) / "sandbox-manifest.json").read_text(encoding="utf-8")
+        )
+        assert manifest["provisioning"]["repos"]["app"], (
+            "fatal provisioning failure must surface on the manifest"
+        )
+
+    def test_non_darwin_platform_raises_and_falls_back(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        source = tmp_path / "src"
+        source.mkdir()
+        runner = runner_for(tmp_path, source)
+        monkeypatch.setattr(sandbox_module.sys, "platform", "linux")
+        with pytest.raises(sandbox_module.SandboxError, match="requires macOS"):
+            runner._clonefile_tree(source, tmp_path / "dest")
+
+    def test_cross_volume_guard_raises(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        source = tmp_path / "src"
+        source.mkdir()
+        runner = runner_for(tmp_path, source)
+        monkeypatch.setattr(sandbox_module.sys, "platform", "darwin")
+        monkeypatch.setattr(
+            sandbox_module, "_same_filesystem", lambda a, b: False
+        )
+        with pytest.raises(sandbox_module.SandboxError, match="different"):
+            runner._clonefile_tree(source, tmp_path / "dest")
+
+    def test_cp_nonzero_exit_raises(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        source = tmp_path / "src"
+        source.mkdir()
+
+        def failing_cp(cwd, argv, env):
+            assert argv[:3] == ["cp", "-c", "-R"]
+            return sandbox_module.CommandResult(
+                returncode=1, stdout=b"", stderr=b"clonefile not supported"
+            )
+
+        runner = runner_for(tmp_path, source, command_runner=failing_cp)
+        monkeypatch.setattr(sandbox_module.sys, "platform", "darwin")
+        with pytest.raises(sandbox_module.SandboxError, match="cp -c -R"):
+            runner._clonefile_tree(source, tmp_path / "dest")
+
+
+# ---------------------------------------------------------------------------
+# 5. Single-flight template build
+# ---------------------------------------------------------------------------
+
+class TestSingleFlightTemplateBuild:
+    def test_concurrent_builders_build_once(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        if not _clonefile_supported(tmp_path):
+            pytest.skip("APFS clonefile (cp -c) unsupported on this volume")
+        monkeypatch.setenv("IRIAI_SANDBOX_TEMPLATE_COW", "1")
+        source = tmp_path / "canonical" / "app"
+        base = init_repo(source)
+        runner = runner_for(tmp_path, source)
+
+        build_count = threading.Semaphore(0)
+        builds: list[str] = []
+        original = SandboxRunner._build_sandbox_template
+
+        def slow_build(self, **kwargs):
+            builds.append(kwargs["digest"])
+            time.sleep(0.5)  # widen the race window
+            result = original(self, **kwargs)
+            build_count.release()
+            return result
+
+        monkeypatch.setattr(SandboxRunner, "_build_sandbox_template", slow_build)
+
+        results: list[Path | None] = []
+
+        def ensure() -> None:
+            results.append(
+                runner._ensure_sandbox_template(
+                    feature_slug="feature-one",
+                    repo_id="app",
+                    source_resolved=source.resolve(),
+                    base_commit=base,
+                )
+            )
+
+        threads = [threading.Thread(target=ensure) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=60)
+
+        assert len(builds) == 1, "exactly one builder per digest"
+        assert len(results) == 4
+        assert all(r is not None for r in results)
+        assert len({str(r) for r in results}) == 1
+
+    def test_foreign_lockdir_times_out_to_legacy_fallback(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A fresh lockdir held by another process: wait, then fall back."""
+        monkeypatch.setenv("IRIAI_SANDBOX_TEMPLATE_BUILD_WAIT_S", "1")
+        source = tmp_path / "canonical" / "app"
+        base = init_repo(source)
+        runner = runner_for(tmp_path, source)
+        digest = runner._template_digest("app", source.resolve(), base)
+        lock_dir = template_feature_dir(tmp_path) / f"{digest}.building"
+        lock_dir.mkdir(parents=True)
+
+        with caplog.at_level("WARNING"):
+            result = runner._ensure_sandbox_template(
+                feature_slug="feature-one",
+                repo_id="app",
+                source_resolved=source.resolve(),
+                base_commit=base,
+            )
+
+        assert result is None
+        assert any("timed out" in rec.getMessage() for rec in caplog.records)
+        assert lock_dir.exists()  # never steal a live builder's lock
+
+    def test_stale_lockdir_is_reclaimed_and_build_proceeds(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        if not _clonefile_supported(tmp_path):
+            pytest.skip("APFS clonefile (cp -c) unsupported on this volume")
+        monkeypatch.setenv("IRIAI_SANDBOX_TEMPLATE_BUILD_WAIT_S", "1")
+        source = tmp_path / "canonical" / "app"
+        base = init_repo(source)
+        runner = runner_for(tmp_path, source)
+        digest = runner._template_digest("app", source.resolve(), base)
+        lock_dir = template_feature_dir(tmp_path) / f"{digest}.building"
+        lock_dir.mkdir(parents=True)
+        old = time.time() - 600  # >> 2 * wait
+        os.utime(lock_dir, (old, old))
+
+        with caplog.at_level("WARNING"):
+            result = runner._ensure_sandbox_template(
+                feature_slug="feature-one",
+                repo_id="app",
+                source_resolved=source.resolve(),
+                base_commit=base,
+            )
+
+        assert result is not None
+        assert result.is_dir()
+        assert any("stale" in rec.getMessage() for rec in caplog.records)
+        assert not lock_dir.exists()
+
+    def test_waiter_reattaches_when_template_appears(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("IRIAI_SANDBOX_TEMPLATE_BUILD_WAIT_S", "10")
+        source = tmp_path / "canonical" / "app"
+        base = init_repo(source)
+        runner = runner_for(tmp_path, source)
+        digest = runner._template_digest("app", source.resolve(), base)
+        template_dir = template_feature_dir(tmp_path) / digest
+        lock_dir = template_feature_dir(tmp_path) / f"{digest}.building"
+        lock_dir.mkdir(parents=True)
+
+        def publish_then_unlock() -> None:
+            time.sleep(0.5)
+            (template_dir / "repo" / ".git").mkdir(parents=True)
+            (template_dir / "template-manifest.json").write_text(
+                "{}", encoding="utf-8"
+            )
+            os.rmdir(lock_dir)
+
+        publisher = threading.Thread(target=publish_then_unlock)
+        publisher.start()
+        try:
+            result = runner._ensure_sandbox_template(
+                feature_slug="feature-one",
+                repo_id="app",
+                source_resolved=source.resolve(),
+                base_commit=base,
+            )
+        finally:
+            publisher.join(timeout=10)
+
+        assert result == template_dir / "repo"
