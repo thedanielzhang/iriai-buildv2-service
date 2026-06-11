@@ -2953,7 +2953,18 @@ def _task_contract_prompt_block(contract: Any | None) -> str:
         sections.extend(["", "Contract acceptance criteria:"])
         for criterion in criteria[:30]:
             if isinstance(criterion, dict):
-                sections.append(f"- `{criterion.get('id', '')}` {criterion.get('text', '')}")
+                # Item-5: planning-contract-waived ACs (must_pass=False) stay
+                # visible but are explicitly marked non-binding.
+                waived_suffix = (
+                    " [WAIVED — operator-approved planning-contract waiver; "
+                    "do not enforce]"
+                    if criterion.get("must_pass") is False
+                    else ""
+                )
+                sections.append(
+                    f"- `{criterion.get('id', '')}` {criterion.get('text', '')}"
+                    f"{waived_suffix}"
+                )
         if len(criteria) > 30:
             sections.append(f"- ... {len(criteria) - 30} more")
     sections.append(
@@ -12468,6 +12479,113 @@ async def _load_test_plan_section(
     return f"\n\n## Test Plan\n\n{body}"
 
 
+def _develop_contract_waivers_enabled() -> bool:
+    """Item-5 flag (IRIAI_DEVELOP_CONTRACT_AC_WAIVERS, default OFF).
+
+    OFF preserves today's behavior exactly: the catalog loader never reads
+    planning contracts, no entry carries a waived marker, and every external
+    AC compiles must_pass=True with byte-identical digests.
+    """
+    return os.environ.get(DEVELOP_CONTRACT_AC_WAIVERS_ENV, "").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+async def _load_planning_contract_waived_ac_ids(
+    runner: WorkflowRunner,
+    feature: Feature,
+    slug: str,
+) -> list[str]:
+    """Read waived_ac_ids from the persisted per-SF planning contract.
+
+    The fefd8f8 planning-side compiler persists SubfeaturePlanningContract at
+    ``dag-contract:{slug}`` with first-class ``waived_ac_ids`` (waivers
+    recorded/approved at the DAG gate). Missing or unparseable contracts are
+    WARN-skipped — a planning contract is optional input here, never a
+    contract-compile blocker.
+    """
+    raw = await runner.artifacts.get(f"dag-contract:{slug}", feature=feature)
+    if not raw:
+        return []
+    try:
+        payload = json.loads(str(raw))
+    except Exception as exc:
+        logger.warning(
+            "Could not parse planning contract dag-contract:%s for AC waivers "
+            "(%s) — no waivers applied for this subfeature",
+            slug, exc,
+        )
+        return []
+    ids = payload.get("waived_ac_ids") if isinstance(payload, dict) else None
+    if not isinstance(ids, list):
+        return []
+    return [str(ac_id).strip() for ac_id in ids if str(ac_id).strip()]
+
+
+async def _load_all_planning_contract_waivers(
+    runner: WorkflowRunner,
+    feature: Feature,
+    decomposition: SubfeatureDecomposition | None = None,
+) -> dict[str, list[str]]:
+    """Map subfeature slug -> waived_ac_ids across all planning contracts."""
+    if decomposition is None:
+        decomp_raw = await runner.artifacts.get("decomposition", feature=feature)
+        if not decomp_raw:
+            return {}
+        try:
+            decomposition = SubfeatureDecomposition.model_validate_json(str(decomp_raw))
+        except Exception:
+            try:
+                decomposition = SubfeatureDecomposition.model_validate(
+                    json.loads(str(decomp_raw))
+                )
+            except Exception:
+                logger.warning("Could not parse decomposition for contract waivers")
+                return {}
+    waivers: dict[str, list[str]] = {}
+    for sf in decomposition.subfeatures:
+        slug = (sf.slug or "").strip()
+        if not slug:
+            continue
+        waived = await _load_planning_contract_waived_ac_ids(runner, feature, slug)
+        if waived:
+            waivers[slug] = waived
+    return waivers
+
+
+def _apply_contract_waivers_to_entries(
+    entries: list[dict[str, Any]],
+    waived_ac_ids: list[str],
+    slug: str,
+) -> list[dict[str, Any]]:
+    """Mark catalog entries matching contract-waived AC ids (WARN each).
+
+    Marking is additive metadata only — the contract compiler
+    (task_contracts._external_acceptance_criteria_by_id) turns the marker into
+    must_pass=False and the gate compiler makes citing gates non-blocking.
+    """
+    waived_normalized = {w.casefold() for w in waived_ac_ids}
+    matched: set[str] = set()
+    for entry in entries:
+        raw_id = str(entry.get("id") or "").strip()
+        if raw_id and raw_id.casefold() in waived_normalized:
+            entry["waived"] = True
+            entry["waiver_source"] = f"dag-contract:{slug}"
+            matched.add(raw_id.casefold())
+            logger.warning(
+                "AC waiver applied: %s (source: dag-contract:%s waived_ac_ids) "
+                "— external AC will compile with must_pass=False",
+                raw_id, slug,
+            )
+    for missing in sorted(waived_normalized - matched):
+        logger.warning(
+            "AC waiver recorded on dag-contract:%s has no matching test-plan "
+            "AC entry: %s (nothing to waive in the develop catalog)",
+            slug, missing,
+        )
+    return entries
+
+
 async def _load_external_acceptance_criteria_catalog(
     runner: WorkflowRunner,
     feature: Feature,
@@ -12485,6 +12603,7 @@ async def _load_external_acceptance_criteria_catalog(
             logger.warning("Could not parse decomposition for contract test-plan catalog")
             return []
 
+    apply_waivers = _develop_contract_waivers_enabled()
     catalog: list[dict[str, Any]] = []
     for sf in decomposition.subfeatures:
         slug = (sf.slug or "").strip()
@@ -12493,7 +12612,14 @@ async def _load_external_acceptance_criteria_catalog(
         raw_plan = await runner.artifacts.get(f"test-plan:{slug}", feature=feature)
         if not raw_plan:
             continue
-        catalog.extend(_test_plan_acceptance_criteria_entries(raw_plan, slug))
+        entries = _test_plan_acceptance_criteria_entries(raw_plan, slug)
+        if apply_waivers:
+            waived = await _load_planning_contract_waived_ac_ids(
+                runner, feature, slug,
+            )
+            if waived:
+                entries = _apply_contract_waivers_to_entries(entries, waived, slug)
+        catalog.extend(entries)
     return catalog
 
 
@@ -25145,6 +25271,37 @@ async def _verify(
                 )
         except Exception:
             pass
+
+    # Item-5 (flag ON): surface planning-contract AC waivers to the group
+    # verifier so a waived AC's absence is never reported (or enforced) as a
+    # blocking finding. WARN-logged per waiver — no silent waivers.
+    if _develop_contract_waivers_enabled():
+        try:
+            contract_waivers = await _load_all_planning_contract_waivers(
+                runner, feature,
+            )
+        except Exception as exc:  # noqa: BLE001 — advisory context only
+            logger.warning("Could not load planning-contract AC waivers: %s", exc)
+            contract_waivers = {}
+        if contract_waivers:
+            waiver_lines = []
+            for slug, ac_ids in sorted(contract_waivers.items()):
+                for ac_id in ac_ids:
+                    logger.warning(
+                        "Group verification honoring AC waiver: %s "
+                        "(source: dag-contract:%s)",
+                        ac_id, slug,
+                    )
+                    waiver_lines.append(
+                        f"- `{ac_id}` (source: dag-contract:{slug})"
+                    )
+            known_issues += (
+                "\n\n## Waived Acceptance Criteria (operator-approved planning-"
+                "contract waivers — do NOT enforce these or report their "
+                "absence as findings)\n"
+                + "\n".join(waiver_lines)
+                + "\n"
+            )
 
     contradiction_decisions = await _format_contradiction_decisions_context(
         runner,
