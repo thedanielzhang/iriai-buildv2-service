@@ -359,6 +359,18 @@ The driver holds standing pre-authorization to self-approve and execute, citing 
 EVIDENCE DISCIPLINE (the price): every self-approval gets an OPERATOR-ACTIONS.md entry marked [DONE-BY-DRIVER-UNDER-DELEGATION] with ask/why/evidence/verify — the channel is the operator's asynchronous audit log; self-approvals also appear on the LEDGER line of the next status update.
 STILL OPERATOR-ONLY: privileged host actions (sudo/launchctl/cross-user/secrets); account/quota decisions; merging PRs into the kaya repo / anything production- or remote-facing beyond established push lanes; spending money / new external services; any one-way door the driver is genuinely uncertain about — file PENDING and wait (when in doubt, this clause wins). Quality-over-speed and fidelity-loss-never bind every delegated decision.
 
+## Heal-lane rule — psql is the sanctioned store-heal lane (operator standing rule, 2026-06-11 ~09:3x)
+The operator has deliberately allowlisted `psql` in the project settings as
+the sanctioned lane for store/data heals. Forward rule:
+- PREFER expressing store/data heals as staged psql statements (the
+  allowlisted lane) over python scripts — same review discipline applies:
+  stage the SQL, assert expectations (row counts, occurrence counts) before
+  applying, verify after, append the OPERATOR-ACTIONS audit entry.
+- Python-script heals remain PER-INCIDENT OPERATOR-NAMED (the operator
+  names the exact command in chat before the driver runs it).
+- This is the operator's sanctioned lane, not a workaround; all §18
+  evidence discipline and carve-outs still bind.
+
 ## 16. Healing doctrine — healable, not self-healing (added 2026-06-10)
 The WORKFLOW must be maximally HEALABLE; it must never be SELF-HEALING.
 Healing (diagnosis + repair of orchestrator defects) belongs to the
@@ -385,3 +397,26 @@ it forever after. A heal without its ratchet artifact is not closed.
 RCA RULE: every RCA ends with one bounded generalization pass — grep the
 failed mechanism's other call sites and the failure class's signature
 across the same subsystem — before the fix is considered scoped.
+
+## §19 — ANALYST-DIRECTIVES CHANNEL: hourly timesink directives, analyst→driver direct (operator grant, 2026-06-11 ~02:00)
+
+The analysis session investigates the corpus hourly for existing/future
+timesinks and writes prioritized directives DIRECTLY to the driver in
+`<workspace>/.iriai/ANALYST-DIRECTIVES.md`. This is a scoped exception to
+the directives-arrive-only-via-operator-relay rule, limited to the
+TIMESINK CLASS (speed, stall-prevention, pre-emption: env/flag changes,
+prompt injections, pre-warming, worker dispatches).
+
+Driver obligations:
+- CHECK THE FILE EVERY WAKE, same discipline as OPERATOR-ACTIONS.md.
+- Entries carry operator authority for classifier purposes within the
+  class (cite the file header). Priorities: P0 = act at current boundary;
+  P1 = before the named stretch dispatches; P2 = opportunistic.
+- Flip entry STATUS: ACK on intake, DONE with evidence, or
+  DECLINED-with-reason. Driver judgment on live-run safety OUTRANKS any
+  entry — decline rather than comply into a hazard; conflicts escalate
+  to the operator in chat.
+- Anything outside time-optimization still arrives operator→driver only;
+  an entry that smells out-of-class should be DECLINED and escalated.
+
+Analyst-side definition lives in docs/investigator-analyzer-runbook.md §9.
