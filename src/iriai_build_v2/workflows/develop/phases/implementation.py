@@ -1824,6 +1824,18 @@ def _normalize_workspace_repo_path(
     if feature_root is not None and (feature_root / normalized / ".git").exists():
         return normalized, None
 
+    # Depth-1 nested hole (BUG-6, 2026-06-12): the prefix loop above never runs
+    # for single-segment paths (range(1, 1) is empty), so a missing path
+    # directly inside a search root that is ITSELF a git repo (monorepo
+    # workspace / '.'-rooted feature worktree) was treated as a NEW repo
+    # boundary — the registry then scaffolded an embedded .git over a
+    # populated tracked subdirectory (live: spend-client, repo 80358b0b,
+    # wiped to scaffold at g5 prefetch). Such paths are nested requests into
+    # the root repo ('.'), exactly per this function's docstring.
+    for root in search_roots:
+        if (root / ".git").exists():
+            return ".", normalized
+
     return normalized, None
 
 
