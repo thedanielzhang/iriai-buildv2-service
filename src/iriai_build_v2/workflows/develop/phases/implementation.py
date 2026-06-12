@@ -6369,6 +6369,125 @@ async def _integrated_lane_task_ids_for_group(
     return integrated
 
 
+@dataclass
+class _PendingMergeFailedLaneProbe:
+    """Per-group probe of terminally-``failed`` durable merge-queue lanes.
+
+    Built for the (W-PM) resume re-route: a wave whose tasks completed but
+    whose lanes terminally ``failed`` for a NON-``commit_hygiene`` class (e.g.
+    ``checkpoint_contradiction`` — "repo not clean at baseline") used to be a
+    permanent dead-end on resume: the re-drive drains nothing (``claim`` cannot
+    re-take ``failed`` lanes) and the per-task pending-marker branch hard-blocks,
+    so the captured patches could NEVER reach the merge queue again. The probe
+    supplies what the per-task resume scan needs to re-route those tasks back
+    through the LIVE enqueue+drain+checkpoint block:
+
+    - ``retry_source_by_task``: task id -> the NEWEST failed lane id (the head
+      of the retry chain — ``_validate_retry_source`` refuses a source that
+      already has a non-cancelled replacement) for single-task lanes whose
+      failure class is NOT ``commit_hygiene`` (that class has its own bounded
+      re-dispatch recovery seam and must keep escalating when exhausted).
+    - ``laned_task_ids``: every task id covered by ANY non-cancelled lane, so
+      the scan can tell "captured but never enqueued" (no lane at all — plain
+      re-enqueue, no retry source) apart from "no evidence" (keep blocking).
+
+    Mirrors :func:`_integrated_lane_task_ids_for_group`'s fail-closed pattern:
+    any missing module, store, connection, or DB error returns an EMPTY probe,
+    so the caller falls through to the UNCHANGED loud-blocker behavior — a
+    re-enqueue is never invented on incomplete evidence.
+    """
+
+    retry_source_by_task: dict[str, int] = field(default_factory=dict)
+    laned_task_ids: set[str] = field(default_factory=set)
+    # False when the probe could not read the queue (missing module/store/DB
+    # error): the caller must then NEVER infer "no lane exists" — fail closed
+    # to the unchanged loud blocker instead of inventing a re-enqueue.
+    probe_ok: bool = False
+
+
+async def _failed_pending_merge_lane_probe_for_group(
+    runner: WorkflowRunner,
+    feature: Feature,
+    *,
+    dag_sha256: str,
+    group_idx: int,
+) -> _PendingMergeFailedLaneProbe:
+    """Probe ONE group's lanes for the (W-PM) pending-merge resume re-route."""
+
+    empty = _PendingMergeFailedLaneProbe()
+    if MergeQueueStore is None:
+        return empty
+    store = _execution_control_store_for_runner(runner)
+    if store is None:
+        return empty
+    feature_id = str(getattr(feature, "id", "") or "")
+    if not feature_id or not str(dag_sha256 or ""):
+        return empty
+    try:
+        async with _merge_queue_connection(store) as conn:
+            queue_store = MergeQueueStore(conn)
+            items = await queue_store.list_group_items(
+                feature_id, str(dag_sha256), group_idx
+            )
+    except Exception:  # pragma: no cover - fail closed on any store/DB error.
+        logger.debug(
+            "failed pending-merge lane probe failed for group %d",
+            group_idx,
+            exc_info=True,
+        )
+        return empty
+    # Lane ids that already have a non-cancelled retry replacement: those are
+    # NOT valid retry sources (`_validate_retry_source` refuses them) — the
+    # chain head (the newest unreplaced failed lane) is.
+    replaced: set[int] = set()
+    for item in items or []:
+        payload = getattr(item, "payload", None) or {}
+        retry_of = getattr(item, "retry_of_queue_item_id", None)
+        if retry_of is None:
+            retry_of = payload.get("retry_of_queue_item_id")
+        if retry_of is None:
+            continue
+        if str(getattr(item, "status", "") or "") == "cancelled":
+            continue
+        try:
+            replaced.add(int(retry_of))
+        except (TypeError, ValueError):
+            continue
+    laned: set[str] = set()
+    sources: dict[str, int] = {}
+    for item in items or []:
+        status = str(getattr(item, "status", "") or "")
+        covered = [
+            str(c.task_id)
+            for c in getattr(item, "task_coverage", []) or []
+            if str(getattr(c, "task_id", ""))
+        ]
+        if status != "cancelled":
+            laned.update(covered)
+        if status != "failed":
+            continue
+        failure_class, _detail = _parse_lane_failure(item)
+        if failure_class == "commit_hygiene":
+            continue
+        # A `task:{id}` lane covers exactly one task; the re-route is per-task.
+        if len(covered) != 1:
+            continue
+        try:
+            lane_id = int(getattr(item, "id", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if lane_id in replaced:
+            continue
+        task_id = covered[0]
+        if sources.get(task_id, -1) < lane_id:
+            sources[task_id] = lane_id
+    return _PendingMergeFailedLaneProbe(
+        retry_source_by_task=sources,
+        laned_task_ids=laned,
+        probe_ok=True,
+    )
+
+
 def _commit_hygiene_recovery_feedback(
     lane: _CommitHygieneRecoveryLane,
     *,
@@ -21788,113 +21907,16 @@ async def _implement_dag(
             if workspace_mgr
             else None
         )
-        authority_guard = WorkspaceAuthorityCompatibilityOutcome()
-        if workspace_mgr and feature_root is not None:
-            authority_guard = await _run_workspace_authority_pre_dispatch_adapter(
-                runner,
-                feature,
-                group_idx,
-                group_tasks,
-                workspace_root=Path(workspace_mgr._base),
-                feature_root=feature_root,
-                stage="initial-dispatch",
-                dag_sha256=dag_sha256,
-            )
-            if _workspace_authority_blocks_dispatch(authority_guard):
-                evidence = "; ".join(
-                    f"{getattr(route, 'failure_class', '')}/"
-                    f"{getattr(route, 'failure_type', '')}: "
-                    f"{getattr(route, 'route', '')}"
-                    for route in authority_guard.routes[:10]
-                )
-                return DagExecutionOutcome(
-                    implementation_text="\n\n".join(to_str(r) for r in all_results),
-                    failure=(
-                        "WorkspaceAuthority pre-dispatch guard blocked normal "
-                        f"group {group_idx} implementation using typed "
-                        "deterministic evidence. Run the typed workflow remediation "
-                        "route for repairable blockers before dispatch; quiesce only "
-                        "for operator-required safety ambiguity. "
-                        f"Evidence: {evidence or 'see workspace-authority-routes artifact'}"
-                    ),
-                    handover=handover,
-                    terminal_state=(
-                        "quiesced" if authority_guard.operator_required else "workflow_blocked"
-                    ),
-                )
-        alias_guard_ok, alias_guard_report = await _run_worktree_alias_pre_dispatch_guard(
-            runner,
-            feature,
-            group_idx,
-            group_tasks,
-            feature_root=feature_root,
-        )
-        if not alias_guard_ok:
-            details = "; ".join(
-                f"{problem.get('task_id')}: {problem.get('path')} -> "
-                f"{problem.get('canonical_path') or problem.get('canonical_repo')}"
-                for problem in alias_guard_report.get("blockers", [])[:10]
-            )
-            return DagExecutionOutcome(
-                implementation_text="\n\n".join(to_str(r) for r in all_results),
-                failure=(
-                    "Canonical worktree alias pre-dispatch guard blocked normal "
-                    f"group {group_idx} implementation before model dispatch. "
-                    "This is a workflow-resolved deterministic unblock, not an "
-                    "operator-required action. Run focused canonical repair against "
-                    f"the canonical repo paths. Alias blockers: {details}"
-                ),
-                handover=handover,
-                terminal_state="workflow_blocked",
-            )
-        if workspace_mgr and not authority_guard.approved:
-            evidence = "; ".join(
-                f"{getattr(route, 'failure_class', '')}/"
-                f"{getattr(route, 'failure_type', '')}: "
-                f"{getattr(route, 'route', '')}"
-                for route in authority_guard.routes[:10]
-            )
-            return DagExecutionOutcome(
-                implementation_text="\n\n".join(to_str(r) for r in all_results),
-                failure=(
-                    "WorkspaceAuthority pre-dispatch guard found deterministic "
-                    f"repairable blockers for group {group_idx}. Run the typed "
-                    "workflow repair route before implementer dispatch. "
-                    f"Evidence: {evidence or 'see workspace-authority-routes artifact'}"
-                ),
-                handover=handover,
-                terminal_state="workflow_blocked",
-            )
-
-        contract_outcome = await _compile_task_contracts_for_group(
-            runner,
-            feature,
-            dag,
-            group_idx,
-            group_tasks,
-            registry=authority_guard.registry,
-            feature_root=feature_root,
-            dag_sha256=dag_sha256,
-        )
-        if not contract_outcome.approved:
-            return DagExecutionOutcome(
-                implementation_text="\n\n".join(to_str(r) for r in all_results),
-                failure=(
-                    contract_outcome.failure
-                    or "Task deliverable contract compilation failed before dispatch."
-                ),
-                handover=handover,
-                terminal_state="workflow_blocked",
-            )
-        contracts_by_task_id = contract_outcome.contracts_by_task_id
-
-        # Build prompts with handover context from prior groups
-        handover_context = ""
-        if handover.completed or handover.failed_attempts:
-            handover.compress()
-            handover_context = f"\n\n## Handover — Prior Work\n\n{to_markdown(handover)}"
-
+        stranded_pending_merge_task_ids: list[str] = []
+        stranded_pending_merge_detail = ""
         # ── Slice 08e-3b P2-a: resume re-drive of a checkpoint-crashed group ──
+        # (W-PM) This block runs BEFORE the workspace-authority pre-dispatch
+        # guard ON PURPOSE: the guard protects NEW implementer dispatch, but a
+        # wave whose tasks all completed needs its captured lanes DRAINED, not
+        # dispatched. Observed (feature 5b280bb4 g1): the guard quiesced on
+        # `workspace_dirty` first, so a resume exited without ever attempting
+        # the pending-merge drain and the wave sat stranded. The drain has its
+        # own baseline-clean fail-closed checks, so running it first is safe.
         # If the 08e-3b `if pending_merge_queue:` block enqueued + drained this
         # group's lanes but the checkpoint then crashed (vector 6), the lanes
         # sit `integrated`, no `dag-group:*` projection exists, and the
@@ -21905,13 +21927,13 @@ async def _implement_dag(
         # (no double-apply — `claim` cannot re-take `integrated` lanes). On
         # success the group is `done`; advance. On failure fall through to the
         # existing fail-closed per-task pending-marker block below.
-        group_has_pending_merge_marker = False
+        pending_merge_marked_task_ids: list[str] = []
         for tid in group:
             if await runner.artifacts.get(
                 _pending_merge_queue_marker_key(tid), feature=feature,
             ):
-                group_has_pending_merge_marker = True
-                break
+                pending_merge_marked_task_ids.append(str(tid))
+        group_has_pending_merge_marker = bool(pending_merge_marked_task_ids)
         if group_has_pending_merge_marker:
             resume_recovery = await _resume_recover_durable_merge_queue_group(
                 runner,
@@ -22009,11 +22031,168 @@ async def _implement_dag(
                 group_idx,
                 resume_recovery.detail,
             )
+            # (W-PM) LOUD typed record of the stranded pending-merge set: a
+            # resume must never conclude (or park on an unrelated dispatch
+            # blocker) while these lanes are undrained without naming them.
+            stranded_pending_merge_task_ids = list(pending_merge_marked_task_ids)
+            stranded_pending_merge_detail = str(resume_recovery.detail or "")
+            await _log_feature_event(
+                runner,
+                feature.id,
+                "dag_resume_pending_merge_stranded",
+                "implementation",
+                content=f"g{group_idx}:resume",
+                metadata={
+                    "group_idx": group_idx,
+                    "stage": "resume",
+                    "stranded_task_ids": stranded_pending_merge_task_ids,
+                    "detail": stranded_pending_merge_detail[:1000],
+                },
+            )
+
+        def _with_stranded_pending_merge_note(failure_text: str) -> str:
+            # (W-PM) Fail-loud invariant: any pre-dispatch blocker surfaced for
+            # a group whose pending-merge re-drive could not complete must NAME
+            # the stranded tasks, so the park is never mistaken for a clean
+            # phase conclusion while captured lanes await the merge queue.
+            if not stranded_pending_merge_task_ids:
+                return failure_text
+            return _append_note_once(
+                failure_text,
+                (
+                    f"STRANDED PENDING-MERGE: unsealed group {group_idx} still "
+                    "carries dag-task-pending-merge markers for task(s) "
+                    + ", ".join(stranded_pending_merge_task_ids)
+                    + " whose durable merge-queue re-drive did not complete"
+                    + (
+                        f": {stranded_pending_merge_detail}"
+                        if stranded_pending_merge_detail
+                        else "."
+                    )
+                ),
+            )
+
+        authority_guard = WorkspaceAuthorityCompatibilityOutcome()
+        if workspace_mgr and feature_root is not None:
+            authority_guard = await _run_workspace_authority_pre_dispatch_adapter(
+                runner,
+                feature,
+                group_idx,
+                group_tasks,
+                workspace_root=Path(workspace_mgr._base),
+                feature_root=feature_root,
+                stage="initial-dispatch",
+                dag_sha256=dag_sha256,
+            )
+            if _workspace_authority_blocks_dispatch(authority_guard):
+                evidence = "; ".join(
+                    f"{getattr(route, 'failure_class', '')}/"
+                    f"{getattr(route, 'failure_type', '')}: "
+                    f"{getattr(route, 'route', '')}"
+                    for route in authority_guard.routes[:10]
+                )
+                return DagExecutionOutcome(
+                    implementation_text="\n\n".join(to_str(r) for r in all_results),
+                    failure=_with_stranded_pending_merge_note(
+                        "WorkspaceAuthority pre-dispatch guard blocked normal "
+                        f"group {group_idx} implementation using typed "
+                        "deterministic evidence. Run the typed workflow remediation "
+                        "route for repairable blockers before dispatch; quiesce only "
+                        "for operator-required safety ambiguity. "
+                        f"Evidence: {evidence or 'see workspace-authority-routes artifact'}"
+                    ),
+                    handover=handover,
+                    terminal_state=(
+                        "quiesced" if authority_guard.operator_required else "workflow_blocked"
+                    ),
+                )
+        alias_guard_ok, alias_guard_report = await _run_worktree_alias_pre_dispatch_guard(
+            runner,
+            feature,
+            group_idx,
+            group_tasks,
+            feature_root=feature_root,
+        )
+        if not alias_guard_ok:
+            details = "; ".join(
+                f"{problem.get('task_id')}: {problem.get('path')} -> "
+                f"{problem.get('canonical_path') or problem.get('canonical_repo')}"
+                for problem in alias_guard_report.get("blockers", [])[:10]
+            )
+            return DagExecutionOutcome(
+                implementation_text="\n\n".join(to_str(r) for r in all_results),
+                failure=_with_stranded_pending_merge_note(
+                    "Canonical worktree alias pre-dispatch guard blocked normal "
+                    f"group {group_idx} implementation before model dispatch. "
+                    "This is a workflow-resolved deterministic unblock, not an "
+                    "operator-required action. Run focused canonical repair against "
+                    f"the canonical repo paths. Alias blockers: {details}"
+                ),
+                handover=handover,
+                terminal_state="workflow_blocked",
+            )
+        if workspace_mgr and not authority_guard.approved:
+            evidence = "; ".join(
+                f"{getattr(route, 'failure_class', '')}/"
+                f"{getattr(route, 'failure_type', '')}: "
+                f"{getattr(route, 'route', '')}"
+                for route in authority_guard.routes[:10]
+            )
+            return DagExecutionOutcome(
+                implementation_text="\n\n".join(to_str(r) for r in all_results),
+                failure=_with_stranded_pending_merge_note(
+                    "WorkspaceAuthority pre-dispatch guard found deterministic "
+                    f"repairable blockers for group {group_idx}. Run the typed "
+                    "workflow repair route before implementer dispatch. "
+                    f"Evidence: {evidence or 'see workspace-authority-routes artifact'}"
+                ),
+                handover=handover,
+                terminal_state="workflow_blocked",
+            )
+
+        contract_outcome = await _compile_task_contracts_for_group(
+            runner,
+            feature,
+            dag,
+            group_idx,
+            group_tasks,
+            registry=authority_guard.registry,
+            feature_root=feature_root,
+            dag_sha256=dag_sha256,
+        )
+        if not contract_outcome.approved:
+            return DagExecutionOutcome(
+                implementation_text="\n\n".join(to_str(r) for r in all_results),
+                failure=(
+                    contract_outcome.failure
+                    or "Task deliverable contract compilation failed before dispatch."
+                ),
+                handover=handover,
+                terminal_state="workflow_blocked",
+            )
+        contracts_by_task_id = contract_outcome.contracts_by_task_id
+
+        # Build prompts with handover context from prior groups
+        handover_context = ""
+        if handover.completed or handover.failed_attempts:
+            handover.compress()
+            handover_context = f"\n\n## Handover — Prior Work\n\n{to_markdown(handover)}"
+
+        # The Slice 08e-3b P2-a pending-merge resume re-drive used to live
+        # HERE (after the workspace-authority pre-dispatch guard). It now
+        # runs BEFORE that guard — see the block above the authority guard
+        # in this loop — so a dispatch-time workspace blocker (e.g.
+        # workspace_dirty) can never strand a fully-completed wave's
+        # pending-merge lanes without ever attempting the drain.
 
         # ── Per-task resume: check which tasks already completed ─────
         pending_tasks: list[ImplementationTask] = []
         completed_results: list[ImplementationResult] = []
         pending_merge_queue_resume_results: list[ImplementationResult] = []
+        # (W-PM) task id -> newest unreplaced FAILED lane id: tasks re-routed
+        # out of a terminally-failed (non-commit_hygiene) lane are enqueued as
+        # `retry_of_queue_item_id` replacements of that lane.
+        resume_pending_merge_retry_source_by_task: dict[str, int] = {}
         stable_task_indices = {tid: idx for idx, tid in enumerate(group)}
 
         # ── Commit-hygiene drain-failure recovery (Blocker #2) ───────
@@ -22039,6 +22218,14 @@ async def _implement_dag(
         # must treat them as a completed success, never a terminal blocker.
         # Fails closed (empty set on any store/DB error → unchanged blocker).
         integrated_lane_task_ids = await _integrated_lane_task_ids_for_group(
+            runner, feature, dag_sha256=dag_sha256, group_idx=group_idx,
+        )
+        # (W-PM) Terminally-failed (non-commit_hygiene) lanes + the set of
+        # task ids that have ANY lane at all — feeds the pending-marker
+        # re-route below so a completed wave whose lanes failed (or were never
+        # enqueued) is routed BACK through the live enqueue+drain+checkpoint
+        # instead of dead-blocking forever. Fails closed to the empty probe.
+        failed_pending_merge_probe = await _failed_pending_merge_lane_probe_for_group(
             runner, feature, dag_sha256=dag_sha256, group_idx=group_idx,
         )
         # Genuine per-task hygiene-refailure count, derived from the durable
@@ -22316,6 +22503,88 @@ async def _implement_dag(
                         tid,
                     )
                     continue
+                # (W-PM) Re-route a stranded completed task BACK through the
+                # LIVE enqueue+drain+checkpoint block — exactly as the live
+                # path would — when its lane terminally `failed` for a
+                # non-commit_hygiene class (newest unreplaced failed lane
+                # becomes the `retry_of_queue_item_id` source) OR when the
+                # marker was written but NO lane was ever enqueued (enqueue
+                # crashed after the marker write — plain re-enqueue). Requires
+                # the durable `dag-task:*` completed result with machine-
+                # readable patch evidence (rehydrated from terminal dispatch
+                # evidence when the notes lack ids). Anything less falls
+                # through to the UNCHANGED loud fail-closed blocker below.
+                reroute_retry_source = (
+                    failed_pending_merge_probe.retry_source_by_task.get(tid)
+                )
+                never_enqueued = (
+                    failed_pending_merge_probe.probe_ok
+                    and tid not in failed_pending_merge_probe.laned_task_ids
+                )
+                if task_marker and (
+                    reroute_retry_source is not None or never_enqueued
+                ):
+                    reroute_result: ImplementationResult | None = None
+                    try:
+                        candidate = ImplementationResult.model_validate_json(
+                            task_marker
+                        )
+                    except Exception:
+                        candidate = None
+                    if (
+                        candidate is not None
+                        and candidate.status == "completed"
+                        and _result_requires_durable_merge_queue(candidate)
+                    ):
+                        if _parse_patch_evidence_ids_from_notes(candidate.notes):
+                            reroute_result = candidate
+                        else:
+                            reroute_result = (
+                                await _rehydrate_pending_merge_queue_result_from_dispatch_evidence(
+                                    runner,
+                                    feature,
+                                    candidate,
+                                    dag_sha256=dag_sha256,
+                                    group_idx=group_idx,
+                                    task_id=tid,
+                                )
+                            )
+                    if reroute_result is not None:
+                        completed_results.append(reroute_result)
+                        all_results.append(reroute_result)
+                        handover.record_success(reroute_result)
+                        pending_merge_queue_resume_results.append(reroute_result)
+                        if reroute_retry_source is not None:
+                            resume_pending_merge_retry_source_by_task[tid] = (
+                                int(reroute_retry_source)
+                            )
+                        await _log_feature_event(
+                            runner,
+                            feature.id,
+                            "dag_resume_pending_merge_requeued",
+                            "implementation",
+                            content=tid,
+                            metadata={
+                                "group_idx": group_idx,
+                                "stage": "resume",
+                                "task_id": tid,
+                                "retry_of_queue_item_id": reroute_retry_source,
+                                "never_enqueued": bool(
+                                    reroute_retry_source is None
+                                ),
+                            },
+                        )
+                        logger.info(
+                            "Task %s pending-merge marker re-routed into the "
+                            "durable merge queue on resume (%s)",
+                            tid,
+                            (
+                                f"retry of failed lane {reroute_retry_source}"
+                                if reroute_retry_source is not None
+                                else "captured but never enqueued"
+                            ),
+                        )
+                        continue
                 # Lane is genuinely NOT integrated (truly pending, or captured
                 # but never enqueued): keep the existing fail-closed blocker.
                 return DagExecutionOutcome(
@@ -23004,7 +23273,11 @@ async def _implement_dag(
                     contracts_by_task_id=contracts_by_task_id,
                     feature_root=feature_root,
                     retry_source_by_task=(
-                        commit_hygiene_retry_source_by_task or None
+                        {
+                            **commit_hygiene_retry_source_by_task,
+                            **resume_pending_merge_retry_source_by_task,
+                        }
+                        or None
                     ),
                 )
             sandbox_blocked = [
@@ -23067,7 +23340,11 @@ async def _implement_dag(
                             # `failed:commit_hygiene` lane is enqueued as a
                             # `retry_of_queue_item_id` replacement of that lane.
                             retry_source_by_task=(
-                                commit_hygiene_retry_source_by_task or None
+                                {
+                                    **commit_hygiene_retry_source_by_task,
+                                    **resume_pending_merge_retry_source_by_task,
+                                }
+                                or None
                             ),
                         )
                     )
