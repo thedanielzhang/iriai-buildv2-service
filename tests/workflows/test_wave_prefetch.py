@@ -38,6 +38,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from iriai_build_v2.execution_control.models import IdempotencyConflict
 from iriai_build_v2.models.outputs import ImplementationTask
 from iriai_build_v2.workflows.develop.execution.sandbox import SandboxSpec
 from iriai_build_v2.workflows.develop.phases import implementation as implementation_module
@@ -589,3 +590,183 @@ async def test_prompt_artifact_rebuilt_when_amendment_lands(monkeypatch):
     new_keys = _prompt_keys(runner)
     assert len(new_keys) == 2
     assert keys_after_prefetch[0] in new_keys
+
+
+# ── N-25: process-scoped prefetch lease identity ─────────────────────────────
+#
+# The durable sandbox-lease idempotency key mixes in attempt_no (default
+# IRIAI_SANDBOX_REUSE_ON_RETRY=off). With deterministic prefetch numbering
+# (BASE + task_idx) a successor process rebuilt byte-identical keys; once a
+# dead run's prefetch leases went terminal, store._insert_or_reuse_sandbox_
+# lease raised IdempotencyConflict("terminal sandbox lease cannot be reused
+# for active allocation") forever (observed live: develop16 g3 attempts
+# 987000000-987000003). The fix salts attempt_no with a per-boot nonce.
+
+_TERMINAL_LEASE_STATUSES = {"captured", "released", "retained", "failed", "poisoned"}
+
+
+class _FakeDurableLeaseStore:
+    """Mimics ExecutionControlStore._insert_or_reuse_sandbox_lease's
+    terminal-reuse rule (execution_control/store.py: a row found by
+    (feature_id, idempotency_key) whose status is terminal cannot be
+    re-allocated as active)."""
+
+    def __init__(self) -> None:
+        self.rows: dict[str, str] = {}
+
+    def allocate(self, idempotency_key: str) -> None:
+        status = self.rows.get(idempotency_key)
+        if status in _TERMINAL_LEASE_STATUSES:
+            raise IdempotencyConflict(
+                "terminal sandbox lease cannot be reused for active allocation"
+            )
+        self.rows[idempotency_key] = "allocated"
+
+    def release(self, idempotency_key: str) -> None:
+        self.rows[idempotency_key] = "released"
+
+
+@pytest.fixture()
+def fresh_boot_salt():
+    """Reset the per-boot salt; returns a callable simulating a new boot."""
+
+    def _reset(value: int | None = None) -> None:
+        implementation_module._WAVE_PREFETCH_BOOT_SALT = value
+
+    _reset()
+    yield _reset
+    _reset()
+
+
+def _prefetch_spec(task_idx: int = 0) -> SandboxSpec:
+    return _spec(
+        attempt_no=implementation_module._wave_prefetch_attempt_no(task_idx)
+    )
+
+
+def test_two_boots_prefetch_same_wave_no_idempotency_conflict(
+    monkeypatch, fresh_boot_salt
+):
+    monkeypatch.delenv("IRIAI_SANDBOX_REUSE_ON_RETRY", raising=False)
+    store = _FakeDurableLeaseStore()
+
+    # Boot 1 prefetches the wave; the run dies and its lease goes terminal.
+    fresh_boot_salt(11)
+    boot1 = _prefetch_spec()
+    store.allocate(boot1.idempotency_key)
+    store.release(boot1.idempotency_key)
+
+    # Boot 2 (successor process, same wave, same content): fresh salt means a
+    # fresh durable key — allocation succeeds, no IdempotencyConflict.
+    fresh_boot_salt(12)
+    boot2 = _prefetch_spec()
+    assert boot2.attempt_no != boot1.attempt_no
+    assert boot2.idempotency_key != boot1.idempotency_key
+    store.allocate(boot2.idempotency_key)  # must not raise
+
+    # The defect class this fixes: a deterministic attempt_no reproduces the
+    # dead boot's key exactly and is permanently rejected.
+    legacy = _spec(
+        attempt_no=implementation_module._WAVE_PREFETCH_ATTEMPT_NO_BASE + 0
+    )
+    store.allocate(legacy.idempotency_key)
+    store.release(legacy.idempotency_key)
+    with pytest.raises(IdempotencyConflict):
+        store.allocate(legacy.idempotency_key)
+
+
+def test_prefetch_attempt_ids_stay_in_reserved_range(fresh_boot_salt):
+    base = implementation_module._WAVE_PREFETCH_ATTEMPT_NO_BASE
+    ceiling = implementation_module._WAVE_PREFETCH_ATTEMPT_NO_CEILING
+    for salt in (0, 11, implementation_module._WAVE_PREFETCH_BOOT_SALT_SPAN - 1):
+        fresh_boot_salt(salt)
+        for task_idx in (0, 7, 999):
+            attempt_no = implementation_module._wave_prefetch_attempt_no(task_idx)
+            assert base <= attempt_no < ceiling
+            assert implementation_module._is_wave_prefetch_attempt_no(attempt_no)
+    # Real attempt ids — the legacy (attempt * 1000 + task_idx) shape and
+    # durable dispatcher attempt row ids (a sequence from 1) — are NEVER in
+    # the reserved prefetch namespace.
+    for real_attempt_no in (0, 1, 42, 1_000, 5_001, 123_456, base - 1):
+        assert not implementation_module._is_wave_prefetch_attempt_no(
+            real_attempt_no
+        )
+
+
+def test_boot_salt_drawn_once_per_process_and_in_range(fresh_boot_salt):
+    first = implementation_module._wave_prefetch_boot_salt()
+    second = implementation_module._wave_prefetch_boot_salt()
+    assert first == second  # stable within one boot
+    assert 0 <= first < implementation_module._WAVE_PREFETCH_BOOT_SALT_SPAN
+    # Distinct tasks in one wave get distinct ids inside the reserved range.
+    attempt_nos = {
+        implementation_module._wave_prefetch_attempt_no(i) for i in range(8)
+    }
+    assert len(attempt_nos) == 8
+    assert all(
+        implementation_module._is_wave_prefetch_attempt_no(no)
+        for no in attempt_nos
+    )
+
+
+def test_salted_attempt_no_keeps_content_key_for_adoption(
+    monkeypatch, fresh_boot_salt
+):
+    monkeypatch.delenv("IRIAI_SANDBOX_REUSE_ON_RETRY", raising=False)
+    fresh_boot_salt(11)
+    prefetch = _prefetch_spec()
+    real_dispatch = _spec(attempt_no=42)  # durable dispatcher attempt id
+    # Adoption matching is attempt-free: the content key is IDENTICAL across
+    # the salted prefetch spec and the real dispatch spec...
+    assert prefetch.content_idempotency_key == real_dispatch.content_idempotency_key
+    # ...and across boots (content_idempotency_key never sees attempt_no), so
+    # only the durable allocation key is process-scoped.
+    fresh_boot_salt(12)
+    assert (
+        _prefetch_spec().content_idempotency_key
+        == prefetch.content_idempotency_key
+    )
+    assert prefetch.idempotency_key != real_dispatch.idempotency_key
+
+
+@pytest.mark.asyncio
+async def test_adoption_end_to_end_with_salted_prefetch_attempt(
+    tmp_path, monkeypatch, fresh_boot_salt
+):
+    monkeypatch.delenv(_FLAG_ENV, raising=False)
+    monkeypatch.delenv("IRIAI_SANDBOX_REUSE_ON_RETRY", raising=False)
+    fresh_boot_salt(11)
+    feature = _feature()
+    runner = _runner()
+    workspace_root, feature_root, repo = _workspace(tmp_path)
+
+    salted_attempt_no = implementation_module._wave_prefetch_attempt_no(0)
+    prefetched = await _bind(
+        runner,
+        feature,
+        workspace_root=workspace_root,
+        feature_root=feature_root,
+        repo=repo,
+        attempt_no=salted_attempt_no,
+        prefetch=True,
+    )
+    assert prefetched is not None
+    assert len(implementation_module._WAVE_PREFETCH_REGISTRY) == 1
+
+    adopted = await _bind(
+        runner,
+        feature,
+        workspace_root=workspace_root,
+        feature_root=feature_root,
+        repo=repo,
+        attempt_no=42,  # the durable dispatcher attempt id
+    )
+    assert adopted is not None
+    assert adopted.lease.sandbox_id == prefetched.lease.sandbox_id
+    assert adopted.binding is not None
+    assert len(implementation_module._WAVE_PREFETCH_REGISTRY) == 0
+    # No second provision: the only sandbox dir is the salted prefetch root.
+    group_dir = _sandbox_group_dir(workspace_root, feature.id, 3)
+    assert sorted(p.name for p in group_dir.iterdir()) == [
+        f"attempt-{salted_attempt_no}"
+    ]

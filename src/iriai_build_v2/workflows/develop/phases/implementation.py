@@ -21717,6 +21717,74 @@ _WAVE_PREFETCH_ENV = "IRIAI_WAVE_PREFETCH"
 # durable dispatcher attempt ids the real dispatch uses, so a stale
 # prefetched sandbox can never sit on a path a real allocation needs.
 _WAVE_PREFETCH_ATTEMPT_NO_BASE = 987_000_000
+# N-25: prefetch lease identity must be PROCESS-SCOPED, not deterministic.
+# The durable sandbox-lease idempotency key (execution_control/models.py
+# `sandbox_lease_idempotency_key` and, on the runner path, sandbox.py
+# `SandboxSpec.idempotency_key`) mixes in `attempt_no` (when
+# IRIAI_SANDBOX_REUSE_ON_RETRY is off, the default), and the store's scope
+# probe + advisory lock (`_fetch_sandbox_lease_by_scope` /
+# `_lock_sandbox_lease_scope` in execution_control/store.py) key on
+# (feature, dag_sha256, group_idx, attempt_no, mode). With the original
+# deterministic `BASE + task_idx` numbering, a successor process rebuilding
+# the SAME wave produced byte-identical keys; once a dead run's prefetch
+# leases went terminal (released on shutdown/recovery),
+# `store._insert_or_reuse_sandbox_lease` permanently raised
+# IdempotencyConflict("terminal sandbox lease cannot be reused for active
+# allocation") — prefetch was dead for that wave forever. Salting the
+# attempt_no with a per-boot nonce makes every process generation allocate
+# under fresh keys (and fresh `attempt-<no>` sandbox roots, so a dead run's
+# leftover directories are never reused either). Adoption is UNAFFECTED: the
+# prefetch-vs-dispatch match uses the attempt-free
+# `SandboxSpec.content_idempotency_key` through the in-process registry, and
+# that key never sees attempt_no.
+#
+# Layout: attempt_no = BASE + boot_salt * STRIDE + task_idx, with
+# boot_salt < SPAN. The whole reserved range is
+# [987_000_000, 987_000_000 + SPAN * STRIDE) — far above any durable
+# dispatcher attempt row id (a Postgres sequence that starts at 1), so
+# prefetch ids still can never collide with real attempt ids.
+_WAVE_PREFETCH_ATTEMPT_TASK_STRIDE = 1_000
+_WAVE_PREFETCH_BOOT_SALT_SPAN = 1_000_000
+_WAVE_PREFETCH_ATTEMPT_NO_CEILING = (
+    _WAVE_PREFETCH_ATTEMPT_NO_BASE
+    + _WAVE_PREFETCH_BOOT_SALT_SPAN * _WAVE_PREFETCH_ATTEMPT_TASK_STRIDE
+)
+_WAVE_PREFETCH_BOOT_SALT_GUARD = threading.Lock()
+_WAVE_PREFETCH_BOOT_SALT: int | None = None
+
+
+def _wave_prefetch_boot_salt() -> int:
+    """Per-process-boot nonce in [0, _WAVE_PREFETCH_BOOT_SALT_SPAN).
+
+    Computed once per process from pid + monotonic boot offset + urandom so
+    two process generations (e.g. a crashed run and its resume) never share
+    prefetch lease identities. Tests simulate a fresh boot by resetting
+    `_WAVE_PREFETCH_BOOT_SALT` to None."""
+    global _WAVE_PREFETCH_BOOT_SALT
+    with _WAVE_PREFETCH_BOOT_SALT_GUARD:
+        if _WAVE_PREFETCH_BOOT_SALT is None:
+            seed = f"{os.getpid()}:{time.monotonic_ns()}:{os.urandom(8).hex()}"
+            digest = hashlib.sha256(seed.encode("utf-8")).digest()
+            _WAVE_PREFETCH_BOOT_SALT = (
+                int.from_bytes(digest[:8], "big") % _WAVE_PREFETCH_BOOT_SALT_SPAN
+            )
+        return _WAVE_PREFETCH_BOOT_SALT
+
+
+def _wave_prefetch_attempt_no(task_idx: int) -> int:
+    """Process-scoped prefetch attempt_no for one wave task (N-25)."""
+    return (
+        _WAVE_PREFETCH_ATTEMPT_NO_BASE
+        + _wave_prefetch_boot_salt() * _WAVE_PREFETCH_ATTEMPT_TASK_STRIDE
+        + int(task_idx)
+    )
+
+
+def _is_wave_prefetch_attempt_no(attempt_no: int) -> bool:
+    """True when `attempt_no` sits in the reserved prefetch namespace."""
+    return _WAVE_PREFETCH_ATTEMPT_NO_BASE <= int(attempt_no) < (
+        _WAVE_PREFETCH_ATTEMPT_NO_CEILING
+    )
 
 
 def _wave_prefetch_enabled() -> bool:
@@ -22159,7 +22227,9 @@ class _WavePrefetchController:
                         runtime=None,
                         repo_id_hint=repo_binding.repo_id,
                         sandbox_mode="task",
-                        sandbox_attempt_no=_WAVE_PREFETCH_ATTEMPT_NO_BASE + task_idx,
+                        # N-25: per-boot salted — never reuses a dead run's
+                        # terminal lease key (see _wave_prefetch_attempt_no).
+                        sandbox_attempt_no=_wave_prefetch_attempt_no(task_idx),
                         prefetch_register_only=True,
                     )
                     if record is None:
