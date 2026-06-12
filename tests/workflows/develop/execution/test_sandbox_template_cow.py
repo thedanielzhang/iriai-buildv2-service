@@ -1172,3 +1172,106 @@ class TestVenvPathRewrite:
         assert published == []  # never publish a template with dangling tooling
         repo_root = Path(lease.repo_roots["app"])
         assert git(repo_root, "rev-parse", "HEAD") == base
+
+
+class TestClonefileParentGroupInheritance:
+    """N-24: cp -c (clonefile) does NOT restore the source group even with -p;
+    the clone's gid follows BSD inheritance from the DESTINATION PARENT dir.
+    _clonefile_tree must therefore make the parent agent-group + setgid before
+    cloning (flag-gated on IRIAI_SANDBOX_TEMPLATE_PERMS), so spot-verify
+    passes instead of full-sweeping every clone (live defect 2026-06-11)."""
+
+    @pytest.fixture
+    def stub_runner(self):
+        from iriai_build_v2.workflows.develop.execution import sandbox as sb
+
+        class _Stub:
+            _clonefile_tree = sb.SandboxRunner._clonefile_tree
+
+            def _run_command(self, cwd, argv, *, env=None):
+                proc = subprocess.run(
+                    list(argv), cwd=cwd, capture_output=True, text=True
+                )
+                return SimpleNamespace(
+                    returncode=proc.returncode,
+                    stdout=proc.stdout,
+                    stderr=proc.stderr,
+                )
+
+        return _Stub()
+
+    def _pick_secondary_gid(self) -> int | None:
+        primary = os.getgid()
+        for gid in os.getgroups():
+            if gid != primary:
+                return gid
+        return None
+
+    @pytest.mark.skipif(os.uname().sysname != "Darwin", reason="clonefile is macOS-only")
+    def test_parent_prepared_and_clone_inherits_group(
+        self, stub_runner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from iriai_build_v2.workflows.develop.execution import sandbox as sb
+
+        gid = self._pick_secondary_gid()
+        if gid is None:
+            pytest.skip("test user has no secondary group to verify inheritance")
+        monkeypatch.setenv("IRIAI_SANDBOX_TEMPLATE_PERMS", "1")
+        monkeypatch.setattr(sb, "_agent_shared_group", lambda: ("testgrp", gid))
+
+        # Model the REAL precondition: a wm-normalized template (whole tree
+        # already agent-gid, dirs setgid).  cp -c -R -p is a hybrid: dirs are
+        # mkdir'd then group-RESTORED from source; files are clonefile'd and
+        # skip the -p group restore (inheriting the dir's creation-time gid).
+        # With a normalized source AND a setgid agent-gid dest parent, both
+        # paths converge on the agent gid.
+        source = tmp_path / "template" / "repo"
+        source.mkdir(parents=True)
+        (source / "f.txt").write_text("x")
+        (source / "sub").mkdir()
+        (source / "sub" / "g.txt").write_text("y")
+        for node in [source, source / "f.txt", source / "sub", source / "sub" / "g.txt"]:
+            os.chown(node, -1, gid)
+            if node.is_dir():
+                os.chmod(node, node.stat().st_mode | stat.S_ISGID | stat.S_IWGRP)
+        dest_parent = tmp_path / "attempt" / "repos"
+        dest_parent.mkdir(parents=True)
+
+        try:
+            stub_runner._clonefile_tree(source, dest_parent / "repo")
+        except sb.SandboxError as exc:
+            if "different filesystems" in str(exc) or "requires macOS" in str(exc):
+                pytest.skip(f"volume does not support this test: {exc}")
+            raise
+
+        parent_st = dest_parent.stat()
+        assert parent_st.st_gid == gid, "destination parent must get the agent gid"
+        assert parent_st.st_mode & stat.S_ISGID, "destination parent must be setgid"
+        clone_root = dest_parent / "repo"
+        assert clone_root.stat().st_gid == gid, "cloned tree root must inherit gid"
+        assert (clone_root / "f.txt").stat().st_gid == gid
+        assert (clone_root / "sub" / "g.txt").stat().st_gid == gid
+
+    @pytest.mark.skipif(os.uname().sysname != "Darwin", reason="clonefile is macOS-only")
+    def test_flag_off_skips_parent_preparation(
+        self, stub_runner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from iriai_build_v2.workflows.develop.execution import sandbox as sb
+
+        monkeypatch.setenv("IRIAI_SANDBOX_TEMPLATE_PERMS", "0")
+        called = []
+        monkeypatch.setattr(
+            sb, "_agent_shared_group", lambda: called.append(1) or ("g", None)
+        )
+        source = tmp_path / "t" / "repo"
+        source.mkdir(parents=True)
+        (source / "f.txt").write_text("x")
+        dest_parent = tmp_path / "a" / "repos"
+        dest_parent.mkdir(parents=True)
+        before_mode = dest_parent.stat().st_mode
+        try:
+            stub_runner._clonefile_tree(source, dest_parent / "repo")
+        except sb.SandboxError as exc:
+            pytest.skip(f"volume does not support clonefile here: {exc}")
+        assert not called, "flag OFF must not touch group resolution"
+        assert dest_parent.stat().st_mode == before_mode

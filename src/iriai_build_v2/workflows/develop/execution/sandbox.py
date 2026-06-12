@@ -298,8 +298,11 @@ _TEMPLATE_LOCKFILE_GLOBS = ("requirements*.txt",)
 _TEMPLATE_PRUNE_GRACE_S = 3600.0
 
 # Template-time permission normalization (IRIAI_SANDBOX_TEMPLATE_PERMS,
-# default ON).  APFS clonefile(2) preserves ownership and modes, so running
-# the group/mode normalization sweep ONCE on the template at build time means
+# default ON).  APFS clonefile(2) preserves MODES (incl. setgid dir bits) but
+# NOT the source group — the clone's gid follows BSD inheritance from the
+# destination parent dir (verified live 2026-06-11), so _clonefile_tree makes
+# the destination parent agent-group + setgid before cloning; with that, the
+# template-build-time normalization sweep means
 # every clonefile copy already carries correct permissions; the per-clone full
 # tree walk (lstat/chown/chmod over an ~8GB tree, minutes per sandbox)
 # downgrades to a cheap bounded spot-verify.  ANY spot-verify mismatch falls
@@ -3765,13 +3768,38 @@ class SandboxRunner:
             )
         cp_args = ["cp", "-c", "-R"]
         if _sandbox_template_perms_enabled():
-            # Template-time permission normalization relies on the clone
-            # INHERITING the template's group + group-write bits; plain
-            # `cp -R` masks created modes with the umask (022 strips g+w), so
-            # preserve attributes explicitly.  Gated on the flag so
-            # IRIAI_SANDBOX_TEMPLATE_PERMS=0 keeps today's clone byte-identical
-            # (the full per-clone sweep re-normalizes either way).
-            cp_args.append("-p")
+            # clonefile(2) preserves MODES (incl. g+w and dir setgid bits) but
+            # NOT the source's group: the clone's gid follows BSD group
+            # inheritance from the DESTINATION PARENT directory, and `-p`
+            # does not restore the group on the -c path (verified live
+            # 2026-06-11: clones of a gid-506 template arrived gid-20/staff,
+            # defeating spot-verify into a full sweep on every clone).  Make
+            # the destination parent setgid + agent-group BEFORE the clone so
+            # the whole tree inherits the right group natively; the template's
+            # preserved modes carry the setgid bit down its own dirs.
+            cp_args.append("-p")  # still preserves timestamps/flags/modes
+            group_name, shared_gid = _agent_shared_group()
+            if shared_gid is not None:
+                try:
+                    parent_st = dest.parent.stat()
+                    if parent_st.st_gid != shared_gid:
+                        os.chown(dest.parent, -1, shared_gid)
+                    os.chmod(
+                        dest.parent,
+                        stat.S_IMODE(parent_st.st_mode)
+                        | stat.S_ISGID
+                        | stat.S_IWGRP
+                        | stat.S_IXGRP,
+                    )
+                except OSError as exc:
+                    # Loud, never silent: the clone will land staff-group and
+                    # spot-verify will (correctly) full-sweep it.
+                    logger.warning(
+                        "clone destination parent %s could not be set to "
+                        "group %s (gid %s) + setgid before clonefile: %s — "
+                        "expect a spot-verify fallback sweep for this clone",
+                        dest.parent, group_name, shared_gid, exc,
+                    )
         result = self._run_command(
             dest.parent, [*cp_args, str(source), str(dest)]
         )
