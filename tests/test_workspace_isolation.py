@@ -248,6 +248,17 @@ def test_workflow_repo_guard_rejects_symlinked_feature_ancestor_before_discovery
     assert _discover_repo_roots_under(repos_root) == []
 
 
+def test_discover_repo_roots_skips_package_manager_subtrees(tmp_path: Path):
+    repos_root = tmp_path / ".iriai" / "features" / "feat" / "repos"
+    app_repo = repos_root / "app"
+    node_modules_repo = repos_root / "app" / "node_modules" / "dep"
+    pnpm_repo = repos_root / "app" / ".pnpm" / "dep"
+    for repo in (app_repo, node_modules_repo, pnpm_repo):
+        (repo / ".git").mkdir(parents=True)
+
+    assert _discover_repo_roots_under(repos_root) == [app_repo]
+
+
 @pytest.mark.asyncio
 async def test_ensure_task_worktrees_writes_registry_preflight(
     monkeypatch: pytest.MonkeyPatch,

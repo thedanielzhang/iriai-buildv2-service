@@ -136,6 +136,16 @@ _ENV_FILE_NAMES = (
     ".env.test",
     ".env.example",
 )
+_WALK_EXCLUDED_DIRS = (
+    "node_modules",
+    ".venv",
+    "venv",
+    ".pnpm",
+    ".git",
+    ".next",
+    "dist",
+    "build",
+)
 
 
 def _utc_now_iso() -> str:
@@ -2420,8 +2430,14 @@ class CodexAgentRuntime(AgentRuntime):
                     if path.is_dir() and feature_id in path.name
                 ):
                     for env_name in _ENV_FILE_NAMES:
-                        for env_path in sorted(feature_dir.rglob(env_name)):
-                            _add(env_path)
+                        logger.info("Discovering Codex env files under %s", feature_dir)
+                        try:
+                            for env_path in sorted(feature_dir.rglob(env_name)):
+                                if set(env_path.parts).intersection(_WALK_EXCLUDED_DIRS):
+                                    continue
+                                _add(env_path)
+                        except OSError:
+                            continue
 
         if workspace_path:
             bases = [workspace_path, *workspace_path.parents[:4]]

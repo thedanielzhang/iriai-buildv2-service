@@ -1556,6 +1556,29 @@ class TestCodexHomeIsolation:
 
         assert database_url == "postgresql://danielzhang@localhost:5431/compose_dev"
 
+    def test_candidate_env_files_skips_package_manager_subtrees(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ):
+        runtime = self._runtime(monkeypatch)
+        feature_dir = tmp_path / ".iriai" / "features" / "compose-beced7b1"
+        valid_env = feature_dir / "repos" / "app" / ".env"
+        node_modules_env = feature_dir / "repos" / "app" / "node_modules" / ".env"
+        pnpm_env = feature_dir / "repos" / "app" / ".pnpm" / "pkg" / ".env"
+        for path in (valid_env, node_modules_env, pnpm_env):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("DATABASE_URL=postgresql://example/test\n", encoding="utf-8")
+
+        candidates = runtime._candidate_env_files(
+            workspace=SimpleNamespace(path=str(tmp_path)),
+            feature_id="beced7b1",
+        )
+
+        assert valid_env.resolve() in candidates
+        assert node_modules_env.resolve() not in candidates
+        assert pnpm_env.resolve() not in candidates
+
 
 class TestCodexInvocationLiveness:
     """invocation_has_live_work must be bounded by output staleness.

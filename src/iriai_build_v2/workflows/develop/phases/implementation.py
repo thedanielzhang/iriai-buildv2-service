@@ -38097,25 +38097,40 @@ async def _run_expanded_dag_verify_lenses(
 def _discover_repo_roots_under(repos_root: Path) -> list[Path]:
     if _workflow_repos_root_guard_problems(repos_root):
         return []
+    walk_excluded_dirs = (
+        "node_modules",
+        ".venv",
+        "venv",
+        ".pnpm",
+        ".next",
+        "dist",
+        "build",
+    )
     allowed_metadata_roots = _git_worktree_metadata_roots_for_repos_root(repos_root)
     repos: list[Path] = []
-    for git_dir in repos_root.rglob(".git"):
-        repo_dir = git_dir.parent
-        if repo_dir == repos_root:
-            continue
-        if (
-            not git_dir.exists()
-            or git_dir.is_symlink()
-            or (
-                not git_dir.is_dir()
-                and not _is_git_worktree_file(
-                    git_dir,
-                    allowed_metadata_roots=allowed_metadata_roots,
+    logger.info("Discovering repo roots under %s", repos_root)
+    try:
+        for git_dir in repos_root.rglob(".git"):
+            if set(git_dir.parts).intersection(walk_excluded_dirs):
+                continue
+            repo_dir = git_dir.parent
+            if repo_dir == repos_root:
+                continue
+            if (
+                not git_dir.exists()
+                or git_dir.is_symlink()
+                or (
+                    not git_dir.is_dir()
+                    and not _is_git_worktree_file(
+                        git_dir,
+                        allowed_metadata_roots=allowed_metadata_roots,
+                    )
                 )
-            )
-        ):
-            continue
-        repos.append(repo_dir)
+            ):
+                continue
+            repos.append(repo_dir)
+    except OSError:
+        pass
     return sorted(set(repos))
 
 
