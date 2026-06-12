@@ -395,6 +395,18 @@ from ..execution.types import (
     _SANDBOX_WORKFLOW_BLOCKER_MARKER,
     _bounded_commit_output,
 )
+# --- Operator gate-override (W-OG) ------------------------------------------
+# First-class, audited operator fiat-completion of a DAG task (formalizes the
+# 2026-06-11 hand-INSERT precedent, live artifacts row 2248683). The marker is
+# written by the `iriai-build-v2 override-task` CLI subcommand; the dispatch
+# loop consumes it in its per-task resume block (see
+# `_consume_operator_task_override`).
+from ..execution.operator_override import (
+    build_override_result,
+    operator_override_marker_key,
+    parse_operator_override,
+    result_is_operator_override,
+)
 # --- Slice-11b git_service shim ---------------------------------------------
 # Per docs/execution-control-plane/11-refactor-map.md § "Boundary-level API
 # contracts" row 12, the git subprocess wrappers used by the legacy commit
@@ -5393,6 +5405,132 @@ def _result_requires_durable_merge_queue(result: ImplementationResult) -> bool:
 
 def _pending_merge_queue_marker_key(task_id: str) -> str:
     return f"dag-task-pending-merge:{task_id}"
+
+
+async def _consume_operator_task_override(
+    runner: WorkflowRunner,
+    feature: Feature,
+    task_id: str,
+    *,
+    group_idx: int,
+) -> tuple[str, ImplementationResult | None, str]:
+    """Operator gate-override (W-OG): consume a valid
+    ``dag-task-operator-override:{task_id}`` marker BEFORE dispatching the task.
+
+    Returns ``(disposition, result, detail)`` where disposition is one of:
+
+    - ``"none"`` — no marker; the caller proceeds with normal dispatch/resume.
+    - ``"consumed"`` — the marker was valid and not yet consumed; the terminal
+      ``dag-task:{task_id}`` row was persisted HERE the same way the engine
+      persists a normal completion (``put(f"dag-task:{task.id}",
+      result.model_dump_json(), feature=feature)`` — see the synthesized
+      revalidation write in this module), with operator-override provenance.
+      ``result`` is the synthesized completed ``ImplementationResult``; the
+      caller records it and skips execution.
+    - ``"already_terminal"`` — a marker exists but the task already has a
+      terminal (completed) ``dag-task:*`` row. Single-shot rule: the marker is
+      NOT re-consumed; the caller falls through to the normal completed-marker
+      short-circuit (which recognizes override-produced rows via
+      ``result_is_operator_override`` without contract-lineage revalidation).
+    - ``"invalid"`` — a marker exists but is malformed, names a different
+      task, or targets an unsupported status. ``detail`` carries the loud
+      error; the caller fails the run fast (no silent degradation: a present
+      but unusable operator directive must never be silently ignored).
+    """
+    artifacts = getattr(runner, "artifacts", None)
+    get = getattr(artifacts, "get", None)
+    put = getattr(artifacts, "put", None)
+    if not callable(get) or not callable(put):
+        return ("none", None, "")
+    marker_key = operator_override_marker_key(task_id)
+    raw = await get(marker_key, feature=feature)
+    if not raw:
+        return ("none", None, "")
+    try:
+        override = parse_operator_override(raw)
+    except ValueError as exc:
+        detail = f"{marker_key}: {exc}"
+        logger.error(
+            "OPERATOR-OVERRIDE marker for task %s is INVALID and cannot be "
+            "consumed: %s",
+            task_id,
+            detail,
+        )
+        return ("invalid", None, detail)
+    if override.task_id != task_id:
+        detail = (
+            f"{marker_key}: marker names task_id={override.task_id!r} but is "
+            f"stored under task {task_id!r}"
+        )
+        logger.error(
+            "OPERATOR-OVERRIDE marker for task %s is INVALID: %s",
+            task_id,
+            detail,
+        )
+        return ("invalid", None, detail)
+    if override.target_status != "completed":
+        detail = (
+            f"{marker_key}: unsupported target_status "
+            f"{override.target_status!r} (only 'completed' is consumable)"
+        )
+        logger.error(
+            "OPERATOR-OVERRIDE marker for task %s is INVALID: %s",
+            task_id,
+            detail,
+        )
+        return ("invalid", None, detail)
+
+    # Single-shot consumption: a terminal completed `dag-task:*` row (whether
+    # written by a prior consumption of this marker or by a real dispatch that
+    # raced the operator) means there is nothing left to consume. The caller's
+    # normal completed-marker handling owns the row from here.
+    existing_raw = await get(f"dag-task:{task_id}", feature=feature)
+    if existing_raw:
+        try:
+            existing = ImplementationResult.model_validate_json(str(existing_raw))
+        except Exception:
+            existing = None
+        if existing is not None and existing.status == "completed":
+            logger.info(
+                "OPERATOR-OVERRIDE marker for task %s already consumed (the "
+                "terminal dag-task row exists); not re-consuming",
+                task_id,
+            )
+            return ("already_terminal", existing, "")
+
+    result = build_override_result(override)
+    # Persist the terminal row the SAME way the engine does on normal
+    # completion (model_dump_json under `dag-task:{task_id}`).
+    await put(f"dag-task:{task_id}", result.model_dump_json(), feature=feature)
+    await _log_feature_event(
+        runner,
+        feature.id,
+        "dag_task_operator_override_consumed",
+        "implementation",
+        content=task_id,
+        metadata={
+            "group_idx": group_idx,
+            "task_id": task_id,
+            "marker_key": marker_key,
+            "target_status": override.target_status,
+            "authorized_by": override.authorized_by,
+            "authorized_at": override.created_at,
+            "reason": override.reason,
+        },
+    )
+    logger.warning(
+        "OPERATOR-OVERRIDE CONSUMED: task %s (group %d) fiat-%s by operator "
+        "directive %s (authorized_by=%s at %s) — task execution SKIPPED; "
+        "terminal dag-task row persisted with override provenance. Reason: %s",
+        task_id,
+        group_idx,
+        override.target_status,
+        marker_key,
+        override.authorized_by,
+        override.created_at or "(unrecorded)",
+        override.reason,
+    )
+    return ("consumed", result, "")
 
 
 def _durable_merge_queue_blocker_for_results(
@@ -23351,6 +23489,43 @@ async def _implement_dag_dispatch_loop(
         )
 
         for tid in group:
+            # ── Operator gate-override (W-OG) ────────────────────────
+            # Consume a valid `dag-task-operator-override:{tid}` marker BEFORE
+            # any dispatch decision: persist the terminal completed
+            # `dag-task:{tid}` row with operator provenance and skip
+            # execution. The recorded result flows into `completed_results`
+            # exactly like the existing completed-marker short-circuit, so
+            # group sealing counts the overridden task as terminal. A present
+            # but INVALID marker fails the run loudly (an operator directive
+            # is never silently ignored); `already_terminal` falls through to
+            # the normal completed-marker handling below.
+            (
+                override_disposition,
+                override_result,
+                override_detail,
+            ) = await _consume_operator_task_override(
+                runner, feature, tid, group_idx=group_idx,
+            )
+            if override_disposition == "invalid":
+                return DagExecutionOutcome(
+                    implementation_text="\n\n".join(
+                        to_str(r) for r in all_results
+                    ),
+                    failure=_workflow_blocker_text(
+                        f"Operator override marker for task {tid} (group "
+                        f"{group_idx}) is present but unusable: "
+                        f"{override_detail}. Re-record it with "
+                        "`iriai-build-v2 override-task` (or delete the "
+                        "marker row) and resume."
+                    ),
+                    handover=handover,
+                    terminal_state="workflow_blocked",
+                )
+            if override_disposition == "consumed" and override_result is not None:
+                completed_results.append(override_result)
+                all_results.append(override_result)
+                handover.record_success(override_result)
+                continue
             recovery_lane = commit_hygiene_recovery.get(tid)
             # A task whose lane already `integrated` (via some retry) must NOT be
             # re-dispatched even though older FAILED lanes for it still exist:
@@ -23734,6 +23909,26 @@ async def _implement_dag_dispatch_loop(
                                 handover=handover,
                                 terminal_state="workflow_blocked",
                             )
+                        elif result_is_operator_override(result):
+                            # Operator gate-override (W-OG), later boots: the
+                            # terminal row was produced by override
+                            # consumption (or the precedent hand-INSERT shape)
+                            # — there is no contract verdict / sandbox lineage
+                            # to revalidate, so the lineage check below would
+                            # wrongly re-run the task. Honor the operator's
+                            # terminal row as-is, loudly.
+                            completed_results.append(result)
+                            all_results.append(result)
+                            handover.record_success(result)
+                            logger.warning(
+                                "OPERATOR-OVERRIDE TERMINAL: task %s (group "
+                                "%d) carries an operator-override completed "
+                                "dag-task row — honoring it without lineage "
+                                "revalidation; execution skipped",
+                                tid,
+                                group_idx,
+                            )
+                            continue
                         elif workspace_mgr is None or feature_root is None:
                             completed_results.append(result)
                             all_results.append(result)
