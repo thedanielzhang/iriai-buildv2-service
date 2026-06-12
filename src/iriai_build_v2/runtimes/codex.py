@@ -1282,7 +1282,8 @@ class CodexAgentRuntime(AgentRuntime):
             self._assert_bound_runtime_path(codex_home, authority, label="CODEX_HOME")
 
         # Global settings (model, etc.) + only the role's MCP servers
-        config: dict[str, Any] = copy.deepcopy(self._global_codex_config)
+        global_config = _read_global_codex_config() or self._global_codex_config
+        config: dict[str, Any] = copy.deepcopy(global_config)
         mcp_servers = self._effective_mcp_servers(
             role,
             workspace=workspace,
@@ -1291,6 +1292,13 @@ class CodexAgentRuntime(AgentRuntime):
         )
         if mcp_servers:
             config["mcp_servers"] = mcp_servers
+
+        logger.info(
+            "Prepared Codex home config: model=%s model_reasoning_effort=%s service_tier=%s",
+            config.get("model"),
+            config.get("model_reasoning_effort"),
+            config.get("service_tier"),
+        )
 
         (codex_home / "config.toml").write_text(
             _serialize_toml(config), encoding="utf-8",

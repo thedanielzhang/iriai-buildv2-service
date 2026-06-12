@@ -1201,6 +1201,13 @@ class TestCodexHomeIsolation:
             "iriai_build_v2.runtimes.codex.shutil.which",
             lambda _command: "/usr/local/bin/codex",
         )
+        monkeypatch.setenv(
+            "CODEX_HOME",
+            str(
+                Path("/tmp")
+                / f"iriai-build-v2-test-missing-codex-home-{id(monkeypatch)}"
+            ),
+        )
         return CodexAgentRuntime()
 
     def test_prepare_codex_home_creates_minimal_config(
@@ -1261,6 +1268,77 @@ class TestCodexHomeIsolation:
         content = (Path(codex_home) / "config.toml").read_text()
         assert "mcp_servers" not in content
         assert 'model = "gpt-5.4"' in content
+
+        shutil.rmtree(codex_home)
+
+    def test_prepare_codex_home_rereads_global_config_each_invocation(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path,
+    ):
+        runtime = self._runtime(monkeypatch)
+
+        fake_global_home = tmp_path / "global_codex"
+        fake_global_home.mkdir()
+        config_path = fake_global_home / "config.toml"
+        config_path.write_text(
+            'model = "gpt-5.4"\n'
+            'model_reasoning_effort = "low"\n'
+            'service_tier = "auto"\n',
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("CODEX_HOME", str(fake_global_home))
+
+        role = Role(name="pm", prompt="Plan", tools=["Read"])
+        workspace = SimpleNamespace(path=str(tmp_path))
+
+        first_home = runtime._prepare_codex_home(role, workspace)
+        config_path.write_text(
+            'model = "gpt-5.5"\n'
+            'model_reasoning_effort = "high"\n'
+            'service_tier = "priority"\n',
+            encoding="utf-8",
+        )
+        second_home = runtime._prepare_codex_home(role, workspace)
+
+        first_content = (Path(first_home) / "config.toml").read_text()
+        second_content = (Path(second_home) / "config.toml").read_text()
+        assert 'model = "gpt-5.4"' in first_content
+        assert 'model_reasoning_effort = "low"' in first_content
+        assert 'service_tier = "auto"' in first_content
+        assert 'model = "gpt-5.5"' in second_content
+        assert 'model_reasoning_effort = "high"' in second_content
+        assert 'service_tier = "priority"' in second_content
+
+        shutil.rmtree(first_home)
+        shutil.rmtree(second_home)
+
+    def test_prepare_codex_home_uses_cached_config_when_fresh_read_fails(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path,
+    ):
+        runtime = self._runtime(monkeypatch)
+        runtime._global_codex_config = {
+            "model": "gpt-5.4",
+            "model_reasoning_effort": "medium",
+            "service_tier": "auto",
+        }
+
+        fake_global_home = tmp_path / "global_codex"
+        fake_global_home.mkdir()
+        (fake_global_home / "config.toml").write_text("model = [\n", encoding="utf-8")
+        monkeypatch.setenv("CODEX_HOME", str(fake_global_home))
+
+        role = Role(name="pm", prompt="Plan", tools=["Read"])
+        codex_home = runtime._prepare_codex_home(
+            role, SimpleNamespace(path=str(tmp_path)),
+        )
+
+        content = (Path(codex_home) / "config.toml").read_text()
+        assert 'model = "gpt-5.4"' in content
+        assert 'model_reasoning_effort = "medium"' in content
+        assert 'service_tier = "auto"' in content
 
         shutil.rmtree(codex_home)
 
