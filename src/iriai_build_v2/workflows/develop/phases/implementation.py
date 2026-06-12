@@ -5402,6 +5402,150 @@ def _contract_runtime_root_specs(contract: Any | None, *, repo_id: str) -> list[
 
 
 _PENDING_DURABLE_MERGE_QUEUE_NOTE = "canonical_mutation=pending_durable_merge_queue"
+_DAG_PARTIAL_ENQUEUE_DRIVER_MARKER_ENV = "IRIAI_DAG_PARTIAL_ENQUEUE_DRIVER_MARKER"
+_DAG_PARTIAL_TRIAGE_MARKER_PREFIX = "dag-partial-triage:"
+
+
+def _dag_partial_enqueue_driver_marker_enabled() -> bool:
+    return os.environ.get(
+        _DAG_PARTIAL_ENQUEUE_DRIVER_MARKER_ENV, ""
+    ).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _dag_partial_triage_marker_key(task_id: str) -> str:
+    return f"{_DAG_PARTIAL_TRIAGE_MARKER_PREFIX}{task_id}"
+
+
+def _partial_result_row_id(result: ImplementationResult) -> int | None:
+    for attr in ("result_row_id", "result_id", "row_id", "id"):
+        try:
+            value = getattr(result, attr)
+        except Exception:
+            value = None
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            continue
+        if parsed > 0:
+            return parsed
+    notes = str(getattr(result, "notes", "") or "")
+    match = re.search(r"\b(?:result_row_id|result_id|row_id)=(\d+)\b", notes)
+    if match:
+        return int(match.group(1))
+    return None
+
+
+def _partial_dispatch_attempt_id(result: ImplementationResult) -> int | None:
+    notes = str(getattr(result, "notes", "") or "")
+    match = re.search(r"\bdispatcher_attempt_id=(\d+)\b", notes)
+    if match:
+        return int(match.group(1))
+    return None
+
+
+async def _filter_partial_results_for_driver_triage(
+    runner: WorkflowRunner,
+    feature: Feature,
+    pending_results: list[ImplementationResult],
+    *,
+    dag_sha256: str,
+    group_idx: int,
+    stage: str,
+) -> list[ImplementationResult]:
+    """Flag-gated partial park: write a driver marker and skip only that lane.
+
+    If the marker already exists, return the original list so the existing
+    fail-closed enqueue refusal fires. That prevents an infinite marker loop
+    while preserving the current hard blocker for unhealed partials.
+    """
+
+    if not _dag_partial_enqueue_driver_marker_enabled():
+        return pending_results
+    artifacts = getattr(runner, "artifacts", None)
+    if artifacts is None:
+        return pending_results
+
+    filtered: list[ImplementationResult] = []
+    for result in pending_results:
+        if str(getattr(result, "status", "") or "") != "partial":
+            filtered.append(result)
+            continue
+        task_id = str(getattr(result, "task_id", "") or "")
+        if not task_id:
+            filtered.append(result)
+            continue
+        marker_key = _dag_partial_triage_marker_key(task_id)
+        try:
+            existing = await artifacts.get(marker_key, feature=feature)
+        except Exception:
+            existing = None
+        if existing:
+            filtered.append(result)
+            continue
+        payload = {
+            "type": "dag_partial_enqueue_driver_decision",
+            "status": "awaiting-driver",
+            "feature_id": str(getattr(feature, "id", "") or ""),
+            "dag_sha256": dag_sha256,
+            "group_idx": group_idx,
+            "stage": stage,
+            "task_id": task_id,
+            "result_status": "partial",
+            "result_row_id": _partial_result_row_id(result),
+            "dispatch_attempt_id": _partial_dispatch_attempt_id(result),
+            "summary": str(getattr(result, "summary", "") or "")[:4000],
+            "deviations": [
+                d.model_dump(mode="json") if hasattr(d, "model_dump") else str(d)
+                for d in (getattr(result, "deviations", []) or [])[:20]
+            ],
+            "notes": str(getattr(result, "notes", "") or "")[:4000],
+            "heal": (
+                "Driver must either supersede this result row to status "
+                "'completed' after judgment, or fail the task; do not enqueue "
+                "the partial row unchanged."
+            ),
+        }
+        await artifacts.put(
+            marker_key,
+            json.dumps(payload, sort_keys=True),
+            feature=feature,
+        )
+        logger.warning(
+            "DAG partial enqueue triage marker written for feature=%s "
+            "group=%s task=%s marker=%s",
+            getattr(feature, "id", ""),
+            group_idx,
+            task_id,
+            marker_key,
+        )
+    return filtered
+
+
+async def _partial_triage_checkpoint_detail(
+    runner: WorkflowRunner,
+    feature: Feature,
+    missing_task_ids: list[str],
+) -> str:
+    artifacts = getattr(runner, "artifacts", None)
+    if artifacts is None:
+        return ""
+    marker_keys: list[str] = []
+    for task_id in missing_task_ids:
+        marker_key = _dag_partial_triage_marker_key(str(task_id))
+        try:
+            existing = await artifacts.get(marker_key, feature=feature)
+        except Exception:
+            existing = None
+        if existing:
+            marker_keys.append(marker_key)
+    if not marker_keys:
+        return ""
+    return (
+        " Partial-result driver triage is awaiting a decision at "
+        f"{', '.join(marker_keys)}. Heal exactly one way: supersede the "
+        "referenced result row to status 'completed' after driver judgment, "
+        "or fail the task; then re-drive the workflow."
+    )
 
 
 def _append_note_once(notes: str, note: str) -> str:
@@ -5945,6 +6089,14 @@ async def _enqueue_durable_merge_queue_for_results(
         )
     contracts_by_task_id = contracts_by_task_id or {}
     feature_id = str(getattr(feature, "id", ""))
+    pending_results = await _filter_partial_results_for_driver_triage(
+        runner,
+        feature,
+        pending_results,
+        dag_sha256=dag_sha256,
+        group_idx=group_idx,
+        stage=stage,
+    )
 
     # ── Phase 1: readiness guard + lane-input resolution (one connection) ──
     # Fail closed: the Slice 08e-1 production readiness guard must pass before
@@ -8646,11 +8798,17 @@ async def _checkpoint_durable_merge_queue_group(
             feature_id, dag_sha256, group_idx
         )
         if not coverage.approved:
+            triage_detail = await _partial_triage_checkpoint_detail(
+                runner,
+                feature,
+                list(getattr(coverage, "missing_task_ids", []) or []),
+            )
             detail = (
                 f"durable merge queue group {group_idx} checkpoint coverage is "
                 f"not approved (missing={coverage.missing_task_ids}, "
                 f"duplicate={coverage.duplicate_task_ids}, "
                 f"failed={coverage.failed_queue_item_ids})"
+                f"{triage_detail}"
             )
             return _MergeQueueCheckpointResult(
                 group_idx=group_idx,

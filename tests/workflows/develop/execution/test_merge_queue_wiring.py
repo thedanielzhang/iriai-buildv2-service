@@ -1017,7 +1017,7 @@ async def _insert_sandbox_patch_evidence(
 def _impl_result(impl, task_id: str, patch_evidence_ids: list[int]):
     """An ImplementationResult carrying the dispatcher's patch-evidence note."""
     notes = (
-        "dispatcher_attempt_id=1; patch_summary_ids="
+        "dispatcher_attempt_id=1; result_row_id=4242; patch_summary_ids="
         + ",".join(str(i) for i in patch_evidence_ids)
         + "\n"
         + impl._PENDING_DURABLE_MERGE_QUEUE_NOTE
@@ -1028,6 +1028,17 @@ def _impl_result(impl, task_id: str, patch_evidence_ids: list[int]):
         status="completed",
         notes=notes,
     )
+
+
+class _MemoryArtifacts:
+    def __init__(self) -> None:
+        self.store: dict[str, str] = {}
+
+    async def get(self, key: str, *, feature):
+        return self.store.get(key)
+
+    async def put(self, key: str, value, *, feature) -> None:
+        self.store[key] = str(value)
 
 
 @pytest.mark.asyncio
@@ -1416,7 +1427,7 @@ async def test_implementation_worker_enqueue_partial_failure_rolls_back_all(
 
 @pytest.mark.asyncio
 async def test_implementation_worker_enqueue_fails_closed_on_partial_result(
-    mq_conn, tmp_path: Path
+    mq_conn, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Slice 08e-2 P3a: a `partial`-status result is refused, not enqueued.
 
@@ -1425,6 +1436,7 @@ async def test_implementation_worker_enqueue_fails_closed_on_partial_result(
     never validated against its captured patch. The splice must fail closed
     rather than stamp an `approved` pre-queue gate node for unvalidated work.
     """
+    monkeypatch.delenv("IRIAI_DAG_PARTIAL_ENQUEUE_DRIVER_MARKER", raising=False)
     impl = _enqueue_implementation_module()
     feature_id = "feat-impl-enqueue-partial-status"
     await _insert_feature(mq_conn, feature_id)
@@ -1450,7 +1462,14 @@ async def test_implementation_worker_enqueue_fails_closed_on_partial_result(
     partial = _impl_result(impl, "TASK-1", [patch_evidence])
     partial.status = "partial"
 
-    with pytest.raises(impl._MergeQueueEnqueueError, match="not 'completed'"):
+    expected = (
+        "durable merge queue enqueue: task 'TASK-1' result status is "
+        "'partial', not 'completed' — its deliverable contract was not "
+        "validated at sandbox patch capture, so it must not be enqueued for "
+        "canonical integration (the legacy canonical commit is disabled and "
+        "is not a fallback)"
+    )
+    with pytest.raises(impl._MergeQueueEnqueueError) as exc_info:
         await impl._enqueue_durable_merge_queue_for_results(
             runner,
             feature,
@@ -1461,12 +1480,203 @@ async def test_implementation_worker_enqueue_fails_closed_on_partial_result(
             feature_root=tmp_path,
             stage="implementation",
         )
+    assert str(exc_info.value) == expected
     # Fail-closed: no lane enqueued for the unvalidated partial result.
     count = await mq_conn.fetchval(
         "SELECT count(*) FROM merge_queue_items WHERE feature_id = $1",
         feature_id,
     )
     assert count == 0
+
+
+@pytest.mark.asyncio
+async def test_implementation_worker_enqueue_partial_flag_writes_marker_and_checkpoint_reason(
+    mq_conn, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Flag-on first partial writes a driver marker and parks at checkpoint."""
+    monkeypatch.setenv("IRIAI_DAG_PARTIAL_ENQUEUE_DRIVER_MARKER", "1")
+    impl = _enqueue_implementation_module()
+    feature_id = "feat-impl-enqueue-partial-marker"
+    await _insert_feature(mq_conn, feature_id)
+    repo = tmp_path / "app"
+    base = _init_repo(repo)
+    contract_ok = await _insert_contract(mq_conn, feature_id, "TASK-1")
+    contract_partial = await _insert_contract(mq_conn, feature_id, "TASK-2")
+    art_ok = await _insert_artifact(
+        mq_conn, feature_id, "dag-sandbox-diff:TASK-1", "diff\n"
+    )
+    art_partial = await _insert_artifact(
+        mq_conn, feature_id, "dag-sandbox-diff:TASK-2", "diff\n"
+    )
+    patch_ok = await _insert_sandbox_patch_evidence(
+        mq_conn, feature_id, repo_id="app", base_commit=base,
+        diff_artifact_id=art_ok,
+    )
+    patch_partial = await _insert_sandbox_patch_evidence(
+        mq_conn, feature_id, repo_id="app", base_commit=base,
+        diff_artifact_id=art_partial,
+    )
+    row_ok = SimpleNamespace(
+        id=contract_ok, repo_id="app", repo_path="app", unknown_write_set=False
+    )
+    row_partial = SimpleNamespace(
+        id=contract_partial, repo_id="app", repo_path="app",
+        unknown_write_set=False,
+    )
+    artifacts = _MemoryArtifacts()
+    feature = SimpleNamespace(id=feature_id, slug=feature_id, metadata={})
+    runner = SimpleNamespace(
+        artifacts=artifacts,
+        services={"execution_control_store": ExecutionControlStore(mq_conn)},
+    )
+    completed = _impl_result(impl, "TASK-1", [patch_ok])
+    partial = _impl_result(impl, "TASK-2", [patch_partial])
+    partial.status = "partial"
+    partial.summary = "ENV/CONTRACT-class self-grade"
+
+    enqueued = await impl._enqueue_durable_merge_queue_for_results(
+        runner,
+        feature,
+        [completed, partial],
+        dag_sha256="dag-sha",
+        group_idx=1,
+        contracts_by_task_id={"TASK-1": row_ok, "TASK-2": row_partial},
+        feature_root=tmp_path,
+        stage="implementation",
+    )
+
+    assert len(enqueued) == 1
+    marker_key = "dag-partial-triage:TASK-2"
+    marker = json.loads(artifacts.store[marker_key])
+    assert marker["status"] == "awaiting-driver"
+    assert marker["result_row_id"] == 4242
+    assert marker["summary"] == "ENV/CONTRACT-class self-grade"
+    await _force_status(mq_conn, feature_id, enqueued[0], "integrated")
+
+    checkpoint = await impl._checkpoint_durable_merge_queue_group(
+        runner,
+        feature,
+        dag_sha256="dag-sha",
+        group_idx=1,
+        expected_task_ids=["TASK-1", "TASK-2"],
+        task_results=[completed, partial],
+        stage="implementation",
+    )
+
+    assert checkpoint.checkpointed is False
+    assert marker_key in checkpoint.detail
+    assert "supersede the referenced result row to status 'completed'" in checkpoint.detail
+    assert "or fail the task" in checkpoint.detail
+
+
+@pytest.mark.asyncio
+async def test_implementation_worker_enqueue_partial_marker_exists_blocks_again(
+    mq_conn, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A still-partial result with an existing marker falls through to refusal."""
+    monkeypatch.setenv("IRIAI_DAG_PARTIAL_ENQUEUE_DRIVER_MARKER", "1")
+    impl = _enqueue_implementation_module()
+    feature_id = "feat-impl-enqueue-partial-marker-exists"
+    await _insert_feature(mq_conn, feature_id)
+    repo = tmp_path / "app"
+    base = _init_repo(repo)
+    contract = await _insert_contract(mq_conn, feature_id, "TASK-1")
+    diff_artifact = await _insert_artifact(
+        mq_conn, feature_id, "dag-sandbox-diff:TASK-1", "diff\n"
+    )
+    patch_evidence = await _insert_sandbox_patch_evidence(
+        mq_conn, feature_id, repo_id="app", base_commit=base,
+        diff_artifact_id=diff_artifact,
+    )
+    contract_row = SimpleNamespace(
+        id=contract, repo_id="app", repo_path="app", unknown_write_set=False
+    )
+    artifacts = _MemoryArtifacts()
+    artifacts.store["dag-partial-triage:TASK-1"] = json.dumps(
+        {"status": "awaiting-driver"}
+    )
+    feature = SimpleNamespace(id=feature_id, slug=feature_id, metadata={})
+    runner = SimpleNamespace(
+        artifacts=artifacts,
+        services={"execution_control_store": ExecutionControlStore(mq_conn)},
+    )
+    partial = _impl_result(impl, "TASK-1", [patch_evidence])
+    partial.status = "partial"
+
+    expected = (
+        "durable merge queue enqueue: task 'TASK-1' result status is "
+        "'partial', not 'completed' — its deliverable contract was not "
+        "validated at sandbox patch capture, so it must not be enqueued for "
+        "canonical integration (the legacy canonical commit is disabled and "
+        "is not a fallback)"
+    )
+    with pytest.raises(impl._MergeQueueEnqueueError) as exc_info:
+        await impl._enqueue_durable_merge_queue_for_results(
+            runner,
+            feature,
+            [partial],
+            dag_sha256="dag-sha",
+            group_idx=1,
+            contracts_by_task_id={"TASK-1": contract_row},
+            feature_root=tmp_path,
+            stage="implementation",
+        )
+    assert str(exc_info.value) == expected
+    count = await mq_conn.fetchval(
+        "SELECT count(*) FROM merge_queue_items WHERE feature_id = $1",
+        feature_id,
+    )
+    assert count == 0
+
+
+@pytest.mark.asyncio
+async def test_implementation_worker_enqueue_completed_after_partial_marker_enqueues_normally(
+    mq_conn, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A driver-superseded completed result is not held by the old marker."""
+    monkeypatch.setenv("IRIAI_DAG_PARTIAL_ENQUEUE_DRIVER_MARKER", "1")
+    impl = _enqueue_implementation_module()
+    feature_id = "feat-impl-enqueue-partial-superseded"
+    await _insert_feature(mq_conn, feature_id)
+    repo = tmp_path / "app"
+    base = _init_repo(repo)
+    contract = await _insert_contract(mq_conn, feature_id, "TASK-1")
+    diff_artifact = await _insert_artifact(
+        mq_conn, feature_id, "dag-sandbox-diff:TASK-1", "diff\n"
+    )
+    patch_evidence = await _insert_sandbox_patch_evidence(
+        mq_conn, feature_id, repo_id="app", base_commit=base,
+        diff_artifact_id=diff_artifact,
+    )
+    contract_row = SimpleNamespace(
+        id=contract, repo_id="app", repo_path="app", unknown_write_set=False
+    )
+    artifacts = _MemoryArtifacts()
+    artifacts.store["dag-partial-triage:TASK-1"] = json.dumps(
+        {"status": "awaiting-driver"}
+    )
+    feature = SimpleNamespace(id=feature_id, slug=feature_id, metadata={})
+    runner = SimpleNamespace(
+        artifacts=artifacts,
+        services={"execution_control_store": ExecutionControlStore(mq_conn)},
+    )
+
+    enqueued = await impl._enqueue_durable_merge_queue_for_results(
+        runner,
+        feature,
+        [_impl_result(impl, "TASK-1", [patch_evidence])],
+        dag_sha256="dag-sha",
+        group_idx=1,
+        contracts_by_task_id={"TASK-1": contract_row},
+        feature_root=tmp_path,
+        stage="implementation",
+    )
+
+    assert len(enqueued) == 1
+    item = await MergeQueueStore(mq_conn).get(enqueued[0])
+    assert item is not None
+    assert item.status == "queued"
+    assert [c.task_id for c in item.task_coverage] == ["TASK-1"]
 
 
 # ── Slice 08f P3-2: real-Postgres coverage for the store.py COALESCE fix ──────
