@@ -113,6 +113,20 @@ SLOs: crash response ≤5 min; P0 channel engagement ≤15 min; ceremony start
   ~/.iriai-secrets/kaya-e2e/e2e-auth.env (never print values).
 
 ## QUEUED WORK (in order)
+0. ⚠️ MANDATORY PRE-END-GATE RIDER (E2E3-NEW-1, BLOCKING — full-stack e2e
+   10:2x): ORM registry collision — new SubmittalActivity (shared_libs/kaya_db/
+   kaya_db/models/submittals/submittal_activity.py:15) vs legacy procore
+   SubmittalActivity (supply-chain/app/integrations/procore/models/
+   submittal_activity.py:7); the legacy string relationship at
+   submittal_change_event.py:29 raises 'Multiple classes found' on mapper
+   configure → EVERY ORM endpoint 500s. The feature BACKEND IS DEAD-ON-ARRIVAL
+   as committed (docker/main masks it). Fix: fully-dotted relationship path or
+   class reference (1-line; both files share a basename — short qualification
+   stays ambiguous). Land at the next boundary; the provisioned END GATE
+   cannot pass without it. ALSO E2E3-NEW-2: portfolio reads
+   (/v2/submittals,+/kpis) guarded RequireProjectView 400 for non-org-admins
+   (no project_id param) — S2-SL2-3 capture-check first, else swap the two
+   read guards to RequireOrgViewMember (worker-verified quarantine patch).
 1. g10 BOUNDARY (if I didn't execute it): wave-10 drain → check captures vs
    the lens findings (R2-02 router sweep by s3a-router-append; R2-07 project_id
    Query params + E2E2-02/03 pages by S2-SL2-3; R2-10/13 by S5-06) → seal →
@@ -169,8 +183,12 @@ SLOs: crash response ≤5 min; P0 channel engagement ≤15 min; ceremony start
 - develop37 (PID 60918, log /tmp/kaya_develop37.log): wave-10 implementers
   streaming on fast-mode codex (~09:40 exec start). On boot: sweep, check
   wave-10 journal state (captures? orphan attempt rows → reset), relaunch.
-- Full-stack e2e worker: mid-setup on the :8001 backend leg; NO report —
-  re-dispatch per §E2E (its method is fully specified there).
+- Full-stack e2e worker: REPORTED before stand-down (OPERATOR-ACTIONS 10:2x
+  entry + checklist Round 4): method PROVEN — note the backend leg needs
+  `baml-cli generate` after pip install (baml_client is image-generated) and
+  the container env dump w/ db/redis host rewrites; 3/7 tests pass full-stack;
+  dev-DB seed rows e2e30000-* left in place; E2E_ORG_ID=1 avoids the
+  resolveOrgId race.
 - W-DL worker (diagnostic-lease reclaim): never reported; its scope is
   covered operationally by the sweep; treat as lost.
 - The wave-10 lens pass: NOT yet dispatched (wave wasn't sealed).
