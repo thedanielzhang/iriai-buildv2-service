@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio as _asyncio
 import collections
 import contextlib
+import contextvars
+import copy
 import dataclasses
 import hashlib
 import itertools
@@ -9214,7 +9216,21 @@ async def _bind_task_sandbox(
     repo_id_hint: str | None = None,
     sandbox_mode: str = "task",
     sandbox_attempt_no: int | None = None,
+    prefetch_register_only: bool = False,
 ) -> RuntimeSandboxTaskBinding | None:
+    """Allocate + runtime-bind the per-task sandbox for one dispatch attempt.
+
+    W-S (``prefetch_register_only=True``): the wave-prefetch background task
+    drives the IDENTICAL spec construction + ``allocate()`` path below, but
+    skips ``bind_runtime`` and instead registers the allocated lease in the
+    in-process wave-prefetch registry keyed by
+    ``SandboxSpec.content_idempotency_key``. The later REAL dispatch builds
+    its spec exactly as before; when the content keys match (same dag, base
+    commits and contract ids), it adopts the prefetched sandbox instead of
+    provisioning a second one. Any drift (wave N moved HEAD / contracts
+    recompiled differently) changes the content key, so the stale prefetched
+    sandbox is simply never matched and is released by the controller.
+    """
     if SandboxRunner is None or SandboxSpec is None:
         raise _sandbox_blocker(
             "SandboxRunner is unavailable for write-producing implementation dispatch.",
@@ -9288,6 +9304,33 @@ async def _bind_task_sandbox(
         contract_ids=contract_ids,
         write_guard_scope="contract",
     )
+    # ── W-S: adopt a prefetched sandbox when its content key matches ──
+    # The real dispatch's spec is built above exactly as before; adoption is
+    # keyed by the attempt-free content digest (sandbox.py
+    # SandboxSpec.content_idempotency_key) so the durable per-attempt
+    # idempotency key (which embeds the unpredictable dispatcher attempt id
+    # unless IRIAI_SANDBOX_REUSE_ON_RETRY=1) never has to match. Any
+    # adoption failure falls through to the unchanged fresh-provision path.
+    if not prefetch_register_only and sandbox_mode == "task" and _wave_prefetch_enabled():
+        prefetch_entry = _wave_prefetch_take(
+            str(feature.id), spec.content_idempotency_key,
+        )
+        if prefetch_entry is not None:
+            adopted = await _adopt_prefetched_task_sandbox(
+                prefetch_entry,
+                runner=runner,
+                feature=feature,
+                task=task,
+                runtime=runtime,
+                task_contract=task_contract,
+                feature_root=feature_root,
+                dag_sha256=dag_sha256,
+                group_idx=group_idx,
+                sandbox_mode=sandbox_mode,
+                snapshots=snapshots,
+            )
+            if adopted is not None:
+                return adopted
     project_profile = await _resolve_project_profile(runner, feature, source, repo_id)
     sandbox_runner = SandboxRunner(
         workspace_root=workspace_root,
@@ -9299,6 +9342,36 @@ async def _bind_task_sandbox(
         blocked_roots=[feature_root],
         project_profile=project_profile,
     )
+    if prefetch_register_only:
+        # W-S: same allocate() (template clonefile + spot-verify + the shared
+        # IRIAI_SANDBOX_PROVISION_CONCURRENCY gate inside it), NO runtime
+        # binding — preparation only. Register for adoption by the real
+        # dispatch and hand the lease back for the prompt prebuild.
+        lease = await sandbox_runner.allocate(spec)
+        _wave_prefetch_register(
+            _WavePrefetchEntry(
+                feature_id=str(feature.id),
+                group_idx=group_idx,
+                task_id=task.id,
+                content_key=spec.content_idempotency_key,
+                spec=spec,
+                runner=sandbox_runner,
+                lease=lease,
+            )
+        )
+        return RuntimeSandboxTaskBinding(
+            runner=sandbox_runner,
+            lease=lease,
+            binding=None,
+            workflow_runner=runner,
+            feature=feature,
+            task_contract=task_contract,
+            feature_root=feature_root,
+            dag_sha256=dag_sha256,
+            group_idx=group_idx,
+            stage=sandbox_mode,
+            snapshots=list(snapshots),
+        )
     try:
         lease = await sandbox_runner.allocate(spec)
         binding = await sandbox_runner.bind_runtime(
@@ -21380,7 +21453,619 @@ async def _resolve_active_regroup_legacy_marker(
 # matches` name via the shim so every existing reader continues to work.
 
 
+# ── W-S: wave-startup prefetch (IRIAI_WAVE_PREFETCH, default ON) ─────────────
+#
+# When wave N dispatches, a BACKGROUND asyncio task immediately kicks wave
+# N+1's full startup — sandbox allocation via the IDENTICAL
+# `_bind_task_sandbox` spec construction + `SandboxRunner.allocate()` path
+# (W-E template clonefile + spot-verify + the shared
+# IRIAI_SANDBOX_PROVISION_CONCURRENCY gate) and dispatch-prompt assembly via
+# the IDENTICAL `_ImplementationPromptBuilder.build_prompt_context` path
+# (W-O worker-thread offload + the shared IRIAI_PROMPT_ASSEMBLY_CONCURRENCY
+# gate, side files written into the prefetched sandbox's own
+# `.iriai-context/` dir, prompt persisted under the digest-keyed
+# `dag-dispatch-prompt:*` artifact). NOTHING EXECUTES EARLY — no
+# `bind_runtime`, no runtime invocation; preparation only.
+#
+# Reuse mechanism (verified): `SandboxSpec.idempotency_key`
+# (execution/sandbox.py) hashes {feature_id, dag_sha256, group_idx, mode,
+# repo_ids, base_commits, contract_ids} and mixes in `attempt_no` ONLY when
+# IRIAI_SANDBOX_REUSE_ON_RETRY is OFF (the default). The real dispatch's
+# attempt_no is the durable dispatcher attempt row id
+# (`_ImplementationSandboxPort.bind_runtime` passes `_attempt_id` from
+# `RuntimeDispatcher.dispatch` -> `store.start_dispatch_attempt`), which is
+# unpredictable at prefetch time — so prefetch-vs-dispatch matching uses the
+# attempt-free `SandboxSpec.content_idempotency_key` (exactly the
+# REUSE_ON_RETRY=1 seed) through the in-process registry below. Contract ids
+# stay stable across the prefetch compile and the dispatch-loop recompile
+# because `ExecutionControlStore.put_task_contract` reuses the digest-matched
+# contract row (`_insert_or_reuse_task_contract`).
+#
+# Staleness CANNOT be adopted: if wave N's seal moves any repo HEAD (or a
+# contract recompiles differently / the dag is regrouped), the real
+# dispatch's content key differs, the registry misses, and the unchanged
+# fresh-provision path runs; the unused prefetched sandbox is released by
+# the controller. The prompt artifact has the same story natively: its key
+# embeds prompt_sha256 (and `_task_amendments_section` is read fresh into
+# the prompt before hashing — see `_build_prompt_context_assembled`), so an
+# amendment landing between prefetch and dispatch changes the key and the
+# dispatcher rebuilds automatically.
+#
+# SAFETY: every prefetch failure is WARN-only and isolated per task; the
+# whole prefetch runs in one cancellable asyncio task that `_implement_dag`'s
+# wrapper cancels (and whose unused sandboxes it releases) on ANY exit —
+# quiesce, workflow-block, crash or normal completion. Waves whose boundary
+# index is in IRIAI_QUIESCE_GROUP_INDEXES (derived via the SAME
+# `_dag_quiesce_group_indexes()` the dispatch gate uses in
+# `_maybe_quiesce_before_group_dispatch`) are never prefetched — a CHK /
+# batched-migration boundary may change the schema. IRIAI_WAVE_PREFETCH=0
+# disables everything (no controller task, no registry reads — byte-identical
+# dispatch behaviour).
+_WAVE_PREFETCH_ENV = "IRIAI_WAVE_PREFETCH"
+# Disjoint attempt_no namespace for prefetch sandbox roots
+# (`.../sandboxes/g{idx}/attempt-{attempt_no}`): never collides with the
+# durable dispatcher attempt ids the real dispatch uses, so a stale
+# prefetched sandbox can never sit on a path a real allocation needs.
+_WAVE_PREFETCH_ATTEMPT_NO_BASE = 987_000_000
+
+
+def _wave_prefetch_enabled() -> bool:
+    """Return True when wave-startup prefetch is on (default).
+
+    Set ``IRIAI_WAVE_PREFETCH=0`` to restore the synchronous wave startup
+    byte-identically (no background provisioning, no adoption registry
+    reads)."""
+    raw = os.environ.get(_WAVE_PREFETCH_ENV, "1")
+    return str(raw).strip() not in ("0", "false", "False", "FALSE", "no", "No", "NO")
+
+
+@dataclass
+class _WavePrefetchEntry:
+    feature_id: str
+    group_idx: int
+    task_id: str
+    content_key: str
+    spec: Any
+    runner: Any  # SandboxRunner — owns the lease; adoption keeps using it.
+    lease: Any  # SandboxLease (status "allocated"; never runtime-bound here).
+
+
+_WAVE_PREFETCH_REGISTRY_GUARD = threading.Lock()
+_WAVE_PREFETCH_REGISTRY: dict[tuple[str, str], _WavePrefetchEntry] = {}
+
+
+def _wave_prefetch_register(entry: _WavePrefetchEntry) -> None:
+    with _WAVE_PREFETCH_REGISTRY_GUARD:
+        _WAVE_PREFETCH_REGISTRY[(entry.feature_id, entry.content_key)] = entry
+
+
+def _wave_prefetch_take(
+    feature_id: str, content_key: str
+) -> _WavePrefetchEntry | None:
+    with _WAVE_PREFETCH_REGISTRY_GUARD:
+        return _WAVE_PREFETCH_REGISTRY.pop((feature_id, content_key), None)
+
+
+def _wave_prefetch_pop_stale(
+    feature_id: str, *, before_group_idx: int
+) -> list[_WavePrefetchEntry]:
+    with _WAVE_PREFETCH_REGISTRY_GUARD:
+        stale_keys = [
+            key
+            for key, entry in _WAVE_PREFETCH_REGISTRY.items()
+            if entry.feature_id == feature_id and entry.group_idx < before_group_idx
+        ]
+        return [_WAVE_PREFETCH_REGISTRY.pop(key) for key in stale_keys]
+
+
+def _wave_prefetch_drain(feature_id: str) -> list[_WavePrefetchEntry]:
+    with _WAVE_PREFETCH_REGISTRY_GUARD:
+        keys = [
+            key
+            for key, entry in _WAVE_PREFETCH_REGISTRY.items()
+            if entry.feature_id == feature_id
+        ]
+        return [_WAVE_PREFETCH_REGISTRY.pop(key) for key in keys]
+
+
+_WAVE_PREFETCH_CONTROLLER_VAR: "contextvars.ContextVar[Any]" = contextvars.ContextVar(
+    "iriai_wave_prefetch_controller", default=None
+)
+
+
+async def _adopt_prefetched_task_sandbox(
+    entry: _WavePrefetchEntry,
+    *,
+    runner: WorkflowRunner,
+    feature: Feature,
+    task: ImplementationTask,
+    runtime: str | None,
+    task_contract: Any | None,
+    feature_root: Path | None,
+    dag_sha256: str,
+    group_idx: int,
+    sandbox_mode: str,
+    snapshots: list[Any],
+) -> RuntimeSandboxTaskBinding | None:
+    """Runtime-bind a content-key-matched prefetched sandbox (W-S adoption).
+
+    Uses the PREFETCH entry's own SandboxRunner so the lease's manifest
+    owner stays consistent for every later capture/release ownership check.
+    Returns ``None`` on ANY problem — the caller's unchanged fresh-provision
+    path then runs; the entry's sandbox is best-effort released so it cannot
+    leak."""
+    try:
+        lease = entry.lease
+        if str(getattr(lease, "status", "") or "") != "allocated":
+            return None
+        manifest_path = Path(
+            str(getattr(lease, "manifest_path", "") or "")
+            or str(Path(str(lease.root)) / "sandbox-manifest.json")
+        )
+        if not manifest_path.exists():
+            return None
+        binding = await entry.runner.bind_runtime(
+            lease,
+            _sandbox_runtime_name(runtime, runner),
+        )
+        logger.info(
+            "wave prefetch: adopted prefetched sandbox %s for task %s "
+            "(group %d) — no second provision",
+            lease.sandbox_id,
+            task.id,
+            group_idx,
+        )
+        return RuntimeSandboxTaskBinding(
+            runner=entry.runner,
+            lease=lease,
+            binding=binding,
+            workflow_runner=runner,
+            feature=feature,
+            task_contract=task_contract,
+            feature_root=feature_root,
+            dag_sha256=dag_sha256,
+            group_idx=group_idx,
+            stage=sandbox_mode,
+            snapshots=list(snapshots),
+        )
+    except _asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.warning(
+            "wave prefetch: adopting prefetched sandbox for task %s failed; "
+            "provisioning fresh: %s",
+            task.id,
+            exc,
+        )
+        try:
+            await entry.runner.release(entry.lease, "release")
+        except Exception:  # pragma: no cover - best effort.
+            logger.debug(
+                "wave prefetch: releasing failed-adoption sandbox failed",
+                exc_info=True,
+            )
+        return None
+
+
+class _WavePrefetchController:
+    """Owns the one in-flight wave-prefetch task for a `_implement_dag` run.
+
+    `spawn()` is called right after a wave's tasks are launched; `settle()`
+    at the next wave's dispatch entry (entries final before the adoption
+    registry is read, stale entries released); `shutdown()` by the
+    `_implement_dag` wrapper on EVERY exit (cancel + release — no orphan
+    tasks holding the allocation/provision/prompt gates, no leaked
+    sandboxes)."""
+
+    def __init__(
+        self, runner: WorkflowRunner, feature: Feature, *, enabled: bool
+    ) -> None:
+        self._runner = runner
+        self._feature = feature
+        self.enabled = bool(enabled)
+        self._task: Any | None = None
+        self._task_group_idx: int | None = None
+
+    @property
+    def feature_id(self) -> str:
+        return str(getattr(self._feature, "id", "") or "")
+
+    def spawn(
+        self,
+        *,
+        dag: ImplementationDAG,
+        group_idx: int,
+        tasks_by_id: dict[str, ImplementationTask],
+        dag_sha256: str,
+        workspace_mgr: Any,
+        feature_root: Path | None,
+        handover: Any,
+        regroup_in_play: bool,
+        regroup_offset: int,
+        regroup_overlay_applied: bool,
+    ) -> bool:
+        """Kick wave ``group_idx + 1``'s startup in the background (or skip)."""
+        if not self.enabled:
+            return False
+        next_idx = group_idx + 1
+        if next_idx >= len(dag.execution_order):
+            return False
+        if group_idx in _dag_quiesce_group_indexes():
+            # Same boundary derivation as `_maybe_quiesce_before_group_dispatch`
+            # (dispatch quiesces before group G iff G-1 is listed; here
+            # G = next_idx, so the boundary index is exactly the CURRENT
+            # group). A CHK / batched-migration boundary must not be
+            # pre-provisioned — the schema may change before the wave runs.
+            logger.info(
+                "wave prefetch: group %d is a quiesce/CHK boundary (%s); "
+                "not prefetching wave %d",
+                group_idx,
+                DAG_QUIESCE_GROUP_INDEXES_ENV,
+                next_idx,
+            )
+            return False
+        if regroup_in_play and not regroup_overlay_applied and next_idx >= regroup_offset:
+            # The effective execution order at/beyond the regroup offset is
+            # resolved only when the dispatch loop reaches the offset
+            # (`_resolve_active_regroup_before_group_dispatch`); base-order
+            # groups there must not be pre-provisioned.
+            logger.info(
+                "wave prefetch: wave %d is at/beyond the unresolved regroup "
+                "offset %d; not prefetching",
+                next_idx,
+                regroup_offset,
+            )
+            return False
+        if workspace_mgr is None or feature_root is None:
+            return False
+        if self._task is not None and not self._task.done():
+            return False
+        group_task_ids = list(dag.execution_order[next_idx])
+        group_tasks = [
+            tasks_by_id[tid] for tid in group_task_ids if tid in tasks_by_id
+        ]
+        if not group_tasks or len(group_tasks) != len(group_task_ids):
+            return False
+        # Snapshot the handover BEFORE wave N records its results (the
+        # prefetch task runs concurrently with the wave gather + integration;
+        # the live HandoverDoc must never be read or compressed mid-mutation).
+        handover_context = ""
+        try:
+            handover_copy = copy.deepcopy(handover)
+            if handover_copy.completed or handover_copy.failed_attempts:
+                handover_copy.compress()
+                handover_context = (
+                    f"\n\n## Handover — Prior Work\n\n{to_markdown(handover_copy)}"
+                )
+        except Exception:
+            logger.warning(
+                "wave prefetch: handover snapshot failed; prebuilding prompts "
+                "without handover context",
+                exc_info=True,
+            )
+        self._task_group_idx = next_idx
+        self._task = _asyncio.get_running_loop().create_task(
+            self._prefetch_wave(
+                dag=dag,
+                next_idx=next_idx,
+                group_tasks=group_tasks,
+                dag_sha256=dag_sha256,
+                workspace_root=Path(workspace_mgr._base),
+                feature_root=feature_root,
+                handover_context=handover_context,
+            ),
+        )
+        logger.info(
+            "wave prefetch: started background startup for wave %d "
+            "(%d task(s)) while wave %d executes",
+            next_idx,
+            len(group_tasks),
+            group_idx,
+        )
+        return True
+
+    async def settle(self, group_idx: int) -> None:
+        """Finish the in-flight prefetch and release already-stale entries."""
+        if not self.enabled:
+            return
+        task = self._task
+        if task is not None:
+            if not task.done():
+                logger.info(
+                    "wave prefetch: waiting for in-flight wave-%s prefetch "
+                    "before dispatching group %d",
+                    self._task_group_idx,
+                    group_idx,
+                )
+            try:
+                await task
+            except _asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning(
+                    "wave prefetch task failed; wave dispatch is unaffected",
+                    exc_info=True,
+                )
+            self._task = None
+            self._task_group_idx = None
+        for entry in _wave_prefetch_pop_stale(
+            self.feature_id, before_group_idx=group_idx
+        ):
+            await self._release_entry(entry, reason=f"stale before g{group_idx}")
+
+    async def shutdown(self) -> None:
+        """Cancel the in-flight prefetch and release every unadopted sandbox."""
+        task = self._task
+        self._task = None
+        self._task_group_idx = None
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except _asyncio.CancelledError:
+                pass
+            except Exception:  # pragma: no cover - prefetch is self-guarded.
+                logger.debug("wave prefetch: cancelled task raised", exc_info=True)
+        for entry in _wave_prefetch_drain(self.feature_id):
+            await self._release_entry(entry, reason="shutdown")
+
+    async def _release_entry(
+        self, entry: _WavePrefetchEntry, *, reason: str
+    ) -> None:
+        try:
+            if str(getattr(entry.lease, "status", "") or "") != "allocated":
+                # Adopted leases leave the registry at adoption; anything
+                # else that progressed past "allocated" is owned elsewhere.
+                return
+            await entry.runner.release(entry.lease, "release")
+            logger.info(
+                "wave prefetch: released unused prefetched sandbox %s for "
+                "task %s (%s)",
+                getattr(entry.lease, "sandbox_id", "?"),
+                entry.task_id,
+                reason,
+            )
+        except _asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "wave prefetch: releasing unused prefetched sandbox for "
+                "task %s failed (%s): %s",
+                entry.task_id,
+                reason,
+                exc,
+            )
+
+    async def _prefetch_wave(
+        self,
+        *,
+        dag: ImplementationDAG,
+        next_idx: int,
+        group_tasks: list[ImplementationTask],
+        dag_sha256: str,
+        workspace_root: Path,
+        feature_root: Path,
+        handover_context: str,
+    ) -> None:
+        runner = self._runner
+        feature = self._feature
+        try:
+            # Resume guard: a completed `dag-task:*` marker means this wave is
+            # a checkpoint-resume re-entry. Prefetch-compiling its contracts
+            # would refresh the `dag-task-contract:*` projection BEFORE the
+            # dispatch loop snapshots `preexisting_contract_digests` for its
+            # completed-marker lineage revalidation
+            # (`_completed_task_marker_has_current_lineage`), masking a real
+            # contract drift. Skip the whole wave — resume re-dispatch is
+            # immediate anyway.
+            for task in group_tasks:
+                marker = await runner.artifacts.get(
+                    f"dag-task:{task.id}", feature=feature,
+                )
+                if marker:
+                    logger.info(
+                        "wave prefetch: wave %d has completed task markers "
+                        "(resume); skipping",
+                        next_idx,
+                    )
+                    return
+            if dag_path_canonicalization_enabled():
+                # Mirror the dispatch loop's static rewrite so the compiled
+                # contracts (and therefore the spec content key) match; the
+                # loop itself records the canonicalization artifact when it
+                # reaches this group. The agentic resolver is deliberately
+                # NOT run here (it dispatches a model); if it rewrites paths
+                # at real dispatch the content key changes and the prefetch
+                # is simply not adopted.
+                group_tasks, _path_rewrites = canonicalize_implementation_tasks(
+                    group_tasks
+                )
+            await _ensure_task_worktrees(
+                runner, feature, group_tasks, group_idx=next_idx,
+            )
+            authority_guard = await _run_workspace_authority_pre_dispatch_adapter(
+                runner,
+                feature,
+                next_idx,
+                group_tasks,
+                workspace_root=workspace_root,
+                feature_root=feature_root,
+                stage="initial-dispatch",
+                dag_sha256=dag_sha256,
+            )
+            if (
+                _workspace_authority_blocks_dispatch(authority_guard)
+                or not authority_guard.approved
+            ):
+                logger.info(
+                    "wave prefetch: workspace authority did not approve wave "
+                    "%d; skipping (the dispatch loop handles it "
+                    "authoritatively)",
+                    next_idx,
+                )
+                return
+            contract_outcome = await _compile_task_contracts_for_group(
+                runner,
+                feature,
+                dag,
+                next_idx,
+                group_tasks,
+                registry=authority_guard.registry,
+                feature_root=feature_root,
+                dag_sha256=dag_sha256,
+            )
+            if not contract_outcome.approved:
+                logger.warning(
+                    "wave prefetch: contract compilation for wave %d failed "
+                    "(%s); skipping",
+                    next_idx,
+                    contract_outcome.failure,
+                )
+                return
+            contracts_by_task_id = contract_outcome.contracts_by_task_id
+
+            async def _prefetch_one(task_idx: int, task: ImplementationTask) -> None:
+                try:
+                    task_contract = contracts_by_task_id.get(task.id)
+                    repo_binding = _resolve_task_dispatch_repo_binding(
+                        task=task,
+                        task_contract=task_contract,
+                        registry=authority_guard.registry,
+                        feature_root=feature_root,
+                    )
+                    record = await _bind_task_sandbox(
+                        runner,
+                        feature,
+                        workspace_root=workspace_root,
+                        feature_root=feature_root,
+                        dag_sha256=dag_sha256,
+                        group_idx=next_idx,
+                        task_idx=task_idx,
+                        attempt=0,
+                        task=task,
+                        task_contract=task_contract,
+                        ws_path=repo_binding.ws_path,
+                        snapshots=list(authority_guard.snapshots),
+                        runtime=None,
+                        repo_id_hint=repo_binding.repo_id,
+                        sandbox_mode="task",
+                        sandbox_attempt_no=_WAVE_PREFETCH_ATTEMPT_NO_BASE + task_idx,
+                        prefetch_register_only=True,
+                    )
+                    if record is None:
+                        return
+                    await self._prebuild_dispatch_prompt(
+                        task=task,
+                        task_contract=task_contract,
+                        repo_binding=repo_binding,
+                        lease=record.lease,
+                        next_idx=next_idx,
+                        handover_context=handover_context,
+                    )
+                    logger.info(
+                        "wave prefetch: sandbox + dispatch prompt prepared "
+                        "for wave %d task %s",
+                        next_idx,
+                        task.id,
+                    )
+                except _asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.warning(
+                        "wave prefetch: preparing task %s for wave %d failed; "
+                        "its real dispatch provisions fresh: %s",
+                        task.id,
+                        next_idx,
+                        exc,
+                    )
+
+            await _asyncio.gather(
+                *[_prefetch_one(i, t) for i, t in enumerate(group_tasks)],
+            )
+        except _asyncio.CancelledError:
+            logger.info("wave prefetch: cancelled while preparing wave %d", next_idx)
+            raise
+        except Exception:
+            logger.warning(
+                "wave prefetch for wave %d failed; wave dispatch is unaffected",
+                next_idx,
+                exc_info=True,
+            )
+
+    async def _prebuild_dispatch_prompt(
+        self,
+        *,
+        task: ImplementationTask,
+        task_contract: Any | None,
+        repo_binding: Any,
+        lease: Any,
+        next_idx: int,
+        handover_context: str,
+    ) -> None:
+        """Pre-assemble the dispatch prompt into the prefetched sandbox.
+
+        Identical builder + gates as the dispatcher's `_build_prompt`
+        (`_ImplementationPromptBuilder.build_prompt_context`): side files
+        land in the prefetched sandbox's `.iriai-context/<task>` dir (the
+        spot the real dispatch's builder reads when the sandbox is adopted)
+        and the prompt persists under the digest-keyed
+        `dag-dispatch-prompt:*` artifact. If a task amendment (or handover
+        delta) lands before the real dispatch, the prompt sha — and so the
+        artifact key — changes and the dispatcher rebuilds; never stale."""
+        runner = self._runner
+        feature = self._feature
+        prefix = f"{repo_binding.repo_path}/" if repo_binding.repo_path else ""
+        inline_prompt = (
+            _build_task_prompt(task, repo_prefix=prefix, contract=task_contract)
+            + await _project_constraints_prompt_block(runner, feature)
+            + handover_context
+        )
+        builder = _ImplementationPromptBuilder(
+            runner=runner,
+            feature=feature,
+            task=task,
+            repo_prefix=prefix,
+            task_contract=task_contract,
+            handover_context=handover_context,
+            inline_prompt=inline_prompt,
+            log_label=f"Wave-prefetch task {task.id}",
+        )
+        repo_roots = dict(getattr(lease, "repo_roots", {}) or {})
+        sandbox_cwd = str(
+            repo_roots.get(repo_binding.repo_id) or getattr(lease, "root", "")
+        )
+        binding_stub = SimpleNamespace(
+            env={"IRIAI_SANDBOX_ROOT": str(getattr(lease, "root", "") or "")},
+            manifest_path=str(getattr(lease, "manifest_path", "") or ""),
+            cwd=sandbox_cwd,
+            workspace_override=sandbox_cwd,
+        )
+        request_stub = SimpleNamespace(group_idx=next_idx, request_digest="")
+        await builder.build_prompt_context(request_stub, binding_stub)
+
+
 async def _implement_dag(
+    runner: WorkflowRunner, feature: Feature, dag: ImplementationDAG
+) -> DagExecutionOutcome:
+    """W-S wrapper around the dispatch loop: installs the wave-prefetch
+    controller for the duration of the run and GUARANTEES cleanup (cancel the
+    in-flight prefetch task + release unadopted prefetched sandboxes) on
+    every exit path — normal completion, quiesce, workflow-block or crash."""
+    controller = _WavePrefetchController(
+        runner, feature, enabled=_wave_prefetch_enabled(),
+    )
+    token = _WAVE_PREFETCH_CONTROLLER_VAR.set(controller)
+    try:
+        return await _implement_dag_dispatch_loop(runner, feature, dag)
+    finally:
+        _WAVE_PREFETCH_CONTROLLER_VAR.reset(token)
+        try:
+            await controller.shutdown()
+        except Exception:  # pragma: no cover - cleanup must never mask returns.
+            logger.warning("wave prefetch: shutdown cleanup failed", exc_info=True)
+
+
+async def _implement_dag_dispatch_loop(
     runner: WorkflowRunner, feature: Feature, dag: ImplementationDAG
 ) -> DagExecutionOutcome:
     """Execute the full DAG with per-group verification, checkpointing, and
@@ -21737,6 +22422,13 @@ async def _implement_dag(
                 ).hexdigest()
                 group = dag.execution_order[group_idx]
                 regroup_overlay_applied = True
+
+        # ── W-S: settle the in-flight wave prefetch for THIS group before
+        # dispatch reads the adoption registry (entries final) and release
+        # entries from already-dispatched waves. No-op with the flag off.
+        _ws_prefetch_controller = _WAVE_PREFETCH_CONTROLLER_VAR.get()
+        if _ws_prefetch_controller is not None:
+            await _ws_prefetch_controller.settle(group_idx)
 
         group_tasks = [tasks_by_id[tid] for tid in group]
         if dag_path_canonicalization_enabled():
@@ -22932,6 +23624,35 @@ async def _implement_dag(
                             )
                 # Unreachable but satisfies type checker
                 return ImplementationResult(task_id=t.id, summary="FAILED", status="blocked")
+
+            # ── W-S: wave N is dispatching — IMMEDIATELY kick wave N+1's
+            # full startup (sandbox provisioning + prompt assembly) in the
+            # background so its sandboxes are waiting when the seal clears.
+            # Preparation only; failures are WARN-only and never touch this
+            # wave. No-op with IRIAI_WAVE_PREFETCH=0.
+            _ws_prefetch_controller = _WAVE_PREFETCH_CONTROLLER_VAR.get()
+            if _ws_prefetch_controller is not None:
+                try:
+                    _ws_prefetch_controller.spawn(
+                        dag=dag,
+                        group_idx=group_idx,
+                        tasks_by_id=tasks_by_id,
+                        dag_sha256=dag_sha256,
+                        workspace_mgr=workspace_mgr,
+                        feature_root=feature_root,
+                        handover=handover,
+                        regroup_in_play=regroup_in_play,
+                        regroup_offset=regroup_offset,
+                        regroup_overlay_applied=regroup_overlay_applied,
+                    )
+                except Exception:
+                    logger.warning(
+                        "wave prefetch: spawn for wave %d failed; wave %d "
+                        "dispatch is unaffected",
+                        group_idx + 1,
+                        group_idx,
+                        exc_info=True,
+                    )
 
             # Dispatch all tasks in parallel with individual error handling
             gathered = await _asyncio.gather(
