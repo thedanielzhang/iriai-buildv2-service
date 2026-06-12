@@ -53,6 +53,20 @@ _DAG = "dag-sha"
 _GROUP = 1
 
 
+@pytest.fixture(autouse=True)
+def _pin_deterministic_checkpoint_route(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pin the DETERMINISTIC queue-checkpoint route (expanded verify OFF).
+
+    W-LQ wired the checkpoint-required dag-verify lens pass into
+    ``_checkpoint_durable_merge_queue_group`` behind the existing
+    ``IRIAI_DAG_EXPANDED_VERIFY`` flag (default ON). Every test in this file
+    documents the deterministic coverage-gate seal, so the flag is pinned OFF
+    here; the flag-ON lens route is covered by
+    ``test_merge_queue_checkpoint_expanded_verify.py``.
+    """
+    monkeypatch.setenv("IRIAI_DAG_EXPANDED_VERIFY", "0")
+
+
 # ── git + DB staging helpers (mirror test_merge_queue_drain.py) ──────────────
 
 

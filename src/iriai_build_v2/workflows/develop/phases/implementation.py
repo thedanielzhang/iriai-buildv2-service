@@ -8055,6 +8055,215 @@ def _checkpoint_coverage_redrivable(detail: str | None) -> bool:
     )
 
 
+# W-LQ: stage label for the queue-checkpoint expanded-verify lens pass. It is
+# the third segment of the `dag-verify:g{N}:{stage}` projection key, so the
+# resume reader / gate-proof machinery (`_dag_verify_stage_from_projection_key`,
+# `_dag_verify_graph_artifact_key`) parse it exactly like the legacy
+# `initial` / `retry-*` stages while keeping the queue route's rows distinct.
+_QUEUE_CHECKPOINT_VERIFY_STAGE = "queue-checkpoint"
+
+
+@dataclass(frozen=True)
+class _QueueCheckpointExpandedVerifyOutcome:
+    """Result of the queue-checkpoint expanded-verify lens pass (W-LQ)."""
+
+    approved: bool
+    detail: str = ""
+    projection_key: str = ""
+    lens_evidence_ids: list[int] = field(default_factory=list)
+    lens_run_count: int = 0
+    lens_failure_count: int = 0
+    required_lens_slugs: list[str] = field(default_factory=list)
+
+
+async def _run_queue_checkpoint_expanded_verify(
+    runner: WorkflowRunner,
+    feature: Feature,
+    *,
+    group_idx: int,
+    dag_sha256: str,
+    task_results: list[ImplementationResult],
+    stage: str,
+) -> _QueueCheckpointExpandedVerifyOutcome:
+    """W-LQ: run the checkpoint-required dag-verify lenses on the QUEUE route.
+
+    The durable merge-queue seal (`_checkpoint_durable_merge_queue_group`) uses
+    a DETERMINISTIC checkpoint-gate decision — coverage approval — and never
+    enters `_verify_and_fix_group`, so with `IRIAI_DAG_EXPANDED_VERIFY=1` the
+    five-lens agentic review wired at the legacy route's approved-Verdict
+    boundary (`_run_checkpoint_required_dag_verify_lenses`, called from
+    `_verify_and_fix_group`) had NEVER executed for queue-sealed groups. This
+    helper runs that exact lens pass for a queue group about to take a FRESH
+    seal:
+
+    * base verdict: a synthesized APPROVED `Verdict` standing in for the
+      deterministic coverage gate (every expected task covered by exactly one
+      `integrated` lane, each committed + proven clean in the drain);
+    * context: the group's per-task `ImplementationResult`s, their
+      created/modified file lists (`_collect_files`), and the group's
+      `ImplementationTask` specs reconstructed from the durable `dag`
+      artifact;
+    * runtime: the same `dag-final-verify` resolution chain the legacy lens
+      call uses (`_dag_repair_runtime_for("dag-final-verify",
+      _dag_repair_runtime_for("dag-normal-verify", review_runtime))` with the
+      group's adversarial `review_runtime` from `_dag_group_runtime_pair`);
+    * merge: `_run_checkpoint_required_dag_verify_lenses` → existing
+      `_merge_dag_expanded_verify_verdicts` semantics — approval survives only
+      if every successful lens approves; lens provider failures are isolated
+      and non-blocking;
+    * persistence: `_put_dag_verify_artifact` under the group's REAL
+      projection key `dag-verify:g{N}:queue-checkpoint`, so the verification
+      graph + durable projection rows are recorded exactly as the legacy
+      route records its `initial`/`retry-*` stages.
+
+    Fail-loud: an APPROVED merged verdict whose verification graph could not
+    be durably persisted is returned as NOT approved (mirrors the legacy
+    checkpoint requirement in `_require_dag_verification_graph_approval` that
+    summary-only approval cannot checkpoint).
+
+    Returns the merged approval, a typed detail for the failure router, and
+    the durable lens evidence ids (the graph's `aggregate_evidence_node_id`
+    `evidence_nodes` row) for `GateDecision.input_evidence_ids` lineage.
+    """
+
+    required_lens_slugs = _dag_verify_required_lens_slugs()
+    projection_key = (
+        f"dag-verify:g{group_idx}:{_QUEUE_CHECKPOINT_VERIFY_STAGE}"
+    )
+    results: list[object] = [
+        r for r in (task_results or []) if isinstance(r, ImplementationResult)
+    ]
+    files = _collect_files(results)
+    # The group's task specs, reconstructed from the durable `dag` artifact
+    # (the same source `_current_dag_sha256` reads). Missing/unparseable dag
+    # degrades only the lens prompt's task-spec section, never the pass.
+    tasks: list[ImplementationTask] = []
+    try:
+        raw_dag = await runner.artifacts.get("dag", feature=feature)
+    except Exception:  # pragma: no cover - defensive artifact-read fault.
+        raw_dag = ""
+    if raw_dag:
+        try:
+            dag = ImplementationDAG.model_validate_json(raw_dag)
+            expected_ids = {str(r.task_id) for r in results if r.task_id}
+            tasks = [t for t in dag.tasks if t.id in expected_ids]
+        except Exception:
+            tasks = []
+    # The dag-final-verify runtime resolution — byte-for-byte the chain
+    # `_verify_and_fix_group` builds for its checkpoint-required lens call
+    # (`dag_final_review_runtime`), seeded with this group's adversarial
+    # review runtime.
+    runtime_policy = _runner_runtime_policy(runner)
+    _group_impl_runtime, group_review_runtime = _dag_group_runtime_pair(
+        group_idx,
+        runtime_policy,
+    )
+    lens_runtime = _dag_repair_runtime_for(
+        "dag-final-verify",
+        _dag_repair_runtime_for("dag-normal-verify", group_review_runtime),
+    )
+    services = getattr(runner, "services", {}) or {}
+    workspace_mgr = services.get("workspace_manager")
+    feature_root = (
+        Path(workspace_mgr._base) / ".iriai" / "features" / feature.slug / "repos"
+        if workspace_mgr
+        else None
+    )
+    base_verdict = Verdict(
+        approved=True,
+        summary=(
+            f"Deterministic merge-queue coverage gate for group {group_idx} "
+            f"(stage={stage}): every expected task is covered by exactly one "
+            "integrated lane, each committed and proven clean by the drain's "
+            "post-apply gates. Checkpoint-required expanded verify lenses run "
+            "on this approved base; the checkpoint gate reflects the MERGED "
+            "verdict."
+        ),
+    )
+    merged, lens_verdicts, lens_failures = (
+        await _run_checkpoint_required_dag_verify_lenses(
+            runner,
+            feature,
+            group_idx,
+            _QUEUE_CHECKPOINT_VERIFY_STAGE,
+            base_verdict,
+            results,
+            files,
+            tasks,
+            runtime=lens_runtime,
+            feature_root=feature_root,
+            projection_key=projection_key,
+            dag_sha256=dag_sha256,
+        )
+    )
+    await _put_dag_verify_artifact(
+        runner,
+        feature,
+        projection_key,
+        merged,
+        group_idx=group_idx,
+        dag_sha256=dag_sha256,
+        lens_verdicts=lens_verdicts,
+        required_lens_slugs=required_lens_slugs,
+        lens_failures=lens_failures,
+        tasks=tasks,
+        results=results,
+        raw_verifier_verdict=base_verdict,
+    )
+    # Durable lens evidence for GateDecision.input_evidence_ids lineage: the
+    # verification graph's aggregate `evidence_nodes` row id, recorded by
+    # `ExecutionControlStore.record_verification_graph_projection` and echoed
+    # in the graph artifact's `durable_projection` metadata.
+    lens_evidence_ids: list[int] = []
+    graph_durably_persisted = False
+    graph_key = _dag_verify_graph_artifact_key(
+        group_idx, _QUEUE_CHECKPOINT_VERIFY_STAGE
+    )
+    graph_raw = await _get_artifact_text(runner, feature, graph_key)
+    graph_payload = _json_object_from_text(graph_raw) if graph_raw else {}
+    if isinstance(graph_payload, dict) and graph_payload:
+        graph_durably_persisted = _dag_verify_graph_payload_has_durable_projection(
+            graph_payload
+        )
+        durable = graph_payload.get("durable_projection")
+        if isinstance(durable, dict):
+            aggregate_node_id = _dag_verify_graph_int(
+                durable.get("aggregate_evidence_node_id")
+            )
+            if aggregate_node_id is not None:
+                lens_evidence_ids.append(aggregate_node_id)
+    approved = _is_approved(merged)
+    detail = ""
+    if approved and not graph_durably_persisted:
+        approved = False
+        detail = (
+            f"expanded verify lenses approved group {group_idx} but the "
+            f"verification graph for {projection_key} is not durably "
+            "persisted; summary-only approval cannot checkpoint "
+            f"(proof_error={str(graph_payload.get('proof_error') or '') if isinstance(graph_payload, dict) else ''!r})"
+        )
+    elif not approved:
+        blocking = [
+            f"[{getattr(c, 'severity', '?')}] {getattr(c, 'description', '')}"
+            for c in getattr(merged, "concerns", [])
+        ][:5]
+        detail = (
+            f"checkpoint-required expanded verify lenses rejected group "
+            f"{group_idx}: {len(getattr(merged, 'concerns', []))} concern(s), "
+            f"{len(getattr(merged, 'gaps', []))} gap(s); top findings: "
+            + ("; ".join(blocking) if blocking else "<none reported>")
+        )
+    return _QueueCheckpointExpandedVerifyOutcome(
+        approved=approved,
+        detail=detail,
+        projection_key=projection_key,
+        lens_evidence_ids=lens_evidence_ids,
+        lens_run_count=len(lens_verdicts),
+        lens_failure_count=len(lens_failures),
+        required_lens_slugs=list(required_lens_slugs),
+    )
+
+
 async def _checkpoint_durable_merge_queue_group(
     runner: WorkflowRunner,
     feature: Feature,
@@ -8218,23 +8427,47 @@ async def _checkpoint_durable_merge_queue_group(
         # covered exactly once by an `integrated` lane.
         return list(ordered_expected)
 
+    # W-LQ: queue-checkpoint expanded-verify lens state. With
+    # `IRIAI_DAG_EXPANDED_VERIFY` OFF (default) these stay at their inert
+    # values and the gate decision below is byte-identical to the
+    # pre-lens deterministic decision. Populated by the lens block before the
+    # checkpoint connection opens; read by the `_checkpoint_gate_decision`
+    # closure at projection time.
+    expanded_verify_ran = False
+    expanded_verify_gate_approved = True
+    expanded_lens_evidence_ids: list[int] = []
+    expanded_verify_gate_payload: dict[str, Any] = {}
+    expanded_lens_run_count = 0
+    expanded_lens_failure_count = 0
+
     async def _checkpoint_gate_decision(coverage: Any) -> Any:
         # Deterministic: an approved coverage means every expected task is
         # covered by exactly one `integrated` lane, each of which already
         # committed + proved clean + passed its post-apply gates inside the
         # drain. A non-approved coverage never reaches the projector
         # (`checkpoint_group` short-circuits), so this is only consulted for an
-        # approved group.
+        # approved group. W-LQ: when the expanded-verify lens pass ran, the
+        # decision's `approved` reflects the MERGED verdict (a lens rejection
+        # already returned a routed failure before this point — the flag here
+        # is belt-and-braces so the projector fails closed if that early
+        # return is ever bypassed) and the lens evidence ids are recorded as
+        # `input_evidence_ids` for lineage.
+        verdict_payload: dict[str, Any] = {
+            "gate": "merge_queue_group_checkpoint",
+            "group_idx": group_idx,
+            "expected_task_ids": list(ordered_expected),
+            "integrated_queue_item_ids": sorted(
+                getattr(coverage, "integrated_queue_item_ids", []) or []
+            ),
+        }
+        if expanded_verify_gate_payload:
+            verdict_payload["expanded_verify"] = dict(
+                expanded_verify_gate_payload
+            )
         return MergeQueueGateDecision(
-            approved=True,
-            verdict_payload={
-                "gate": "merge_queue_group_checkpoint",
-                "group_idx": group_idx,
-                "expected_task_ids": list(ordered_expected),
-                "integrated_queue_item_ids": sorted(
-                    getattr(coverage, "integrated_queue_item_ids", []) or []
-                ),
-            },
+            approved=expanded_verify_gate_approved,
+            input_evidence_ids=list(expanded_lens_evidence_ids),
+            verdict_payload=verdict_payload,
         )
 
     async def _task_results_provider(
@@ -8280,6 +8513,121 @@ async def _checkpoint_durable_merge_queue_group(
         if ordered_dag_body_task_ids is not None:
             return list(ordered_dag_body_task_ids)
         return list(ordered_expected)
+
+    # ── W-LQ: checkpoint-required expanded verify lenses (QUEUE route) ──────
+    # Flag-gated EXCLUSIVELY on the existing `_dag_expanded_verify_enabled()`
+    # (IRIAI_DAG_EXPANDED_VERIFY); OFF skips this entire block and the seal is
+    # byte-identical to the deterministic path. The lens pass runs only for a
+    # FRESH seal — an approved coverage whose candidate lanes are all still
+    # `integrated`. Re-drives of a group that already has `done` or
+    # `checkpointing` lanes skip it: a `done` group is the idempotent-success
+    # case, and a `checkpointing` lane means a prior seal attempt already
+    # passed its checkpoint gate (doc 08's recovery row requires COMPLETING
+    # that idempotent transaction, not re-litigating it — re-running the
+    # nondeterministic lenses there could poison a recovering lane). The
+    # fresh-seal probe uses a SHORT-LIVED connection so the long agentic lens
+    # runs never hold a pool connection or the feature advisory lock; the
+    # coordinator below recomputes coverage authoritatively under the lock.
+    if _dag_expanded_verify_enabled() and _dag_verify_required_lens_slugs():
+        async with _merge_queue_connection(store) as probe_conn:
+            probe_coordinator = MergeQueueGroupCoordinator(
+                MergeQueueStore(probe_conn),
+                _expected_provider,
+            )
+            probe_coverage = await probe_coordinator.coverage(
+                feature_id, dag_sha256, group_idx
+            )
+        fresh_seal = (
+            probe_coverage.approved
+            and bool(probe_coverage.integrated_queue_item_ids)
+            and not probe_coverage.done_queue_item_ids
+            and not probe_coverage.checkpointing_queue_item_ids
+        )
+        if fresh_seal:
+            try:
+                lens_outcome = await _run_queue_checkpoint_expanded_verify(
+                    runner,
+                    feature,
+                    group_idx=group_idx,
+                    dag_sha256=dag_sha256,
+                    task_results=list(task_results or []),
+                    stage=stage,
+                )
+            except Exception as exc:
+                # Per-LENS provider crashes are isolated inside
+                # `_run_expanded_dag_verify_lenses` (non-blocking, existing
+                # semantics). THIS catch is the infrastructure boundary:
+                # a context/persistence crash in the lens pass itself fails
+                # the seal LOUD through the same typed checkpoint-failure
+                # router as every other checkpoint fault — never an
+                # unstructured crash out of the seal, never a silent
+                # deterministic-gate fallback.
+                detail = (
+                    f"durable merge queue group {group_idx} checkpoint-"
+                    "required expanded verify pass crashed before the "
+                    f"checkpoint gate: {type(exc).__name__}: {exc}"
+                )
+                return _MergeQueueCheckpointResult(
+                    group_idx=group_idx,
+                    checkpointed=False,
+                    detail=detail,
+                    routed_failure=_route(
+                        detail, cause="expanded_verify_crashed"
+                    ),
+                )
+            expanded_verify_ran = True
+            expanded_verify_gate_approved = lens_outcome.approved
+            expanded_lens_evidence_ids = list(lens_outcome.lens_evidence_ids)
+            expanded_lens_run_count = lens_outcome.lens_run_count
+            expanded_lens_failure_count = lens_outcome.lens_failure_count
+            expanded_verify_gate_payload = {
+                "enabled": True,
+                "stage_label": _QUEUE_CHECKPOINT_VERIFY_STAGE,
+                "projection_key": lens_outcome.projection_key,
+                "required_lens_slugs": list(lens_outcome.required_lens_slugs),
+                "lens_run_count": lens_outcome.lens_run_count,
+                "lens_failure_count": lens_outcome.lens_failure_count,
+                "approved": lens_outcome.approved,
+                "lens_evidence_ids": list(lens_outcome.lens_evidence_ids),
+            }
+            await _log_feature_event(
+                runner,
+                feature.id,
+                "dag_merge_queue_checkpoint_expanded_verify",
+                "implementation",
+                content=f"g{group_idx}:{stage}",
+                metadata={
+                    "group_idx": group_idx,
+                    "stage": stage,
+                    "approved": lens_outcome.approved,
+                    "projection_key": lens_outcome.projection_key,
+                    "lens_run_count": lens_outcome.lens_run_count,
+                    "lens_failure_count": lens_outcome.lens_failure_count,
+                    "lens_evidence_ids": list(lens_outcome.lens_evidence_ids),
+                },
+            )
+            if not lens_outcome.approved:
+                # Route EXACTLY like the other checkpoint failures: typed
+                # Slice 07 router (`checkpoint_contradiction` class), never a
+                # legacy fallback — the caller's blocked path keeps the lanes
+                # `integrated` and the pending markers durable, so the repair
+                # / re-drive cycle re-runs the lenses on the next seal
+                # attempt. The detail deliberately does NOT match
+                # `_checkpoint_coverage_redrivable` (a lens rejection is a
+                # finding to fix, not a visibility transient to auto-re-drive).
+                detail = (
+                    f"durable merge queue group {group_idx} checkpoint was "
+                    "refused by the checkpoint-required expanded verify "
+                    f"lenses: {lens_outcome.detail}"
+                )
+                return _MergeQueueCheckpointResult(
+                    group_idx=group_idx,
+                    checkpointed=False,
+                    detail=detail,
+                    routed_failure=_route(
+                        detail, cause="expanded_verify_rejected"
+                    ),
+                )
 
     async with _merge_queue_connection(store) as conn:
         queue_store = MergeQueueStore(conn)
@@ -8376,6 +8724,24 @@ async def _checkpoint_durable_merge_queue_group(
             routed_failure=_route(detail, cause="born_adopted_upsert_failed"),
         )
 
+    # W-LQ observability rider: ONE line per queue seal stating which verify
+    # route ran and the lens counts (the legacy `_verify_and_fix_group` route
+    # logs its own lens completion; queue seals were previously silent about
+    # having taken the deterministic gate).
+    logger.info(
+        "DAG group %d sealed via durable merge-queue checkpoint (stage=%s): "
+        "verify route=%s, lenses run=%d failed=%d",
+        group_idx,
+        stage,
+        (
+            "queue-checkpoint expanded-verify lenses + deterministic coverage gate"
+            if expanded_verify_ran
+            else "deterministic coverage gate only "
+            "(expanded verify disabled, no required lenses, or idempotent re-drive)"
+        ),
+        expanded_lens_run_count,
+        expanded_lens_failure_count,
+    )
     return _MergeQueueCheckpointResult(
         group_idx=group_idx,
         checkpointed=True,
