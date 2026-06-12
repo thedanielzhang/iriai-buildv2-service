@@ -1905,3 +1905,378 @@ async def test_resume_recovery_fails_closed_on_a_failed_lane(
     assert "could not integrate" in recovery.detail
     # No checkpoint projection — the recovery failed closed.
     assert await _dag_group_projection(mq_conn, feature_id, _GROUP) is None
+
+
+# ── (W-PM) resume MUST drain pending-merge rows before any pre-dispatch guard ─
+#
+# Live incident (feature 5b280bb4 g1, 2026-06-11): a develop run completed ALL
+# of a wave's tasks, enqueued the lanes, wrote the `dag-task-pending-merge:*`
+# markers, and the drain failed every lane (`checkpoint_contradiction` — dirty
+# canonical repo) → typed park. The NEXT resume then quiesced at the
+# WorkspaceAuthority PRE-DISPATCH guard (`workspace_dirty`) BEFORE the
+# pending-merge re-drive block, so the resume exited without ever attempting
+# the drain and the wave sat stranded with no path back into the merge queue.
+# These tests pin the fix: (1) the re-drive runs BEFORE the pre-dispatch
+# guard; (2) when the re-drive cannot complete, any pre-dispatch park NAMES
+# the stranded tasks; (3) a terminally-`failed` (non-commit_hygiene) lane is
+# re-routed through the LIVE enqueue as a `retry_of_queue_item_id` replacement
+# instead of dead-blocking forever.
+
+
+class _DeletablePgArtifacts(_PgArtifacts):
+    """`_PgArtifacts` + the `delete` the re-drive marker sweep calls."""
+
+    async def delete(self, key: str, *, feature) -> None:
+        await self._conn.execute(
+            "DELETE FROM artifacts WHERE feature_id = $1 AND key = $2",
+            feature.id,
+            key,
+        )
+
+
+def _pending_merge_resume_dag():
+    from iriai_build_v2.models.outputs import (
+        ImplementationDAG,
+        ImplementationTask,
+    )
+
+    dag = ImplementationDAG(
+        tasks=[
+            ImplementationTask(
+                id="TASK-1", name="Task one", description="do task one",
+                files=["app/feature.py"],
+            )
+        ],
+        execution_order=[["TASK-1"]],
+        complete=True,
+    )
+    dag_sha = __import__("hashlib").sha256(
+        dag.model_dump_json().encode("utf-8")
+    ).hexdigest()
+    return dag, dag_sha
+
+
+async def _seed_pending_merge_markers(runner, feature, *, notes: str) -> None:
+    """The marker pair the live `if pending_merge_queue:` block persists."""
+    await runner.artifacts.put(
+        "dag-task:TASK-1",
+        impl.ImplementationResult(
+            task_id="TASK-1", summary="implemented task one",
+            status="completed", notes=notes,
+        ).model_dump_json(),
+        feature=feature,
+    )
+    await runner.artifacts.put(
+        "dag-task-pending-merge:TASK-1", notes, feature=feature,
+    )
+
+
+async def _noop_async(*args, **kwargs):  # noqa: ANN002, ANN003
+    del args, kwargs
+    return None
+
+
+@pytest.mark.asyncio
+async def test_implement_dag_resume_with_pending_merge_rows_drains_and_seals(
+    mq_conn, tmp_path: Path, monkeypatch
+) -> None:
+    """Resume with pending-merge rows drains the queue and seals the group.
+
+    A wave's lanes sit `queued` (enqueued, never drained), the per-task
+    `dag-task-pending-merge:*` markers and `dag-task:*` results survive, and NO
+    `dag-group:*` checkpoint exists. The resume MUST route those lanes through
+    the idempotent drain + checkpoint — and it must do so BEFORE the
+    workspace-authority pre-dispatch guard can park the run (the guard protects
+    NEW dispatch; a completed wave needs draining, not dispatch). The guard is
+    patched to a hard test failure so any pre-seal call proves the regression.
+    """
+    feature_id = "feat-wpm-resume-drains-seals"
+    await _insert_feature(mq_conn, feature_id)
+    base, repo, base_commit = _build_feature_workspace(tmp_path, feature_id)
+    patch = _diff_for_appended_line(repo, "pending merge resume line\n")
+    dag, dag_sha = _pending_merge_resume_dag()
+
+    runner = _workspace_runner(mq_conn, base)
+    runner.artifacts = _DeletablePgArtifacts(mq_conn)
+    feature = _feature(feature_id)
+
+    lane = await _enqueue_drainable_lane_for_dag(
+        mq_conn, feature_id, task_id="TASK-1", repo_id="app",
+        repo_path=repo, base_commit=base_commit, patch_text=patch,
+        dag_sha256=dag_sha, group_idx=0,
+    )
+    await _seed_pending_merge_markers(
+        runner, feature, notes="canonical_mutation=pending_durable_merge_queue",
+    )
+
+    async def _guard_must_not_run(*args, **kwargs):  # noqa: ANN002, ANN003
+        raise AssertionError(
+            "the pending-merge re-drive must run BEFORE the workspace-"
+            "authority pre-dispatch guard — the guard ran first"
+        )
+
+    monkeypatch.setattr(impl, "_ensure_task_worktrees", _noop_async)
+    monkeypatch.setattr(impl, "enqueue_public_exhibit_refresh", _noop_async)
+    monkeypatch.setattr(
+        impl,
+        "_run_workspace_authority_pre_dispatch_adapter",
+        _guard_must_not_run,
+    )
+    runner.run = _no_dispatch  # any task dispatch is a hard failure
+
+    outcome = await impl._implement_dag(runner, feature, dag)
+
+    assert outcome.terminal_state == "complete", outcome.failure
+    assert outcome.failure == ""
+    # The lane was drained + the group checkpoint sealed.
+    item = await MergeQueueStore(mq_conn).get(lane)
+    assert item is not None and item.status == "done"
+    body = json.loads(await runner.artifacts.get("dag-group:0", feature=feature))
+    assert [r["task_id"] for r in body["results"]] == ["TASK-1"]
+    # The now-stale pending markers were swept so a later resume cannot
+    # false-block on them.
+    assert not await runner.artifacts.get(
+        "dag-task-pending-merge:TASK-1", feature=feature,
+    )
+
+
+@pytest.mark.asyncio
+async def test_implement_dag_resume_parks_loudly_naming_stranded_pending_merge_tasks(
+    mq_conn, tmp_path: Path, monkeypatch
+) -> None:
+    """A pre-dispatch park while pending-merge rows are stranded NAMES them.
+
+    The incident shape: every lane of the wave terminally `failed`
+    (`checkpoint_contradiction` — the canonical repo is not clean at baseline),
+    so the idempotent re-drive cannot complete, and the workspace-authority
+    pre-dispatch guard then blocks (`workspace_dirty`). The resulting park must
+    NOT look like an unrelated workspace blocker: it must name the stranded
+    pending-merge task set so the phase is never silently concluded/parked over
+    undrained lanes.
+    """
+    feature_id = "feat-wpm-resume-loud-park"
+    await _insert_feature(mq_conn, feature_id)
+    base, repo, base_commit = _build_feature_workspace(tmp_path, feature_id)
+    patch = _diff_for_appended_line(repo, "stranded wave line\n")
+    dag, dag_sha = _pending_merge_resume_dag()
+
+    runner = _workspace_runner(mq_conn, base)
+    feature = _feature(feature_id)
+
+    lane = await _enqueue_drainable_lane_for_dag(
+        mq_conn, feature_id, task_id="TASK-1", repo_id="app",
+        repo_path=repo, base_commit=base_commit, patch_text=patch,
+        dag_sha256=dag_sha, group_idx=0,
+    )
+    # Dirty the canonical repo (the incident's `spend-client/test-results/...`
+    # analogue) and drain: the lane fails `checkpoint_contradiction`.
+    (repo / "README.md").write_text(
+        (repo / "README.md").read_text() + "uncommitted dirt\n"
+    )
+    drained = await impl._drain_durable_merge_queue_for_feature(
+        runner, feature, dag_sha256=dag_sha
+    )
+    assert len(drained) == 1 and drained[0].succeeded is False
+    item = await MergeQueueStore(mq_conn).get(lane)
+    assert item is not None and item.status == "failed"
+
+    await _seed_pending_merge_markers(
+        runner, feature, notes="canonical_mutation=pending_durable_merge_queue",
+    )
+
+    async def _blocking_guard(*args, **kwargs):  # noqa: ANN002, ANN003
+        del args, kwargs
+        # The develop12 shape: typed deterministic workspace_dirty block.
+        return impl.WorkspaceAuthorityCompatibilityOutcome(approved=False)
+
+    monkeypatch.setattr(impl, "_ensure_task_worktrees", _noop_async)
+    monkeypatch.setattr(
+        impl,
+        "_run_workspace_authority_pre_dispatch_adapter",
+        _blocking_guard,
+    )
+    runner.run = _no_dispatch
+
+    outcome = await impl._implement_dag(runner, feature, dag)
+
+    assert outcome.terminal_state == "workflow_blocked", outcome.terminal_state
+    # The park is LOUD about the stranded pending-merge set — never a bare
+    # workspace blocker while undrained markers exist for an unsealed group.
+    assert "STRANDED PENDING-MERGE" in outcome.failure, outcome.failure
+    assert "TASK-1" in outcome.failure
+    # Nothing was sealed and the marker survives for the next resume.
+    assert await _dag_group_projection(mq_conn, feature_id, 0) is None
+    assert await runner.artifacts.get(
+        "dag-task-pending-merge:TASK-1", feature=feature,
+    )
+
+
+@pytest.mark.asyncio
+async def test_failed_pending_merge_lane_probe_maps_retry_chain_heads(
+    mq_conn, tmp_path: Path
+) -> None:
+    """The (W-PM) probe returns retry-chain HEADS and excludes commit_hygiene.
+
+    - the newest unreplaced `failed` lane per task is the retry source (a lane
+      that already has a non-cancelled replacement is NOT a valid source —
+      `_validate_retry_source` refuses it);
+    - `failed` lanes whose failure class is `commit_hygiene` are excluded
+      (that class has its own bounded re-dispatch recovery seam);
+    - `laned_task_ids` covers every task with ANY non-cancelled lane;
+    - `probe_ok` is True on a successful read (the re-route requires it before
+      it may infer "never enqueued").
+    """
+    feature_id = "feat-wpm-lane-probe"
+    await _insert_feature(mq_conn, feature_id)
+    base, repo, base_commit = _build_feature_workspace(tmp_path, feature_id)
+    patch = _diff_for_appended_line(repo, "probe line\n")
+    runner = _workspace_runner(mq_conn, base)
+    feature = _feature(feature_id)
+
+    contract_t1 = await _insert_contract(
+        mq_conn, feature_id, "TASK-1",
+        allowed_paths=[
+            {"repo_id": "app", "path": "README.md", "match_kind": "file"}
+        ],
+    )
+    lane_a = await _enqueue_drainable_lane(
+        mq_conn, feature_id, task_id="TASK-1", repo_id="app",
+        repo_path=repo, base_commit=base_commit, patch_text=patch,
+        contract=contract_t1,
+    )
+    lane_hygiene = await _enqueue_drainable_lane(
+        mq_conn, feature_id, task_id="TASK-2", repo_id="app",
+        repo_path=repo, base_commit=base_commit, patch_text=patch,
+    )
+    # Dirty the repo so BOTH lanes fail at the drain.
+    (repo / "README.md").write_text(
+        (repo / "README.md").read_text() + "probe dirt\n"
+    )
+    drained = await impl._drain_durable_merge_queue_for_feature(
+        runner, feature, dag_sha256=_DAG
+    )
+    assert len(drained) == 2 and all(not r.succeeded for r in drained)
+    # Reclass TASK-2's failure as commit_hygiene (the worker records
+    # `payload.last_error = "{failure_class}: {detail}"`).
+    await mq_conn.execute(
+        "UPDATE merge_queue_items SET payload = jsonb_set(payload, "
+        "'{last_error}', '\"commit_hygiene: hook said no\"') WHERE id = $1",
+        lane_hygiene,
+    )
+    # TASK-1 grew a failed RETRY lane replacing lane A — the chain head.
+    lane_b = await _enqueue_drainable_lane(
+        mq_conn, feature_id, task_id="TASK-1", repo_id="app",
+        repo_path=repo, base_commit=base_commit, patch_text=patch,
+        retry_of=lane_a, head_commit="fresh-head-1", contract=contract_t1,
+    )
+    drained_again = await impl._drain_durable_merge_queue_for_feature(
+        runner, feature, dag_sha256=_DAG
+    )
+    assert len(drained_again) == 1 and drained_again[0].succeeded is False
+
+    probe = await impl._failed_pending_merge_lane_probe_for_group(
+        runner, feature, dag_sha256=_DAG, group_idx=_GROUP,
+    )
+    assert probe.probe_ok is True
+    # Chain head: lane B (newest, unreplaced); lane A is replaced — excluded.
+    assert probe.retry_source_by_task == {"TASK-1": lane_b}
+    assert probe.laned_task_ids == {"TASK-1", "TASK-2"}
+
+    # Fail-closed: with no usable store the probe must NOT report ok.
+    bare_runner = SimpleNamespace(artifacts=runner.artifacts, services={})
+    empty = await impl._failed_pending_merge_lane_probe_for_group(
+        bare_runner, feature, dag_sha256=_DAG, group_idx=_GROUP,
+    )
+    assert empty.probe_ok is False
+    assert empty.retry_source_by_task == {}
+    assert empty.laned_task_ids == set()
+
+
+@pytest.mark.asyncio
+async def test_implement_dag_resume_reroutes_failed_pending_merge_lane_as_retry(
+    mq_conn, tmp_path: Path, monkeypatch
+) -> None:
+    """A terminally-failed lane is re-routed through the LIVE enqueue as a retry.
+
+    The incident's dead-end: the wave's lanes terminally `failed`
+    (non-commit_hygiene), the re-drive drains nothing (`claim` cannot re-take
+    `failed` lanes), and pre-fix the per-task pending-marker branch
+    hard-blocked — the captured patches could NEVER re-reach the merge queue.
+    Post-fix the scan routes the completed `dag-task:*` result (with its patch
+    evidence ids) into `pending_merge_queue_resume_results` and the LIVE
+    enqueue receives it with `retry_source_by_task` mapping the task to the
+    newest failed lane — exactly how a commit_hygiene recovery re-enqueues.
+    """
+    feature_id = "feat-wpm-resume-reroute"
+    await _insert_feature(mq_conn, feature_id)
+    base, repo, base_commit = _build_feature_workspace(tmp_path, feature_id)
+    patch = _diff_for_appended_line(repo, "reroute line\n")
+    dag, dag_sha = _pending_merge_resume_dag()
+
+    runner = _workspace_runner(mq_conn, base)
+    feature = _feature(feature_id)
+
+    lane = await _enqueue_drainable_lane_for_dag(
+        mq_conn, feature_id, task_id="TASK-1", repo_id="app",
+        repo_path=repo, base_commit=base_commit, patch_text=patch,
+        dag_sha256=dag_sha, group_idx=0,
+    )
+    # Fail the lane at the drain (dirty baseline), then CLEAN the repo — the
+    # operator fixed the workspace; the resume must now re-route the patch.
+    original = (repo / "README.md").read_text()
+    (repo / "README.md").write_text(original + "transient dirt\n")
+    drained = await impl._drain_durable_merge_queue_for_feature(
+        runner, feature, dag_sha256=dag_sha
+    )
+    assert len(drained) == 1 and drained[0].succeeded is False
+    (repo / "README.md").write_text(original)
+
+    await _seed_pending_merge_markers(
+        runner, feature,
+        notes=(
+            "dispatcher_attempt_id=1; patch_summary_ids=999\n"
+            "canonical_mutation=pending_durable_merge_queue"
+        ),
+    )
+
+    captured: dict = {}
+
+    async def _capture_enqueue(
+        runner_, feature_, pending_results, **kwargs
+    ):  # noqa: ANN001, ANN002, ANN003
+        del runner_, feature_
+        captured["task_ids"] = [r.task_id for r in pending_results]
+        captured["retry_source_by_task"] = kwargs.get("retry_source_by_task")
+        raise impl._MergeQueueEnqueueError("captured by test")
+
+    async def _approving_guard(*args, **kwargs):  # noqa: ANN002, ANN003
+        del args, kwargs
+        return impl.WorkspaceAuthorityCompatibilityOutcome()
+
+    async def _fake_compile_contracts(*args, **kwargs):  # noqa: ANN002, ANN003
+        del args, kwargs
+        return impl.TaskContractCompileOutcome()
+
+    monkeypatch.setattr(impl, "_ensure_task_worktrees", _noop_async)
+    monkeypatch.setattr(
+        impl,
+        "_run_workspace_authority_pre_dispatch_adapter",
+        _approving_guard,
+    )
+    monkeypatch.setattr(
+        impl, "_compile_task_contracts_for_group", _fake_compile_contracts,
+    )
+    monkeypatch.setattr(
+        impl, "_enqueue_durable_merge_queue_for_results", _capture_enqueue,
+    )
+    runner.run = _no_dispatch  # the completed task must NOT be re-dispatched
+
+    outcome = await impl._implement_dag(runner, feature, dag)
+
+    # The stranded task reached the LIVE enqueue as a retry replacement of the
+    # newest failed lane — never re-dispatched, never silently dropped.
+    assert captured.get("task_ids") == ["TASK-1"], outcome.failure
+    assert captured.get("retry_source_by_task") == {"TASK-1": lane}
+    # The (test-injected) enqueue failure stays a LOUD typed park.
+    assert outcome.terminal_state == "workflow_blocked"
+    assert "Durable merge queue enqueue failed" in outcome.failure
