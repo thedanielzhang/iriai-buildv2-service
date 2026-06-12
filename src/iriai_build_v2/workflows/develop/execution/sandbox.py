@@ -793,6 +793,26 @@ class SandboxRunner:
         if existing is not None:
             return existing
 
+        # W-U: fail loud BEFORE provisioning when the durable persist path
+        # would reject the spec anyway. `_persist_allocated_lease` enforces
+        # positive base snapshot ids only after the (expensive) clone +
+        # permission sweep; surfacing the identical deterministic blocker
+        # here keeps the requirement unchanged while preventing a doomed
+        # multi-minute provision whose failure can be masked by a dispatcher
+        # attempt timeout (observed: TimeoutError on attempt-0 hid the
+        # missing-snapshot-id blocker until the retry).
+        if self._durable_lease_persist_enabled():
+            missing_snapshot_ids = self._missing_durable_snapshot_repo_ids(spec)
+            if missing_snapshot_ids:
+                task_ids = ",".join(str(task_id) for task_id in spec.task_ids)
+                raise SandboxAllocationError(
+                    "sandbox repo bindings require durable workspace snapshot ids "
+                    f"for repos: {', '.join(missing_snapshot_ids)} "
+                    "(pre-provision check: refusing to clone; "
+                    f"feature_id={spec.feature_id} group_idx={spec.group_idx} "
+                    f"mode={spec.mode} task_ids={task_ids})"
+                )
+
         feature_slug = _slugify(spec.feature_id)
         sandbox_id = self._sandbox_id(spec)
         sandbox_root = self._sandbox_root(spec)
@@ -1526,6 +1546,32 @@ class SandboxRunner:
         if self.owner:
             return owner == self.owner
         return True
+
+    def _durable_lease_persist_enabled(self) -> bool:
+        """True iff `_persist_allocated_lease` will take the durable
+        `allocate_sandbox_lease` path that enforces positive base snapshot
+        ids (W-U pre-provision mirror of that gate — keep in sync)."""
+        return (
+            self.store is not None
+            and getattr(self.store, "allocate_sandbox_lease", None) is not None
+            and StoredSandboxLease is not None
+            and StoredSandboxRepoBinding is not None
+        )
+
+    @staticmethod
+    def _missing_durable_snapshot_repo_ids(spec: SandboxSpec) -> list[str]:
+        """Repo ids whose base snapshot id is absent or non-positive —
+        exactly the set `_persist_allocated_lease` fails loud on."""
+        return sorted(
+            str(repo_id)
+            for idx, repo_id in enumerate(spec.repo_ids)
+            if (
+                int(spec.base_snapshot_ids[idx])
+                if idx < len(spec.base_snapshot_ids)
+                else 0
+            )
+            <= 0
+        )
 
     async def _persist_allocated_lease(
         self,

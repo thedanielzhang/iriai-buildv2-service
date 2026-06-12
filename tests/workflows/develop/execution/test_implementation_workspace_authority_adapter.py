@@ -3134,6 +3134,97 @@ async def test_dirty_workspace_snapshot_blocks_dispatch(
 
 
 @pytest.mark.asyncio
+async def test_gate_shape_wave_without_path_targets_still_captures_durable_snapshot(
+    tmp_path: Path,
+) -> None:
+    """W-U: a wave made only of empty-write-set tasks (gate shape: no
+    file_scope, no files) produces zero authority path targets, so preflight
+    reports ``snapshot_required=False``. The adapter used to persist
+    ``snapshots: []`` — and the later per-task sandbox binding then failed
+    loud on the durable-snapshot requirement, a deterministic
+    SANDBOX_WORKFLOW_BLOCKER (live evidence: feature 5b280bb4 wave 2
+    TASK-RCAN-00-UPSTREAM-GATES). The adapter must capture + persist the
+    wave snapshot anyway."""
+    workspace_root, feature_root = _workspace(tmp_path)
+    _repo(feature_root, "app")
+    artifacts = _Artifacts()
+    store = _BridgeExecutionControlStore()
+    task = ImplementationTask(
+        id="TASK-GATE-00-UPSTREAM",
+        name="gate",
+        description="upstream gate checkpoint with no write-set",
+        repo_path="app",
+        file_scope=[],
+        files=[],
+    )
+
+    outcome = await _run_workspace_authority_pre_dispatch_adapter(
+        _runner(workspace_root, artifacts, execution_control_store=store),
+        _feature(),
+        2,
+        [task],
+        workspace_root=workspace_root,
+        feature_root=feature_root,
+        dag_sha256="dag-sha",
+    )
+
+    assert outcome.approved is True
+    assert outcome.snapshots, "gate-shape wave must still capture a workspace snapshot"
+    assert store.workspace_snapshots, "snapshot evidence must persist to the durable store"
+    snapshot_ids = [int(getattr(snapshot, "id", 0) or 0) for snapshot in outcome.snapshots]
+    assert all(snapshot_id > 0 for snapshot_id in snapshot_ids), snapshot_ids
+    snapshot_repo_ids = {
+        str(getattr(snapshot, "repo_id", "")) for snapshot in outcome.snapshots
+    }
+    assert snapshot_repo_ids, "snapshot must cover the registry repos"
+    artifact = json.loads(
+        artifacts.store["workspace-authority-snapshot:g2:initial-dispatch"]
+    )
+    assert artifact["snapshots"], "persisted snapshot artifact must not be empty"
+    # The sandbox binding contract: every repo the binding can resolve must
+    # see a durable (positive) snapshot id.
+    binder_visible = [
+        implementation_module._snapshot_id_for_repo(outcome.snapshots, repo_id)
+        for repo_id in snapshot_repo_ids
+    ]
+    assert all(snapshot_id > 0 for snapshot_id in binder_visible), binder_visible
+
+
+@pytest.mark.asyncio
+async def test_gate_shape_wave_dirty_workspace_blocks_dispatch(
+    tmp_path: Path,
+) -> None:
+    """W-U companion: once gate-shape waves snapshot, they inherit the same
+    dirty-workspace fail-loud semantics as path-targeted waves."""
+    workspace_root, feature_root = _workspace(tmp_path)
+    repo = _repo(feature_root, "app")
+    (repo / "src" / "main.py").write_text("value = 'dirty'\n", encoding="utf-8")
+    artifacts = _Artifacts()
+    task = ImplementationTask(
+        id="TASK-GATE-00-UPSTREAM",
+        name="gate",
+        description="upstream gate checkpoint with no write-set",
+        repo_path="app",
+        file_scope=[],
+        files=[],
+    )
+
+    outcome = await _run_workspace_authority_pre_dispatch_adapter(
+        _runner(workspace_root, artifacts),
+        _feature(),
+        2,
+        [task],
+        workspace_root=workspace_root,
+        feature_root=feature_root,
+        dag_sha256="dag-sha",
+    )
+
+    assert outcome.approved is False
+    assert outcome.routes
+    assert outcome.routes[0].failure_type == "dirty_snapshot_before_dispatch"
+
+
+@pytest.mark.asyncio
 async def test_unresolved_workspace_ambiguity_blocks_with_typed_evidence(
     tmp_path: Path,
 ) -> None:

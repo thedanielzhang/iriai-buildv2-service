@@ -4596,7 +4596,21 @@ async def _run_workspace_authority_pre_dispatch_adapter(
         authority.route_preflight(preflight)
     ) or [])
     snapshots: list[Any] = []
-    if bool(getattr(preflight, "snapshot_required", False)):
+    snapshot_required = bool(getattr(preflight, "snapshot_required", False))
+    if not snapshot_required and group_tasks and not targets:
+        # W-U (gate-task snapshot binding): waves made only of empty-write-set
+        # tasks (e.g. upstream-gate checkpoints with no file_scope/files)
+        # produce ZERO path targets, so authority preflight reports
+        # `snapshot_required=False` and this adapter used to persist
+        # `snapshots: []`. Every dispatched task still sandbox-binds, and
+        # `sandbox._persist_allocated_lease` fails loud without a durable
+        # workspace snapshot id for the bound repo — a deterministic
+        # `workflow_blocked`. Capture the wave snapshot anyway: with no
+        # targets `WorkspaceAuthority._snapshot_repos` falls back to every
+        # registry repo, so the gate task's resolved repo is always covered.
+        # The durable-snapshot requirement itself is unchanged.
+        snapshot_required = True
+    if snapshot_required:
         snapshots = list(await _maybe_await_workspace_authority(
             authority.snapshot(
                 feature_id,

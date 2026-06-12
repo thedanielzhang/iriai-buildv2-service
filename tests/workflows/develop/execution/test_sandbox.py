@@ -492,6 +492,54 @@ def test_durable_store_bridge_persists_lease_id_and_runtime_binding(
     assert manifest["sandbox_lease_id"] == 321
 
 
+def test_durable_store_missing_snapshot_ids_fail_loud_before_provisioning(
+    tmp_path: Path,
+) -> None:
+    """W-U: with the durable store path active, a spec lacking positive base
+    snapshot ids must be rejected BEFORE any repo clone/provisioning — the
+    same deterministic blocker `_persist_allocated_lease` raises, surfaced
+    early so it can never be masked by a dispatcher attempt timeout during
+    the (expensive) provision (live evidence: feature 5b280bb4 wave 2
+    TASK-RCAN-00-UPSTREAM-GATES attempt-0 TimeoutError)."""
+    source = tmp_path / "canonical" / "app"
+    base = init_repo(source)
+    store = DurableFakeStore()
+    runner = runner_for(tmp_path, source, store=store)
+    spec = spec_for(base)
+    spec.base_snapshot_ids = [0]
+
+    with pytest.raises(SandboxAllocationError) as exc_info:
+        run(runner.allocate(spec))
+
+    message = str(exc_info.value)
+    assert "require durable workspace snapshot ids" in message
+    assert "for repos: app" in message
+    assert "pre-provision check" in message
+    assert store.allocated_leases == []
+    # No sandbox directory may exist — the failure happened before cloning.
+    assert not list((tmp_path / ".iriai").glob("features/*/sandboxes/g4/attempt-2"))
+
+
+def test_legacy_store_without_durable_path_skips_snapshot_id_pre_check(
+    tmp_path: Path,
+) -> None:
+    """The pre-provision check mirrors `_persist_allocated_lease` gating
+    exactly: stores without `allocate_sandbox_lease` never required snapshot
+    ids, and must keep allocating (no behavioral change for the legacy
+    bridge path)."""
+    source = tmp_path / "canonical" / "app"
+    base = init_repo(source)
+    store = FakeStore()
+    runner = runner_for(tmp_path, source, store=store)
+    spec = spec_for(base)
+    spec.base_snapshot_ids = [0]
+
+    lease = run(runner.allocate(spec))
+
+    assert lease.sandbox_id
+    assert store.leases, "legacy record_sandbox_lease path must still persist"
+
+
 def test_durable_store_allocation_failure_records_diagnostic_context(
     tmp_path: Path,
 ) -> None:
