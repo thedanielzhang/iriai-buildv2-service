@@ -160,5 +160,18 @@ MCP_SERVERS = {
 
 
 def mcp_servers_for(*names: str) -> dict:
-    """Return a subset of MCP_SERVERS for the given names."""
-    return {n: MCP_SERVERS[n] for n in names if n in MCP_SERVERS}
+    """Return a subset of MCP_SERVERS for the given names.
+
+    IRIAI_MCP_DISABLE (comma-separated server names) drops servers globally —
+    for providers that are down/quota-dead, where a hung handshake stalls
+    every agent that lists them (e.g. context7 at zero quota wedged the
+    wave-13 implementer pre-stream for 50 minutes).
+    """
+    disabled = {
+        n.strip()
+        for n in os.environ.get("IRIAI_MCP_DISABLE", "").split(",")
+        if n.strip()
+    }
+    return {
+        n: MCP_SERVERS[n] for n in names if n in MCP_SERVERS and n not in disabled
+    }
