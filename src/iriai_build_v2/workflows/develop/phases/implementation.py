@@ -26570,6 +26570,30 @@ def _checkpoint_no_dirty_proof(
     return proof
 
 
+def _checkpoint_results_all_operator_override(checkpoint: dict[str, Any]) -> bool:
+    """True when EVERY checkpoint result is a W-OG operator-override completion.
+
+    Empty-write-set groups completed by operator fiat (dag-task-operator-override
+    consumption) have NO write product: their authorized-repo set is empty, so
+    repo-heads/commit/merge-lane proofs structurally cannot exist
+    (`_current_feature_repo_heads` returns "" and `_dag_group_checkpoint_is_fresh`
+    fails closed on it). Such checkpoints are instead validated against the
+    durable per-task override rows — see the acceptance branch in
+    `_dag_group_checkpoint_is_fresh`.
+    """
+    results = checkpoint.get("results")
+    if not isinstance(results, list) or not results:
+        return False
+    for raw in results:
+        try:
+            result = ImplementationResult.model_validate(raw)
+        except Exception:
+            return False
+        if result.status != "completed" or not result_is_operator_override(result):
+            return False
+    return True
+
+
 def _checkpoint_results_match_tasks(
     checkpoint: dict[str, Any],
     group_task_ids: list[str],
@@ -27210,6 +27234,31 @@ async def _dag_group_checkpoint_is_fresh(
         return False
     if not _checkpoint_results_match_tasks(checkpoint, group_task_ids):
         return False
+    # Operator-overridden group (W-OG): every result is a fiat completion and the
+    # group has no write product — repo-heads/commit/merge-lane proofs cannot
+    # exist (empty authorized-repo set yields empty heads, which fails closed
+    # below). Accept the checkpoint on the override rows' OWN durable evidence:
+    # each task's newest dag-task row must be the terminal override completion.
+    if _checkpoint_results_all_operator_override(checkpoint):
+        for tid in group_task_ids:
+            stored_raw = await runner.artifacts.get(
+                f"dag-task:{tid}", feature=feature,
+            )
+            if not stored_raw:
+                return False
+            try:
+                stored = ImplementationResult.model_validate_json(stored_raw)
+            except Exception:
+                return False
+            if stored.status != "completed" or not result_is_operator_override(stored):
+                return False
+        logger.warning(
+            "Group %d checkpoint accepted via OPERATOR-OVERRIDE evidence: every "
+            "task is fiat-completed (durable dag-task override rows); no write "
+            "product to attest, repo-head/merge proofs not required",
+            group_idx,
+        )
+        return True
     commit_hash = str(checkpoint.get("commit_hash") or "")
     if not commit_hash:
         return False
