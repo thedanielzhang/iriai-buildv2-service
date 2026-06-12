@@ -319,10 +319,256 @@ async def _run_resume(
         await teardown(env)
 
 
+async def _override_task_core(
+    *,
+    artifacts: object,
+    feature_store: object,
+    feature_id: str,
+    task_id: str,
+    target_status: str,
+    reason: str,
+    authorized_by: str,
+    echo: object = click.echo,
+) -> dict:
+    """Operator gate-override (W-OG): validate + write the durable
+    ``dag-task-operator-override:{task_id}`` marker via the store layer.
+
+    Pure store-level core (dependency-injected ``artifacts`` /
+    ``feature_store`` so tests run against fakes). Rails, all fail-fast:
+
+    1. non-empty ``--reason`` (an override is an audited action);
+    2. the feature must exist;
+    3. the task must be known to the ACTIVE DAG (artifact key ``"dag"`` — the
+       same key the engine reads, ``phases/implementation.py``);
+    4. refuse when the task already has a terminal (completed) ``dag-task:*``
+       row — there is nothing to override;
+    5. idempotent: re-running with the same args is a no-op (no second row).
+
+    Returns a summary dict describing what was (or was not) written.
+    """
+    from ...models.outputs import ImplementationDAG, ImplementationResult
+    from ...workflows.develop.execution.operator_override import (
+        new_operator_override,
+        operator_override_marker_key,
+        overrides_equivalent,
+        parse_operator_override,
+    )
+
+    task_id = str(task_id or "").strip()
+    if not task_id:
+        raise click.ClickException("--task-id must be non-empty.")
+    if not str(reason or "").strip():
+        raise click.ClickException(
+            "--reason must be non-empty: an operator override is an audited "
+            "action and requires a recorded justification."
+        )
+
+    feature = await feature_store.get_feature(feature_id)
+    if feature is None:
+        raise click.ClickException(
+            f"Feature '{feature_id}' not found in the workflow database."
+        )
+
+    # Rail: the task must be known to the ACTIVE DAG.
+    dag_raw = await artifacts.get("dag", feature=feature)
+    if not dag_raw:
+        raise click.ClickException(
+            f"Feature '{feature_id}' has no active implementation DAG "
+            "(artifact key 'dag'); cannot validate the task id — refusing to "
+            "record an override for an unknown task."
+        )
+    try:
+        dag = ImplementationDAG.model_validate_json(str(dag_raw))
+    except Exception as exc:  # noqa: BLE001 - loud, typed CLI failure.
+        raise click.ClickException(
+            f"Feature '{feature_id}' active DAG artifact could not be parsed "
+            f"({exc}); refusing to record an override without validating the "
+            "task id."
+        ) from exc
+    known_task_ids = {t.id for t in dag.tasks}
+    if task_id not in known_task_ids:
+        sample = ", ".join(sorted(known_task_ids)[:8])
+        raise click.ClickException(
+            f"Task '{task_id}' is unknown to the active DAG for feature "
+            f"'{feature_id}' ({len(known_task_ids)} known tasks; e.g. "
+            f"{sample}). Refusing to record the override."
+        )
+
+    # Rail: refuse when the task already has a TERMINAL dag-task row.
+    existing_raw = await artifacts.get(f"dag-task:{task_id}", feature=feature)
+    existing_status = ""
+    if existing_raw:
+        try:
+            existing_result = ImplementationResult.model_validate_json(
+                str(existing_raw)
+            )
+            existing_status = existing_result.status
+        except Exception:  # noqa: BLE001 - unparseable row is not terminal.
+            existing_status = ""
+        if existing_status == "completed":
+            raise click.ClickException(
+                f"Task '{task_id}' already has a terminal dag-task row "
+                "(status=completed); there is nothing to override. Refusing."
+            )
+
+    override = new_operator_override(
+        task_id=task_id,
+        reason=reason,
+        authorized_by=authorized_by,
+        feature_id=feature_id,
+        target_status=target_status,
+    )
+    marker_key = operator_override_marker_key(task_id)
+
+    # Rail: idempotency. Same intent already recorded → no second row.
+    prior_raw = await artifacts.get(marker_key, feature=feature)
+    if prior_raw:
+        try:
+            prior = parse_operator_override(prior_raw)
+        except ValueError:
+            prior = None
+        if prior is not None and overrides_equivalent(prior, override):
+            echo(
+                f"OPERATOR-OVERRIDE already recorded for task '{task_id}' "
+                f"(key {marker_key}) with the same status/reason/authorizer — "
+                "idempotent no-op, nothing written."
+            )
+            return {
+                "written": False,
+                "idempotent": True,
+                "marker_key": marker_key,
+                "override": prior.model_dump(),
+            }
+        echo(
+            f"WARNING: task '{task_id}' already has an override marker with "
+            "DIFFERENT content; the new marker row will supersede it (the "
+            "engine reads the newest row)."
+        )
+
+    await artifacts.put(marker_key, override.model_dump_json(), feature=feature)
+    record = None
+    get_record = getattr(artifacts, "get_record", None)
+    if callable(get_record):
+        record = await get_record(marker_key, feature=feature)
+
+    echo("=" * 60)
+    echo("  OPERATOR-OVERRIDE MARKER RECORDED")
+    echo(f"  feature_id    : {feature_id}")
+    echo(f"  task_id       : {task_id}")
+    echo(f"  marker key    : {marker_key}")
+    if record is not None:
+        echo(f"  artifact row  : id={record.get('id')} created_at={record.get('created_at')}")
+    echo(f"  target status : {override.target_status}")
+    echo(f"  authorized_by : {override.authorized_by}")
+    echo(f"  recorded_at   : {override.created_at}")
+    if existing_status:
+        echo(
+            f"  note          : supersedes non-terminal dag-task row "
+            f"(status={existing_status})"
+        )
+    echo(f"  reason        : {override.reason}")
+    echo(
+        "  The implementation dispatch loop will consume this marker on the "
+        "next boot/resume:"
+    )
+    echo(
+        "  it persists the terminal dag-task row with override provenance "
+        "and SKIPS executing the task."
+    )
+    echo("=" * 60)
+    return {
+        "written": True,
+        "idempotent": False,
+        "marker_key": marker_key,
+        "artifact_row_id": (record or {}).get("id"),
+        "override": override.model_dump(),
+    }
+
+
+async def _run_override_task(
+    feature_id: str,
+    task_id: str,
+    target_status: str,
+    reason: str,
+    authorized_by: str,
+) -> None:
+    """Wire the real Postgres-backed stores (the same store layer
+    ``_bootstrap.bootstrap`` builds) around ``_override_task_core``."""
+    from ...config import DATABASE_URL
+    from ...db import create_pool, ensure_schema
+    from ...storage import PostgresArtifactStore, PostgresFeatureStore
+
+    pool = await create_pool(DATABASE_URL)
+    try:
+        await ensure_schema(pool)
+        artifacts = PostgresArtifactStore(pool)
+        feature_store = PostgresFeatureStore(pool)
+        await _override_task_core(
+            artifacts=artifacts,
+            feature_store=feature_store,
+            feature_id=feature_id,
+            task_id=task_id,
+            target_status=target_status,
+            reason=reason,
+            authorized_by=authorized_by,
+        )
+    finally:
+        await pool.close()
+
+
 @click.group()
 def cli() -> None:
     """iriai-build-v2 — Agent orchestration build system."""
     pass
+
+
+@cli.command("override-task")
+@click.option("--feature-id", required=True, help="Feature ID whose DAG task is being overridden.")
+@click.option("--task-id", required=True, help="DAG task ID to override (must exist in the active DAG).")
+@click.option(
+    "--status",
+    "target_status",
+    type=click.Choice(["completed"]),
+    default="completed",
+    show_default=True,
+    help="Terminal status the override grants (only 'completed' is supported).",
+)
+@click.option(
+    "--reason",
+    required=True,
+    help="Non-empty audited justification (recorded verbatim in the marker).",
+)
+@click.option(
+    "--authorized-by",
+    default="operator",
+    show_default=True,
+    help="Who authorized the override (audit provenance).",
+)
+def override_task(
+    feature_id: str,
+    task_id: str,
+    target_status: str,
+    reason: str,
+    authorized_by: str,
+) -> None:
+    """Record an audited OPERATOR OVERRIDE for a DAG task.
+
+    Writes a durable ``dag-task-operator-override:{task_id}`` marker via the
+    store layer. The implementation dispatch loop consumes the marker before
+    dispatching the task: it persists the terminal ``dag-task`` row with
+    operator provenance and skips execution (single-shot; composes with group
+    sealing). Refuses unknown tasks, already-terminal tasks, and empty
+    reasons; re-running with the same arguments is an idempotent no-op.
+    """
+    asyncio.run(
+        _run_override_task(
+            feature_id,
+            task_id,
+            target_status,
+            reason,
+            authorized_by,
+        )
+    )
 
 
 @cli.command()
