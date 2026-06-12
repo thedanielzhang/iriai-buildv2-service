@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio as _asyncio
 import collections
+import contextlib
 import dataclasses
 import hashlib
 import itertools
@@ -13,7 +14,9 @@ import shutil
 import stat
 import subprocess
 import tempfile
+import threading
 import time
+import weakref
 from collections.abc import Iterable, Mapping, Sequence
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
@@ -10894,6 +10897,107 @@ def _optional_int(value: Any) -> int | None:
         return None
 
 
+# ── W-O: parallel per-task dispatch prompt assembly ──────────────────────────
+#
+# Wave dispatch already gathers `_run_task` coroutines concurrently, but the
+# per-task prompt assembly inside `_ImplementationPromptBuilder
+# .build_prompt_context` is dominated by SYNCHRONOUS sections (sandbox prompt
+# side-file writes, the `.iriai-context` rglob + read_text + sha256 material,
+# large reference-material string assembly). Synchronous sections never yield
+# to the event loop, so across a wave the assemblies execute one-after-another
+# in wall clock — wave prompt startup = sum(per-task seconds), not max.
+# Structural mirror of the W-D provisioning gate
+# (execution/sandbox.py::_provision_concurrency_gate): offload the blocking
+# sections to worker threads (asyncio.to_thread) and bound them with an
+# optional per-loop semaphore.
+#
+# IRIAI_PROMPT_ASSEMBLY_CONCURRENCY:
+#   unset / blank / invalid / <= 0 → no extra bound (effective concurrency =
+#       the wave width, since each wave task issues exactly one assembly per
+#       attempt; this is the default)
+#   1   → serial assembly across the wave (today's wall-clock behaviour)
+#   N>1 → at most N concurrent assemblies
+#
+# Assembly is pure read+build with NO shared mutable state across sibling
+# tasks: artifact-store reads/writes go through the asyncpg pool (per-call
+# connection acquisition — never a shared connection) or a per-feature
+# in-memory dict in tests; the sandbox prompt side files live under the
+# task's OWN sandbox `.iriai-context/<task-segment>/` directory; and the one
+# persisted `dag-dispatch-prompt:*` artifact per attempt has a per-task,
+# per-digest key (concurrent inserts of distinct keys are safe). Outputs are
+# therefore byte-identical at any concurrency.
+_PROMPT_ASSEMBLY_CONCURRENCY_ENV = "IRIAI_PROMPT_ASSEMBLY_CONCURRENCY"
+
+_PROMPT_ASSEMBLY_SEMAPHORES_GUARD = threading.Lock()
+# Per-event-loop (asyncio primitives must not cross loops) and per-limit so a
+# mid-flight env change can't strand waiters on a differently-sized semaphore
+# (same shape as sandbox._PROVISION_SEMAPHORES).
+_PROMPT_ASSEMBLY_SEMAPHORES: "weakref.WeakKeyDictionary[Any, dict[int, _asyncio.Semaphore]]" = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _prompt_assembly_concurrency_limit() -> int | None:
+    raw = os.environ.get(_PROMPT_ASSEMBLY_CONCURRENCY_ENV)
+    if raw is None or not str(raw).strip():
+        return None
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+def _prompt_assembly_gate() -> Any:
+    """Async context manager bounding concurrent per-task prompt assemblies.
+
+    Returns a no-op context when ``IRIAI_PROMPT_ASSEMBLY_CONCURRENCY`` is
+    unset/invalid/non-positive (default: bounded only by the wave width).
+    Must be called from a running event loop."""
+    limit = _prompt_assembly_concurrency_limit()
+    if limit is None:
+        return contextlib.nullcontext()
+    loop = _asyncio.get_running_loop()
+    with _PROMPT_ASSEMBLY_SEMAPHORES_GUARD:
+        per_loop = _PROMPT_ASSEMBLY_SEMAPHORES.get(loop)
+        if per_loop is None:
+            per_loop = {}
+            _PROMPT_ASSEMBLY_SEMAPHORES[loop] = per_loop
+        semaphore = per_loop.get(limit)
+        if semaphore is None:
+            semaphore = _asyncio.Semaphore(limit)
+            per_loop[limit] = semaphore
+    return semaphore
+
+
+def _scan_prompt_context_dir_sha_material(
+    context_base: Path | None, task_id: str
+) -> tuple[list[str], list[str]]:
+    """Collect (context_paths, context_sha_material) for the task's prompt
+    context dir.
+
+    Moved VERBATIM out of ``build_prompt_context`` so the blocking
+    rglob/read_text/sha256 section can run on a worker thread; it only
+    touches the task's own ``.iriai-context/<segment>`` directory."""
+    context_paths: list[str] = []
+    context_sha_material: list[str] = []
+    if context_base is not None:
+        segment = _prompt_context_segment_for_task(task_id)
+        context_dir = context_base / ".iriai-context" / segment
+        if context_dir.exists() and context_dir.is_dir():
+            for path in sorted(context_dir.rglob("*")):
+                if path.is_file():
+                    rel = str(path.relative_to(context_base))
+                    context_paths.append(rel)
+                    try:
+                        context_sha_material.append(
+                            f"{rel}:{_sha256_text(path.read_text(encoding='utf-8'))}"
+                        )
+                    except OSError:
+                        context_sha_material.append(f"{rel}:unreadable")
+    return context_paths, context_sha_material
+
+
 class _ImplementationPromptBuilder:
     def __init__(
         self,
@@ -10917,6 +11021,19 @@ class _ImplementationPromptBuilder:
         self._log_label = log_label
 
     async def build_prompt_context(self, _request: Any, binding: Any | None = None) -> Any:
+        # W-O: bound the per-task assembly with the optional concurrency gate
+        # and run the blocking sections on worker threads (see the
+        # _prompt_assembly_gate block comment). Per-task error isolation is
+        # unchanged: an exception here propagates to THIS task's dispatcher
+        # `_build_prompt` try/except (typed failure
+        # runtime_context/context_materialization_failed) while siblings in
+        # the wave gather proceed; `async with` releases the gate on failure.
+        async with _prompt_assembly_gate():
+            return await self._build_prompt_context_assembled(_request, binding)
+
+    async def _build_prompt_context_assembled(
+        self, _request: Any, binding: Any | None = None
+    ) -> Any:
         context_base = None
         context_read_base = None
         if binding is not None:
@@ -10940,7 +11057,10 @@ class _ImplementationPromptBuilder:
                 or ""
             )
             context_read_base = Path(context_read_base_text) if context_read_base_text else context_base
-        prompt = _build_task_prompt_with_optional_sandbox_context(
+        # W-O: worker thread — sandbox prompt side-file writes + large string
+        # assembly are synchronous; off-loop they overlap across the wave.
+        prompt = await _asyncio.to_thread(
+            _build_task_prompt_with_optional_sandbox_context,
             self._task,
             repo_prefix=self._repo_prefix,
             task_contract=self._task_contract,
@@ -10960,22 +11080,12 @@ class _ImplementationPromptBuilder:
         prompt += await _task_amendments_section(
             self._runner, self._feature, self._task.id
         )
-        context_paths: list[str] = []
-        context_sha_material: list[str] = []
-        if context_base is not None:
-            segment = _prompt_context_segment_for_task(self._task.id)
-            context_dir = context_base / ".iriai-context" / segment
-            if context_dir.exists() and context_dir.is_dir():
-                for path in sorted(context_dir.rglob("*")):
-                    if path.is_file():
-                        rel = str(path.relative_to(context_base))
-                        context_paths.append(rel)
-                        try:
-                            context_sha_material.append(
-                                f"{rel}:{_sha256_text(path.read_text(encoding='utf-8'))}"
-                            )
-                        except OSError:
-                            context_sha_material.append(f"{rel}:unreadable")
+        # W-O: worker thread — the context-dir scan (rglob + read_text +
+        # sha256 per file) is the other blocking section; body moved verbatim
+        # to _scan_prompt_context_dir_sha_material.
+        context_paths, context_sha_material = await _asyncio.to_thread(
+            _scan_prompt_context_dir_sha_material, context_base, self._task.id
+        )
         prompt_sha = _sha256_text(prompt)
         context_sha = _sha256_text("\n".join(context_sha_material))
         prompt_ref = await _materialize_implementation_prompt_artifact(
