@@ -2135,12 +2135,15 @@ async def test_runner_claim_cap_claims_up_to_max_active_and_leaves_rest_queued(
     assert list(queued_dir.glob("*.json")) == []
 
 
-def test_runner_claim_cap_defaults_to_four(tmp_path: Path) -> None:
+def test_runner_claim_cap_defaults_to_eight(tmp_path: Path) -> None:
+    # 8 >= max remaining wave width + headroom (operator concurrency
+    # directive 2026-06-12 00:4x): the profile runner must never throttle
+    # below dispatched wave width.
     runtime = ClaudePoolRuntime(root=tmp_path, profiles=_profiles())
     del runtime
-    assert DEFAULT_RUNNER_MAX_ACTIVE == 4
+    assert DEFAULT_RUNNER_MAX_ACTIVE == 8
     runner = ClaudePoolRunner(profile="iriai-claude-1", root=tmp_path)
-    assert runner.max_active == 4
+    assert runner.max_active == 8
 
 
 # ---------------------------------------------------------------------------

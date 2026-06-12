@@ -148,7 +148,10 @@ DEFAULT_ACTIVE_JOB_SPREAD_PENALTY = float(
 # claims up to (max_active - currently_active) and leaves the rest queued.
 # Codex members keep their own existing in-process accounting untouched.
 DEFAULT_RUNNER_MAX_ACTIVE = int(
-    os.environ.get("IRIAI_POOL_RUNNER_MAX_ACTIVE", "4") or "4"
+    # 8 ≥ max remaining wave width (6, wave-8) + headroom: a profile runner
+    # must never be the throttle below dispatched wave width (operator
+    # concurrency directive 2026-06-12 00:4x). Env knob overrides per host.
+    os.environ.get("IRIAI_POOL_RUNNER_MAX_ACTIVE", "8") or "8"
 )
 # When NO pool member is available (e.g. every account hit its usage window at
 # once), wait up to this many seconds for a member to recover instead of
