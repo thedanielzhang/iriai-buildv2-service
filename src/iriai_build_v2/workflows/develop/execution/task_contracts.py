@@ -1993,6 +1993,29 @@ def _fail_cross_forbidden(
                 )
 
 
+def _tolerated_cross_read_write_pairs() -> set[tuple[str, str]]:
+    """Operator-attested (reader, writer) pairs allowed to co-wave.
+
+    A regroup overlay packed by write-set disjointness can legally co-wave a
+    reader and a writer of the same path that the original order serialized
+    (live: greedy-13 put TASK-HRDD-S2-04 [reads submittal_management.py] with
+    TASK-RCAN-01-BACKEND-SERVICES [writes it] in one wave; a mid-run re-pack is
+    structurally blocked by the overlay boundary validator). The reader's
+    sandbox sees the sealed wave baseline and the write sets stay disjoint, so
+    the residual risk — the reader integrating against pre-writer content — is
+    caught by the group verify/test gates at the seal. Env shape:
+    IRIAI_CONTRACT_TOLERATED_READ_WRITE_PAIRS="reader:writer[,reader:writer...]"
+    Default empty = behavior byte-identical to the unconditioned gate.
+    """
+    raw = os.environ.get("IRIAI_CONTRACT_TOLERATED_READ_WRITE_PAIRS", "")
+    pairs: set[tuple[str, str]] = set()
+    for item in raw.split(","):
+        reader_id, sep, writer_id = item.strip().partition(":")
+        if sep and reader_id and writer_id:
+            pairs.add((reader_id, writer_id))
+    return pairs
+
+
 def _fail_cross_read_write(
     reader: TaskDeliverableContract,
     writer: TaskDeliverableContract,
@@ -2005,6 +2028,17 @@ def _fail_cross_read_write(
             reader_wave = task_waves.get(reader.task_id, 0)
             writer_wave = task_waves.get(writer.task_id, 0)
             if writer.task_id in reader.dependency_task_ids and reader_wave > writer_wave:
+                continue
+            if (reader.task_id, writer.task_id) in _tolerated_cross_read_write_pairs():
+                logger.warning(
+                    "contract_scope_conflict TOLERATED by operator attestation "
+                    "(IRIAI_CONTRACT_TOLERATED_READ_WRITE_PAIRS): %s reads %s "
+                    "while %s writes it in the same group wave — reader sees the "
+                    "sealed wave baseline; integration verified at the group seal",
+                    reader.task_id,
+                    read_only.path,
+                    writer.task_id,
+                )
                 continue
             _raise_compile(
                 "contract_scope_conflict",
