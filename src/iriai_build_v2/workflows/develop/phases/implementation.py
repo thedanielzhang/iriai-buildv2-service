@@ -4596,7 +4596,34 @@ async def _run_workspace_authority_pre_dispatch_adapter(
         authority.route_preflight(preflight)
     ) or [])
     snapshots: list[Any] = []
-    if bool(getattr(preflight, "snapshot_required", False)):
+    snapshot_required = bool(getattr(preflight, "snapshot_required", False))
+    if not snapshot_required and group_tasks:
+        # W-RC: an empty-write-set group (e.g. a gates-check task forced into
+        # a singleton wave by dag_regroup_missing_write_set_coverage step-10)
+        # yields ZERO path targets, so preflight reports
+        # snapshot_required=False and no workspace snapshot would be captured
+        # or persisted for the group. Every implementer dispatch is
+        # sandbox_required/write_producing, and durable sandbox allocation
+        # terminally refuses repo bindings without positive snapshot ids
+        # (sandbox.py: "sandbox repo bindings require durable workspace
+        # snapshot ids"), so such a wave could never dispatch. Default to a
+        # read-baseline snapshot of the group's registry repos — the
+        # WorkspaceAuthority snapshot path falls back to every registry repo
+        # when there are no targets — mirroring how
+        # _contract_runtime_roots(contract=None) still grants the repo
+        # read-binding for contract-less tasks.
+        snapshot_required = True
+        logger.info(
+            "workspace authority: group %s (%s) produced no path targets "
+            "(empty write-set wave; tasks: %s) — defaulting to read-baseline "
+            "workspace snapshot capture across %d registry repo(s) so the "
+            "sandbox-required dispatch carries durable snapshot ids",
+            group_idx,
+            stage,
+            ", ".join(task.id for task in group_tasks) or "<none>",
+            len(list(getattr(registry, "repos", []) or [])),
+        )
+    if snapshot_required:
         snapshots = list(await _maybe_await_workspace_authority(
             authority.snapshot(
                 feature_id,
@@ -10005,6 +10032,33 @@ def _dispatcher_request_for_task(
         runtime_hint=runtime_hint,
         runtime_policy=runtime_policy,
     )
+    workspace_snapshot_ids = _workspace_snapshot_ids_for_dispatch(
+        snapshots, dispatch_repo_id
+    )
+    if not workspace_snapshot_ids and bool(
+        getattr(actor_metadata, "sandbox_required", False)
+    ):
+        # W-RC invariant pin: a sandbox_required dispatch payload must never
+        # carry empty workspace_snapshot_ids when a durable execution-control
+        # store backs sandbox allocation — sandbox.py terminally refuses the
+        # repo binding ("sandbox repo bindings require durable workspace
+        # snapshot ids"), so every runtime attempt would burn out with
+        # runtime_terminal_reason=sandbox_binding_failed. Fail loud BEFORE
+        # dispatch instead. Store-less (artifact-only test/dev) environments
+        # are unchanged: there sandbox allocation never enforces snapshot ids.
+        durable_store = _execution_control_store_for_runner(runner)
+        if durable_store is not None and hasattr(
+            durable_store, "allocate_sandbox_lease"
+        ):
+            raise _sandbox_blocker(
+                "Dispatch payload for task "
+                f"{task.id} would carry sandbox_required=true with EMPTY "
+                f"workspace_snapshot_ids for repo {dispatch_repo_id!r}; "
+                "durable sandbox allocation terminally refuses such bindings. "
+                "Capture a pre-dispatch workspace snapshot for this group "
+                "(empty write-set waves get the read-baseline default).",
+                task_id=task.id,
+            )
     data: dict[str, Any] = {
         "feature_id": feature.id,
         "dag_sha256": dag_sha256 or "unknown-dag",
@@ -10018,7 +10072,7 @@ def _dispatcher_request_for_task(
             f"dispatch-sandbox:{feature.id}:g{group_idx}:"
             f"t{task_idx}:a{attempt}:{stage}"
         ),
-        "workspace_snapshot_ids": _workspace_snapshot_ids_for_dispatch(snapshots, dispatch_repo_id),
+        "workspace_snapshot_ids": workspace_snapshot_ids,
         "base_commit_by_repo": _base_commit_for_dispatch(ws_path, dispatch_repo_id),
         "runtime_policy": str(runtime_policy),
         "runtime_policy_digest": _runtime_policy_digest_for_dispatch(runtime_policy),

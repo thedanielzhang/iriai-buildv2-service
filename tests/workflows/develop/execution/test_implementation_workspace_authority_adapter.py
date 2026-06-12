@@ -7035,3 +7035,229 @@ async def test_prior_attempt_context_offload_avoids_canonical_feature_root(
         *context_path.resolve(strict=False).parents,
     ]
     assert not (feature_root / ".iriai-context").exists()
+
+
+# ── W-RC: empty write-set waves get a read-baseline snapshot ─────────────────
+#
+# The regroup validator (dag_regroup_missing_write_set_coverage step-10)
+# forces tasks with an EMPTY write-set/file_scope (e.g. gates-check tasks like
+# TASK-RCAN-00-UPSTREAM-GATES) into singleton waves. Such a wave produces zero
+# WorkspaceAuthority path targets, so preflight used to report
+# snapshot_required=False and the adapter persisted NO workspace snapshot for
+# the group. Every implementer dispatch is sandbox_required, and durable
+# sandbox allocation terminally refuses repo bindings without positive
+# snapshot ids ("sandbox repo bindings require durable workspace snapshot
+# ids" -> runtime_terminal_reason=sandbox_binding_failed), so the wave could
+# never dispatch. The adapter now defaults to a read-baseline snapshot of the
+# group's registry repos, and the dispatch-payload builder pins the invariant
+# 'sandbox_required dispatch => nonempty workspace_snapshot_ids' whenever a
+# durable execution-control store backs sandbox allocation.
+
+
+class _DurableSandboxStore(_BridgeExecutionControlStore):
+    """Bridge store that ALSO advertises durable sandbox-lease allocation.
+
+    `sandbox.py::_persist_allocated_lease` only enforces positive workspace
+    snapshot ids when the store exposes `allocate_sandbox_lease`; the payload
+    builder pins the same condition.
+    """
+
+    async def allocate_sandbox_lease(self, *args, **kwargs):  # pragma: no cover
+        raise NotImplementedError
+
+
+def _empty_write_set_task() -> ImplementationTask:
+    return ImplementationTask(
+        id="TASK-RCAN-00-UPSTREAM-GATES",
+        name="upstream gates check",
+        description="gates-only task with an empty write-set",
+        file_scope=[],
+    )
+
+
+@pytest.mark.asyncio
+async def test_empty_write_set_group_gets_read_baseline_snapshot(
+    tmp_path: Path,
+) -> None:
+    workspace_root, feature_root = _workspace(tmp_path)
+    _repo(feature_root, "app")
+    artifacts = _Artifacts()
+    store = _BridgeExecutionControlStore()
+    runner = _runner(workspace_root, artifacts, execution_control_store=store)
+
+    outcome = await _run_workspace_authority_pre_dispatch_adapter(
+        runner,
+        _feature(),
+        2,
+        [_empty_write_set_task()],
+        workspace_root=workspace_root,
+        feature_root=feature_root,
+        dag_sha256="dag-sha",
+    )
+
+    assert outcome.approved is True
+    assert outcome.snapshots, (
+        "empty write-set wave must still capture a read-baseline snapshot"
+    )
+    snapshot_ids = [
+        int(getattr(snapshot, "id", 0) or 0) for snapshot in outcome.snapshots
+    ]
+    assert all(snapshot_id > 0 for snapshot_id in snapshot_ids)
+    # The snapshot row was durably persisted at dispatch prep.
+    assert store.workspace_snapshots
+    persisted = store.workspace_snapshots[0]
+    assert persisted.stage == "initial-dispatch"
+    assert persisted.group_idx == 2
+    assert persisted.repo_id
+    # The compatibility snapshot artifact is non-empty for the group.
+    snapshot_artifact = json.loads(
+        artifacts.store["workspace-authority-snapshot:g2:initial-dispatch"]
+    )
+    assert snapshot_artifact["snapshots"]
+
+
+@pytest.mark.asyncio
+async def test_empty_write_set_dispatch_payload_carries_snapshot_ids(
+    tmp_path: Path,
+) -> None:
+    workspace_root, feature_root = _workspace(tmp_path)
+    _repo(feature_root, "app")
+    artifacts = _Artifacts()
+    store = _DurableSandboxStore()
+    runner = _runner(workspace_root, artifacts, execution_control_store=store)
+    task = _empty_write_set_task()
+
+    outcome = await _run_workspace_authority_pre_dispatch_adapter(
+        runner,
+        _feature(),
+        2,
+        [task],
+        workspace_root=workspace_root,
+        feature_root=feature_root,
+        dag_sha256="dag-sha",
+    )
+    assert outcome.snapshots
+    repo_id = str(getattr(outcome.snapshots[0], "repo_id", ""))
+
+    request = implementation_module._dispatcher_request_for_task(
+        runner=runner,
+        feature=_feature(),
+        dag_sha256="dag-sha",
+        group_idx=2,
+        task_idx=0,
+        attempt=0,
+        task=task,
+        task_contract=None,
+        snapshots=list(outcome.snapshots),
+        ws_path=str(feature_root / "app"),
+        runtime_hint=None,
+        runtime_policy=implementation_module.DEFAULT_RUNTIME_POLICY,
+        actor_suffix="g2-t0",
+        stage="initial-dispatch",
+        repo_id=repo_id,
+    )
+
+    assert list(request.workspace_snapshot_ids)
+    assert all(int(value) > 0 for value in request.workspace_snapshot_ids)
+    assert bool(request.actor_metadata.sandbox_required) is True
+
+
+@pytest.mark.asyncio
+async def test_sandbox_required_dispatch_payload_never_has_empty_snapshot_ids(
+    tmp_path: Path,
+) -> None:
+    """Invariant pin: sandbox_required dispatch => nonempty snapshot ids.
+
+    With a durable execution-control store (the condition under which
+    sandbox.py terminally refuses repo bindings lacking positive snapshot
+    ids), the payload builder must fail LOUD before dispatch instead of
+    letting every runtime attempt burn out with sandbox_binding_failed.
+    """
+    from iriai_build_v2.workflows.develop.execution.types import (
+        SandboxWorkflowBlocker,
+    )
+
+    workspace_root, feature_root = _workspace(tmp_path)
+    _repo(feature_root, "app")
+    artifacts = _Artifacts()
+    store = _DurableSandboxStore()
+    runner = _runner(workspace_root, artifacts, execution_control_store=store)
+
+    with pytest.raises(SandboxWorkflowBlocker) as excinfo:
+        implementation_module._dispatcher_request_for_task(
+            runner=runner,
+            feature=_feature(),
+            dag_sha256="dag-sha",
+            group_idx=2,
+            task_idx=0,
+            attempt=0,
+            task=_empty_write_set_task(),
+            task_contract=None,
+            snapshots=[],
+            ws_path=str(feature_root / "app"),
+            runtime_hint=None,
+            runtime_policy=implementation_module.DEFAULT_RUNTIME_POLICY,
+            actor_suffix="g2-t0",
+            stage="initial-dispatch",
+            repo_id="repo-app",
+        )
+    assert "workspace_snapshot_ids" in str(excinfo.value)
+
+    # Store-less (artifact-only) environments are unchanged: sandbox
+    # allocation never enforces snapshot ids there, so the builder must not
+    # newly block them.
+    storeless_runner = _runner(workspace_root, artifacts)
+    request = implementation_module._dispatcher_request_for_task(
+        runner=storeless_runner,
+        feature=_feature(),
+        dag_sha256="dag-sha",
+        group_idx=2,
+        task_idx=0,
+        attempt=0,
+        task=_empty_write_set_task(),
+        task_contract=None,
+        snapshots=[],
+        ws_path=str(feature_root / "app"),
+        runtime_hint=None,
+        runtime_policy=implementation_module.DEFAULT_RUNTIME_POLICY,
+        actor_suffix="g2-t0",
+        stage="initial-dispatch",
+        repo_id="repo-app",
+    )
+    assert list(request.workspace_snapshot_ids) == []
+
+
+@pytest.mark.asyncio
+async def test_normal_group_snapshot_capture_is_unchanged(
+    tmp_path: Path,
+) -> None:
+    """A group with real write-set targets behaves exactly as before."""
+    workspace_root, feature_root = _workspace(tmp_path)
+    _repo(feature_root, "app")
+    artifacts = _Artifacts()
+    store = _BridgeExecutionControlStore()
+    runner = _runner(workspace_root, artifacts, execution_control_store=store)
+    task = ImplementationTask(
+        id="TASK-normal",
+        name="normal",
+        description="normal write-producing task",
+        repo_path="app",
+        file_scope=[TaskFileScope(path="app/src/main.py", action="create")],
+    )
+
+    outcome = await _run_workspace_authority_pre_dispatch_adapter(
+        runner,
+        _feature(),
+        3,
+        [task],
+        workspace_root=workspace_root,
+        feature_root=feature_root,
+        dag_sha256="dag-sha",
+    )
+
+    assert outcome.approved is True
+    assert outcome.snapshots
+    assert store.workspace_snapshots
+    assert all(
+        int(getattr(snapshot, "id", 0) or 0) > 0 for snapshot in outcome.snapshots
+    )
