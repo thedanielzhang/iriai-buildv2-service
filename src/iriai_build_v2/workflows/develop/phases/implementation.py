@@ -15393,6 +15393,24 @@ class ImplementationPhase(Phase):
     ) -> BuildState:
         dag_json = await runner.artifacts.get("dag", feature=feature)
         dag = ImplementationDAG.model_validate_json(dag_json)
+        # (W-PR) Resume visibility: a previously persisted implementation/
+        # handover pair from a quiesced or blocked exit carries
+        # phase_state="in_progress" (legacy rows carry no marker — UNKNOWN,
+        # treated the same). Either way the phase re-derives real progress
+        # from durable per-task/group checkpoints below; log loudly so a
+        # resume over a non-terminal pair is never mistaken for done.
+        prior_phase_state = _handover_artifact_phase_state(
+            await runner.artifacts.get("handover", feature=feature)
+        )
+        if prior_phase_state != "complete":
+            logger.info(
+                "Implementation phase entered with a %s persisted handover "
+                "(phase_state=%r) — prior implementation/handover artifacts "
+                "are NOT completion proof; progress re-derives from durable "
+                "checkpoints",
+                "non-terminal" if prior_phase_state else "legacy/absent",
+                prior_phase_state or "<none>",
+            )
         # Loaded once per execute() call and spliced into 4 of 6 post-DAG gates
         # (test author, QA, integration tester, verifier) AND into the
         # post-fix integration regression re-run in _run_regression. Code
@@ -15434,8 +15452,27 @@ class ImplementationPhase(Phase):
             dag_failure = dag_outcome.failure
             handover = dag_outcome.handover
 
+            # (W-PR) Exit-path persist: the implementation/handover pair is
+            # persisted on EVERY exit (quiesce, block, verify-failed cycle,
+            # completion) so context survives — but a non-complete exit must
+            # never look final. The persisted handover carries an explicit
+            # `phase_state` ("in_progress" | "complete") + progress summary
+            # that resume/downstream readers check; the artifact keys are
+            # unchanged for existing consumers.
+            phase_state = _phase_state_for_terminal_state(
+                dag_outcome.terminal_state
+            )
             await runner.artifacts.put("implementation", impl_text, feature=feature)
-            await runner.artifacts.put("handover", to_str(handover), feature=feature)
+            await runner.artifacts.put(
+                "handover",
+                _handover_artifact_payload(
+                    handover,
+                    phase_state=phase_state,
+                    terminal_state=dag_outcome.terminal_state,
+                    tasks_total=len(dag.tasks),
+                ),
+                feature=feature,
+            )
             await enqueue_public_exhibit_refresh(
                 runner,
                 feature,
@@ -22163,6 +22200,245 @@ class _WavePrefetchController:
         await builder.build_prompt_context(request_stub, binding_stub)
 
 
+# ── (W-PR) FALSE-COMPLETE guards ────────────────────────────────────────────
+# Defect class (2026-06-11, feature 5b280bb4, develop12/13/14): a quiesced /
+# workflow_blocked implementation phase was indistinguishable from a completed
+# one at two seams — the phase persisted a final-looking implementation +
+# handover pair unconditionally, and the CLI printed "Workflow resume
+# complete!" after `resume_workflow` swallowed `WorkflowQuiesced`. These
+# helpers are additive: a completion predicate that refuses to let a
+# success-shaped dispatch-loop return stand without per-task terminal-success
+# evidence, and an explicit `phase_state` marker on the persisted handover so
+# a resume (or any downstream reader) can tell in-progress from complete.
+
+_HANDOVER_PHASE_STATE_KEY = "phase_state"
+_HANDOVER_PHASE_PROGRESS_KEY = "phase_progress"
+
+
+def _phase_state_for_terminal_state(terminal_state: str) -> str:
+    """Map a ``DagExecutionOutcome.terminal_state`` to the persisted
+    ``phase_state`` marker: only a genuine completion is ``"complete"``;
+    every quiesce / workflow-block / verify-failed persist is
+    ``"in_progress"`` so resume can never mistake it for done."""
+    return (
+        "complete"
+        if str(terminal_state or "") in {"complete", "completed"}
+        else "in_progress"
+    )
+
+
+def _handover_artifact_payload(
+    handover: HandoverDoc,
+    *,
+    phase_state: str,
+    terminal_state: str,
+    tasks_total: int,
+) -> str:
+    """Serialize *handover* for the durable ``handover`` artifact with an
+    explicit ``phase_state`` field plus a small progress summary.
+
+    Additive and backward compatible: the payload is the exact
+    ``HandoverDoc`` JSON plus two extra top-level keys. Pydantic v2 ignores
+    unknown keys on validation, so any legacy reader that parses the artifact
+    back into ``HandoverDoc`` is unaffected; legacy rows that PREDATE the
+    marker simply lack the key (see ``_handover_artifact_phase_state``)."""
+    try:
+        data = json.loads(to_str(handover))
+        if not isinstance(data, dict):  # pragma: no cover - defensive.
+            raise ValueError("handover did not serialize to an object")
+    except Exception:  # pragma: no cover - never block the persist.
+        logger.warning(
+            "handover artifact: could not decorate payload with phase_state; "
+            "persisting the plain HandoverDoc JSON",
+            exc_info=True,
+        )
+        return to_str(handover)
+    data[_HANDOVER_PHASE_STATE_KEY] = phase_state
+    data[_HANDOVER_PHASE_PROGRESS_KEY] = {
+        "terminal_state": str(terminal_state or ""),
+        "tasks_completed": len(handover.completed),
+        "tasks_total": int(tasks_total),
+    }
+    return json.dumps(data, indent=2)
+
+
+def _handover_artifact_phase_state(raw: str | None) -> str:
+    """Phase state of a persisted ``handover`` artifact.
+
+    Returns ``"complete"`` or ``"in_progress"`` when the (W-PR) marker is
+    present, and ``""`` for legacy rows that predate the marker, empty rows,
+    or unparseable payloads. Callers MUST treat ``""`` as UNKNOWN — i.e.
+    non-terminal — never as proof of completion."""
+    if not raw:
+        return ""
+    try:
+        data = json.loads(raw)
+    except (ValueError, TypeError):
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    value = str(data.get(_HANDOVER_PHASE_STATE_KEY, "") or "")
+    return value if value in {"complete", "in_progress"} else ""
+
+
+async def _phase_completion_predicate_gap(
+    runner: WorkflowRunner,
+    feature: Feature,
+    dag: ImplementationDAG,
+    all_results: list[object],
+) -> str:
+    """Validate that the dispatch loop's success-shaped return is justified.
+
+    Returns ``""`` when every task in the EFFECTIVE execution order has
+    terminal-success evidence; otherwise a typed
+    ``phase_completion_predicate: ...`` gap description naming the uncovered
+    tasks. Evidence, per task (any one suffices):
+
+    1. a completed ``ImplementationResult`` accumulated by this run
+       (live dispatch or checkpoint reload);
+    2. a durable ``dag-task:{id}`` marker with ``status == "completed"``;
+    3. a ``dag-group:{g}`` checkpoint for the task's EFFECTIVE group whose
+       body either does not list per-task coverage at all (legacy /
+       strict-adoption seals carry empty bodies — the dispatch loop already
+       trusts those seals to skip the group) or explicitly lists the task.
+       A checkpoint that LISTS tasks and omits this one is NOT evidence —
+       that is precisely the stale/partial rehydration this guard exists
+       to catch.
+
+    A lingering ``dag-task-pending-merge:{id}`` marker on a task WITHOUT
+    terminal evidence is named in the gap; on a covered task it only warns
+    (the post-seal marker sweep is best-effort and a stale marker after a
+    sealed integration is an already-tolerated state). Fails CLOSED: a store
+    error while reading evidence is a gap, never a pass."""
+    ordered: list[str] = []
+    seen: set[str] = set()
+    group_idx_by_tid: dict[str, int] = {}
+    for g_idx, group in enumerate(dag.execution_order):
+        for tid in group:
+            tid = str(tid)
+            if not tid:
+                continue
+            group_idx_by_tid.setdefault(tid, g_idx)
+            if tid not in seen:
+                seen.add(tid)
+                ordered.append(tid)
+    if not ordered:
+        for task in dag.tasks:
+            tid = str(getattr(task, "id", "") or "")
+            if tid and tid not in seen:
+                seen.add(tid)
+                ordered.append(tid)
+    completed_ids = {
+        str(r.task_id)
+        for r in all_results
+        if isinstance(r, ImplementationResult)
+        and r.task_id
+        and r.status == "completed"
+    }
+    # group idx -> set of task ids its checkpoint body explicitly lists, or
+    # None for a trusted seal with no per-task listing, keyed only for groups
+    # that HAVE a checkpoint artifact.
+    checkpoint_listing: dict[int, set[str] | None] = {}
+
+    async def _group_checkpoint_covers(tid: str) -> bool:
+        g_idx = group_idx_by_tid.get(tid)
+        if g_idx is None:
+            return False
+        if g_idx not in checkpoint_listing:
+            raw = await runner.artifacts.get(
+                f"dag-group:{g_idx}", feature=feature,
+            )
+            if not raw:
+                return False
+            try:
+                body = json.loads(raw)
+                if not isinstance(body, dict):
+                    return False
+                listed: set[str] = {
+                    str(t) for t in (body.get("task_ids") or []) if str(t)
+                }
+                for r_data in body.get("results") or []:
+                    if isinstance(r_data, dict) and r_data.get("task_id"):
+                        listed.add(str(r_data["task_id"]))
+            except (ValueError, TypeError):
+                # Unparseable checkpoint body: NOT completion evidence.
+                return False
+            checkpoint_listing[g_idx] = listed or None
+        listing = checkpoint_listing.get(g_idx)
+        if listing is None:
+            return g_idx in checkpoint_listing
+        return tid in listing
+
+    missing: list[str] = []
+    pending_merge_uncovered: list[str] = []
+    pending_merge_stale: list[str] = []
+    try:
+        for tid in ordered:
+            has_pending_marker = bool(
+                await runner.artifacts.get(
+                    _pending_merge_queue_marker_key(tid), feature=feature,
+                )
+            )
+            covered = (
+                tid in completed_ids
+                or await _group_checkpoint_covers(tid)
+            )
+            if not covered:
+                marker = await runner.artifacts.get(
+                    f"dag-task:{tid}", feature=feature,
+                )
+                if marker:
+                    try:
+                        covered = (
+                            ImplementationResult.model_validate_json(
+                                marker
+                            ).status
+                            == "completed"
+                        )
+                    except Exception:
+                        covered = False
+            if covered:
+                if has_pending_marker:
+                    pending_merge_stale.append(tid)
+                continue
+            missing.append(tid)
+            if has_pending_marker:
+                pending_merge_uncovered.append(tid)
+    except Exception as exc:  # noqa: BLE001 - fail closed, never silently pass.
+        return (
+            "phase_completion_predicate: completion evidence could not be "
+            f"read ({type(exc).__name__}: {exc}); refusing to conclude the "
+            "implementation phase without per-task terminal-success proof"
+        )
+    if pending_merge_stale:
+        logger.warning(
+            "phase_completion_predicate: %d task(s) with terminal-success "
+            "evidence still carry dag-task-pending-merge markers (best-effort "
+            "post-seal sweep did not remove them): %s",
+            len(pending_merge_stale),
+            ", ".join(pending_merge_stale[:15]),
+        )
+    if not missing:
+        return ""
+    parts = [
+        f"phase_completion_predicate: {len(missing)}/{len(ordered)} tasks "
+        "lack terminal-success state"
+    ]
+    shown = ", ".join(missing[:15])
+    if len(missing) > 15:
+        shown += f", +{len(missing) - 15} more"
+    parts.append(f"missing: {shown}")
+    if pending_merge_uncovered:
+        shown = ", ".join(pending_merge_uncovered[:15])
+        if len(pending_merge_uncovered) > 15:
+            shown += f", +{len(pending_merge_uncovered) - 15} more"
+        parts.append(
+            f"{len(pending_merge_uncovered)} uncovered task(s) still carry "
+            f"dag-task-pending-merge markers: {shown}"
+        )
+    return "; ".join(parts)
+
+
 async def _implement_dag(
     runner: WorkflowRunner, feature: Feature, dag: ImplementationDAG
 ) -> DagExecutionOutcome:
@@ -24523,6 +24799,41 @@ async def _implement_dag_dispatch_loop(
                 ),
             )
         group_idx += 1
+
+    # ── (W-PR) Phase-completion predicate ─────────────────────────────
+    # The loop is about to take its ONLY success-shaped return. Never let
+    # that reach the phase persist unless every effective-order task has
+    # durable terminal-success evidence and no pending-merge marker is
+    # outstanding (observed FALSE-COMPLETE class: a stale/partial resume
+    # rehydration concluding with a fraction of the DAG covered). Fails
+    # closed to a typed workflow blocker naming the gap.
+    completion_gap = await _phase_completion_predicate_gap(
+        runner, feature, dag, all_results,
+    )
+    if completion_gap:
+        logger.error(
+            "DAG dispatch loop reached its success return WITHOUT full "
+            "terminal-success coverage — refusing to conclude: %s",
+            completion_gap,
+        )
+        await _log_feature_event(
+            runner,
+            feature.id,
+            "dag_phase_completion_predicate_failed",
+            "implementation",
+            content=completion_gap[:500],
+            metadata={
+                "group_count": len(dag.execution_order),
+                "task_count": len(dag.tasks),
+                "gap": completion_gap[:1000],
+            },
+        )
+        return DagExecutionOutcome(
+            implementation_text="\n\n".join(to_str(r) for r in all_results),
+            failure=_workflow_blocker_text(completion_gap),
+            handover=handover,
+            terminal_state="workflow_blocked",
+        )
 
     # ── Enhancement group: fix accumulated non-blocking findings ──────
     enh_failure = await _run_enhancement_group(

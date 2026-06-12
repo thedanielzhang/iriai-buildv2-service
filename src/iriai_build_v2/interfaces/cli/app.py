@@ -17,6 +17,43 @@ from ...runtime_policy import (
 
 load_dotenv()
 
+# (W-PR) Exit code for a workflow that QUIESCED (intentional pause on a typed
+# blocker) instead of completing. Distinct from 0 (genuine completion) and 1
+# (crash) so drivers/orchestrators can route it without text-scraping.
+WORKFLOW_QUIESCED_EXIT_CODE = 3
+
+
+def _print_workflow_outcome(runner: object, *, label: str) -> None:
+    """Print the terminal banner for a finished `execute_workflow` /
+    `resume_workflow` call.
+
+    FALSE-COMPLETE guard (2026-06-11, feature 5b280bb4 develop12/13/14): the
+    runner deliberately swallows ``WorkflowQuiesced`` (a quiesce is a clean,
+    resumable park, not a crash) and records it on
+    ``runner.last_workflow_quiesce`` — but this CLI used to print
+    "Workflow [resume] complete!" unconditionally afterwards, so a
+    workflow_blocked implementation phase was reported to the operator as a
+    completed run three times in one day. A quiesced workflow now prints a
+    loud NOT-COMPLETE banner with the phase + typed reason and exits with
+    ``WORKFLOW_QUIESCED_EXIT_CODE``; the genuine-completion banner is
+    byte-identical to the legacy one."""
+    quiesce = getattr(runner, "last_workflow_quiesce", None)
+    print(f"\n{'='*60}")
+    if quiesce is None:
+        print(f"  {label} complete!")
+        print(f"{'='*60}\n")
+        return
+    metadata = getattr(quiesce, "metadata", None) or {}
+    terminal_state = str(metadata.get("terminal_state", "") or "quiesced")
+    reason = " ".join(str(getattr(quiesce, "reason", "") or "").split())
+    print(f"  {label} QUIESCED — NOT COMPLETE")
+    print(f"  Phase: {getattr(quiesce, 'phase_name', '') or '<unknown>'}")
+    print(f"  Terminal state: {terminal_state}")
+    print(f"  Reason: {reason[:1500] or '(none recorded)'}")
+    print(f"  The workflow did NOT finish. Resolve the blocker and resume.")
+    print(f"{'='*60}\n")
+    raise SystemExit(WORKFLOW_QUIESCED_EXIT_CODE)
+
 
 async def _run(
     workflow_name: str,
@@ -165,9 +202,8 @@ async def _run(
 
         await runner.execute_workflow(workflow, feature, state)
 
-        print(f"\n{'='*60}")
-        print(f"  Workflow complete!")
-        print(f"{'='*60}\n")
+        # (W-PR) Loud quiesce-vs-complete report; exits non-zero on quiesce.
+        _print_workflow_outcome(runner, label="Workflow")
 
     finally:
         await teardown(env)
@@ -273,9 +309,11 @@ async def _run_resume(
             workflow, feature, state, resume_from_phase=resume_phase
         )
 
-        print(f"\n{'='*60}")
-        print(f"  Workflow resume complete!")
-        print(f"{'='*60}\n")
+        # (W-PR) Loud quiesce-vs-complete report; exits non-zero on quiesce.
+        # Occurrence 3 (develop14, 2026-06-11 19:27:20): the implementation
+        # phase quiesced on a typed SANDBOX_WORKFLOW_BLOCKER yet this command
+        # printed "Workflow resume complete!" and exited 0.
+        _print_workflow_outcome(runner, label="Workflow resume")
 
     finally:
         await teardown(env)
