@@ -547,9 +547,8 @@ class SandboxSpec(_SandboxModel):
             raise ValueError("attempt_no cannot be negative")
         return self
 
-    @property
-    def idempotency_key(self) -> str:
-        seed: dict[str, Any] = {
+    def _idempotency_seed(self) -> dict[str, Any]:
+        return {
             "feature_id": self.feature_id,
             "dag_sha256": self.dag_sha256,
             "group_idx": self.group_idx,
@@ -561,6 +560,10 @@ class SandboxSpec(_SandboxModel):
             },
             "contract_ids": sorted(self.contract_ids),
         }
+
+    @property
+    def idempotency_key(self) -> str:
+        seed: dict[str, Any] = self._idempotency_seed()
         # When IRIAI_SANDBOX_REUSE_ON_RETRY is off (default) include attempt_no
         # in the key so each attempt gets a fresh sandbox (previous behaviour).
         # When enabled, the key is content-digest-only: same task/dag/repos/
@@ -569,6 +572,21 @@ class SandboxSpec(_SandboxModel):
         if not _sandbox_reuse_on_retry_enabled():
             seed["attempt_no"] = self.attempt_no
         return f"idem:sandbox:{_stable_digest(seed)}"
+
+    @property
+    def content_idempotency_key(self) -> str:
+        """Attempt-free content digest of this spec (W-S wave prefetch).
+
+        Exactly the seed ``idempotency_key`` hashes when
+        ``IRIAI_SANDBOX_REUSE_ON_RETRY`` is enabled (attempt_no is only mixed
+        in when that flag is OFF): feature, dag_sha256, group_idx, mode,
+        repo_ids, base_commits and contract_ids. Two specs that differ ONLY
+        in attempt_no share a content key; any base-commit / contract / dag
+        drift between a prefetch-time spec and a real-dispatch spec changes
+        the key, so a stale prefetched sandbox can never be matched. The
+        distinct ``idem:sandbox-content:`` prefix keeps these keys out of the
+        durable allocation-key namespace."""
+        return f"idem:sandbox-content:{_stable_digest(self._idempotency_seed())}"
 
 
 class SandboxLease(_SandboxModel):
