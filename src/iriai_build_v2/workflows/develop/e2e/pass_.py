@@ -16,7 +16,9 @@ notarized DMG is available.
 from __future__ import annotations
 
 import json
+import logging
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -53,6 +55,8 @@ LIVE_REPO_TMPL = os.environ.get(
 )
 
 REQUIRE_PROFILE_ENV = "IRIAI_E2E_REQUIRE_PROFILE"
+
+logger = logging.getLogger(__name__)
 
 
 class E2EProfileRequiredError(RuntimeError):
@@ -158,6 +162,11 @@ class LaneResult:
     started: bool = False
     detail: str = ""
     boot_error: str = ""  # set ONLY on a real build/webServer failure
+    # Operator standing rule (17:2x item 5): True iff the lane's OWN auth
+    # bootstrap (Playwright globalSetup credentials / Auth0 sign-in) broke —
+    # an environment/credential problem, NEVER a product regression. The lane
+    # is loudly skipped; boot_smoke/page_critical are untouched.
+    auth_blocked: bool = False
 
     @property
     def boot_failed(self) -> bool:
@@ -186,7 +195,10 @@ class PassSummary:
     # Item-11 G4 (flat): "" = studio/non-browser-lane product (unchanged);
     # "not_built" = profile declares native_test_cmd but no configs yet;
     # "ran" = declared compose browser lanes executed in this pass;
-    # "skipped_attach" = ATTACH mode probed the running stack, lanes skipped.
+    # "skipped_attach" = ATTACH mode probed the running stack, lanes skipped;
+    # "auth_blocked" = at least one lane's auth bootstrap (harness credentials)
+    # broke — lane(s) loudly skipped, green covers boot+host ONLY (operator
+    # standing rule: a broken e2e credential must never quiesce dispatch).
     browser_lanes: str = ""
 
 
@@ -220,6 +232,139 @@ def lane_boot_error(run: Any, stderr_tail: str = "") -> str:
             or "harness did not produce a runnable surface"
         )
     return ""
+
+
+# ── AUTH-class browser-lane failures (operator standing rule, 17:2x item 5) ──
+# A broken e2e CREDENTIAL must NEVER quiesce the workflow: loud lane skip + an
+# OPERATOR-ACTIONS entry naming the broken env(s); dispatch continues.
+# IRIAI_E2E_CRITICAL_QUIESCE stays reserved for regressions in the feature's
+# own surfaces. The marker strings below are the harness's OWN error shapes
+# (kaya spend-client e2e/global-setup.ts): the missing-env throw, the Auth0
+# sign-in locator failures, the distinct-users guard, and the post-login
+# profile assertions. Matched case-insensitively against the lane's
+# globalSetup errors + stderr tail — per-TEST failures are never auth-classed
+# (a product auth regression must still page).
+_AUTH_LANE_MARKERS = (
+    "missing auth0 e2e environment variables",
+    "auth0 e2e role credentials must use distinct users",
+    "was not visible during auth0 login",
+    "auth0 profile check failed",
+    "auth0 profile did not include",
+)
+
+_AUTH_ENV_NAME_RE = re.compile(r"\bE2E_[A-Z0-9_]+\b")
+_AUTH_MISSING_ENV_RE = re.compile(
+    r"Missing Auth0 e2e environment variables:\s*([A-Za-z0-9_,\s]+)")
+
+
+def lane_auth_error(run: Any, stderr_tail: str = "") -> str:
+    """The AUTH-class failure text for a lane, or '' if not auth-class.
+
+    Auth-class = the lane's own auth bootstrap (globalSetup credential read /
+    Auth0 sign-in / profile assertion) failed — an environment problem, never a
+    product regression. Only globalSetup-level evidence (report top-level
+    errors + stderr) is consulted; failed TESTS keep today's regression path.
+    """
+    for text in [*run.global_errors, stderr_tail or ""]:
+        low = text.lower()
+        if any(m in low for m in _AUTH_LANE_MARKERS):
+            return text.strip()
+    return ""
+
+
+def auth_broken_env_names(auth_error: str, profile: Any = None) -> list[str]:
+    """NAME the broken credential env var(s) for the operator entry.
+
+    Prefers the explicit names in the harness's missing-env throw; falls back
+    to any E2E_* tokens in the error, then to the profile's declared
+    test-account key names (creds present but sign-in/profile failed).
+    """
+    m = _AUTH_MISSING_ENV_RE.search(auth_error)
+    if m:
+        names = [t for t in re.split(r"[,\s]+", m.group(1).strip()) if t]
+        if names:
+            return names
+    names = sorted(set(_AUTH_ENV_NAME_RE.findall(auth_error)))
+    if names:
+        return names
+    return [
+        k for k in (
+            getattr(profile, "e2e_test_account_user_key", ""),
+            getattr(profile, "e2e_test_account_pass_key", ""),
+        ) if k
+    ]
+
+
+def _workspace_root_from_checkpoint(checkpoint: Any) -> Path | None:
+    """Workspace root from the checkpoint's repo paths.
+
+    The develop flow checks feature repos out under
+    ``<workspace>/.iriai/features/<feature>/repos/<repo>`` — the same layout
+    the implementation-phase OPERATOR-ACTIONS writer keys off
+    (``<workspace>/.iriai``). Walk each repo_path for a ``.iriai`` component;
+    its parent is the workspace root. None when no repo path carries one (the
+    caller falls back to the durable registry row).
+    """
+    for r in getattr(checkpoint, "repos", []) or []:
+        repo_path = getattr(r, "repo_path", "") or ""
+        if not repo_path:
+            continue
+        parts = Path(repo_path).parts
+        if ".iriai" in parts:
+            idx = parts.index(".iriai")
+            if idx > 0:
+                return Path(*parts[:idx])
+    return None
+
+
+def append_auth_operator_action(
+    checkpoint: Any, *, lane: str, auth_error: str, env_names: list[str],
+) -> bool:
+    """Best-effort [PENDING] entry in <workspace>/.iriai/OPERATOR-ACTIONS.md.
+
+    Newest-first, same shape as the implementation-phase writer
+    (``_append_operator_actions_entry``). Deduped per (checkpoint, lane) via
+    the entry title so a re-run pass never spams the queue. Returns True when
+    the entry exists (written now or already present); False when the
+    workspace root is unreachable from the e2e layer — the caller records the
+    durable ``e2e-auth-blocked`` registry row instead. Failures only WARN:
+    this entry must never break the pass that is deliberately NOT quiescing.
+    """
+    try:
+        root = _workspace_root_from_checkpoint(checkpoint)
+        if root is None or not (root / ".iriai").is_dir():
+            return False
+        path = root / ".iriai" / "OPERATOR-ACTIONS.md"
+        label = f"group {getattr(checkpoint, 'group_idx', '?')}"
+        title = f"e2e browser lane AUTH-BLOCKED ({lane}) @ {label}"
+        existing = path.read_text(encoding="utf-8") if path.exists() else ""
+        if title in existing:
+            return True  # already queued for this checkpoint+lane
+        from datetime import datetime as _datetime
+
+        ts = _datetime.now().strftime("%Y-%m-%d %H:%M")
+        broken = ", ".join(env_names) or "(unknown — see error below)"
+        entry = (
+            f"## [PENDING] {ts} — {title}\n"
+            "URGENCY: non-blocking (lane skipped LOUDLY; dispatch continues — "
+            "operator standing rule: auth failures never quiesce)\n"
+            f"COMMANDS: fix/rotate the e2e credential env(s) [{broken}] in the "
+            "harness secret env file, then re-run the e2e pass for this "
+            "checkpoint\n"
+            f"WHY: browser lane {lane} auth bootstrap failed: "
+            f"{auth_error[:400]}\n"
+            f"VERIFY: the lane runs (browser_lanes='ran', no auth_blocked "
+            f"lane) on the next e2e pass at {label} or later\n"
+            "RESOLVED:\n\n"
+        )
+        path.write_text(entry + existing, encoding="utf-8")
+        return True
+    except Exception as exc:  # noqa: BLE001 — never break the non-quiescing pass
+        logger.warning(
+            "OPERATOR-ACTIONS auth-blocked entry failed for lane %r: %s",
+            lane, exc,
+        )
+        return False
 
 
 async def _load_latest(conn, feature: str, key: str):
@@ -742,6 +887,68 @@ async def _run_compose_pass(
                     nr = await adapter.run_native_config(instance, cfg)
                     run = nr.result
                     boot_error = lane_boot_error(run, nr.stderr_tail)
+                    auth_error = (
+                        lane_auth_error(run, nr.stderr_tail) if boot_error else ""
+                    )
+                    if auth_error:
+                        # Operator standing rule (17:2x item 5): the lane's OWN
+                        # auth bootstrap broke (credential env / Auth0 sign-in)
+                        # — an ENVIRONMENT failure, never a product regression.
+                        # Loud skip: no boot_smoke fail, no bridge, no
+                        # page_critical (so CRITICAL_QUIESCE/page_critical can
+                        # never fire for it); dispatch continues. Green keeps
+                        # covering boot+host ONLY — browser_lanes=auth_blocked
+                        # is the honest non-coverage marker (same exclusion
+                        # shape as "not_built").
+                        broken = auth_broken_env_names(auth_error, profile)
+                        lr = LaneResult(
+                            config=cfg, web_server_ok=run.web_server_ok,
+                            started=run.started,
+                            detail=f"auth_blocked: {auth_error[:200]}",
+                            boot_error=f"auth_blocked: {auth_error[:500]}",
+                            auth_blocked=True)
+                        summary.lanes.append(lr)
+                        summary.browser_lanes = "auth_blocked"
+                        msg = (
+                            f"  WARNING: browser lane {cfg} AUTH-BLOCKED — "
+                            f"lane SKIPPED, dispatch continues (broken "
+                            f"credential env(s): "
+                            f"{', '.join(broken) or 'unknown'}; harness auth "
+                            f"bootstrap failure, NOT a product regression): "
+                            f"{auth_error[:300]}")
+                        logger.warning(msg.strip())
+                        on_log(msg)
+                        recorded = append_auth_operator_action(
+                            checkpoint, lane=cfg, auth_error=auth_error,
+                            env_names=broken)
+                        if recorded:
+                            on_log(
+                                "  auth-blocked entry appended to "
+                                "<workspace>/.iriai/OPERATOR-ACTIONS.md")
+                        else:
+                            # Workspace unreachable from the e2e layer: the
+                            # durable registry row (NOT BLOCKER_KEY — that
+                            # would feed CRITICAL_QUIESCE) is the fallback.
+                            from .registry import AUTH_BLOCKED_KEY
+
+                            prior = await registry.get_raw(AUTH_BLOCKED_KEY) or {}
+                            rows = [
+                                r for r in prior.get("lanes", [])
+                                if not (r.get("lane") == cfg
+                                        and r.get("checkpoint") == label)
+                            ]
+                            rows.append({
+                                "checkpoint": label, "lane": cfg,
+                                "broken_env_names": broken,
+                                "error": auth_error[:500],
+                            })
+                            await registry.put_raw(
+                                AUTH_BLOCKED_KEY, {"lanes": rows})
+                            on_log(
+                                "  workspace OPERATOR-ACTIONS.md unreachable "
+                                f"— durable {AUTH_BLOCKED_KEY!r} row recorded "
+                                "instead")
+                        continue
                     lr = LaneResult(
                         config=cfg, web_server_ok=run.web_server_ok,
                         passed=run.passed, failed=run.failed, flaky=run.flaky,

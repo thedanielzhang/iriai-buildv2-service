@@ -33,6 +33,12 @@ CURSOR_KEY = "e2e-track-cursor"
 STATUS_KEY = "e2e-status"
 GREEN_KEY = "e2e-green-checkpoint"
 BLOCKER_KEY = "e2e-blocker"
+# Durable AUTH-BLOCKED lane record (operator standing rule, 17:2x item 5):
+# DISTINCT from BLOCKER_KEY on purpose — the tier-i critical-quiesce hook
+# (IRIAI_E2E_CRITICAL_QUIESCE) consumes BLOCKER_KEY, and a broken e2e
+# CREDENTIAL must never quiesce dispatch. Written only as the fallback when
+# the workspace OPERATOR-ACTIONS.md is unreachable from the e2e layer.
+AUTH_BLOCKED_KEY = "e2e-auth-blocked"
 ENHANCEMENT_BACKLOG_KEY = "enhancement-backlog"
 
 
