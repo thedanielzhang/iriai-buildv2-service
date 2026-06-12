@@ -129,6 +129,27 @@ DEFAULT_PROBE_FAILED_AFTER_SECONDS = float(
 DEFAULT_RECENT_USAGE_WINDOW_SECONDS = float(
     os.environ.get("IRIAI_CLAUDE_POOL_RECENT_USAGE_WINDOW_SECONDS", "21600") or "21600"
 )
+# W-Q: per-active-job spread penalty in the dispatcher's weighted-least-loaded
+# selector.  Pool accounts are NOT 1-job-at-a-time — multiple concurrent jobs
+# per profile is desired.  An in-flight job therefore contributes only a MILD
+# spread preference (so load spreads when profiles are otherwise tied), never
+# a "profile busy/skip" signal.  Previously this unit was 1000.0/job, which
+# dwarfed the recent-cost (x100/USD) and token signals and effectively
+# excluded any profile with one queued/running job from receiving a second.
+# usage_limited/auth gating is untouched — an UNAVAILABLE profile stays
+# excluded via the profile-state records, not this score.
+DEFAULT_ACTIVE_JOB_SPREAD_PENALTY = float(
+    os.environ.get("IRIAI_POOL_ACTIVE_JOB_SPREAD_PENALTY", "10.0") or "10.0"
+)
+# W-Q safety rail: cap how many manifests a per-profile RUNNER claims into
+# concurrent execution.  The runner previously claimed every queued manifest
+# unbounded; with the dispatcher now happily routing multiple concurrent jobs
+# to one profile, this bounds per-account concurrency.  Per cycle the runner
+# claims up to (max_active - currently_active) and leaves the rest queued.
+# Codex members keep their own existing in-process accounting untouched.
+DEFAULT_RUNNER_MAX_ACTIVE = int(
+    os.environ.get("IRIAI_POOL_RUNNER_MAX_ACTIVE", "4") or "4"
+)
 # When NO pool member is available (e.g. every account hit its usage window at
 # once), wait up to this many seconds for a member to recover instead of
 # raising and crashing the whole workflow. Usage windows reset on their own
@@ -1840,13 +1861,17 @@ class ClaudePoolRuntime(AgentRuntime):
     def _profile_load_score(self, profile_name: str) -> float:
         # Codex members have no job-queue dir and would otherwise score 0.0
         # forever (starve-winning every selection). Mirror claude's
-        # active*1000.0 units using the in-memory active counter so the
-        # weighted-least-loaded selector treats codex co-equally.
+        # per-active-job spread-penalty units using the in-memory active
+        # counter so the weighted-least-loaded selector treats codex
+        # co-equally.
         profile = next(
             (p for p in self.profiles if p.name == profile_name), None
         )
         if profile is not None and profile.kind == "codex":
-            return self._codex_active.get(profile_name, 0) * 1000.0
+            return (
+                self._codex_active.get(profile_name, 0)
+                * DEFAULT_ACTIVE_JOB_SPREAD_PENALTY
+            )
         active = 0
         for state_name in ("queued", "running"):
             active += len(list((self.root / "jobs" / state_name / profile_name).glob("*.json")))
@@ -1871,7 +1896,13 @@ class ClaudePoolRuntime(AgentRuntime):
                 cost, tokens = _extract_cost_and_tokens(result)
                 recent_cost += cost
                 recent_tokens += tokens
-        return (active * 1000.0) + (recent_cost * 100.0) + (recent_tokens / 100_000.0)
+        # W-Q: active jobs are a MILD spread preference, never an exclusion —
+        # multiple concurrent jobs per profile is the desired steady state.
+        return (
+            (active * DEFAULT_ACTIVE_JOB_SPREAD_PENALTY)
+            + (recent_cost * 100.0)
+            + (recent_tokens / 100_000.0)
+        )
 
     def _clear_profile_unavailable(self, profile_name: str) -> None:
         state_path = _profile_state_path(self.root)
@@ -2546,11 +2577,17 @@ class ClaudePoolRunner:
         root: Path | str = DEFAULT_POOL_ROOT,
         poll_interval: float = DEFAULT_POLL_INTERVAL_SECONDS,
         heartbeat_interval: float = DEFAULT_HEARTBEAT_SECONDS,
+        max_active: int | None = None,
     ) -> None:
         self.root = Path(root)
         self.profile = profile
         self.poll_interval = poll_interval
         self.heartbeat_interval = heartbeat_interval
+        # W-Q safety rail: per-cycle the runner claims at most
+        # (max_active - currently_active) manifests and leaves the rest
+        # queued.  IRIAI_POOL_RUNNER_MAX_ACTIVE overrides; <= 0 disables
+        # the cap (unbounded, the previous behavior).
+        self.max_active = DEFAULT_RUNNER_MAX_ACTIVE if max_active is None else max_active
         self.profiles = ensure_pool_layout(self.root)
         self.profile_config = next((item for item in self.profiles if item.name == profile), None)
         if self.profile_config is None:
@@ -2618,7 +2655,18 @@ class ClaudePoolRunner:
                 self.profile,
             )
             return
+        self._reap_active()
         for queued_path in sorted((self.root / "jobs" / "queued" / self.profile).glob("*.json")):
+            if self.max_active > 0 and len(self._active) >= self.max_active:
+                # W-Q safety rail: at the concurrency cap — leave the rest
+                # queued for a later cycle (after active jobs finish).
+                logger.info(
+                    "Claude pool runner profile %s at max_active=%d; "
+                    "leaving remaining queued manifests for a later cycle",
+                    self.profile,
+                    self.max_active,
+                )
+                break
             claimed = self._claim(queued_path)
             if claimed is None:
                 continue

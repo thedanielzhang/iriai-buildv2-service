@@ -16,6 +16,8 @@ from iriai_compose.actors import Role
 from iriai_compose.storage import AgentSession
 
 from iriai_build_v2.runtimes.claude_pool import (
+    DEFAULT_ACTIVE_JOB_SPREAD_PENALTY,
+    DEFAULT_RUNNER_MAX_ACTIVE,
     ClaudePoolProfile,
     ClaudePoolRunner,
     ClaudePoolRuntime,
@@ -595,6 +597,71 @@ async def test_select_profile_prefers_lower_recent_usage(tmp_path: Path):
     picked = await runtime._select_profile(session_key="actor:feat", persistent=False)
 
     assert picked.name == "iriai-claude-2"
+
+
+# W-Q: an in-flight job is a MILD spread preference, never a busy/skip signal.
+@pytest.mark.asyncio
+async def test_active_job_is_mild_spread_preference_not_busy_exclusion(tmp_path: Path):
+    runtime = ClaudePoolRuntime(root=tmp_path, profiles=_profiles())
+    # claude-1 has one in-flight (queued) job: small spread penalty only.
+    _write_json_atomic(
+        _job_state_path(tmp_path, "queued", "iriai-claude-1", "inflight-1"),
+        {"id": "inflight-1", "status": "queued"},
+    )
+    # claude-2 and claude-3 are idle but carry heavier recent usage.
+    for idx, profile in enumerate(("iriai-claude-2", "iriai-claude-3")):
+        job_id = f"recent-cost-{idx}"
+        payload_dir = _payload_dir(tmp_path, job_id)
+        payload_dir.mkdir(parents=True)
+        result_path = payload_dir / "result.json"
+        _write_json_atomic(
+            result_path,
+            {"ok": True, "raw": {"total_cost_usd": 5.0, "usage": {}}},
+        )
+        _write_json_atomic(
+            _job_state_path(tmp_path, "done", profile, job_id),
+            {"id": job_id, "paths": {"result": str(result_path)}},
+        )
+
+    picked = await runtime._select_profile(session_key="actor:feat", persistent=False)
+
+    # Under the old active*1000.0 scoring the in-flight job made claude-1
+    # lose to any idle profile; with the mild penalty it wins over idle
+    # profiles with heavier recent usage.
+    assert picked.name == "iriai-claude-1"
+
+
+# W-Q: usage_limited gating is untouched — an UNAVAILABLE profile stays
+# excluded even when every available profile is busy with concurrent jobs.
+@pytest.mark.asyncio
+async def test_usage_limited_profile_still_excluded_when_others_busy(tmp_path: Path):
+    runtime = ClaudePoolRuntime(root=tmp_path, profiles=_profiles())
+    future = datetime.now(UTC) + timedelta(minutes=5)
+    _write_json_atomic(
+        tmp_path / "profile_state.json",
+        {
+            "profiles": {
+                "iriai-claude-1": {
+                    "status": "unavailable",
+                    "reason": "usage_limited",
+                    "probe_after": future.isoformat(),
+                }
+            }
+        },
+    )
+    for profile in ("iriai-claude-2", "iriai-claude-3"):
+        for idx in range(3):
+            _write_json_atomic(
+                _job_state_path(tmp_path, "queued", profile, f"busy-{profile}-{idx}"),
+                {"id": f"busy-{profile}-{idx}", "status": "queued"},
+            )
+
+    picked = [
+        (await runtime._select_profile(session_key=f"actor-{idx}:feat", persistent=False)).name
+        for idx in range(4)
+    ]
+
+    assert "iriai-claude-1" not in picked
 
 
 @pytest.mark.asyncio
@@ -1993,7 +2060,12 @@ async def test_fake_load_completes_one_thousand_jobs_without_single_flat_queue(t
         _write_json_atomic(_job_state_path(tmp_path, "queued", profile, job_id), manifest)
 
     runners = [
-        _FakeClaudeRunner(profile=profile.name, root=tmp_path, heartbeat_interval=0.01)
+        # max_active=0 disables the W-Q per-cycle claim cap so a single
+        # run_once drains the whole queue (this test exercises queue layout,
+        # not the concurrency rail).
+        _FakeClaudeRunner(
+            profile=profile.name, root=tmp_path, heartbeat_interval=0.01, max_active=0
+        )
         for profile in _profiles()
     ]
     await asyncio.gather(*(runner.run_once(wait=True) for runner in runners))
@@ -2005,6 +2077,70 @@ async def test_fake_load_completes_one_thousand_jobs_without_single_flat_queue(t
         assert len(done) == expected
     assert completed == 1000
     assert len(list((tmp_path / "payloads").iterdir())) > 1
+
+
+def _queue_fake_claude_job(tmp_path: Path, profile: str, job_id: str) -> None:
+    payload_dir = _payload_dir(tmp_path, job_id)
+    payload_dir.mkdir(parents=True)
+    for name in ("prompt.md", "system_prompt.md"):
+        (payload_dir / name).write_text("test", encoding="utf-8")
+    (payload_dir / "schema.json").write_text(
+        json.dumps(_SimpleOutput.model_json_schema()),
+        encoding="utf-8",
+    )
+    manifest = {
+        "id": job_id,
+        "kind": "claude",
+        "profile": profile,
+        "status": "queued",
+        "cwd": str(tmp_path),
+        "role": {"name": "fake", "model": "sonnet", "effort": "low", "tools": []},
+        "paths": {
+            "prompt": str(payload_dir / "prompt.md"),
+            "system_prompt": str(payload_dir / "system_prompt.md"),
+            "schema": str(payload_dir / "schema.json"),
+            "result": str(payload_dir / "result.json"),
+            "stdout": str(payload_dir / "stdout.json"),
+            "stderr": str(payload_dir / "stderr.log"),
+        },
+    }
+    _write_json_atomic(_job_state_path(tmp_path, "queued", profile, job_id), manifest)
+
+
+# W-Q safety rail: the runner claims at most (max_active - currently_active)
+# manifests per cycle and leaves the rest queued for a later cycle.
+@pytest.mark.asyncio
+async def test_runner_claim_cap_claims_up_to_max_active_and_leaves_rest_queued(
+    tmp_path: Path,
+) -> None:
+    runtime = ClaudePoolRuntime(root=tmp_path, profiles=_profiles())
+    del runtime
+    for idx in range(6):
+        _queue_fake_claude_job(tmp_path, "iriai-claude-1", f"cap{idx}0000")
+    runner = _FakeClaudeRunner(
+        profile="iriai-claude-1", root=tmp_path, heartbeat_interval=0.01, max_active=4
+    )
+
+    await runner.run_once(wait=True)
+
+    queued_dir = tmp_path / "jobs" / "queued" / "iriai-claude-1"
+    done_dir = tmp_path / "jobs" / "done" / "iriai-claude-1"
+    assert len(list(done_dir.glob("*.json"))) == 4
+    assert len(list(queued_dir.glob("*.json"))) == 2
+
+    # Next cycle picks up the remainder once active slots free up.
+    await runner.run_once(wait=True)
+
+    assert len(list(done_dir.glob("*.json"))) == 6
+    assert list(queued_dir.glob("*.json")) == []
+
+
+def test_runner_claim_cap_defaults_to_four(tmp_path: Path) -> None:
+    runtime = ClaudePoolRuntime(root=tmp_path, profiles=_profiles())
+    del runtime
+    assert DEFAULT_RUNNER_MAX_ACTIVE == 4
+    runner = ClaudePoolRunner(profile="iriai-claude-1", root=tmp_path)
+    assert runner.max_active == 4
 
 
 # ---------------------------------------------------------------------------
@@ -2240,12 +2376,55 @@ def test_codex_load_score_uses_in_memory_active(tmp_path: Path):
     runtime = _runtime_with_fake_codex(tmp_path)
     assert runtime._profile_load_score("codex") == 0.0
     runtime._record_codex_dispatch_active("codex", 1)
-    assert runtime._profile_load_score("codex") == 1000.0
+    assert runtime._profile_load_score("codex") == DEFAULT_ACTIVE_JOB_SPREAD_PENALTY
     runtime._record_codex_dispatch_active("codex", -1)
     assert runtime._profile_load_score("codex") == 0.0
     # Clamped at >= 0.
     runtime._record_codex_dispatch_active("codex", -5)
     assert runtime._profile_load_score("codex") == 0.0
+
+
+# W-Q: a 7-job wave spreads across codex + claude-1 + claude-2 with NO
+# profile excluded for busyness — every member keeps receiving concurrent
+# jobs (target shape ~3/2/2 given equal availability and equal weight).
+@pytest.mark.asyncio
+async def test_seven_job_wave_spreads_concurrently_across_codex_and_claude(
+    tmp_path: Path,
+) -> None:
+    profiles = [
+        ClaudePoolProfile(name="codex", user="codex", kind="codex"),
+        ClaudePoolProfile(
+            name="iriai-claude-1", user="iriai-claude-1", claude_command="/bin/echo"
+        ),
+        ClaudePoolProfile(
+            name="iriai-claude-2", user="iriai-claude-2", claude_command="/bin/echo"
+        ),
+    ]
+    runtime = ClaudePoolRuntime(root=tmp_path, profiles=profiles)
+    runtime._codex_runtime = _FakeCodexRuntime()
+
+    picked: list[str] = []
+    for idx in range(7):
+        profile = await runtime._select_profile(
+            session_key=f"actor-{idx}:feat", persistent=False
+        )
+        picked.append(profile.name)
+        # Simulate the dispatched job staying in flight for the whole wave
+        # (none complete before the next selection).
+        if profile.kind == "codex":
+            runtime._record_codex_dispatch_active(profile.name, 1)
+        else:
+            _write_json_atomic(
+                _job_state_path(tmp_path, "queued", profile.name, f"wave-{idx}"),
+                {"id": f"wave-{idx}", "status": "queued"},
+            )
+
+    counts = {name: picked.count(name) for name in ("codex", "iriai-claude-1", "iriai-claude-2")}
+    # Every profile keeps taking concurrent jobs (>= 2 each) — busyness never
+    # excludes; the spread is the round-robin target shape 3/2/2.
+    assert sum(counts.values()) == 7
+    assert all(count >= 2 for count in counts.values()), counts
+    assert counts == {"codex": 3, "iriai-claude-1": 2, "iriai-claude-2": 2}
 
 
 # 7b. dispatching to codex bumps and clears the in-memory active counter.
